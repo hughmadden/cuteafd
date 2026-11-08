@@ -125,7 +125,7 @@ pub(crate) fn installed(snapshot: &std::path::Path) -> Result<Installed> {
 fn baseline_operands<'a>(device: Device<'a>, operands: BTreeMap<&'static str, Vec<u8>>)
     -> Result<BTreeMap<&'static str, Allocation<'a>>> {
     operands.into_iter().map(|(name, bytes)| {
-        let owner = Allocation::new(device, bytes.len())?;
+        let owner = Allocation::new(device, bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
         device.run(|| device.library.copy_h2d(owner.buffer, &bytes))?;
         Ok((name, owner))
     }).collect()
@@ -146,7 +146,7 @@ fn baseline_layer<'a>(device: Device<'a>, layout: &LayerLayout, packed: PackedLa
     let core = packed.core.into_iter().map(|(name, loaded)|
         Ok((name, layout.core[name].upload(device, loaded)?))).collect::<Result<_>>()?;
     let native = packed.native.into_iter().map(|(name, bytes)| device.run(|| {
-        let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len())?;
+        let values = crate::shared::memory::DeviceAllocation::new(device.library, bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
         device.library.copy_h2d(values.buffer, &bytes)?;
         Ok((name, crate::shared::native_attention::NativeAttentionWeights {
             layout: layout.native[name].clone(), values, scales: None }))
@@ -226,7 +226,7 @@ fn recorded_for_ranks<'a>(library: &'a NativeLibrary, model: &Installed,
         let layers = selected.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
         let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
             rank, &global, &layers.iter().collect::<Vec<_>>())?;
-        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout)?))
+        Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?))
     }).collect::<Result<BTreeMap<_, _>>>()?.into();
     let mut global = Vec::new();
     for (rank, layout) in globals.iter().enumerate() { global.push((rank, records.global(devices[rank], layout)?)); }

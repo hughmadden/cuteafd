@@ -66,7 +66,7 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.norm.weight")?;
         let local_head = head.map(|weights| -> Result<_> {
             ensure!(weights.device_id() == library.cuda_get_device()?, "dSpark head device differs");
-            let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+            let workspace = DeviceAllocation::untagged(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
             let kernel = unsafe { library.v41_vocabulary_head(workspace.buffer)? };
             let fp8_scratch = crate::families::deepseek_v41::v41_tensors::fp8_scratch(library, weights.copy(),
                 capacity * self.draft_width, crate::families::deepseek_v41::v41_tensors::Fp8Head::Draft)?;
@@ -75,7 +75,7 @@ impl<'library> DsparkWeights<'library> {
         Ok(DsparkTerminal {
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "v41-terminal")?,
             local_head,
-            normalized: DeviceAllocation::new(library, capacity * self.draft_width * 10240)?,
+            normalized: DeviceAllocation::untagged(library, capacity * self.draft_width * 10240)?,
             weights: self,
             stream: LoadStream {
                 library,
@@ -86,15 +86,15 @@ impl<'library> DsparkWeights<'library> {
                 .confidence(capacity * self.draft_width, DsparkConfidence::device_bytes(capacity * self.draft_width)?)?,
             sample: library.v41_draft_step()?,
             hc: library.v41_hc()?,
-            residual: DeviceAllocation::new(library, capacity * self.draft_width * 40960)?,
-            pre_mix: DeviceAllocation::new(library, capacity * self.draft_width * 16)?,
-            shared_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            adjusted_logits: DeviceAllocation::new(library, capacity * self.draft_width * 129280 * 4)?,
-            rng: DeviceAllocation::new(library, capacity * 16)?,
+            residual: DeviceAllocation::untagged(library, capacity * self.draft_width * 40960)?,
+            pre_mix: DeviceAllocation::untagged(library, capacity * self.draft_width * 16)?,
+            shared_logits: DeviceAllocation::untagged(library, capacity * self.draft_width * 129280 * 4)?,
+            adjusted_logits: DeviceAllocation::untagged(library, capacity * self.draft_width * 129280 * 4)?,
+            rng: DeviceAllocation::untagged(library, capacity * 16)?,
             sampling_requests: None,
-            sampling_staging: HostAllocation::new(library, capacity * 20)?,
-            temperatures: DeviceAllocation::new(library, capacity * 4)?,
-            tokens: DeviceAllocation::new(library, capacity * (self.draft_width + 1) * 4)?,
+            sampling_staging: HostAllocation::untagged(library, capacity * 20)?,
+            temperatures: DeviceAllocation::untagged(library, capacity * 4)?,
+            tokens: DeviceAllocation::untagged(library, capacity * (self.draft_width + 1) * 4)?,
             capacity,
             width: self.draft_width,
             graph: BindingGraphs::new(library)?,

@@ -334,7 +334,7 @@ fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
                 id: 0,
             },
             plan.layout.clone(),
-            ExpectedCoverage::from_plan(&checked, 5)?,
+            ExpectedCoverage::from_plan(&checked, 5)?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")
         )?;
         // Reverse run order as the transport may deliver arbitrary fragments.
         for entry in checked.plan.entries.iter().rev() {

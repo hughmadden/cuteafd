@@ -24,6 +24,7 @@ use cuteafd_loader::{
 };
 use cuteafd_transport::worker_selection::push::{self, Offer};
 use std::{net::TcpStream, os::fd::AsRawFd, rc::Rc};
+use cuteafd_core::memory_layout::ArenaTag;
 
 pub(super) fn load<'a>(
     library: &'a NativeLibrary,
@@ -102,7 +103,7 @@ fn receive<'a>(
     let joined = (|| -> Result<_> {
         let started = std::time::Instant::now();
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
-        let arena = LoadingArena::new(device, plan.layout.clone(), expected)?;
+        let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-fp8"))?;
         let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
         let allocated = started.elapsed();
         let rank = client.join(JoinArgs {

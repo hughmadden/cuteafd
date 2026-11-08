@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::Path;
+use crate::shared::memory::Tag;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
@@ -471,7 +472,7 @@ impl<'a> DsparkDrafter<'a> {
             Ok(allocation)
         };
         let zeroed = |n: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, n.max(256))?;
+            let allocation = DeviceAllocation::new(library, n.max(256), Tag::drafter_kv("shared/dspark-state"))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -902,7 +903,7 @@ impl<'a> DsparkDrafter<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
-        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256));
+        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256), Tag::drafter_workspace("shared/dspark"));
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
@@ -926,7 +927,7 @@ impl<'a> DsparkDrafter<'a> {
             ids: alloc(rows * 4)?,
             tokens: alloc(rows * 4)?,
             confidence: alloc(rows * 4)?,
-            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, rows * 8, Tag::staging("shared/dspark-landing"))?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             attention_workspace,
@@ -1236,7 +1237,7 @@ mod tests {
                         prefetch(snapshot).join().map_err(|_| anyhow::anyhow!("prefetch panic"))?? };
                     let mut allocate = |id,name:&str,bytes| {
                         assert_eq!(id,device.id); requested.borrow_mut().push((name.to_owned(),bytes));
-                        weight_allocation(device,arena,name,bytes)
+                        weight_allocation(device,arena,name,bytes, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))
                     };
                     let cfg = DsparkConfig::read(snapshot)?;
                     let drafter = device.run(|| if cfg.window.is_some() {
@@ -1262,7 +1263,7 @@ mod tests {
                 };
                 let wanted = digest(&baseline)?;
                 for recorded in [false,true] {
-                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?)?;
+                    let arena = DeviceWeightArena::new(device,WeightArenaLayout::new("test/block",expected.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
                     let actual = if recorded {
                         let (draft,records) = dense::recording(|| run(device,&programs,&snapshot,representation,Some(&arena),&expected))?;
                         let sockets=tempfile::tempdir()?;

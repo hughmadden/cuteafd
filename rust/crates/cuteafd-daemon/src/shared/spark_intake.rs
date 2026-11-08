@@ -39,6 +39,7 @@ use crate::shared::wave_geometry::SlotGeometry;
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock};
+use crate::shared::memory::Tag;
 
 /// Most ranks a compact reduction sums.
 pub(crate) const MAX_INTAKE_RANKS: usize = 8;
@@ -191,8 +192,8 @@ pub(crate) fn device_exchange_available(library: &NativeLibrary, route: LandingR
 pub(crate) fn probe_h2d(library: &NativeLibrary) -> Result<f64> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("probe");
     const BYTES: usize = 64 << 20;
-    let host = HostAllocation::new(library, BYTES)?;
-    let device = DeviceAllocation::new(library, BYTES)?;
+    let host = HostAllocation::new(library, BYTES, Tag::staging("shared/intake-probe"))?;
+    let device = DeviceAllocation::new(library, BYTES, Tag::workspace("shared/intake-probe"))?;
     let stream = library.cuda_stream_create()?;
     let timed = (|| -> Result<f64> {
         let mut started = std::time::Instant::now();
@@ -507,7 +508,7 @@ impl<'a> SparkIntake<'a> {
         let reserve_bytes = usize::try_from(cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
             u64::try_from(logical_bytes.max(256))?)?)?;
         let planes = (0..ranks).map(|rank| {
-            let allocation = DeviceAllocation::new(library, reserve_bytes)?;
+            let allocation = DeviceAllocation::new(library, reserve_bytes, Tag::transport("shared/spark-intake"))?;
             let (offset, bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(
                 allocation.buffer.ptr as u64, u64::try_from(logical_bytes.max(256))?)?;
             let (offset, bytes) = (usize::try_from(offset)?, usize::try_from(bytes)?);
@@ -525,9 +526,9 @@ impl<'a> SparkIntake<'a> {
         }).collect::<Result<Vec<_>>>()?;
         // Host mode stages every wave; pinned mode only small ones (see `stages`).
         let staging = match mode {
-            IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes)?)),
+            IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes, Tag::staging("shared/spark-intake"))?)),
             IntakeMode::Pinned => Some(RefCell::new(HostAllocation::new(library,
-                (ranks * plane_bytes).min(SMALL_WAVE_BYTES).max(256))?)),
+                (ranks * plane_bytes).min(SMALL_WAVE_BYTES).max(256), Tag::staging("shared/spark-intake"))?)),
             IntakeMode::Gpu => None,
         };
         // Every mode has a copy stream: prefill transport workers upload there.
@@ -2151,8 +2152,8 @@ mod tests {
         for ranks in [2, 3, 4, 6] {
             let intake = SparkIntake::new(&library, IntakeMode::Pinned, ranks, 4096, 10240)?;
             let stream = WarmStream::new(&library)?;
-            let shared = DeviceAllocation::new(&library, 4096 * 10240)?;
-            let output = DeviceAllocation::new(&library, 4096 * 10240)?;
+            let shared = DeviceAllocation::new(&library, 4096 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
+            let output = DeviceAllocation::new(&library, 4096 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
             let reducer = library.v41_compact_reducer()?;
             for rows in [1, 6, 80, 81, 256, 1024, 4096, 6] {
                 intake.before_dispatch()?;

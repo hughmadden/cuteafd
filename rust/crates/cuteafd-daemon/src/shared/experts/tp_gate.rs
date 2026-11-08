@@ -201,8 +201,8 @@ fn native_tp_rank_sum() -> Result<()> {
         ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress, partial_reply_bytes: None }],
             spark_rings(config.max_frame_bytes)?, gate_executions(&catalog, 16)?)?, None)?.select(&peers)?;
     let h = geometry.hidden as usize;
-    let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
-    let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
+    let zero = DeviceAllocation::new(&library, 16 * output_row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
+    let output = DeviceAllocation::new(&library, 16 * output_row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, output_row_bytes)?;

@@ -81,10 +81,10 @@ pub(crate) struct Arenas<'a> {
 impl<'a> Arenas<'a> {
     pub fn new(target: Device<'a>, draft: Option<Device<'a>>, slots: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
-        let target = (slots > 0).then(|| Allocation::new(target, slots * BackboneMark::BYTES).map(std::rc::Rc::new))
+        let target = (slots > 0).then(|| Allocation::untagged(target, slots * BackboneMark::BYTES).map(std::rc::Rc::new))
             .transpose()?;
         let draft = match draft {
-            Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::new(device, slots * super::speculative::DRAFT_MARK_BYTES)?)),
+            Some(device) if slots > 0 => Some(std::rc::Rc::new(Allocation::untagged(device, slots * super::speculative::DRAFT_MARK_BYTES)?)),
             _ => None,
         };
         Ok(Self { target, draft, slots })
@@ -95,7 +95,7 @@ impl<'a> Arenas<'a> {
         ensure!(self.draft.is_none(), "draft mark arena already allocated");
         if self.slots > 0 {
             let _scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
-            self.draft = Some(std::rc::Rc::new(Allocation::new(draft, self.slots * super::speculative::DRAFT_MARK_BYTES)?));
+            self.draft = Some(std::rc::Rc::new(Allocation::untagged(draft, self.slots * super::speculative::DRAFT_MARK_BYTES)?));
         }
         Ok(self)
     }

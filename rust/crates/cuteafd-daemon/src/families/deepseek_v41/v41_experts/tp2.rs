@@ -71,9 +71,9 @@ mod tests {
         let mut inputs = Vec::new();
         for device in devices {
             inputs.push((
-                Allocation::new(device, capacity as usize * 5280)?,
-                Allocation::new(device, capacity as usize * 24)?,
-                Allocation::new(device, capacity as usize * 24)?,
+                Allocation::new(device, capacity as usize * 5280, cuteafd_ffi::memory_ledger::TEST)?,
+                Allocation::new(device, capacity as usize * 24, cuteafd_ffi::memory_ledger::TEST)?,
+                Allocation::new(device, capacity as usize * 24, cuteafd_ffi::memory_ledger::TEST)?,
                 Stream::new(device)?,
             ));
         }
@@ -223,8 +223,8 @@ mod tests {
         };
         let capacity = 16;
         let bytes = capacity * 5120 * 6 * 4;
-        let a = Allocation::new(d0, bytes)?;
-        let b = Allocation::new(d1, bytes)?;
+        let a = Allocation::new(d0, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+        let b = Allocation::new(d1, bytes, cuteafd_ffi::memory_ledger::TEST)?;
         let p0 = Stream::new(d0)?;
         let p1 = Stream::new(d1)?;
         let mut lane0 = OwnerReduce::new(

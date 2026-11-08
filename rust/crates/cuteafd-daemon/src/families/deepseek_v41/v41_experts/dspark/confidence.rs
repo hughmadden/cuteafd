@@ -34,9 +34,9 @@ impl<'library> DsparkWeights<'library> {
         self.tensor("mtp.2.confidence_head.proj.weight")?;
         Ok(DsparkConfidence {
             standalone: &self.standalone,
-            hidden: DeviceAllocation::new(library, capacity * 10240)?,
-            markov: DeviceAllocation::new(library, capacity * 512)?,
-            output: DeviceAllocation::new(library, capacity * 4)?,
+            hidden: DeviceAllocation::untagged(library, capacity * 10240)?,
+            markov: DeviceAllocation::untagged(library, capacity * 512)?,
+            output: DeviceAllocation::untagged(library, capacity * 4)?,
             kernel,
             weights: self,
             graph: BindingGraphs::new(library)?,

@@ -20,6 +20,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
+use crate::shared::memory::Tag;
 
 /// Exclusive to one rank's serialized stream; all capacities share one scratch arena.
 pub(crate) struct Exl3Tp2<'a> {
@@ -664,7 +665,7 @@ impl<'a> Exl3Tp2<'a> {
         })?);
         self.output = Some(Allocation::new(
             self.device,
-            output_bytes(self.geometry, self.max_rows)?,
+            output_bytes(self.geometry, self.max_rows)?, Tag::workspace("experts/rtx-exl3-output")
         )?);
         Ok(())
     }

@@ -24,7 +24,7 @@ pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::Standa
 impl<'a> Arena<'a> {
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-scratch");
-        Ok(Self(Rc::new(Allocation::new(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
+        Ok(Self(Rc::new(Allocation::untagged(device, bytes)?), Rc::new(crate::shared::memory::StandaloneStream::new(device))))
     }
 
     pub(super) fn standalone(&self) -> Rc<crate::shared::memory::StandaloneStream<'a>> {
@@ -285,7 +285,7 @@ pub(super) fn planes<'a>(device: Device<'a>, sizes: &[usize],
     arena: Option<(&Arena<'a>, usize)>) -> Result<Vec<Plane<'a>>> {
     if let Some((arena, offset)) = arena { return arena.planes(device, sizes, offset); }
     sizes.iter().map(|&bytes| {
-        let owner = Rc::new(Allocation::new(device, bytes)?);
+        let owner = Rc::new(Allocation::untagged(device, bytes)?);
         Ok(Plane { buffer: owner.buffer, _owner: owner })
     }).collect()
 }

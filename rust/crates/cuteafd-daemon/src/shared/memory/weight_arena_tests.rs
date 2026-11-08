@@ -18,15 +18,15 @@ fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()>
     let tensors = [("payload".to_string(), vec![3u8; 513]), ("scales".into(), vec![17u8; 258])];
     let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
         tensors.iter().map(|(name, data)| (name.clone(), data.len())))?;
-    let arena = DeviceWeightArena::new(device, layout)?;
+    let arena = DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
     assert_eq!(arena.layout().padding_bytes(), 255);
-    assert!(weight_allocation(Device { library: &library, id: 0 }, Some(&arena), "payload", 513).is_err());
+    assert!(weight_allocation(Device { library: &library, id: 0 }, Some(&arena), "payload", 513, cuteafd_core::memory_layout::ArenaTag::weights("test/arena")).is_err());
     assert!(arena.view("absent", 513).is_err());
     assert!(arena.view("payload", 512).is_err());
     let views = tensors.iter().map(|(name, data)| arena.view(name, data.len())).collect::<Result<Vec<_>>>()?;
     assert_eq!(views[1].buffer.ptr as usize - views[0].buffer.ptr as usize, 768);
     for ((_, data), view) in tensors.iter().zip(&views) {
-        let tensor = Allocation::new(device, data.len())?;
+        let tensor = Allocation::new(device, data.len(), cuteafd_ffi::memory_ledger::TEST)?;
         device.run(|| {
             library.copy_h2d(tensor.buffer, data)?;
             library.copy_h2d(view.buffer, data)?;
@@ -63,7 +63,7 @@ fn static_weight_receipts_share_one_backing_across_inventories() -> Result<()> {
     let device = Device { library: &library, id: 1 };
     let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
         [("first".into(), 257), ("second".into(), 2)])?;
-    let arena = DeviceWeightArena::new(device, layout)?;
+    let arena = DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
     let first = arena.view("first", 257)?;
     let second = super::super::DeviceAllocation::from_allocation(arena.view("second", 2)?);
     let devices = [1];
@@ -103,7 +103,7 @@ fn static_weight_partial_load_and_failed_drain_keep_owner_contract() -> Result<(
         let load = || -> Result<()> {
             let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/core/1",
                 [("first".into(), 257), ("second".into(), 2)])?;
-            let arena = DeviceWeightArena::new(device, layout)?;
+            let arena = DeviceWeightArena::new(device, layout, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
             let first = arena.view("first", 257)?;
             if failed_drain { library.quarantine_module_after_failed_drain(); }
             // A later tensor's rejected extent unwinds the partially loaded views.

@@ -675,7 +675,7 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-        let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+        let allocation = DeviceAllocation::untagged(library, bytes.max(256))?;
         library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
         Ok(allocation)
     };
@@ -705,7 +705,7 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
     }
     table
     };
-    let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
+    let cos_sin = DeviceAllocation::untagged(library, table.len() * 4)?;
     library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
     Ok((kv, index, cos_sin))
 }
@@ -793,7 +793,7 @@ impl<'a> GlmEngine<'a> {
         self.expert_usage = Some(cuteafd_ffi::expert_usage::ExpertUsage::new(self.library, geometry,
             &[cuteafd_ffi::expert_usage::UsageDevice { logical: 0, cuda: self.device }], reader)?);
         let _owner = cuteafd_ffi::memory_ledger::owner("glm.usage.lookup");
-        let lookup = HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES)?;
+        let lookup = HostAllocation::untagged(self.library, cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES)?;
         // SAFETY: fresh pinned owner is private; all later readers see immutable row pairs.
         unsafe { std::ptr::copy_nonoverlapping(usage_lookup().as_ptr(), lookup.buffer.ptr.cast(),
             cuteafd_loader::placement::families::glm5::USAGE_LOOKUP_BYTES / 4); }
@@ -1053,7 +1053,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        DeviceAllocation::untagged(self.library, bytes.max(256))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2354,7 +2354,7 @@ impl<'a> GlmEngine<'a> {
         let route_bytes = layout.route_bytes;
         let mut staging = w.router_host.borrow_mut();
         if staging.as_ref().is_none_or(|pinned| pinned.buffer.bytes < layout.bytes) {
-            *staging = Some(HostAllocation::new(w.x._owner.library, layout.bytes)?);
+            *staging = Some(HostAllocation::untagged(w.x._owner.library, layout.bytes)?);
         }
         let staging = staging.as_ref().context("GLM diagnostic route staging")?;
         let timer = std::time::Instant::now();
@@ -2365,7 +2365,7 @@ impl<'a> GlmEngine<'a> {
         let sample = match cuteafd_transport::route_log::input_sample() {
             Some(ordinal) => {
                 let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
-                let pinned = HostAllocation::new(self.library, rows * h * 2)?;
+                let pinned = HostAllocation::untagged(self.library, rows * h * 2)?;
                 // SAFETY: `x` holds this layer-step's `t` >= `rows` BF16 rows in stream order; the sync below completes it.
                 unsafe { self.library.copy_d2h_host_buffer_async(pinned.buffer, w.x.buffer, rows * h * 2, self.stream)?; }
                 Some((ordinal, rows, pinned))
@@ -2438,8 +2438,8 @@ impl<'a> GlmEngine<'a> {
         let Some(ordinal) = cuteafd_transport::route_log::input_sample() else { return Ok(()) };
         let h = self.cfg.hidden;
         let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
-        let pinned = HostAllocation::new(self.library, rows * h * 2)?;
-        let ids = HostAllocation::new(self.library, rows * self.cfg.topk * 8)?;
+        let pinned = HostAllocation::untagged(self.library, rows * h * 2)?;
+        let ids = HostAllocation::untagged(self.library, rows * self.cfg.topk * 8)?;
         // SAFETY: `x`, ids and weights hold this layer-step's rows in stream
         // order; the event below completes the copies (diagnostic only).
         unsafe {

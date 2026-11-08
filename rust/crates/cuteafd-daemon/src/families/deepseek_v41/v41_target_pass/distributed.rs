@@ -199,13 +199,13 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         })?;
         #[cfg(test)]
         let trace_buffers = [
-            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
-            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 40 * 16 * 40976))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::untagged(device.library, 40 * 16 * 40976))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::untagged(device.library, 40 * 16 * 40976))?,
         ];
         #[cfg(test)]
         let trace_queries = [
-            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
-            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::new(device.library, 60 * 16 * 131072))?,
+            lanes[0].device.own(|| crate::shared::memory::DeviceAllocation::untagged(device.library, 60 * 16 * 131072))?,
+            lanes[1].device.own(|| crate::shared::memory::DeviceAllocation::untagged(device.library, 60 * 16 * 131072))?,
         ];
         let chain = crate::shared::memory::chain::enabled()
             .then(|| crate::shared::memory::chain::StageChain::on_devices(lanes[0].device.library, &[0, 1]))

@@ -963,7 +963,22 @@ extern "C" cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* o
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out) {
+namespace {
+// The caller states what it allocates; an untagged request is a caller defect.
+cuteafd_status_t check_tag(uint32_t kind, const char* owner) {
+  if (kind == 0 || kind > CUTEAFD_MEMORY_KIND_COUNT) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "allocation memory kind is invalid");
+  }
+  if (owner == nullptr || owner[0] == '\0') {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "allocation owner is unnamed");
+  }
+  return CUTEAFD_STATUS_OK;
+}
+}  // namespace
+
+extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out,
+                                                    uint32_t kind, const char* owner) {
+  if (const cuteafd_status_t tagged = check_tag(kind, owner); tagged != CUTEAFD_STATUS_OK) return tagged;
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "device buffer output pointer is null");
   }
@@ -999,7 +1014,9 @@ extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_de
 }
 
 extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
-                                                           cuteafd_device_buffer_t* out) {
+                                                           cuteafd_device_buffer_t* out,
+                                                           uint32_t kind, const char* owner) {
+  if (const cuteafd_status_t tagged = check_tag(kind, owner); tagged != CUTEAFD_STATUS_OK) return tagged;
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "managed device buffer output pointer is null");
   }
@@ -1079,7 +1096,9 @@ extern "C" cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr) {
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out) {
+extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out,
+                                                  uint32_t kind, const char* owner) {
+  if (const cuteafd_status_t tagged = check_tag(kind, owner); tagged != CUTEAFD_STATUS_OK) return tagged;
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "host buffer output pointer is null");
   }

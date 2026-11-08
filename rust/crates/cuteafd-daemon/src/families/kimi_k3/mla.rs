@@ -134,7 +134,7 @@ impl CacheLayout {
         let _scope = cuteafd_ffi::memory_ledger::scope("kv/kimi MLA pages");
         let layers = self.layers.iter().map(|share| -> Result<_> {
             if share.is_none() { return Ok(None); }
-            let allocation = Rc::new(Allocation::new(device, self.layer_bytes)?);
+            let allocation = Rc::new(Allocation::untagged(device, self.layer_bytes)?);
             ensure!(allocation.buffer.bytes == self.layer_bytes && allocation.buffer.device_id == device.id,
                 "Kimi MLA cache allocation differs from admitted extent/device");
             Ok(Some(allocation))
@@ -209,7 +209,7 @@ mod tests {
         let readers = (0..2).map(|_| Rc::new(Stream { device, raw: std::ptr::null_mut() })).collect::<Vec<_>>();
         let bytes = MLA_PAGE_ROWS * MLA_RECORD_BYTES;
         let bank = CacheBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
-            layers: vec![None, Some(Rc::new(Allocation::new(device, bytes)?))],
+            layers: vec![None, Some(Rc::new(Allocation::new(device, bytes, cuteafd_ffi::memory_ledger::TEST)?))],
             layout: CacheLayout { format: MlaCacheFormat::Bf16, layers: vec![None, Some(AttentionShare::Whole)], pages: 1, rank: 0, parity: false, layer_bytes: bytes, bytes } };
         assert!(bank.layer(0).is_err());
         assert!(bank.layer(2).is_err());

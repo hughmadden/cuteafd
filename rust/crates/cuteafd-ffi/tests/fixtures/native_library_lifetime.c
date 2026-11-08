@@ -292,7 +292,11 @@ int cuteafd_fp8moe_launch_segments_core(void *ctx, void **ptrs, int rows, void *
     return reply_core(ptrs, rows, 1);
 }
 
-int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out) {
+/* Mirrors the native ABI: every allocation names a kind (1..12) and an owner. */
+static int valid_tag(uint32_t kind, const char *owner) { return kind >= 1 && kind <= 12 && owner && owner[0]; }
+
+int cuteafd_alloc_host_buffer(size_t bytes, struct host_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;
     out->bytes = bytes;
@@ -331,7 +335,8 @@ int cuteafd_cuda_dmabuf_allocation_granularity(size_t *out) {
     return 0;
 }
 
-int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out) {
+int cuteafd_alloc_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     if (extent_only) {
         out->ptr = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -367,7 +372,8 @@ int cuteafd_free_device_buffer(struct device_buffer *buffer) {
     return 0;
 }
 
-int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out) {
+int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out, uint32_t kind, const char *owner) {
+    if (!valid_tag(kind, owner)) return 1;
     // Host-resident managed pages deliberately do not reduce physical free.
     out->ptr = malloc(bytes);
     if (!out->ptr) return 1;

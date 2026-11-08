@@ -117,7 +117,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 {
             rank_mark_bytes.iter().enumerate().map(|(rank, &bytes)| {
-                engine.on(rank, || DeviceAllocation::new(engine.library, (slots * bytes).max(256)))
+                engine.on(rank, || DeviceAllocation::untagged(engine.library, (slots * bytes).max(256)))
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()

@@ -111,7 +111,7 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
     executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/muse onboarded partials");
         Ok(OnboardedExperts { epilogue: device.run(|| PartialEpilogue::load(device.library, programs, unit_rows))?,
-            own: Allocation::new(device, own)?, tables: Allocation::new(device, layout.bytes())?, layout,
+            own: Allocation::untagged(device, own)?, tables: Allocation::untagged(device, layout.bytes())?, layout,
             executor, layers: layers.clone(), written: None })
     }).collect()
 }

@@ -13,6 +13,7 @@ use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, RtxPartialDtype, RtxTp2Combine, V41Tp2ExpertReducer,
 };
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// The dtype of the FFN exchange payload under [`Combine::FusedAllReduce`].
 pub(crate) type ExchangeDtype = RtxPartialDtype;
@@ -343,8 +344,8 @@ impl<'a> OwnerReduce<'a> {
         Ok(Self {
             transfer: PeerTransfer::new(devices[1 - owner as usize], local)?,
             local_ready: Event::new(local)?,
-            staging: Allocation::new(local, staging_bytes)?,
-            output: Allocation::new(local, output_bytes)?,
+            staging: Allocation::new(local, staging_bytes, Tag::transport("experts/tp2-combine"))?,
+            output: Allocation::new(local, output_bytes, Tag::workspace("experts/tp2-combine"))?,
             reducer: local.run(|| local.library.v41_tp2_expert_reducer())?,
             capacity,
             local_rank: owner,

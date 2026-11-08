@@ -5,6 +5,7 @@ use super::memory::{HostAllocation, device::{Device, Event, Stream}};
 use cuteafd_loader::shared::token_table::{UploadCursor, UploadShape, METADATA_SM_COPY_BYTES};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 pub(crate) struct CopyPlane { pub destination: CuteafdDeviceBuffer, pub offset: usize, pub bytes: usize }
 
@@ -43,7 +44,7 @@ pub(crate) struct RetainedUploads<'a> {
 impl<'a> RetainedUploads<'a> {
     pub fn new(device: Device<'a>, shape: UploadShape) -> Result<Self> {
         let cursor = UploadCursor::new(shape)?;
-        let storage = HostAllocation::new(device.library, shape.capacity_bytes()?)?;
+        let storage = HostAllocation::new(device.library, shape.capacity_bytes()?, Tag::staging("shared/token-table-uploads"))?;
         let alias = device.library.cuda_host_buffer_device_alias(storage.buffer)?;
         let events = (0..shape.ranges).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
         Ok(Self { storage, alias, cursor, events, upload: Stream::new(device)?, previous_reader: Event::new(device)?,

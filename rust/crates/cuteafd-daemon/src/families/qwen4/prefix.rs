@@ -95,7 +95,7 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let arenas = if slots == 0 { Vec::new() } else {
             mark_layout.owners.iter().map(|&(id, bytes)| {
                 let bytes = slots.checked_mul(bytes).context("Qwen mark arena overflow")?;
-                Allocation::new(Device { library: engine.library, id }, bytes).map(Rc::new)
+                Allocation::untagged(Device { library: engine.library, id }, bytes).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         };
         let streams = engine.owner_streams();

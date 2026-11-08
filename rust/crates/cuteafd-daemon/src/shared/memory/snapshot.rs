@@ -2,6 +2,7 @@
 use super::*;
 use anyhow::{ensure, Context};
 use std::{cell::RefCell, rc::Rc};
+use crate::shared::memory::Tag;
 
 /// Stream destruction drains before the queued source/storage owners are dropped.
 pub(crate) struct SnapshotCopies<'a, T> {
@@ -39,7 +40,7 @@ impl<'a> SnapshotPool<'a> {
         ensure!(bytes > 0 && slots > 0, "empty snapshot arena");
         let stride = bytes.checked_add(255).context("snapshot stride overflow")? / 256 * 256;
         let allocation = DeviceAllocation::new(library,
-            stride.checked_mul(slots).context("snapshot arena overflow")?)?;
+            stride.checked_mul(slots).context("snapshot arena overflow")?, Tag::prefix("shared/prefix-snapshots"))?;
         Ok(Self(Rc::new(Arena { allocation, stride, free: RefCell::new((0..slots).rev().collect()) })))
     }
     pub fn device_bytes(&self) -> usize { self.0.allocation.buffer.bytes }
@@ -78,7 +79,7 @@ impl<'a> SnapshotStorage<'a> {
     pub fn new(library: &'a NativeLibrary, bytes: usize, pool: Option<&SnapshotPool<'a>>) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix/snapshot");
         if let Some(pool) = pool { return pool.take(bytes); }
-        let owned = DeviceAllocation::new(library, bytes)?;
+        let owned = DeviceAllocation::new(library, bytes, Tag::prefix("shared/prefix-snapshot"))?;
         Ok(Self { buffer: owned.buffer, _owned: Some(owned), pooled: None })
     }
 }

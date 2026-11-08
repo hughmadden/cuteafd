@@ -98,7 +98,7 @@ impl<'a> MuseSparkPath<'a> {
         let layout = CombineTables { capacity: unit };
         let tables = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse combine tables");
-            Allocation::new(stream.device, layout.bytes() * waves)?
+            Allocation::untagged(stream.device, layout.bytes() * waves)?
         };
         let mut link = stream.device.run(|| SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config,
             intake_row_bytes, waves, u32::try_from(unit)?))?;

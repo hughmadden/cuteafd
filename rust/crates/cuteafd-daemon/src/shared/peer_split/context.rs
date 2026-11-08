@@ -50,6 +50,7 @@ use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::placement::{ContextBuffers, ContextExchangeLayout, CONTEXT_EXCHANGES};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// The GPU that owns logical page `page` of any sequence.
 pub(crate) fn page_owner(page: usize) -> usize {
@@ -265,7 +266,7 @@ impl<'a> ContextExchange<'a> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 library.peer_exchange_initialize()?;
-                let allocation = DeviceAllocation::new(library, bytes)?;
+                let allocation = DeviceAllocation::new(library, bytes, Tag::transport("shared/context-exchange"))?;
                 library.cuda_zero_bytes(allocation.buffer, bytes)?;
                 Ok(allocation)
             })

@@ -92,7 +92,7 @@ impl<'a> TargetTapWave<'a> {
             && unit <= rows, "invalid target tap storage dimensions");
         Ok(Rc::new(TargetTapStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            values: DeviceAllocation::new(library, rows * 30720)?, rows, unit,
+            values: DeviceAllocation::untagged(library, rows * 30720)?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(storage: Rc<TargetTapStorage<'a>>) -> Result<Self> {
@@ -253,7 +253,7 @@ mod storage_tests {
         let mut slots = [TargetTapWave::on_storage(storage.clone())?,
             TargetTapWave::on_storage(storage.clone())?];
         let sources = (0..6).map(|seed| -> Result<DeviceAllocation<'_>> {
-            let allocation = DeviceAllocation::new(&library, rows * 40960)?;
+            let allocation = DeviceAllocation::new(&library, rows * 40960, cuteafd_ffi::memory_ledger::TEST)?;
             let host: Vec<u8> = (0..rows * 20480).flat_map(|i| {
                 let value = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((value.to_bits() >> 16) as u16).to_ne_bytes()

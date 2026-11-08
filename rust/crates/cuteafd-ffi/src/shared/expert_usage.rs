@@ -130,17 +130,20 @@ impl RawOwner {
             destroy_event: library.cuteafd_cuda_event_destroy()?,
         };
         {
-            let _owner = memory_ledger::owner(&device_owner(device.logical, "counters"));
-            raw.counters = library.alloc_device_buffer(bytes)?;
+            let owner = device_owner(device.logical, "counters");
+            let _owner = memory_ledger::owner(&owner);
+            raw.counters = library.alloc_device_buffer(bytes, memory_ledger::tag(memory_ledger::MemoryKind::Workspace, &owner))?;
             library.cuda_zero_bytes(raw.counters, bytes)?;
         }
         {
-            let _owner = memory_ledger::owner(&device_owner(device.logical, "snapshot"));
-            raw.snapshot = library.alloc_device_buffer(bytes)?;
+            let owner = device_owner(device.logical, "snapshot");
+            let _owner = memory_ledger::owner(&owner);
+            raw.snapshot = library.alloc_device_buffer(bytes, memory_ledger::tag(memory_ledger::MemoryKind::Staging, &owner))?;
         }
         {
-            let _owner = memory_ledger::owner(&device_owner(device.logical, "pinned"));
-            raw.host = library.alloc_host_buffer(bytes)?;
+            let owner = device_owner(device.logical, "pinned");
+            let _owner = memory_ledger::owner(&owner);
+            raw.host = library.alloc_host_buffer(bytes, memory_ledger::tag(memory_ledger::MemoryKind::Staging, &owner))?;
         }
         raw.stream = library.cuda_stream_create()?;
         raw.event = library.cuda_event_create_ordering()?;

@@ -2,7 +2,7 @@
 use super::{state, Context, Space, CONTEXT};
 use serde::{ser::{SerializeMap, SerializeSeq}, Serialize, Serializer};
 use std::{cell::{Cell, RefCell}, ffi::{c_char, CStr}, fs::{File, OpenOptions}, io::{self, Write}, path::{Path, PathBuf}, sync::{Arc, Mutex, OnceLock}};
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Category, MemoryKind};
 
 const LIMITS: &[&str] = &[
     "plan: unavailable: accepted-plan registration not captured in this version",
@@ -31,7 +31,7 @@ pub struct FailureReport { pub path: PathBuf, pub summary: String, pub complete:
 pub struct ArenaView { pub name: String, pub offset: usize, pub bytes: usize }
 #[derive(Debug, Serialize)]
 pub struct Arena {
-    pub id: String, pub kind: Category, pub device: i32, pub bytes: usize,
+    pub id: String, pub kind: MemoryKind, pub device: i32, pub bytes: usize,
     pub padding_bytes: usize, pub tail_bytes: Option<usize>, pub views: Vec<ArenaView>,
 }
 #[derive(Default)]
@@ -186,7 +186,7 @@ extern "C" fn event_callback(space: i32, address: usize, bytes: usize, released:
             // SAFETY: valid stack output, query does not select a device.
             unsafe { (q.get)(&mut device); }
         } }
-        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)));
+        super::record_native_alloc(space, device, address, bytes, &format!("{}:{line}", native_text(file)), None);
     });
 }
 extern "C" fn callback(trigger: *const NativeFailure) {
@@ -278,11 +278,14 @@ impl Serialize for LiveRows<'_> {
         for (address, live) in &self.0.live {
             #[derive(Serialize)]
             struct Row<'a> { address: Hex, bytes: usize, device: i32, space: &'a str, scope: &'a str,
+                kind: Option<MemoryKind>, component: Option<&'a str>,
                 category: Category, owner: Option<&'a str>, tensor: Option<&'a str>, tensor_stem: Option<&'a str>,
                 format: Option<&'a str>, site: DisplayValue<&'a std::panic::Location<'static>>, native_site: Option<&'a str> }
             seq.serialize_element(&Row { address: Hex(*address), bytes: live.bytes,
                 device: live.key.device, space: live.key.space.label(), scope: live.key.scope,
-                category: Category::of_scope(live.key.scope), owner: live.key.owner, tensor: live.name,
+                kind: live.key.tag.map(|tag| tag.kind), component: live.key.tag.map(|tag| tag.owner),
+                category: live.key.tag.map_or_else(|| Category::of_scope(live.key.scope), |tag| tag.kind.category()),
+                owner: live.key.owner, tensor: live.name,
                 tensor_stem: live.key.tensor, format: live.key.format, site: DisplayValue(live.site), native_site: live.native_site })?;
         }
         seq.end()
@@ -536,11 +539,10 @@ fn summary(stage: &str, sticky: bool) -> String {
         let observed = observe(device, sticky);
         let _ = writeln!(out, "device={device} free={} total={} tracked={tracked} residual={} status={}",
             optional(observed.free_bytes), optional(observed.total_bytes), optional(observed.total_bytes.zip(observed.free_bytes).map(|(t,f)| t as i128-f as i128-tracked as i128)), observed.status);
-        let mut categories = std::collections::BTreeMap::new();
-        for row in &snapshot.rows { if row.key.device == device {
-            *categories.entry(Category::of_scope(row.key.scope).label()).or_insert(0usize) += row.bytes;
-        } }
-        let _ = writeln!(out, "device={device} categories={categories:?}");
+        // Typed kinds; legacy untagged bytes are their own bucket until the fan-out ends.
+        let (kinds, untagged) = snapshot.by_kind(Space::Device, device);
+        let kinds = kinds.into_iter().map(|(kind, bytes)| (kind.label(), bytes)).collect::<std::collections::BTreeMap<_, _>>();
+        let _ = writeln!(out, "device={device} kinds={kinds:?} untagged={untagged}");
     }
     let data = attachments().lock().unwrap_or_else(|e| e.into_inner());
     for arena in data.arenas.values().take(20) { let _ = writeln!(out, "arena={} kind={} device={} bytes={} padding={} tail={} views={}",
@@ -606,7 +608,7 @@ mod tests {
     fn ready_summary_with_ten_arenas_is_compact_and_registrations_retire() {
         let _guard = super::super::test_guard();
         let arenas: Vec<_> = (0..10).map(|i| register_arena(Arena { id: format!("arena-{i}"),
-            kind: Category::Weights, device: 0, bytes: 512, padding_bytes: 0, tail_bytes: None,
+            kind: MemoryKind::Weights, device: 0, bytes: 512, padding_bytes: 0, tail_bytes: None,
             views: vec![ArenaView { name: "weight".into(), offset: 0, bytes: 512 }] })).collect();
         let text = compact_summary("ready");
         assert!(text.lines().count() < 60, "{text}");
@@ -617,9 +619,9 @@ mod tests {
     #[test]
     fn borrowed_trigger_strings_first_token_and_pending_arena_are_retained() {
         let _guard = super::super::test_guard(); setup(); clear_failure();
-        let pending = register_arena(Arena { id: "pending-fixture".into(), kind: Category::Weights,
+        let pending = register_arena(Arena { id: "pending-fixture".into(), kind: MemoryKind::Weights,
             device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] });
-        let live = register_arena(Arena { id: "live-fixture".into(), kind: Category::Weights,
+        let live = register_arena(Arena { id: "live-fixture".into(), kind: MemoryKind::Weights,
             device: 1, bytes: 64, padding_bytes: 0, tail_bytes: Some(0), views: vec![] });
         live.bind(0x1234);
         {
@@ -683,7 +685,7 @@ mod tests {
         let old = { let mut data = attachments().lock().unwrap(); std::mem::take(&mut data.inputs) };
         set_inputs(serde_json::Value::Object((0..35).map(|i| (format!("input-{i}"), serde_json::json!(i))).collect()));
         let mut arenas: Vec<_> = (0..25).map(|i| register_arena(Arena { id: format!("bounded-{i}"),
-            kind: Category::Weights, device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] })).collect();
+            kind: MemoryKind::Weights, device: 1, bytes: 64, padding_bytes: 0, tail_bytes: None, views: vec![] })).collect();
         let text = compact_summary("ready");
         assert_eq!(text.lines().filter(|line| line.starts_with("arena=")).count(), 20);
         assert!(text.contains("+5 more arenas (320 bytes)"));

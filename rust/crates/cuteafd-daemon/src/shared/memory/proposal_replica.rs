@@ -3,6 +3,7 @@ use super::device::{Allocation, Device};
 use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer,V41PeerCopy};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 #[derive(Clone,Copy,PartialEq,Eq)]
 pub(crate) enum ProposalFormat { WindowFp8, CompressedFp4 }
@@ -33,8 +34,8 @@ impl<'a> ProposalReplica<'a> {
             "proposal replica requires peer devices from one library");
         destination.run(||destination.library.cuda_enable_peer(source.id))?;
         let (values,scales)=format.widths();
-        Ok(Self { values:Allocation::attention_plane(destination,capacity,values,"peer proposal values")?,
-            scales:Allocation::attention_plane(destination,capacity,scales,"peer proposal scales")?,
+        Ok(Self { values:Allocation::attention_plane(destination,capacity,values,"peer proposal values", Tag::workspace("shared/proposal-replica"))?,
+            scales:Allocation::attention_plane(destination,capacity,scales,"peer proposal scales", Tag::workspace("shared/proposal-replica"))?,
             copy:destination.run(||destination.library.v41_peer_copy())?,source,format,capacity })
     }
     /// # Safety
@@ -106,8 +107,8 @@ mod tests {
             let owner=Device { library:&lib,id:gpu };let peer=Device { library:&lib,id:1-gpu };
             let replica=ProposalReplica::new(owner,peer,16,format)?;
             let (vw,sw)=format.widths();
-            let source_values=Allocation::new(owner,16*vw)?;
-            let source_scales=Allocation::new(owner,16*sw)?;
+            let source_values=Allocation::new(owner,16*vw, cuteafd_ffi::memory_ledger::TEST)?;
+            let source_scales=Allocation::new(owner,16*sw, cuteafd_ffi::memory_ledger::TEST)?;
             let producer=Stream::new(owner)?;
             let mut publication=PeerPublication::new(owner,peer)?;
             let (destination_values,destination_scales)=replica.buffers();

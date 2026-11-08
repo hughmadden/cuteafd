@@ -77,7 +77,7 @@ struct Dev<'a> {
 }
 impl<'a> Dev<'a> {
     fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
-        let owner = Rc::new(DeviceAllocation::new(library, bytes)?);
+        let owner = Rc::new(DeviceAllocation::untagged(library, bytes)?);
         Ok(Self { buffer: owner.buffer, _owner: owner })
     }
     fn view(owner: Rc<DeviceAllocation<'a>>, offset: usize, bytes: usize) -> Result<Self> {
@@ -1074,7 +1074,7 @@ impl<'a> StepPlan<'_, 'a> {
     fn slots(&self, rank: usize, rows: usize, count: usize) -> Result<Vec<Workspace<'a>>> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).arena_bytes();
-        let owner = Rc::new(DeviceAllocation::new(self.library,
+        let owner = Rc::new(DeviceAllocation::untagged(self.library,
             usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?)?);
         let temps = Rc::new(self.temporaries(rank, rows, false)?);
         let mut offset = 0;
@@ -1152,10 +1152,10 @@ impl<'a> DenseNvfp4<'a> {
             && matches!(info.weights, cuteafd_ffi::fp8_moe::Fp8MoeWeights::Nvfp4),
             "{} ({info:?}) is not the dense NVFP4 MLP package", directory.display());
         let top = info.capacity_for(rows).with_context(|| format!("dense NVFP4 package has no capacity for {rows} rows"))?;
-        let scratch = crate::shared::memory::DeviceAllocation::new(library, module.scratch_bytes(top)?.max(256))?;
-        let ids = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let scratch = crate::shared::memory::DeviceAllocation::untagged(library, module.scratch_bytes(top)?.max(256))?;
+        let ids = crate::shared::memory::DeviceAllocation::untagged(library, rows * 4)?;
         library.copy_h2d(ids.buffer, &vec![0u8; rows * 4])?;
-        let weights = crate::shared::memory::DeviceAllocation::new(library, rows * 4)?;
+        let weights = crate::shared::memory::DeviceAllocation::untagged(library, rows * 4)?;
         let ones: Vec<u8> = (0..rows).flat_map(|_| 1f32.to_le_bytes()).collect();
         library.copy_h2d(weights.buffer, &ones)?;
         Ok(Self { module, scratch, ids, weights })
@@ -2508,8 +2508,8 @@ impl<'a> GlmfEngine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
-                checks.insert((layer, lane), (rows, [self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?]));
+                checks.insert((layer, lane), (rows, [self.on(0, || HostAllocation::untagged(self.library, bytes))?,
+                    self.on(1, || HostAllocation::untagged(self.library, bytes))?]));
             }
         }
         Ok(())
@@ -2526,8 +2526,8 @@ impl<'a> GlmfEngine<'a> {
             for &layer in &tp2.layers {
                 let bytes = self.prefill_rows * self.cfg.topk * 8;
                 layers.insert(layer, RouteHosts { hosts: [
-                    self.on(0, || HostAllocation::new(self.library, bytes))?,
-                    self.on(1, || HostAllocation::new(self.library, bytes))?], collected: [false; 2] });
+                    self.on(0, || HostAllocation::untagged(self.library, bytes))?,
+                    self.on(1, || HostAllocation::untagged(self.library, bytes))?], collected: [false; 2] });
             }
             storage.push(layers);
         }
@@ -5610,8 +5610,8 @@ mod tp2_tests {
             std::fs::write(std::env::var("CUTEAFD_GLMF_FATAL_RANK_EVIDENCE")?,
                 fixture.directory().join("events").to_str().context("fixture evidence path")?)?;
             let library = fixture.load()?;
-            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-                Allocation::new(Device { library: &library, id: 1 }, 256)?];
+            let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, cuteafd_ffi::memory_ledger::TEST)?,
+                Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?];
             fixture.configure_pack(&library, 0, 1)?;
             fixture.configure_drain_after(&library, after.parse()?)?;
             let result = drain_ranks(2, |rank| Device { library: &library, id: rank as i32 }.run(|| {
@@ -5645,8 +5645,8 @@ mod tp2_tests {
         use crate::shared::memory::device::{Allocation, Device};
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
-        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256)?,
-            Allocation::new(Device { library: &library, id: 1 }, 256)?];
+        let storage = [Allocation::new(Device { library: &library, id: 0 }, 256, cuteafd_ffi::memory_ledger::TEST)?,
+            Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?];
         fixture.configure_pack(&library, 0, 0)?;
         library.cuda_set_device(1)?;
         crate::shared::decode_graph::fatal_drain(drain_ranks(2, |rank|

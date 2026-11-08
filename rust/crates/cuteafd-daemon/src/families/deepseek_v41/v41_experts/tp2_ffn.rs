@@ -82,10 +82,10 @@ impl<'a> PeerInputs<'a> {
     fn new(device: Device<'a>, capacity: u32) -> Result<Self> {
         let [values, wire, ids, routing] = Self::allocation_sizes(capacity);
         Ok(Self {
-            values: Allocation::new(device, values)?,
-            wire: Allocation::new(device, wire)?,
-            ids: Allocation::new(device, ids)?,
-            routing: Allocation::new(device, routing)?,
+            values: Allocation::untagged(device, values)?,
+            wire: Allocation::untagged(device, wire)?,
+            ids: Allocation::untagged(device, ids)?,
+            routing: Allocation::untagged(device, routing)?,
         })
     }
     fn buffers(&self) -> [CuteafdDeviceBuffer; 4] {
@@ -297,8 +297,8 @@ impl<'a> Execution<'a> {
                 modules,
             )?,
             output: [
-                Allocation::new(devices[0], reserve as usize * 10240)?,
-                Allocation::new(devices[1], reserve as usize * 10240)?,
+                Allocation::untagged(devices[0], reserve as usize * 10240)?,
+                Allocation::untagged(devices[1], reserve as usize * 10240)?,
             ],
             add: devices[0].library.bf16_add()?,
             sm: [Some(devices[0].run(|| devices[0].library.v41_peer_copy())?),
@@ -1013,7 +1013,7 @@ mod shared_storage_tests {
             let b=inputs[i].buffers();runtime.block_on(unsafe {slot.execute(0,16,b[0],b[1],b[2],b[3])})?;
         }
         let rank=storage.execution.try_lock().unwrap().routed.rank_output(0);
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len())?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), cuteafd_ffi::memory_ledger::TEST)?;
         let reader_copy=devices[1].run(||lib.v41_peer_copy())?;
         devices[1].run(||unsafe {reader_copy.launch(saved.buffer,rank,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];

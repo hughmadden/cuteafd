@@ -407,10 +407,10 @@ impl LaneLayout {
         ensure!(stream.device.id == device.id && std::ptr::eq(stream.device.library, device.library),
             "Kimi admitted lane stream differs from device");
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/kimi lane");
-        let arena = Allocation::new(device, self.arena_bytes)?;
+        let arena = Allocation::untagged(device, self.arena_bytes)?;
         let operands = self.operands.iter().filter(|(name, _)| !self.arena_offsets.contains_key(*name))
             .map(|(name, bytes)| {
-                let allocation = Allocation::new(device, *bytes)?;
+                let allocation = Allocation::untagged(device, *bytes)?;
                 ensure!(allocation.buffer.bytes == *bytes && allocation.buffer.device_id == device.id,
                     "Kimi allocated lane operand {name} differs from admitted extent/device");
                 Ok((*name, allocation))
@@ -1799,7 +1799,7 @@ impl IoLayout {
         let [ids, logits, workspace] = self.extents();
         let allocate = |bytes| -> Result<Option<Allocation<'a>>> {
             if bytes == 0 { return Ok(None); }
-            let allocation = Allocation::new(device, bytes)?;
+            let allocation = Allocation::untagged(device, bytes)?;
             ensure!(allocation.buffer.bytes == bytes && allocation.buffer.device_id == device.id,
                 "Kimi IO allocation differs from admitted extent/device");
             Ok(Some(allocation))
@@ -2398,7 +2398,7 @@ mod tests {
         layout.arena_offsets.clear();
         layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
-            Ok((name, Allocation::new(device, bytes)?))).collect::<Result<BTreeMap<_, _>>>())?;
+            Ok((name, Allocation::new(device, bytes, cuteafd_ffi::memory_ledger::TEST)?))).collect::<Result<BTreeMap<_, _>>>())?;
         let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout,
             window: None, metadata_bank: 0, core: None };
         lane.prime_attention()?;
@@ -2472,8 +2472,8 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let lane = Lane { stream: stream.clone(),
-            operands: BTreeMap::from([("delta", Allocation::new(device, 16)?)]),
-            arena: Some(Allocation::new(device, 32)?),
+            operands: BTreeMap::from([("delta", Allocation::new(device, 16, cuteafd_ffi::memory_ledger::TEST)?)]),
+            arena: Some(Allocation::new(device, 32, cuteafd_ffi::memory_ledger::TEST)?),
             layout: LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout {
                 rows: 1, unit: 1, max_context: 64, operands: BTreeMap::from([("delta", 16)]),
                 arena_offsets: BTreeMap::new(), arena_bytes: 32 }, core: None }, window: None, metadata_bank: 0, core: None };
@@ -3081,7 +3081,7 @@ mod expert_usage_tests {
         impl Fixture<'_> {
             fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
                 let bytes = words.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>();
-                let buffer = self.library.alloc_device_buffer(bytes.len())?;
+                let buffer = self.library.alloc_device_buffer(bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
                 self.buffers.push(buffer);
                 self.library.copy_h2d(buffer, &bytes)?;
                 Ok(buffer)

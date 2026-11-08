@@ -407,8 +407,8 @@ impl<'a> Engine<'a> {
         for &layer in &tp2.layers {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.n_activated_experts * 8;
-                let ranks = [Some(self.on(0, || HostAllocation::new(self.library, bytes))?),
-                    Some(self.on(1, || HostAllocation::new(self.library, bytes))?)];
+                let ranks = [Some(self.on(0, || HostAllocation::untagged(self.library, bytes))?),
+                    Some(self.on(1, || HostAllocation::untagged(self.library, bytes))?)];
                 checks.insert((layer, lane), PendingCheck { rows, ranks });
             }
         }

@@ -1,6 +1,7 @@
 //! Reusable pinned output storage with cooperative, owner-local completion.
 use super::*;
 use anyhow::ensure;
+use crate::shared::memory::Tag;
 
 pub(crate) struct RowDownload<'a> {
     stream: LoadStream<'a>,
@@ -9,7 +10,7 @@ pub(crate) struct RowDownload<'a> {
 impl<'a> RowDownload<'a> {
     pub fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
         Ok(Self { stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            staging: HostAllocation::new(library, bytes)? })
+            staging: HostAllocation::new(library, bytes, Tag::staging("shared/row-download"))? })
     }
     /// # Safety
     /// Source producers are complete. Keep source storage alive and unchanged
@@ -50,7 +51,7 @@ mod tests {
     fn native_row_downloads_preserve_selection_and_peer_storage() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let width = 129280 * 4;
-        let source = DeviceAllocation::new(&lib, 4*width)?;
+        let source = DeviceAllocation::new(&lib, 4*width, cuteafd_ffi::memory_ledger::TEST)?;
         let original: Vec<u8> = (0..4*width).map(|i| ((i*13+i/width)%251) as u8).collect();
         lib.copy_h2d(source.buffer, &original)?;
         let mut first = RowDownload::new(&lib, 4*width)?;

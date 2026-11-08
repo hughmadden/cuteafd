@@ -11,6 +11,7 @@ use cuteafd_transport::{
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN,
 };
 use std::rc::Rc;
+use crate::shared::memory::Tag;
 
 pub(crate) struct Fp8Worker<'a> {
     // Drain the stream before dropping the experts or the inputs.
@@ -98,8 +99,8 @@ impl<'a> Fp8Worker<'a> {
             copied: (0..extent.buffered_units).map(|_| crate::shared::memory::device::Event::new(device)).collect::<Result<_>>()?,
             input_offset: if self.experts.bf16_module.is_some() { self.capacity * self.experts.module.info().hidden * 2 } else { 0 },
             staged_units: 0, flushes: 0, rows, unit_rows: extent.staging_rows as usize, descriptors,
-            device: [DeviceAllocation::new(self.library, rows * 8)?, DeviceAllocation::new(self.library, rows * topk * 4)?,
-                DeviceAllocation::new(self.library, rows * topk * 4)?, DeviceAllocation::new(self.library, rows * 8)?],
+            device: [DeviceAllocation::new(self.library, rows * 8, Tag::workspace("experts/fp8-segments"))?, DeviceAllocation::new(self.library, rows * topk * 4, Tag::workspace("experts/fp8-segments"))?,
+                DeviceAllocation::new(self.library, rows * topk * 4, Tag::workspace("experts/fp8-segments"))?, DeviceAllocation::new(self.library, rows * 8, Tag::workspace("experts/fp8-segments"))?],
             staged: Vec::with_capacity(extent.buffered_units as usize) });
         Ok(())
     }
@@ -291,11 +292,11 @@ impl<'a> Fp8Worker<'a> {
                 else { hidden + hidden / 32 },
         };
         let inputs = [
-            DeviceAllocation::new(library, input_bytes)?,
-            DeviceAllocation::new(library, capacity * topk * 4)?,
-            DeviceAllocation::new(library, capacity * topk * 4)?,
+            DeviceAllocation::new(library, input_bytes, Tag::workspace("experts/fp8-inputs"))?,
+            DeviceAllocation::new(library, capacity * topk * 4, Tag::workspace("experts/fp8-inputs"))?,
+            DeviceAllocation::new(library, capacity * topk * 4, Tag::workspace("experts/fp8-inputs"))?,
         ];
-        let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
+        let output = DeviceAllocation::new(library, capacity * hidden * 2, Tag::workspace("experts/fp8-output"))?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(experts.tp)?.topology().executor_id(experts.rank)?;
         let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?
             .map(|timing| Rc::new(std::cell::RefCell::new(timing)));
@@ -574,7 +575,7 @@ mod tests {
                 } else { None };
                 let resident = {
                     let _scope = memory_ledger::scope("experts/weights");
-                    DeviceAllocation::new(&library, 512)?
+                    DeviceAllocation::new(&library, 512, cuteafd_ffi::memory_ledger::TEST)?
                 };
                 let weights = Rc::new(Fp8Weights {
                     layers: vec![super::super::Fp8Layer { layer: 3,
@@ -654,7 +655,7 @@ mod tests {
         fixture.configure_fp8_segments(&library)?;
         // SAFETY: this test built the CPU-only ABI and owns its buffers below.
         let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
-        let source_scratch = DeviceAllocation::new(&library, 1 << 20)?;
+        let source_scratch = DeviceAllocation::new(&library, 1 << 20, cuteafd_ffi::memory_ledger::TEST)?;
         let (y, positions) = module.reply_sources(source_scratch.buffer, 2, false)?;
         assert_eq!(y.bytes, 2 * geometry.topk as usize * geometry.hidden as usize * 2);
         assert_eq!(positions.bytes, 2 * geometry.topk as usize * 4);
@@ -698,12 +699,12 @@ mod tests {
                     owned.header.flags |= flag
                         | cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                     let encoded = owned.encode()?;
-                    let mut frame = HostAllocation::new(&library, encoded.len())?;
+                    let mut frame = HostAllocation::new(&library, encoded.len(), cuteafd_ffi::memory_ledger::TEST)?;
                     frame.bytes_mut().copy_from_slice(&encoded);
                     let request = BackboneRequest::parse(frame.bytes(), 4096)?;
                     let view = ExpertProtocolV2RequestView::parse(frame.bytes())?;
                     let reply = HostAllocation::new(&library,
-                        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + request.plane_bytes()?)?;
+                        EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + request.plane_bytes()?, cuteafd_ffi::memory_ledger::TEST)?;
                     let alias = library.cuda_host_buffer_device_alias(frame.buffer)?;
                     let mapped = ProtocolV2RequestDevicePayload {
                         hidden_payload: CuteafdDeviceBuffer {
@@ -821,7 +822,7 @@ mod tests {
             tp: 2, rank: 0, weight_read_bytes: 256 });
         let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
             capacity: 4096, compiled: 4096, staging_rows: 769, buffered_units: 3 };
-        let scratch = Rc::new(DeviceAllocation::new(&library, weights.owner_scratch_bytes(extent)?)?);
+        let scratch = Rc::new(DeviceAllocation::new(&library, weights.owner_scratch_bytes(extent)?, cuteafd_ffi::memory_ledger::TEST)?);
         let mut worker = Fp8Worker::with_extent(&library, weights, 4096, Some(scratch), segmented.then_some(extent))?;
         if segmented { worker.prepare_segments(extent)?; }
         worker.defer(3, if segmented { 769 } else { 4096 }, cuteafd_core::ExecutionOwner::Prefill)?;
@@ -850,9 +851,9 @@ mod tests {
                 vec![input; rows as usize * (hidden + hidden / 32)])?;
             owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             let encoded = owned.encode()?;
-            let mut frame = HostAllocation::new(&library, encoded.len())?;
+            let mut frame = HostAllocation::new(&library, encoded.len(), cuteafd_ffi::memory_ledger::TEST)?;
             frame.bytes_mut().copy_from_slice(&encoded);
-            let mut reply = HostAllocation::new(&library, prefix + rows as usize * hidden * 2 + 32)?;
+            let mut reply = HostAllocation::new(&library, prefix + rows as usize * hidden * 2 + 32, cuteafd_ffi::memory_ledger::TEST)?;
             reply.bytes_mut().fill(0xa5);
             expected.push((0..rows as usize).flat_map(|row| {
                 let value = input as u16 + ids[row * topk..(row + 1) * topk].iter()

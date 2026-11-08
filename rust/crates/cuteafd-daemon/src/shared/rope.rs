@@ -7,6 +7,7 @@ use cuteafd_ffi::{
 };
 use cuteafd_loader::plan::rope::{Recipe, Tables};
 use std::rc::Rc;
+use crate::shared::memory::Tag;
 
 pub(crate) struct Table<'a> {
     pub cos: Allocation<'a>,
@@ -28,7 +29,7 @@ impl<'a> RotaryTables<'a> {
         reservations: &[u64],
     ) -> Result<Self> {
         Self::load_with(device, programs, plan, prefix, available, reservations,
-            |_, bytes| Allocation::new(device, bytes))
+            |_, bytes| Allocation::new(device, bytes, Tag::weights("shared/rotary")))
     }
 
     pub fn arena_requests(plan: &Tables, prefix: &str) -> Result<Vec<(String, usize)>> {
@@ -152,7 +153,7 @@ mod tests {
         let requests=RotaryTables::arena_requests(&plan,"draft.")?;
         assert_eq!(requests.len(),4);
         assert_eq!(requests.iter().map(|(_,bytes)|bytes).sum::<usize>() as u64,plan.allocation_bytes);
-        let arena=DeviceWeightArena::new(device,WeightArenaLayout::new("test/rotary",requests.clone())?)?;
+        let arena=DeviceWeightArena::new(device,WeightArenaLayout::new("test/rotary",requests.clone())?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         let tables=requests.chunks_exact(2).map(|pair| -> Result<_> {
             let cos=arena.view(&pair[0].0,pair[0].1)?;
             let sin=arena.view(&pair[1].0,pair[1].1)?;
@@ -175,7 +176,7 @@ mod tests {
         let programs=library.programs()?;
         let mut called=false;
         assert!(RotaryTables::load_with(device,&programs,plan,"missing.",1<<30,&[],|_,bytes| {
-            called=true; Allocation::new(device,bytes)
+            called=true; Allocation::new(device,bytes, cuteafd_ffi::memory_ledger::TEST)
         }).is_err());
         assert!(!called);
         Ok(())

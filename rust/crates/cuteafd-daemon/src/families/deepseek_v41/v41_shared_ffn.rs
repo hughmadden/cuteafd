@@ -46,14 +46,14 @@ impl<'library> SharedFfnStorage<'library> {
         let [up, down, alpha, gate, intermediate_up, intermediate] = Self::allocation_sizes(
             up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, unit);
         let value = Self {
-            up_scratch: DeviceAllocation::new(library, up)?,
-            down_scratch: DeviceAllocation::new(library, down)?,
+            up_scratch: DeviceAllocation::untagged(library, up)?,
+            down_scratch: DeviceAllocation::untagged(library, down)?,
             up_kernel, down_kernel,
             activation: library.v41_shared_swiglu()?,
-            alpha: DeviceAllocation::new(library, alpha)?,
-            gate: DeviceAllocation::new(library, gate)?,
-            up: DeviceAllocation::new(library, intermediate_up)?,
-            intermediate: DeviceAllocation::new(library, intermediate)?,
+            alpha: DeviceAllocation::untagged(library, alpha)?,
+            gate: DeviceAllocation::untagged(library, gate)?,
+            up: DeviceAllocation::untagged(library, intermediate_up)?,
+            intermediate: DeviceAllocation::untagged(library, intermediate)?,
             capacity: unit,
         };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };

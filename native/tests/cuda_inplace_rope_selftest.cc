@@ -19,10 +19,10 @@ int main() {
       frequency[i] = std::cos(angle); frequency[i+1] = std::sin(angle);
     }
     cuteafd_device_buffer_t source{}, separate{}, inplace{}, freq{};
-    ok(cuteafd_alloc_device_buffer(bytes+2, &source));
-    ok(cuteafd_alloc_device_buffer(bytes+2, &separate));
-    ok(cuteafd_alloc_device_buffer(bytes+2, &inplace));
-    ok(cuteafd_alloc_device_buffer(frequency.size()*4, &freq));
+    ok(cuteafd_alloc_device_buffer(bytes+2, &source, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+    ok(cuteafd_alloc_device_buffer(bytes+2, &separate, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+    ok(cuteafd_alloc_device_buffer(bytes+2, &inplace, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
+    ok(cuteafd_alloc_device_buffer(frequency.size()*4, &freq, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest"));
     ok(cuteafd_copy_h2d(source, input.data(), bytes+2));
     ok(cuteafd_copy_h2d(separate, input.data(), bytes+2));
     ok(cuteafd_copy_h2d(inplace, input.data(), bytes+2));

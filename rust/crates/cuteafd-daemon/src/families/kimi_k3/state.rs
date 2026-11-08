@@ -204,7 +204,7 @@ impl KdaLayout {
         let [state, conv, replay, marks] = self.extents()?;
         let allocate = |bytes, category| -> Result<Rc<Allocation<'a>>> {
             let _scope = cuteafd_ffi::memory_ledger::scope(category);
-            let allocation = Rc::new(Allocation::new(device, bytes)?);
+            let allocation = Rc::new(Allocation::untagged(device, bytes)?);
             ensure!(allocation.buffer.device_id == device.id && allocation.buffer.bytes == bytes,
                 "Kimi KDA allocation differs from admitted device/extent");
             Ok(allocation)
@@ -523,7 +523,7 @@ mod tests {
         let reader = || Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let readers = vec![reader(), reader()];
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let allocation = || Allocation::new(device, 16).map(Rc::new);
+        let allocation = || Allocation::new(device, 16, cuteafd_ffi::memory_ledger::TEST).map(Rc::new);
         let bank = KdaBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
             state: allocation()?, conv: allocation()?, marks: Some(allocation()?),
             replay: vec![allocation()?, allocation()?], tables: vec![allocation()?, allocation()?],

@@ -382,7 +382,7 @@ impl<'a> LocalExperts<'a> {
         if layers.is_empty() && stages.is_empty() {
             return Ok(None);
         }
-        let scratch = DeviceAllocation::new(library, scratch_bytes.max(256))?;
+        let scratch = DeviceAllocation::untagged(library, scratch_bytes.max(256))?;
         for state in &mut states {
             // SAFETY: the arena is exclusively owned and sized for every variant.
             unsafe {
@@ -397,7 +397,7 @@ impl<'a> LocalExperts<'a> {
             resident_weights,
             backend: Backend::Native { ids: backbone[..layers.len()].to_vec(), layers, stages, states, reduction_plan, _scratch: scratch },
             reducer: library.v41_local_expert_reducer()?,
-            output: DeviceAllocation::new(library, max_rows * shape.hidden * 2)?,
+            output: DeviceAllocation::untagged(library, max_rows * shape.hidden * 2)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
         }))
@@ -493,7 +493,7 @@ impl<'a> LocalExperts<'a> {
             resident_weights,
             backend: Backend::Exl3 { executions, row_policy, reduction_plan, stages, layers },
             reducer: library.v41_local_expert_reducer()?,
-            output: DeviceAllocation::new(library, output_bytes)?,
+            output: DeviceAllocation::untagged(library, output_bytes)?,
             topk: shape.topk,
             device: library.cuda_get_device()?,
         }))

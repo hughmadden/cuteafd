@@ -136,7 +136,7 @@ mod tests {
     fn native_queued_draft_rings_preserve_peers_and_abort() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let mut window = DsparkWindow::new(&lib, 2, 128, usize::MAX)?;
-        let storage = DeviceAllocation::new(&lib, 3 * V41DsparkCache::SLOT_BYTES)?;
+        let storage = DeviceAllocation::new(&lib, 3 * V41DsparkCache::SLOT_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         let at = |i: usize| slice(storage.buffer, i * V41DsparkCache::SLOT_BYTES, V41DsparkCache::SLOT_BYTES);
         for end in [5u64, 128, 129, 1_000_000] {
             let first = window.begin_request(0, 1)?;
@@ -175,7 +175,7 @@ mod tests {
     fn native_draft_ring_survives_slot_reuse() -> Result<()> {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         let mut window = DsparkWindow::new(&lib, 2, 128, usize::MAX)?;
-        let storage = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES)?;
+        let storage = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
         for end in [5u64, 128, 129, 1000000] {
             let old = window.begin_request(0, 1)?;
             assert!(window.capture_ring(old, storage.buffer).is_err());

@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use cuteafd_core::packed_head::{PackStatus, PackedHeadLayout, Region, STATUS_WORDS};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, PackedHeadPlanes};
 use std::ffi::c_void;
+use crate::shared::memory::Tag;
 
 /// An `[n, k]` BF16 head in the exact 12-bit format: one allocation laid out by
 /// [`PackedHeadLayout`] (planes, bases, exception table and the pack's status).
@@ -38,7 +39,7 @@ impl<'a> PackedHead<'a> {
         -> Result<Self> {
         Self::pack_with(library, w, n, k, stream, |_, bytes| {
             crate::shared::memory::device::Allocation::new(crate::shared::memory::device::Device {
-                library, id: library.cuda_get_device()? }, bytes)
+                library, id: library.cuda_get_device()? }, bytes, Tag::weights("shared/packed-head"))
         })
     }
 
@@ -104,7 +105,7 @@ pub(crate) fn scratch<'a>(library: &'a NativeLibrary, rows: usize, shapes: &[(us
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace/packed-head");
     let bytes = shapes.iter().map(|&(k, n)| library.packed_head_workspace(rows, k, n))
         .collect::<Result<Vec<_>>>()?.into_iter().max().unwrap_or(0);
-    DeviceAllocation::new(library, bytes.max(256))
+    DeviceAllocation::new(library, bytes.max(256), Tag::workspace("shared/packed-head"))
 }
 
 #[cfg(test)]
@@ -134,11 +135,11 @@ mod tests {
         for (index, bits) in [(0, 0), (k+7, 0x7f80), (2*k+9, 0xffc1)] { values[index] = bits; }
         let reference = PackedReference::pack(&values, n, k)?;
         let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
-        let source = Allocation::new(device, bytes.len())?;
+        let source = Allocation::new(device, bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
         device.run(|| library.copy_h2d(source.buffer, &bytes))?;
         let baseline = device.run(|| PackedHead::pack(&library, source.buffer.ptr, n, k, std::ptr::null_mut()))?;
         let layout = PackedHeadLayout::new(n,k)?;
-        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?)?;
+        let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         let packed = device.run(|| PackedHead::pack_with(&library, source.buffer.ptr, n, k, std::ptr::null_mut(),
             |name, bytes| arena.view(name, bytes)))?;
         drop(arena);
@@ -176,9 +177,9 @@ mod tests {
         fixture.stage(&library)?;
         fixture.configure_pack(&library, 1, 1)?;
         let device = Device { library: &library, id: 0 };
-        let source = Allocation::new(device, 16*128*2)?;
+        let source = Allocation::new(device, 16*128*2, cuteafd_ffi::memory_ledger::TEST)?;
         let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head/quarantine",
-            [("packed12".into(), PackedHeadLayout::new(16,128)?.total_bytes())])?)?;
+            [("packed12".into(), PackedHeadLayout::new(16,128)?.total_bytes())])?, cuteafd_core::memory_layout::ArenaTag::weights("test/arena"))?;
         let packed = PackedHead::pack_with(&library, source.buffer.ptr,16,128,std::ptr::null_mut(),
             |name, bytes| arena.view(name, bytes));
         assert!(packed.is_err());

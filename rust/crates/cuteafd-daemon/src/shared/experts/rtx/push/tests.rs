@@ -926,7 +926,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         .map(|t| Rect { name: t.metadata.name.clone(), path: root.path().join(&t.shard), base: t.metadata.byte_offset,
             row_bytes: t.metadata.byte_length as usize, rows: 0..1, cols: 0..t.metadata.byte_length as usize })
         .collect::<Vec<_>>();
-    let allocations = dense.iter().map(|r| crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256)))
+    let allocations = dense.iter().map(|r| crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256), cuteafd_ffi::memory_ledger::TEST))
         .collect::<Result<Vec<_>>>()?;
     let mut records = Records::default();
     anyhow::ensure!(dense.len() == 2, "fixture has two dense tensors");
@@ -998,7 +998,7 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
     let device = Device { library: &library, id: 0 };
     let sockets = tempfile::tempdir_in(fixture.directory())?;
     // Old shape: each step stages [scale (front), weight (back)].
-    let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight))?;
+    let staged = crate::shared::memory::DeviceAllocation::new(&library, experts * (scale + weight), cuteafd_ffi::memory_ledger::TEST)?;
     let mut mixed = Records::default();
     for e in 0..experts {
         // SAFETY: expert e's complete image lies inside the retained allocation.
@@ -1019,8 +1019,8 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
         assert_eq!(&actual[base + scale..base + scale + weight], &file[weight_at(e)..weight_at(e) + weight]);
     }
     // New shape: weights-only steps, scales as operands.
-    let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale)?;
-    let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight)?;
+    let scales = crate::shared::memory::DeviceAllocation::new(&library, experts * scale, cuteafd_ffi::memory_ledger::TEST)?;
+    let weights = crate::shared::memory::DeviceAllocation::new(&library, experts * weight, cuteafd_ffi::memory_ledger::TEST)?;
     let mut split = Records::default();
     for e in 0..experts {
         // SAFETY (offsets): expert e's slices lie inside both allocations.
@@ -1114,14 +1114,14 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
         let rects: Vec<_> = pair.iter().map(|(name, path, base, bytes)| Rect { name: name.clone(), path: path.clone(),
             base: *base, row_bytes: *bytes, rows: 0..1, cols: 0..*bytes }).collect();
         let allocations = devices[gpu].run(|| rects.iter().map(|r|
-            crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256))).collect::<Result<Vec<_>>>())?;
+            crate::shared::memory::DeviceAllocation::new(&library, r.bytes().max(256), cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>())?;
         records.operands.push(Operand { device: gpu as i32, buffer: allocations[0].buffer,
             lands: vec![(rects[0].clone(), 0)], bytes: rects[0].bytes() });
         records.steps.push(Step { device: gpu as i32, rects: vec![rects[1].clone()],
             jobs: vec![Job::Upload { at: 0, bytes: rects[1].bytes(), dst: allocations[1].buffer }] });
         owned.push((rects, allocations));
     }
-    let replica = devices[0].run(|| crate::shared::memory::DeviceAllocation::new(&library, owned[1].0[0].bytes()))?;
+    let replica = devices[0].run(|| crate::shared::memory::DeviceAllocation::new(&library, owned[1].0[0].bytes(), cuteafd_ffi::memory_ledger::TEST))?;
     library.copy_h2d(replica.buffer, &vec![0xa5; replica.buffer.bytes])?;
     records.peer_copies.push(crate::shared::experts::rtx::dense::PeerCopy::new(
         owned[1].1[0].buffer, replica.buffer, replica.buffer.bytes)?);

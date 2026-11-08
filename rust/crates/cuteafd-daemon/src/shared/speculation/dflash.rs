@@ -24,6 +24,7 @@
 //! ([`TargetHead`]): its BF16 matrix, or its own launcher (GLM 5.3 Flash's
 //! FP8-only head). The target verifies every proposal. After Hugh Madden's
 //! glm53f-afd (MIT, v1.1.0 16de2a6).
+use crate::shared::memory::Tag;
 use crate::shared::fp8_linear;
 use crate::shared::memory::DeviceAllocation;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
@@ -607,7 +608,7 @@ impl<'a> Workspace<'a> {
             gate_up: owners.take("gate_up")?, act: owners.take("act")?,
             head: Some(HeadWorkspace { head, _head_workspace: head_workspace, logits: owners.take("logits")?,
             anchors: owners.take("anchors")?, ids: owners.take("ids")?, tokens: owners.take("tokens")?,
-            landing: crate::shared::memory::HostAllocation::new(library, landing_bytes)?,
+            landing: crate::shared::memory::HostAllocation::new(library, landing_bytes, Tag::staging("shared/dflash-landing"))?,
             unary: if plain { None } else { Some(owners.take("unary")?) },
             candidates: if plain { None } else { Some(owners.take("candidates")?) },
             projected: if plain { None } else { Some(owners.take("projected")?) },
@@ -1167,8 +1168,8 @@ impl<'a> DflashDrafter<'a> {
         let peer = device.own(|| Self::load_rank(library, programs, snapshot, Some(file), exchange.stream(1 - head_rank), slots,
             max_sequences, mask_row, row_window, representation, scales, fp8_rows, kv_cache, 1, 2, &mut allocate).map(Box::new))?;
         let bytes = max_sequences * lead.cfg.block * lead.cfg.hidden * 2;
-        let reduced = DeviceAllocation::new(library, bytes)?;
-        let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes))?;
+        let reduced = DeviceAllocation::new(library, bytes, Tag::drafter_workspace("shared/dflash-reduce"))?;
+        let peer_reduced = device.own(|| DeviceAllocation::new(library, bytes, Tag::transport("shared/dflash-reduce")))?;
         lead.head_split = Some(GqaHeadSplit { peer, exchange, lead: head_rank, reduced, peer_reduced });
         Ok(lead)
     }
@@ -1196,8 +1197,8 @@ impl<'a> DflashDrafter<'a> {
             None => super::weights::Load::open(library, snapshot)?,
         }.with_allocator(allocate);
         checkpoint.validate(source_cfg.tensor_shapes())?;
-        let zeroed = |id: &str| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, physical.owner_bytes(id)?)?;
+        let zeroed = |id: &str, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, physical.owner_bytes(id)?, tag)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1222,8 +1223,8 @@ impl<'a> DflashDrafter<'a> {
                     mlp_conv: weight.mlp_conv, mlp_base: weight.mlp_base },
                 attention: DraftAttention::Gqa(GqaAttention { qkv: weight.qkv,
                     q_norm: weight.q_norm, k_norm: weight.k_norm, o: weight.o,
-                    k_ring: zeroed(&format!("layer.{l}.k_ring"))?,
-                    v_ring: zeroed(&format!("layer.{l}.v_ring"))?,
+                    k_ring: zeroed(&format!("layer.{l}.k_ring"), Tag::drafter_kv("shared/dflash-rings"))?,
+                    v_ring: zeroed(&format!("layer.{l}.v_ring"), Tag::drafter_kv("shared/dflash-rings"))?,
                 }), gate_up: weight.gate_up, down: weight.down,
             })
         }).collect::<Result<Vec<_>>>()?;
@@ -1243,12 +1244,12 @@ impl<'a> DflashDrafter<'a> {
                 None => DraftHeadOps::Peer,
             },
             layers,
-            taps: zeroed("taps")?,
-            fused: zeroed("fused")?,
-            fused_norm: zeroed("fused_norm")?,
-            context_positions: zeroed("context_positions")?,
+            taps: zeroed("taps", Tag::drafter_workspace("shared/dflash-taps"))?,
+            fused: zeroed("fused", Tag::drafter_workspace("shared/dflash-context-update"))?,
+            fused_norm: zeroed("fused_norm", Tag::drafter_workspace("shared/dflash-context-update"))?,
+            context_positions: zeroed("context_positions", Tag::drafter_workspace("shared/dflash-context-update"))?,
             context: DraftContext::Gqa(GqaContext {
-                kv: zeroed("context.kv")?, slots: zeroed("context.slots")?,
+                kv: zeroed("context.kv", Tag::drafter_kv("shared/dflash-context"))?, slots: zeroed("context.slots", Tag::drafter_kv("shared/dflash-context"))?,
             }),
             mask_row,
             mask_rows: None,
@@ -2454,7 +2455,7 @@ impl<'a> DflashDrafter<'a> {
             "native vocabulary head scratch differs from layout");
         ensure!(self.library.glm_dflash_topk_workspace(drafted)?.max(256) == physical.owner_bytes("workspace.dflash.topk")?, "native DFlash selector scratch differs from layout");
         }
-        let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?);
+        let alloc = |id: &str| DeviceAllocation::new(self.library, physical.owner_bytes(&format!("workspace.{id}"))?, Tag::drafter_workspace("shared/dflash-workspace"));
         let head = if has_head {
             let head_workspace = alloc("head")?;
             // SAFETY: the retained scratch outlives this borrowed handle.
@@ -2462,7 +2463,7 @@ impl<'a> DflashDrafter<'a> {
                 rows as u32, c.vocab as u32)? };
             Some(HeadWorkspace { head, _head_workspace: head_workspace,
                 logits: alloc("logits")?, anchors: alloc("anchors")?, ids: alloc("ids")?, tokens: alloc("tokens")?,
-                landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?)?,
+                landing: crate::shared::memory::HostAllocation::new(self.library, physical.owner_bytes("workspace.landing")?, Tag::staging("shared/dflash-landing"))?,
                 unary: Some(alloc("dflash.unary")?), candidates: Some(alloc("dflash.candidates")?),
                 projected: Some(alloc("dflash.projected")?), features: Some(alloc("dflash.features")?),
                 topk_workspace: Some(alloc("dflash.topk")?),

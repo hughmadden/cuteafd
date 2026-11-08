@@ -196,7 +196,7 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         let arenas = parts.into_iter().enumerate().map(|(rank, part)| -> Result<_> {
             let arena = if slots > 0 { Some(engine.on(rank, || {
                 let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
-                Allocation::new(device, slots * part).map(Rc::new)
+                Allocation::untagged(device, slots * part).map(Rc::new)
             })?) }
                 else { None };
             Ok((part, arena))

@@ -71,7 +71,7 @@ pub(crate) struct Lane<'a> {
 impl<'a> Lane<'a> {
     pub(crate) fn allocate(device: Device<'a>, planes: &LanePlanes) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse lane planes");
-        let owner = Allocation::new(device, planes.bytes()?)?;
+        let owner = Allocation::untagged(device, planes.bytes()?)?;
         let views = LaneViews::carve(planes, owner.buffer)?;
         Ok(Self { _owner: owner, views })
     }

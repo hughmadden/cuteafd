@@ -200,8 +200,8 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
                 library: &lib, stream: chain.stream.raw,
                 peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
             let peer = pending.peers[0].as_ref().unwrap().clone();
-            let source = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
-            let destination = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
+            let source = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20, cuteafd_ffi::memory_ledger::TEST)?;
+            let destination = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20, cuteafd_ffi::memory_ledger::TEST)?;
             peer.device.run(|| {
                 // Model a partial submission: peer work exists, but no root
                 // wait on its completion was installed before an error.

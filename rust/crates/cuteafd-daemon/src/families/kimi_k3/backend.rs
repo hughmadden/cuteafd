@@ -576,9 +576,9 @@ mod tests {
         let manifest = std::path::PathBuf::from(std::env::var("CUTEAFD_PROGRAM_MANIFEST")?);
         let programs = library.programs()?.with_manifest(&manifest)?;
         let program = programs.program("kimik3_router_scores", &["x", "w", "logits"])?;
-        let input = Allocation::new(device, 96 * 7168 * 2)?;
-        let weights = Allocation::new(device, 896 * 7168 * 2)?;
-        let output = Allocation::new(device, 96 * 896 * 4)?;
+        let input = Allocation::new(device, 96 * 7168 * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let weights = Allocation::new(device, 896 * 7168 * 2, cuteafd_ffi::memory_ledger::TEST)?;
+        let output = Allocation::new(device, 96 * 896 * 4, cuteafd_ffi::memory_ledger::TEST)?;
         let stream = Stream::new(device)?;
         let mut seed = 0x517cc1b727220a95u64;
         let mut bf16 = |elements: usize| -> Vec<u8> {

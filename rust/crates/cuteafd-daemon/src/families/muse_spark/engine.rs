@@ -72,7 +72,7 @@ pub(crate) fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 impl<'a> StepStorage<'a> {
     pub(crate) fn allocate(device: Device<'a>, tables: StepTables) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse step metadata");
-        Ok(Self { owner: Allocation::new(device, tables.bytes())?, tables })
+        Ok(Self { owner: Allocation::untagged(device, tables.bytes())?, tables })
     }
 
     /// The whole planes of `bank`, by name.
@@ -149,13 +149,13 @@ impl<'a> RankResources<'a> {
                 let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(weights.shape[0],
                     cfg.vocab_size)?;
                 let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse head logits");
-                Some((Allocation::new(device, stored)?, Allocation::new(device, trimmed)?))
+                Some((Allocation::untagged(device, stored)?, Allocation::untagged(device, trimmed)?))
             }
             None => None,
         };
         let prefill_logits = if globals.head.is_some() && built.prefill_logits_bytes > 0 {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse prefill logits");
-            Some(Allocation::new(device, built.prefill_logits_bytes)?)
+            Some(Allocation::untagged(device, built.prefill_logits_bytes)?)
         } else { None };
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,

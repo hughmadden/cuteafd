@@ -75,8 +75,8 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     )?;
     let weights = MimoWeights {
         layers: vec![],
-        norm: DeviceAllocation::new(&library, 256)?,
-        head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256)?),
+        norm: DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?,
+        head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?),
         output_fp8: false,
     };
     let mut engine = ManuallyDrop::new(MimoEngine::new(

@@ -182,7 +182,7 @@ impl<'a> NativeDraft<'a> {
         let device = streams[0].device;
         let allocate = |name| -> Result<Allocation<'a>> {
             let demand = demands.iter().find(|d| d.group == name).context("Kimi draft bridge inventory missing")?;
-            Allocation::new(device, usize::try_from(demand.bytes)?)
+            Allocation::untagged(device, usize::try_from(demand.bytes)?)
         };
         let marks = usize::try_from(admission.mark_selection.slots)?;
         let window_bytes = layout.window_mark_bytes()?;
@@ -864,8 +864,8 @@ mod tests {
         fixture.immediate_copies(&library)?;
         let bridge = Bridge::Local { stream: Stream::new(device)?, terminal: Cell::new(TerminalState::Active) };
         let target = Stream::new(device)?;
-        let source = Allocation::new(device, 64)?;
-        let destination = Allocation::new(device, 32)?;
+        let source = Allocation::new(device, 64, cuteafd_ffi::memory_ledger::TEST)?;
+        let destination = Allocation::new(device, 32, cuteafd_ffi::memory_ledger::TEST)?;
         let bytes = (0u8..64).collect::<Vec<_>>();
         device.run(|| library.copy_h2d(source.buffer, &bytes))?;
         let mut producer = crate::shared::memory::device::Event::new(device)?;

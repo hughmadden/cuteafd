@@ -15,6 +15,7 @@ use std::{
     collections::BTreeMap,
     ffi::c_void,
 };
+use crate::shared::memory::Tag;
 
 /// Full submission boundary, including captured graph replays and caller-side
 /// exchanges. Shutdown must publish aborts before draining and retire the engine;
@@ -455,7 +456,7 @@ impl<'a> Pair<'a> {
         ensure!(self.active.borrow().iter().all(Option::is_none), "undrained TP2 route diagnostics");
         let storage = (0..self.lanes).map(|_| self.layers.iter().map(|&layer| {
             let hosts = (0..2).map(|rank| self.routes.on(rank, ||
-                HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::local_physical::route_check_bytes(self.max_rows, self.topk)?))).collect::<Result<Vec<_>>>()?;
+                HostAllocation::new(self.library, cuteafd_loader::placement::families::glm5::local_physical::route_check_bytes(self.max_rows, self.topk)?, Tag::staging("experts/route-checks")))).collect::<Result<Vec<_>>>()?;
             Ok((layer, hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?))
         }).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
         *checks = Some(SlotRouteChecks::new(storage, force)?);

@@ -49,7 +49,7 @@ impl<'a> BackboneRouterStorage<'a> {
         Ok(Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             buffers: Self::allocation_sizes(rows).into_iter()
-                .map(|n| DeviceAllocation::new(library, n)).collect::<Result<_>>()?,
+                .map(|n| DeviceAllocation::untagged(library, n)).collect::<Result<_>>()?,
             rows, unit,
         }))
     }
@@ -149,9 +149,9 @@ impl<'a> BackboneRouterWeights<'a> {
             // Decode/verification benefits from batching small DMA transfers.
             // Large prefill retains direct downloads to avoid another host copy.
             // Route ids (24 B per row); also the non-deferred mask staging.
-            request_staging: HostAllocation::new(self.library, capacity as usize * 24)?,
-            mask_staging: HostAllocation::new(self.library, capacity as usize)?,
-            route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24)?),
+            request_staging: HostAllocation::untagged(self.library, capacity as usize * 24)?,
+            mask_staging: HostAllocation::untagged(self.library, capacity as usize)?,
+            route_ring: Some(HostAllocation::untagged(self.library, 40 * capacity as usize * 24)?),
             ring_capture: false,
             ring_pending: Vec::with_capacity(40),
             weights: self,
@@ -1055,7 +1055,7 @@ mod host_order_tests {
         fixture.immediate_copies(&library)?;
         fixture.trace_stream_queries(&library)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let storage = DeviceAllocation::new(&library, 4)?;
+        let storage = DeviceAllocation::new(&library, 4, cuteafd_ffi::memory_ledger::TEST)?;
         let pass = StageChain::new(&library)?;
         pass.set_device_order(false);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -1222,7 +1222,7 @@ mod shared_storage_tests {
                 let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((f.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, hidden.len())?;
+            let source = DeviceAllocation::new(&lib, hidden.len(), cuteafd_ffi::memory_ledger::TEST)?;
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |wave: &BackboneRouterWave<'_, '_>| -> Result<Vec<Vec<u8>>> {

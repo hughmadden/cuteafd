@@ -24,7 +24,7 @@ impl<'a> Arena<'a> {
     }
     fn alloc(&mut self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         self.library.cuda_set_device(self.device)?;
-        let buffer = self.library.alloc_device_buffer(bytes)?;
+        let buffer = self.library.alloc_device_buffer(bytes, cuteafd_ffi::memory_ledger::TEST)?;
         self.buffers.push(buffer);
         Ok(buffer)
     }

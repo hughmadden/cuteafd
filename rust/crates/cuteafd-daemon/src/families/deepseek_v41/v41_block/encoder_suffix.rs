@@ -51,8 +51,8 @@ impl<'a> EncoderSuffix<'a> {
     }
     /// A startup arena of `rows` suffix rows, at rest (no prompt bound).
     fn arena(library: &'a NativeLibrary, rows: usize) -> Result<Self> {
-        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960)?),
-            pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16)?), tokens: Vec::new(),
+        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::untagged(library, rows * 40960)?),
+            pre: std::rc::Rc::new(DeviceAllocation::untagged(library, rows * 16)?), tokens: Vec::new(),
             next: 0, end: 0, binding: QueryBinding::new(19)?, invalid: true, packed: None })
     }
     /// One serially reused arena, charged before KV pool admission.
@@ -250,8 +250,8 @@ mod tests {
             eprintln!("skip GPU suffix test: CUTEAFD_ENCODER_SUFFIX_LIBRARY unset"); return Ok(());
         };
         let lib = unsafe { NativeLibrary::load(path)? };
-        let residual = DeviceAllocation::new(&lib, 80 * 40960)?;
-        let pre = DeviceAllocation::new(&lib, 80 * 16)?;
+        let residual = DeviceAllocation::new(&lib, 80 * 40960, cuteafd_ffi::memory_ledger::TEST)?;
+        let pre = DeviceAllocation::new(&lib, 80 * 16, cuteafd_ffi::memory_ledger::TEST)?;
         for end in [1, 127, 128, 129, 257, 2049] {
             let mut suffix = EncoderSuffix::new(&lib, end, EncoderSuffix::device_bytes(end)?)?;
             assert!(suffix.output().is_err());

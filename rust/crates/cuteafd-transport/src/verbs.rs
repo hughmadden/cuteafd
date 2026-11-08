@@ -910,7 +910,7 @@ impl VerbsHostProtocolV2PinnedResponseFrame {
     fn new(library: Arc<NativeLibrary>, len: usize, audit_owner: &str) -> Result<Self> {
         let _owner = cuteafd_ffi::memory_ledger::owner(audit_owner);
         let buffer = library
-            .alloc_host_buffer(len)
+            .alloc_host_buffer(len, cuteafd_ffi::memory_ledger::tag(cuteafd_ffi::memory_ledger::MemoryKind::Transport, audit_owner))
             .context("allocating pinned verbs-host response frame")?;
         Ok(Self {
             library,
@@ -1205,7 +1205,7 @@ fn transport_census_observes_native_pinned_recycle_queue_without_consuming_it() 
 fn transport_census_resolves_only_worker_attributed_recycle_frames() {
     use cuteafd_ffi::memory_ledger::{AllocationRecord, Key, Space};
     let record = |address, bytes, owner| AllocationRecord { address, bytes, endpoint: None,
-        key: Key { space: Space::Pinned, device: -1, scope: "fixture", owner: Some(owner), tensor: None, format: None } };
+        key: Key { space: Space::Pinned, device: -1, tag: None, scope: "fixture", owner: Some(owner), tensor: None, format: None } };
     let visible = TransportHostAllocation { owner: "visible".into(), address: 0x1000, bytes: 512,
         flags: CUTEAFD_HOST_BUFFER_FLAG_PINNED, mapped: None, audit_owner: Some("worker.a".into()) };
     let mut census = TransportAllocationCensus { host: vec![visible.clone()], unclassified: Vec::new(),
@@ -4291,7 +4291,8 @@ impl VerbsHostMappedRdmaRing {
             let alignment = self.endpoint.library.dmabuf_allocation_granularity()?;
             let bytes = self.layout.registered_span_bytes.checked_next_multiple_of(alignment)
                 .context("device SEND ring alignment overflow")?;
-            let mut raw = self.endpoint.library.alloc_device_buffer(bytes)?;
+            let mut raw = self.endpoint.library.alloc_device_buffer(bytes,
+                cuteafd_ffi::memory_ledger::Tag::new(cuteafd_ffi::memory_ledger::MemoryKind::Transport, "transport/rdma-device-send-ring"))?;
             let view = raw;
             tracing::info!(allocation_bytes = bytes, allocation_granularity = alignment,
                 "allocated whole device SEND ring");
