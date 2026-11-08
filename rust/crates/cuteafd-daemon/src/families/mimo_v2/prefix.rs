@@ -36,6 +36,7 @@
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS, RING_ROWS};
 use super::mtp::HIDDEN_ROWS;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
 use cuteafd_ffi::CuteafdDeviceBuffer;
@@ -156,14 +157,15 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             debug_assert_eq!((offsets[0] - draft_offset) as u64,
                 cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
                     drafter.cfg.layers as u64, drafter.cfg.kv_heads as u64, drafter.cfg.head_dim as u64, drafter.kv_cache)?);
-            Some(Rc::new(Allocation::untagged(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id }, engine.rings * 8)?))
+            Some(Rc::new(Allocation::new(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id },
+                engine.rings * 8, Tag::drafter_workspace("mimo/prefix-draft-floors"))?))
         } else { None };
         let mark_bytes: usize = offsets.iter().sum();
         let slots = slots(mark_bytes);
         let arenas = if slots > 0 && mark_bytes > 0 {
             offsets.iter().enumerate().map(|(rank, &bytes)| {
                 let device = Device { library: engine.library, id: engine.kv_layer_on(rank, 0).1.device_id };
-                Allocation::untagged(device, (slots * bytes).max(256)).map(Rc::new)
+                Allocation::new(device, (slots * bytes).max(256), Tag::prefix("mimo/prefix-marks")).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         } else {
             Vec::new()
@@ -217,7 +219,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
     pub(super) fn terminal_fixture(engine: &'e MimoEngine<'a>) -> Result<Self> {
         let arenas = (0..engine.ranks()).map(|rank| engine.on(rank, || {
             let device = Device { library: engine.library, id: engine.library.cuda_get_device()? };
-            Allocation::untagged(device, 4096).map(Rc::new)
+            Allocation::new(device, 4096, crate::shared::memory::TEST).map(Rc::new)
         })).collect::<Result<Vec<_>>>()?;
         Ok(Self { engine, full: Vec::new(), states: Vec::new(),
             rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),

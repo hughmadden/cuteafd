@@ -35,7 +35,7 @@ use crate::shared::experts::rtx::{ExpertInput as RtxInput, FusedCombine,
     ExchangeDtype, RouteCheck, RouteIdentity, RouteSource, Routes, RtxExpertLayer};
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::{DeviceAllocation, HostAllocation};
+use crate::shared::memory::{DeviceAllocation, HostAllocation, Tag};
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
 use crate::shared::spark_intake::SparkLink;
@@ -908,7 +908,7 @@ impl<'a> MimoEngine<'a> {
             RING_ROWS - DECODE_ROWS);
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-            let allocation = Rc::new(Allocation::untagged(Device { library, id: device }, bytes.max(256))?);
+            let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256), Tag::kv("mimo/kv-records"))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -928,7 +928,7 @@ impl<'a> MimoEngine<'a> {
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             drafter: None, mtp: None, l2: None, embedding,
-            mtp_staging: RefCell::new((HostAllocation::untagged(library, 1 << 20)?, 0)), prefill_w8a8: true,
+            mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20, Tag::staging("mimo/mtp-staging"))?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
             graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
@@ -1128,7 +1128,7 @@ impl<'a> MimoEngine<'a> {
             exchange
         };
         let zeroed = |bytes: usize| -> Result<Rc<Allocation<'a>>> {
-            let allocation = Rc::new(Allocation::untagged(Device { library, id: device }, bytes.max(256))?);
+            let allocation = Rc::new(Allocation::new(Device { library, id: device }, bytes.max(256), Tag::kv("mimo/kv-records"))?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1327,8 +1327,8 @@ impl<'a> MimoEngine<'a> {
             hidden: self.cfg.hidden, vocab: self.cfg.vocab_size }
     }
 
-    fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        { let owner = Rc::new(DeviceAllocation::untagged(self.library, bytes.max(256))?);
+    fn alloc(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        { let owner = Rc::new(DeviceAllocation::new(self.library, bytes.max(256), tag)?);
           Ok(Dev { buffer: owner.buffer, _owner: owner }) }
     }
 
@@ -1383,7 +1383,7 @@ impl<'a> MimoEngine<'a> {
             return Ok(Rc::clone(arena));
         }
         let _owner = cuteafd_ffi::memory_ledger::owner(&format!("mimo/owner-{rank}/state.prefill_kv_wide"));
-        let arena = Rc::new(self.alloc(bytes)?);
+        let arena = Rc::new(self.alloc(bytes, Tag::workspace("mimo/prefill-kv-wide"))?);
         *owned = Some(Rc::clone(&arena));
         Ok(arena)
     }
@@ -1412,7 +1412,7 @@ impl<'a> MimoEngine<'a> {
         let prefix = format!("mimo/owner-{rank}/{shape}");
         let alloc = |name: &str, bytes: u64| -> Result<Dev<'a>> {
             let _owner = cuteafd_ffi::memory_ledger::owner(&format!("{prefix}.{name}"));
-            self.alloc(size(bytes)?)
+            self.alloc(size(bytes)?, Tag::workspace("mimo/step-workspace"))
         };
         let head_workspace = alloc("head_workspace", layout.head_workspace)?;
         let identity: Vec<i64> = (0..if decode { 1 } else { self.prefill_waves() }).flat_map(|_| 0..t as i64).collect();

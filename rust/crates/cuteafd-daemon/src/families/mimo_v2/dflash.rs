@@ -20,7 +20,7 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 use crate::shared::peer_split::{PeerExchange, DIRECT};
 use std::rc::Rc;
 use crate::shared::experts::rtx::dense::{DenseLoad, Operand, Rect};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use crate::shared::token_io::TokenEmbedding;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{VocabularyHead, VOCABULARY_HEAD_WORKSPACE};
@@ -627,8 +627,8 @@ impl<'a> MimoDrafter<'a> {
             None => Load::open_file(library, &dir.join(WEIGHTS))?,
         }.with_allocator(&mut allocate);
         checkpoint.validate(tensor_shapes(&source_cfg))?;
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::untagged(library, bytes.max(256))?;
+        let zeroed = |bytes: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, bytes.max(256), tag)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -658,14 +658,15 @@ impl<'a> MimoDrafter<'a> {
                 gate_up: sharded(&[(&format!("{p}.mlp.gate_proj.weight"), source_cfg.intermediate),
                     (&format!("{p}.mlp.up_proj.weight"), source_cfg.intermediate)], h, ShardAxis::Rows)?,
                 down: sharded(&[(&format!("{p}.mlp.down_proj.weight"), h)], source_cfg.intermediate, ShardAxis::Columns)?,
-                k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
-                v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim), Tag::drafter_kv("mimo/dflash-rings"))?,
+                v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim), Tag::drafter_kv("mimo/dflash-rings"))?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
         tracing::info!(?representation, own_weight_bytes = weight_layout.resident_bytes()?,
             max_load_staging = weight_layout.max_load_staging, slots, max_sequences,
             "DFlash immutable weight storage");
+        let scratch = |bytes: usize| zeroed(bytes, Tag::drafter_workspace("mimo/dflash-workspace"));
         Ok(Self {
             kv_cache,
             library, projections,
@@ -677,12 +678,12 @@ impl<'a> MimoDrafter<'a> {
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
             layers,
-            taps: zeroed(TAP_ROWS * taps * 2)?,
-            fused: zeroed(TAP_ROWS * h * 2)?,
-            fused_norm: zeroed(TAP_ROWS * h * 2)?,
-            context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
-            context_positions: zeroed(TAP_ROWS * 8)?,
-            context_slots: zeroed(TAP_ROWS * 4)?,
+            taps: scratch(TAP_ROWS * taps * 2)?,
+            fused: scratch(TAP_ROWS * h * 2)?,
+            fused_norm: scratch(TAP_ROWS * h * 2)?,
+            context_kv: scratch(TAP_ROWS * 2 * kv * 2)?,
+            context_positions: scratch(TAP_ROWS * 8)?,
+            context_slots: scratch(TAP_ROWS * 4)?,
             mask_device: {
                 let owner = DeviceAllocation::from_allocation(arena.view("mask_embedding", mask_row.len().max(256))?);
                 DenseLoad::mount(library).operand(Operand { device: owner.buffer.device_id,
@@ -876,7 +877,7 @@ impl<'a> MimoDrafter<'a> {
         let c = &self.cfg;
         let rows = sequences * c.block;
         let drafted = sequences * c.drafts();
-        let alloc = |bytes: usize| DeviceAllocation::untagged(self.library, bytes.max(256));
+        let alloc = |bytes: usize| DeviceAllocation::new(self.library, bytes.max(256), Tag::drafter_workspace("mimo/dflash-workspace"));
         Ok(Workspace {
             sequences,
             h: alloc(rows * c.hidden * 2)?,
@@ -901,7 +902,8 @@ impl<'a> MimoDrafter<'a> {
                     logits: alloc(rows * c.vocab * 4)?,
                     unary: alloc(drafted * 16 * 4)?,
                     candidates: alloc(drafted * 16 * 4)?,
-                    landing: crate::shared::memory::HostAllocation::untagged(self.library, 2 * drafted * 16 * 4)?,
+                    landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4,
+                        Tag::staging("mimo/dflash-landing"))?,
                     topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
                     // SAFETY: the workspace outlives this head's plan and uses the lead device.
                     head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,

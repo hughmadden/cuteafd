@@ -160,8 +160,8 @@ impl<'a> MimoEngine<'a> {
             for (lane, &rows) in rows.iter().enumerate() {
                 let bytes = rows * self.cfg.topk * 8;
                 checks.insert((layer, lane), PendingRouteCheck { rows, ranks: [
-                    self.on(0, || HostAllocation::untagged(self.library, bytes))?,
-                    self.on(1, || HostAllocation::untagged(self.library, bytes))?] });
+                    self.on(0, || HostAllocation::new(self.library, bytes, crate::shared::memory::Tag::staging("mimo/tp2-route-checks")))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes, crate::shared::memory::Tag::staging("mimo/tp2-route-checks")))?] });
             }
         }
         Ok(())
