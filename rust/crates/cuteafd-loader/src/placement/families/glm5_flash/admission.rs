@@ -986,7 +986,6 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         }
     }
     contract.components.extend(p::serving::blas_components("sm_120", &blas, maximum, contract.phase_order)?);
-    contract.add_driver_page_tables();
     let request = p::Request { context: i.context,
         pool: PoolPolicy::normalize_request(i.requested_pool).map_or(p::Pin::Auto, p::Pin::Exact),
         onboard: i.onboard.layers(routed.len()).map_or(p::Pin::Auto, |n| p::Pin::Exact(n as u64)),

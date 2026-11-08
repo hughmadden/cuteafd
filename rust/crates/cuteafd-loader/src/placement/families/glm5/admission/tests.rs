@@ -1818,7 +1818,8 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     request.pool = Pin::Auto;
     request.onboard = Pin::Exact(0);
     request.prefill = Pin::Exact(recipe.prefill[0]);
-    let contract = recipe.prepare(&request).unwrap();
+    let mut contract = recipe.prepare(&request).unwrap();
+    contract.add_driver_page_tables();
     let selected = [0, 0, 0, 0, 0, 0, 0];
     let wanted = context + 128 * 64;
     let facts = contract.facts(&selected, wanted / 64).unwrap();

@@ -129,6 +129,33 @@ pub struct BytePiece {
     pub last: u64,
     pub bytes_at_first: u64,
     pub bytes_per_page: u64,
+    /// Round the whole affine request independently, not its per-page slope.
+    pub granularity: u64,
+}
+impl BytePiece {
+    pub(super) fn raw_at(&self, pages: u64) -> Result<u64, Refusal> {
+        self.bytes_per_page.checked_mul(pages - self.first)
+            .and_then(|n| self.bytes_at_first.checked_add(n))
+            .ok_or(Refusal::Overflow("component curve"))
+    }
+    pub(super) fn at(&self, pages: u64) -> Result<u64, Refusal> {
+        if self.granularity == 0 {
+            return Err(Refusal::InvalidFact("zero curve granularity".into()));
+        }
+        self.raw_at(pages)?.div_ceil(self.granularity).checked_mul(self.granularity)
+            .ok_or(Refusal::Overflow("rounded component curve"))
+    }
+    /// ceil(raw / G) * G <= available iff raw <= floor(available / G) * G.
+    pub(super) fn last_affordable(&self, available: u64) -> Result<Option<u64>, Refusal> {
+        if self.granularity == 0 {
+            return Err(Refusal::InvalidFact("zero curve granularity".into()));
+        }
+        let ceiling = available / self.granularity * self.granularity;
+        Ok(if ceiling < self.bytes_at_first { None }
+            else if self.bytes_per_page == 0 { Some(self.last) }
+            else { Some(self.last.min(self.first.saturating_add(
+                (ceiling - self.bytes_at_first) / self.bytes_per_page))) })
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ByteCurve(pub Vec<BytePiece>);
@@ -142,15 +169,11 @@ impl ByteCurve {
             last: maximum,
             bytes_at_first,
             bytes_per_page,
+            granularity: 1,
         }])
     }
     pub fn at(&self, pages: u64) -> Result<u64, Refusal> {
-        let piece = self.piece(pages)?;
-        piece
-            .bytes_per_page
-            .checked_mul(pages - piece.first)
-            .and_then(|n| piece.bytes_at_first.checked_add(n))
-            .ok_or(Refusal::Overflow("component curve"))
+        self.piece(pages)?.at(pages)
     }
     pub(super) fn piece(&self, pages: u64) -> Result<&BytePiece, Refusal> {
         self.0
@@ -166,7 +189,7 @@ impl ByteCurve {
                     "component curve has a gap, overlap or invalid interval".into(),
                 ));
             }
-            self.at(piece.last)?;
+            piece.at(piece.last)?;
             next = piece
                 .last
                 .checked_add(1)

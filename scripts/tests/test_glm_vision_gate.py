@@ -181,7 +181,10 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES" not in graphs
     admission = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash/admission.rs").read_text()
     assert 'p::serving::blas_components("sm_120"' in admission
-    assert 'contract.add_driver_page_tables()' in admission
+    search = (ROOT / "rust/crates/cuteafd-loader/src/placement/planner/search.rs").read_text()
+    solve = search.split("pub fn solve(", 1)[1]
+    assert solve.index("recipe.prepare(&request)?") < solve.index("contract.add_driver_page_tables()")
+    assert solve.index("contract.add_driver_page_tables()") < solve.index("apply_reserve_override(")
     assert "kda.in[24896|12576,4096]" in source
     module = (root / "glm5_flash/mod.rs").read_text()
     opening = module.split("pub fn with_engine", 1)[1]

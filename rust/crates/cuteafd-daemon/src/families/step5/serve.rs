@@ -304,9 +304,11 @@ fn with_backend<T>(args: &ServeArgs,
     let measured = RuntimeInventory::measure(&library, &ids, InventoryPhase::PreWeight, |id| {
         programs.load_matching(|name| selected.contains(name)
             || native_selection.resolved.programs.iter().any(|selected| selected == name))?;
+        // Spark intake loads every registered native module even on TP1. Load
+        // before sampling, so admission sees its exact occupancy (#1554).
+        library.tp2_native_initialize()?;
         if let Some(other) = ids.iter().copied().find(|&other| other != id) {
             library.cuda_enable_peer(other)?;
-            library.tp2_native_initialize()?;
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
             if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1") {
@@ -334,17 +336,12 @@ fn with_backend<T>(args: &ServeArgs,
         onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
             Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
             args.rtx_expert_layers.resolve(catalog.routed_experts().routed_layers()))? };
-    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs {
-        memory: cuteafd_loader::formats::mapped_preload::host_memory()?,
-        cache_bytes: match args.prefix.host_cache_bytes {
+    inputs.host = cuteafd_loader::plan::families::step5::admission::HostInputs::from_contract(
+        &contract, &cfg, ids.len(), cuteafd_loader::formats::mapped_preload::host_memory()?,
+        match args.prefix.host_cache_bytes {
             crate::shared::prefix::budget::HostBudget::Auto => None,
             crate::shared::prefix::budget::HostBudget::Bytes(bytes) => Some(bytes),
-        },
-        headroom: args.prefix.host_cache_headroom_bytes,
-        retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
-        attention_mount_load: contract.attention_mount_load(ids.len())?,
-        push: Some(cuteafd_loader::plan::families::step5::admission::push_host_envelope(&contract, &cfg, ids.len())?),
-    };
+        }, args.prefix.host_cache_headroom_bytes)?;
     tracing::info!(elapsed_s = startup.elapsed().as_secs_f64(), "Step-5 startup inventory complete");
     let planning = std::time::Instant::now();
     // One admission: the contract prices every retained owner, and native ABIs
@@ -397,6 +394,7 @@ fn with_backend<T>(args: &ServeArgs,
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
     } else { None };
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/pre-weight", Default::default())?;
     let caches = devices.iter().enumerate().map(|(rank, &device)| Ok(RefCell::new(CacheRank::new(device,
         admission.cache.clone(), rank, inputs.sequences as u64, admission.marks as u64,
         admission.placement.pool_tokens / 64, admission.reservations[rank].total)?)))
@@ -407,6 +405,7 @@ fn with_backend<T>(args: &ServeArgs,
             Staging::bytes_for_sequences(&admission.cache, rank, inputs.sequences)?, inputs.sequences, inputs.unit_rows())
     }).collect::<Result<Vec<_>>>()?;
     let target_input = Inputs::allocate(devices[0], inputs.rows, Inputs::bytes(inputs.rows)?)?;
+    crate::shared::inventory::startup_probe(&library, &ids, "step5/cache-staging-inputs", Default::default())?;
     let tensor = checkpoint.tensors.iter().find(|t| t.meta.name == "model.embed_tokens.weight")
         .context("Step-5 embedding header missing")?;
     let source = EmbedSource::new(&args.snapshot, &tensor.shard, &tensor.meta, cfg.hidden)?;
@@ -429,9 +428,11 @@ fn with_backend<T>(args: &ServeArgs,
     let load = || TokenEmbedding::load_with(&library, source.clone(), EmbedPlacement::Gpu, || -> Result<_> {
         let native = Execution::load_native_with_plan(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
             inputs.unit_rows(), inputs.rows, inputs.logit_rows(), &available, &reserves, 92, &native_plan, Some(&weight_arenas))?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/target-native-loaded", Default::default())?;
         let mtp = predictor_budget.map(|(available, reserved)| native.load_predictor(
             &programs, &checkpoint, &caches[head_rank].borrow(), stages[head_rank].stream.clone(),
             usize::from(args.mtp), inputs.unit_rows(), available, &[reserved])).transpose()?;
+        crate::shared::inventory::startup_probe(&library, &ids, "step5/mtp-loaded", Default::default())?;
         Ok((native, mtp))
     }, |name, bytes| crate::shared::memory::weight_arena::weight_allocation(devices[entry], Some(&weight_arenas[entry]), name, bytes, ArenaTag::weights("step5/target")));
     let planned = policy.plan(|| -> Result<_> {
@@ -518,6 +519,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(embedding.allocation_receipts(coordinator, "step5.embedding")?);
+        census.normalize(admission.solved.facts.phase_order)?;
         crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded",
             crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
     }
@@ -634,6 +636,7 @@ mod tests {
     #[test]
     fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("census.normalize(admission.solved.facts.phase_order)?"));
         assert!(source.contains("args.attention.selected_view = Some(view)"));
         assert!(source.contains("Checkpoint::coordinator_view(&view"));
         assert!(source.contains("read_expert_catalog_view(&view)"));
@@ -644,6 +647,17 @@ mod tests {
         assert!(!source.contains("read_expert_catalog(&args.snapshot"));
         assert!(!source.contains("CoordinatorPush::prepare_alone_admitted("));
         assert!(!source.contains("CoordinatorPush::prepare_admitted("));
+    }
+
+    #[test]
+    fn all_native_modules_load_inside_measured_baseline_even_for_tp1() {
+        let source = include_str!("serve.rs");
+        let measured = source.split("let measured = RuntimeInventory::measure").nth(1).unwrap()
+            .split("let mut selected_programs").next().unwrap();
+        let native = measured.find("library.tp2_native_initialize()?").unwrap();
+        let peer = measured.find("if let Some(other)").unwrap();
+        assert!(native < peer, "Spark intake native modules must be sampled on TP1 too");
+        assert_eq!(measured.matches("library.tp2_native_initialize()?").count(), 1);
     }
 
     #[test]

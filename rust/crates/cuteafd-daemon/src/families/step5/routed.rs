@@ -405,7 +405,7 @@ impl<'a> RoutedFfn<'a> {
                 scratch_out = Some(match native_scratch {
                     Some(scratch) => scratch,
                     None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?, crate::shared::memory::Tag::workspace("step5/native-projection"))?),
+                        &core.scratch_layout(plan.admission.rows)?.context("native shared scratch")?, crate::shared::memory::Tag::workspace("step5/shared-projection"))?),
                 });
                 let mut take = |name: &str| -> Result<super::native::NativeLinear<'a>> {
                     std::rc::Rc::try_unwrap(core.linears.remove(name).context("native shared operand")?)

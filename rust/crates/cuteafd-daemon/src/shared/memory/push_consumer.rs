@@ -74,7 +74,7 @@ impl RankEvents for PushRank {
     }
 }
 
-const COPY_STREAMS: usize = 4;
+use cuteafd_loader::push_load::COPY_STREAMS;
 
 struct Copies<'a> {
     device: Device<'a>,

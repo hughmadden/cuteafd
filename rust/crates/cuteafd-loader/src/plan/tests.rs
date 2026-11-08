@@ -82,11 +82,11 @@ fn solved_phase_ledger_preserves_chronology_and_renders_each_physical_peak() {
     assert_eq!(solved.phases.len(), 18);
     assert_eq!(solved.phases[1].phase, Phase::DraftLoad);
     assert!(report.memory_layout.is_none(), "startup peaks never become Ready items");
-    assert_eq!(solved.items(Location::coordinator(0)).unwrap().iter().map(|item| item.bytes).sum::<u64>(), 120);
+    assert_eq!(solved.items(Location::coordinator(0)).unwrap().iter().map(|item| item.bytes).sum::<u64>(), 120 + planner::driver_page_table_bytes(200));
     let text = render(&report);
     for expected in [
-        "memory peak gpu.0 [coordinator GPU 0 device]: checkpoint loading; 720 bytes (owned 700, opaque 20); available 2000 bytes",
-        "memory peak gpu.1 [coordinator GPU 1 device]: decode warm-up; 260 bytes (owned 250, opaque 10); available 2000 bytes",
+        "memory peak gpu.0 [coordinator GPU 0 device]: checkpoint loading; 722 bytes (owned 700, opaque 22); available 2000 bytes",
+        "memory peak gpu.1 [coordinator GPU 1 device]: decode warm-up; 261 bytes (owned 250, opaque 11); available 2000 bytes",
         "memory peak host [host RAM ordinary + host RAM pinned]: checkpoint loading; 1600 bytes (owned 600, opaque 1000); available 3904 bytes",
         "baseline 16 bytes (calibrated: maintained baseline); headroom 32 bytes",
         "baseline 16 bytes (sampled: preload sample); headroom 32 bytes",
@@ -4743,7 +4743,8 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
         b + crate::placement::planner::allocation_granularity_forecast(&[b]).unwrap()
     };
     assert_eq!(gpu.devices[0].used_bytes() - off.devices[0].used_bytes(),
-        charged(&gpu_target.ranks[0]) - charged(&host_target.ranks[0]));
+        charged(&gpu_target.ranks[0]) - charged(&host_target.ranks[0])
+            - crate::placement::planner::driver_page_table_bytes(embedding));
     options.layout.as_mut().unwrap().force_gpu_embedding = false;
     options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30];
     let pro = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
@@ -4765,7 +4766,13 @@ fn layout_charges_admitted_probe_outputs_before_sizing_kv() {
     let output = diagnostic.devices[0].items.iter().find(|i| i.group == "probe prefill logits").unwrap();
     assert_eq!(output.category, cuteafd_core::memory_layout::Category::Workspace);
     assert!(output.bytes > 0);
-    assert_eq!(ordinary.devices[0].free_bytes() - diagnostic.devices[0].free_bytes(), output.bytes as i64);
+    let cfg = crate::families::qwen4::Qwen4Config::read(dir.path()).unwrap();
+    let landing = |full| crate::placement::families::qwen4::host::pinned_logits_bytes(
+        1, full, 128, cfg.vocab_size as u64).unwrap();
+    let mappings = crate::placement::planner::driver_page_table_bytes(landing(true))
+        - crate::placement::planner::driver_page_table_bytes(landing(false));
+    assert_eq!(ordinary.devices[0].free_bytes() - diagnostic.devices[0].free_bytes(),
+        (output.bytes + mappings) as i64);
     assert!(diagnostic.devices.iter().skip(1).all(|d| d.items.iter().all(|i| i.group != "probe prefill logits")));
 }
 

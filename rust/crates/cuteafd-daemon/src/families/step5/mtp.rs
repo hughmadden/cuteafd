@@ -73,7 +73,7 @@ impl InputPlan {
             programs.spec("step5_mtp_eh")?, rows)?;
         let native_bytes = match &native {
             Some(name) => (layout.core[name].bytes as u64).checked_add(
-                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.bytes()? as u64)
+                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.packed_bytes()? as u64)
                 .context("Step-5 native eh overflow")?,
             None => 0,
         };
@@ -222,8 +222,9 @@ impl Coordinates {
     }
 }
 
-/// Predictor weights and cache identity are private; sequential scratch aliases
-/// the target and all predictors on the admitted main stream.
+/// Predictor weights and cache identity are private. Per-step scratch, including
+/// compact K/V producers, reuses the target's Workspace sequential-scratch arena
+/// on the admitted main stream, after retained outputs have been copied out.
 pub(super) struct StageOwner<'a> {
     stream: Rc<Stream<'a>>,
     input: InputOwner<'a>,

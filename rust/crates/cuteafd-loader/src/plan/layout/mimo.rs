@@ -696,10 +696,37 @@ mod tests {
                             assert_eq!(waste[0].bytes, replica);
                             assert_eq!(waste[0].device, "rtx1");
                         }
+                        use crate::placement::families::mimo_v2::admission as production;
+                        use crate::placement::planner::{Baseline, EmbeddingHome, Operation, PrefillShape};
+                        let prefill = PrefillShape { rows: 4096, waves: lanes as u64 };
+                        let (experts, expert_workspace, tp2_workspace, onboard) =
+                            expert_costs(&input, &cfg, &opts, ranks, 4, 4096).unwrap();
+                        let probe = spark_intake_probe_bytes(true,
+                            std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref()).unwrap();
+                        let budgets = production::production_budgets(&vec![(95 * GIB, 95 * GIB); ranks],
+                            &(0..ranks).map(|rank| production::device_headroom(rank, probe)).collect::<Vec<_>>(),
+                            vec![Baseline::Forecast { occupied: 0, source: "empty fixture devices".into(), assumed: false }; ranks],
+                            opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
+                        let runtime = production::ProductionInput {
+                            expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
+                            mtp_stages: 0, context: 32768, maximum_pool_tokens: 32768, prefill,
+                            lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,
+                            experts, expert_workspace, tp2_workspace, spark: admitted.clone(),
+                            no_spark: profile(checkpoint, &opts, ranks, 0, 4096, 4, 32768, None).unwrap(),
+                            post_kv_additional: vec![vec![]; ranks],
+                            draft_packing: offline_draft_packing(checkpoint, &opts).unwrap(),
+                            host: offline_host(checkpoint, &opts, &cfg, ranks, 4096, 4, 32768, 0).unwrap(),
+                            spark_reply_formats: opts.spark_reply_formats,
+                            resident_weights: admitted.resident_weights.clone(), operation: Operation::Serving, budgets,
+                        }.prepare().unwrap().admit(production::production_request(
+                            crate::placement::planner::Context::resolve(32768, None), opts.pool_tokens, onboard,
+                            prefill, Operation::Serving, crate::placement::ResidentWeights(opts.weight_budget_bytes),
+                            opts.spark_reply_formats)).unwrap();
+                        assert_eq!(runtime.placement.pool_tokens, placement.pool_tokens);
                         for rank in 0..ranks {
-                            let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
-                                + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes
-                                + crate::placement::families::mimo_v2::admission::POST_READY_RUNTIME_BYTES;
+                            assert_eq!(devices[rank].items, runtime.placement.items[rank],
+                                "all physical owners, pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
+                            let total = runtime.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
                             assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
                             assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
                                 "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
@@ -1046,7 +1073,11 @@ mod tests {
         assert_eq!(*occupied, 575 << 20);
         let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
             && row.phase == crate::placement::planner::Phase::Ready).unwrap();
-        let runtime = ready.opaque - tails;
+        let mappings = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+            .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
+            .map(|item| item.bytes).sum::<u64>();
+        assert!(mappings > 0);
+        let runtime = ready.opaque - tails - mappings;
         assert_eq!(runtime, 570 << 20);
         let measured_baseline = 1_179_189_248u64 - 576_716_800;
         let measured_owned = 97_985_769_216u64;

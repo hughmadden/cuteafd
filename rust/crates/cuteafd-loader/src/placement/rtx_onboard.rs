@@ -53,6 +53,14 @@ pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&s
     tp: usize, family: &str) -> Result<u64> {
     ensure!([1, 2].contains(&tp), "RTX experts need TP1 or TP2");
     ensure!((1..=4096).contains(&rows), "RTX expert capacity must be 1..=4096 rows");
+    expert_workspace_requests(catalog, manifest, rows, tp, family)?.into_iter()
+        .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).context("RTX workspace sum overflow")
+}
+
+/// Physical CUDA requests, excluding expert weights and family exchange planes.
+pub fn expert_workspace_requests(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
+    tp: usize, family: &str) -> Result<Vec<u64>> {
+    ensure!([1, 2].contains(&tp) && (1..=4096).contains(&rows), "RTX workspace geometry");
     if catalog.exl3().is_some() { exl3_workspace(catalog, manifest, rows, tp) }
     else { fp8_workspace(catalog, manifest, rows, tp, family) }
 }
@@ -60,7 +68,7 @@ pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&s
 /// `fp8-<family>[-format]/tp<tp>` scratch (and a BF16-input sibling's, when
 /// installed) plus the TP2 BF16 partial plane.
 fn fp8_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
-    tp: usize, family: &str) -> Result<u64> {
+    tp: usize, family: &str) -> Result<Vec<u64>> {
     let shape = catalog.routed_experts();
     let fp8 = catalog.fp8().context("fp8moe expert catalog missing")?;
     let name = fp8.format().package_name(family);
@@ -82,13 +90,15 @@ fn fp8_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pat
         inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)
             .with_context(|| format!("missing BF16-input {name} scratch"))?
     } else { 0 };
-    Ok(scratch.max(sibling) + if tp == 2 { rows * shape.hidden as u64 * 2 } else { 0 })
+    let mut requests = vec![scratch.max(sibling)];
+    if tp == 2 { requests.push(rows * shape.hidden as u64 * 2); }
+    Ok(requests)
 }
 
 /// The installed `exl3-<family>-k<tiers>/rtx-tp<tp>` arena at `rows`, plus the
 /// routed output (F32 for both whole and TP2 execution).
 fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
-    tp: usize) -> Result<u64> {
+    tp: usize) -> Result<Vec<u64>> {
     let exl3 = catalog.exl3().context("EXL3 onboarding needs EXL3 expert headers")?;
     let shape = catalog.routed_experts();
     let geometry = shape.geometry()?;
@@ -110,6 +120,8 @@ fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pa
             && value["experts"].as_u64() == Some(shape.experts as u64), "{stem} package geometry mismatch");
         Ok(value)
     }).collect::<Result<Vec<_>>>()?;
-    Ok(crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
-        + crate::serving_capacity::exl3_rtx_output_bytes(rows, shape.hidden as u64)?)
+    let mut requests = crate::serving_capacity::Exl3WorkspaceLayout::from_manifests(
+        &manifests, true, Exl3Epilogue::Sum)?.owners.into_iter().map(|owner| owner.bytes).collect::<Vec<_>>();
+    requests.push(crate::serving_capacity::exl3_rtx_output_bytes(rows, shape.hidden as u64)?);
+    Ok(requests)
 }

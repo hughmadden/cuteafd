@@ -18,6 +18,9 @@ pub use nest_push::{client::{JoinArgs, Poll, Conn, Listener}, plan, proto, slot}
 pub mod builder;
 pub mod native;
 
+/// Concurrent H2D streams per push destination; admission shares this count.
+pub const COPY_STREAMS: usize = 4;
+
 /// Header-bound dense receive, boundary windows and transform scratch. Source
 /// reads are windowed, so a large selected tensor never charges its full size.
 pub fn admitted_push_envelope(largest_selected_dense_bytes: u64, slots: usize, slot_bytes: u64)

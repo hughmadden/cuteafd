@@ -19,6 +19,8 @@ impl BufferOwner for Plane<'_> {
     fn buffer(&self) -> CuteafdDeviceBuffer { self.buffer }
 }
 
+/// One Workspace backing: target and MTP per-step scratch reuse it in stream
+/// order, after live outputs have been copied to retained cache/history storage.
 #[derive(Clone)]
 pub(super) struct Arena<'a>(Rc<Allocation<'a>>, Rc<crate::shared::memory::StandaloneStream<'a>>);
 impl<'a> Arena<'a> {
@@ -67,8 +69,14 @@ impl<'a> CompactKv<'a> {
     pub(super) fn new(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
         rows: usize, heads: &[usize], sizes: [usize; 2], arena: Option<(&Arena<'a>, usize)>,
         tag: Tag) -> Result<Self> {
+        Self::with_planes(device, programs, rows, heads, planes(device, &sizes, arena, tag)?)
+    }
+
+    pub(super) fn with_planes(device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        rows: usize, heads: &[usize], planes: Vec<Plane<'a>>) -> Result<Self> {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
-        ensure!(rows > 0 && !heads.is_empty(), "Step-5 compact producer capacity");
+        ensure!(rows > 0 && !heads.is_empty() && planes.len() == 2, "Step-5 compact producer capacity");
+        let sizes = planes.iter().map(|plane| plane.buffer.bytes).collect::<Vec<_>>();
         let writers = heads.iter().copied().map(|heads| {
             ensure!(matches!(heads, 32 | 64), "Step-5 compact producer heads");
             let groups = heads / 16;
@@ -84,7 +92,7 @@ impl<'a> CompactKv<'a> {
                 "{name}: compact producer ABI/geometry/capacity");
             Ok((heads, device.run(|| programs.program(name, &["x", "out"]))?))
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { planes: planes(device, &sizes, arena, tag)?, writers, device, rows })
+        Ok(Self { planes, writers, device, rows })
     }
 
     pub(super) fn enqueue(&self, stream: &Stream<'a>, sources: [CuteafdDeviceBuffer; 2],
