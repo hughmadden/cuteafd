@@ -48,8 +48,6 @@ if lock.exists():
     import json as _json
     revision = _json.loads(lock.read_text())["revision"]
     (args.output_dir / "manifest.json").write_text(_json.dumps({"sparkinfer_revision": revision}))
-    if args.mode == "pinned-object":
-        (args.output_dir / "kernel.o").write_text(str(value) + revision)
 if args.mode == "foreign":
     open("/etc/hostname").read() if os.path.exists("/etc/hostname") else None
     open(os.environ["FOREIGN"]).read()
@@ -178,20 +176,15 @@ def bump_pin(source, revision):
         {"revision": revision * 40, "source_tree_sha256": "c" * 64}))
 
 
-def test_a_pin_bump_reuses_the_export_and_renames_the_pin_in_its_manifests(tree):
+def test_a_pin_bump_never_reuses_a_whole_command(tree):
+    # Exporters derive content from the pin (the audio export hashes its manifest,
+    # revision included, into a compiled header), so whole-command outputs never
+    # cross a bump; only individual programs do (export_b12x_dsv4_aot.py).
     source, build = tree
     run(tree)
     bump_pin(source, "d")
-    assert run(tree)[0] == "hit"
+    assert run(tree)[0] == "miss"
     assert json.loads((build / "out/manifest.json").read_text()) == {"sparkinfer_revision": "d" * 40}
-
-
-def test_a_pin_named_outside_json_is_never_reused_across_a_bump(tree):
-    source, build = tree
-    run(tree, mode="pinned-object")
-    bump_pin(source, "e")
-    assert run(tree, mode="pinned-object")[0] == "miss"
-    assert (build / "out/kernel.o").read_text().endswith("e" * 40)
 
 
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):
