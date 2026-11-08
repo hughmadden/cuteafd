@@ -1097,6 +1097,11 @@ const CENSUS_NATIVE: &str = "f5b8d1e1371ae31c97164f08a6da5de293241ef0a4c1c89beee
 const CENSUS_TOOLCHAIN: &str = "rustc 1.98.1 (48a229cea 2026-09-01); binary: rustc; commit-hash: 48a229ceaefd4985c50990b14116b6d856af0985; commit-date: 2026-09-01; host: x86_64-unknown-linux-gnu; release: 1.98.1; LLVM version: 22.1.8";
 const MIN_LAYOUT: &str = "glm53-exl3-k4/47af23347db743b4666d952e2eb48f2b01c3fede; dflash/425aa615ce320caac34400208b30808c8f14f76c/fp8; heads/1; sparks/4; onboard/0; context/1048576; compiled/1048576; pool/1257856; C16; prefill/2752x3; lanes/1; embedding/device; selector/device; replies/bf16,bf16; l2/auto; host-prefix/34359738368; instrumentation/census";
 const MAX_LAYOUT: &str = "glm53-exl3-k4/47af23347db743b4666d952e2eb48f2b01c3fede; dflash/425aa615ce320caac34400208b30808c8f14f76c/fp8; context/2; sparks/6; onboard/3..9/tp2; context/1048576; compiled/1048576; pool/2097152; C16; prefill/2752x3; lanes/1; embedding/device; selector/device; replies/bf16,bf16; l2/auto; host-prefix/34359738368; instrumentation/census";
+
+/// The HQA min layout declares the same startup key set as its EXL3 sibling
+/// (`MIN_GRAPHS`), so the row is keyed by that fingerprint; this string records
+/// the checkpoint and attention placement that actually produced the bytes.
+const HQA_MIN_LAYOUT: &str = "glm53-hqa-k4-core-k6/354226e187c9f6c318a633aeee3a1bb327ae11f7/heads/1; sparks/4; onboard/0; context/1048576; compiled/1048576; C16; prefill/2752x3; lanes/1; instrumentation/census";
 const MIN_GRAPHS: &str = "2bae8417cb9862ba77083453922d96de79b52db8de16a9ddebbd821d476afaf6";
 const MAX_GRAPHS: [&str; 2] = [
     "b3acfa6e5d560b9f0440af62250a9f3b32424f9186deeb769f1a1ed0d5311543",
@@ -1165,10 +1170,10 @@ struct MeasuredGraphSet {
 /// identify the set. Every row records both the cuteafd commit and the
 /// SparkInfer revision of the build that measured it.
 const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
-    MeasuredGraphSet { keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_560_622_592, layout: MIN_LAYOUT,
-        census: "glm53-exl3-min-census-r1 device 0: 16827 capture instantiate records",
-        commit: "4a56925e7986a57e3194c0cca6df256838386519",
-        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
+    MeasuredGraphSet { keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_984_247_296, layout: HQA_MIN_LAYOUT,
+        census: "glm53-hqa-min-glm5-r1 device 0: 16827 capture instantiate records; free 8245936128->5261688832",
+        commit: "a5aa27a3f8968b6c25821f6baf6a10559b4ef5a6",
+        sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
     MeasuredGraphSet { keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
         census: "glm53-exl3-max-census-r1 device 0: 16827 capture instantiate records",
         commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
@@ -1261,6 +1266,14 @@ fn graph_row(fingerprint: &str, keys: usize) -> Option<GraphRow> {
         // `reconcile_startup_graphs` before Ready. Charge the largest measured
         // row for the same declared count (or 2 MiB per executable when there is
         // none), never a proportional scale, and say so loudly.
+        //
+        // The pool is sized from this placeholder, so a census of a fingerprint
+        // whose live capture exceeds it only reconciles if the growth phase has
+        // slack. With `KV_TARGET_TOKENS == KV_MAX_TOKENS` the pool fills the
+        // budget and there is none: reconcile then refuses (`during post-ready
+        // growth`) instead of shrinking the pool. A census run therefore either
+        // carries a measured row for its fingerprint or leaves the pool target
+        // below the maximum.
         if std::env::var("CUTEAFD_GRAPH_CENSUS").is_ok_and(|value| value == "1") {
             let bytes = MEASURED_GLM_GRAPHS.iter().filter(|row| row.keys == keys)
                 .map(|row| row.bytes).max()

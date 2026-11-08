@@ -1295,7 +1295,7 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_refuse_other_layouts(
     assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
     assert_eq!(max.declared()[0].fingerprint(0).unwrap(), MAX_GRAPHS[0]);
     assert_eq!(max.declared()[1].fingerprint(1).unwrap(), MAX_GRAPHS[1]);
-    assert_eq!(min.ranks()[0].bytes, 2_560_622_592);
+    assert_eq!(min.ranks()[0].bytes, 2_984_247_296);
     assert_eq!(max.ranks().iter().map(|rank| rank.bytes).collect::<Vec<_>>(),
         [3_042_967_552, 2_971_664_384]);
     for (rank, graph) in min.ranks().iter().enumerate() {
