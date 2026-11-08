@@ -220,6 +220,7 @@ impl ProjectionLayout {
         Ok(Demand::new(device,Category::Workspace,name,self.bytes()? as u64,Basis::Exact))
     }
     pub(crate) fn allocate<'a>(&self,device:Device<'a>)->Result<ProjectionScratch<'a>> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/native-projection");
         let storage=ProjectionScratchLayout {
             extents:self.extents.clone(),rows:self.rows }.storage()?;
         let mut owners=BTreeMap::new();

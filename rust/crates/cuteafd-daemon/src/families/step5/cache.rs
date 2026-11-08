@@ -52,10 +52,19 @@ impl<'a> CacheRank<'a> {
         let stream = Stream::new(device)?;
         // Allocate all storage before enqueueing initialization: failed allocation
         // cannot release an earlier plane still being initialized asynchronously.
-        let active = Allocation::new(device, reservation.active)?;
-        let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
+        let active = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("kv/step5-active");
+            Allocation::new(device, reservation.active)?
+        };
+        let marks = if reservation.marks > 0 {
+            let _scope = cuteafd_ffi::memory_ledger::scope("prefix/step5-marks");
+            Some(Rc::new(Allocation::new(device, reservation.marks)?))
+        } else { None };
         let page_count = pages;
-        let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
+        let pages = if reservation.pages > 0 {
+            let _scope = cuteafd_ffi::memory_ledger::scope("kv/step5-pages");
+            Some(Rc::new(Allocation::new(device, reservation.pages)?))
+        } else { None };
         let predictor_evidence = (0..sequences).map(|_|
             (0..layout.ranks[rank].mtp_lengths.len()).map(|_| Cell::new(0)).collect()).collect();
         let landed = RefCell::new(Event::new(device)?);

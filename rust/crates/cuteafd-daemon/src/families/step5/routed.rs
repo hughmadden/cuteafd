@@ -431,7 +431,7 @@ impl<'a> RoutedFfn<'a> {
 
     fn workspace(device: Device<'a>, admission: Admission,
         immutable: std::rc::Rc<RoutedWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/step5-routed");
         let spans = cuteafd_loader::plan::families::step5::native::routed_layout(admission.rows,
             admission.span, admission.full)?;
         let planes = scratch::region_planes(device, &spans, arena)?;
