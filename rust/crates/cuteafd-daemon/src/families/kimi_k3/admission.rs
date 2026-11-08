@@ -18,8 +18,6 @@ const SINGLE: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: &[WHOLE]
     hops: false, attention: AttentionPlacement::Layers };
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
 use cuteafd_loader::placement::families::kimi::ARENA_PADDING_GROUP as ARENA_PADDING;
-#[cfg(test)]
-use cuteafd_loader::placement::families::kimi::arena_padding_owner as padding_owner;
 
 fn reconcile_arena(rank: usize, layout: &cuteafd_loader::serving_capacity::WeightArenaLayout,
     items: &[cuteafd_core::memory_layout::Item]) -> Result<()> {
@@ -1127,6 +1125,7 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use cuteafd_loader::placement::families::kimi::arena_padding_owner as padding_owner;
 
     fn arena_item(group: &str, bytes: u64) -> cuteafd_core::memory_layout::Item {
         cuteafd_core::memory_layout::Item { category: Category::Weights, group: group.into(),
