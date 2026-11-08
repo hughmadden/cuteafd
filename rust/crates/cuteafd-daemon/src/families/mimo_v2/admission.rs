@@ -1202,11 +1202,18 @@ mod tests {
             let compact = MimoDraftCapacity { kv_cache: Qwen4KvCache::Fp8, ..capacity };
             let fp8 = draft_reservations_with(&cfg, &headers, mode, compact, |_| Ok(2048)).unwrap();
             assert_eq!(bf16.steady.len(), fp8.steady.len());
-            for (a, b) in bf16.steady.iter().zip(&fp8.steady) {
+            for (index, (a, b)) in bf16.steady.iter().zip(&fp8.steady).enumerate() {
                 assert_eq!(a.name, b.name);
                 if a.name.ends_with("_ring") {
                     assert_eq!(a.bytes, 20 * 1024 * 128 * 2);
                     assert_eq!(b.bytes, 20 * 1024 * 144);
+                } else if a.name == "draft.backing.tail" {
+                    // The slack follows the ring widths, so only its shape is shared.
+                    for (reservations, bytes) in [(&bf16, a.bytes), (&fp8, b.bytes)] {
+                        assert_eq!(bytes,
+                            cuteafd_loader::placement::planner::independent_backing_slack(
+                                reservations.steady[..index].iter().map(|cost| cost.bytes)).unwrap());
+                    }
                 } else {
                     assert_eq!(a.bytes, b.bytes, "{}", a.name);
                 }
