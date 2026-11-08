@@ -3,7 +3,7 @@
 
 Run through scripts/build/cuteafd-dev.sh cpu, with --output and --staging on
 NVMe. Publication never switches current; validate the candidate with
-CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/PROGRAMS.json before promoting it.
+CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/share/PROGRAMS.json before promoting it.
 """
 from __future__ import annotations
 
@@ -31,6 +31,15 @@ def load(name, path):
 
 compare = load("placement_compare", ROOT / "scripts/build/compare-sm-exports.py")
 kernel_records = load("placement_kernel_records", ROOT / "scripts/build/kernel-records.py")
+
+# Installed names match build-{wip,release}-artifacts.sh. These are allocation
+# inputs to the native planner, not optional release-only executable artifacts.
+V41_MANIFESTS = {
+    "v41-fp8": ("v41_fp8.json", "V41_FP8_AOT.json"),
+    "v41-experts": ("v41_experts.json", "V41_EXPERT_AOT.json"),
+    **{f"v41-{role}": ("v41_experts.json", f"V41_EXPERT_WORKSPACES/mxfp4_{role}.json")
+       for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2")},
+}
 
 
 def live_configs(root=ROOT):
@@ -81,6 +90,15 @@ def export_jobs():
             jobs.append((f"fp8/fp8-{family}{suffix}", "package_fp8_moe_aot.py", [
                 "--geometry", geometry, "--capacities", compare.EXL3_CAPACITIES,
                 "--layouts", "tp1,tp2", "--role", "coordinator"]))
+    jobs.extend([
+        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", compare.V41_PROJECTION_CAPACITIES]),
+        ("v41-experts", "export_b12x_v41_experts_aot.py",
+         ["--role", "coordinator", "--input-format", "bf16", "--rows", compare.V41_DRAFT_CAPACITIES]),
+    ])
+    for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
+        jobs.append((f"v41-{role}", "export_b12x_slices_aot.py", [
+            "--role", role, "--rows", compare.V41_DRAFT_CAPACITIES if role == "dspark_tp2" else compare.V41_CAPACITIES,
+            "--width", "192", "--standard-names"]))
     return jobs
 
 
@@ -165,7 +183,8 @@ def check_job_sm170(job, staging, previous, timeout, env, verify_all=False):
         return {"sm170_seconds": 0, "sm170_programs": 0}
     records = json.loads(records_path.read_text())
     current = publication_records(staging, [job])
-    old = publication_records(previous / ".workers", [job]) if previous else {}
+    prior_records = json.loads((previous / "INPUTS.json").read_text())["program_records"] if previous else {}
+    old = {path: record for path, record in prior_records.items() if path.startswith(name + "/")}
     report = kernel_records.change_report(old, current)
     selected = {entry["program"].removeprefix(name + "/")
                 for category in ("added", "changed") for entry in report[category]}
@@ -268,10 +287,17 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
            or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
            or summary.get("cuda_initialized") is not False for summary in summaries):
         raise ValueError("placement worker provenance mismatch or initialized CUDA")
-    shutil.copy2(staging / "programs/dsv4_programs.json", destination / "PROGRAMS.json")
+    share = destination / "share"
+    share.mkdir()
+    shutil.copy2(staging / "programs/dsv4_programs.json", share / "PROGRAMS.json")
     for name, exporter, _ in jobs[1:]:
-        target = destination / name
-        if exporter == "package_exl3_aot.py":
+        target = destination / ("lib" if name.startswith("fp8/") else "share") / name
+        if name in V41_MANIFESTS:
+            source, installed = V41_MANIFESTS[name]
+            target = share / installed
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staging / name / source, target)
+        elif exporter == "package_exl3_aot.py":
             for source in (staging / name).rglob("v41_exl3.json"):
                 copied = target / source.relative_to(staging / name)
                 copied.parent.mkdir(parents=True, exist_ok=True)
@@ -279,16 +305,20 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
         else:
             # These capacities are the production compiler's exact scratch
             # query, including the maximum across each capacity's prefill forms.
-            records = json.loads((staging / name / "routed.json").read_text())["programs"]
+            routed = json.loads((staging / name / "routed.json").read_text())
+            records = routed["programs"]
             layouts = {}
+            geometry = routed["layouts"]
             for record in records:
                 capacities = layouts.setdefault(record["layout"], {})
                 rows = record["capacity"]
                 capacities[rows] = max(capacities.get(rows, 0), record["scratch_bytes"])
-            manifest = {"layouts": {layout: {"capacities": [
+            manifest = {"layouts": {layout: {**geometry[layout], "capacities": [
                 {"capacity": rows, "scratch_bytes": scratch} for rows, scratch in sorted(capacities.items())]}
                 for layout, capacities in layouts.items()}}
             target.mkdir(parents=True)
+            for layout in layouts:
+                (target / layout).mkdir()
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     # Preserve only the exact metadata needed to replay a job, not heavy objects.
     for name, _, _ in jobs:
@@ -300,7 +330,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             shutil.copy2(source, target)
     records = publication_records(staging, jobs)
     if records:
-        programs_path = destination / "PROGRAMS.json"
+        programs_path = share / "PROGRAMS.json"
         programs = json.loads(programs_path.read_text())
         programs["kernel_records"] = records
         programs_path.write_text(json.dumps(programs, indent=2) + "\n")
@@ -336,7 +366,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
 
 def rsync_publication(destination, hosts, timeout=7200):
     resolved = Path(destination).expanduser().resolve()
-    for required in ("INPUTS.json", "PROGRAMS.json"):
+    for required in ("INPUTS.json", "share/PROGRAMS.json"):
         if not (resolved / required).is_file():
             raise ValueError(f"missing published placement input {resolved / required}")
     cleaned = [host.strip() for host in hosts if host and host.strip()]
@@ -373,11 +403,21 @@ def publication_records(staging, jobs):
                     record["planner_metadata"] = {key: value for key, value in program.items()
                                                   if key not in ("object_sha256", "card_plans")}
                     record["planner_metadata"]["plan"] = plan
+        elif name in V41_MANIFESTS:
+            manifest = json.loads((directory / V41_MANIFESTS[name][0]).read_text())
+            metadata = {key: value for key, value in manifest.items()
+                        if key not in ("artifacts", "device", "physical_sms", "sparkinfer_revision")}
+            # Bind allocation-only changes to the job without repeating the
+            # complete manifest for every quantizer/projection object.
+            if job_records:
+                job_records[min(job_records)]["planner_metadata"] = metadata
         elif name.startswith("fp8/"):
-            for program in json.loads((directory / "routed.json").read_text())["programs"]:
+            routed = json.loads((directory / "routed.json").read_text())
+            for program in routed["programs"]:
                 job_records[program["name"] + ".o"]["scratch_bytes_at_capacity"] = {
                     str(program["capacity"]): program["scratch_bytes"]}
-                job_records[program["name"] + ".o"]["planner_metadata"] = program
+                job_records[program["name"] + ".o"]["planner_metadata"] = {
+                    **program, "geometry": routed["layouts"][program["layout"]]}
         else:
             for manifest_path in directory.rglob("v41_exl3.json"):
                 manifest = json.loads(manifest_path.read_text())

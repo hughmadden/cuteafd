@@ -197,8 +197,8 @@ def test_live_planner_skip_is_explicit_and_recorded(tmp_path, monkeypatch):
     calls = _fake(monkeypatch, [(0, BUILD_OK), (0, 'test result: ok. 1 passed; 0 failed; 0 ignored\n')])
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**{**vars(ARGS), 'skip_live_planners': True}), {})
     test_cmd = calls[1]
-    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(set(gate.FULL_TESTS) | set(gate.LIVE_PLANNERS))
-    assert result['skipped_live_planners'] == list((*gate.LIVE_PLANNERS, *gate.INSTALLED_PLANNERS))
+    assert test_cmd[-1] == '--exact' and test_cmd.count('--skip') == len(set(gate.FULL_TESTS) | set(gate.LIVE_PLANNERS) | set(gate.MERGE_INSTALLED_PLANNERS))
+    assert result['skipped_live_planners'] == list((*gate.LIVE_PLANNERS, *gate.INSTALLED_PLANNERS, *gate.MERGE_INSTALLED_PLANNERS))
     record = {'task': 't', 'verdict': 'pass', 'head': 'a' * 40, 'dirty': False, 'suites': [result]}
     assert 'live planner tests skipped' in gate.render(record)
 
@@ -233,6 +233,7 @@ def test_default_and_full_select_the_same_named_tests_in_both_runners(tmp_path, 
     assert len(gate.FULL_TESTS) == len(set(gate.FULL_TESTS))
     for name in gate.INSTALLED_PLANNERS:
         assert name in gate.FULL_TESTS
+    assert not set(gate.MERGE_INSTALLED_PLANNERS).intersection(gate.FULL_TESTS)
 
 
 @pytest.mark.parametrize('nextest', [False, True])
@@ -293,7 +294,7 @@ def test_failed_live_v4_provenance_is_not_reported_as_skipped(tmp_path, monkeypa
 @pytest.mark.parametrize('full', [False, True])
 @pytest.mark.parametrize('inventory', ['home', 'hf-home', 'override'])
 @pytest.mark.parametrize('programs_override', [False, True])
-def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monkeypatch, full, inventory, programs_override):
+def test_installed_deployment_inventory_is_enabled_for_both_tiers(tmp_path, monkeypatch, full, inventory, programs_override):
     (tmp_path / 'logs').mkdir()
     calls = []
     def run_logged(cmd, path, env, cwd, timeout):
@@ -316,9 +317,9 @@ def test_installed_deployment_inventory_is_enabled_only_for_full(tmp_path, monke
         env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] = str(tmp_path / 'PROGRAMS.json')
     result = gate.cargo(ROOT, tmp_path, SimpleNamespace(**vars(ARGS), full=full), env)
     assert result['status'] == 'pass'
-    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == (expected if full or inventory == 'override' else None)
+    assert calls[1].get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME') == expected
     manifest = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
-                       str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json'))
+                       str(tmp_path / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     assert all(call['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == manifest for call in calls)
     assert result['deployment_test_programs'] == manifest
     assert calls[1].get('CUTEAFD_TEST_PYTHON') == ('/gate-venv/bin/python' if full else None)
@@ -772,7 +773,7 @@ def test_gate_requirements_check_prefers_gate_venv_and_fails_fast_on_mismatch(tm
 def test_missing_installed_programs_manifest_surfaces_in_receipt_error(tmp_path, monkeypatch, nextest):
     (tmp_path / 'logs').mkdir()
     test_id = 'shared::experts::rtx::local_physical_tests::installed_glm_local_physical_equals_serving'
-    reason = f'required installed PROGRAMS.json missing: {tmp_path}/placement-inputs/current/PROGRAMS.json'
+    reason = f'required installed PROGRAMS.json missing: {tmp_path}/placement-inputs/current/share/PROGRAMS.json'
     failed = f'test {test_id} ... FAILED\nError: {reason}\ntest result: FAILED. 8 passed; 1 failed; 0 ignored\n'
     _fake(monkeypatch, [(0, BUILD_OK), (101, failed),
                         (0, 'test result: ok. 2 passed; 0 failed; 0 ignored\n')])

@@ -1189,7 +1189,7 @@ def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace(weights="fp8")
+    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -1227,6 +1227,9 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
                       indirect, "auto")]
     records = json.loads((tmp_path / "routed.json").read_text())["programs"]
     assert len(records) == 1
+    assert json.loads((tmp_path / "routed.json").read_text())["layouts"]["tp1"] == {
+        "tp": 1, "hidden": 4096, "slice": 2048, "experts": 256, "top_k": 8,
+        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16"}
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
@@ -1255,7 +1258,7 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    geometry = SimpleNamespace(weights=weights)
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
     calls = []
     def compile_program(g, **kwargs):
         calls.append(kwargs)
@@ -1497,7 +1500,8 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
         filesystem if name == 'placement_filesystem' else real_load(name, path))
     jobs = [("programs", "export_b12x_dsv4_aot.py", []),
             ("exl3/exl3-glm-k45", "package_exl3_aot.py", []),
-            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", [])]
+            ("fp8/fp8-mimop", "package_fp8_moe_aot.py", []),
+            *[job for job in publisher.export_jobs() if job[0] in publisher.V41_MANIFESTS]]
     monkeypatch.setattr(publisher, 'export_jobs', lambda: jobs)
     calls = []
 
@@ -1519,10 +1523,14 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
             directory.mkdir(parents=True)
             (directory / 'v41_exl3.json').write_text('{"scratch":123,"compiler":true}')
         elif payload['exporter'] == 'package_fp8_moe_aot.py':
-            (output / 'routed.json').write_text(json.dumps({'programs': [
+            (output / 'routed.json').write_text(json.dumps({'layouts': {'tp1': {'tp': 1, 'hidden': 4096, 'input': 'bf16'},
+                             'tp2': {'tp': 2, 'hidden': 4096, 'input': 'bf16'}}, 'programs': [
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 123},
                 {'layout': 'tp1', 'capacity': 2752, 'scratch_bytes': 456},
                 {'layout': 'tp2', 'capacity': 4096, 'scratch_bytes': 789}]}))
+        elif output.name in publisher.V41_MANIFESTS:
+            source, _ = publisher.V41_MANIFESTS[output.name]
+            (output / source).write_text('{"compiler":true,"scratch_bytes":123}')
         else:
             (output / 'dsv4_programs.json').write_text('{"compiler":true}')
     monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
@@ -1544,10 +1552,17 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     metadata = json.loads((target / 'INPUTS.json').read_text())
     assert metadata['engine_commit'] == 'a' * 40
     assert metadata['engine_sources_sha256'] == publisher.source_hashes()
-    assert len(calls) == len(metadata['exports']) == 3
-    assert (target / 'PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
-    assert (target / 'exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
-    fp8 = json.loads((target / 'fp8/fp8-mimop/manifest.json').read_text())
+    assert len(calls) == len(metadata['exports']) == len(jobs)
+    for name, (source, installed) in publisher.V41_MANIFESTS.items():
+        assert (target / 'share' / installed).read_bytes() == (staging / name / source).read_bytes()
+        assert 'share/' + installed in metadata['files']
+    assert (target / 'share/PROGRAMS.json').read_bytes() == (staging / 'programs/dsv4_programs.json').read_bytes()
+    assert not (target / 'PROGRAMS.json').exists()
+    assert (target / 'share/exl3/exl3-glm-k45/rtx-tp2/m2752/v41_exl3.json').read_bytes() == b'{"scratch":123,"compiler":true}'
+    fp8 = json.loads((target / 'lib/fp8/fp8-mimop/manifest.json').read_text())
+    assert (target / 'lib/fp8/fp8-mimop/tp1').is_dir()
+    assert fp8['layouts']['tp1']['input'] == 'bf16'
+    assert fp8['layouts']['tp2']['tp'] == 2
     assert fp8['layouts']['tp1']['capacities'] == [{'capacity': 2752, 'scratch_bytes': 456}]
     assert fp8['layouts']['tp2']['capacities'] == [{'capacity': 4096, 'scratch_bytes': 789}]
     for path, checksum in metadata['files'].items():
@@ -1557,6 +1572,27 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
         publisher.publish(target, tmp_path / 'other-staging', 1, 1)
 
 
+def test_v41_allocation_metadata_is_bound_to_publication_records(tmp_path):
+    publisher = compare_sm.load_file("test_v41_placement_records", ROOT / "scripts/build/export-placement-inputs.py")
+    for name, (source, _) in publisher.V41_MANIFESTS.items():
+        directory = tmp_path / name
+        directory.mkdir()
+        records = {"z.o": {"object_sha256": "z"}, "a.o": {"object_sha256": "a"}}
+        (directory / "program-records.json").write_text(json.dumps(records))
+        manifest = {"variants": [{"capacity": 4096, "scratch_bytes": 123}],
+                    "artifacts": {"a.o": "a"}, "physical_sms": 188, "sparkinfer_revision": "old"}
+        (directory / source).write_text(json.dumps(manifest))
+        jobs = [(name, "export.py", [])]
+        published = publisher.publication_records(tmp_path, jobs)
+        assert published[name + "/a.o"]["planner_metadata"] == {"variants": manifest["variants"]}
+        assert "planner_metadata" not in published[name + "/z.o"]
+        manifest["variants"][0]["scratch_bytes"] = 456
+        (directory / source).write_text(json.dumps(manifest))
+        changed = publisher.publication_records(tmp_path, jobs)
+        report = publisher.kernel_records.change_report(published, changed)
+        assert [entry["program"] for entry in report["changed"]] == [name + "/a.o"]
+
+
 def test_installed_placement_export_jobs_cover_live_native_families_and_packages():
     publisher = compare_sm.load_file("test_placement_jobs", ROOT / "scripts/build/export-placement-inputs.py")
     jobs = publisher.export_jobs()
@@ -1564,6 +1600,13 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     assert {'exl3/exl3-glm-k45', 'exl3/exl3-glmf-k34', 'exl3/exl3-kimik3-k23',
             'exl3/exl3-step5-k46', 'exl3/exl3-muse-k45', 'exl3/exl3-ml4-k45',
             'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
+    assert set(publisher.V41_MANIFESTS) <= names
+    for name, exporter, extra in jobs:
+        if name.startswith('v41-'):
+            assert extra[extra.index('--rows') + 1] == (
+                compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
+                compare_sm.V41_DRAFT_CAPACITIES if name in ('v41-experts', 'v41-dspark_tp2') else
+                compare_sm.V41_CAPACITIES)
     assert not any('nvfp4' in name for name in names)
     # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
     assert not any(name.startswith('fp8/fp8-step5') for name in names)
@@ -1621,7 +1664,8 @@ def test_placement_publication_rsync_host_syncs_directory_and_current_symlink(tm
     with pytest.raises(ValueError, match='missing published placement input'):
         publisher.rsync_publication(published, ['maxq'], timeout=30)
     (published / 'INPUTS.json').write_text('{}')
-    (published / 'PROGRAMS.json').write_text('{}')
+    (published / 'share').mkdir()
+    (published / 'share/PROGRAMS.json').write_text('{}')
     rsync_calls = []
 
     def fake_run(cmd, **kwargs):

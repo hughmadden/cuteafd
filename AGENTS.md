@@ -201,7 +201,7 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `HF_HOME` (or `~/.cache/huggingface`); override with
   `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
   `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default
-  `~/.cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json`). The gate
+  `~/.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json`). The gate
   supplies this single manifest variable to all installed planner tests on
   every host, including the default tier's installed GLM physical test. Missing
   checkpoints/revisions or missing/stale exports fail; only the explicitly

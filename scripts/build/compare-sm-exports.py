@@ -518,8 +518,14 @@ def export_routed(extra, output, selected_objects=None):
     if segmented:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
+    layout_metadata = {}
     for layout in dict.fromkeys(layouts):
-        _, g = package.layout_geometry(base, layout)
+        tp, g = package.layout_geometry(base, layout)
+        layout_metadata[layout] = {
+            "tp": tp, **{key: getattr(g, key) for key in
+                ("hidden", "slice", "experts", "top_k", "intermediate", "weights")},
+            "input": "wire" if wire else "bf16",
+        }
         forms = [(rows, "auto", indirect) for rows in capacities]
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
         if segmented and not indirect:
@@ -552,7 +558,7 @@ def export_routed(extra, output, selected_objects=None):
                             **({"core_only": True} if core_only else {}),
                             "scratch_bytes": scratch})
             print(f"exported {stem}", flush=True)
-    (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
+    (output / "routed.json").write_text(json.dumps({"programs": records, "layouts": layout_metadata}, indent=2) + "\n")
 
 
 @contextmanager

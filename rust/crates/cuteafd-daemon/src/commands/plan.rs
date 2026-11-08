@@ -904,7 +904,7 @@ mod tests {
         }
         let manifest = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap())
-                .join(".cache/cuteafd/builds/placement-inputs/current/PROGRAMS.json"));
+                .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         anyhow::ensure!(manifest.is_file(), "installed Kimi context check requires {}", manifest.display());
         let cli = crate::cli::Cli::try_parse_from([
             "cuteafd", "plan", snapshot.to_str().unwrap(), "--layout", "--config", config.to_str().unwrap(),
