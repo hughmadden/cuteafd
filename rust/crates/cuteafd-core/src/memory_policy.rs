@@ -28,8 +28,8 @@ pub const AGENTIC_FLOOR_TOKENS: u64 = 262_144;
 /// the remaining owners are attributed. Per coordinator GPU, inside its cap.
 pub const DEFAULT_MEMORY_PADDING: u64 = 100 << 20;
 
-/// A percentage of each measured class rate, or absolute bytes per node.
-/// Percentage padding rounds each class to the nearest whole byte per node.
+/// A percentage of each measured node/executable coefficient, or absolute
+/// bytes added to each coefficient. Percentage adjustments round to whole bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GraphPaddingValue { BasisPoints(u64), Bytes(u64) }
 
@@ -78,7 +78,7 @@ impl Default for GraphNodePadding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("GRAPH_NODE_PADDING must be a percentage (up to two decimals), integer bytes/node, or rtx=VALUE,spark=VALUE")]
+#[error("GRAPH_NODE_PADDING must be a percentage (up to two decimals), integer bytes per coefficient, or rtx=VALUE,spark=VALUE")]
 pub struct GraphNodePaddingError;
 
 impl FromStr for GraphNodePadding {

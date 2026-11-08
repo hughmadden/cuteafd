@@ -14,8 +14,8 @@ pub fn startup_graph_component(id: &str, location: Location, rank: crate::placem
     }
     let mut source = startup_graph_source(id);
     if let Some(charge) = rank.node_charge {
-        source.push_str(&format!("; nodes={}; measured-rate bytes={}; GRAPH_NODE_PADDING={} bytes ({}); packed={} bytes",
-            charge.nodes, charge.rate_bytes, charge.padding_bytes, charge.padding, charge.packed_bytes));
+        source.push_str(&format!("; nodes={}; executables={}; measured-rate bytes={}; GRAPH_NODE_PADDING={} bytes ({}); packed={} bytes",
+            charge.nodes, charge.executables, charge.rate_bytes, charge.padding_bytes, charge.padding, charge.packed_bytes));
     }
     Ok(Component { activation: Activation::always(), bytes: ByteCurve::fixed(rank.bytes, maximum),
         kind: ComponentKind::Allowance(Allowance { location, bytes: rank.bytes,
@@ -46,7 +46,7 @@ pub fn reconcile_startup_graphs(plan: &mut ResolvedPlan, prefix: &str,
         let modeled = estimated.ranks[rank];
         crate::placement::graph_nodes::reconcile(prefix, rank, modeled.bytes, graph.bytes);
         if let Some(charge) = modeled.node_charge {
-            let value = serde_json::json!({"nodes": charge.nodes, "rate_bytes": charge.rate_bytes,
+            let value = serde_json::json!({"nodes": charge.nodes, "executables": charge.executables, "rate_bytes": charge.rate_bytes,
                 "padding_bytes": charge.padding_bytes, "padding": charge.padding,
                 "modeled_bytes": charge.packed_bytes, "measured_bytes": graph.bytes});
             cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({

@@ -65,7 +65,7 @@ pub(crate) struct MemoryArgs {
     /// Per-GPU release allowance inside the cap (default 100MiB); GPU_RESERVE replaces it.
     #[arg(long, global = true, value_parser = parse_size)]
     pub(crate) memory_padding: Option<u64>,
-    /// Graph node padding: percentage (default 2.5%), bytes/node, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
+    /// Graph node/executable padding: percentage (default 2.5%), bytes per coefficient, or rtx=VALUE,spark=VALUE; independent of GPU_RESERVE.
     #[arg(long, global = true)]
     pub(crate) graph_node_padding: Option<cuteafd_core::memory_policy::GraphNodePadding>,
     /// KV tokens the layout is sized for (default 2M; 1M on cards of 32 GiB or less).

@@ -3478,10 +3478,10 @@ fn graph_node_owner_and_padding_survive_reserve_override_once() {
     use crate::placement::graph_nodes::{GraphNodeCharge, GraphNodeCounts, charge};
     use crate::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES;
     use cuteafd_core::memory_policy::MemoryPolicy;
-    let nodes = GraphNodeCounts(std::collections::BTreeMap::from([("ordinary", 10)]));
+    let nodes = GraphNodeCounts { nodes: 10, executables: 2 };
     let charged: GraphNodeCharge = charge("glm5", "sm_120", &nodes, &GLM_SM120_NODE_RATES,
         MemoryPolicy::default().graph_node_padding).unwrap();
-    let graph = serving::startup_graph_component("test.0", Location::coordinator(0), charged.rank(2), 1).unwrap();
+    let graph = serving::startup_graph_component("test.0", Location::coordinator(0), charged.rank(), 1).unwrap();
     let mut contract = with_reserve_components(1);
     contract.components.push(graph);
     let mut budgets = vec![budget(1 << 30)];
@@ -3492,7 +3492,7 @@ fn graph_node_owner_and_padding_survive_reserve_override_once() {
         ComponentKind::Allowance(owner) => Some(owner), _ => None }).collect();
     assert_eq!(graphs.len(), 1);
     assert_eq!(graphs[0].bytes, charged.packed_bytes);
-    assert!(graphs[0].source.contains("GRAPH_NODE_PADDING=1670 bytes"));
+    assert!(graphs[0].source.contains("GRAPH_NODE_PADDING=5854 bytes"));
 }
 
 #[test]

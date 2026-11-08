@@ -1,19 +1,16 @@
-//! Family-owned launch counts, architecture-specific measured rates, one pack
-//! per physical device (combine all banks before calling `charge`). Fingerprints
-//! validate capture coverage; they never select a memory price.
-use std::collections::BTreeMap;
+//! Family-owned launch counts and per-family, per-architecture node/executable
+//! rates. Combine every bank on one physical device before the single pack.
+//! Fingerprints validate coverage; they never select a memory price.
 use cuteafd_core::memory_policy::{GraphNodePadding, GraphPaddingValue};
 use serde::{Deserialize, Serialize};
 use super::inventory::{DeclaredGraphSet, GraphRank};
 
 pub const DRIVER_CHUNK: u64 = 2 << 20;
-pub const ORDINARY: &str = "ordinary";
-pub const DSA_PAGED: &str = "dsa-paged-logits-and-tiled-topk";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GraphNodeError {
-    #[error("missing graph-node measurement: family={family}, architecture={architecture}, class={class}; collect a graph census on this architecture")]
-    MissingRate { family: String, architecture: String, class: String },
+    #[error("missing graph measurement: family={family}, architecture={architecture}; collect a graph census on this architecture")]
+    MissingRate { family: String, architecture: String },
     #[error("graph-node arithmetic overflow: {0}")]
     Overflow(&'static str),
     #[error("invalid graph-node measurement: {0}")]
@@ -34,43 +31,52 @@ pub struct GraphRateProvenance {
     pub limitation: &'static str,
 }
 
+/// Whole-byte coefficients rounded from the family's ordered-block fit.
+/// Executable overhead is not another node class or another driver chunk tail.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphNodeRate {
+    pub family: &'static str,
     pub architecture: &'static str,
-    pub class: &'static str,
     pub bytes_per_node: u64,
+    pub bytes_per_executable: u64,
     pub provenance: GraphRateProvenance,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GraphNodeCounts(pub BTreeMap<&'static str, u64>);
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GraphNodeCounts {
+    pub nodes: u64,
+    pub executables: u64,
+}
 
 impl GraphNodeCounts {
-    pub fn add(&mut self, class: &'static str, nodes: u64) -> Result<(), GraphNodeError> {
-        let count = self.0.entry(class).or_default();
-        *count = count.checked_add(nodes).ok_or(GraphNodeError::Overflow("node count"))?;
+    /// Combine banks before pricing, so a physical device gets one chunk tail.
+    pub fn add(&mut self, other: Self) -> Result<(), GraphNodeError> {
+        let nodes = self.nodes.checked_add(other.nodes).ok_or(GraphNodeError::Overflow("node count"))?;
+        let executables = self.executables.checked_add(other.executables)
+            .ok_or(GraphNodeError::Overflow("executable count"))?;
+        *self = Self { nodes, executables };
         Ok(())
     }
 
-    /// Counts a declared set, not a captured table. Families supply a pure
-    /// key-to-launch-count function and combine banks sharing a device here.
+    /// Families supply a pure key-to-launch-count function, not a captured table.
     pub fn declared<K: std::hash::Hash + Eq + Clone + std::fmt::Debug>(
         declared: &DeclaredGraphSet<K>,
-        mut count: impl FnMut(&K) -> Result<Self, GraphNodeError>,
+        mut count: impl FnMut(&K) -> Result<u64, GraphNodeError>,
     ) -> Result<Self, GraphNodeError> {
         let mut total = Self::default();
         for key in declared.iter() {
-            for (class, nodes) in count(key)?.0 { total.add(class, nodes)?; }
+            total.add(Self { nodes: count(key)?, executables: 1 })?;
         }
         Ok(total)
     }
 }
 
-/// The padding is an identified part of the single graph owner, not a second
+/// Both rate terms and their padding belong to one graph owner, not a second
 /// allocation or reserve. Only the combined raw sum receives a chunk tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphNodeCharge {
     pub nodes: u64,
+    pub executables: u64,
     pub rate_bytes: u64,
     pub padding: GraphPaddingValue,
     pub padding_bytes: u64,
@@ -78,41 +84,45 @@ pub struct GraphNodeCharge {
 }
 
 impl GraphNodeCharge {
-    pub fn rank(self, executables: u64) -> GraphRank {
-        GraphRank { node_charge: Some(self), ..GraphRank::estimated(executables, self.packed_bytes) }
+    pub fn rank(self) -> GraphRank {
+        GraphRank { node_charge: Some(self), ..GraphRank::estimated(self.executables, self.packed_bytes) }
     }
 }
 
 pub fn charge(family: &str, architecture: &str, counts: &GraphNodeCounts,
     rates: &[GraphNodeRate], padding: GraphNodePadding) -> Result<GraphNodeCharge, GraphNodeError> {
-    let missing = |class: &str| GraphNodeError::MissingRate { family: family.into(),
-        architecture: architecture.into(), class: class.into() };
+    let missing = || GraphNodeError::MissingRate { family: family.into(), architecture: architecture.into() };
     let padding = match architecture {
         "sm_120" => padding.rtx,
         "sm_121" => padding.spark,
-        _ => return Err(missing("architecture")),
+        _ => return Err(missing()),
     };
-    let (mut nodes, mut rate_bytes, mut padding_bytes) = (0u64, 0u64, 0u64);
-    for (&class, &count) in &counts.0 {
-        if count == 0 { continue; }
-        let mut matching = rates.iter().filter(|rate| rate.architecture == architecture && rate.class == class);
-        let rate = matching.next().ok_or_else(|| missing(class))?;
-        if matching.next().is_some() || rate.bytes_per_node == 0
+    let (mut rate_bytes, mut padding_bytes) = (0u64, 0u64);
+    if counts.nodes != 0 || counts.executables != 0 {
+        if counts.executables == 0 {
+            return Err(GraphNodeError::Nodes("nodes without graph executables".into()));
+        }
+        let mut matching = rates.iter().filter(|rate| rate.family == family && rate.architecture == architecture);
+        let rate = matching.next().ok_or_else(missing)?;
+        if matching.next().is_some() || rate.bytes_per_node == 0 || rate.bytes_per_executable == 0
             || rate.provenance.engine_sha.is_empty() || rate.provenance.sparkinfer_sha.is_empty()
             || rate.provenance.evidence.is_empty() {
-            return Err(GraphNodeError::InvalidRate(format!("{family}/{architecture}/{class}")));
+            return Err(GraphNodeError::InvalidRate(format!("{family}/{architecture}")));
         }
-        let per_node = padding.bytes_per_node(rate.bytes_per_node).ok_or(GraphNodeError::Overflow("padding rate"))?;
-        padding_bytes = count.checked_mul(per_node).and_then(|bytes| padding_bytes.checked_add(bytes))
-            .ok_or(GraphNodeError::Overflow("padding bytes"))?;
-        nodes = nodes.checked_add(count).ok_or(GraphNodeError::Overflow("total nodes"))?;
-        rate_bytes = count.checked_mul(rate.bytes_per_node).and_then(|bytes| rate_bytes.checked_add(bytes))
-            .ok_or(GraphNodeError::Overflow("rate bytes"))?;
+        for (count, coefficient) in [(counts.nodes, rate.bytes_per_node),
+            (counts.executables, rate.bytes_per_executable)] {
+            let adjustment = padding.bytes_per_node(coefficient).ok_or(GraphNodeError::Overflow("padding rate"))?;
+            padding_bytes = count.checked_mul(adjustment).and_then(|bytes| padding_bytes.checked_add(bytes))
+                .ok_or(GraphNodeError::Overflow("padding bytes"))?;
+            rate_bytes = count.checked_mul(coefficient).and_then(|bytes| rate_bytes.checked_add(bytes))
+                .ok_or(GraphNodeError::Overflow("rate bytes"))?;
+        }
     }
     let raw = rate_bytes.checked_add(padding_bytes).ok_or(GraphNodeError::Overflow("combined bytes"))?;
     let packed_bytes = raw.div_ceil(DRIVER_CHUNK).checked_mul(DRIVER_CHUNK)
         .ok_or(GraphNodeError::Overflow("driver chunks"))?;
-    Ok(GraphNodeCharge { nodes, rate_bytes, padding, padding_bytes, packed_bytes })
+    Ok(GraphNodeCharge { nodes: counts.nodes, executables: counts.executables,
+        rate_bytes, padding, padding_bytes, packed_bytes })
 }
 
 /// Emit a discrepancy without rejecting successfully instantiated CUDA graphs.
@@ -121,7 +131,7 @@ pub fn reconcile(family: &str, device: usize, modeled_bytes: u64, measured_bytes
     let gap = measured_bytes.saturating_sub(modeled_bytes);
     if gap != 0 {
         tracing::warn!(family, device, modeled_bytes, measured_bytes, gap_bytes = gap,
-            "startup graph memory exceeds node model; capture succeeded, continuing; increase GRAPH_NODE_PADDING for this architecture on future launches");
+            "startup graph memory exceeds node/executable model; capture succeeded, continuing; increase GRAPH_NODE_PADDING for this architecture on future launches");
     }
     gap
 }
@@ -129,68 +139,86 @@ pub fn reconcile(family: &str, device: usize, modeled_bytes: u64, measured_bytes
 #[cfg(test)]
 mod tests {
     use super::*;
-    const PROVENANCE: GraphRateProvenance = GraphRateProvenance {
-        engine_sha: "archived", sparkinfer_sha: "851c42833da26711c68868014cad2fc043916416",
-        cuda_driver_version: None, nvml_driver_version: None,
-        evidence: "#1605 archived census, VALIDATION.md", limitation: "inferred capture-key join; single rank",
-    };
-    fn rates(ordinary: u64, dsa: u64) -> [GraphNodeRate; 2] {
-        [GraphNodeRate { architecture: "sm_120", class: ORDINARY, bytes_per_node: ordinary, provenance: PROVENANCE },
-         GraphNodeRate { architecture: "sm_120", class: DSA_PAGED, bytes_per_node: dsa, provenance: PROVENANCE }]
-    }
-    fn counts(ordinary: u64, dsa: u64) -> GraphNodeCounts {
-        GraphNodeCounts(BTreeMap::from([(ORDINARY, ordinary), (DSA_PAGED, dsa)]))
-    }
+    use crate::serving_capacity::glm_graph_nodes::{GLM_SM120_NODE_RATES, GLMF_SM120_NODE_RATES};
+    fn counts(nodes: u64, executables: u64) -> GraphNodeCounts { GraphNodeCounts { nodes, executables } }
+
     #[test]
-    fn archived_totals_and_smaller_contexts() {
-        for (family, rates, full, small, bytes, small_bytes) in [
-            ("glm5", rates(6680, 2792), counts(434790, 28560), counts(392064, 12096), 2984247296, 2652897280),
-            ("glm5_flash", rates(7143, 2456), counts(321180, 7700), counts(288996, 4620), 2313158656, 2076180480),
-        ] {
-            let zero = "0".parse().unwrap();
-            let full = charge(family, "sm_120", &full, &rates, zero).unwrap();
-            let small = charge(family, "sm_120", &small, &rates, zero).unwrap();
-            assert_eq!(full.packed_bytes, bytes);
-            assert_eq!(small.packed_bytes, small_bytes);
-            assert!(small.nodes < full.nodes && small.packed_bytes < full.packed_bytes);
+    fn glm_full_calibration_and_independent_small_context() {
+        // #1615 sealed same-build captures. The small capture is independent,
+        // not the old 404,160-node prefix of the full-context warm order.
+        for (nodes, executables, bytes) in [(463350, 16827, 2984247296), (402240, 15168, 2648702976)] {
+            let charge = charge("glm5", "sm_120", &counts(nodes, executables), &GLM_SM120_NODE_RATES,
+                "0".parse().unwrap()).unwrap();
+            assert_eq!(charge.packed_bytes, bytes);
+            assert_eq!(charge.rank().executables, executables);
         }
-    }
-    #[test]
-    fn padding_is_per_node_per_device_and_independent_of_reserve() {
-        use cuteafd_core::memory_policy::MemoryPolicy;
-        let rates = rates(6680, 2792);
-        let policy = MemoryPolicy { graph_node_padding: "rtx=350,spark=22".parse().unwrap(), ..Default::default() };
-        let calculate = || charge("glm5", "sm_120", &counts(434790, 28560), &rates,
-            MemoryPolicy::current().graph_node_padding).unwrap();
-        let expected = policy.scoped(calculate);
-        assert_eq!(expected.padding_bytes, 463350 * 350);
-        assert_eq!(expected.packed_bytes, (expected.rate_bytes + expected.padding_bytes).div_ceil(DRIVER_CHUNK) * DRIVER_CHUNK);
-        assert_eq!(MemoryPolicy { gpu_reserve: Some(0), ..policy }.scoped(calculate), expected);
-        let spark_rates = rates.map(|rate| GraphNodeRate { architecture: "sm_121", ..rate });
-        let spark = charge("fixture", "sm_121", &counts(3, 2), &spark_rates, policy.graph_node_padding).unwrap();
-        assert_eq!(spark.padding_bytes, 5 * 22);
-        assert_eq!(spark.packed_bytes, DRIVER_CHUNK); // not one chunk per class
-    }
-    #[test]
-    fn percentage_padding_uses_each_class_rate_and_architecture() {
-        let glm = charge("glm5", "sm_120", &counts(434790, 28560), &rates(6680, 2792), Default::default()).unwrap();
-        assert_eq!(glm.padding_bytes, 434790 * 167 + 28560 * 70);
-        let flash = charge("glm5_flash", "sm_120", &counts(321180, 7700), &rates(7143, 2456), Default::default()).unwrap();
-        assert_eq!(flash.padding_bytes, 321180 * 179 + 7700 * 61);
-        let spark_rates = rates(1000, 2000).map(|r| GraphNodeRate { architecture: "sm_121", ..r });
-        let spark = charge("fixture", "sm_121", &counts(2, 3), &spark_rates, Default::default()).unwrap();
-        assert_eq!(spark.padding_bytes, 2 * 25 + 3 * 50);
     }
 
     #[test]
-    fn unknown_rates_and_overflow_are_typed() {
-        for arch in ["sm_121", "sm_999"] {
-            assert!(matches!(charge("glm5", arch, &counts(1, 1), &rates(6680, 2792), Default::default()),
+    fn flash_archived_block_fit_is_within_one_chunk() {
+        let charge = charge("glm5_flash", "sm_120", &counts(328880, 13800), &GLMF_SM120_NODE_RATES,
+            "0".parse().unwrap()).unwrap();
+        // Same ordered-256-graph-block fit as GLM; retain its measured residual.
+        assert_eq!(charge.packed_bytes, 2313158656 + DRIVER_CHUNK);
+    }
+
+    #[test]
+    fn padding_applies_to_both_terms_and_survives_reserve_override() {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let counts = counts(463350, 16827);
+        let policy = MemoryPolicy { graph_node_padding: "rtx=350,spark=22".parse().unwrap(), ..Default::default() };
+        let calculate = || charge("glm5", "sm_120", &counts, &GLM_SM120_NODE_RATES,
+            MemoryPolicy::current().graph_node_padding).unwrap();
+        let expected = policy.scoped(calculate);
+        assert_eq!(expected.padding_bytes, (counts.nodes + counts.executables) * 350);
+        assert_eq!(MemoryPolicy { gpu_reserve: Some(0), ..policy }.scoped(calculate), expected);
+        let spark_rates = GLM_SM120_NODE_RATES.map(|rate| GraphNodeRate { architecture: "sm_121", ..rate });
+        let spark = charge("glm5", "sm_121", &self::counts(3, 2), &spark_rates, policy.graph_node_padding).unwrap();
+        assert_eq!(spark.padding_bytes, 5 * 22);
+        assert_eq!(spark.packed_bytes, DRIVER_CHUNK);
+    }
+
+    #[test]
+    fn percentage_padding_uses_node_and_executable_rates() {
+        let glm = charge("glm5", "sm_120", &counts(463350, 16827), &GLM_SM120_NODE_RATES, Default::default()).unwrap();
+        assert_eq!(glm.padding_bytes, 463350 * 67 + 16827 * 2592);
+        let flash = charge("glm5_flash", "sm_120", &counts(328880, 13800), &GLMF_SM120_NODE_RATES, Default::default()).unwrap();
+        assert_eq!(flash.padding_bytes, 328880 * 44 + 13800 * 3132);
+    }
+
+    #[test]
+    fn declared_banks_are_combined_before_one_pack() {
+        let keys = DeclaredGraphSet::new(&[1u64, 2]).unwrap();
+        let bank = GraphNodeCounts::declared(&keys, |&key| Ok(key)).unwrap();
+        assert_eq!(bank, counts(3, 2));
+        let mut total = bank;
+        total.add(bank).unwrap();
+        let priced = charge("glm5", "sm_120", &total, &GLM_SM120_NODE_RATES, "0".parse().unwrap()).unwrap();
+        assert_eq!(priced.executables, 4);
+        assert_eq!(priced.packed_bytes, DRIVER_CHUNK);
+        assert_eq!(charge("glm5", "sm_120", &GraphNodeCounts::default(), &[], Default::default()).unwrap().packed_bytes, 0);
+        // Even a zero-node executable retains its executable overhead.
+        assert_eq!(charge("glm5", "sm_120", &counts(0, 1), &GLM_SM120_NODE_RATES,
+            "0".parse().unwrap()).unwrap().rate_bytes, 103662);
+    }
+
+    #[test]
+    fn unknown_rates_invalid_inputs_and_overflow_are_typed() {
+        for (family, arch) in [("glm5", "sm_121"), ("glm5", "sm_999"), ("glm5_flash", "sm_120")] {
+            assert!(matches!(charge(family, arch, &counts(1, 1), &GLM_SM120_NODE_RATES, Default::default()),
                 Err(GraphNodeError::MissingRate { .. })));
         }
-        assert!(matches!(charge("glm5", "sm_120", &counts(u64::MAX, 1), &rates(6680, 2792), Default::default()),
-            Err(GraphNodeError::Overflow(_))));
+        for counts in [counts(u64::MAX, 1), counts(1, u64::MAX)] {
+            assert!(matches!(charge("glm5", "sm_120", &counts, &GLM_SM120_NODE_RATES, Default::default()),
+                Err(GraphNodeError::Overflow(_))));
+        }
+        assert!(matches!(charge("glm5", "sm_120", &counts(1, 0), &GLM_SM120_NODE_RATES, Default::default()),
+            Err(GraphNodeError::Nodes(_))));
+        let duplicate = [GLM_SM120_NODE_RATES[0]; 2];
+        assert!(matches!(charge("glm5", "sm_120", &counts(1, 1), &duplicate, Default::default()),
+            Err(GraphNodeError::InvalidRate(_))));
     }
+
     #[test]
     fn successful_capture_overrun_is_only_a_warning() {
         assert_eq!(reconcile("fixture", 0, 10, 1000), 990);
