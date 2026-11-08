@@ -423,6 +423,7 @@ impl Bench {
                 "eta_s": a.eta_s, "elapsed_s": a.started.elapsed().as_secs_f64()})),
             "readiness_s": crate::context::readiness_s(),
             "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
+            "draft": crate::context::get().draft_mode(),
             "snapshot": crate::context::get().snapshot,
             "settings": crate::context::get().settings,
             "fingerprint": fingerprint,

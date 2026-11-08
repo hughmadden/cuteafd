@@ -51,8 +51,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
-    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=15))]
-    pub draft_fixed: Option<u8>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// The drafter's ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -429,13 +429,12 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
             image_health: encoder.health_handle_for(false), audio_health: encoder.health_handle_for(true) };
         let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(cache_bytes),
             encoder, 16);
-        let drafts = match (&args.draft, args.draft_fixed) {
-            (None, _) => scheduler::Drafts::None,
-            (Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true },
-            (Some(snapshot), None) => scheduler::Drafts::Neural {
-                depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts(), fixed: false },
+        let drafts = match &args.draft {
+            None => scheduler::Drafts::None,
+            Some(snapshot) => scheduler::Drafts::Neural {
+                depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts() },
         };
-        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, args.draft_length, eos,
             args.decode_share, &prefix, args.loop_abort.config(), args.token_io.token_select, &mut media, None,
             || {
                 crate::shared::inventory::startup_probe(backend.library(), &args.devices(), "muse-scheduler-ready", Default::default())?;

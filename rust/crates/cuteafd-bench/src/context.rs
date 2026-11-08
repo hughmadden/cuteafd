@@ -49,6 +49,11 @@ impl ServerContext {
         context.settings
     }
 
+    pub fn draft_mode(&self) -> &str {
+        self.settings.iter().find(|setting| setting.name == "draft-mode" && setting.source == "resolved")
+            .and_then(|setting| setting.value.as_deref()).unwrap_or("adaptive")
+    }
+
     pub fn resolve(&mut self, name: &str, value: &str) {
         apply_resolved(&mut self.settings, name, value);
     }

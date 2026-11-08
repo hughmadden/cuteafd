@@ -567,9 +567,9 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
-    /// V4.1 proposal limit for --layout (otherwise DSPARK_DRAFT_LIMIT or five).
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub(crate) dspark_draft_limit: Option<u8>,
+    /// Fixed draft length for --layout (otherwise DRAFT_LENGTH or adaptive).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) draft_length: Option<u64>,
     /// V4.1 native dSpark routed-expert TP2; requires --layout, --rtx 2 and dSpark.
     #[arg(long, requires = "layout")]
     pub(crate) tp2_dspark_experts: bool,
@@ -1192,18 +1192,18 @@ mod tests {
         assert_eq!(args.reserve.limits(1_048_576).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.resolved_prefix_entries(), 20);
-        assert_eq!(args.dspark_draft_limit, 5);
+        assert_eq!(args.draft_length.effective(5), 5);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
             (vec!["--dspark"], true),
             (vec!["--dspark", "--independent-decode-lanes"], true),
-            (vec!["--dspark", "--dspark-fixed"], false),
+            (vec!["--dspark", "--draft-length", "5"], false),
         ] {
             let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected native serving"); };
             assert_eq!(args.adaptive_dspark(), adaptive);
         }
-        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-fixed"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", "5"])).is_ok());
         // The removed policies' flags are rejected rather than silently ignored.
         for removed in [["--dspark", "--dspark-adaptive"].as_slice(),
             &["--dspark", "--dspark-confidence-cutoff", "0.5"],
@@ -1214,20 +1214,20 @@ mod tests {
             (vec!["--dspark"], 5),
             (vec!["--dspark", "--rtx-gpus", "1"], 5),
             (vec!["--dspark", "--rtx-gpus", "2"], 5),
-            (vec!["--dspark", "--rtx-gpus", "2", "--dspark-draft-limit", "5"], 5),
-            (vec!["--dspark", "--dspark-draft-limit", "5", "--rtx-gpus", "2"], 5),
-            (vec!["--dspark", "--dspark-draft-limit", "5"], 5),
-            (vec!["--dspark", "--rtx-gpus", "2", "--dspark-draft-limit", "7"], 7),
+            (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "5"], 5),
+            (vec!["--dspark", "--draft-length", "5", "--rtx-gpus", "2"], 5),
+            (vec!["--dspark", "--draft-length", "5"], 5),
+            (vec!["--dspark", "--rtx-gpus", "2", "--draft-length", "7"], 7),
         ] {
             let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
                 base.into_iter().chain(flags)).unwrap().command else { panic!("expected native serving"); };
-            assert_eq!(args.dspark_draft_limit, expected);
+            assert_eq!(args.draft_length.draft_length.unwrap_or(5).min(7), expected);
         }
         for limit in ["1", "2", "3", "4", "5", "6", "7"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-draft-limit", limit])).is_ok());
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", limit])).is_ok());
         }
-        for limit in ["0", "8"] {
-            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--dspark-draft-limit", limit])).is_err());
+        for limit in ["0", "invalid"] {
+            assert!(super::Cli::try_parse_from(base.into_iter().chain(["--draft-length", limit])).is_err());
         }
         for entries in ["0", "2", "24", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
@@ -1555,16 +1555,8 @@ pub(crate) struct NativeServeArgs {
 
     /// Enable greedy RTX dSpark proposal generation and target verification.
     #[arg(long)] pub dspark: bool,
-    /// Draft width (tokens proposed per request). Defaults to the drafter's
-    /// trained five-token block on both layouts; 7 loads the wider block and
-    /// lets the policy choose 5 or 7 each round (measured slower under
-    /// concurrency, so not the default).
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub dspark_draft_limit: u8,
-    /// Verify every available draft instead of the online bandwidth-balance
-    /// length selection (the default whenever dSpark is enabled).
-    #[arg(long, requires = "dspark")]
-    pub dspark_fixed: bool,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Compatibility spelling: decode lanes always advance independently.
     #[arg(long, hide = true)]
     pub independent_decode_lanes: bool,
@@ -1603,7 +1595,7 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 
 impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
-        self.dspark && !self.dspark_fixed
+        self.dspark && self.draft_length.draft_length.is_none()
     }
 }
 

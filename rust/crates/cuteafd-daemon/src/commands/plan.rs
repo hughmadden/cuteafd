@@ -93,7 +93,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glmf_shared_replay: args.replay_records == crate::cli::PlanReplayRecords::Shared,
                 glmf_auto_replay: args.replay_records == crate::cli::PlanReplayRecords::Auto,
                 concurrency: args.concurrency,
-                dspark_draft_limit: args.dspark_draft_limit.unwrap_or(5),
+                v41_draft_width: args.draft_length.unwrap_or(5).min(7) as u8,
                 tp2_dspark_experts: args.tp2_dspark_experts,
                 tp2_dflash: args.tp2_dflash.unwrap_or(false),
                 state_slots: args.state_slots,
@@ -222,12 +222,13 @@ fn resolve_exlr8_draft(args: &mut PlanArgs, snapshot: &std::path::Path, family: 
 }
 
 fn v41_draft_limit(args: &PlanArgs, cfg: &std::collections::BTreeMap<String, String>) -> Result<u8> {
-    let limit = args.dspark_draft_limit.map(Ok).unwrap_or_else(|| {
-        cfg.get("DSPARK_DRAFT_LIMIT").filter(|limit| !limit.is_empty())
-            .map(|limit| limit.parse::<u8>().context("DSPARK_DRAFT_LIMIT must be in 1..7"))
+    let limit = args.draft_length.map(Ok).unwrap_or_else(|| {
+        cfg.get("DRAFT_LENGTH").filter(|limit| !limit.is_empty())
+            .map(|limit| limit.parse::<u64>().context("DRAFT_LENGTH must be a positive integer"))
             .unwrap_or(Ok(5))
     })?;
-    anyhow::ensure!((1..=7).contains(&limit), "DSPARK_DRAFT_LIMIT must be in 1..7");
+    anyhow::ensure!(limit > 0, "DRAFT_LENGTH must be a positive integer");
+    let limit = limit.min(7) as u8;
     Ok(limit)
 }
 
@@ -380,7 +381,7 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             || config.get("architectures").and_then(serde_json::Value::as_array)
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
         if v41 { v41_layout(layout, &args); }
-        if v41 { layout.dspark_draft_limit = v41_draft_limit(&args, &cfg)?; }
+        if v41 { layout.v41_draft_width = v41_draft_limit(&args, &cfg)?; }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
@@ -1299,18 +1300,18 @@ mod tests {
     fn v41_configured_draft_limit_matches_serving_width() {
         let mut request = args(std::path::Path::new("/not-read"), 3, false);
         for (configured, expected) in [(None, 5), (Some(""), 5), (Some("5"), 5), (Some("6"), 6), (Some("7"), 7)] {
-            let cfg = configured.map(|value| [("DSPARK_DRAFT_LIMIT".into(), value.into())].into()).unwrap_or_default();
+            let cfg = configured.map(|value| [("DRAFT_LENGTH".into(), value.into())].into()).unwrap_or_default();
             assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), expected);
         }
-        for value in ["0", "8", "invalid"] {
-            let cfg = [("DSPARK_DRAFT_LIMIT".into(), value.into())].into();
+        for value in ["0", "invalid"] {
+            let cfg = [("DRAFT_LENGTH".into(), value.into())].into();
             assert!(v41_draft_limit(&request, &cfg).is_err());
-            request.dspark_draft_limit = Some(7);
+            request.draft_length = Some(7);
             assert_eq!(v41_draft_limit(&request, &cfg).unwrap(), 7);
-            request.dspark_draft_limit = None;
+            request.draft_length = None;
         }
-        request.dspark_draft_limit = Some(7);
-        assert_eq!(options(&request).unwrap().layout.unwrap().dspark_draft_limit, 7);
+        request.draft_length = Some(7);
+        assert_eq!(options(&request).unwrap().layout.unwrap().v41_draft_width, 7);
     }
 
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
@@ -1363,7 +1364,7 @@ mod tests {
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             replay_records: crate::cli::PlanReplayRecords::Own,
             concurrency: 8,
-            dspark_draft_limit: None,
+            draft_length: None,
             tp2_dspark_experts: false,
             tp2_dflash: None,
             state_slots: None,

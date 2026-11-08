@@ -10,7 +10,7 @@ use std::{cell::RefCell, path::Path};
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Drafts {
     None,
-    Neural { depth: usize, fixed: bool },
+    Neural { depth: usize },
 }
 
 /// Ungraphed rows can replay prompt tokens or advance a live decode.
@@ -753,7 +753,7 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
+    drafts: Drafts, length: crate::shared::draft::length::DraftLength, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
     loop_abort: LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<Prompt, B::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>,
@@ -763,6 +763,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     anyhow::ensure!(geometry.decode_rows > 0 && max_sequences <= geometry.decode_rows
         && max_sequences <= geometry.slots, "scheduler lanes exceed target decode/state capacity");
     let width = match drafts { Drafts::Neural { depth, .. } => depth, Drafts::None => 0 };
+    let drafts = match drafts {
+        Drafts::Neural { depth } => Drafts::Neural { depth: length.effective(depth) },
+        Drafts::None => Drafts::None,
+    };
     // Publish readiness only after all fallible scheduler-owned startup work.
     let (family, mut cache, markers, mut grammars, tokenizer, mut selector, mut shared, mut trace, mut prefills) = initialize(|| {
         let (family, cache) = engine.prefix_cache(prefix, max_sequences)?;
@@ -775,8 +779,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let shared = if width > 0 {
             let geometry = engine.draft_geometry(snapshot, width)?;
             engine.arm_draft_probe()?;
-            let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, cuteafd_core::PolicySeed::weak(width))?;
-            crate::shared::draft::apply_length_rule(&mut policy);
+            let policy = length.policy(geometry, cuteafd_core::PolicySeed::weak(width), width)?;
             Some(policy)
         } else { None };
         let trace = Trace::open()?;
@@ -1306,7 +1309,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();
     let mut proposals: Vec<Vec<u32>> = match drafts {
         Drafts::None => vec![Vec::new(); active.len()],
-        Drafts::Neural { depth, fixed } => {
+        Drafts::Neural { depth } => {
             let limits: Vec<usize> = limits.iter().map(|&l| l.min(depth)).collect();
             let histories: Vec<&DraftHistory> = active.iter().map(|a| &a.outcomes).collect();
             neural_confidence = DraftHistory::acceptance(&histories, &limits);
@@ -1319,7 +1322,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             let selection = resource::select_drafted(shared, &candidates, depth, geometry.decode_rows,
                 neural_confidence.iter().filter(|p| !p.is_empty()).count());
             predicted = selection.predicted;
-            let mut depths = if fixed { neural_confidence.iter().map(Vec::len).collect() } else { selection.lengths };
+            let mut depths = selection.lengths;
             for (a, d) in active.iter().zip(depths.iter_mut()) {
                 // A whole-prompt prefix hit has no draft continuation yet: it drafts after its first step.
                 if a.draft.pending_rows() == 0 {
@@ -1349,11 +1352,11 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let copies: Vec<_> = active.iter().zip(&proposals).zip(&limits).zip(&mut neural_confidence)
         .map(|(((a, proposal), &limit), prior)| {
             prior.truncate(proposal.len());
-            shared.as_ref().filter(|_| !matches!(drafts, Drafts::Neural { fixed: true, .. }))
+            shared.as_ref().filter(|policy| !policy.fixed())
                 .and_then(|shared| resource::copy_continuation(shared, active.len(), a.ticket.id(), &a.history,
                     proposal, prior, limit, a.job.sampling.is_greedy()))
         }).collect();
-    if let Some(shared) = shared.as_mut().filter(|_| drafted_width > 0 && !matches!(drafts, Drafts::Neural { fixed: true, .. })) {
+    if let Some(shared) = shared.as_mut().filter(|policy| drafted_width > 0 && !policy.fixed()) {
         let candidates: Vec<_> = active.iter().zip(&neural_confidence).zip(&limits).map(|((a, prior), &limit)|
             resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: false }).collect();
         let selection = resource::select_drafted(shared, &candidates, drafted_width, geometry.decode_rows, drafted_requests);

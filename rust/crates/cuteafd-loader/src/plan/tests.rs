@@ -832,7 +832,7 @@ fn v41_full_concurrency_launcher_admission_and_configured_draft_width() {
                 layout.pool_tokens = Some(0);
                 layout.workspace_manifest = v41_workspace(dir.path());
                 layout.native_mtp_layers = 3;
-                layout.dspark_draft_limit = limit;
+                layout.v41_draft_width = limit;
                 let start = std::time::Instant::now();
                 let report = input.plan_spark_count(&options, 6, Some(ranks)).unwrap();
                 assert!(start.elapsed() < std::time::Duration::from_secs(10));

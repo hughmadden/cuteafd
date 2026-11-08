@@ -29,7 +29,7 @@ container-name characters, [A-Za-z0-9_.-].
   --config FILE                 alternate complete configuration
   --set KEY=VALUE               override one configuration key for this launch
                                 (repeatable; e.g. --set RTX_GPUS=2,
-                                --set CONCURRENCY=8, --set DSPARK_DRAFT_LIMIT=7,
+                                --set CONCURRENCY=8, --set DRAFT_LENGTH=7,
                                 --set TP2_ATTENTION=on, --set ADDR=0.0.0.0:8001)
   --embedding-placement host|gpu  token embedding residency (EMBEDDING)
   --wip SLOT                     serve a ./wip.sh slot's artifacts in the dev images
@@ -42,10 +42,10 @@ DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
 CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
 KV_POOL_SIZE, HOST_CACHE_BYTES, GPU_MEMORY_CAP, PREFIX_CACHE_ENTRIES,
 MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS, PREFILL_BATCH_TOKENS, SPECULATOR (dspark|off),
-DSPARK_DRAFT_LIMIT (1..7), TP2_ATTENTION, TP2_QUERY_PROJECTION,
+DRAFT_LENGTH (positive integer), TP2_ATTENTION, TP2_QUERY_PROJECTION,
 TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 (--listen, --rtx-gpus, --concurrency, --kv-pool-size,
---prefix-cache-entries, --dspark-draft-limit, --tp2-*, ...) are these keys.
+--prefix-cache-entries, --draft-length, --tp2-*, ...) are these keys.
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
   CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
@@ -75,7 +75,7 @@ legacy_key() {
     --pool-tokens) printf POOL_TOKENS ;; --kv-pool-size) printf KV_POOL_SIZE ;;
     --prefix-cache-entries) printf PREFIX_CACHE_ENTRIES ;;
     --max-context-tokens) printf MAX_CONTEXT_TOKENS ;; --max-output-tokens) printf MAX_OUTPUT_TOKENS ;;
-    --prefill-batch-tokens) printf PREFILL_BATCH_TOKENS ;; --dspark-draft-limit) printf DSPARK_DRAFT_LIMIT ;;
+    --prefill-batch-tokens) printf PREFILL_BATCH_TOKENS ;; --draft-length) printf DRAFT_LENGTH ;;
     *) return 1 ;;
   esac
 }

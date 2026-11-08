@@ -46,8 +46,8 @@ pub(crate) struct ServeArgs {
     /// Split the native draft cache and attention over both physical GPUs.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)] pub tp2_dflash: bool,
     /// Fixed draft depth; absent lets the shared policy choose up to the checkpoint width.
-    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=7))]
-    pub draft_fixed: Option<u8>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     /// The lane holds the exact shared shape (8256 rows for three waves).
     #[arg(long)] pub prefill_rows: Option<usize>,
@@ -195,10 +195,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, concurrency,
                 match loaded.engine.native_draft() {
                     Some(draft) => scheduler::Drafts::Neural {
-                        depth: worker_args.draft_fixed.map_or(draft.drafts(), usize::from),
-                        fixed: worker_args.draft_fixed.is_some() },
+                        depth: draft.drafts() },
                     None => scheduler::Drafts::None,
-                }, eos, worker_args.decode_share, &worker_args.prefix,
+                }, worker_args.draft_length, eos, worker_args.decode_share, &worker_args.prefix,
                 worker_args.loop_abort.config(), worker_args.token_io.token_select,
                 &mut super::super::qwen3_5::serve::text_media(), None, || {
                     loaded.engine.require_live()?;
@@ -282,26 +281,26 @@ mod tests {
     }
 
     #[test]
-    fn native_draft_is_opt_in_with_explicit_precision_and_bounded_fixed_depth() -> Result<()> {
+    fn native_draft_is_opt_in_with_explicit_precision_and_fixed_length() -> Result<()> {
         let defaults = args(&[])?;
         assert!(defaults.draft.is_none());
         assert!(!defaults.draft_fp8);
         assert!(!defaults.tp2_dflash);
-        assert!(defaults.draft_fixed.is_none());
+        assert!(defaults.draft_length.draft_length.is_none());
         for fp8 in ["false", "true"] {
-            let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-fixed", "7"])?;
+            let selected = args(&["--draft", "/drafter", "--draft-fp8", fp8, "--draft-length", "7"])?;
             assert_eq!(selected.draft.as_deref(), Some(std::path::Path::new("/drafter")));
             assert_eq!(selected.draft_fp8, fp8 == "true");
-            assert_eq!(selected.draft_fixed, Some(7));
+            assert_eq!(selected.draft_length.draft_length, Some(7));
         }
         for enabled in ["false", "true"] {
             assert_eq!(args(&["--tp2-dflash", enabled])?.tp2_dflash, enabled == "true");
         }
         assert!(args(&["--tp2-dflash"]).is_err());
         assert!(args(&["--draft-fp8"]).is_err());
-        assert!(args(&["--draft-fixed", "1"]).is_err());
-        for depth in ["0", "8"] {
-            assert!(args(&["--draft", "/drafter", "--draft-fixed", depth]).is_err());
+        assert!(args(&["--draft-length", "1"]).is_ok());
+        for depth in ["0", "invalid"] {
+            assert!(args(&["--draft", "/drafter", "--draft-length", depth]).is_err());
         }
         Ok(())
     }

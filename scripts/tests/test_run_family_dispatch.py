@@ -370,11 +370,11 @@ def test_deepseek_v41_goes_to_run_family_like_every_family(tmp_path: Path) -> No
     repo, hf = _repo(tmp_path), tmp_path / "hf"
     _snapshot(hf, "deepseek-ai/DeepSeek-V4.1-Flash", {"model_type": "deepseek_v41"})
     (repo / "v41.config").write_text("MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n")
-    result = _run(repo, hf, "--config", str(repo / "v41.config"), "--set", "DSPARK_DRAFT_LIMIT=7",
+    result = _run(repo, hf, "--config", str(repo / "v41.config"), "--set", "DRAFT_LENGTH=7",
                   "--wip", "gate", "--restart")
     assert result.returncode == 0, result.stderr
     assert result.stdout == (f"run-family --config {repo / 'v41.config'} --family deepseek_v41 "
-                             "--set DSPARK_DRAFT_LIMIT=7 --wip gate --restart\n")
+                             "--set DRAFT_LENGTH=7 --wip gate --restart\n")
     result = _run(repo, hf, "--config", str(repo / "v41.config"), "--dry-run")
     assert result.returncode == 0, result.stderr
     assert result.stdout.endswith("--family deepseek_v41 --dry-run\n")
@@ -590,7 +590,7 @@ def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selectio
     if revision:
         keys += f"SPECULATOR_MODEL_REVISION={revision}\n"
     if selection == "dspark":
-        keys += "SPECULATOR_DRAFTS=3\n"
+        keys += "DRAFT_LENGTH=3\n"
     result = _family_launch_result(tmp_path, config, model, keys,
         extra_args=("--wip", "dense-test"),
         encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
@@ -604,7 +604,7 @@ def test_dense_27b_dspark_default_and_explicit_disable(tmp_path, model, selectio
         assert launch[launch.index("--draft") + 1] == snapshot
         assert plan[plan.index("--drafter-snapshot") + 1] == snapshot
     if selection == "dspark":
-        assert launch[launch.index("--draft-fixed") + 1] == "3"
+        assert launch[launch.index("--draft-length") + 1] == "3"
 
 
 @pytest.mark.parametrize("model", ["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"])
@@ -2383,12 +2383,12 @@ def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(
                 if "cuteafd plan" in line and "--deployment" in line)
     assert plan[plan.index("--speculator") + 1] == "dspark"
     fixed = _family_launch_result(tmp_path / "fixed", config, "test/ml4",
-        f"RTX_GPUS={gpus}\nSPECULATOR=dspark\nSPECULATOR_DRAFTS=2\nVISION=off\nAUDIO=off\n")
+        f"RTX_GPUS={gpus}\nSPECULATOR=dspark\nDRAFT_LENGTH=2\nVISION=off\nAUDIO=off\n")
     assert fixed.returncode == 0, fixed.stderr
     fixed_serve = next(shlex.split(line) for line in fixed.stderr.splitlines()
                       if "docker run -d" in line and "serve-glm" in line)
     assert "--dspark" in fixed_serve
-    assert fixed_serve[fixed_serve.index("--draft-fixed") + 1] == "2"
+    assert fixed_serve[fixed_serve.index("--draft-length") + 1] == "2"
     disabled = _family_launch_result(tmp_path / "off", config, "test/ml4",
                                     f"RTX_GPUS={gpus}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert disabled.returncode == 0, disabled.stderr
@@ -2701,6 +2701,16 @@ def test_target_head_key_rejects_bad_values_before_launch(tmp_path):
     assert result.returncode == 2 and "TARGET_HEAD must be tensor or exact" in result.stderr, result.stderr
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
+
+
+def test_fixed_length_without_drafter_preserves_precision_defaults(tmp_path):
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/glmf",
+                                  "RTX_GPUS=1\nSPECULATOR=off\nDRAFT_LENGTH=4\n")
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--draft-length 4" in launch, launch
+    assert "--draft-linear" not in launch, launch
+    assert "--draft-fp8" not in launch, launch
 
 
 @pytest.mark.parametrize("keys,forwarded", [("", None), ("GLM5_FLASH_DRAFT_LINEAR=w8a16\n", None),

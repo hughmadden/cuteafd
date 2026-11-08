@@ -2,7 +2,7 @@
 """Replay fixed-K7 requests, then fit the shared six-feature selector prior.
 
 Launch the desired drafter with SPECULATION_TRACE=/abs/trace.jsonl,
-SPECULATOR_DRAFTS=7 and an output/context room no wider than seven positions.
+DRAFT_LENGTH=7 and an output/context room no wider than seven positions.
 This tool never launches a server:
 --replay-url optionally sends 32 fixed, deterministic code requests to one
 already running; --trace fits recorded outcomes without hardware. Output is

@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        draft: "adaptive".into(),
         supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },

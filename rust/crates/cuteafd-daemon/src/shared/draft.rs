@@ -19,6 +19,7 @@ pub(crate) mod binding;
 pub(crate) mod clock;
 pub(crate) mod copy;
 pub(crate) mod evidence;
+pub(crate) mod length;
 pub(crate) mod probe;
 pub(crate) mod remote;
 pub(crate) mod remote_dflash;

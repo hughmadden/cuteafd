@@ -70,10 +70,8 @@ pub(crate) struct ServeArgs {
     /// template's Low effort, think block open, a short plan as reasoning).
     #[arg(long, env = "CUTEAFD_GLM_THINKING_OFF", default_value = "empty")]
     pub thinking_off: GlmThinkingOff,
-    /// With --draft: verify exactly this many DFlash2 drafts per step
-    /// (within the rows) instead of the adaptive policy.
-    #[arg(long)]
-    pub draft_fixed: Option<usize>,
+    #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
     /// Prefill the prompts that wait together in one pass: each prompt's next chunk, up to the first
     /// prefill lane's rows, every per-sequence program over its own rows and one Spark wave per MoE
     /// layer for all of them. Off: one pass per prompt.
@@ -118,10 +116,10 @@ fn verify_room(verify_rows: usize, sequences: usize) -> usize {
     verify_rows.saturating_sub(sequences)
 }
 
-/// Fixed neural count and packed admission prefill.
+/// Shared neural length policy and packed admission prefill.
 #[derive(Debug, Clone, Copy)]
 struct Policy {
-    fixed: Option<usize>,
+    length: crate::shared::draft::length::DraftLength,
     batch: bool,
 }
 
@@ -203,7 +201,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let mut engine_args = args.engine.clone();
     resolve_serving_capacity(&mut engine_args, max_sequences);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), max_sequences, args.decode_share);
-    let policy = Policy { fixed: args.draft_fixed, batch: args.prefill_batch };
+    let policy = Policy { length: args.draft_length, batch: args.prefill_batch };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || console_layout(&args, &profile.id, max_sequences));
     let vision = args.vision;
@@ -244,15 +242,14 @@ fn console_layout(args: &ServeArgs, model: &str, max_sequences: usize) -> Result
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
     layout.concurrency = max_sequences;
-    let policy = match args.draft_fixed {
-        Some(n) => format!("fixed {n}"),
-        None => "adaptive".to_string(),
-    };
-    let drafter = args.engine.draft.as_deref()
-        .map(|snapshot| super::dspark::is_dspark(snapshot).map(|dspark| if dspark { "dSpark" } else { "DFlash2" }))
-        .transpose()?;
-    layout.speculator = drafter.map(|name| console::Speculator { name: name.into(), positions: 8,
-        policy: policy + " · confident copy continuation" });
+    layout.speculator = args.engine.draft.as_deref().map(|snapshot| {
+        let dspark = super::dspark::is_dspark(snapshot)?;
+        let native = if dspark { super::dspark::DsparkConfig::read(snapshot)?.drafts() }
+            else { crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts() };
+        Ok::<_, anyhow::Error>(console::Speculator {
+            name: if dspark { "dSpark" } else { "DFlash2" }.into(), positions: native,
+            policy: args.draft_length.label(native) })
+    }).transpose()?;
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
             ("draft", "block draft", Accepted), ("plan", "draft plan + copy windows", Ink),
@@ -431,7 +428,7 @@ struct SharedPolicy {
 
 impl SharedPolicy {
     fn new(engine: &GlmfEngine<'_>, opened: &Opened, drafter: &super::dspark::Drafter<'_>,
-        ranks: Option<usize>) -> Result<Self> {
+        ranks: Option<usize>, length: crate::shared::draft::length::DraftLength) -> Result<Self> {
         let geometry = engine.draft_geometry(opened.experts.as_ref(), drafter.drafts(),
             super::draft_binding::COPY_EXTENSION)?;
         let layers = &geometry.layers;
@@ -442,8 +439,7 @@ impl SharedPolicy {
             first_slice_bytes = slice, rows = geometry.max_requests, width = ?geometry.widths, ranks,
             installed_group_rows = ?layers.iter().map(|l| l.group_rows).collect::<Vec<_>>(),
             "GLM Flash shared draft policy geometry");
-        let mut policy = cuteafd_core::DraftPolicy::seeded(geometry, super::draft_binding::seed())?;
-        crate::shared::draft::apply_length_rule(&mut policy);
+        let policy = length.policy(geometry, super::draft_binding::seed(), drafter.drafts())?;
         engine.arm_draft_probe(engine.decode_rows)?;
         let fp8_head = matches!(engine.draft_head(), crate::shared::speculation::dflash::TargetHead::Launch(_));
         let trace = crate::shared::speculation_trace::Trace::open()?.is_some();
@@ -962,10 +958,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // `--decode-rows 128`).
     let verify_rows = engine.verify_rows;
     // The resource-priced shared draft policy (v3 D2/D3) chooses DFlash2/dSpark verify lengths under
-    // the verify-row budget; a fixed count keeps its own.
+    // the verify-row budget; fixed mode bypasses prices in the same policy.
     let mut shared = match drafter {
-        Some(drafter) if policy.fixed.is_none() =>
-            Some(SharedPolicy::new(engine, opened, drafter, ranks)?),
+        Some(drafter) => Some(SharedPolicy::new(engine, opened, drafter, ranks, policy.length)?),
         _ => None,
     };
     let mut active: Vec<Active<'_>> = Vec::new();
@@ -1092,8 +1087,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 continue;
             };
             // Disabled neural drafts need neither a ring slot nor context updates.
-            let slot = take_ring(&mut free_slots, drafter.is_some() && !probe::no_speculation(&ready.job().job.probe)
-                && policy.fixed != Some(0), &mut ring_misses);
+            let slot = take_ring(&mut free_slots, drafter.is_some() && !probe::no_speculation(&ready.job().job.probe), &mut ring_misses);
             cache.tick();
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
@@ -1329,7 +1323,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             continue;
         }
         let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened, policy.fixed,
+        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
             &mut free_slots, &mut trace, cycle)))? else { continue };
         for index in (0..active.len()).rev() {
@@ -1426,7 +1420,7 @@ impl LaneCommit for Commit<'_, '_, '_, '_> {
 /// One round of lane 0: draft, plan, verify, select, emit and commit. `None`
 /// when the step failed and its requests were released.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Opened, fixed: Option<usize>,
+async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Opened,
     verify_rows: usize, lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<SharedPolicy>,
     selector: &mut TokenSelector<'_>, family: &GlmfPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
     free_kda: &mut Vec<i32>, free_slots: &mut Vec<usize>, trace: &mut Option<crate::shared::speculation_trace::Trace>,
@@ -1502,16 +1496,16 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         }).collect();
     let copies: Vec<_> = active.iter().zip(&drafted).zip(&limits).zip(&mut shared_priors)
         .map(|(((a, draft), &limit), prior)| match (&shared, draft) {
-            (Some(shared), Some(d)) if fixed.is_none() =>
+            (Some(shared), Some(d)) if !shared.policy.fixed() =>
                 super::draft_binding::copy_continuation(&shared.policy, active.len(), a.ticket.id(), &a.history,
                     &d.tokens, prior, limit, a.job.sampling.is_greedy()),
             _ => None,
         }).collect();
     let mut predicted = None;
-    let mut planned = match (fixed, shared.as_mut()) {
+    let mut planned = match shared.as_mut() {
         // No draft pass ran: every sequence verifies its next token alone.
-        (None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
-        (None, Some(shared)) => {
+        Some(_) if drafted_width == 0 => vec![0; active.len()],
+        Some(shared) => {
             let candidates: Vec<_> = active.iter().zip(&shared_priors).zip(&limits).zip(&drafted)
                 .map(|(((a, prior), &limit), draft)| super::draft_binding::Candidate { id: a.ticket.id(), prior,
                     limit, selector: draft.as_ref().is_some_and(|d| d.confidence.is_empty()), cold: a.drafts.cold() })
@@ -1524,11 +1518,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             predicted = selection.predicted;
             selection.lengths
         }
-        // A fixed count within each sequence's room.
-        (Some(fixed), _) => drafted.iter().zip(&limits).map(|(draft, &limit)| draft.as_ref()
-            .map_or(0, |d| fixed.min(limit).min(d.tokens.len()))).collect(),
         // No neural drafter means no speculative proposal.
-        (None, None) => vec![0; active.len()],
+        None => vec![0; active.len()],
     };
     if super::draft_binding::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
         |i| active[i].ticket.id()) { predicted = None; }

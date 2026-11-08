@@ -37,7 +37,7 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
                 requests: Default::default(), pending: vec![None; lane_count],
                 request_limit: requests as usize, draft_limit: 5, draft_width: weights.draft_width(),
-                confidence_trace: Default::default(), neural_lengths: Default::default(), fixed: false, policy: None,
+                confidence_trace: Default::default(), neural_lengths: Default::default(), length: Default::default(), policy: None,
                 published: None,
                 lanes: (0..lane_count).map(|_| LaneRound::new(policy::LAYERS, policy::TOPK)).collect(),
             })

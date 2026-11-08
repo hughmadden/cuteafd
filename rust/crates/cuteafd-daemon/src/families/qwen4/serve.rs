@@ -38,6 +38,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
+    pub draft_length: crate::shared::draft::length::DraftLength,
+    #[command(flatten)]
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
@@ -47,10 +49,6 @@ pub(crate) struct ServeArgs {
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
-    /// With --mtp: verify exactly --mtp drafts per sequence where room allows
-    /// instead of the adaptive plan.
-    #[arg(long)]
-    pub mtp_fixed: bool,
     #[command(flatten)]
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
@@ -106,7 +104,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     cuteafd_bench::context::set_resolved("mtp", &engine_args.mtp.min(DECODE_ROWS - 1).to_string());
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
-        Drafts::Neural { depth: engine_args.mtp.min(DECODE_ROWS - 1), fixed: args.mtp_fixed }
+        Drafts::Neural { depth: engine_args.mtp.min(DECODE_ROWS - 1) }
     } else { Drafts::None };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id, drafts, &eos)));
@@ -114,7 +112,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix,
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, args.draft_length, eos, decode_share, prefix,
             vision, media_cache_bytes, remote, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = args.prefix.reserve.limits(max_context)?;
@@ -149,8 +147,8 @@ fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) ->
     layout.eos = eos.to_vec();
     layout.speculator = match drafts {
         Drafts::None => None,
-        Drafts::Neural { depth, fixed } => Some(console::Speculator { name: "MTP".into(), positions: depth,
-            policy: if fixed { format!("fixed {depth}") } else { format!("adaptive ≤ {depth}") } }),
+        Drafts::Neural { depth } => Some(console::Speculator { name: "MTP".into(), positions: depth,
+            policy: args.draft_length.label(depth) }),
     };
     layout.steps = vec![
         StepGroup::new("Decode step", "host clock", &[("round.cycle", "step", Target),
@@ -170,7 +168,8 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
+    draft: Drafts,
+    length: crate::shared::draft::length::DraftLength, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     args.planner_graph_modes = Some((max_sequences, !matches!(draft, Drafts::None)));
@@ -224,7 +223,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             *stats = serde_json::json!({});
             probe::graph_capture_stats(&mut stats);
         }
-        scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences, draft, eos,
+        scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences, draft, length, eos,
             decode_share, &prefix, loop_abort, args.token_io.token_select, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));

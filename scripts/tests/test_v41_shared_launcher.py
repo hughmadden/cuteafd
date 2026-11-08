@@ -177,7 +177,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         else:
             config = ROOT / "examples/configs" / f"{case}.config"
             overrides = {}
-        for flag in ("--kv-pool-size", "--dspark-draft-limit"):
+        for flag in ("--kv-pool-size", "--draft-length"):
             if flag in command:
                 additions += [flag, command[command.index(flag) + 1]]
         cache = command[command.index("--host-cache-bytes") + 1] if "--host-cache-bytes" in command else "0"
@@ -188,10 +188,10 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         index = expected.index("--available-sparks") + 2
         expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
         enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
-        draft_limit = command[command.index("--dspark-draft-limit") + 1] if "--dspark-draft-limit" in command else ""
+        draft_limit = command[command.index("--draft-length") + 1] if "--draft-length" in command else ""
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"
-                      f"DSPARK_DRAFT_LIMIT={draft_limit}\nEXPERT_USAGE=on\n"
+                      f"DRAFT_LENGTH={draft_limit}\nEXPERT_USAGE=on\n"
                       + ''.join(f"SPARK_{rank}_HOST={host}\n" for rank, host in enumerate(HOSTS[:available])))
         digest = hashlib.sha256(normalized.encode()).hexdigest()[:16]
         mount_index = expected.index("-v") + 2
@@ -220,17 +220,17 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
         assert args[args.index("--mapped-scale-preload-gib") + 1] == cap
 
 
-@pytest.mark.parametrize("limit", [None, "7"])
-def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
+@pytest.mark.parametrize("limit", [None, "7", "99"])
+def test_draft_length_reaches_plan_and_serve(tmp_root, monkeypatch, limit) -> None:
     import v41_launch_capture as capture_module
     original = capture_module.example_config
 
     def with_limit(name, directory):
         config = original(name, directory)
         text = "\n".join(line for line in config.read_text().splitlines()
-                         if not line.startswith("DSPARK_DRAFT_LIMIT=")) + "\n"
+                         if not line.startswith("DRAFT_LENGTH=")) + "\n"
         if limit is not None:
-            text += f"DSPARK_DRAFT_LIMIT={limit}\n"
+            text += f"DRAFT_LENGTH={limit}\n"
         config.write_text(text)
         return config
 
@@ -238,8 +238,8 @@ def test_dspark_draft_limit_reaches_plan_and_serve(tmp_root, monkeypatch, limit)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     command = parse_run(result["containers"][0]["argv"])["command"]
     for args in [command, *result["plans"]]:
-        assert args.count("--dspark-draft-limit") == (limit is not None)
-        resolved = args[args.index("--dspark-draft-limit") + 1] if limit is not None else "5"
+        assert args.count("--draft-length") == (limit is not None)
+        resolved = args[args.index("--draft-length") + 1] if limit is not None else "5"
         assert resolved == (limit or "5")
 
 

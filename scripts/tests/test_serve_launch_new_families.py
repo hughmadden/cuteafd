@@ -127,16 +127,16 @@ def test_kimi_dflash2_uses_one_resolved_fp8_snapshot_for_plan_and_serve(tmp_path
     _snapshot(tmp_path / "hf", model, {}, revision=revision)
     result = _kimi(tmp_path, f"SPECULATOR={'dflash2' if enabled else 'off'}\n"
                             f"SPECULATOR_MODEL_ID={model}\nSPECULATOR_MODEL_REVISION={revision}\n"
-                            + ("SPECULATOR_DRAFTS=7\n" if enabled else ""))
+                            + ("DRAFT_LENGTH=7\n" if enabled else ""))
     serve, plan = _line(result, "serve-kimi --snapshot"), _line(result, "cuteafd plan")
     assert _flag(plan, "--speculator") == ("dflash2" if enabled else "off")
     if enabled:
         snapshot = str(tmp_path / f"hf/hub/models--{model.replace('/', '--')}/snapshots/{revision}")
         assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
         assert _flag(serve, "--draft-fp8") == _flag(plan, "--draft-fp8") == "true"
-        assert _flag(serve, "--draft-fixed") == "7"
+        assert _flag(serve, "--draft-length") == "7"
     else:
-        assert all(flag not in serve.split() for flag in ("--draft", "--draft-fp8", "--draft-fixed"))
+        assert all(flag not in serve.split() for flag in ("--draft", "--draft-fp8", "--draft-length"))
         assert all(flag not in plan.split() for flag in ("--drafter-snapshot", "--draft-fp8"))
 
 
@@ -445,7 +445,7 @@ def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, 
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
-    ("SPECULATOR_DRAFTS=adaptive\n", "unused configuration key: SPECULATOR_DRAFTS"),
+    ("DRAFT_LENGTH=adaptive\n", "DRAFT_LENGTH must be a positive integer"),
     ("KV_CACHE=int8\n", "KV_CACHE must be bf16 or fp8"),
 ])
 def test_step5_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagnostic: str) -> None:
@@ -721,14 +721,14 @@ def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
 def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, drafter, revision, cache) -> None:
     _snapshot(tmp_path / "hf", drafter, {}, revision=revision)
     keys = (f"SPECULATOR=dflash2\nSPECULATOR_MODEL_ID={drafter}\nSPECULATOR_MODEL_REVISION={revision}\n"
-            "SPECULATOR_DRAFTS=5\n" + ("" if cache is None else f"DRAFT_KV_CACHE={cache}\n"))
+            "DRAFT_LENGTH=5\n" + ("" if cache is None else f"DRAFT_KV_CACHE={cache}\n"))
     result = _muse(tmp_path, keys)
     serve, plan = _line(result, "serve-muse --snapshot"), _line(result, "cuteafd plan")
     snapshot = str(tmp_path / f"hf/hub/models--{drafter.replace('/', '--')}/snapshots/{revision}")
     assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
     assert _flag(plan, "--speculator") == "dflash2"
     assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == (cache or "fp8")
-    assert _flag(serve, "--draft-fixed") == "5"
+    assert _flag(serve, "--draft-length") == "5"
     assert "--draft-fp8" not in serve.split()
 
 

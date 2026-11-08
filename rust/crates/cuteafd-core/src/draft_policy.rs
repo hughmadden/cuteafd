@@ -769,6 +769,7 @@ pub struct DraftPolicy {
     native_confidence_positions: usize,
     priced: Vec<Priced>,
     fixed: bool,
+    fixed_length: Option<usize>,
     cost: CostModel,
     /// Per request, the routes of recent committed tokens, newest first, each
     /// `layers * topk` expert ids.
@@ -844,7 +845,7 @@ impl DraftPolicy {
             selected_rows: BTreeMap::new(),
             selected_draft_room: BTreeMap::new(), skipped: BTreeMap::new(),
             action_age: BTreeMap::new(), simple: None,
-            seed, priced, fixed,
+            seed, priced, fixed, fixed_length: None,
             history: BTreeMap::new(),
             novelty: std::array::from_fn(|_| vec![2.5; geometry.layers.len()]),
             confidence: std::array::from_fn(|_| Confidence::new(positions)),
@@ -859,6 +860,7 @@ impl DraftPolicy {
     /// A fresh policy over the same geometry and priors.
     pub fn restarted(&self, fixed: bool) -> Self {
         let mut policy = Self::build(self.geometry.clone(), fixed, self.seed.clone());
+        policy.fixed_length = self.fixed_length;
         policy.survival_lengths = self.survival_lengths;
         policy.set_draft_mode(self.draft_mode());
         policy.set_row_cost(self.row_cost());
@@ -927,6 +929,17 @@ impl DraftPolicy {
     }
     pub fn fixed(&self) -> bool {
         self.fixed
+    }
+
+    /// Effective native draft extent in fixed mode, before the round's row cap.
+    pub fn fixed_length(&self) -> Option<usize> { self.fixed_length }
+
+    pub fn set_fixed_length(&mut self, length: usize) -> Result<(), DraftPolicyError> {
+        if !self.fixed || length == 0 || length > self.geometry.max_positions || self.stats.rounds != 0 {
+            return Err(DraftPolicyError::Geometry("invalid fixed draft length or policy already observed"));
+        }
+        self.fixed_length = Some(length);
+        Ok(())
     }
     pub fn geometry(&self) -> &PolicyGeometry {
         &self.geometry
@@ -2246,6 +2259,8 @@ mod tests {
         let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         assert_eq!(policy.select(false, &[DraftCandidate { id: 1, confidence: &[0.1; 5] }], 5), Ok(None));
         let mut fixed = DraftPolicy::new(placement(5), PolicySeed::weak(7), true).unwrap();
+        fixed.set_fixed_length(4).unwrap();
+        assert_eq!(fixed.restarted(true).fixed_length(), Some(4));
         let truth = truth();
         let mut token = 0;
         for _ in 0..300 { run_round(&mut fixed, &truth, &mut token, 6, 3, None); }

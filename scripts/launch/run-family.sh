@@ -526,12 +526,10 @@ release_validate_tp2_options
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
 [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
 case "$SPECULATOR" in dspark|off) ;; *) release_die "SPECULATOR must be dspark or off for DeepSeek V4.1" ;; esac
-# DSPARK_DRAFT_LIMIT: dSpark draft width per request, 1..7 (unset: the engine's 5).
-dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
-[[ -z "$dspark_draft_limit" || "$dspark_draft_limit" =~ ^[1-7]$ ]] ||
-  release_die "DSPARK_DRAFT_LIMIT must be in 1..7"
-[[ -z "$dspark_draft_limit" || "$SPECULATOR" == dspark ]] ||
-  release_die "DSPARK_DRAFT_LIMIT requires dSpark"
+# Unset preserves V4.1's adaptive five-token maximum.
+draft_length="$DRAFT_LENGTH"
+[[ -z "$draft_length" || "$draft_length" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "DRAFT_LENGTH must be a positive integer"
 release_validate_verbs_device_map
 # V41_FP8_HEAD: which vocabulary heads run from one resident E4M3 copy: all
 # (target and dSpark draft), draft (the draft only; the target keeps its BF16
@@ -687,7 +685,7 @@ esac
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
-count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DSPARK_DRAFT_LIMIT "$dspark_draft_limit" EXPERT_USAGE "$(get EXPERT_USAGE on)"
+count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" DRAFT_LENGTH "$draft_length" EXPERT_USAGE "$(get EXPERT_USAGE on)"
   for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
@@ -721,7 +719,7 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 count_args+=(--speculator "$SPECULATOR")
-[[ -z "$dspark_draft_limit" ]] || count_args+=(--dspark-draft-limit "$dspark_draft_limit")
+[[ -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
 deployment_peers=()
 for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   lane_key="SPARK_${rank}_LANE_A"
@@ -907,7 +905,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -933,7 +931,7 @@ if ((dry_run)); then
     echo "  Spark image must advertise V41 expert role: $spark_tp_roles_required (selected rank advertises: ${spark_advertised_roles:-<unreadable>})"
   echo "  memory policy: ${memory_policy_args[*]:-defaults (full GPU cap, family reserves, 2M KV target)}"
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
-  echo "  dSpark draft: policy=$DSPARK_DRAFT_POLICY limit=${dspark_draft_limit:-5}"
+  echo "  dSpark draft: ${draft_length:+fixed }${draft_length:-adaptive (maximum 5)}"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
@@ -1066,8 +1064,7 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
   args+=(--pool-tokens "$planner_tokens")
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
-[[ "$SPECULATOR" != dspark || "$DSPARK_DRAFT_POLICY" != full ]] || args+=(--dspark-fixed)
-[[ -z "$dspark_draft_limit" ]] || args+=(--dspark-draft-limit "$dspark_draft_limit")
+[[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)
 [[ "$TP2_QUERY_PROJECTION" != on ]] || args+=(--tp2-query-projection)
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
@@ -1716,13 +1713,12 @@ case "$speculator" in
   mtp)
     family_args+=(--mtp "$(get SPECULATOR_DEPTH "$mtp_depth")") ;;
 esac
-# SPECULATOR_DRAFTS: adaptive (default) or a fixed draft count per cycle
-# (DFlash2 on GLM 5.x, GLM 5.3 Flash and MiMo V2; dSpark on Mistral Large 4, GLM 5.3 Flash or dense Qwen), for policy A/B runs.
-drafts="$(get SPECULATOR_DRAFTS adaptive)"
-if [[ "$drafts" != adaptive ]]; then
-  [[ "$drafts" =~ ^[0-9]+$ && ($speculator == dflash2 || $family:$speculator == glm5_flash:dspark || $checkpoint_family:$speculator == mistral_large4:dspark || $family:$speculator == qwen3_5:dspark) ]] ||
-    { echo "SPECULATOR_DRAFTS must be adaptive or a draft count, with SPECULATOR=dflash2 (or dspark on Mistral Large 4, GLM 5.3 Flash or dense Qwen)" >&2; exit 2; }
-  draft_args+=(--draft-fixed "$drafts")
+draft_model_args=${#draft_args[@]}
+# One fixed-length override for every family and speculator.
+draft_length="$(get DRAFT_LENGTH)"
+if [[ -n "$draft_length" ]]; then
+  [[ "$draft_length" =~ ^[1-9][0-9]*$ ]] || release_die "DRAFT_LENGTH must be a positive integer"
+  draft_args+=(--draft-length "$draft_length")
 fi
 # Prefix cache (MiMo, GLM 5.3, GLM 5.3 Flash, Qwen 3.8, DeepSeek V4): PREFIX_CACHE_ENTRIES
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
@@ -1912,7 +1908,7 @@ fi
 if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get L2_PREFETCH)" ]] || family_args+=(--l2-prefetch "$(get L2_PREFETCH)")
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")
-  if [[ ${#draft_args[@]} -gt 0 ]]; then
+  if ((draft_model_args > 0)); then
     if [[ $family == mimo_v2 ]]; then
       [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || family_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
       [[ -z "$(get DRAFT_SEQUENCES)" ]] || family_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
@@ -2103,7 +2099,7 @@ if [[ $family == glm5_flash ]]; then
   # 64 rows), wide (the same bits in passes of 128 rows) or w8a8 (past one draft block, E4M3
   # activations per row and 128-wide K block on FP8 tensor cores). Drafts only.
   draft_linear_default=w8a16
-  if [[ ${#draft_args[@]} != 0 && "$(get SPECULATOR_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
+  if [[ "$draft_model_args" != 0 && "$(get SPECULATOR_FP8 auto)" != off ]]; then draft_linear_default=w8a8; fi
   draft_linear="$(get GLM5_FLASH_DRAFT_LINEAR "$draft_linear_default")"
   case "$draft_linear" in
     ""|w8a16) ;;
