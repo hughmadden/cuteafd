@@ -136,17 +136,10 @@ impl Drop for GraphExec<'_> {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("GLM rank {rank} decode key {key:?} is absent from the sealed startup graph inventory")]
-struct UndeclaredDecodeGraph {
-    rank: usize,
-    key: GraphKey,
-}
-
-fn startup_capture_allowed(warmed: bool, warming: bool, rank: usize, key: GraphKey)
-    -> std::result::Result<bool, UndeclaredDecodeGraph> {
-    if warmed { Err(UndeclaredDecodeGraph { rank, key }) } else { Ok(warming) }
-}
+/// Only the explicit startup warm-up may capture. A key the sealed startup set
+/// lacks after it runs the segment eagerly: it allocates nothing and pays only
+/// its own launches, so live traffic never captures.
+fn startup_capture_allowed(warmed: bool, warming: bool) -> bool { !warmed && warming }
 
 /// Host tables of one step.
 #[derive(Clone)]
@@ -633,7 +626,6 @@ pub(crate) struct GlmEngine<'a> {
     pub(super) usage_active: Cell<bool>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
-    graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::drafter::GlmDrafter<'a>>,
     /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
@@ -793,7 +785,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -2194,17 +2186,12 @@ impl<'a> GlmEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        // Only the explicit startup warm-up may capture. Disabled, partial and
-        // transport-free warm paths stay eager, including before Ready.
-        let capture = startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get(), rank, key)
-            .map_err(|error| {
-                let misses = self.graph_misses.get().saturating_add(1);
-                self.graph_misses.set(misses);
-                tracing::error!(rank, ?key, graph_misses = misses, %error,
-                    "GLM sealed startup graph inventory violation");
-                error
-            })?;
-        if !capture { return segment(); }
+        // Only the explicit startup warm-up may capture. Disabled, partial,
+        // transport-free and post-warmup paths stay eager, including before
+        // Ready; the shape allocates nothing outside the declared set.
+        if !startup_capture_allowed(self.graphs_warmed.get(), self.graphs_warming.get()) {
+            return segment();
+        }
         // SAFETY: capture records launches on that rank's stream; nothing in the
         // segment synchronizes the host.
         self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
@@ -3372,18 +3359,13 @@ mod long_graph_tests {
     use super::*;
 
     #[test]
-    fn graph_capture_is_startup_only_and_sealed_misses_are_typed_errors() {
-        let key = GraphKey { layer: 7, rows: 64, table_width: 16384, table_stride: 16384,
-            previous: Previous::Planes(6), head: false };
+    fn graph_capture_is_startup_only_and_sealed_misses_run_eager() {
         // Skipped/disabled/partial warm-up never acquires capture permission.
-        assert!(!startup_capture_allowed(false, false, 0, key).unwrap());
-        assert!(startup_capture_allowed(false, true, 0, key).unwrap());
+        assert!(!startup_capture_allowed(false, false));
+        assert!(startup_capture_allowed(false, true));
+        // A sealed set never captures a shape it lacks; the step runs ungraphed.
         for warming in [false, true] {
-            let error = startup_capture_allowed(true, warming, 1, key).unwrap_err();
-            assert_eq!(error.rank, 1);
-            assert_eq!(error.key, key);
-            let message = error.to_string();
-            assert!(message.contains("rank 1") && message.contains(&format!("{key:?}")));
+            assert!(!startup_capture_allowed(true, warming));
         }
     }
 
