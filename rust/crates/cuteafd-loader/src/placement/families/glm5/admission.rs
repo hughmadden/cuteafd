@@ -1749,7 +1749,7 @@ impl StartupGraphs {
                 _ => {}
             }
             figures.push(row.figure);
-            ranks.push(GraphRank { executables: keys.len() as u64, bytes: row.bytes, margin: 0, basis: row.basis });
+            ranks.push(GraphRank { executables: keys.len() as u64, bytes: row.bytes, margin: 0, basis: row.basis, node_charge: None });
             fingerprints.push(fingerprint);
         }
         if !estimated.is_empty() {
