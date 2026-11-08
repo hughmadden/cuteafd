@@ -663,6 +663,8 @@ def worker(payload):
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
     os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = "1"
     os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = "1"
+    # As native/CMakeLists.txt: Triton line info embeds the checkout path (#1485).
+    os.environ["TRITON_DISABLE_LINE_INFO"] = "1"
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
