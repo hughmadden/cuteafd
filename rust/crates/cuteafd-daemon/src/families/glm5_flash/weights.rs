@@ -938,7 +938,11 @@ impl<'a> GlmfLoader<'a> {
                     sources.push((key, name, bytes, dtype, shape));
                 }
                 for (key, image) in super::kx7::pack_layer(cfg, sources)? {
-                    kx7.insert(key, crate::shared::kx7::Kx7Weights::upload(self.library, &image)?);
+                    // Each pack lands in the arena views its layout reserved at the pack's bound.
+                    let views = crate::shared::kx7::arena_views(&format!("{p}.{key}"), image.n, image.k)?;
+                    let weights = self.on_rank(0, || crate::shared::kx7::Kx7Weights::upload_with(self.library, &image,
+                        |buffer, _| self.allocation(0, &views[buffer].0, views[buffer].1)))?;
+                    kx7.insert(key, weights);
                 }
                 ops.insert("w_aux", self.rows_on(0, &[a("f_a_proj.weight"), a("g_a_proj.weight"), a("b_proj.weight")])?);
                 for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,

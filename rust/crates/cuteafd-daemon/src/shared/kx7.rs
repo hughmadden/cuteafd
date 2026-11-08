@@ -156,6 +156,17 @@ impl PackSplit {
     }
 }
 
+/// The weight-arena views a resident [n, k] pack named `stem` takes, in [`Kx7Weights`] buffer
+/// order (tables, offsets, lengths, streams): each buffer's resident admission bound
+/// (`cuteafd_core::kx7::resident_bound`, at least [`FLOOR`] bytes), known before any weight is
+/// read. A weight layout reserves these and [`Kx7Weights::upload_with`] lands the pack in them.
+pub(crate) fn arena_views(stem: &str, n: usize, k: usize) -> Result<[(String, usize); 4]> {
+    let bound = cuteafd_core::kx7::resident_bound(n, k)?;
+    let sizes = [bound.tables, bound.offsets, bound.lengths, bound.streams];
+    let names = ["tables", "offsets", "lengths", "streams"];
+    Ok(std::array::from_fn(|i| (format!("{stem}.kx7.{}", names[i]), sizes[i].max(FLOOR) as usize)))
+}
+
 /// One resident KX7 matrix [n, k]: its four buffers on one GPU and its code's header scalars.
 pub(crate) struct Kx7Weights<'a> {
     buffers: [DeviceAllocation<'a>; 4],
@@ -170,14 +181,25 @@ impl<'a> Kx7Weights<'a> {
     /// Uploads `image` to the current device (each buffer at least [`FLOOR`] bytes; device
     /// allocations are 256-byte aligned, as the streams' 16-byte quad loads need).
     pub fn upload(library: &'a NativeLibrary, image: &Kx7Image) -> Result<Self> {
+        Self::upload_with(library, image, |_, bytes| DeviceAllocation::new(library, (bytes as u64).max(FLOOR) as usize))
+    }
+
+    /// [`Self::upload`] into allocations `allocate(buffer, bytes)` gives (buffer 0..4 in
+    /// tables, offsets, lengths, streams order; at least `bytes` each), such as the weight
+    /// arena's [`arena_views`].
+    pub fn upload_with(library: &'a NativeLibrary, image: &Kx7Image,
+        mut allocate: impl FnMut(usize, usize) -> Result<DeviceAllocation<'a>>) -> Result<Self> {
         let _memory_format = cuteafd_ffi::memory_ledger::format("kx7");
-        let [tables, offsets, lengths, streams] = image.buffers().map(|bytes| -> Result<DeviceAllocation<'a>> {
-            let allocation = DeviceAllocation::new(library, (bytes.len() as u64).max(FLOOR) as usize)?;
-            crate::shared::memory::load_timing::upload(bytes.len(), || library.copy_h2d(allocation.buffer, bytes))?;
-            Ok(allocation)
-        });
-        Ok(Self { buffers: [tables?, offsets?, lengths?, streams?], code: image.code, esc_len: image.esc_len,
-            table_words: image.table_words, n: image.n, k: image.k })
+        let mut buffers = Vec::with_capacity(4);
+        for (i, bytes) in image.buffers().into_iter().enumerate() {
+            let allocation = allocate(i, bytes.len())?;
+            ensure!(allocation.buffer.bytes >= bytes.len(), "KX7 {} buffer {i}: {} bytes do not fit its {}-byte allocation",
+                image.name, bytes.len(), allocation.buffer.bytes);
+            crate::shared::memory::load_timing::upload(bytes.len(), || library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..allocation.buffer }, bytes))?;
+            buffers.push(allocation);
+        }
+        let buffers: [DeviceAllocation<'a>; 4] = buffers.try_into().map_err(|_| anyhow::anyhow!("KX7 pack buffers"))?;
+        Ok(Self { buffers, code: image.code, esc_len: image.esc_len, table_words: image.table_words, n: image.n, k: image.k })
     }
 
     /// Device bytes of the four allocations.
