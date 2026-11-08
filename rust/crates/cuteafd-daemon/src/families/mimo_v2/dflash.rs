@@ -374,7 +374,10 @@ mod mask_tests {
                 assert_eq!(actual, expected, "{representation:?} sinks={sinks}");
                 let layout = c.weight_layout(representation)?;
                 assert!(one.payload_bytes() as u64 >= layout.resident_bytes()?, "{representation:?}");
-                let halves = (0..2).map(|rank| dflash_arena_requests(&c, representation, rank, 2))
+                // TP2 needs dividing KV heads (the shared fixture has one).
+                let split = DflashConfig { kv_heads: 2, ..c.clone() };
+                let one = dflash_arena_requests(&split, representation, 0, 1)?;
+                let halves = (0..2).map(|rank| dflash_arena_requests(&split, representation, rank, 2))
                     .collect::<Result<Vec<_>>>()?;
                 assert_eq!(halves[0].views().keys().collect::<Vec<_>>(), one.views().keys().collect::<Vec<_>>());
                 assert_eq!(halves[0].views().values().map(|v| v.bytes()).collect::<Vec<_>>(),

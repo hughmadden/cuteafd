@@ -271,11 +271,11 @@ mod tests {
             }
         }
         // The bundled DFlash2 drafter (its own DraftLoad arena), BF16-only as shipped.
-        let draft = super::draft_config::DflashConfig::read(&snapshot.join("dflash"))?;
+        let draft = crate::families::mimo_v2::draft_config::DflashConfig::read(&snapshot.join("dflash"))?;
         for ranks in [1, 2] {
             for rank in 0..ranks {
                 let layout = dflash_arena_requests(&draft,
-                    super::draft_representation::MimoDraftRepresentation::Bf16Only, rank, ranks)?;
+                    crate::families::mimo_v2::draft_representation::MimoDraftRepresentation::Bf16Only, rank, ranks)?;
                 let requests = layout.views().values().map(|v| v.bytes() as u64).collect::<Vec<_>>();
                 let large = requests.iter().filter(|&&b| b > MIB).collect::<Vec<_>>();
                 let rounding = large.iter().map(|&&b| b.div_ceil(SM120_GRANULE) * SM120_GRANULE - b).sum::<u64>();
