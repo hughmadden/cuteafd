@@ -542,8 +542,11 @@ mod tests {
                 let mut arenas = vec![target];
                 if rank == draft_home { arenas.push(draft_owners.draft_arenas[rank].clone()); }
                 testing::assert_weight_arena_items(&layout.devices[rank], &arenas);
-                assert!(!layout.devices[rank].items.iter().any(|item|
-                    item.group == "target weights" || item.group == "embedding"));
+                assert!(!layout.devices[rank].items.iter().any(|item| item.group == "target weights"));
+                for alias in layout.devices[rank].items.iter().filter(|item| item.group == "embedding") {
+                    assert_eq!(alias.bytes, 0);
+                    assert_eq!(alias.format, "alias of target weight arena; charged in weight arena");
+                }
             }
             let serialized = serde_json::to_value(&report)?;
             let devices = serialized["memory_layout"]["devices"].as_array().unwrap();
