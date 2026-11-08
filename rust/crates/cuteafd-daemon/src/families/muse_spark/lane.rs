@@ -4,6 +4,7 @@
 //! program launch takes its buffers from here, so a launch can never address
 //! past the plane the planner charged.
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::lane::LanePlanes;
@@ -70,8 +71,7 @@ pub(crate) struct Lane<'a> {
 
 impl<'a> Lane<'a> {
     pub(crate) fn allocate(device: Device<'a>, planes: &LanePlanes) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse lane planes");
-        let owner = Allocation::untagged(device, planes.bytes()?)?;
+        let owner = Allocation::new(device, planes.bytes()?, Tag::workspace("muse/lane"))?;
         let views = LaneViews::carve(planes, owner.buffer)?;
         Ok(Self { _owner: owner, views })
     }

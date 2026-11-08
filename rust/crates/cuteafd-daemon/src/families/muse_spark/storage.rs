@@ -5,6 +5,7 @@
 //! same group before it is made.
 use super::device::LayerKv;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::{cache::{MuseCacheLayout, PAGE_ROWS}, MuseAttention, MuseSparkConfig};
@@ -57,12 +58,10 @@ impl<'a> RankKv<'a> {
             "Muse sliding rings differ from admission ({} charged, {} allocated)", charged("sliding rings"),
             extents.ring_bytes());
         let pool = {
-            let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse records");
-            std::rc::Rc::new(Allocation::untagged(device, extents.pool_bytes().max(256))?)
+            std::rc::Rc::new(Allocation::new(device, extents.pool_bytes().max(256), Tag::kv("muse/kv-records"))?)
         };
         let rings = {
-            let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse sliding rings");
-            Allocation::untagged(device, extents.ring_bytes().max(256))?
+            Allocation::new(device, extents.ring_bytes().max(256), Tag::kv("muse/kv-rings"))?
         };
         let (mut full, mut sliding) = (0usize, 0usize);
         let layers = cfg.attention.iter().map(|kind| match kind {

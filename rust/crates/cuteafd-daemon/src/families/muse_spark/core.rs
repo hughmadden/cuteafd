@@ -4,7 +4,7 @@
 //! require must equal the one admission charged
 //! (`weight_layout::projections`), or startup refuses before allocating it.
 use crate::shared::{dense_trellis::{CoreWeights, Projection, ProjectionLayout, ProjectionScratch},
-    memory::device::{Allocation, Device}};
+    memory::{device::{Allocation, Device}, Tag}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{dense_trellis::TrellisDType, programs::Programs, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::muse_spark::weight_layout::{projection_key, ProjectionKey, ProjectionOutput,
@@ -55,7 +55,7 @@ impl<'a> NativePrograms<'a> {
         let fp8_f32 = load_fp8(ProjectionOutput::F32, Output::F32)?;
         ensure!(u64::try_from(required)? == admitted.native_programs.fp8_scratch_bytes,
             "Muse native scratch differs from exact admission");
-        let scratch = if required == 0 { None } else { Some(Allocation::untagged(device, required)?) };
+        let scratch = if required == 0 { None } else { Some(Allocation::new(device, required, Tag::workspace("muse/core-scratch"))?) };
         Ok(Self { bf16, bf16_f32, fp8, fp8_f32, scratch, rows })
     }
 

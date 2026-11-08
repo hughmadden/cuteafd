@@ -18,6 +18,7 @@
 use super::experts::CombineTables;
 use crate::shared::experts::{exl3::partial::PartialEpilogue, rtx::{exl3::Exl3Tp2, RtxSelectionPolicy}};
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer as Buffer};
 use cuteafd_loader::families::muse_spark::MuseSparkConfig;
@@ -109,9 +110,9 @@ pub(crate) fn load<'a>(devices: &[Device<'a>], programs: &[&'a Programs<'a>], cf
         vec![weights.execution()?]
     };
     executors.into_iter().zip(devices).zip(programs).map(|((executor, &device), programs)| {
-        let _scope = cuteafd_ffi::memory_ledger::scope("experts/muse onboarded partials");
         Ok(OnboardedExperts { epilogue: device.run(|| PartialEpilogue::load(device.library, programs, unit_rows))?,
-            own: Allocation::untagged(device, own)?, tables: Allocation::untagged(device, layout.bytes())?, layout,
+            own: Allocation::new(device, own, Tag::workspace("muse/expert-partials"))?,
+            tables: Allocation::new(device, layout.bytes(), Tag::workspace("muse/expert-combine"))?, layout,
             executor, layers: layers.clone(), written: None })
     }).collect()
 }

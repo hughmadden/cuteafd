@@ -17,6 +17,7 @@
 //!   admission refuses a drafter with others).
 use super::engine::RankResources;
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use crate::shared::memory::weight_arena::{weight_allocation, DeviceWeightArena};
 use crate::shared::speculation::dflash::{ContextRow, DflashDrafter, Draft, DraftSeq, TargetHead, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
@@ -107,9 +108,9 @@ impl<'a> MuseDraft<'a> {
         // The ids below and the backend's route probe ring (`RoundProbe::new` at HEAD_ROWS).
         let probe = cfg.layers * cuteafd_loader::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4;
         ensure!(admitted.runtime == (rows * 4 + probe) as u64, "Muse drafter runtime buffers differ from their admission");
-        let _scope = cuteafd_ffi::memory_ledger::scope("drafter/head");
-        Ok(Self { drafter, stored: Allocation::untagged(device, rows * stored_width * 4)?,
-            trimmed: Allocation::untagged(device, rows * cfg.vocab_size * 4)?, ids: Allocation::untagged(device, rows * 4)?,
+        Ok(Self { drafter, stored: Allocation::new(device, rows * stored_width * 4, Tag::drafter_workspace("muse/draft-head"))?,
+            trimmed: Allocation::new(device, rows * cfg.vocab_size * 4, Tag::drafter_workspace("muse/draft-head"))?,
+            ids: Allocation::new(device, rows * 4, Tag::drafter_workspace("muse/draft-head"))?,
             stream, device, block: admitted.block, rows })
     }
 

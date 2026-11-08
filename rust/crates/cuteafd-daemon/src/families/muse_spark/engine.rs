@@ -6,7 +6,7 @@
 //! device layer (`RankDevice`) its view for one step.
 use super::{core::CorePrograms, device::{RankDevice, RankPrograms, StepPlanes, Tp2Ops}, lane::Lane, step::StepMetadata,
     storage::RankKv, weights::{load_rank, GlobalWeights, LayerWeights}};
-use crate::shared::memory::device::Allocation;
+use crate::shared::memory::{device::Allocation, Tag};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::lane::StepTables;
 use crate::shared::{memory::device::Device, rope::{RotaryTables, Table}};
@@ -71,8 +71,7 @@ pub(crate) fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 impl<'a> StepStorage<'a> {
     pub(crate) fn allocate(device: Device<'a>, tables: StepTables) -> Result<Self> {
-        let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse step metadata");
-        Ok(Self { owner: Allocation::untagged(device, tables.bytes())?, tables })
+        Ok(Self { owner: Allocation::new(device, tables.bytes(), Tag::workspace("muse/step-metadata"))?, tables })
     }
 
     /// The whole planes of `bank`, by name.
@@ -148,14 +147,13 @@ impl<'a> RankResources<'a> {
             Some(weights) => {
                 let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(weights.shape[0],
                     cfg.vocab_size)?;
-                let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse head logits");
-                Some((Allocation::untagged(device, stored)?, Allocation::untagged(device, trimmed)?))
+                Some((Allocation::new(device, stored, Tag::workspace("muse/head-logits"))?,
+                    Allocation::new(device, trimmed, Tag::workspace("muse/head-logits"))?))
             }
             None => None,
         };
         let prefill_logits = if globals.head.is_some() && built.prefill_logits_bytes > 0 {
-            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse prefill logits");
-            Some(Allocation::untagged(device, built.prefill_logits_bytes)?)
+            Some(Allocation::new(device, built.prefill_logits_bytes, Tag::workspace("muse/prefill-logits"))?)
         } else { None };
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
