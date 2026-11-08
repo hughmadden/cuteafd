@@ -652,16 +652,16 @@ impl<'a> Runtime<'a> {
         available: u64, reservations: &[u64]) -> Result<Self> {
         ensure!((1..=3).contains(&depth) && rows > depth,
             "Step-5 predictor runtime depth/row capacity");
-        let immutable = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?.resident_bytes;
+        // One arena holds every predictor stage; the admitted charge is its
+        // payload plus padding, exactly as the planner charged it.
+        let packed = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?
+            .mtp_arena(cache.stream.device.id)?;
+        let immutable = RankWeightLayout::mtp_weight_charge(checkpoint, contract, depth)?;
+        ensure!(immutable == packed.bytes() as u64, "Step-5 predictor arena differs from its admitted charge");
         let total = reservations.iter().try_fold(immutable, |n, bytes| n.checked_add(*bytes))
             .context("Step-5 predictor runtime reservation overflow")?;
         ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,
             "Step-5 predictor runtime exceeds admitted owners/cache");
-        // One arena holds every predictor stage; its padding is admitted with it.
-        let packed = RankWeightLayout::mtp_from_contract(checkpoint, contract, depth)?
-            .arena_layout(format!("step5/mtp/gpu{}", cache.stream.device.id), |_| true)?;
-        ensure!(total.checked_add(packed.padding_bytes() as u64).is_some_and(|n| n <= available),
-            "Step-5 packed predictor and reservations exceed admission");
         let weight_arena = DeviceWeightArena::new(cache.stream.device, packed)?;
         let mut stages = Vec::with_capacity(depth);
         for stage in 0..depth {

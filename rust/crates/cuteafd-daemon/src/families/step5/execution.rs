@@ -356,10 +356,17 @@ impl<'e, 'a> Execution<'e, 'a> {
         plan: &NativePlan) -> Result<RankAdmission> {
         ensure!((1..=span).contains(&logits), "Step-5 head rows outside the span");
         let admission = Self::rank_admission(programs, checkpoint, ownership, rank, rows, span, 92, plan)?;
-        if rank == ownership.execution().spec().head_gpu as usize {
+        let admission = if rank == ownership.execution().spec().head_gpu as usize {
             admission.with_head(&super::head::HeadPlan::for_execution(programs, checkpoint, logits, ownership,
-                &plan.layouts[rank])?)
-        } else { Ok(admission) }
+                &plan.layouts[rank])?)?
+        } else { admission };
+        // The arena serve allocates for this rank: its inter-view padding is the
+        // one owner its payload owners do not already hold.
+        let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+        let padding = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+            rank as i32, 92, entry)?.padding_bytes() as u64;
+        Ok(RankAdmission { immutable: admission.immutable.checked_add(padding)
+            .context("Step-5 target arena padding overflow")?, ..admission })
     }
 
     fn rank_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -1652,6 +1659,67 @@ mod tests {
             theta: vec![], rotary: vec![], rope_scaling: None, scale_full: false,
             scale_sliding: false, activation: vec![], shared_activation: vec![] }
     }
+    /// Planner == runtime for packed weights: the planner's rank charge exceeds
+    /// its payload by exactly the padding of the arena serve allocates, the
+    /// predictor charge is exactly its arena, and the loader's rotary planes
+    /// are the views RotaryTables::load_with requests.
+    #[test]
+    fn planned_arena_padding_equals_the_served_arenas() -> Result<()> {
+        use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
+        let fixture = tempfile::tempdir()?;
+        testing::write_step5_exl3_snapshot(fixture.path());
+        let checkpoint = Checkpoint::coordinator(fixture.path(), false, true)?;
+        let cfg = Config::parse(&checkpoint)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let manifest = testing::step5_native_manifest(fixture.path());
+        let rope = crate::shared::rope::RotaryTables::arena_requests(&contract.rope_tables, super::super::weights::ROPE_PREFIX)?;
+        for (ranks, sparks) in [(1, 3), (2, 6)] {
+            let report = testing::plan(fixture.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(plan::spec::DraftOwnership::NativeMtp),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; ranks], workspace_manifest: Some(manifest.clone()),
+                    context_tokens: 1 << 20, ..Default::default() }), ..Default::default()
+            })?;
+            let placement = report.solver_placement.as_ref().context("arena-test placement")?;
+            let spec = HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: (H * 4) as u64,
+                rows: 64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
+            let ownership = ExecutionOwnership::new(&cfg, ranks, LayerExecutionPlan::new(placement, spec)?)?;
+            let plan = NativePlan::new(&checkpoint, &ownership, Rc::new(contract.clone()))?;
+            for rank in 0..ranks {
+                let layout = &plan.layouts[rank];
+                let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+                let served = super::super::weights::target_arena(layout, Some(&contract.rope_tables),
+                    rank as i32, 92, entry)?;
+                // Rotary views are exactly the daemon's requests.
+                for (name, bytes) in &rope {
+                    assert_eq!(served.view(name).map(|v| v.bytes()), Some(*bytes), "rank {rank} {name}");
+                }
+                let admitted = cuteafd_loader::plan::families::step5::native::rank_admission_for_layout(
+                    &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
+                // Payload the rank charges under immutable: target owners (not the
+                // embedding, which its own owner charges) and the rotary planes.
+                let payload = admitted.resident_weights.0 + contract.rope_tables.allocation_bytes;
+                let head = rank == usize::from(ownership.execution().spec().head_gpu);
+                let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
+                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.bytes())
+                    .transpose()?.unwrap_or(0) as u64 } else { 0 };
+                assert_eq!(admitted.immutable - payload - head_scratch, served.padding_bytes() as u64,
+                    "ranks {ranks} rank {rank}: planner padding differs from the served arena");
+                let embedding = layout.operands.iter().find(|o| o.name == "model.embed_tokens.weight")
+                    .map_or(0, |o| o.allocation_bytes);
+                assert_eq!(served.payload_bytes() as u64, admitted.resident_weights.0 + contract.rope_tables.allocation_bytes
+                    + if entry { embedding } else { 0 }, "ranks {ranks} rank {rank}: served payload owners");
+            }
+        }
+        for depth in 1..=cfg.mtp {
+            let layout = RankWeightLayout::mtp_from_contract(&checkpoint, &contract, depth)?;
+            assert_eq!(RankWeightLayout::mtp_weight_charge(&checkpoint, &contract, depth)?,
+                layout.mtp_arena(0)?.bytes() as u64, "predictor depth {depth}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn whole_model_native_context_constructs_headers_once() -> Result<()> {
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};

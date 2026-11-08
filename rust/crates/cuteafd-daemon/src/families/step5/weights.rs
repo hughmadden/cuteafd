@@ -16,26 +16,13 @@ use std::collections::BTreeMap;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
 
-/// One rank's target arena: its selected operands and trellis cores, the
-/// generated rotary planes, and the embedding table on the entry rank.
+/// One rank's target arena, planned and served by the same loader function.
 pub(super) fn target_arena(layout: &RankWeightLayout, rope: Option<&cuteafd_loader::plan::rope::Tables>,
     device: i32, count: usize, embedding: bool) -> Result<cuteafd_loader::serving_capacity::WeightArenaLayout> {
-    let mut tensors = layout.arena_tensors(|name| {
-        if name == EMBEDDING { return embedding; }
-        if let Some(rest) = name.strip_prefix("model.layers.") {
-            return rest.split_once('.').and_then(|(layer, _)| layer.parse::<usize>().ok())
-                .is_some_and(|layer| layer < count);
-        }
-        count == 92
-    })?;
-    if let Some(rope) = rope {
-        tensors.extend(crate::shared::rope::RotaryTables::arena_requests(rope, ROPE_PREFIX)?);
-    }
-    cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("step5/target/gpu{device}"), tensors)
+    layout.target_arena(rope, device, count, embedding)
 }
 
-/// Program and allocation prefix of the target's rotary tables.
-pub(super) const ROPE_PREFIX: &str = "step5_";
+pub(super) use cuteafd_loader::plan::families::step5::coordinator::ROPE_PREFIX;
 
 /// The host packing the dense records replaced (the unit tests' oracle).
 #[cfg(test)]

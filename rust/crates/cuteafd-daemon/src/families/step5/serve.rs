@@ -388,8 +388,8 @@ fn with_backend<T>(args: &ServeArgs,
             .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
     };
     let predictor_budget = if args.mtp > 0 {
-        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_from_contract(
-            &checkpoint, &native_plan.contract, usize::from(args.mtp))?.resident_bytes;
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_weight_charge(
+            &checkpoint, &native_plan.contract, usize::from(args.mtp))?;
         let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
             .context("Step-5 solved predictor allocation overflow")?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))

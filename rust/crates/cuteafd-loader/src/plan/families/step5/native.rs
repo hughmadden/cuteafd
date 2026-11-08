@@ -431,7 +431,14 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         .context("Step-5 native rank immutable overflow")?;
     let weights = layout.core.values().try_fold(weights, |n, core| n.checked_add(core.bytes as u64))
         .context("Step-5 native core weights overflow")?;
+    // The served target arena's inter-view padding, from the same layout the
+    // daemon allocates. Payload stays with its owners: target weights and rotary
+    // planes here, the entry rank's embedding under its Embedding owner.
+    let entry = rank == usize::from(ownership.execution().spec().entry_gpu);
+    let padding = layout.target_arena(Some(&contract.rope_tables), rank as i32, cfg.layers, entry)?
+        .padding_bytes() as u64;
     let mut immutable = weights.checked_add(contract.rope_tables.allocation_bytes)
+        .and_then(|n| n.checked_add(padding))
         .context("Step-5 native immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
@@ -611,9 +618,13 @@ mod tests {
             .map(|w| w.allocation_bytes).sum::<u64>()
             + layout.core.values().map(|core| core.bytes as u64).sum::<u64>()
             + CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes;
+        // The served rank arena's inter-view padding (rank 0 is the entry rank).
+        let padding = layout.target_arena(Some(&CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables),
+            0, cfg.layers, true)?.padding_bytes() as u64;
+        assert!(padding > 0);
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
-            assert_eq!(admitted.immutable, weights + 165511240);
+            assert_eq!(admitted.immutable, weights + padding + 165511240);
             assert_eq!(admitted.resident_weights.0, weights
                 - CoordinatorContract::from_checkpoint(&checkpoint)?.rope_tables.allocation_bytes);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?

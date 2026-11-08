@@ -235,6 +235,9 @@ fn is_exl3_member(name: &str) -> bool {
     matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg")
 }
 
+/// Program and allocation prefix of the target's rotary tables.
+pub const ROPE_PREFIX: &str = "step5_";
+
 impl RankWeightLayout {
     /// Final rank-local owners only; composite FP8 values/scales remain one view.
     pub fn arena_tensors(&self, select: impl Fn(&str) -> bool) -> Result<Vec<(String, usize)>> {
@@ -252,6 +255,44 @@ impl RankWeightLayout {
     pub fn arena_layout(&self, id: impl Into<String>, select: impl Fn(&str) -> bool)
         -> Result<crate::serving_capacity::WeightArenaLayout> {
         crate::serving_capacity::WeightArenaLayout::new(id, self.arena_tensors(select)?)
+    }
+
+    /// The one target arena a coordinator rank allocates, planned and served
+    /// alike: the selected operands and trellis cores of the first `count`
+    /// layers (globals only for the whole model), the generated rotary planes,
+    /// and the embedding table on the entry rank.
+    pub fn target_arena(&self, rope: Option<&crate::plan::rope::Tables>, device: i32, count: usize,
+        embedding: bool) -> Result<crate::serving_capacity::WeightArenaLayout> {
+        let mut tensors = self.arena_tensors(|name| {
+            if name == "model.embed_tokens.weight" { return embedding; }
+            if let Some(rest) = name.strip_prefix("model.layers.") {
+                return rest.split_once('.').and_then(|(layer, _)| layer.parse::<usize>().ok())
+                    .is_some_and(|layer| layer < count);
+            }
+            count == 92
+        })?;
+        if let Some(rope) = rope {
+            for (index, recipe) in rope.recipes.iter().enumerate() {
+                let plane = usize::try_from(recipe.allocation_bytes(rope.extent)? / 2)?;
+                for part in ["cos", "sin"] { tensors.push((format!("{ROPE_PREFIX}rotary.{index}.{part}"), plane)); }
+            }
+        }
+        crate::serving_capacity::WeightArenaLayout::new(format!("step5/target/gpu{device}"), tensors)
+    }
+
+    /// The predictor's own arena: every stage's owners, nothing of the target.
+    pub fn mtp_arena(&self, device: i32) -> Result<crate::serving_capacity::WeightArenaLayout> {
+        self.arena_layout(format!("step5/mtp/gpu{device}"), |_| true)
+    }
+
+    /// Bytes the predictor's weights admit, planned and served alike: its arena
+    /// payload plus the arena's inter-view padding, charged once.
+    pub fn mtp_weight_charge(checkpoint: &Checkpoint, contract: &CoordinatorContract, depth: usize) -> Result<u64> {
+        let layout = Self::mtp_from_contract(checkpoint, contract, depth)?;
+        // No predictor owners (depth 0): no arena is allocated, nothing is charged.
+        if layout.operands.is_empty() && layout.core.is_empty() { return Ok(0); }
+        let padding = layout.mtp_arena(0)?.padding_bytes() as u64;
+        layout.resident_bytes.checked_add(padding).context("Step-5 predictor arena charge overflow")
     }
 
     pub fn from_checkpoint(checkpoint: &Checkpoint, rank: usize, ranks: usize) -> Result<Self> {
