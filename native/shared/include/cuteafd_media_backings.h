@@ -30,12 +30,24 @@ typedef struct cuteafd_media_tags {
 // (get_backings, after create, including a partial owner create returns) and
 // retires each on its released bit, so tower allocations and frees emit no
 // native memory events.
-// The tagged native allocator the towers use (cudaError_t status). The tag is
-// validated and retained as this thread's attempted tag before cudaMalloc.
-int32_t cuteafd_media_allocate(void** ptr, size_t bytes, uint32_t kind, const char* owner);
+
 // Create contract for every tower: on failure *out is null when every backing
 // was released, and otherwise holds the owner with exactly its still-live
 // backings, which the caller records (get_backings) and destroys later.
 #ifdef __cplusplus
+}
+#endif
+
+#if defined(__cplusplus) && defined(__CUDACC__)
+#include <cuda_runtime.h>
+#include "memory_failure.h"
+// The tagged allocator the towers use (cudaError_t status): the tag is checked
+// and retained as this thread's attempted tag before cudaMalloc, so a tower OOM
+// reaches the failure callback naming the tag it asked for.
+inline int32_t cuteafd_media_allocate(void** ptr, size_t bytes, uint32_t kind, const char* owner) {
+  if (ptr == nullptr || bytes == 0) return static_cast<int32_t>(cudaErrorInvalidValue);
+  *ptr = nullptr;
+  if (cuteafd_tag_check(kind, owner) == 0) return static_cast<int32_t>(cudaErrorInvalidValue);
+  return static_cast<int32_t>(CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(ptr, bytes), bytes, 1, nullptr));
 }
 #endif
