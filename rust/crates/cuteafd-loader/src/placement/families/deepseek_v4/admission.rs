@@ -924,6 +924,23 @@ impl Recipe for PreparedV4<'_> {
             owners.components.extend(weight_arena_components(arena, Location::coordinator(0),
                 Lifetime::RESIDENT, self.maximum_pages, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?);
         }
+        // The lead GPU's one borrowed vocabulary GEMM handle and the shared
+        // cuBLASLt initialization: 64 MiB + 2 MiB, created on the first target
+        // or draft vocabulary head. Measured once on the sealed V4 census
+        // (2026-11-08, SM120/driver 13020 LAZY); the head split's peer runs no
+        // vocabulary head, so no second owner exists (#1579).
+        let vocabulary = serving::BlasOwners {
+            name: "shared/blas/vocabulary".into(),
+            process: "coordinator".into(),
+            thread: "v4/blas/serve".into(),
+            location: Location::coordinator(0),
+            gemm: false,
+            lt: true,
+            lifetime: Lifetime::RESIDENT,
+            activation: Activation::always(),
+        };
+        owners.components.extend(serving::blas_components("sm_120", &[vocabulary],
+            self.maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?);
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {
             for demand in self.context_buffers().demands().map_err(invalid)? {

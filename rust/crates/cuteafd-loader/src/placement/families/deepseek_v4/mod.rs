@@ -260,7 +260,9 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
     if catalog.exl3().is_some() { "exl3" } else { "*" }
 }
 
-/// Retained dev mixed residency, including BLAS, until measured owners replace it (#1579).
+/// Selected-program module bytes per rank. BLAS handles, modules and driver
+/// storage are disjoint named owners charged by the admission contract; this
+/// no longer carries a mixed residency sample (#1579).
 pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
     let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
