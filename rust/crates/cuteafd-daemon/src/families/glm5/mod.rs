@@ -1844,9 +1844,19 @@ impl Opened {
             };
             let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation
                 ::from_fp8_option(args.draft_fp8);
-            let drafter = dflash::DflashDrafter::load(&self.library, programs, snapshot, file, stream,
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    cuteafd_loader::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+                        snapshot, representation, 0, 1)?)?)?;
+            let drafter = dflash::DflashDrafter::load_with(&self.library, programs, snapshot, file, stream,
                 args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
-                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache)?;
+                mask, false, representation, args.fp8_scales, crate::shared::fp8_linear::Fp8Rows::W8a16, args.draft_kv_cache,
+                |id, name, bytes| {
+                    ensure!(id == device.id, "GLM draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             // Priming reads the weights; recorded owners prime only after commit.
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1870,8 +1880,16 @@ impl Opened {
                 Ok(crate::shared::experts::rtx::dense::Rect { name: name.into(), path: catalog.snapshot().join(&tensor.shard),
                     base: tensor.metadata.byte_offset, row_bytes: bytes / rows, rows: 0..rows, cols: 0..bytes / rows })
             };
-            let drafter = dflash::DflashDrafter::load_ml4(&self.library, programs, native, ml4,
-                ml4.logit_softcap as f32, stream, layout, &source)?;
+            let device = crate::shared::memory::device::Device { library: &self.library,
+                id: self.library.cuda_get_device()? };
+            let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device,
+                cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm/draft/{}", device.id),
+                    layout.immutable_arena_requests())?)?;
+            let drafter = dflash::DflashDrafter::load_ml4_with(&self.library, programs, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &source, |id, name, bytes| {
+                    ensure!(id == device.id, "ML4 draft arena device differs from load binder");
+                    arena.view(name, bytes)
+                })?;
             if !crate::shared::experts::rtx::dense::is_recording() { drafter.prepare_workspace()?; }
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
             Some(drafter)

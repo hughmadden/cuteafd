@@ -2,6 +2,7 @@ use super::*;
 
 fn check_arenas(inventory: &WeightInventory) -> Result<()> {
     let arenas = inventory.coordinator_arenas()?;
+    let components = inventory.components(1)?;
     assert_eq!(arenas.len(), inventory.ranks);
     for (rank, arena) in arenas.iter().enumerate() {
         let owners = inventory.owners.iter().filter(|owner|
@@ -17,10 +18,38 @@ fn check_arenas(inventory: &WeightInventory) -> Result<()> {
             end = view.offset() + view.bytes();
         }
         assert_eq!(end, arena.bytes());
+        let roots = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.location == Location::coordinator(rank as u8)
+                && template.view.is_none() => Some(template), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "no legacy payload allocations beside target root");
+        assert_eq!((roots[0].id.as_str(), roots[0].bytes), (arena.id(), arena.bytes() as u64));
+        let tails = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::AllocationGranularity(owner) if owner.location == Location::coordinator(rank as u8)
+                => Some(owner), _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].backings.len(), 1);
+        assert_eq!(tails[0].backings[0].backing, arena.id());
+        assert_eq!(tails[0].backings[0].requests, [arena.bytes() as u64]);
         for owner in owners {
             assert_eq!(arena.view(&owner.allocation.id).unwrap().bytes() as u64, owner.allocation.bytes);
             assert_eq!(owner.allocation.lifetime, Lifetime::RESIDENT);
+            let alias = components.iter().find_map(|component| match &component.kind {
+                ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template), _ => None,
+            }).unwrap();
+            assert_eq!(alias.view.as_ref().unwrap().backing, arena.id());
         }
+        let weights = components.iter().filter_map(|component| match &component.kind {
+            ComponentKind::ResidentWeight(owner) if owner.id == arena.id() => Some(owner.weights.0), _ => None,
+        }).sum::<u64>();
+        assert_eq!(weights, arena.payload_bytes() as u64);
+    }
+    for owner in inventory.owners.iter().filter(|owner| owner.allocation.location == Location::PINNED) {
+        let allocation = components.iter().find_map(|component| match &component.kind {
+            ComponentKind::Allocation { template, .. } if template.id == owner.allocation.id => Some(template), _ => None,
+        }).unwrap();
+        assert_eq!(allocation, &owner.allocation);
     }
     Ok(())
 }

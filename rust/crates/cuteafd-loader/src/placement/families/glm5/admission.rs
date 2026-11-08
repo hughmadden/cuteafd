@@ -421,6 +421,8 @@ impl TargetFacts {
 pub struct DraftFacts {
     owners: Vec<Allocation>,
     weights: Vec<ResidentWeight>,
+    arena: Option<crate::serving_capacity::WeightArenaLayout>,
+    arena_weights: u64,
     loading: Vec<Sequential>,
     prefetch: Option<DflashPrefetch>,
     /// Target-side staging and exchange controls of the shared device-driven
@@ -439,6 +441,8 @@ impl DraftFacts {
         let layout = crate::families::glm5::draft_physical::GlmDflashPhysicalLayout::read(
             snapshot, representation, capacity, sm_count, fp8_mode, kv_cache)?;
         let mut facts = Self::from_gqa(&layout)?;
+        facts.pack_arena(crate::families::glm5::draft_physical::gqa_checkpoint_arena_requests(
+            snapshot, representation, 0, 1)?)?;
         facts.prefetch = Some(DflashPrefetch::from_snapshot(snapshot)?);
         let cfg = crate::families::glm5::draft_physical::GlmDflashConfig::read(snapshot)?;
         facts.bridge = Self::bridge_demands(cfg.hidden, cfg.vocab, cfg.taps.len(), capacity.block_rows)?;
@@ -528,7 +532,26 @@ impl DraftFacts {
         }
         facts.bridge = Self::bridge_demands(layout.target_hidden(), layout.target_vocab(),
             layout.target_taps().len(), layout.capacity().block_rows)?;
+        facts.pack_arena(layout.immutable_arena_requests())?;
         Ok(facts)
+    }
+
+    fn pack_arena(&mut self, requests: Vec<(String, usize)>) -> anyhow::Result<()> {
+        use anyhow::{ensure, Context};
+        ensure!(self.arena.is_none(), "GLM draft arena supplied twice");
+        let arena = crate::serving_capacity::WeightArenaLayout::new("glm/draft/0", requests)?;
+        let ids = self.weights.iter().map(|weight| weight.id.clone()).collect::<BTreeSet<_>>();
+        self.arena_weights = self.weights.iter().try_fold(0u64, |sum, weight|
+            sum.checked_add(weight.weights.0).context("GLM draft logical weight overflow"))?;
+        let removed = self.owners.iter().filter(|owner| ids.contains(&owner.id)
+            || owner.id == "glm.draft.markov_norms").try_fold(0u64, |sum, owner|
+                sum.checked_add(owner.bytes).context("GLM draft immutable owner overflow"))?;
+        ensure!(removed == arena.payload_bytes() as u64,
+            "GLM draft immutable owners differ from shared arena requests: {removed}/{}", arena.payload_bytes());
+        self.owners.retain(|owner| !ids.contains(&owner.id) && owner.id != "glm.draft.markov_norms");
+        self.weights.clear();
+        self.arena = Some(arena);
+        Ok(())
     }
 
     /// The shared remote DFlash bridge with the head on GPU0: tap, input,
@@ -540,7 +563,8 @@ impl DraftFacts {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.owners.is_empty() && self.weights.is_empty() && self.loading.is_empty() && self.prefetch.is_none()
+        self.owners.is_empty() && self.weights.is_empty() && self.arena.is_none()
+            && self.loading.is_empty() && self.prefetch.is_none()
     }
 
     /// Ordered homes: GPU1 needs a second coordinator and the bridge inventory.
@@ -574,6 +598,22 @@ impl DraftFacts {
         };
         let mut out = physical_components(self.owners.iter().cloned().map(|mut owner| {
             owner.location = moved(owner.location); owner }), maximum_pages);
+        if let Some(arena) = &self.arena {
+            let id = format!("glm/draft/{home}");
+            let location = Location::coordinator(home);
+            // Push planning retains the drafter while target shared experts load.
+            // One contract covers push and mount, so include that Load overlap.
+            let lifetime = Lifetime::RESIDENT;
+            let mut components = weight_arena_extent_components(&id, arena.bytes() as u64,
+                location, lifetime, maximum_pages)?;
+            components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+            let root = Allocation::buffer(&id, location, arena.bytes() as u64,
+                lifetime, cuteafd_core::memory_layout::Category::Weights, "weight arena");
+            components.push(Component::resident_weight(ResidentWeight::from_allocation(&root,
+                crate::placement::ResidentWeights(self.arena_weights)),
+                ByteCurve::fixed(self.arena_weights, maximum_pages)));
+            out.extend(components);
+        }
         out.extend(self.weights.iter().cloned().map(|mut weight| {
             weight.location = moved(weight.location);
             let bytes = ByteCurve::fixed(weight.weights.0, maximum_pages);
@@ -915,7 +955,8 @@ impl<'a> ProductionInput<'a> {
                     replicated.attention_mount = Default::default();
                     let mut condition = when.clone();
                     condition.push(When::Embedding(*home));
-                    recipe.weights.push(Case { when: condition, value: replicated });
+                    recipe.owners.push(Case { when: condition,
+                        value: WeightInventory::standalone_components(&replicated.owners, maximum_pages) });
                 }
             }
             for device in 0..self.gpus as u8 {

@@ -378,6 +378,60 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
 }
 
 #[test]
+fn shared_draft_arena_reconciliation_maps_roots_views_and_derived_references() -> anyhow::Result<()> {
+    for prefix in ["qwen3_5/dspark/gpu", "glm/draft/", "glm5_flash/draft/", "kimi/draft/"] {
+        for physical in [&[1][..], &[0, 1], &[1, 0]] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let mut contract = Linear::new().prepare(&request())?;
+            contract.components.clear();
+            let mut runtime = Vec::new();
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let id = format!("{prefix}{rank}");
+                let location = Location::coordinator(rank as u8);
+                let components = weight_arena_extent_components(&id, 3 << 20, location,
+                    Lifetime::RESIDENT, contract.maximum_pages)?;
+                let ComponentKind::Allocation { template, .. } = &components[0].kind else { unreachable!() };
+                let address = 0x1000000 + rank as u64 * 0x1000000;
+                runtime.push(Receipt { allocation: Allocation { id: format!("{prefix}{ordinal}"), ..template.clone() }, address });
+                let mut alias = Allocation::buffer(format!("draft.{rank}.tensor"), location, 257,
+                    Lifetime::RESIDENT, Category::Drafter, "draft owners");
+                alias.view = Some(View { backing: id.clone(), offset: 256 });
+                contract.components.extend(components);
+                contract.components.push(Component::allocation(alias.clone(),
+                    ByteCurve::fixed(alias.bytes, contract.maximum_pages), false, contract.maximum_pages));
+                alias.view.as_mut().unwrap().backing = format!("{prefix}{ordinal}");
+                runtime.push(Receipt { allocation: alias, address: address + 256 });
+            }
+            let mut budgets = vec![budget(16 << 20)];
+            if physical.len() == 2 { let mut peer = budget(16 << 20);
+                peer.id = "peer".into(); peer.locations = vec![Location::coordinator(1)]; budgets.push(peer); }
+            let facts = contract.facts(&vec![0; contract.variables.len()], 1)?;
+            let plan = ResolvedPlan { encoder_diagnostics: vec![], request: request(), decisions: decisions(0),
+                pool_tokens: 64, phases: evaluate(&facts, &budgets)?, budgets, facts };
+            let original = plan.clone();
+            let mapped = devices.remap_plan_weight_arenas(&plan)?;
+            assert_eq!(plan, original);
+            assert_eq!(mapped.phases, original.phases);
+            for (rank, &ordinal) in physical.iter().enumerate() {
+                let id = format!("{prefix}{ordinal}");
+                assert!(mapped.facts.resident_weights.iter().any(|owner| owner.id == id
+                    && owner.location == Location::coordinator(rank as u8)));
+                assert!(mapped.facts.allocation_granularity.iter().any(|owner|
+                    owner.backings.iter().any(|backing| backing.backing == id && backing.requests == [3 << 20])));
+            }
+            devices.reconcile(&plan, Phase::Ready, &runtime)?;
+            let mut missing = plan.facts.allocations.clone();
+            missing.remove(0);
+            assert!(devices.remap_weight_arenas(&missing).is_err());
+            let mut wrong = plan.facts.allocations.clone();
+            wrong[0].id.push('9');
+            assert!(devices.remap_weight_arenas(&wrong).is_err());
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> anyhow::Result<()> {
     use crate::serving_capacity::{expert_weight_arena_id, WeightArenaLayout};
     for physical in [&[1][..], &[0, 1], &[1, 0]] {

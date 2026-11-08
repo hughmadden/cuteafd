@@ -293,10 +293,7 @@ impl<'a> MlaDraftStorage<'a> {
             ensure!(bytes == expected("fp8_scratch")?, "MLA draft FP8 workspace disagrees with admission");
         }
         let buffers = Self::recipes(&layout)?.iter().map(|b| {
-            let immutable = layout.weight_destinations().iter().any(|weight| weight.owner == b.name)
-                || (layout.kind() == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
-                    && b.name == "markov_norms");
-            if immutable {
+            if layout.is_immutable_buffer(&b.name) {
                 super::weights::checked_allocation(library, &b.name, b.bytes, allocate)
             } else {
                 DeviceAllocation::named(library, b.bytes, "drafter/mla")

@@ -210,6 +210,16 @@ impl MlaDraftRuntimeLayout {
     pub fn buffers(&self) -> &[MlaDraftBuffer] { &self.buffers }
     pub fn owners(&self) -> &[MlaDraftOwner] { &self.owners }
     pub fn weight_destinations(&self) -> &[MlaDraftWeight] { &self.weight_destinations }
+    pub fn is_immutable_buffer(&self, name: &str) -> bool {
+        self.weight_destinations.iter().any(|weight| weight.owner == name)
+            || (self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
+                && name == "markov_norms")
+    }
+    /// The exact immutable subset handed to the serving weight allocator.
+    pub fn immutable_arena_requests(&self) -> Vec<(String, usize)> {
+        self.common_device_buffers().into_iter().filter(|buffer| self.is_immutable_buffer(&buffer.name))
+            .map(|buffer| (buffer.name, buffer.bytes)).collect()
+    }
     pub fn device_buffers(&self) -> Vec<MlaDraftBuffer> {
         if self.owners.is_empty() { return self.buffers.clone(); }
         self.owners.iter().filter(|o| o.domain == MlaDraftDomain::Device)

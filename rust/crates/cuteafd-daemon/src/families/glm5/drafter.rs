@@ -146,6 +146,14 @@ impl<'a> GlmDrafter<'a> {
         use cuteafd_core::memory_layout::Category;
         use cuteafd_loader::placement::planner::{Lifetime, Phase};
         let mut receipts = (**self).allocation_receipts(devices, prefix)?;
+        // The shared contract covers push: its draft survives later Load work.
+        for receipt in &mut receipts {
+            let allocation = &mut receipt.allocation;
+            if allocation.id.starts_with("glm/draft/") || allocation.view.as_ref()
+                .is_some_and(|view| view.backing.starts_with("glm/draft/")) {
+                allocation.lifetime = Lifetime::RESIDENT;
+            }
+        }
         if let Self::Remote(d) = self {
             let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, &format!("{prefix}.bridge"),
                 Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "remote draft bridge");

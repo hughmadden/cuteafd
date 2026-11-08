@@ -324,16 +324,54 @@ impl WeightInventory {
         if maximum_pages == 0 {
             return Err(Refusal::InvalidFact("empty GLM weight page domain".into()));
         }
-        Ok(self
-            .owners
-            .iter()
-            .flat_map(|owner| {
-                let bytes = ByteCurve::fixed(owner.allocation.bytes, maximum_pages);
-                [Component::allocation(owner.allocation.clone(), bytes.clone(), false, maximum_pages),
-                    Component::resident_weight(crate::placement::planner::ResidentWeight::from_allocation(
-                        &owner.allocation, crate::placement::ResidentWeights(owner.allocation.bytes)), bytes)]
-            })
-            .collect())
+        use crate::placement::planner::{Device, ResidentWeight, View, weight_arena_components,
+            weight_arena_extent_components};
+        let mut out = Vec::new();
+        for rank in 0..self.ranks {
+            let location = Location::coordinator(rank as u8);
+            let owners = self.owners.iter().filter(|owner| owner.allocation.location == location
+                && !owner.allocation.id.contains(".shared.layer.")).collect::<Vec<_>>();
+            if owners.is_empty() { continue; }
+            let layout = crate::serving_capacity::WeightArenaLayout::new(format!("glm/coordinator/{rank}"),
+                owners.iter().map(|owner| Ok((owner.allocation.id.clone(),
+                    usize::try_from(owner.allocation.bytes).map_err(|_| Refusal::Overflow("GLM arena view"))?)))
+                    .collect::<Result<Vec<_>, Refusal>>()?)
+                .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+            let mut components = weight_arena_components(&layout, location, Lifetime::RESIDENT, maximum_pages)?;
+            components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+            let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
+                Lifetime::RESIDENT, Category::Weights, "weight arena");
+            let payload = u64::try_from(layout.payload_bytes()).map_err(|_| Refusal::Overflow("GLM arena payload"))?;
+            out.extend(components);
+            out.push(Component::resident_weight(ResidentWeight::from_allocation(&root,
+                crate::placement::ResidentWeights(payload)), ByteCurve::fixed(payload, maximum_pages)));
+            for owner in owners {
+                let mut alias = owner.allocation.clone();
+                alias.view = Some(View { backing: layout.id().into(),
+                    offset: layout.view(&alias.id).expect("arena built from these owners").offset() as u64 });
+                out.push(Component::allocation(alias.clone(), ByteCurve::fixed(alias.bytes, maximum_pages),
+                    false, maximum_pages));
+            }
+        }
+        for owner in self.owners.iter().filter(|owner| !matches!(owner.allocation.location.device,
+            Device::Coordinator(_)) || owner.allocation.id.contains(".shared.layer.")) {
+            if matches!(owner.allocation.location.device, Device::Coordinator(_)) {
+                out.extend(weight_arena_extent_components(&owner.allocation.id, owner.allocation.bytes,
+                    owner.allocation.location, owner.allocation.lifetime, maximum_pages)?);
+            } else {
+                out.extend(Self::standalone_components(std::slice::from_ref(owner), maximum_pages));
+            }
+        }
+        Ok(out)
+    }
+
+    pub(super) fn standalone_components(owners: &[WeightOwner], maximum_pages: u64) -> Vec<Component> {
+        owners.iter().flat_map(|owner| {
+            let bytes = ByteCurve::fixed(owner.allocation.bytes, maximum_pages);
+            [Component::allocation(owner.allocation.clone(), bytes.clone(), false, maximum_pages),
+                Component::resident_weight(crate::placement::planner::ResidentWeight::from_allocation(
+                    &owner.allocation, crate::placement::ResidentWeights(owner.allocation.bytes)), bytes)]
+        }).collect()
     }
 
     /// Display totals are reduced from physical owners, never the other way round.
