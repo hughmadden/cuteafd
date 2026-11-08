@@ -131,7 +131,8 @@ pub fn initialize(directory: &Path, host: &str, role: &str) -> io::Result<()> {
     if SERVICE.get().is_some() { return Ok(()); }
     std::fs::create_dir_all(directory)?;
     sweep_unused_spools(directory)?;
-    let trigger_path = directory.join(format!("memory-triggers-{}-{}-{}.jsonl", sanitize(host), sanitize(role), std::process::id()));
+    let startup_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let trigger_path = directory.join(format!("memory-triggers-{}-{startup_ns}-{}-{}-{}.jsonl", utc_timestamp(), sanitize(host), sanitize(role), std::process::id()));
     let trigger_file = OpenOptions::new().append(true).create_new(true).mode(0o600).open(&trigger_path)?;
     lock_spool(&trigger_file)?;
     let mut spools = Vec::new();
