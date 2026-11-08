@@ -189,6 +189,8 @@ mod tests {
         eprintln!("V41_CHARGE layout=vision gpu0 old_planner={source} old_serving_weights={b} new={} B={b} \
             tail={tail} padding={} delta_vs_planner={} delta_vs_serving={tail} rounding=no",
             b + tail, vision.padding_bytes(), (b + tail) as i128 - source as i128);
+        eprintln!("V41_CHARGE layout=vision SparkManaged old={source} new={b} B={b} tail=0 \
+            padding={} delta={} rounding=no", vision.padding_bytes(), b as i128 - source as i128);
         Ok(())
     }
 

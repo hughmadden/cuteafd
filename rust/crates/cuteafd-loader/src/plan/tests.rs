@@ -4669,7 +4669,12 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
     assert!(off.devices.iter().all(|d| d.items.iter().all(|i| !i.group.starts_with("vision "))));
     assert_eq!(auto.devices[0].used_bytes(), off.devices[0].used_bytes());
     assert_eq!(auto.devices[1].used_bytes() - off.devices[1].used_bytes(), tower);
-    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower);
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let vision = crate::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+        checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap();
+    let vision_b = vision.bytes() as u64;
+    let vision_tail = crate::placement::planner::allocation_granularity_forecast(&[vision_b]).unwrap();
+    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower + vision_b + vision_tail);
     assert_eq!(auto.pool_tokens, off.pool_tokens);
     assert_eq!(local.pool_tokens, off.pool_tokens);
     use cuteafd_core::memory_layout::Category;

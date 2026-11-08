@@ -1430,12 +1430,11 @@ impl Recipe for V41Recipe<'_> {
                         if bytes == 0 {
                             continue;
                         }
-                        // A coordinator tower is one preplanned arena: root B and
-                        // its single SM120 tail, budgeted at logical payload P.
-                        // Spark (managed) towers keep their source-sized owner.
-                        if part == "weights" && matches!(location.device, Device::Coordinator(_)) {
+                        // Every tower owns B, budgeted at logical payload P. Only
+                        // coordinator device arenas have the SM120 allocation tail.
+                        if part == "weights" {
                             let layout = self.vision_arena.as_ref()
-                                .ok_or_else(|| invalid("coordinator vision tower lacks its arena layout"))?;
+                                .ok_or_else(|| invalid("vision tower lacks its arena layout"))?;
                             let payload = u64::try_from(layout.payload_bytes())
                                 .map_err(|_| Refusal::Overflow("V4.1 vision payload"))?;
                             if payload != bytes {
@@ -1443,12 +1442,17 @@ impl Recipe for V41Recipe<'_> {
                             }
                             let id = format!("v41.encoder.{option}.{copy}.weights");
                             let extent = u64::try_from(layout.bytes()).map_err(|_| Refusal::Overflow("V4.1 vision arena"))?;
-                            let mut arena = weight_arena_extent_components(&id, extent, location,
-                                Lifetime::RESIDENT, self.maximum_pages)?;
-                            arena.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
-                            let root = Allocation::buffer(id, location, extent, Lifetime::RESIDENT,
+                            let root = Allocation::buffer(&id, location, extent, Lifetime::RESIDENT,
                                 Category::Weights, "weight arena");
-                            components.extend(arena);
+                            if matches!(location.device, Device::Coordinator(_)) {
+                                let mut arena = weight_arena_extent_components(&id, extent, location,
+                                    Lifetime::RESIDENT, self.maximum_pages)?;
+                                arena.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+                                components.extend(arena);
+                            } else {
+                                components.push(Component::allocation(root.clone(),
+                                    ByteCurve::fixed(extent, self.maximum_pages), false, self.maximum_pages));
+                            }
                             components.push(Component::resident_weight(
                                 ResidentWeight::from_allocation(&root, ResidentWeights(payload)),
                                 ByteCurve::fixed(payload, self.maximum_pages),

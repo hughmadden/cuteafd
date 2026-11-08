@@ -257,6 +257,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     prepared.recipe.vision_arena = (vision_weights > 0).then(|| v41::weight_layout::vision_layout_from_headers(
         checkpoint.tensors.iter().map(|tensor| &tensor.meta))).transpose()?;
     prepared.recipe.media_cache_bytes = media_cache_bytes;
+    let vision_extent = prepared.recipe.vision_arena.as_ref().map_or(0, |layout| layout.bytes() as u64);
     let admitted = prepared.admit(request)?;
     report.host_ledger = Some(admitted.host_ledger(host_facts.prefix_bytes)?);
     let mut encoder = encoders[admitted.solved.decisions.encoder.context("missing admitted encoder")?].clone();
@@ -291,7 +292,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         ensure_tower_spark(&mut sparks, rank, options);
         let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) else { continue };
         let overhead = crate::plan::encoder::V41_SPARK_CUDA_OVERHEAD_BYTES;
-        device.items.push(Item::new(Category::Weights, "vision tower", "", encoder.weights, Basis::Exact));
+        device.items.push(Item::new(Category::Weights, "vision tower", "", vision_extent, Basis::Exact));
         device.items.push(Item::new(Category::Workspace, "vision scratch", "",
             encoder.scratch.saturating_sub(overhead), Basis::Exact));
         device.items.push(Item::new(Category::Runtime, "vision CUDA overhead", "", overhead, Basis::Exact));

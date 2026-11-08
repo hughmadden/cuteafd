@@ -576,11 +576,109 @@ mod tests {
         };
         let request = production_request(32768, Some(32768), Onboard::Layers(40),
             PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
-        let admitted = input.prepare().unwrap().admit(request).unwrap();
+        let mut prepared = input.prepare().unwrap();
+        prepared.recipe.vision_arena = Some(crate::serving_capacity::WeightArenaLayout::new(
+            "v41/vision", [("tower".into(), 123456)]).unwrap());
+        let admitted = prepared.admit(request).unwrap();
         assert!(admitted.spark.spark_layers.is_empty());
         let owners = admitted.solved.facts.allocations.iter().filter(|owner| owner.id.starts_with("v41.encoder.")).collect::<Vec<_>>();
         assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), 123456 + 654321);
         assert!(owners.iter().all(|owner| owner.location.device == crate::placement::planner::Device::Spark(0)));
+    }
+
+    #[test]
+    fn vision_arenas_preserve_choices_payload_and_physical_device_binding() -> anyhow::Result<()> {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        use crate::placement::planner::{Activation, ComponentKind, CoordinatorDevices, Device,
+            Domain, Recipe, allocation_granularity_forecast};
+        let config = config();
+        // Deliberately include alignment padding so Managed B cannot masquerade as P.
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/vision",
+            [("first".into(), (1 << 20) + 1), ("second".into(), 2)])?;
+        let payload = arena.payload_bytes() as u64;
+        let extent = arena.bytes() as u64;
+        assert!(extent > payload);
+        for physical in [&[1][..], &[1, 0][..]] {
+            let devices = CoordinatorDevices::new(physical)?;
+            let ranks = physical.len();
+            let mut kinds = vec![EncoderKind::Rtx { gpu: 0 }, EncoderKind::Spark { rank: 0 }, EncoderKind::Off];
+            if ranks == 2 { kinds.insert(1, EncoderKind::Rtx { gpu: 1 }); }
+            for first in 0..kinds.len() {
+                let mut ordered = kinds.clone();
+                ordered.rotate_left(first);
+                let encoders = ordered.iter().cloned().map(|kind| EncoderPlacement {
+                    replicas: if matches!(kind, EncoderKind::Spark { .. }) { vec![1] } else { vec![] },
+                    kind, weights: payload, scratch: 333, reason: "arena proof".into(), shortfall: 0,
+                }).collect();
+                let mut prepared = ProductionInput {
+                    expert_usage: false, config: &config, gpus: ranks, context: 512, maximum_pool_tokens: 512,
+                    prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
+                    replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
+                    experts: vec![cost(ranks); 40], workspace: 0, owners: vec![], weight_arenas: vec![],
+                    startup: vec![], allowances: vec![], draft: None, encoders, media_cache_bytes: 0,
+                    resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
+                    operation: Operation::Serving,
+                    budgets: admission::live_budgets(&vec![(96 << 30, 96 << 30, 96 << 30); ranks],
+                        &[64 << 30; 4])?,
+                }.prepare()?;
+                prepared.recipe.vision_arena = Some(arena.clone());
+                let request = production_request(512, Some(512), Onboard::Layers(0),
+                    PrefillShape { rows: 128, waves: 1 }, Operation::Serving, u64::MAX, Default::default());
+                let contract = prepared.recipe.prepare(&request)?;
+                for component in &contract.components {
+                    let id = match &component.kind {
+                        ComponentKind::Allocation { template, .. } => &template.id,
+                        ComponentKind::ResidentWeight(claim) => &claim.id,
+                        ComponentKind::AllocationGranularity(tail) => &tail.id,
+                        _ => continue,
+                    };
+                    if let Some(suffix) = id.strip_prefix("v41.encoder.") {
+                        let option: usize = suffix.split('.').next().unwrap().parse()?;
+                        let clause = &component.activation.clauses[0];
+                        assert_eq!(clause.len(), 1);
+                        assert_eq!(component.activation, Activation::choice(clause[0].variable, option));
+                    }
+                }
+                let admitted = prepared.admit(request)?;
+                assert_eq!(admitted.solved.decisions.encoder, Some(0));
+                let mapped = devices.remap_plan_weight_arenas(&admitted.solved)?;
+                let roots = mapped.facts.allocations.iter().filter(|owner|
+                    owner.id.starts_with("v41.encoder.") && owner.id.ends_with(".weights")).collect::<Vec<_>>();
+                let expected_copies = match ordered[0] {
+                    EncoderKind::Off => 0, EncoderKind::Spark { .. } => 2, _ => 1,
+                };
+                assert_eq!(roots.len(), expected_copies);
+                for (copy, root) in roots.iter().enumerate() {
+                    assert_eq!(root.id, format!("v41.encoder.0.{copy}.weights"));
+                    assert_eq!((root.bytes, root.group.as_str()), (extent, "weight arena"));
+                    assert_eq!(root.lifetime, Lifetime::RESIDENT);
+                    assert!(root.view.is_none());
+                    let claim = mapped.facts.resident_weights.iter().find(|claim| claim.id == root.id).unwrap();
+                    assert_eq!(claim.weights.0, payload);
+                    let tails = mapped.facts.allocation_granularity.iter().filter(|tail|
+                        tail.backings.iter().any(|backing| backing.backing == root.id)).collect::<Vec<_>>();
+                    match root.location.device {
+                        Device::Coordinator(rank) => {
+                            assert_eq!(devices.location(physical[usize::from(rank)])?, root.location);
+                            assert_eq!(tails.len(), 1);
+                            assert_eq!(tails[0].id, format!("{}.tail", root.id));
+                            assert_eq!(tails[0].requests(), [extent]);
+                            assert_eq!(tails[0].bytes()?, allocation_granularity_forecast(&[extent])?);
+                        }
+                        Device::Spark(rank) => {
+                            assert_eq!(usize::from(rank), copy);
+                            assert_eq!(root.location.domain, Domain::Managed);
+                            assert!(tails.is_empty());
+                        }
+                        _ => panic!("unexpected tower location"),
+                    }
+                    let scratch = mapped.facts.allocations.iter().find(|owner|
+                        owner.id == format!("v41.encoder.0.{copy}.scratch")).unwrap();
+                    assert_eq!((scratch.location, scratch.bytes), (root.location, 333));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
