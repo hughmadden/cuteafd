@@ -627,6 +627,50 @@ def test_publisher_writes_sm170_report_before_failing(tmp_path, monkeypatch):
     assert "HARD FAILURE" in (destination / "CHANGES.md").read_text()
 
 
+@pytest.mark.parametrize("content_changed", [False, True])
+def test_publication_route_content_identity_is_pin_independent(tmp_path, content_changed):
+    spec = importlib.util.spec_from_file_location("route_publisher", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    sides = []
+    raw_hashes = []
+    for name, revision, scratch in (("old", "old-pin", 64), ("new", "new-pin", 128 if content_changed else 64)):
+        staging = tmp_path / name
+        directory = staging / "exl3" / "m1"
+        directory.mkdir(parents=True)
+        route = directory / "routes.json"
+        route.write_text(json.dumps({"sparkinfer_revision": revision,
+                                    "source_tree_sha256": revision + "-tree", "scratch": scratch}))
+        raw = records.digest(route.read_bytes())
+        raw_hashes.append(raw)
+        (directory / "v41_exl3.json").write_text(json.dumps({
+            "sparkinfer_revision": revision, "capacity": 1, "unique_execution_buffer_bytes": 64,
+            "objects": [], "route_preparation": {"manifest": "routes.json", "sha256": raw}}))
+        (staging / "exl3" / "program-records.json").write_text(json.dumps({"m1/core.o": {"object_sha256": "same"}}))
+        sides.append(publisher.publication_records(staging, [("exl3", "package_exl3_aot.py", [])]))
+    assert raw_hashes[0] != raw_hashes[1]
+    for side, raw in zip(sides, raw_hashes):
+        assert side["exl3/m1/core.o"]["planner_metadata"]["route_preparation"]["sha256"] == raw
+    report = records.change_report(*sides, expected=[])
+    assert bool(report["changed"]) == content_changed
+    assert report["leaks"] == (["exl3/m1/core.o"] if content_changed else [])
+    if content_changed:
+        assert report["changed"][0]["planner_metadata_changed"]
+
+
+@pytest.mark.parametrize("digests", [(None, None), (None, "same"), ("same", None), ("", "same")])
+def test_legacy_route_records_keep_raw_checksum_strict(digests):
+    sides = []
+    for raw, content in zip(("old", "new"), digests):
+        route = {"manifest": "routes.json", "sha256": raw}
+        if content is not None:
+            route["content_sha256"] = content
+        sides.append({"core.o": {"planner_metadata": {"route_preparation": route}}})
+    report = records.change_report(*sides, expected=[])
+    assert report["leaks"] == ["core.o"]
+    assert report["changed"][0]["planner_metadata_changed"]
+
+
 def test_identity_and_reports_are_deterministic():
     assert records.stable_hash({"ir": "a", "target": [12, 0]}) == records.stable_hash({"target": [12, 0], "ir": "a"})
     assert records.stable_hash({"ir": "a"}) != records.stable_hash({"ir": "b"})
