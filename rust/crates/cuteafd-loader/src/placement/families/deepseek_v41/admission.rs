@@ -38,12 +38,21 @@ pub struct Owner {
     pub resident: u64,
     pub deferred: bool,
     pub lifetime: Lifetime,
+    /// An immutable weight arena: `bytes` and `resident` are its physical
+    /// extent B, charged once with its single SM120 tail (no per-tensor payload).
+    pub arena: Option<crate::serving_capacity::WeightArenaLayout>,
 }
 
 impl Owner {
     /// Retained weights: the allocation and its resident-weight ledger agree.
     pub fn weights(gpu: u8, category: Category, group: impl Into<String>, bytes: u64) -> Self {
         Self { resident: bytes, ..Self::charged(gpu, category, group, bytes) }
+    }
+
+    /// One preplanned weight arena on `gpu`, live from Load for the whole run.
+    pub fn arena(gpu: u8, layout: crate::serving_capacity::WeightArenaLayout) -> Self {
+        let bytes = layout.bytes() as u64;
+        Self { arena: Some(layout), ..Self::weights(gpu, Category::Weights, "weight arena", bytes) }
     }
 
     /// A transient allocation that is not retained checkpoint weights.
@@ -56,6 +65,7 @@ impl Owner {
             resident: 0,
             deferred: false,
             lifetime: Lifetime::RESIDENT,
+            arena: None,
         }
     }
 
@@ -99,6 +109,7 @@ impl Owner {
                 ItemLifetime::ReadyResident => Lifetime::RESIDENT,
                 ItemLifetime::PostReadyReserve => Lifetime { first: Phase::Ready, last: Phase::Growth },
             },
+            arena: None,
         }
     }
 }
@@ -149,6 +160,15 @@ fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Resul
 fn owner_components(prefix: &str, owners: &[Owner], maximum: u64) -> Result<Vec<Component>, Refusal> {
     let mut out = Vec::new();
     for (index, owner) in owners.iter().enumerate() {
+        if let Some(layout) = &owner.arena {
+            // Root B, its resident claim and one separate tail; the shared
+            // helper replaces any payload, padding or per-tensor forecast.
+            if owner.bytes != layout.bytes() as u64 || owner.resident != owner.bytes || owner.deferred {
+                return Err(invalid("weight arena owner differs from its layout"));
+            }
+            out.extend(weight_arena_components(layout, owner.location, owner.lifetime, maximum)?);
+            continue;
+        }
         let id = format!("v41.{prefix}.{index}");
         if owner.bytes > 0 {
             let allocation = Allocation::buffer(
@@ -871,6 +891,10 @@ pub struct ProductionInput<'a> {
     pub workspace: u64,
     /// Every retained physical owner except KV and the routed-expert arena.
     pub owners: Vec<Owner>,
+    /// Target weight arenas by GPU (`weight_layout::TargetLayout::ranks`). Each
+    /// replaces the `owners::WEIGHT_ARENA_GROUP` owner on that GPU, which
+    /// carries the same extent B, with the shared root, claim and tail.
+    pub weight_arenas: Vec<crate::serving_capacity::WeightArenaLayout>,
     /// Sequential load peaks in absolute bytes above the availability sample.
     /// Each is charged as the part above the owners already live at load, and
     /// the peaks never coexist.
@@ -1002,9 +1026,29 @@ impl<'a> ProductionInput<'a> {
             owners: Vec::new(),
             opaques: self.allowances,
         };
+        // Every target arena replaces its single same-extent owner exactly once.
+        let mut arenas = self.weight_arenas.iter().map(Some).collect::<Vec<_>>();
+        if arenas.len() > self.gpus { return Err(invalid("more target weight arenas than GPUs")); }
+        let mut owners = Vec::with_capacity(self.owners.len());
+        for owner in &self.owners {
+            if owner.group != super::owners::WEIGHT_ARENA_GROUP || owner.arena.is_some() {
+                owners.push(owner.clone());
+                continue;
+            }
+            let Device::Coordinator(rank) = owner.location.device else {
+                return Err(invalid("target weight arena is not on a coordinator GPU"));
+            };
+            let layout = arenas.get_mut(usize::from(rank)).and_then(Option::take)
+                .ok_or_else(|| invalid("target weight arena has no layout or appears twice"))?;
+            if layout.bytes() as u64 != owner.bytes || owner.resident != owner.bytes {
+                return Err(invalid("target weight arena owner differs from its layout"));
+            }
+            owners.push(Owner { arena: Some(layout.clone()), ..owner.clone() });
+        }
+        if arenas.iter().any(Option::is_some) { return Err(invalid("target weight arena layout without an owner")); }
         recipe.owners.push(Case {
             when: Vec::new(),
-            value: owner_components("owner", &self.owners, maximum_pages)?,
+            value: owner_components("owner", &owners, maximum_pages)?,
         });
         let draft_demands = recipe.draft.as_ref().map(|draft| draft_owners(draft, self.gpus))
             .transpose()?;
@@ -1073,7 +1117,15 @@ pub fn draft_owners(draft: &DraftInventory, gpus: usize) -> Result<Vec<Owner>, R
         return Err(invalid("dSpark owner is outside the topology"));
     }
     let home = (gpus - 1) as u8;
-    let mut owners = vec![Owner::weights(home, Category::Drafter, "dSpark weights", draft.resident)];
+    let mut owners = Vec::new();
+    let mut experts = draft.resident;
+    if let Some(dense) = &draft.dense {
+        // The dense arena is part of `resident`; the rest is routed experts.
+        experts = experts.checked_sub(dense.bytes() as u64)
+            .ok_or_else(|| invalid("dSpark dense arena exceeds its retained weights"))?;
+        owners.push(Owner::arena(home, dense.clone()));
+    }
+    if experts > 0 { owners.push(Owner::weights(home, Category::Drafter, "dSpark experts", experts)); }
     if draft.marks > 0 {
         owners.push(Owner::charged(home, Category::Prefix, "dSpark marks", draft.marks));
     }

@@ -427,6 +427,11 @@ pub struct DraftInventory {
     /// max(experts + their staging, all retained weights). Runtime owners
     /// (lanes, windows, main contexts) are not part of loading.
     pub loader_peak: [u64; 2],
+    /// The independently retired dense arena on the home GPU
+    /// (`weight_layout::draft_layout`). Its extent is part of `resident`;
+    /// admission charges it as one arena plus its tail and the remainder of
+    /// `resident` as routed experts.
+    pub dense: Option<crate::serving_capacity::WeightArenaLayout>,
 }
 
 impl DraftInventory {

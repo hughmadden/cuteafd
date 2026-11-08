@@ -105,15 +105,36 @@ pub fn transports_bytes(decode_rows: u64, rows: u64, ranks: usize, slots: usize,
     Ok(lanes + outputs + crate::serving_capacity::prefill_return_bytes_with_format(slots as u64, rows, ranks as u64, 5120, format)?)
 }
 
-/// Full vocabulary packing peak above the pre-weight sample: the resident
-/// weights (but the head being packed) and the packing staging. Every lane
-/// and slot owner, transport, draft, vision and mark allocates after it.
-pub fn vocabulary_load_phase(weights: &[Demand], target: &[Demand], packing: u64) -> Result<Demand> {
-    ensure!(weights.iter().chain(target).all(|d| d.gpu == 0),
-        "vocabulary startup phase requires the single-RTX owners");
-    let bytes = weights.iter().filter(|d| !matches!(d.group.as_str(), "lm_head" | "norm")).try_fold(packing, |sum, d|
-        sum.checked_add(d.bytes).context("V4.1 vocabulary phase overflow"))?;
+/// Single-RTX vocabulary packing peak above the pre-weight sample. The whole
+/// target arena (final head copy included) is allocated before any payload, so
+/// the peak is its extent B plus the head conversion's transient source, the
+/// same bound `TargetArenas::new` checks before allocating. Every lane and slot
+/// owner, transport, draft, vision and mark allocates after it.
+pub fn vocabulary_load_phase(arena: &crate::serving_capacity::WeightArenaLayout,
+    head: super::resident::Fp8Head) -> Result<Demand> {
+    let transient = super::weight_layout::TargetLayout::vocabulary_transient_bytes(head, 1)? as u64;
+    let bytes = (arena.bytes() as u64).checked_add(transient).context("V4.1 vocabulary phase overflow")?;
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
+}
+
+/// Retained device target weights as one demand per arena (extent B, resident
+/// B), replacing the per-tensor `resident_headers` device items. Load phases,
+/// the pre-draft sample and admission all see the arena exactly where the
+/// payload used to be; `ProductionInput::weight_arenas` carries the layouts.
+pub fn target_arena_demands(layout: &super::weight_layout::TargetLayout) -> Vec<Demand> {
+    layout.ranks.iter().enumerate().map(|(rank, arena)| Demand::new(rank as u8, Category::Weights,
+        WEIGHT_ARENA_GROUP, arena.bytes() as u64, Basis::Exact)
+        .with_resident_weights(crate::placement::ResidentWeights(arena.bytes() as u64))).collect()
+}
+
+/// The group every arena demand carries; `ProductionInput` replaces these
+/// demands with the shared arena components.
+pub const WEIGHT_ARENA_GROUP: &str = "weight arena";
+
+/// The device weight items the arenas replace: everything `resident_headers`
+/// places on a coordinator GPU (a host-placed embedding stays a host owner).
+pub fn is_arena_weight(item: &cuteafd_core::memory_layout::Item) -> bool {
+    matches!(item.category, Category::Weights | Category::Embedding | Category::Tables)
 }
 
 /// Serving lanes allocated after the dual-RTX draft loader drains. Setup is
