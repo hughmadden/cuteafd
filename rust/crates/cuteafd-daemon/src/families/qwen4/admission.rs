@@ -191,15 +191,15 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
 /// holds is charged once by the recipe). `push` names the admitted push
 /// receive envelopes that will be prepared after the solve.
 pub(super) fn host_owners(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, mtp: bool, owners: usize,
-    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>,
+    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64,
     push: Vec<(&'static str, cuteafd_loader::push_load::PushHostEnvelope)>)
     -> Result<qwen4::QwenHost> {
     host_owners_with_memory(args, cfg, layers, mtp, owners, spark_ranks, spark_bf16, ple_row_bytes,
-        push, cuteafd_loader::formats::mapped_preload::host_memory_before_process()?)
+        host_embedding, push, cuteafd_loader::formats::mapped_preload::host_memory_before_process()?)
 }
 
 fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, mtp: bool, owners: usize,
-    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>,
+    spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64,
     push: Vec<(&'static str, cuteafd_loader::push_load::PushHostEnvelope)>, memory: (u64, u64))
     -> Result<qwen4::QwenHost> {
     use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, pinned_logits_bytes, scoring_logits_bytes};
@@ -240,7 +240,7 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         scoring_logits: scoring_logits_bytes(args.full_prefill_logits, shape.span_rows, cfg.vocab_size as u64)?,
         prefix_quota, prefix_chunk,
         loaded_media_cache: args.planner_media_cache_bytes,
-        host_embedding: 0,
+        host_embedding,
         table_reactor: cuteafd_loader::formats::mapped_table::table_reactor_workspace_bytes(usize::from(mapped)) as u64,
         preloaded_tables: 0, spark, push,
     })
@@ -897,6 +897,9 @@ mod tests {
             fixed.extend(experts.transport);
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
+            let host_embedding = if host {
+                cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?
+            } else { 0 };
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
@@ -908,7 +911,7 @@ mod tests {
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
                 spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
-                    Vec::new(), (128 << 30, 128 << 30))?, encoders: Default::default() })?;
+                    host_embedding, Vec::new(), (128 << 30, 128 << 30))?, encoders: Default::default() })?;
             assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
             assert_eq!(runtime.pool_tokens, layout.pool_tokens);
             assert_eq!(runtime.tp2.unwrap().layers, 4);

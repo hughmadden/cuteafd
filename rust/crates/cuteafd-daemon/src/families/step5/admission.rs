@@ -277,7 +277,7 @@ mod tests {
                     );
                     GpuBudget {
                         capacity_bytes,
-                        reserve_bytes: 0,
+                        reserve_bytes: cuteafd_loader::placement::reserve::gpu("step5"),
                         baseline: Baseline::Measured {
                             free_bytes: capacity_bytes - arch.context_bytes,
                         },

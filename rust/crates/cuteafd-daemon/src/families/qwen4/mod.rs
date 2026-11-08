@@ -784,8 +784,11 @@ impl Opened {
                     vec![("qwen.host.push.exl3", local.push_envelope()?.2)],
                 _ => Vec::new(),
             };
+            let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
+                cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?
+            } else { 0 };
             let host = admission::host_owners(args, &self.cfg, layers, model.mtp.is_some(), 1, source.spark_ranks(),
-                self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), window_push)?;
+                self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), host_embedding, window_push)?;
             let (pool, host) = admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
                 future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host)?;
