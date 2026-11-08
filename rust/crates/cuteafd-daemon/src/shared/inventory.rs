@@ -457,7 +457,7 @@ fn observer_capacity_reaches_glm_forecasts_and_v4_physical_inputs() -> Result<()
     let library = fixture.load()?;
     fixture.configure_memory(&library, 0, 10_000)?;
     // Stand in for the external observer's resident context in raw CUDA counters.
-    let observer = library.alloc_device_buffer(550, crate::shared::memory::TEST)?;
+    let mut observer = library.alloc_device_buffer(550, crate::shared::memory::TEST)?;
     assert_eq!(library.cuda_physical_memory_info()?, (9_450, 10_000));
     let (free, physical) = library.cuda_allocatable_memory_info()?;
     assert_eq!((free, physical), (9_450, 9_450));
@@ -471,6 +471,6 @@ fn observer_capacity_reaches_glm_forecasts_and_v4_physical_inputs() -> Result<()
     // V4 reads this same pre-budget total separately from the logical sample.
     let v4_physical = library.cuda_allocatable_memory_info()?.1;
     assert_eq!(v4_physical, physical);
-    library.free_device_buffer(observer)?;
+    library.free_device_buffer(&mut observer)?;
     Ok(())
 }
