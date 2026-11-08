@@ -1,7 +1,7 @@
 //! Flash stage composition over the shared native EXLR8 owners and linears.
 use super::*;
 use crate::shared::{experts::exlr8::{self, dense_execution::{NativeOut, NativePrograms, ScratchOwner},
-    NativeExperts}, memory::device::{Allocation, Device}};
+    NativeExperts}, memory::{device::{Allocation, Device}, Tag}};
 use cuteafd_loader::plan::exlr8::dense::requests::key;
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, F32Bf16Narrow,
     glm_stage::{Buffers as KvBuffers, GlmStage}, projected_index::{self, ProjectedIndex, ProjectedKeys},
@@ -34,7 +34,8 @@ impl<'a> Scratch<'a> {
     fn new(device: Device<'a>, linear: &cuteafd_loader::plan::exlr8::dense::scratch::LinearScratchLayout,
         stages: &FlashStageLayout) -> Result<Self> {
         Ok(Self { linear: ScratchOwner::new(device, linear)?, stages: stages.extents.iter()
-            .map(|(&name, &bytes)| Ok((name, Allocation::untagged(device, bytes)?))).collect::<Result<_>>()? })
+            .map(|(&name, &bytes)| Ok((name, Allocation::new(device, bytes, Tag::workspace("glmf/native-stages"))?)))
+            .collect::<Result<_>>()? })
     }
     fn stage(&self, name: &str) -> Result<Buffer> {
         Ok(self.stages.get(name).with_context(|| format!("native Flash stage {name}"))?.buffer)

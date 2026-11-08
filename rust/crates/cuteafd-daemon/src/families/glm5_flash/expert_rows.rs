@@ -1,7 +1,7 @@
 //! Fixed-input expert-row checks through the production local packages.
 use super::{bf16s, similarity, EngineArgs, Opened};
 use crate::families::deepseek_v4::local::{LocalExperts, LocalLayer};
-use crate::shared::memory::{DeviceAllocation, LoadStream};
+use crate::shared::memory::{DeviceAllocation, LoadStream, Tag};
 use anyhow::{ensure, Context, Result};
 
 pub(super) fn check(args: &EngineArgs, opened: &Opened, max_rows: usize) -> Result<()> {
@@ -37,10 +37,11 @@ pub(super) fn check(args: &EngineArgs, opened: &Opened, max_rows: usize) -> Resu
     .context("no local expert package for this checkpoint")?;
     let (hidden, topk, count) = (shape.hidden, shape.topk, shape.experts);
     let stride = hidden + hidden / 32;
-    let wire = DeviceAllocation::untagged(library, max_rows * stride)?;
-    let ids = DeviceAllocation::untagged(library, max_rows * topk * 4)?;
-    let weights = DeviceAllocation::untagged(library, max_rows * topk * 4)?;
-    let shared = DeviceAllocation::untagged(library, max_rows * hidden * 2)?;
+    let tag = Tag::workspace("glmf/expert-row-check");
+    let wire = DeviceAllocation::new(library, max_rows * stride, tag)?;
+    let ids = DeviceAllocation::new(library, max_rows * topk * 4, tag)?;
+    let weights = DeviceAllocation::new(library, max_rows * topk * 4, tag)?;
+    let shared = DeviceAllocation::new(library, max_rows * hidden * 2, tag)?;
     library.copy_h2d(shared.buffer, &vec![0; shared.buffer.bytes])?;
     library.copy_h2d(
         weights.buffer,

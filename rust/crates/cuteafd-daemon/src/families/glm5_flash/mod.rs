@@ -2404,10 +2404,7 @@ impl Opened {
             let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
                 embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
                     &self.library, embed.as_ref().context("legacy Flash embedding source")?.clone(), args.token_io.embed_placement, || {
-                        devices[0].run(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                            planning.model(&self.cfg, &execution)
-                        })
+                        devices[0].run(|| planning.model(&self.cfg, &execution))
                     }, |name, bytes| planning.allocate(embedding_device.id, name, bytes)))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
@@ -2659,10 +2656,8 @@ impl Opened {
                 None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     embed.as_ref().context("legacy Flash embedding source")?.clone(),
                     args.token_io.embed_placement, || {
-                        crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
-                            let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
-                            loader.model(&self.cfg, &execution)
-                        })
+                        crate::shared::memory::device::Device { library: &self.library, id: args.device }
+                            .run(|| loader.model(&self.cfg, &execution))
                     }, |name, bytes| loader.allocate(embedding_device.id, name, bytes)))?),
             };
             let tp2 = if tp2_layers.is_empty() { pushed_whole = pushed; None }
