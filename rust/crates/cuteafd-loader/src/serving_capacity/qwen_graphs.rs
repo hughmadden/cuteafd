@@ -13,12 +13,15 @@ pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];
 /// Tokens per allocation unit (four 64-row record pages) and pages per unit.
 pub const QWEN_UNIT_ROWS: usize = 256;
 pub const QWEN_UNIT_PAGES: usize = 4;
-/// SM120 PRO, driver 595.91.07: 4,569,694,208 B / 30,380 startup graphs at the
-/// 1-RTX qualified layout (v3-p2 ready ledgers, EXL3 and NVFP4 alike,
-/// 2026-10-10), rounded up; 2026-10-07 TP4 measured 149,712 (12,397 graphs).
-pub const QWEN_GRAPH_BYTES_PER_GRAPH: u64 = 150_418;
-pub const QWEN_GRAPH_MARGIN_PERCENT: u64 = 10;
-pub const QWEN_GRAPH_MARGIN_BYTES: u64 = 256 << 20;
+/// Measured driver bytes of one startup graph executable, rounded up: the
+/// 1-RTX min config (`qwen38-exl3-min`, EXL3 K4.25 PLE FP8, MTP depth 3)
+/// captured 33,418 executables (682 shapes x 49 segments) for 5,102,370,816 B
+/// on SM120 PRO, 2026-11-08 — 152,683.31 B each, charged as the next byte. The
+/// capture measures allocatable memory before and after the whole loop, so it
+/// absorbs the modules and stream slabs that capturing the set creates
+/// (pinned-host page tables are charged as their own owner); multiplying it by
+/// the exact executable count is the whole charge, with no margin.
+pub const QWEN_GRAPH_BYTES_PER_GRAPH: u64 = 152_684;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QwenGraphGeometry {
@@ -82,13 +85,14 @@ pub fn qwen_pool_pages(pool_tokens: usize) -> Option<usize> {
     pool_tokens.div_ceil(QWEN_UNIT_ROWS).checked_mul(QWEN_UNIT_PAGES)
 }
 
-/// The startup graph set at `pool_tokens`: shapes x (layers + 1) executables,
-/// measured bytes each, +10% (at least 256 MiB).
+/// The startup graph set at `pool_tokens`: shapes x (layers + 1) executables
+/// at the measured per-executable price, no margin (the capture is the
+/// measurement; a set outside this one runs ungraphed).
 pub fn qwen_startup_graphs(context: usize, pool_tokens: usize, dense: usize, sequences: usize, speculation: bool,
     layers: usize) -> Option<GraphSet> {
     let shapes = qwen_serving_graph_shapes(context, qwen_pool_pages(pool_tokens)?, dense, sequences, speculation).len();
     let executables = (shapes as u64).checked_mul(layers as u64 + 1)?;
-    Some(GraphSet::new(&[executables], QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT, QWEN_GRAPH_MARGIN_BYTES,
+    Some(GraphSet::new(&[executables], QWEN_GRAPH_BYTES_PER_GRAPH, 0, 0,
         shapes as u64, Lifetime::Startup))
 }
 
@@ -112,7 +116,7 @@ pub fn qwen_startup_graphs_placed(context: usize, pool_tokens: usize, dense: usi
     let shapes = qwen_serving_graph_shapes(context, qwen_pool_pages(pool_tokens)?, dense, sequences, speculation).len();
     let executables = qwen_graph_segments(owners)?.into_iter()
         .map(|segments| (shapes as u64).checked_mul(segments)).collect::<Option<Vec<_>>>()?;
-    Some(GraphSet::new(&executables, QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT, QWEN_GRAPH_MARGIN_BYTES,
+    Some(GraphSet::new(&executables, QWEN_GRAPH_BYTES_PER_GRAPH, 0, 0,
         shapes as u64, Lifetime::Startup))
 }
 

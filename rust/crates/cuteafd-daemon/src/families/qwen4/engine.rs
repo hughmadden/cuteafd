@@ -46,6 +46,20 @@ use std::sync::Arc;
 type Dev<'a> = Rc<Allocation<'a>>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
+/// Views are 256-byte aligned; every record-set part is `PAGE_ROWS` rows of a
+/// 256-byte multiple (`record bytes` is 1040 or 2048), so the offsets hold.
+const INDEX_DIM_BYTES: usize = INDEX_DIM * 2;
+
+/// One pooled record set's physical request: the KV records, then the token
+/// index keys and the pool index keys at aligned offsets. One arena per record
+/// set, so admission prices a single cudaMalloc rounding for the set instead of
+/// one per part (`qwen4.rs` `pooled_backing`).
+fn record_arena_bytes(pages: usize, pool_pages: usize, record_bytes: usize) -> Result<(usize, usize, usize)> {
+    let bytes = |dim: usize, stride: usize| dim.checked_mul(PAGE_ROWS).and_then(|rows| rows.checked_mul(stride))
+        .ok_or_else(|| anyhow::anyhow!("Qwen record arena overflow"));
+    Ok((bytes(pages, record_bytes)?, bytes(pages, INDEX_DIM_BYTES)?, bytes(pool_pages, INDEX_DIM_BYTES)?))
+}
+
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::qwen4::VERIFY_ROWS;
 use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
@@ -1382,9 +1396,11 @@ impl<'a> Qwen4Engine<'a> {
             let _layer_scope = device.enter()?;
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes, Tag::kv("qwen4/kv-records"))?));
-                    index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2, Tag::kv("qwen4/kv-index-keys"))?,
-                        zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2, Tag::kv("qwen4/kv-pool-keys"))?)));
+                    let (records, keys, pooled) = record_arena_bytes(pages, pool_pages, kv_record_bytes)?;
+                    let arena = zeroed(records + keys + pooled, Tag::kv("qwen4/kv-arena"))?;
+                    kv.push(Some(Rc::new(Allocation::view(&arena, 0, records)?)));
+                    index.push(Some((Rc::new(Allocation::view(&arena, records, keys)?),
+                        Rc::new(Allocation::view(&arena, records + keys, pooled)?))));
                 }
                 Qwen4Attention::Gdn => {
                     kv.push(None);
@@ -1415,9 +1431,11 @@ impl<'a> Qwen4Engine<'a> {
         // The MTP layer's own attention cache and its per-slot stash of target
         // rows (snapshotted with the rest of a slot's state) are drafter state.
         let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
-            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes, Tag::drafter_kv("qwen4/mtp-kv-records"))?,
-                zeroed(pages * PAGE_ROWS * INDEX_DIM * 2, Tag::drafter_kv("qwen4/mtp-kv-index-keys"))?,
-                zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2, Tag::drafter_kv("qwen4/mtp-kv-pool-keys"))?)),
+            let (records, keys, pooled) = record_arena_bytes(pages, pool_pages, kv_record_bytes)?;
+            let arena = zeroed(records + keys + pooled, Tag::drafter_kv("qwen4/mtp-kv-arena"))?;
+            (Some((Rc::new(Allocation::view(&arena, 0, records)?),
+                Rc::new(Allocation::view(&arena, records, keys)?),
+                Rc::new(Allocation::view(&arena, records + keys, pooled)?))),
              Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2, Tag::drafter_kv("qwen4/mtp-stash"))?))
         } else {
             (None, None)
@@ -1650,6 +1668,8 @@ impl<'a> Qwen4Engine<'a> {
         let bytes: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before as i64 - after as i64).collect();
         tracing::info!(graphs, elapsed_ms = started.elapsed().as_millis() as u64,
             graph_bytes = bytes.iter().sum::<i64>(), graph_bytes_by_owner = ?bytes,
+            graph_bytes_charged = graphs as u64
+                * cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
             "Qwen decode graphs captured at startup");
         Ok(graphs)
     }
@@ -3604,10 +3624,25 @@ impl<'a> Qwen4Engine<'a> {
             }
             return Ok(());
         }
-        ensure!(!self.startup_graphs || self.warming_graphs.get(),
-            "Qwen serving graph was not captured at startup: {key:?}");
+        if !self.warming_graphs.get() {
+            // The startup set is exhaustive by construction, so a key outside it
+            // is a shape the warm-up never enumerated. Run the segment ungraphed:
+            // it allocates no graph executable and never captures at runtime.
+            // Name the variant once so the next restart can add it.
+            if self.startup_graphs {
+                self.miss_graph(key);
+            }
+            segment()?;
+            if self.cfg.ple_layers.contains(&key.segment) {
+                if let Some(ple) = &self.ple {
+                    // SAFETY: the ungraphed segment's PLE reader is on this stream; no later layer is queued yet.
+                    unsafe { ple.mapped().consumed(self.execution_stream())?; }
+                }
+            }
+            return Ok(());
+        }
         // SAFETY: capture records this stream's launches; nothing in a segment
-        // synchronizes the host or allocates.
+        // synchronizes the host or allocates. Only the startup warm-up captures.
         unsafe { self.library.cuda_graph_begin_capture(self.execution_stream())? };
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
@@ -3626,6 +3661,23 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Record and warn about one ungraphed decode shape. The warning names the
+    /// family, the shape key and the engine's request context exactly once per
+    /// variant; every occurrence joins the process-wide `/v1/stats`
+    /// `graph_missing_variants` inventory that `probe::graph_capture_stats`
+    /// publishes.
+    fn miss_graph(&self, key: GraphKey) {
+        let variant = format!("rows={} spec={} long={} pool_width={} page_stride={} pool_stride={}",
+            key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride);
+        if crate::shared::decode_graph::note_missing("qwen4", &variant) {
+            tracing::warn!(target: "cuteafd::graph_capture", family = "qwen4", shape = %variant,
+                segment = key.segment, max_context = self.max_context, slots = self.slots,
+                pages = self.pages,
+                "qwen4 decode shape is outside the startup graph set: running it ungraphed and allocating no \
+                 graph bytes; consider adding it to the startup graph set");
+        }
     }
 
     fn site<'l>(layer: &'l Qwen4Layer<'_>, site: &str) -> Result<[*mut c_void; 3]> {

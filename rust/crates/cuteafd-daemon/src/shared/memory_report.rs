@@ -76,15 +76,29 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
     for device in snapshot.devices() {
         let tracked = snapshot.total(Space::Device, device) + snapshot.total(Space::Managed, device);
         let scopes: BTreeMap<&str, usize> = snapshot.by_scope(Space::Device, device);
+        // Live allocations behind every scope, so a scope's bytes can be read
+        // beside the number of physical requests that carry rounding.
+        let scope_allocations: BTreeMap<&str, usize> = snapshot.rows.iter()
+            .filter(|row| row.key.space == Space::Device && row.key.device == device)
+            .fold(BTreeMap::new(), |mut out, row| {
+                *out.entry(row.key.scope).or_default() += row.allocations;
+                out
+            });
         let mut entry = json!({
             "device": device,
             "cuda_memory_scope": "raw cudaMemGetInfo; GB10 under-reports reclaimable page cache; host MemAvailable is allocatable headroom",
             "tracked": tracked,
             "peak": snapshot.peak.get(&(Space::Device, device)).copied().unwrap_or(0),
             "scopes": scopes,
+            "scope_allocations": scope_allocations,
             "by_kind": kinds(snapshot, Space::Device, device),
             "managed_by_kind": kinds(snapshot, Space::Managed, device),
         });
+        if let Some(g) = snapshot.granularity.get(&(Space::Device, device)) {
+            // SM120 direct-device rounding already inside the measured bytes used.
+            entry["granularity"] = json!({"tail": g.tail, "large_requests": g.large_requests,
+                "small_bytes": g.small_bytes});
+        }
         if let Some((free, total)) = device_memory(device) {
             let used = total - free;
             entry["used"] = json!(used);
@@ -129,7 +143,16 @@ pub(crate) fn log(stage: &str) {
     }
     let stage = stage.to_owned();
     let value = std::thread::spawn(move || report(&stage)).join();
-    if let Ok(value) = value {
+    if let Ok(mut value) = value {
+        // Bounded diagnostic boundary: the process-wide stream census and the
+        // current device's CUDA pool retention. Both are queries: no
+        // allocation, no synchronization, no device switch.
+        let (live, peak) = cuteafd_ffi::stream_census();
+        value["streams"] = json!({"live": live, "peak": peak,
+            "scope": "process-wide cudaStreamCreate/Destroy census; a context's driver slabs follow its live streams at 2 MiB per four (#1511)"});
+        if let Some(pool) = memory_ledger::current_cuda_memory_snapshot() {
+            value["cuda_pool"] = pool;
+        }
         tracing::info!(target: "cuteafd::memory", report = %value, "memory ledger");
     }
 }

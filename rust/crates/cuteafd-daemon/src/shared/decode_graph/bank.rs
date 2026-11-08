@@ -41,7 +41,9 @@ static MISSING: std::sync::Mutex<Vec<MissingVariant>> = std::sync::Mutex::new(Ve
 /// Counts one eager execution of `shape` and reports whether it is the first,
 /// which is the only occurrence that warns. A bank miss is a mismatch between
 /// the sealed startup inventory and real traffic, so it is rare by construction.
-fn note_missing(family: &'static str, shape: &str) -> bool {
+/// A family that owns its decode graph holder directly (Qwen) calls this too, so
+/// every family's misses land in the same process-wide /v1/stats inventory.
+pub(crate) fn note_missing(family: &'static str, shape: &str) -> bool {
     let mut missing = MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match missing.iter_mut().find(|entry| entry.family == family && entry.shape == shape) {
         Some(entry) => { entry.runs += 1; false }

@@ -932,8 +932,8 @@ mod tests {
     }
 
     fn set(count: u64) -> Option<cuteafd_loader::placement::GraphSet> {
-        Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, QWEN_GRAPH_MARGIN_PERCENT,
-            QWEN_GRAPH_MARGIN_BYTES, 0, cuteafd_loader::placement::Lifetime::Startup))
+        Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, 0, 0, 0,
+            cuteafd_loader::placement::Lifetime::Startup))
     }
 
     #[test]
@@ -1088,7 +1088,7 @@ mod tests {
         let (available, headroom, per_token) = (4_u64 << 30, 1_u64 << 30, 4096);
         let (tokens, graphs) = qwen_graph_pool(available, headroom, per_token, 2_097_152, None, |_| set(12397)).unwrap();
         let reserve = graphs.bytes(0);
-        assert_eq!(reserve, 12397 * QWEN_GRAPH_BYTES_PER_GRAPH + QWEN_GRAPH_MARGIN_BYTES);
+        assert_eq!(reserve, 12397 * QWEN_GRAPH_BYTES_PER_GRAPH);
         assert_eq!(tokens, (available - headroom - reserve) / per_token / 256 * 256);
         assert!(tokens * per_token + headroom + reserve <= available);
     }
@@ -1104,9 +1104,9 @@ mod tests {
     }
 
     #[test]
-    fn margin_and_fixed_pool_rounding_do_not_spend_headroom() {
+    fn graph_charge_is_the_measurement_and_fixed_pool_rounding_does_not_spend_headroom() {
         let measured = 21560 * QWEN_GRAPH_BYTES_PER_GRAPH;
-        assert_eq!(set(21560).unwrap().bytes(0), measured + measured.div_ceil(10));
+        assert_eq!(set(21560).unwrap().bytes(0), measured);
         let (tokens, graphs) = qwen_graph_pool(8 << 30, 3 << 30, 28422, 2097152, Some(73727), |_| set(12397)).unwrap();
         assert_eq!(tokens, 73728);
         assert!(tokens * 28422 + graphs.bytes(0) + (3 << 30) <= 8 << 30);
