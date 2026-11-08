@@ -7,7 +7,7 @@
 //! whole-layer prefix (or a TP2 half prefix) loads after dSpark's stages into
 //! the same arena, so its peak is the running resident total plus the largest
 //! staging step, never the sum of every step.
-use super::{context_buffers, fixed_demands, V4Inputs};
+use super::{context_buffers, fixed_demands, steps_requests, V4Inputs};
 use crate::placement::planner::*;
 use crate::placement::{
     hop_buffer_bytes, plan_hops, residual_homes, AttentionClass, AttentionPlacement, ExpertHome,
@@ -281,7 +281,7 @@ fn context_floor(inputs: &V4Inputs) -> u64 {
 pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     let started = std::time::Instant::now();
     let (modes, attention) = modes(inputs)?;
-    let (_, _, reserves) = fixed_demands(inputs).map_err(invalid)?;
+    let (_, reserves) = fixed_demands(inputs).map_err(invalid)?;
     let budgets = budgets(inputs, &reserves)?;
     if inputs.max_context == 0
         || inputs.prefill_rows == 0
@@ -512,8 +512,10 @@ impl Owners {
         component.activation = activation;
         self.components.push(component);
         // Requests at or below 1 MiB share driver blocks; their rounding is a
-        // pool-level fact, not this owner's, so only large requests are priced.
-        if requests.iter().all(|&bytes| bytes > (1 << 20)) {
+        // pool-level fact, not this owner's. One request above 1 MiB already
+        // forces the whole extent into its own cudaMalloc, so a mixed list
+        // prices its backing exactly like an all-large one.
+        if requests.iter().any(|&bytes| bytes > (1 << 20)) {
             let granularity = AllocationGranularity { id: format!("{id}.tail"), location,
                 lifetime: STEADY, evidence: GranularityEvidence::Forecast,
                 backings: vec![GranularityBacking { backing: id, requests }] };
@@ -884,18 +886,27 @@ impl Recipe for PreparedV4<'_> {
         if let Some(geometry) = self.expert_usage() {
             owners.components.extend(crate::placement::expert_usage::components(geometry, &[0], self.maximum_pages)?);
         }
-        let (fixed, overhead, _) = fixed_demands(inputs).map_err(invalid)?;
+        let (fixed, _) = fixed_demands(inputs).map_err(invalid)?;
         for (index, demand) in fixed.iter().enumerate() {
             let id = format!("v4.fixed.{index}");
             let activation = Activation::always();
-            owners.owner(
-                id.clone(),
-                demand.gpu,
-                demand.bytes,
-                demand.category,
-                &demand.group,
-                activation.clone(),
-            );
+            // The daemon's own builders report their exact cudaMalloc request
+            // lists for the step workspaces, Spark intake planes and route
+            // probe; the prefix mark arena is one request. Both thereby price
+            // their shared 2 MiB backing instead of only their payload. Any
+            // other demand keeps its logical extent (and is either a single
+            // aligned request or already priced from its own geometry).
+            let requests = match demand.group.as_str() {
+                "steps" => steps_requests(inputs, demand.gpu as usize).map_err(invalid)?,
+                "marks" => Some(vec![demand.bytes]),
+                _ => None,
+            };
+            match requests {
+                Some(requests) => owners.physical(id.clone(), demand.gpu, requests,
+                    demand.category, &demand.group, activation.clone())?,
+                None => owners.owner(id.clone(), demand.gpu, demand.bytes,
+                    demand.category, &demand.group, activation.clone()),
+            }
             owners.weights(id, demand.gpu, demand.resident_weights.0, activation);
         }
         // Owners a caller adds after the family's own facts (an RTX media
@@ -913,8 +924,9 @@ impl Recipe for PreparedV4<'_> {
             );
             owners.weights(id, demand.gpu, demand.resident_weights.0, activation);
         }
-        // The pool's own unit metadata and lane page tables scale with it.
-        let scale = self.page_rows / V4_PAGE_ROWS;
+        // The pool's own lane page tables scale with it.
+        let tables = crate::serving_capacity::deepseek_v4_lane_page_tables(inputs.decode_rows)
+            .map_err(invalid)?;
         let gpus = inputs.gpus.len();
         let context = self.attention == AttentionPlacement::Context;
         let sequences = inputs.sequences.max(1);
@@ -977,18 +989,45 @@ impl Recipe for PreparedV4<'_> {
                     }
                 }
             }
-            // Beside the records, not inside them: unit metadata and lane page tables.
-            let unit = overhead[gpu]
-                .checked_mul(scale)
-                .ok_or(Refusal::Overflow("V4 pool overhead"))?;
+            // Beside the records, not inside them: every admitted lane keeps
+            // its own C4 page table as a pool-sized cudaMalloc. Prefill lanes
+            // hold one private, aligned page list per packed member (16 plus
+            // three alignment rows); the decode lane holds `decode_rows`
+            // lists. `pool_units` adds one partial unit per sequence, and each
+            // backing is rounded independently.
+            let lanes = inputs.workspace.as_ref().and_then(|ranks| ranks.get(gpu as usize))
+                .map(|rank| rank.prefill_waves)
+                .unwrap_or(inputs.prefill_waves);
+            let table_first = c4_unit(1, true)?;
+            let table_slope = c4_unit(2, true)?.checked_sub(table_first)
+                .ok_or(Refusal::Overflow("V4 lane table units"))?;
+            let table_fixed = table_first.checked_sub(table_slope)
+                .ok_or(Refusal::Overflow("V4 lane table units"))?;
+            for lane in 0..lanes {
+                owners.paged(
+                    format!("v4.records.tables.{gpu}.prefill{lane}"),
+                    gpu as u8,
+                    tables.prefill_unit_bytes.checked_mul(table_slope)
+                        .ok_or(Refusal::Overflow("V4 lane table slope"))?,
+                    tables.prefill_unit_bytes.checked_mul(table_fixed)
+                        .and_then(|fixed| fixed.checked_add(tables.prefill_fixed_bytes))
+                        .ok_or(Refusal::Overflow("V4 lane table fixed"))?,
+                    SM120_ALLOCATION_GRANULARITY_BYTES,
+                    Category::Kv,
+                    "lane page tables",
+                    Activation::always(),
+                )?;
+            }
             owners.paged(
-                format!("v4.records.overhead.{gpu}"),
+                format!("v4.records.tables.{gpu}.decode"),
                 gpu as u8,
-                unit,
-                0,
-                0,
+                tables.decode_unit_bytes.checked_mul(table_slope)
+                    .ok_or(Refusal::Overflow("V4 lane table slope"))?,
+                tables.decode_unit_bytes.checked_mul(table_fixed)
+                    .ok_or(Refusal::Overflow("V4 lane table fixed"))?,
+                SM120_ALLOCATION_GRANULARITY_BYTES,
                 Category::Kv,
-                "records",
+                "lane page tables",
                 Activation::always(),
             )?;
         }
