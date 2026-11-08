@@ -166,7 +166,16 @@ fn owner_components(prefix: &str, owners: &[Owner], maximum: u64) -> Result<Vec<
             if owner.bytes != layout.bytes() as u64 || owner.resident != owner.bytes || owner.deferred {
                 return Err(invalid("weight arena owner differs from its layout"));
             }
-            out.extend(weight_arena_components(layout, owner.location, owner.lifetime, maximum)?);
+            // The resident-weight budget keeps counting logical payload P, not
+            // the physical extent; the root and tail carry the physical charge.
+            let mut components = weight_arena_components(layout, owner.location, owner.lifetime, maximum)?;
+            components.retain(|component| !matches!(component.kind, ComponentKind::ResidentWeight(_)));
+            let payload = u64::try_from(layout.payload_bytes()).map_err(|_| Refusal::Overflow("V4.1 arena payload"))?;
+            let root = Allocation::buffer(layout.id(), owner.location, owner.bytes, owner.lifetime,
+                Category::Weights, "weight arena");
+            out.extend(components);
+            out.push(Component::resident_weight(ResidentWeight::from_allocation(&root, ResidentWeights(payload)),
+                ByteCurve::fixed(payload, maximum)));
             continue;
         }
         let id = format!("v41.{prefix}.{index}");
