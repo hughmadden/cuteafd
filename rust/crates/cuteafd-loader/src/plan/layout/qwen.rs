@@ -392,7 +392,7 @@ fn host_prefix(report: &mut PlanReport, options: &LayoutOptions, input: &super::
 fn qwen_encoders(report: &mut PlanReport, options: &LayoutOptions, sparks: &[DeviceLayout], gpus: usize)
     -> Result<qwen4::QwenEncoders> {
     use super::super::encoder::{candidates, encoder_placement, EncoderGpuBudget, EncoderHardware,
-        EncoderKind, EncoderRequest, EncoderSparkBudget};
+        EncoderKind, EncoderPlacement, EncoderRequest, EncoderSparkBudget};
     use super::super::MediaMode;
     let towers = qwen_towers(report);
     let (weights, scratch) = match towers.vision {
@@ -423,7 +423,10 @@ fn qwen_encoders(report: &mut PlanReport, options: &LayoutOptions, sparks: &[Dev
     anyhow::ensure!(!encoders.is_empty() || report.vision == MediaMode::Off,
         "requested Qwen vision placement has no executable device");
     use crate::placement::planner::{Baseline, Budget, Device, Domain, Location};
-    let spark_budgets = sparks.iter().map(|device| Budget {
+    // The media solve owns only candidate workers; full layouts check all ranks separately.
+    let media_ranks: std::collections::BTreeSet<usize> = encoders.iter()
+        .flat_map(EncoderPlacement::spark_ranks).collect();
+    let spark_budgets = sparks.iter().filter(|device| media_ranks.contains(&(device.index as usize))).map(|device| Budget {
         id: format!("spark{}", device.index),
         locations: vec![Location { device: Device::Spark(device.index as u8), domain: Domain::Managed }],
         physical_bytes: device.capacity_bytes,

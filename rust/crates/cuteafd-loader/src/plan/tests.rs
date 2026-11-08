@@ -3367,6 +3367,49 @@ fn capacity_suggests_a_packaged_rank_count() {
 }
 
 #[test]
+fn qwen_spark_encoder_candidate_enforces_its_physical_budget() {
+    use cuteafd_core::memory_layout::DeviceKind;
+    let mut config = qwen4_config(1);
+    config["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+        "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
+        "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+    let (mut tensors, manifest) = qwen4_exl3(1, 4);
+    tensors.extend(qwen4_coordinator(&config, false));
+    tensors.extend([
+        t("model.visual.patch_embed.proj.weight", "BF16", &[1152, 3, 2, 16, 16]),
+        t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
+        t("model.visual.blocks.0.norm1.bias", "BF16", &[1152]),
+    ]);
+    let dir = snapshot(config, &tensors);
+    write_quantize_config(dir.path(), &manifest);
+    let mut options = PlanOptions {
+        vision: MediaMode::Spark(Some(0)),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            rtx_bytes: vec![96 << 30], pool_tokens: Some(32768), target_pool_tokens: 32768,
+            onboard: Some(crate::placement::OnboardSetting::Layers(1)), ..Default::default()
+        }), ..sparks(1)
+    };
+    let roomy = plan(dir.path(), &options).unwrap();
+    assert!(roomy.executable(), "{}", render(&roomy));
+    assert_eq!(roomy.encoder.as_ref().unwrap().kind, super::encoder::EncoderKind::Spark { rank: 0 });
+    let spark = roomy.memory_layout.as_ref().unwrap().devices.iter()
+        .find(|device| device.kind == DeviceKind::Spark).unwrap();
+    let required = spark.used_bytes();
+    assert!(spark.items.iter().any(|item| item.group.starts_with("cuBLAS handles:")));
+    assert!(spark.items.iter().any(|item| item.group.starts_with("cuBLAS first use")));
+    options.layout.as_mut().unwrap().spark_bytes = required;
+    let exact = plan(dir.path(), &options).unwrap();
+    assert!(exact.executable(), "{}", render(&exact));
+    options.layout.as_mut().unwrap().spark_bytes = required - 1;
+    let short = plan(dir.path(), &options).unwrap();
+    assert!(!short.executable() && !short.placement_supported, "{}", render(&short));
+    assert!(short.hints.iter().any(|hint| hint.what.contains("memory budget 'spark0'")), "{}", render(&short));
+}
+
+#[test]
 fn capacity_counts_the_widest_rank_of_an_uneven_split() {
     // 2048 = 16 whole 128-blocks: six ranks hold 3, 3, 3, 3, 2, 2 of them, so the
     // widest carries 3/16 of the routed bytes, not 1/6.
