@@ -185,7 +185,7 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     module = (root / "glm5_flash/mod.rs").read_text()
     opening = module.split("pub fn with_engine", 1)[1]
     inventory = opening.index("self.admission_inventory(")
-    allocation = opening.index("TokenEmbedding::load(")
+    allocation = opening.index("TokenEmbedding::load_with(")
     assert opening.count("self.admission_inventory(") == 1
     assert inventory < opening.index("self.admit_candidate(")
     assert all(inventory < start < allocation for start in (

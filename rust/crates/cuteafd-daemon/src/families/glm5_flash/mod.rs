@@ -20,6 +20,7 @@ pub(crate) mod head;
 mod precision;
 mod native;
 pub(crate) mod weights;
+mod weight_layout;
 
 /// Whether this launch's coordinator operands can join a push group: every
 /// representation the push path records (BF16 operands, GPU FP8 copies,
@@ -2229,7 +2230,7 @@ impl Opened {
         // both admissions reserve these marks, and `prefix_cache` allocates as many.
         let mark_slots = args.mark_arena.slots_placed(&self.cfg, layers, index_cache, args.kda_state,
             context_mode.is_some())?;
-        let loader = weights::GlmfLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
+        let loader = weights::GlmfLoader { arenas: Default::default(), library: &self.library, checkpoint: &self.checkpoint, stream,
             kda_fp8: args.kda_fp8, kda_output_shard: args.kda_output_shard,
             fp8_head: args.fp8_head, kda_nvfp4: args.kda_nvfp4_gate.as_deref().map(|mode| mode == "search"),
             fp8_scales: args.fp8_scales, device: args.device,
@@ -2376,18 +2377,32 @@ impl Opened {
             "GLM Flash executor only binds whole experts on coordinator rank zero");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d))
             .map(|id| crate::shared::memory::device::Device { library: &self.library, id }).collect();
+        let layouts = if let Some(native) = &native_admission {
+            native.arena_layouts(&self.cfg, embedding_rank)?
+        } else {
+            let embedding = (args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu)
+                .then(|| embed.as_ref().context("Flash embedding source").and_then(|source|
+                    source.allocation_request("embedding.table", cuteafd_loader::placement::planner::EmbeddingHome::Device(embedding_rank as u8))))
+                .transpose()?.map(|request| (embedding_rank, request.bytes as usize));
+            weight_layout::target(&self.checkpoint, &self.cfg, execution.modes(), gpus, args.kda_fp8,
+                args.kda_output_shard, args.fp8_head, embedding)?
+        };
+        let arenas = layouts.into_iter().zip(&devices).map(|(layout, device)| {
+            Ok((device.id, crate::shared::memory::weight_arena::DeviceWeightArena::new(*device, layout)?))
+        }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+        let loader = weights::GlmfLoader { arenas: std::rc::Rc::new(arenas), ..loader };
         let plan_dense = |sparks: usize| -> Result<_> {
             ensure!(dense_pushable(args), "GLM Flash NVFP4 measurement mode cannot record required push operands");
             let load = std::rc::Rc::new(weights::DenseLoad::push(&self.library));
             let planning = weights::GlmfLoader { dense: load.clone(), ..loader.clone() };
             let ((embedding, model), mut records) = crate::shared::experts::rtx::dense::recording(|| {
-                embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(
+                embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(
                     &self.library, embed.as_ref().context("legacy Flash embedding source")?.clone(), args.token_io.embed_placement, || {
                         devices[0].run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                             planning.model(&self.cfg, &execution)
                         })
-                    }))
+                    }, |name, bytes| planning.allocate(embedding_device.id, name, bytes)))
             })?;
             records.extend(load.sink.as_ref().context("push sink")?.take_all());
             records.extend(media.clone());
@@ -2635,14 +2650,14 @@ impl Opened {
                     split.log("glm5_flash dense push");
                     (pushed, (embedding, model))
                 }
-                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load(&self.library,
+                None => (None, embedding_device.run(|| crate::shared::token_io::TokenEmbedding::load_with(&self.library,
                     embed.as_ref().context("legacy Flash embedding source")?.clone(),
                     args.token_io.embed_placement, || {
                         crate::shared::memory::device::Device { library: &self.library, id: args.device }.run(|| {
                             let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
                             loader.model(&self.cfg, &execution)
                         })
-                    }))?),
+                    }, |name, bytes| loader.allocate(embedding_device.id, name, bytes)))?),
             };
             let tp2 = if tp2_layers.is_empty() { pushed_whole = pushed; None }
                 else { Some(tp2_weights(pushed)?) };
@@ -2655,6 +2670,15 @@ impl Opened {
             .map(|item| item.bytes).sum::<u64>()).context("GLM Flash embedding admission")?;
         tracing::info!(rank = embedding_rank, device = embedding_device.id, bytes = embedding.device_bytes(),
             "GLM Flash embedding matches admission (peer-readable single residency)");
+        let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+        let receipt_devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+        let mut weight_census = crate::shared::memory::receipts::Census::default();
+        weight_census.owners(model.allocation_receipts(&shares, receipt_devices)?);
+        weight_census.owners(embedding.allocation_receipts(receipt_devices, "glm5_flash.embedding")?);
+        weight_census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!(owners = weight_census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
+            aliases = weight_census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
+            "GLM Flash retained weight arena census");
         probe("target-weights")?;
         let resident: usize = model.layers.iter().map(weights::GlmfLayer::bytes).sum();
         let peer_resident: usize = shares.iter().flatten().map(weights::GlmfLayer::bytes).sum();
@@ -2912,9 +2936,13 @@ impl Opened {
             let devices = [args.device, exchange.device(1)].map(|id|
                 crate::shared::memory::device::Device { library: &self.library, id });
             dspark::Drafter::Dflash2(crate::shared::experts::rtx::push::load_alone_admitted(snapshot,
-                &devices, admitted, || DflashDrafter::load_tp2(&self.library, programs, snapshot, file,
-                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
-                    args.draft_kv_cache, exchange))?)
+                &devices, admitted, || {
+                    let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &devices.map(|d| d.id))?;
+                    DflashDrafter::load_tp2_with(&self.library, programs, snapshot, file,
+                        slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear,
+                        args.draft_kv_cache, exchange,
+                        |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
+                })?)
         } else if let Some(prepared) = prepared {
             use crate::shared::speculation::dflash::{DflashConfig, DflashDrafter};
             let cfg = DflashConfig::read(snapshot)?;
@@ -2924,8 +2952,12 @@ impl Opened {
             let file = read.join_dflash()?;
             let device = prepared.stream.device;
             let draft = crate::shared::experts::rtx::push::load_alone_admitted(snapshot, &[device], admitted, ||
-                device.own(|| DflashDrafter::load(&self.library, programs, snapshot, file, prepared.stream.raw,
-                    slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache)))?;
+                device.own(|| {
+                    let arenas = dspark::dflash_arenas(&self.library, snapshot, representation, &[device.id])?;
+                    DflashDrafter::load_with(&self.library, programs, snapshot, file, prepared.stream.raw,
+                        slots, batch, mask, true, representation, args.fp8_scales, args.draft_linear, args.draft_kv_cache,
+                        |device, name, bytes| dspark::draft_allocation(&self.library, &arenas, device, name, bytes))
+                }))?;
             dspark::Drafter::RemoteDflash(crate::shared::draft::remote_dflash::RemoteDflash::new(draft, prepared)?)
         } else {
             let device = crate::shared::memory::device::Device { library: &self.library, id: args.device };
@@ -2935,6 +2967,18 @@ impl Opened {
                     args.draft_linear, args.draft_kv_cache, read))?
         };
         drafter.set_draft_head(args.draft_head);
+        let mut physical = vec![args.device];
+        if let Some(peer) = args.split_device { physical.push(peer); }
+        if let dspark::Drafter::RemoteDflash(remote) = &drafter {
+            if !physical.contains(&remote.draft.device.id) { physical.push(remote.draft.device.id); }
+        }
+        let mut census = crate::shared::memory::receipts::Census::default();
+        census.owners(drafter.allocation_receipts(
+            cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?)?);
+        census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+        tracing::info!(owners = census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),
+            aliases = census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),
+            "GLM Flash retained draft arena census");
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, draft_head = ?args.draft_head,
             draft_linear = ?args.draft_linear, "{} drafter resident", drafter.name());
         Ok(Some(drafter))

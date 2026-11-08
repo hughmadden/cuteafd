@@ -85,6 +85,24 @@ impl DraftRead {
     }
 }
 
+pub(super) fn dflash_arenas<'a>(library: &'a NativeLibrary, snapshot: &Path,
+    representation: GlmDraftRepresentation, devices: &[i32])
+    -> Result<std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>> {
+    use crate::shared::memory::{device::Device, weight_arena::DeviceWeightArena};
+    crate::shared::speculation::dflash::DflashDrafter::arena_requests(snapshot, representation, devices, 0)?
+        .into_iter().map(|(id, requests)| {
+            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/draft/{id}"), requests)?;
+            Ok((id, DeviceWeightArena::new(Device { library, id }, layout)?))
+        }).collect()
+}
+
+pub(super) fn draft_allocation<'a>(library: &'a NativeLibrary,
+    arenas: &std::collections::BTreeMap<i32, crate::shared::memory::weight_arena::DeviceWeightArena<'a>>,
+    device: i32, name: &str, bytes: usize) -> Result<crate::shared::memory::device::Allocation<'a>> {
+    crate::shared::memory::weight_arena::weight_allocation(crate::shared::memory::device::Device { library, id: device },
+        Some(arenas.get(&device).context("Flash draft arena absent")?), name, bytes)
+}
+
 /// The GLM 5.3 Flash drafter: DFlash2 or dSpark, behind one interface the
 /// engine (taps), the serve loop and glmf-golden use.
 pub(crate) enum Drafter<'a> {
@@ -94,6 +112,28 @@ pub(crate) enum Drafter<'a> {
 }
 
 impl<'a> Drafter<'a> {
+    pub(super) fn allocation_receipts(&self,
+        devices: cuteafd_loader::placement::planner::CoordinatorDevices<'_>)
+        -> Result<Vec<cuteafd_loader::placement::planner::Receipt>> {
+        let mut receipts = match self {
+            Self::Dflash2(draft) => draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::RemoteDflash(draft) => draft.draft.allocation_receipts(devices, "glm5_flash.draft")?,
+            Self::Dspark(draft) => {
+                let mut inventory = crate::shared::memory::receipts::Inventory::new(devices,
+                    "glm5_flash.draft", cuteafd_loader::placement::planner::Lifetime::RESIDENT,
+                    cuteafd_core::memory_layout::Category::Weights, "draft weights");
+                draft.allocation_receipts(&mut inventory, "weights")?;
+                inventory.receipts
+            }
+        };
+        for receipt in &mut receipts {
+            if receipt.allocation.id.starts_with("glm5_flash/draft/") {
+                receipt.allocation.lifetime = cuteafd_loader::placement::planner::Lifetime::RESIDENT;
+            }
+        }
+        Ok(receipts)
+    }
+
     pub fn require_live(&self) -> Result<()> {
         match self { Self::RemoteDflash(d) => d.require_live(), Self::Dflash2(d) => d.require_live(), _ => Ok(()) }
     }
@@ -143,8 +183,16 @@ impl<'a> Drafter<'a> {
             let mask = embedding.host_rows(&[cfg.mask_token])?;
             tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
             let tensors = read.join_dspark()?.context("dSpark drafter read")?;
-            return Ok(Self::Dspark(DsparkDrafter::load(library, programs, snapshot, tensors, stream, slots,
-                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache)?));
+            let arenas = DsparkDrafter::arena_requests(snapshot, representation, library.cuda_get_device()?)?
+                .into_iter().map(|(id, requests)| {
+                    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                        format!("glm5_flash/draft/{id}"), requests)?;
+                    Ok((id, crate::shared::memory::weight_arena::DeviceWeightArena::new(
+                        crate::shared::memory::device::Device { library, id }, layout)?))
+                }).collect::<Result<std::collections::BTreeMap<_, _>>>()?;
+            return Ok(Self::Dspark(DsparkDrafter::load_with(library, programs, snapshot, tensors, stream, slots,
+                sequences.min(MAX_SEQUENCES), mask, representation, scales, fp8_rows, kv_cache,
+                |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?));
         }
         let cfg = crate::shared::speculation::dflash::DflashConfig::read(snapshot)?;
         ensure!(cfg.hidden == hidden && cfg.vocab == vocab && cfg.taps.iter().all(|&l| l < layers),
@@ -152,8 +200,10 @@ impl<'a> Drafter<'a> {
         let mask = embedding.host_rows(&[cfg.mask_token])?;
         tracing::info!(mask_source = "target mask_token row", mask_token = cfg.mask_token, "drafter mask source");
         let file = read.ok().context("DFlash2 drafter read")?.join_dflash()?;
-        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load(library, programs, snapshot, file, stream, slots,
-            sequences, mask, true, representation, scales, fp8_rows, kv_cache)?))
+        let arenas = dflash_arenas(library, snapshot, representation, &[library.cuda_get_device()?])?;
+        Ok(Self::Dflash2(crate::shared::speculation::dflash::DflashDrafter::load_with(library, programs, snapshot, file, stream, slots,
+            sequences, mask, true, representation, scales, fp8_rows, kv_cache,
+            |device, name, bytes| draft_allocation(library, &arenas, device, name, bytes))?))
     }
 
     pub fn prepare_workspace(&self) -> Result<()> {
