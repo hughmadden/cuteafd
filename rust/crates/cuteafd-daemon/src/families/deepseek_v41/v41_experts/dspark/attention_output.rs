@@ -200,6 +200,7 @@ impl Drop for DsparkAttentionOutput<'_, '_> {
 pub(super) fn pack_grouped_scales<'a>(
     library: &'a NativeLibrary,
     tensors: &crate::families::deepseek_v41::v41_tensors::NativeRtxTensors<'a>,
+    arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 ) -> Result<[DeviceAllocation<'a>; 3]> {
     let mut output = Vec::with_capacity(3);
     // Drain before destinations are released on any failed load.
@@ -208,7 +209,9 @@ pub(super) fn pack_grouped_scales<'a>(
         raw: library.cuda_stream_create()?,
     };
     for stage in 0..3 {
-        output.push(DeviceAllocation::new(library, 1048576)?);
+        output.push(crate::families::deepseek_v41::weight_layout::allocation(library, Some(arena),
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(
+                &format!("mtp.{stage}.attn.wo_a.weight")), 1048576)?);
         unsafe {
             crate::shared::experts::rtx::dense::v41_pack_scales(&library.v41_fp8_matrix_kernel(1, 32768, 8192)?,
                 tensors.get(&format!("mtp.{stage}.attn.wo_a.scale"))?,

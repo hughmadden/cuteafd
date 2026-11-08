@@ -24,6 +24,7 @@ impl<'a> BackboneLaneWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load_distributed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -33,6 +34,7 @@ impl<'a> BackboneLaneWeights<'a> {
     ) -> Result<Self> {
         Self::load_distributed_with_split(library,catalog,placement,budgets,staging,false,false)
     }
+    #[cfg(test)]
     pub fn load_distributed_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,
         placement:CachePlacement,budgets:[usize;2],staging:usize,split_query_b:bool,split_output_b:bool)->Result<Self> {
         ensure!(
@@ -44,6 +46,7 @@ impl<'a> BackboneLaneWeights<'a> {
         );
         Self::load_placed_with_split(library, catalog, staging, Some(placement),split_query_b,split_output_b)
     }
+    #[cfg(test)]
     pub(super) fn load_placed(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -52,8 +55,15 @@ impl<'a> BackboneLaneWeights<'a> {
     ) -> Result<Self> {
         Self::load_placed_with_split(library,catalog,staging,placement,false,false)
     }
+    #[cfg(test)]
     fn load_placed_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,staging:usize,
         placement:Option<CachePlacement>,split_query_b:bool,split_output_b:bool)->Result<Self> {
+        Self::load_in(library, catalog, staging, placement, split_query_b, split_output_b, None)
+    }
+    pub(crate) fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        staging: usize, placement: Option<CachePlacement>, split_query_b: bool,
+        split_output_b: bool, arenas: Option<&crate::families::deepseek_v41::weight_layout::TargetArenas<'a>>,
+    ) -> Result<Self> {
         let original = library.cuda_get_device()?;
         let layers = (0..40)
             .map(|layer| {
@@ -63,24 +73,25 @@ impl<'a> BackboneLaneWeights<'a> {
                 };
                 let [hc, query, projection, shared, router] =
                     Self::layer_bytes_with_split(library, catalog, layer,split_query_b,split_output_b)?;
+                let arena = arenas.map(|arenas| arenas.get(id)).transpose()?;
                 Device { library, id }.own(|| {
                     Ok(LayerWeights {
-                        hc: BackboneHcWeights::load(library, catalog, layer, hc, staging)?,
-                        query: AttentionQueryWeights::load_with_split(
-                            library, catalog, layer, query, staging,split_query_b,
+                        hc: BackboneHcWeights::load_in(library, catalog, layer, hc, staging, arena)?,
+                        query: AttentionQueryWeights::load_in(
+                            library, catalog, layer, query, staging, split_query_b, arena,
                         )?,
-                        projection: AttentionOutputWeights::load_with_split(
-                            library, catalog, layer, projection, staging,split_output_b,
+                        projection: AttentionOutputWeights::load_in(
+                            library, catalog, layer, projection, staging, split_output_b, arena,
                         )?,
                         shared: if placement.is_some() {
                             None
                         } else {
-                            Some(BackboneSharedWeights::load(
-                                library, catalog, layer, shared, staging,
+                            Some(BackboneSharedWeights::load_in(
+                                library, catalog, layer, shared, staging, arena,
                             )?)
                         },
-                        router: BackboneRouterWeights::load(
-                            library, catalog, layer, router, staging,
+                        router: BackboneRouterWeights::load_in(
+                            library, catalog, layer, router, staging, arena,
                         )?,
                     })
                 })

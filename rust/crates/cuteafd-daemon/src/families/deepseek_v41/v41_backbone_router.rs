@@ -78,7 +78,10 @@ fn request_hidden_format(nvfp4: bool) -> (cuteafd_transport::ExpertV2Dtype, usiz
     }
 }
 impl<'a> BackboneRouterWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         ensure!(layer < 40, "invalid backbone router layer");
         Ok(["weight", "bias", "bias_vl"]
             .map(|n| format!("layers.{layer}.ffn.gate.{n}"))
@@ -92,6 +95,7 @@ impl<'a> BackboneRouterWeights<'a> {
         );
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -99,6 +103,10 @@ impl<'a> BackboneRouterWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog, layer)? <= budget,
             "backbone router weights exceed budget"
@@ -107,12 +115,8 @@ impl<'a> BackboneRouterWeights<'a> {
             library,
             layer,
             nvfp4: catalog.nvfp4().is_some(),
-            tensors: NativeRtxTensors::load(
-                library,
-                catalog,
-                &Self::names(layer)?,
-                budget,
-                staging,
+            tensors: NativeRtxTensors::load_in(
+                library, catalog, &Self::names(layer)?, budget, staging, arena,
             )?,
         })
     }

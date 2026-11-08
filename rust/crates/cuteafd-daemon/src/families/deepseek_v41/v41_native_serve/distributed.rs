@@ -79,77 +79,50 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // Dense owners allocate exactly as through the mount; with coordinator push
     // possible their bytes are recorded and arrive in the Spark push group.
     let pushing = super::coordinator_push::wanted(&args, &catalog)?;
+    let (_, embedding_total) = devices[0].run(|| lib.cuda_memory_info())?;
+    let embedding = super::admission::embedding_placement(args.embedding_placement, embedding_total);
+    let target_arenas = crate::families::deepseek_v41::weight_layout::TargetArenas::new(&lib,
+        crate::families::deepseek_v41::weight_layout::target_layout(&catalog, Some(map),
+            embedding == crate::shared::memory::EmbedPlacement::Gpu,
+            crate::families::deepseek_v41::v41_tensors::fp8_head(),
+            args.tp2_query_projection, args.tp2_output_projection)?)?;
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
-    let backbone_bytes = BackboneLaneWeights::distributed_device_bytes_with_split(
-        &lib, &catalog, map, args.tp2_query_projection, args.tp2_output_projection)?;
-    let weights = BackboneLaneWeights::load_distributed_with_split(
-        &lib,
-        &catalog,
-        map,
-        backbone_bytes,
-        16 << 20,
-        args.tp2_query_projection,
-        args.tp2_output_projection,
-    )?;
+    let weights = BackboneLaneWeights::load_in(&lib, &catalog, 16 << 20, Some(map),
+        args.tp2_query_projection, args.tp2_output_projection, Some(&target_arenas))?;
     let query_shards=if args.tp2_query_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
-            Weights::load(devices[rank],&catalog,layer,Kind::QueryB,rank,
-                Weights::load_peak_device_bytes(Kind::QueryB))).collect::<Result<Vec<_>>>())
+            Weights::load_in(devices[rank],&catalog,layer,Kind::QueryB,rank,
+                Weights::load_peak_device_bytes(Kind::QueryB),Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     let output_shards=if args.tp2_output_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
-            Weights::load(devices[rank],&catalog,layer,Kind::OutputB,rank,
-                Weights::load_peak_device_bytes(Kind::OutputB))).collect::<Result<Vec<_>>>())
+            Weights::load_in(devices[rank],&catalog,layer,Kind::OutputB,rank,
+                Weights::load_peak_device_bytes(Kind::OutputB),Some(target_arenas.get(rank as i32)?))).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     memory_checkpoint("attention mHC router weights")?;
-    let producers_bytes = CacheProducerWeights::distributed_device_bytes(&lib, &catalog, map)?;
-    let producers = CacheProducerWeights::load_distributed(
-        &lib,
-        &catalog,
-        map,
-        producers_bytes,
-        16 << 20,
-    )?;
+    let producers = CacheProducerWeights::load_in(&lib, &catalog, 16 << 20, Some(map), Some(&target_arenas))?;
     memory_checkpoint("cache producer weights")?;
-    let iw_bytes = IndexLaneWeights::distributed_device_bytes(&lib, &catalog, map)?;
-    let iw = IndexLaneWeights::load_distributed(
-        &lib,
-        &catalog,
-        map,
-        iw_bytes,
-        16 << 20,
-    )?;
+    let iw = IndexLaneWeights::load_in(&lib, &catalog, 16 << 20, Some(map), Some(&target_arenas))?;
     memory_checkpoint("index query weights")?;
-    let ew_bytes = PlacedEngramWeights::device_bytes(&lib, &catalog, map)?;
-    let ew = PlacedEngramWeights::load(
-        &lib,
-        &catalog,
-        map,
-        ew_bytes,
-        16 << 20,
-    )?;
+    let ew = PlacedEngramWeights::load_in(&lib, &catalog, map, 16 << 20, Some(&target_arenas))?;
     memory_checkpoint("Engram weights")?;
     let table = devices[0].own(|| {
-        let (_, total) = lib.cuda_memory_info()?;
-        NativeRtxTensors::load_embedding(&lib, &catalog,
-            super::admission::embedding_placement(args.embedding_placement, total))
+        NativeRtxTensors::load_embedding_in(&lib, &catalog, embedding, Some(target_arenas.get(0)?))
     })?;
     memory_checkpoint("embedding weights")?;
     let vocab = [
-        devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
-        devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?,
+        devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 0..64640, 1 << 30, 16 << 20, Some(target_arenas.get(0)?)))?,
+        devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20, Some(target_arenas.get(1)?)))?,
     ];
     memory_checkpoint("vocabulary weights")?;
     let hw = devices[1].own(|| {
-        TargetHeadWeights::load(
-            &lib,
-            &catalog,
-            TargetHeadWeights::device_bytes(&catalog)?,
-            16 << 20,
+        TargetHeadWeights::load_in(
+            &lib, &catalog, TargetHeadWeights::device_bytes(&catalog)?,
+            16 << 20, Some(target_arenas.get(1)?),
         )
     })?;
     memory_checkpoint("head normalization weights")?;
@@ -157,11 +130,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         .map(|r| {
             (0..40)
                 .map(|l| {
-                    SharedWeights::load(
-                        devices[r],
-                        &catalog,
-                        l,
-                        SharedWeights::load_peak_device_bytes(),
+                    SharedWeights::load_in(
+                        devices[r], &catalog, l, SharedWeights::load_peak_device_bytes(),
+                        Some(target_arenas.get(r as i32)?),
                     )
                 })
                 .collect::<Result<Vec<_>>>()
@@ -172,6 +143,24 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         .ok()
         .expect("two ranks");
     let mut records = recorder.map(|r| r.finish());
+    crate::families::deepseek_v41::weight_layout::probe_weights(&lib, &[0, 1], "v41/weights-loaded", |inventory| {
+        weights.inventory(inventory)?;
+        producers.inventory(inventory)?;
+        iw.inventory(inventory)?;
+        ew.inventory(inventory)?;
+        table.inventory(inventory)?;
+        for shard in &vocab { shard.inventory(inventory)?; }
+        hw.inventory(inventory)?;
+        for shards in [&query_shards, &output_shards].into_iter().flatten() {
+            for rank in shards {
+                for shard in rank { shard.inventory(inventory)?; }
+            }
+        }
+        for rank in &shared_owned {
+            for weights in rank { weights.inventory(inventory)?; }
+        }
+        Ok(())
+    })?;
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
         producer_bytes=?crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,

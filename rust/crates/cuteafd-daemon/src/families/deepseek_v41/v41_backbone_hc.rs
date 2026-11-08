@@ -10,6 +10,9 @@ pub(crate) struct BackboneHcWeights<'a> {
     tensors: NativeRtxTensors<'a>,
 }
 impl<'a> BackboneHcWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
     pub fn layer(&self) -> usize { self.layer }
     /// The buffers one sublayer's mHC reads (L2 prefetch): function, scale, base, norm.
     pub(crate) fn decode_reads(&self, attention: bool) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
@@ -25,7 +28,7 @@ impl<'a> BackboneHcWeights<'a> {
             ffn.prepare_binding(&self.tensors, Self::names(self.layer, false)?)?,
         ])
     }
-    fn names(layer: usize, attention: bool) -> Result<[String; 4]> {
+    pub(super) fn names(layer: usize, attention: bool) -> Result<[String; 4]> {
         ensure!(layer < 40, "invalid backbone mHC layer");
         let kind = if attention { "attn" } else { "ffn" };
         Ok([
@@ -41,6 +44,7 @@ impl<'a> BackboneHcWeights<'a> {
         ensure!(bytes == 3_952_856, "unexpected backbone mHC tensor sizes");
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -48,6 +52,10 @@ impl<'a> BackboneHcWeights<'a> {
         budget: usize,
         staging: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes(catalog, layer)? <= budget,
             "backbone mHC weights exceed budget"
@@ -56,7 +64,7 @@ impl<'a> BackboneHcWeights<'a> {
         Ok(Self {
             library,
             layer,
-            tensors: NativeRtxTensors::load(library, catalog, &names, budget, staging)?,
+            tensors: NativeRtxTensors::load_in(library, catalog, &names, budget, staging, arena)?,
         })
     }
     pub fn block(

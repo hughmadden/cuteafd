@@ -70,6 +70,7 @@ pub(super) fn wave_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize
 pub(super) fn pack_scales<'a>(
     library: &'a NativeLibrary,
     tensors: &NativeRtxTensors<'a>,
+    arena: &crate::shared::memory::weight_arena::DeviceWeightArena<'a>,
 ) -> Result<[DeviceAllocation<'a>; 13]> {
     let mut scales = Vec::with_capacity(13);
     // On error the stream drains before the vector releases pending destinations.
@@ -80,8 +81,9 @@ pub(super) fn pack_scales<'a>(
     for kind in KINDS {
         let (_, name, k, n) = kind.binding()?;
         let kernel = library.v41_fp8_matrix_kernel(16, k, n)?;
-        scales.push(DeviceAllocation::new(
-            library,
+        scales.push(crate::families::deepseek_v41::weight_layout::allocation(
+            library, Some(arena),
+            &crate::families::deepseek_v41::weight_layout::packed_scale_name(&format!("{name}.weight")),
             kernel.info().packed_weight_scale_bytes as usize,
         )?);
         unsafe {

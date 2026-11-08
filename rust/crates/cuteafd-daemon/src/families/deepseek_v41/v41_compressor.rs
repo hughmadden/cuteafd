@@ -289,7 +289,10 @@ pub(crate) struct CompressorWeights<'a> {
     names: Vec<String>,
 }
 impl<'a> CompressorWeights<'a> {
-    fn names(layer: usize) -> Result<Vec<String>> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)
+    }
+    pub(super) fn names(layer: usize) -> Result<Vec<String>> {
         let suffixes = if ratio(layer)? == 2 {
             vec!["wkv", "norm", "wgate"]
         } else {
@@ -308,6 +311,7 @@ impl<'a> CompressorWeights<'a> {
     pub fn device_bytes(catalog: &OfficialV41Catalog, layer: usize) -> Result<usize> {
         NativeRtxTensors::plan(catalog, &Self::names(layer)?)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -315,8 +319,12 @@ impl<'a> CompressorWeights<'a> {
         budget: usize,
         staging_bytes: usize,
     ) -> Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging_bytes: usize, arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         let names = Self::names(layer)?;
-        let tensors = NativeRtxTensors::load(library, catalog, &names, budget, staging_bytes)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &names, budget, staging_bytes, arena)?;
         Ok(Self {
             library,
             tensors,

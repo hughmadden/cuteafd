@@ -18,6 +18,10 @@ pub(crate) struct IndexLaneWeights<'a> {
     placement: Option<CachePlacement>,
 }
 impl<'a> IndexLaneWeights<'a> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        for weights in &self.weights { weights.inventory(inventory)?; }
+        Ok(())
+    }
     pub fn device_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog) -> Result<usize> {
         LAYERS.into_iter().try_fold(0usize, |total, layer| {
             total
@@ -25,6 +29,7 @@ impl<'a> IndexLaneWeights<'a> {
                 .context("index weight budget overflow")
         })
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,

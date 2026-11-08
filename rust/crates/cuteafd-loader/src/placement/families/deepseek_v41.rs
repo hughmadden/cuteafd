@@ -3,6 +3,7 @@ use super::super::*;
 pub mod admission;
 pub mod owners;
 pub mod resident;
+pub mod weight_layout;
 
 /// Existing lazy-capture envelope, separate from qualified ready residency.
 /// Small cards previously hid this same growth allowance in the CUDA sample.

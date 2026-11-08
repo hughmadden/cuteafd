@@ -55,8 +55,14 @@ impl<'a> VocabularyShard<'a> {
 
     /// The caller scopes construction/destruction to the owning GPU. Admission
     /// precedes allocation and payload reads. No full-head GPU staging is used.
+    #[cfg(test)]
     pub fn load(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
         tokens: Range<usize>, budget: usize, staging_bytes: usize) -> Result<Self> {
+        Self::load_in(library, catalog, tokens, budget, staging_bytes, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
+        tokens: Range<usize>, budget: usize, staging_bytes: usize,
+        arena: Option<&DeviceWeightArena<'a>>) -> Result<Self> {
         let bytes = Self::device_bytes(catalog, tokens.clone())?;
         ensure!(Self::load_bytes(catalog, tokens.clone())? <= budget, "vocabulary shard peak load exceeds device budget");
         ensure!((1..=64 * 1024 * 1024).contains(&staging_bytes),
@@ -69,7 +75,9 @@ impl<'a> VocabularyShard<'a> {
         let (allocation, fp8) = if super::fp8_head() == super::Fp8Head::All {
             // The FP8 copy is the only resident one: pack 16-row windows of the
             // staged BF16 rows straight into it (tiles are independent).
-            let packed = crate::shared::fp8_linear::Fp8Weight::allocate(library, rows, 5120)?;
+            let device = Device { library, id: device_id };
+            let packed = crate::shared::fp8_linear::Fp8Weight::allocate_with(library, rows, 5120,
+                "head.fp8", |name, bytes| weight_allocation(device, arena, name, bytes))?;
             let (values, scale) = packed.buffers();
             let steps = Self::pack_steps(whole, device_id, values, scale)?;
             let stream = library.cuda_stream_create()?;
@@ -82,7 +90,10 @@ impl<'a> VocabularyShard<'a> {
             staged?;
             (None, Some(packed))
         } else {
-            let allocation = DeviceAllocation::new(library, bytes)?;
+            // Packed conversion consumes a transient BF16 source; other modes retain it.
+            let retained = (super::fp8_head() != super::Fp8Head::Packed).then_some(arena).flatten();
+            let allocation = super::allocation(
+                library, retained, "head.bf16", bytes)?;
             dense.operand(crate::shared::experts::rtx::dense::Operand { device: device_id, buffer: allocation.buffer,
                 lands: vec![(whole, 0)], bytes })?;
             match super::fp8_head() {
@@ -91,12 +102,12 @@ impl<'a> VocabularyShard<'a> {
                     // The exact copy packs (and verifies) from the whole landed
                     // BF16 shard, which it then releases.
                     ensure!(!crate::shared::experts::rtx::dense::is_recording(), "the packed head loads through the mount");
-                    packed = Some(super::pack_packed(library, allocation, rows)?);
+                    packed = Some(super::pack_packed_in(library, allocation, rows, arena)?);
                     (None, None)
                 }
                 _ => {
                     ensure!(!crate::shared::experts::rtx::dense::is_recording(), "the draft-only FP8 head loads through the mount");
-                    let (source, packed) = super::pack_fp8(library, allocation, rows)?;
+                    let (source, packed) = super::pack_fp8_in(library, allocation, rows, arena)?;
                     (source, Some(packed))
                 }
             }
@@ -107,6 +118,13 @@ impl<'a> VocabularyShard<'a> {
             fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), packed12_bytes = packed.as_ref().map_or(0, |h| h.bytes()),
             exceptions, row_exceptions, "V4.1 vocabulary residency");
         Ok(Self { allocation, device_id, tokens, fp8, packed })
+    }
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        let name = format!("gpu{}.head", self.device_id);
+        if let Some(allocation) = &self.allocation { allocation.inventory(inventory, &format!("{name}.bf16"))?; }
+        if let Some(fp8) = &self.fp8 { fp8.inventory(inventory, &format!("{name}.fp8"))?; }
+        if let Some(packed) = &self.packed { packed.inventory(inventory, &name)?; }
+        Ok(())
     }
     pub fn resident_bytes(&self) -> usize {
         self.allocation.as_ref().map_or(0, |a| a.buffer.bytes)

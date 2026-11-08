@@ -29,7 +29,14 @@ pub(crate) struct AttentionQueryWeights<'a> {
     split_query_b: bool,
 }
 impl<'a> AttentionQueryWeights<'a> {
-    fn names(layer: usize) -> Result<[String; 5]> {
+    pub(crate) fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>) -> Result<()> {
+        self.tensors.inventory(inventory)?;
+        for (index, scales) in self.scales.iter().enumerate() {
+            scales.inventory(inventory, &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&self.names[index * 2]))?;
+        }
+        Ok(())
+    }
+    pub(super) fn names(layer: usize) -> Result<[String; 5]> {
         ensure!(layer < 40, "invalid backbone query layer");
         Ok([
             format!("layers.{layer}.attn.wq_a.weight"),
@@ -57,6 +64,7 @@ impl<'a> AttentionQueryWeights<'a> {
         }
         Ok(bytes)
     }
+    #[cfg(test)]
     pub fn load(
         library: &'a NativeLibrary,
         catalog: &OfficialV41Catalog,
@@ -66,8 +74,14 @@ impl<'a> AttentionQueryWeights<'a> {
     ) -> Result<Self> {
         Self::load_with_split(library,catalog,layer,budget,staging,false)
     }
+    #[cfg(test)]
     pub fn load_with_split(library:&'a NativeLibrary,catalog:&OfficialV41Catalog,layer:usize,
         budget:usize,staging:usize,split_query_b:bool)->Result<Self> {
+        Self::load_in(library, catalog, layer, budget, staging, split_query_b, None)
+    }
+    pub fn load_in(library: &'a NativeLibrary, catalog: &OfficialV41Catalog, layer: usize,
+        budget: usize, staging: usize, split_query_b: bool,
+        arena: Option<&crate::shared::memory::weight_arena::DeviceWeightArena<'a>>) -> Result<Self> {
         ensure!(
             Self::device_bytes_with_split(library, catalog, layer,split_query_b)? <= budget,
             "attention query weights exceed budget"
@@ -75,7 +89,7 @@ impl<'a> AttentionQueryWeights<'a> {
         let names = Self::names(layer)?;
         let selected:Vec<_>=names.iter().enumerate().filter(|(i,_)|!split_query_b || !matches!(i,2|3))
             .map(|(_,name)|name.clone()).collect();
-        let tensors = NativeRtxTensors::load(library, catalog, &selected, budget, staging)?;
+        let tensors = NativeRtxTensors::load_in(library, catalog, &selected, budget, staging, arena)?;
         let stream = LoadStream {
             library,
             raw: library.cuda_stream_create()?,
@@ -83,8 +97,9 @@ impl<'a> AttentionQueryWeights<'a> {
         let mut scales = vec![];
         for (i, (k, n)) in MATRICES.into_iter().take(if split_query_b {1} else {2}).enumerate() {
             let kernel = library.v41_fp8_matrix_kernel(1, k, n)?;
-            let scale =
-                DeviceAllocation::new(library, kernel.info().packed_weight_scale_bytes as usize)?;
+            let scale = super::v41_tensors::allocation(library, arena,
+                &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&names[i * 2]),
+                kernel.info().packed_weight_scale_bytes as usize)?;
             let launched = unsafe {
                 crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, tensors.get(&names[i * 2 + 1])?, scale.buffer, stream.raw)
             };
