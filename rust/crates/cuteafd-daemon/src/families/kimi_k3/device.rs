@@ -11,7 +11,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, programs::VocabularyHead};
 use std::rc::Rc;
 use super::weights::GlobalWeights;
 use cuteafd_core::memory_layout::{Basis, Category};
-use cuteafd_loader::{families::kimi_k3::config::KimiK3Config, placement::Demand};
+use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::Demand};
 use std::collections::BTreeMap;
 
 /// A device-resident batch: `rows` BF16 rows of `width` in one plane.
@@ -755,25 +755,70 @@ impl<'a> LocalLane<'a> {
         }, |local| { local.lane.metadata_bank = 0; local.attention = None; Ok(()) })
     }
 
-    pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
-        use super::graphs::Op;
+    fn check_startup_keys(&self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
         ensure!(self.graphs.is_none() && keys.iter().all(|key|
             rank == self.rank && key.lane == self.lane_index && key.rank == rank && key.rows <= self.rows()),
             "Kimi startup graph keys differ from local binding");
-        let stream = self.stream().clone();
+        Ok(())
+    }
+
+    fn submit_startup_graph(&mut self, key: super::graphs::Key) -> Result<()> {
+        use super::graphs::Op;
+        match key.op {
+            Op::Residual(site) => { self.residual(site, key.rows)?; }
+            Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
+            Op::Context { layer, speculative } => self.context_step(layer, key.rows, speculative)?,
+            Op::Attention { layer, sequences, speculative } => {
+                self.attention = Some(AttentionShape { rows: key.rows, sequences });
+                self.attention(layer, key.rows, speculative)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Only KDA is qualified for eager startup execution. MLA/Context still
+    /// capture without eager replay; their first-use bytes are not calibrated
+    /// graph residency. All KDA readers drain before the engine restores state.
+    pub(crate) fn prewarm_kda_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
+        self.check_startup_keys(keys, rank)?;
         let staged = self.attention.take();
-        let graphs = super::graphs::Graphs::capture(&stream, keys, |key| {
-            match key.op {
-                Op::Residual(site) => { self.residual(site, key.rows)?; }
-                Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
-                Op::Context { layer, speculative } => self.context_step(layer, key.rows, speculative)?,
-                Op::Attention { layer, sequences, speculative } => {
-                    self.attention = Some(AttentionShape { rows: key.rows, sequences });
-                    self.attention(layer, key.rows, speculative)?;
-                }
+        let result = (|| {
+            for &key in keys {
+                let super::graphs::Op::Attention { layer, sequences, .. } = key.op else { continue; };
+                if self.cfg.attention.get(layer) != Some(&KimiAttention::Kda) { continue; }
+                let metadata = super::state::startup_metadata(key.rows, sequences, self.kda.slots())?;
+                let stream = self.stream().clone();
+                let input = self.plane("normalized", key.rows, 7168)?;
+                stream.device.run(|| {
+                    // SAFETY: startup is exclusive and the exact serialized
+                    // compute stream retains these admitted operands.
+                    unsafe { stream.device.library.cuda_zero_bytes_async(input, input.bytes, stream.raw)?; }
+                    for (name, words) in ["KDA slots", "KDA first"].into_iter().zip(&metadata) {
+                        let bytes = words.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
+                        // SAFETY: ordered upload retains its source through
+                        // the copy; fixed metadata destinations outlive work.
+                        unsafe { stream.device.library.copy_h2d_ordered(self.lane.buffer(name)?, &bytes, stream.raw)?; }
+                    }
+                    Ok(())
+                })?;
+                self.submit_startup_graph(key)?;
             }
             Ok(())
-        });
+        })();
+        self.attention = staged;
+        result
+    }
+
+    pub(crate) fn restore_startup_kda(&self) -> Result<()> {
+        ensure!(self.graphs.is_none(), "Kimi startup state restore after graph sealing");
+        self.kda.zero_startup_state()
+    }
+
+    pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
+        self.check_startup_keys(keys, rank)?;
+        let stream = self.stream().clone();
+        let staged = self.attention.take();
+        let graphs = super::graphs::Graphs::capture(&stream, keys, |key| self.submit_startup_graph(key));
         self.attention = staged;
         self.graphs = Some(graphs?);
         Ok(())

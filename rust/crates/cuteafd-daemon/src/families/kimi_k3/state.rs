@@ -9,6 +9,16 @@ use cuteafd_ffi::KimiKda;
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config}, placement::Demand};
 use std::rc::Rc;
 
+/// Warm the exact single- or multi-sequence closure on valid startup slots.
+/// Chunked prefill has no negative-slot semantics (#1486).
+pub(super) fn startup_metadata(rows: usize, sequences: usize, slots: usize) -> Result<[Vec<i32>; 2]> {
+    ensure!((1..=4096).contains(&rows) && sequences > 0 && sequences <= slots
+        && (sequences == 1 || sequences == rows) && (rows <= 64 || sequences == 1),
+        "Kimi startup KDA sequences exceed valid distinct slots or row geometry");
+    let indices = (0..rows).map(|row| if sequences == 1 { 0 } else { row as i32 }).collect::<Vec<_>>();
+    Ok([indices.clone(), indices])
+}
+
 /// A replay belongs to exactly one verified batch until accept or discard.
 /// Placement.len is scheduler-owned and may already have advanced at accept.
 pub(crate) struct Provisional {
@@ -211,14 +221,7 @@ impl KdaLayout {
         let replays = bank.replay.iter().map(|allocation| allocation.buffer).collect::<Vec<_>>();
         let tables = bank.tables.iter().map(|allocation| allocation.buffer).collect::<Vec<_>>();
         self.lane_inputs(0, &replays, &tables)?;
-        device.run(|| {
-            for allocation in [&bank.state, &bank.conv] {
-                // SAFETY: this bank retains every destination until its stream drains.
-                unsafe { device.library.cuda_zero_bytes_async(allocation.buffer, allocation.buffer.bytes, bank.stream.raw)?; }
-            }
-            Ok(())
-        })?;
-        bank.stream.drain()?;
+        bank.zero_startup_state()?;
         Ok(bank)
     }
 }
@@ -249,6 +252,22 @@ impl<'a> KdaBank<'a> {
     pub(super) fn marks(&self) -> usize { self.layout.marks }
     pub(super) fn mark_bytes(&self) -> usize { self.layout.mark }
     pub(super) fn readers(&self) -> &[Rc<Stream<'a>>] { &self.readers }
+
+    /// Startup only: wide KDA has no null-state sentinel. Every reader must
+    /// finish before restoring the same zero bytes as a never-warmed bank.
+    pub(super) fn zero_startup_state(&self) -> Result<()> {
+        for reader in &self.readers { reader.drain()?; }
+        self.stream.device.run(|| {
+            for allocation in [&self.state, &self.conv] {
+                // SAFETY: all readers drained; this bank retains both full
+                // destinations until the copy stream completes below.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(
+                    allocation.buffer, allocation.buffer.bytes, self.stream.raw)?; }
+            }
+            Ok(())
+        })?;
+        self.stream.drain()
+    }
 
     pub(super) fn check_reader(&self, lane: usize, stream: &Rc<Stream<'a>>) -> Result<()> {
         ensure!(self.readers.get(lane).is_some_and(|reader| Rc::ptr_eq(reader, stream))
@@ -292,6 +311,111 @@ impl<'a> KdaBank<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_metadata_uses_valid_distinct_slots_including_wide_single_sequences() -> Result<()> {
+        for rows in [1, 4, 16, 64, 4096] {
+            let [slots, first] = startup_metadata(rows, 1, 1)?;
+            assert_eq!(slots, vec![0; rows]);
+            assert_eq!(first, vec![0; rows]);
+        }
+        for rows in [2, 4, 16, 64] {
+            let [slots, first] = startup_metadata(rows, rows, rows)?;
+            assert_eq!(slots, (0..rows as i32).collect::<Vec<_>>());
+            assert_eq!(first, slots);
+            assert!(startup_metadata(rows, rows, rows - 1).is_err());
+        }
+        for (rows, sequences, slots) in [(0, 1, 1), (4097, 1, 1), (1, 0, 1),
+            (1, 1, 0), (4, 2, 2), (65, 65, 65)] {
+            assert!(startup_metadata(rows, sequences, slots).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUDA, matching CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST"]
+    fn warmed_startup_kda_state_checksums_match_never_warmed_all_slots() -> Result<()> {
+        use cuteafd_ffi::{KimiKdaCore, KimiKdaCoreBatch, KimiKdaCoreWeights};
+        use sha2::{Digest, Sha256};
+        // SAFETY: the shared native-test runner supplies the sealed library;
+        // every stream and allocation below drops before its handle.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = Device { library: &library,
+            id: std::env::var("CUTEAFD_CACHE_TEST_DEVICE").unwrap_or_else(|_| "0".into()).parse()? };
+        let programs = device.run(|| library.programs()?.with_manifest(std::path::Path::new(
+            &std::env::var("CUTEAFD_PROGRAM_MANIFEST")?)))?;
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.layers = 1;
+        cfg.attention = vec![KimiAttention::Kda];
+        cfg.dense = vec![true];
+        let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+            let mut bytes = vec![0; buffer.bytes];
+            device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+            Ok(bytes)
+        };
+        let upload = |bytes: &[u8]| -> Result<Allocation<'_>> {
+            let allocation = Allocation::new(device, bytes.len())?;
+            device.run(|| library.copy_h2d(allocation.buffer, bytes))?;
+            Ok(allocation)
+        };
+        let bf16_ones = |count| upload(&[0x80u8, 0x3f].repeat(count));
+        // Use both real local-head geometries and every touched slot, with
+        // two retained readers to exercise the same drain-before-zero path.
+        for ranks in [1, 2] {
+            let readers = (0..2).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
+            let layout = KdaLayout::for_ranks(&cfg, 4, 0, 2, ranks)?;
+            let bank = layout.allocate(device, readers.clone())?;
+            let reference = layout.allocate(device, readers.clone())?;
+            let never_warmed = [read(reference.state.buffer)?, read(reference.conv.buffer)?];
+            assert!(never_warmed.iter().flatten().all(|&byte| byte == 0));
+            let heads = layout.geometry.heads();
+            let width = layout.geometry.width();
+            let fab = upload(&vec![0; layout.geometry.aux_width() * 7168 * 2])?;
+            let forget = upload(&vec![0; width * 128 * 2])?;
+            let convolution = upload(&1f32.to_le_bytes().repeat(3 * width * 4))?;
+            let a_log = upload(&vec![0; heads * 4])?;
+            let dt_bias = upload(&vec![0; width * 4])?;
+            let norm = upload(&1f32.to_le_bytes().repeat(128))?;
+            let weights = KimiKdaCoreWeights { fab: fab.buffer, forget: forget.buffer,
+                convolution: convolution.buffer, a_log: a_log.buffer, dt_bias: dt_bias.buffer, norm: norm.buffer };
+            let kernels = device.run(|| Ok([
+                KimiKdaCore::load(&programs, &format!("kda_core_h{heads}_m64"), 64, true)?,
+                KimiKdaCore::load(&programs, &format!("kda_core_h{heads}_m4096"), 4096, false)?,
+            ]))?;
+            for (rows, sequences, speculative) in [(1, 1, false), (4, 4, false),
+                (16, 1, false), (64, 1, false), (4096, 1, false), (4, 1, true)] {
+                let [slots, first] = startup_metadata(rows, sequences, bank.slots())?;
+                let slots = upload(&slots.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+                let first = upload(&first.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+                let input = bf16_ones(rows * 7168)?;
+                let projected = (0..4).map(|_| bf16_ones(rows * width)).collect::<Result<Vec<_>>>()?;
+                let output = Allocation::new(device, rows * width * 2)?;
+                let kernel = &kernels[usize::from(rows > 64)];
+                let scratch = Allocation::new(device, kernel.scratch_bytes())?;
+                for (lane, stream) in readers.iter().enumerate() {
+                    let [state, conv_state, replay] = bank.layer(0, lane)?;
+                    device.run(|| Ok(kernel.launch(weights, KimiKdaCoreBatch { rows, sequences,
+                        state_slots: bank.slots(), speculative, input: input.buffer, q: projected[0].buffer,
+                        k: projected[1].buffer, v: projected[2].buffer, gate: projected[3].buffer,
+                        conv_state, state, slots: slots.buffer, first: first.buffer,
+                        output: output.buffer, replay, scratch: scratch.buffer }, stream.raw)?))?;
+                    stream.drain()?;
+                }
+                if !speculative {
+                    assert_ne!(read(bank.conv.buffer)?, never_warmed[1], "oracle must execute real state writes");
+                    assert_ne!(read(bank.state.buffer)?, never_warmed[0], "oracle must execute real recurrent writes");
+                }
+                bank.zero_startup_state()?;
+                for (index, owner) in [&bank.state, &bank.conv].into_iter().enumerate() {
+                    let restored = read(owner.buffer)?;
+                    assert_eq!(Sha256::digest(&restored), Sha256::digest(&never_warmed[index]),
+                        "heads={heads} rows={rows} sequences={sequences} speculative={speculative} owner={index}");
+                    assert_eq!(restored, never_warmed[index], "all touched and untouched slots must restore byte-exactly");
+                }
+            }
+        }
+        Ok(())
+    }
 
     fn provisional_fixture() -> Result<(Provisional, Vec<super::super::prefix::Placement>, Vec<Vec<u32>>)> {
         let mut placements = vec![
