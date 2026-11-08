@@ -373,7 +373,9 @@ mod tests {
         let owned1 = resident_weights_placed(&checkpoint, &cfg, 6, 2, Default::default(), Layers, 1).unwrap();
         let mut previous = [0; 2];
         for layers in 0..=6 {
-            let single = resident_weights(&checkpoint, &cfg, layers, 1, Default::default()).unwrap();
+            // Hold head precision fixed while checking only attention ownership.
+            let single = resident_weights(&checkpoint, &cfg, layers, 1,
+                GlmfRepresentation { head: GlmfHeadFormat::Fp8, ..Default::default() }).unwrap();
             let split = resident_weights(&checkpoint, &cfg, layers, 2, Default::default()).unwrap();
             for first in [0, 1] {
                 let owned = resident_weights_placed(&checkpoint, &cfg, layers, 2, Default::default(), Layers, first).unwrap();

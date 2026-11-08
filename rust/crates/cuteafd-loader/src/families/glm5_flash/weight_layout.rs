@@ -325,7 +325,7 @@ mod tests {
             let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
                 .context("installed embedding header")?.meta.byte_length as usize;
             let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                true, ranks == 2, GlmfHeadFormat::Fp8, Some((0, embedding)))?;
+                true, ranks == 2, GlmfHeadFormat::Auto, Some((0, embedding)))?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
