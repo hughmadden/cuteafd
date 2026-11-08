@@ -42,6 +42,57 @@ fn zero_spark_is_a_typed_planner_result_not_a_launcher_restriction() {
     assert!(report.hints.iter().any(|hint| hint.what.contains("joint admission refused")), "{:?}", report.hints);
 }
 
+fn check_target_arena_admission(input: &testing::BudgetedPlanInput) {
+    use crate::families::muse_spark::{core::CoreInventory,
+        weight_layout::{coordinator_arena, GlobalLayout, LayerLayout}, MuseSparkConfig};
+    use cuteafd_core::memory_layout::DeviceKind;
+    let checkpoint = input.checkpoint();
+    let cfg = MuseSparkConfig::from_hf(&checkpoint.config).unwrap();
+    let core = CoreInventory::from_checkpoint(&cfg, checkpoint).unwrap();
+    let global = GlobalLayout::new(&cfg, &core).unwrap();
+    for gpus in [1, 2] {
+        let report = input.plan(&with_layout(gpus, 6)).unwrap();
+        let placement = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+        let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, gpus, &core).unwrap())
+            .collect::<Vec<_>>();
+        let devices = report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|device| device.kind == DeviceKind::Rtx).collect::<Vec<_>>();
+        assert_eq!(devices.len(), gpus);
+        for (gpu, device) in devices.iter().enumerate() {
+            let local = layouts.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
+            let arena = coordinator_arena(gpu, gpus, &global, &local).unwrap();
+            let bytes = arena.bytes() as u64;
+            let tail = bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+            let roots = device.items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1, "one target root per physical GPU");
+            assert_eq!(roots[0].bytes, bytes);
+            assert_eq!(device.items.iter().filter(|item| item.group == "allocation granularity")
+                .map(|item| item.bytes).sum::<u64>(), tail);
+            assert!(!placement.items[gpu].iter().any(|item| matches!(item.group.as_str(),
+                "token embedding" | "lm head (K6)" | "final norm" |
+                "Muse native attention values and block scales") || item.group.starts_with("layer weights (")),
+                "the old immutable tensor charge must not survive beside its arena");
+        }
+    }
+}
+
+#[test]
+fn target_admission_replaces_tensor_charges_with_runtime_arenas() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    check_target_arena_admission(&input);
+}
+
+#[test]
+#[ignore = "reads the installed Muse checkpoint headers"]
+fn installed_target_admission_matches_runtime_arenas() {
+    let hub = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/mnt/sparknest/hf-home"));
+    let snapshot = hub.join("hub/models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97");
+    let input = testing::BudgetedPlanInput::open(&snapshot).unwrap();
+    check_target_arena_admission(&input);
+}
+
 #[test]
 fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     let dir = snapshot(&[0]);
@@ -393,8 +444,12 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
     for gpu in 0..2 {
         let id = format!("rtx{gpu}");
+        let placement = report.solver_placement.as_ref().unwrap();
+        let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")
+            .map(|item| item.bytes).sum::<u64>();
         for row in ledger.phases.iter().filter(|row| row.budget == id) {
-            assert_eq!(row.opaque, 160 << 20, "estimated first-use GPU growth at every phase");
+            assert_eq!(row.opaque, (160 << 20) + tails,
+                "estimated first-use GPU growth plus the separate target arena tail at every phase");
         }
     }
     options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
@@ -568,7 +623,19 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let sms = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES).sms;
     let expected = crate::placement::families::muse_spark::drafter_inventory(&cfg, &config, 16, 16, 202_112,
         u64::from(sms), crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
-    assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch + expected.runtime);
+    let nonweights = expected.owned - expected.weights.0 + expected.scratch + expected.head_scratch + expected.runtime;
+    assert_eq!(group(1), nonweights);
+    let arena = expected.arena(0, 1).unwrap();
+    let arena_bytes = arena.bytes() as u64;
+    let tail = arena_bytes.div_ceil(2 << 20) * (2 << 20) - arena_bytes;
+    let root_bytes = |placement: &crate::placement::Placement, gpu: usize|
+        placement.items[gpu].iter().filter(|item| item.group == "weight arena").map(|item| item.bytes).sum::<u64>();
+    let plain_placed = plain.solver_placement.as_ref().unwrap();
+    assert_eq!(root_bytes(placed, 0), root_bytes(plain_placed, 0));
+    assert_eq!(root_bytes(placed, 1) - root_bytes(plain_placed, 1), arena_bytes);
+    let tails = |placement: &crate::placement::Placement, gpu: usize|
+        placement.items[gpu].iter().filter(|item| item.group == "allocation granularity").map(|item| item.bytes).sum::<u64>();
+    assert_eq!(tails(placed, 1) - tails(plain_placed, 1), tail);
     assert_eq!(expected.runtime, (16 * 8 * 4 + 62 * 64 * 8 * 4) as u64, "draft ids + probe ring");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
     assert!(placed.pool_tokens <= plain.solver_placement.as_ref().unwrap().pool_tokens);
@@ -583,10 +650,10 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let memory = single_plain.memory_layout.as_ref().unwrap();
     let device = memory.devices.iter().find(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-    let charged = expected.owned + expected.scratch + expected.head_scratch + expected.runtime;
+    let charged = nonweights + arena_bytes + tail;
     let draft_device = single_drafted.memory_layout.as_ref().unwrap().devices.iter().find(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
-    assert_eq!(draft_device.items.iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>(), charged);
+    assert_eq!(draft_device.items.iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>(), nonweights);
     let fixed = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
         .filter(|item| item.group != "full-layer KV (paged K+V records)").map(|item| item.bytes).sum::<u64>();
     assert_eq!(fixed(draft_device) - fixed(device), charged);

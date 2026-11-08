@@ -301,6 +301,21 @@ mod tests {
                 let arena = coordinator_arena(rank, ranks, &global, &local)?;
                 let large = arena.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
                 let rounding = |bytes: usize| bytes.div_ceil(2 << 20) * (2 << 20) - bytes;
+                let expected = match (ranks, rank) {
+                    (1, 0) => (23_557_636_864, 1_768_704),
+                    (2, 0) => (13_082_126_336, 2_004_992),
+                    (2, 1) => (11_013_968_640, 273_664),
+                    _ => unreachable!(),
+                };
+                assert_eq!((arena.bytes(), rounding(arena.bytes())), expected);
+                use crate::placement::planner::{weight_arena_components, ComponentKind, Lifetime, Location};
+                let components = weight_arena_components(&arena, Location::coordinator(rank as u8),
+                    Lifetime::RESIDENT, 1)?;
+                assert_eq!(components.iter().filter(|component| matches!(component.kind,
+                    ComponentKind::Allocation { .. })).count(), 1);
+                assert_eq!(components.iter().filter(|component| matches!(component.kind,
+                    ComponentKind::AllocationGranularity(_))).map(|component| component.bytes.at(1).unwrap())
+                    .sum::<u64>(), expected.1 as u64);
                 eprintln!("Muse installed inventory TP{ranks} rank{rank}: N={} payload={} large_N={} large_bytes={} old_large_slack={} arena={} padding={} final_tail={}",
                     arena.views().len(), arena.payload_bytes(), large.len(),
                     large.iter().map(|view| view.bytes()).sum::<usize>(),
