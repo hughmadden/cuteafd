@@ -341,11 +341,19 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         for rank in 0..RANKS {
             let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
             let count = set.inventory.ranks[rank].executables;
+            let reserved = set.inventory.bytes(rank);
             tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = set.inventory.bytes(rank), reserve = "estimated",
+                reserved_bytes = reserved, reserve = "estimated",
                 "Kimi startup graph census");
-            ensure!(bytes <= set.inventory.bytes(rank), "Kimi startup graphs exceed admitted reserve");
+            if bytes > reserved {
+                let per_executable = bytes.div_ceil(count.max(1));
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserved,
+                    bytes_per_executable = per_executable,
+                    "Kimi startup capture exceeds its calibrated estimate; update \
+                     cuteafd_loader::families::kimi_k3::allocation::GRAPH_CENSUS_BYTES with this capture");
+            }
+            ensure!(bytes <= reserved, "Kimi startup graphs exceed admitted reserve");
         }
     }
     Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
@@ -411,6 +419,16 @@ mod tests {
         for mode in [None, Some(AttentionPlacement::Heads), Some(AttentionPlacement::Layers)] {
             assert!(check_attention(mode, 2, false).is_ok());
         }
+    }
+
+    #[test]
+    fn native_modules_load_inside_the_shared_measured_baseline() {
+        assert!(include_str!("../../shared/inventory.rs").contains("library.tp2_native_initialize()"));
+        let source = include_str!("startup.rs");
+        let measured = source.split("RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight")
+            .nth(1).unwrap().split("let lane_layouts").next().unwrap();
+        assert!(!measured.contains("tp2_native_initialize"),
+            "the shared inventory preloads native modules; a family copy would load them twice");
     }
 
     fn projection(stem:&str)->CoreProjection {

@@ -1,6 +1,6 @@
 //! CPU allocation layouts shared by Kimi checkpoint planning and native owners.
 use super::config::{KimiAttention, KimiK3Config};
-use crate::placement::{Demand, GraphSet, Lifetime};
+use crate::placement::{Demand, GraphRank, GraphSet, Lifetime};
 use crate::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -260,6 +260,17 @@ impl NativeScratch {
 }
 
 pub const GRAPH_RESERVE: &str = "Kimi startup graph reserve";
+/// Header-only plans calibrate the CUDA context and loaded modules as one
+/// Estimated owner; the runtime replaces it with the measured post-module
+/// baseline under `CONTEXT_MEASURED`. Neither is a single driver request.
+pub const CONTEXT_ESTIMATE: &str = "CUDA context (estimated)";
+pub const CONTEXT_MEASURED: &str = "CUDA context and loaded modules";
+/// Measured SM120 startup capture for the Kimi K3 HQA min config on one
+/// coordinator GPU (2026-11-09 census): 530,579,456 B over 3,961 executables.
+/// The estimate scales that observation by executable count with no padding;
+/// the synchronized capture at Ready is the exact owner.
+pub const GRAPH_CENSUS_BYTES: u64 = 530_579_456;
+pub const GRAPH_CENSUS_EXECUTABLES: u64 = 3_961;
 pub const GRAPH_ROWS: [usize; 5] = [1, 4, 16, 64, 4096];
 
 /// Speculative verify rows replay at their exact flattened batch width (no
@@ -326,8 +337,10 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
         }
         *count *= lanes as u64;
     }
-    Ok(GraphSet::new(&counts, 256 << 10, 10, 64 << 20,
-        counts.iter().sum(), Lifetime::Startup))
+    let ranks = counts.iter().map(|&count| GraphRank::estimate(count, GRAPH_CENSUS_BYTES,
+        GRAPH_CENSUS_EXECUTABLES).map_err(|error| anyhow::anyhow!(error)))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(GraphSet { ranks, lifetime: Lifetime::Startup, shapes: counts.iter().sum() })
 }
 
 pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
