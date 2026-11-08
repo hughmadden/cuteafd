@@ -176,6 +176,19 @@ mod tests {
                 ranks - 1, old_payload + draft.padding_bytes() as u64, b + tail, draft.padding_bytes(),
                 (b + tail) as i128 - old_payload as i128, tail);
         }
+        // Vision: the shared header recipe is the tower's runtime layout.
+        let vision = cuteafd_loader::placement::families::deepseek_v41::weight_layout::vision_layout_from_headers(
+            catalog.tensors().iter().map(|t| &t.metadata))?;
+        let names = super::super::v41_vision::VisionRuntime::names();
+        ensure!(vision.views().len() == names.len() && names.iter().all(|n| vision.view(n).is_some()),
+            "vision recipe differs from the tower's tensors");
+        let source = names.iter().map(|n| catalog.tensor(n).map(|t| t.metadata.byte_length))
+            .collect::<Result<Vec<_>>>()?.into_iter().sum::<u64>();
+        ensure!(vision.payload_bytes() as u64 == source, "vision payload differs from its source tensors");
+        let (b, tail) = charge(&vision, 0)?;
+        eprintln!("V41_CHARGE layout=vision gpu0 old_planner={source} old_serving_weights={b} new={} B={b} \
+            tail={tail} padding={} delta_vs_planner={} delta_vs_serving={tail} rounding=no",
+            b + tail, vision.padding_bytes(), (b + tail) as i128 - source as i128);
         Ok(())
     }
 
