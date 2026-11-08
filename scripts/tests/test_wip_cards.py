@@ -3294,6 +3294,28 @@ def test_shared_launcher_package_verifier_requires_every_rank(tmp_path):
     verifier.verify(tmp_path, {package: layouts}, 'ml4 seal fixture')
 
 
+def test_spark_package_preflight_resolves_the_slot_on_the_sparks_own_home(tmp_path, monkeypatch, capsys):
+    """The launcher passes a ~-relative WIP slot root; the Spark expands it against its own HOME,
+    which need not be the coordinator's."""
+    spec = importlib.util.spec_from_file_location('spark_preflight', ROOT / 'scripts/launch/preflight-spark-packages.py')
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+    package, layout = 'exl3/exl3-glmf-k34', 'tp4-rank0/m1'
+    rel = '.cache/cuteafd/builds/wip-inst/slots/s/spark-expert/workspace/.cuteafd-wip'
+    directory = tmp_path / rel / package / layout
+    directory.mkdir(parents=True)
+    (directory / 'libcuteafd_exl3.so').touch()
+    monkeypatch.setenv('HOME', str(tmp_path))
+    argv = ['preflight', json.dumps({package: [layout]}), 'glmf fixture', '~/' + rel]
+    monkeypatch.setattr(sys, 'argv', argv)
+    assert verifier.main() == 0
+    monkeypatch.setenv('HOME', str(tmp_path / 'elsewhere'))
+    assert verifier.main() == 2
+    assert 'missing Spark package exl3/exl3-glmf-k34/tp4-rank0/m1' in capsys.readouterr().err
+    launcher = (ROOT / 'scripts/launch/run-family.sh').read_text()
+    assert 'slot_root="${WIP_ROOT:-~/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}/slots/' in launcher
+
+
 def test_seal_inventory_reads_libraries_not_registered_directories(tmp_path):
     root = tmp_path / 'wip'
     slot = _sealed_slot(root)
