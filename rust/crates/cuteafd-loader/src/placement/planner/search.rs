@@ -844,6 +844,7 @@ pub fn solve(
 ) -> Result<ResolvedPlan, Refusal> {
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
+    contract.add_driver_page_tables();
     contract.resident_weight_limit = request.resident_weight_limit;
     let mut budgets = budgets;
     apply_reserve_override(&mut contract, &mut budgets);

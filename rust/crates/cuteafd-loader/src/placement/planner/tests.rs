@@ -261,7 +261,8 @@ fn driver_page_table_staircase_limits_pool_without_rounding_slope() {
     let mut component = Component::allocation(pinned, ByteCurve::linear(1, 513, maximum), false, maximum);
     component.byte_extent(ByteCurve::linear(1, 513, maximum)).unwrap();
     contract.components.push(component);
-    contract.add_driver_page_tables();
+    assert!(!contract.components.iter().any(|component|
+        matches!(component.kind, ComponentKind::DriverPageTables { .. })));
     let mut host = budget(1 << 30);
     host.id = "host".into();
     host.locations = vec![Location::PINNED];
