@@ -700,7 +700,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 ensure!(ownership.ranks() == 2, "Step-5 TP2 onboarding needs two ranks");
                 let spec = ownership.execution().spec();
                 let (unit, lanes) = (usize::try_from(spec.rows)?, usize::try_from(spec.lanes)?);
-                use cuteafd_loader::plan::families::step5::admission::{tp2_exchange_bytes, Tp2Exchange};
+                use cuteafd_loader::plan::families::step5::admission::{tp2_exchange_requests, Tp2Exchange};
                 let kind = match &weights {
                     crate::shared::experts::rtx::Tp2Weights::Exl3(_) => Tp2Exchange::Exl3,
                     crate::shared::experts::rtx::Tp2Weights::Fp8(_) => Tp2Exchange::Fp8,
@@ -731,12 +731,21 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                         plane(1, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?],
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
-                let charged = tp2_exchange_bytes(unit, lanes, kind)?;
+                let mut expected = tp2_exchange_requests(unit, lanes, kind)?;
+                if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|value| value == "1") {
+                    expected.push(cuteafd_loader::serving_capacity::PeerStorageLayout::new(
+                        2 * lanes, scratch, true)?.progress_bytes as u64);
+                }
+                expected.sort_unstable();
+                let retained = onboard.pair.routes.allocation_buffers();
                 for rank in 0..2 {
                     let planes = [&onboard.partial[rank], &onboard.incoming[rank], &onboard.owner_incoming[rank],
                         &onboard.scratch[rank]];
-                    let bytes = planes.iter().map(|a| a.buffer.bytes as u64).sum::<u64>();
-                    ensure!(bytes <= charged, "Step-5 TP2 exchange planes exceed their admission ({bytes} > {charged})");
+                    let mut requests = planes.iter().map(|a| a.buffer.bytes as u64)
+                        .chain(retained.iter().filter(|(owner, _, _)| *owner == rank)
+                            .map(|(_, _, buffer)| buffer.bytes as u64)).collect::<Vec<_>>();
+                    requests.sort_unstable();
+                    ensure!(requests == expected, "Step-5 TP2 exchange requests differ from admission: {requests:?} != {expected:?}");
                 }
                 Some(onboard)
             }

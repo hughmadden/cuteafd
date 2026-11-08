@@ -734,10 +734,14 @@ mod tests {
                 )
                 .context("Step-5 test hop size overflow")?;
                 let charged = checked_sum(admission.placement.items[rank].iter().map(|i| i.bytes))?;
-                assert_eq!(
-                    charged,
-                    fixed + hops[rank] + admission.reservations[rank].pages as u64
-                );
+                let tails = admission.solved.facts.allocation_granularity.iter()
+                    .filter(|owner| owner.location == crate::placement::planner::Location::coordinator(rank as u8))
+                    .try_fold(0u64, |total, owner| -> Result<u64> {
+                        total.checked_add(owner.bytes()?).context("Step-5 test physical tails overflow")
+                    })?;
+                let payload = admission.reservations[rank].pages as u64;
+                let page = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
+                assert_eq!(charged, fixed + hops[rank] + payload.div_ceil(page) * page + tails);
             }
             assert_eq!(admission.ownership.execution().mode(3)?, WHOLE0);
             if ranks == 2 {
@@ -1052,7 +1056,7 @@ mod tests {
     fn explicit_unaligned_pool_keeps_its_pin_and_charges_physical_records() -> Result<()> {
         let mut input = inputs(1);
         input.context = EXTENT;
-        input.serving_context = crate::placement::planner::Context::pinned(FLOOR);
+        input.serving_context = crate::placement::planner::Context::resolve(EXTENT, Some(FLOOR));
         input.requested_pool = Some(FLOOR + 64);
         let admitted = run(&input)?;
         assert_eq!(admitted.placement.pool_tokens, FLOOR + 64);
@@ -1062,6 +1066,34 @@ mod tests {
             .find(|owner| owner.id == "step5.records.0").unwrap();
         assert_eq!(owner.bytes, payload.div_ceil(page) * page);
         assert!(owner.bytes >= payload && owner.bytes - payload < page);
+        Ok(())
+    }
+
+    #[test]
+    fn automatic_pool_keeps_every_affordable_page_without_alignment_loss() -> Result<()> {
+        let mut input = inputs(1);
+        input.context = EXTENT;
+        input.serving_context = crate::placement::planner::Context::automatic(EXTENT);
+        input.requested_pool = None;
+        input.kv_format = crate::families::qwen4::Qwen4KvCache::Fp8;
+        let probe = run(&input)?;
+        let location = crate::placement::planner::Location::coordinator(0);
+        let phase = probe.solved.phases.iter().find(|phase| phase.phase ==
+            crate::placement::planner::Phase::Growth && phase.budget == probe.solved.budgets[0].id).unwrap();
+        let records = probe.solved.facts.allocations.iter().find(|owner|
+            owner.id == "step5.records.0" && owner.location == location).unwrap();
+        let fixed = phase.owned + phase.opaque - records.bytes;
+        let unit = probe.cache.geometry.ranks[0].persistent_unit_bytes;
+        let quantum = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
+        let wanted = 22_096;
+        let physical = (unit * wanted).div_ceil(quantum) * quantum;
+        let budget = fixed + physical;
+        input.inventory.gpus[0].reserve_bytes = 0;
+        input.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: budget };
+        let admitted = run(&input)?;
+        assert_eq!(admitted.placement.pool_tokens / 64, physical / unit);
+        assert!(admitted.placement.pool_tokens >= wanted * 64);
+        assert_ne!(admitted.placement.pool_tokens / 64 % 1024, 0);
         Ok(())
     }
 

@@ -63,7 +63,7 @@ impl Figures {
             .get(usize::from(rank))
             .context("Step-5 pool geometry rank")?
             .persistent_unit_bytes;
-        let pool = pool_curve(unit, pages, true)?.at(pages)?;
+        let pool = pool_physical_bytes(unit, pages)?;
         let weights = self.weights.iter().chain(&self.granularity).filter(|component| match &component.kind {
             ComponentKind::Allocation { template, .. } => template.location == Location::coordinator(rank),
             ComponentKind::AllocationGranularity(owner) => owner.location == Location::coordinator(rank),
@@ -103,32 +103,19 @@ fn physical(fixed: &mut Vec<Demand>, backings: &mut Vec<GranularityBacking>, ran
     Ok(())
 }
 
-fn gcd(mut a: u64, mut b: u64) -> u64 {
-    while b != 0 { (a, b) = (b, a % b); }
-    a
+fn pool_physical_bytes(unit: u64, pages: u64) -> Result<u64, Refusal> {
+    unit.checked_mul(pages).and_then(|bytes| bytes.div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES)
+        .checked_mul(SM120_ALLOCATION_GRANULARITY_BYTES))
+        .ok_or(Refusal::Overflow("Step-5 pool backing"))
 }
 
-/// Records have no header/intercept: aligning page count makes every auto-pool
-/// backing exactly physical, and the alignment slack remains usable records.
-fn pool_page_multiple(units: impl IntoIterator<Item = u64>) -> Result<u64> {
-    units.into_iter().try_fold(1u64, |multiple, unit| {
-        let quantum = SM120_ALLOCATION_GRANULARITY_BYTES / gcd(unit, SM120_ALLOCATION_GRANULARITY_BYTES);
-        (multiple / gcd(multiple, quantum)).checked_mul(quantum)
-            .context("Step-5 pool alignment overflow")
-    })
-}
-
-/// Explicit pools retain their exact page count. Their single backing's
-/// physical cost is an exact piecewise-affine rounded curve, not a margin.
-fn pool_curve(unit: u64, maximum: u64, physical: bool) -> Result<ByteCurve, Refusal> {
-    if !physical || unit == 0 || unit % SM120_ALLOCATION_GRANULARITY_BYTES == 0 {
+/// Both automatic and explicit pools price the backing's physical round-up.
+/// Page counts remain unaligned; the shared solver keeps the last affordable page.
+fn pool_curve(unit: u64, maximum: u64) -> Result<ByteCurve, Refusal> {
+    if unit == 0 || unit % SM120_ALLOCATION_GRANULARITY_BYTES == 0 {
         return Ok(ByteCurve::linear(unit, unit, maximum));
     }
-    let at = |pages: u64| -> Result<u64, Refusal> {
-        unit.checked_mul(pages).and_then(|bytes| bytes.div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES)
-            .checked_mul(SM120_ALLOCATION_GRANULARITY_BYTES))
-            .ok_or(Refusal::Overflow("Step-5 pool backing"))
-    };
+    let at = |pages| pool_physical_bytes(unit, pages);
     let mut pieces = Vec::new();
     let mut first = 1;
     while first <= maximum {
@@ -147,38 +134,23 @@ mod physical_pool_tests {
     use super::*;
 
     #[test]
-    fn automatic_pages_align_every_zero_intercept_records_backing() -> Result<()> {
-        let page = SM120_ALLOCATION_GRANULARITY_BYTES;
-        for units in [[384 * 64, 768 * 64], [3 * page / 8, 5 * page / 16], [0, page], [7, 33]] {
-            let quantum = pool_page_multiple(units)?;
-            for unit in units {
-                assert_eq!(unit * quantum % page, 0);
-                for pages in [quantum, 17 * quantum] {
-                    assert_eq!((unit * pages).div_ceil(page) * page, unit * pages);
-                }
-            }
-            let before = 123_457;
-            let after = before / quantum * quantum;
-            assert!(before - after < quantum);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn explicit_pool_curve_prices_exact_physical_backing_without_changing_pages() -> Result<()> {
+    fn pool_curve_prices_exact_physical_backing_without_aligning_pages() -> Result<()> {
         let page = SM120_ALLOCATION_GRANULARITY_BYTES;
         for unit in [0, 1, 7, page / 16, page / 2, page, page + 7, 13 * page / 8] {
             let maximum = 259;
-            let curve = pool_curve(unit, maximum, true)?;
+            let curve = pool_curve(unit, maximum)?;
             assert_eq!(curve.0.first().unwrap().first, 1);
             assert_eq!(curve.0.last().unwrap().last, maximum);
             assert!(curve.0.windows(2).all(|pair| pair[0].last + 1 == pair[1].first));
             for pages in 1..=maximum {
                 assert_eq!(curve.at(pages)?, (unit * pages).div_ceil(page) * page);
-                assert_eq!(pool_curve(unit, maximum, false)?.at(pages)?, unit * pages);
             }
         }
-        assert!(pool_curve(u64::MAX, 2, true).is_err());
+        let baseline_pages = 22_096;
+        let unit = 2_308_096;
+        assert_eq!(pool_curve(unit, baseline_pages)?.at(baseline_pages)?,
+            (unit * baseline_pages).div_ceil(page) * page);
+        assert!(pool_curve(u64::MAX, 2).is_err());
         Ok(())
     }
 }
@@ -612,10 +584,7 @@ impl Recipe for Step5Recipe<'_> {
             spark_reply_formats: None,
             resident_weight_limit: request.resident_weight_limit,
             page_rows: self.page_rows,
-            pool_page_multiple: if matches!(request.pool, Pin::Auto) {
-                pool_page_multiple(self.figures.cache.geometry.ranks.iter().map(|r| r.persistent_unit_bytes))
-                    .map_err(|error| Refusal::InvalidFact(error.to_string()))?
-            } else { 1 },
+            pool_page_multiple: 1,
             maximum_pages: self.maximum_pages,
             gpus: self.gpus,
             variables: vec![Variable::Prefill(vec![self.prefill])],
@@ -681,7 +650,7 @@ impl Recipe for Step5Recipe<'_> {
             let owner = Allocation::buffer(format!("step5.records.{rank}"),
                 Location::coordinator(rank as u8), unit, Lifetime::RESIDENT, Category::Kv, "records");
             contract.components.push(Component::allocation(owner,
-                pool_curve(unit, self.maximum_pages, matches!(request.pool, Pin::Exact(_)))?, false, self.maximum_pages));
+                pool_curve(unit, self.maximum_pages)?, false, self.maximum_pages));
         }
         for (rank, &bytes) in self.figures.hops.iter().enumerate() {
             if bytes == 0 {
