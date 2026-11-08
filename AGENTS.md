@@ -27,6 +27,9 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   `ncu <args> <program>` on the host or in a dev container. No sudo. Never put
   anything under sudo inside a wrapper script or interpreter (`sudo python …`,
   `sudo bash …`): the approver can't see what it runs and will flag or deny it.
+  CPU sampling of your own processes also works on raptor
+  (`kernel.perf_event_paranoid=1`): add `--sample=process-tree
+  --cpuctxsw=process-tree` to nsys to find host-side stalls.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
   `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
   `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
