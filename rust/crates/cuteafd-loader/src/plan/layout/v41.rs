@@ -414,7 +414,7 @@ mod tests {
                 experts: vec![expert; 40], workspace: 0,
                 owners: vec![Owner::charged(0, Category::Weights, "backbone", 2 * gib),
                     Owner::charged(1, Category::Weights, "backbone", 2 * gib)],
-                startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+                weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
                 media_cache_bytes: 0, resident_weight_limit: limit,
                 spark_reply_formats: Default::default(), operation: Operation::Serving, budgets,
             };
@@ -454,7 +454,7 @@ mod tests {
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
             experts: vec![expert; 40], workspace: 0,
             owners: vec![Owner::weights(0, Category::Weights, "backbone", 2 * gib)],
-            startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
+            weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(), draft: None, encoders: Vec::new(),
             media_cache_bytes: 0, resident_weight_limit: 0, spark_reply_formats: Default::default(),
             operation: Operation::Serving, budgets,
         };

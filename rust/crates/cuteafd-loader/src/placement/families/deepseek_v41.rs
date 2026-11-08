@@ -486,7 +486,7 @@ mod tests {
             config, gpus: ranks, context, maximum_pool_tokens: pool.unwrap_or(2 << 20),
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency, retained_turns: turns,
             replicated, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
-            experts, workspace: 0, owners, startup: Vec::new(), allowances: Vec::new(),
+            experts, workspace: 0, owners, weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
             draft, encoders: Vec::new(), media_cache_bytes: 0,
             resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
             operation: Operation::Serving, budgets,
@@ -507,7 +507,7 @@ mod tests {
                     maximum_pool_tokens: 4096, prefill: PrefillShape { rows: 128, waves: 1 },
                     concurrency: 1, retained_turns: 0, replicated: false, spark_ranks: 4,
                     onboard_minimum: 0, onboard_counts: None, experts: vec![cost(ranks); 40],
-                    workspace: 0, owners: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
+                    workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(), allowances: Vec::new(),
                     draft: None, encoders: Vec::new(), media_cache_bytes: 0,
                     resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
                     operation: Operation::Serving,
@@ -567,7 +567,7 @@ mod tests {
             expert_usage: false, config: &config, gpus: 2, context: 32768, maximum_pool_tokens: 32768,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 1, onboard_minimum: 0, onboard_counts: None,
-            experts: vec![cost(2); 40], workspace: 0, owners: vec![], startup: vec![], allowances: vec![],
+            experts: vec![cost(2); 40], workspace: 0, owners: vec![], weight_arenas: Vec::new(), startup: vec![], allowances: vec![],
             draft: None, encoders: vec![EncoderPlacement { kind: EncoderKind::Spark { rank: 0 },
                 weights: 123456, scratch: 654321, replicas: vec![], reason: "tower only".into(), shortfall: 0 }],
             media_cache_bytes: 0, resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
@@ -664,7 +664,7 @@ mod tests {
             config: &config, gpus: 2, context: 262_144, maximum_pool_tokens: 2 << 20,
             prefill: PrefillShape { rows: 128, waves: 1 }, concurrency: 1, retained_turns: 0,
             replicated: false, spark_ranks: 4, onboard_minimum: 0, onboard_counts: None,
-            experts: vec![cost(2); 40], workspace: 0, owners: Vec::new(), startup: Vec::new(),
+            experts: vec![cost(2); 40], workspace: 0, owners: Vec::new(), weight_arenas: Vec::new(), startup: Vec::new(),
             allowances: Vec::new(), draft: None, encoders: Vec::new(), media_cache_bytes: 0,
             resident_weight_limit: u64::MAX, spark_reply_formats: Default::default(),
             operation: Operation::Serving, budgets,
@@ -733,7 +733,7 @@ mod tests {
         let inventory = DraftInventory { resident: 6 << 30,
             runtime: vec![Demand::new(1, Category::Drafter, "dSpark request lanes", 1 << 30, Basis::Formula)],
             marks: 0, peer_half: 2 << 30, staging: [1 << 30, 1 << 29],
-            loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2] };
+            loading_experts: [4 << 30, 2 << 30], loader_peak: [0; 2], dense: None };
         let free = 8 << 30;
         let base = admit(&config, 2, Vec::new(), None, vec![cost(2); 40], Onboard::Layers(4),
             None, 512, 1, 0, false, free)?;

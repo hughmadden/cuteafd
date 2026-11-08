@@ -558,12 +558,17 @@ mod tests {
         let target = vec![demand("lane 0 backbone", 40), demand("lane 0 engram", 30),
             demand("lane 0 window batch table", 5), demand("lane 0 target head", 60),
             demand("lane 0 target taps", 70), demand("lane 1 backbone", 80)];
-        // Lanes and slots allocate after the head is packed.
-        let phase = vocabulary_load_phase(&weights, &target, 400)?;
-        assert_eq!(phase.bytes, 400 + 100 + 20 + 50);
-        assert_eq!(phase.category, Category::Staging);
-        assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
-        assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
+        let _ = (&weights, &target);
+        // The whole target arena exists before the head converts; only the
+        // mode's transient source sits beside it. Lanes and slots come after.
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("head.fp8.payload".to_string(), 3 << 20), ("norm.weight".to_string(), 10)])?;
+        for (head, transient) in [(Fp8Head::All, 16 * 10240), (Fp8Head::Off, 0), (Fp8Head::Draft, 0),
+            (Fp8Head::Packed, 129280 * 10240)] {
+            let phase = vocabulary_load_phase(&arena, head)?;
+            assert_eq!(phase.bytes, arena.bytes() as u64 + transient, "{head:?}");
+            assert_eq!(phase.category, Category::Staging);
+        }
         for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             assert_eq!(transport_bytes(1024, ranks)?, ranks as u64 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(1024 * 10240)?
                 + 2 * 1024 * 10240);
@@ -603,9 +608,11 @@ mod tests {
         let target = vec![demand(0, "lane 0 backbone", 40), demand(0, "lane 0 engram", 30),
             demand(0, "lane 0 window batch table", 5), demand(0, "lane 0 target head", 60),
             demand(0, "lane 0 target taps", 70), demand(0, "lane 1 backbone", 80)];
-        let vocabulary = vocabulary_load_phase(&weights, &target,
-            Fp8Head::All.load_bytes(1_323_827_200))?;
-        assert_eq!(vocabulary.bytes, 2_006_425_845 - 40 - 30 - 5);
+        let _ = (&weights, &target);
+        let arena = crate::serving_capacity::WeightArenaLayout::new("v41/target/gpu0",
+            [("weights".to_string(), 170), ("head.fp8.payload".to_string(), 682_598_400)])?;
+        let vocabulary = vocabulary_load_phase(&arena, Fp8Head::All)?;
+        assert_eq!(vocabulary.bytes, arena.bytes() as u64 + 16 * 10240);
         let draft = DraftInventory { resident: 600, loading_experts: [500, 0],
             staging: [200, 0], loader_peak: [600, 0], marks: 50,
             runtime: vec![demand(0, "draft runtime", 70)], ..Default::default() };
