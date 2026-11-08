@@ -176,6 +176,18 @@ pub fn host_marks_enabled(gpus: usize, partitioned: bool, host: bool) -> bool {
     host && (gpus == 1 || partitioned)
 }
 
+/// Peak live CUDA streams in one coordinator context at Ready (#1511): the
+/// engine's stream and the prefix cache's copy stream on the rank, one intake
+/// copy stream per Spark link, and -- when the retained host tier is live --
+/// the host copy engine's store/restore pair plus its event probe per device.
+/// Load, rotary and push streams retire before Ready. Only the band matters
+/// (the driver retains a 2 MiB slab per four live streams): 2 and 4 streams
+/// stay in the first band, 6 and 8 in the second.
+pub fn startup_peak_live_streams(host_tier: bool, spark_links: bool) -> u64 {
+    let serving = 1 + 1 + if spark_links { 2 } else { 0 };
+    serving + if host_tier { 4 } else { 0 }
+}
+
 /// Prefix mark slots over every rank's mark, 0 without prefix entries.
 pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_stages: usize, sequences: u64,
     entries: u64, budget_bytes: u64, host: bool) -> Result<u64, PlacementError> {
@@ -614,4 +626,24 @@ pub fn expert_costs(catalog: &crate::OfficialV41Catalog, stages: usize)
     let draft = (0..stages).map(|stage| deepseek_v4_expert_cost(catalog, stage, true))
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((layers, draft))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_streams_price_each_ready_band() {
+        let slab = crate::placement::planner::cuda_stream_slab_bytes;
+        // Engine and prefix-copy streams, plus one pair when Sparks carry experts.
+        assert_eq!(startup_peak_live_streams(false, false), 2);
+        assert_eq!(startup_peak_live_streams(false, true), 4);
+        assert_eq!(slab(2).unwrap(), 2 << 20);
+        assert_eq!(slab(4).unwrap(), 2 << 20);
+        // The host tier's copy engine crosses into the second band.
+        assert_eq!(startup_peak_live_streams(true, false), 6);
+        assert_eq!(startup_peak_live_streams(true, true), 8);
+        assert_eq!(slab(6).unwrap(), 4 << 20);
+        assert_eq!(slab(8).unwrap(), 4 << 20);
+    }
 }

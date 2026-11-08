@@ -1059,6 +1059,30 @@ impl Recipe for PreparedV4<'_> {
         };
         owners.components.extend(serving::blas_components("sm_120", &[vocabulary],
             self.maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?);
+        // The driver's retained stream slabs (#1511): one 2 MiB band per four
+        // live streams, which stays on the device after the streams that grew
+        // it retire. V4 holds its engine stream and the prefix cache's copy
+        // stream on every rank, one intake copy stream per Spark link, and --
+        // when the retained host tier is live, exactly when `prefix_owners`
+        // admits a quota -- the host copy engine's store/restore pair with an
+        // event probe on each device. This is not a cudaMalloc request, so it
+        // receives no allocation-tail charge.
+        let host_tier = self.prefix.owners.quota_bytes > 0;
+        let peak = super::startup_peak_live_streams(host_tier, inputs.spark_ranks > 0);
+        let slab = cuda_stream_slab_bytes(peak).map_err(invalid)?;
+        for gpu in 0..gpus {
+            owners.components.push(Component {
+                activation: Activation::always(),
+                bytes: ByteCurve::fixed(slab, self.maximum_pages),
+                kind: ComponentKind::Allowance(Allowance {
+                    location: Location::coordinator(gpu as u8),
+                    bytes: slab,
+                    lifetime: Lifetime::RESIDENT,
+                    assumed: false,
+                    source: format!("v4/driver-stream-slabs/gpu{gpu} ({peak} peak live streams, SM120 driver/runtime13020 LAZY, #1511 2026-11-08)"),
+                }),
+            });
+        }
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {
             for demand in self.context_buffers().demands().map_err(invalid)? {
