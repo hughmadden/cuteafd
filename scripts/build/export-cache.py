@@ -111,14 +111,15 @@ def run(args) -> int:
     if os.environ.get("CUTEAFD_EXPORT_CACHE_REQUIRE_HIT") == "1":
         cache.stats("required-hit-missed", layer="invocation", exporter=label)
         return 3
+    watched = output_roots(command, roots.build)
     with tempfile.TemporaryDirectory(prefix="export-reads-") as reads:
         environment = dict(os.environ)
+        environment["CUTEAFD_EXPORT_CACHE_OUTPUTS"] = json.dumps([str(path) for path in watched])
         environment.update({
             cache.READS_ENV: reads, cache.ROOT_ENV: str(ROOT), cache.BUILD_ENV: str(roots.build),
             "PYTHONPATH": os.pathsep.join(filter(None, [str(BOOTSTRAP), environment.get("PYTHONPATH")])),
         })
         environment.pop("PYTHONNOUSERSITE", None)
-        watched = output_roots(command, roots.build)
         before = tree_state(watched)
         status = subprocess.call(command, env=environment)
         if status != 0:
@@ -129,12 +130,16 @@ def run(args) -> int:
     reason = refusal(record, command)
     if record is not None:
         # Written then removed (a staging directory renamed or cleaned up): not outputs.
-        record["written"] = [path for path in record["written"] if os.path.lexists(path)]
+        # Directories are created along the way (mkdir also fires for existing ones);
+        # only files are outputs, and a restore recreates their parents.
+        record["written"] = [path for path in record["written"] if os.path.lexists(path) and not os.path.isdir(path)]
     if not reason and not watched:
         reason = "the command names no output directory under the build directory"
     if not reason and any(not any(Path(path) == root or root in Path(path).parents for root in watched)
                           for path in record["written"]):
-        reason = "the export wrote outside the output directories it names"
+        outside = next(path for path in record["written"]
+                       if not any(Path(path) == root or root in Path(path).parents for root in watched))
+        reason = f"the export wrote outside the output directories it names, e.g. {normalized(outside, roots)}"
     if not reason:
         # Every file the export created or changed must be one it was seen writing:
         # an entry restores exactly those, so an unseen write would be dropped.

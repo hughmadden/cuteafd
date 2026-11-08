@@ -52,7 +52,7 @@ CUTEAFD_EXPORT_JOBS CUTEAFD_EXPORT_SLOT_DIR CUTEAFD_EXPORT_HOST_SLOT_DIR
 CUTEAFD_EXPORT_GPU_SLOT_DIR CUTEAFD_EXPORT_GPU_BUDGET_MIB CUTEAFD_EXPORT_WORKER_GPU_MIB
 CUTEAFD_EXPORT_WORKER_RAM_MIB CUTEAFD_EXPORT_CONTEXT_SPACING_S CUTEAFD_EXPORT_GPU
 CUTEAFD_EXPORT_CACHE CUTEAFD_EXPORT_CACHE_READS CUTEAFD_EXPORT_CACHE_SOURCE_ROOT
-CUTEAFD_EXPORT_CACHE_BUILD_DIR CUTEAFD_EXPORT_CACHE_STATS CUTEAFD_EXPORT_CACHE_REQUIRE_HIT
+CUTEAFD_EXPORT_CACHE_BUILD_DIR CUTEAFD_EXPORT_CACHE_STATS CUTEAFD_EXPORT_CACHE_REQUIRE_HIT CUTEAFD_EXPORT_CACHE_OUTPUTS
 CUTEAFD_EXPORT_IMAGE_ID CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
 B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE B12X_COMPILE_CACHE_DIR B12X_LOG_CUTE_COMPILES
 B12X_PRINT_COMPILE_PROGRESS TRITON_CACHE_DIR CUTE_DSL_CACHE_DIR
@@ -127,6 +127,8 @@ class Roots:
         sparkinfer = os.environ.get("CUTEAFD_SPARKINFER_SOURCE_DIR")
         self.sparkinfer = Path(sparkinfer).resolve() if sparkinfer else self.source / "third_party/sparkinfer"
         self.build = Path(build_dir).resolve() if build_dir else None
+        self.outputs = tuple(os.path.realpath(path) for path in
+                             json.loads(os.environ.get("CUTEAFD_EXPORT_CACHE_OUTPUTS", "[]")))
         prefixes = {sys.prefix, sys.base_prefix, sys.exec_prefix, "/usr", "/lib", "/lib64", "/opt",
                     "/etc", "/proc", "/sys", "/dev", "/run", "/bin", "/sbin"}
         self.toolchain = tuple(sorted({str(Path(prefix).resolve()) for prefix in prefixes}))
@@ -247,6 +249,7 @@ class Recorder:
         self.scopes: list[Scope] = []
         self.unknown: set[str] = _Unknown(self)
         self.env_written: set[str] = set()
+        self.made_dirs: set[str] = set()
         self.temp_read: set[str] = set()
         self.temp_written: set[str] = set()
         self.lock = threading.RLock()
@@ -367,23 +370,37 @@ class Recorder:
                 self.written.discard(resolved)
                 self.deleted.add(resolved)
 
+    def owned(self, resolved: str) -> bool:
+        """Under an output directory the command names: it owns those trees.
+
+        Exporters remove and recreate what they produce there, so which names
+        exist beforehand is not an input (a file read there still is).
+        """
+        if any(resolved == root or resolved.startswith(root + "/") for root in self.roots.outputs):
+            return True
+        # ...or under a directory this process created (a staging directory).
+        parent = resolved
+        while parent and parent != "/":
+            if parent in self.made_dirs:
+                return True
+            parent = os.path.dirname(parent)
+        return False
+
     def note_listing(self, path) -> None:
         kind, name = self.roots.classify(path)
         if kind == "foreign":
             self.unknown.add("list:" + name)
         elif name is not None:
             resolved = os.path.realpath(os.fsdecode(path))
-            if kind == "build" and any(item.startswith(resolved + "/") for item in self.written):
-                # A directory this export filled: its names are outputs, but
-                # pre-existing entries still matter, so key what was there.
-                pass
-            self._observe("list|" + name, lambda: listing(resolved))
+            if not self.owned(resolved):
+                self._observe("list|" + name, lambda: listing(resolved))
 
     def note_stat(self, path, kind_value) -> None:
         kind, name = self.roots.classify(path)
         if name is None or kind not in ("src", "build"):
             return
-        if os.path.realpath(os.fsdecode(path)) in self.written:
+        resolved = os.path.realpath(os.fsdecode(path))
+        if resolved in self.written or self.owned(resolved):
             return
         self._observe("stat|" + name, lambda: kind_value)
 
@@ -491,6 +508,10 @@ class Recorder:
                 self.note_delete(args[0])
         elif event == "os.mkdir":
             if args and is_path(args[0]) and not self._fd_relative(event, args):
+                target = os.path.realpath(os.fsdecode(args[0]))
+                if not os.path.exists(target):  # the audit event precedes the call
+                    with self.lock:
+                        self.made_dirs.add(target)
                 self.note_write(args[0])
         elif event == "subprocess.Popen":
             executable, argv, _, environment = (list(args) + [None] * 4)[:4]
