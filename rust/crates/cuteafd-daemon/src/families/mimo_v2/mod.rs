@@ -698,6 +698,19 @@ mod source_format_tests {
         assert!(native < sampled, "Spark intake native modules must be sampled on TP1 too (#1554)");
         assert_eq!(window.matches("tp2_native_initialize").count(), 1);
     }
+
+    #[test]
+    fn serving_decode_graph_misses_join_the_shared_eager_inventory() {
+        let source = include_str!("engine.rs");
+        let eager = source.split_once("self.miss_graph(rank, &key);")
+            .expect("the serving miss branch records its variant").1;
+        assert!(eager.trim_start().starts_with("return segment();"),
+            "a serving miss must run eagerly, never capture on the request");
+        let missing = source.split_once("fn miss_graph(&self").expect("miss_graph body").1;
+        let missing = missing.split_once("\n    }\n").expect("miss_graph end").0;
+        assert!(missing.contains(concat!("crate::shared::decode_graph::note",
+            "_eager(\"mimo_v2\"")), "eager misses go through the one shared entry point");
+    }
 }
 
 impl EngineArgs {

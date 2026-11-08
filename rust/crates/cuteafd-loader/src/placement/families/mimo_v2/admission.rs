@@ -10,7 +10,7 @@ use crate::families::mimo_v2::capacity::MimoCapacityProfiles;
 use crate::placement::planner::{
     Allocation, Baseline, Budget, ByteCurve, Component, Contract, EmbeddingHome, ExpertDestination,
     Lifetime, Location, Operation, Phase, PhaseOrder, Pin, PrefillShape, Recipe, Refusal, Request,
-    ResolvedPlan, Variable,
+    ResolvedPlan, SM120_ALLOCATION_GRANULARITY_BYTES, Variable,
 };
 use crate::placement::{
     plan_hops, residual_homes, AttentionClass, AttentionPlacement, ExpertCost, ExpertHome,
@@ -183,7 +183,7 @@ impl HostOwners {
             let b = self.demands(recipe, last, count)?;
             for (index, ((_, a), (_, b))) in a.iter().zip(&b).enumerate() {
                 curves[index].push(crate::placement::planner::BytePiece { granularity: 1, first: start, last,
-                    bytes_at_first: *a, bytes_per_page: if last == start { 0 } else { b.saturating_sub(*a).div_ceil(last - start) } });
+                    bytes_at_first: *a, bytes_per_page: if last == start { 0 } else { b.saturating_sub(*a).div_ceil(last - start) }, backings: 1, });
             }
         }
         Ok(first.into_iter().zip(curves).map(|((name, bytes), pieces)| {
@@ -443,6 +443,17 @@ impl MimoRecipe<'_> {
         Ok((peak, weights))
     }
 
+    /// The runtime allocates the target record pool as one page buffer per
+    /// full-attention layer, so each layer rounds its own SM120 backing. A
+    /// layer's request is `persistent_unit_bytes / backings` at every page
+    /// count, which keeps the shared pool curve's split exact.
+    fn pool_backings(&self) -> Result<u64, Refusal> {
+        let full = self.cfg.attention[..self.layers].iter()
+            .filter(|attention| **attention == MimoAttention::Full).count() as u64;
+        if full == 0 { return Err(invalid("MiMo pool has no full-attention layers")); }
+        Ok(full)
+    }
+
     /// Per-page steady bytes on `rank`, split into KV records and page tables.
     fn pool_pages(&self, profile: &CapacityProfile, rank: usize) -> Result<(u64, u64), Refusal> {
         let costs = profile.devices.get(rank).ok_or_else(|| invalid("profile rank"))?;
@@ -695,8 +706,12 @@ impl Recipe for MimoRecipe<'_> {
                     if costs.pool_unit_bytes > 0 {
                         let owner = Allocation::buffer(format!("rtx{rank}.{phase:?}.pool"), Location::coordinator(rank as u8),
                             costs.pool_unit_bytes, Lifetime { first: phase, last: phase }, Category::Kv, "records");
+                        // The runtime allocates one page buffer per full-attention
+                        // layer; each rounds its own SM120 backing (see pool_pages).
                         let mut component = Component::allocation(owner,
-                            ByteCurve::linear(costs.pool_unit_bytes, costs.pool_unit_bytes, maximum), false, maximum);
+                            ByteCurve::paged(costs.pool_unit_bytes, costs.pool_unit_bytes,
+                                SM120_ALLOCATION_GRANULARITY_BYTES, self.pool_backings()?, maximum),
+                            false, maximum);
                         component.activation = activation.clone();
                         contract.components.push(component);
                     }
@@ -718,15 +733,17 @@ impl Recipe for MimoRecipe<'_> {
                     contract.components.push(component);
                 }
                 let (records, tables) = self.pool_pages(profile, rank)?;
-                for (group, category, bytes) in [
-                    ("records", Category::Kv, records),
-                    ("pool page tables", Category::Workspace, tables),
+                for (group, category, bytes, curve) in [
+                    ("records", Category::Kv, records,
+                        ByteCurve::paged(records, records, SM120_ALLOCATION_GRANULARITY_BYTES,
+                            self.pool_backings()?, maximum)),
+                    ("pool page tables", Category::Workspace, tables,
+                        ByteCurve::linear(tables, tables, maximum)),
                 ] {
                     if bytes == 0 { continue; }
                     let owner = Allocation::buffer(format!("rtx{rank}.pool.{group}"), location,
                         bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth }, category, group);
-                    let mut component = Component::allocation(owner,
-                        ByteCurve::linear(bytes, bytes, maximum), false, maximum);
+                    let mut component = Component::allocation(owner, curve, false, maximum);
                     component.activation = activation.clone();
                     contract.components.push(component);
                 }

@@ -2279,8 +2279,9 @@ impl<'a> MimoEngine<'a> {
 
     /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`;
     /// `launch` false only captures a startup shape. A serving miss runs the segment
-    /// eagerly: the startup shape set is closed, so a request outside it allocates
-    /// no graph storage and no runtime capture ever happens.
+    /// eagerly through the shared miss inventory ([`Self::miss_graph`]): the
+    /// startup shape set is closed, so a request outside it allocates no graph
+    /// storage and no runtime capture ever happens.
     fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let graphs = match (rank, &self.peer) {
@@ -2296,6 +2297,7 @@ impl<'a> MimoEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if launch {
+            self.miss_graph(rank, &key);
             return segment();
         }
         // Instantiation allocates driver graph storage; name the owner and the
@@ -2316,6 +2318,19 @@ impl<'a> MimoEngine<'a> {
         }
         graphs.borrow_mut().insert(key, exec);
         Ok(())
+    }
+
+    /// Records one eager run of a decode segment the sealed startup set did not
+    /// contain: every occurrence joins the shared `/v1/stats`
+    /// `graph_missing_variants` inventory, and a variant warns once with its
+    /// rank and request context. The variant is the whole baked shape, so two
+    /// distinct misses never share a row.
+    fn miss_graph(&self, rank: usize, key: &GraphKey) {
+        let variant = format!("layer={} rows={} table_stride={} previous={:?} head={}",
+            key.layer, key.rows, key.table_stride, key.previous, key.head);
+        crate::shared::decode_graph::note_eager("mimo_v2", &variant, || format!(
+            "rank={rank} max_context={} pages={} rings={} prefill_rows={}",
+            self.max_context, self.pages, self.rings, self.prefill_rows));
     }
 
     /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
