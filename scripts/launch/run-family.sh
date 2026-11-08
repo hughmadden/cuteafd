@@ -2088,17 +2088,14 @@ if [[ $family == glm5_flash ]]; then
   # GLM5_FLASH_FP8_HEAD: the one resident LM head the target and drafter share. auto (default) = on,
   # an E4M3 copy; off keeps the checkpoint's BF16; packed keeps the exact 12-bit copy of the BF16
   # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
-  # three quarters of the BF16 bytes. packed serves one GPU: refused with the two-GPU head split.
+  # three quarters of the BF16 bytes. The daemon checks packed split support after normalizing
+  # native K6/EXLR8 heads, which ignore this conversion setting.
   fp8_head="$(key GLM5_FLASH_FP8_HEAD GLMF_FP8_HEAD auto)"
   case "$fp8_head" in
     ""|auto) fp8_head=on ;;
     on|off|packed) ;;
     *) echo "GLM5_FLASH_FP8_HEAD must be auto, on, off or packed" >&2; exit 2 ;;
   esac
-  if [[ $fp8_head == packed && $head_split != 0 ]]; then
-    echo "GLM5_FLASH_FP8_HEAD=packed keeps one exact 12-bit head on one GPU; the two-GPU head split takes on or off (or set RTX_GPUS=1)" >&2
-    exit 2
-  fi
   case "$fp8_head" in
     on) family_args+=(--fp8-head true) ;;
     off) family_args+=(--fp8-head false) ;;

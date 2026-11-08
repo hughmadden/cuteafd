@@ -2617,14 +2617,13 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
     assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
 
 
-@pytest.mark.parametrize("prefix", ["GLM5_FLASH", "GLMF"])
 @pytest.mark.parametrize("layout,physical_gpus", [("RTX_GPUS=1\n", (0, 1)), ("RTX_GPUS=auto\n", (0,)),
                                                   ("COORDINATOR_GPUS=0,1\nCOORDINATOR_SPLIT=off\n", (0, 1))])
-def test_glmf_packed_head_reaches_serve_and_plan_on_one_gpu(tmp_path, prefix, layout, physical_gpus):
+def test_glmf_packed_head_reaches_serve_and_plan_on_one_gpu(tmp_path, layout, physical_gpus):
     """GLM5_FLASH_FP8_HEAD=packed (mirroring V41_FP8_HEAD=packed) keeps the exact 12-bit head:
     serve-glmf and its plan both get --fp8-head packed, once, beside the default row128 KDA."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  layout + f"{prefix}_FP8_HEAD=packed\n", physical_gpus=physical_gpus)
+                                  layout + "GLM5_FLASH_FP8_HEAD=packed\n", physical_gpus=physical_gpus)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert "--split-device" not in launch
@@ -2634,14 +2633,18 @@ def test_glmf_packed_head_reaches_serve_and_plan_on_one_gpu(tmp_path, prefix, la
     assert plans and all("--fp8-head packed" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
 
 
-@pytest.mark.parametrize("prefix", ["GLM5_FLASH", "GLMF"])
 @pytest.mark.parametrize("layout", ["RTX_GPUS=2\n", "RTX_GPUS=auto\n", "COORDINATOR_GPUS=1,0\n"])
-def test_glmf_packed_head_refuses_the_two_gpu_head_split(tmp_path, prefix, layout):
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  layout + f"{prefix}_FP8_HEAD=packed\n", physical_gpus=(0, 1))
-    assert result.returncode == 2, result.stderr
-    assert "GLM5_FLASH_FP8_HEAD=packed" in result.stderr and "head split" in result.stderr, result.stderr
-    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+@pytest.mark.parametrize("model", ["test/glmf", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"])
+def test_glmf_packed_head_split_validation_reaches_checkpoint_aware_daemon(tmp_path, layout, model):
+    # The launcher does not know the head format. Native K6 ignores conversion;
+    # the daemon separately refuses packed BF16 heads on a split.
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], model,
+                                  layout + "GLM5_FLASH_FP8_HEAD=packed\n", physical_gpus=(0, 1))
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
+    assert "--split-device" in launch and "--fp8-head packed" in launch, launch
+    plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
+    assert plans and all("--fp8-head packed" in plan for plan in plans), plans
 
 
 def test_glmf_packed_head_refuses_an_explicit_tensor_target_head(tmp_path):

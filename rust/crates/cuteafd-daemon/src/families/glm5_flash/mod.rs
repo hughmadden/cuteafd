@@ -863,7 +863,7 @@ mod draft_cli_tests {
         assert!(Parse::try_parse_from(["test", "--snapshot", "/checkpoint", "--native-lib", "/native",
             "--fp8-head", "maybe"]).is_err());
         let error = check_options(&parse(&["--fp8-head", "packed", "--split-device", "1"])).unwrap_err().to_string();
-        assert!(error.contains("--fp8-head packed") && error.contains("--split-device"), "{error}");
+        assert_eq!(error, "--fp8-head packed keeps one exact 12-bit head on one GPU; the two-GPU head split (--split-device) is not supported yet: use --fp8-head true or false");
         for format in ["true", "false"] {
             check_options(&parse(&["--fp8-head", format, "--split-device", "1"])).unwrap();
         }
