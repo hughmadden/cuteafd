@@ -1621,9 +1621,14 @@ def main() -> None:
                         "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development")}
             cacheable = program_cache is not None and object_selection is None and recipe is not None
             reused = program_cache.lookup(identity) if cacheable else None
+            records = globals().get("_program_records")
+            if reused is not None and records is not None and records.active and "ir_record" not in reused:
+                reused = None  # stored without an IR record: a records worker compiles it
             if reused is not None:
                 geometry, plan_scratch, program_abi, checked = (
                     reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
+                if records is not None and records.active:
+                    records.restore(output, label, reused["ir_record"])
             else:
                 def construct():
                     with exportable_compilation():
@@ -1648,8 +1653,11 @@ def main() -> None:
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
             if reused is None and cacheable:
-                program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], {
-                    "geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi})
+                metadata = {"geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi}
+                ir_record = records.record(output, label) if records is not None and records.active else None
+                if ir_record is not None:
+                    metadata["ir_record"] = ir_record
+                program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], metadata)
             for key, size in plan_scratch.items():
                 scratch[key] = max(scratch.get(key, 0), size)
             plans.append({"sm_count": sms, "label": label, "geometry": dict(geometry),

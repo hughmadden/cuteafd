@@ -58,6 +58,35 @@ def recorded_construction(function, *args, **kwargs):
     if PROGRAM_RECORDER is not None:
         return PROGRAM_RECORDER.construct(function, *args, **kwargs)
     return function(*args, **kwargs)
+
+
+class ProgramRecords:
+    """The exporter's view of this worker's IR records, for programs it reuses whole.
+
+    export_b12x_dsv4_aot.py stores a program's record with its cached object and
+    hands it back here on a hit, so the publication keeps one record per object.
+    """
+
+    def record(self, output, label):
+        if PROGRAM_RECORDER is None:
+            return None
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        record = PROGRAM_RECORDER.exports.get(path)
+        return json.loads(json.dumps(record)) if record is not None else None
+
+    def restore(self, output, label, record):
+        if PROGRAM_RECORDER is None:
+            return
+        path = (Path(output) / (label + ".o")).relative_to(PROGRAM_RECORDER.output).as_posix()
+        # The reads it recorded, hashed as they are now (the export cache matched them).
+        record = dict(record, source_reads_sha256={
+            name: sha((ROOT / name).read_bytes()) for name in record.get("source_reads_sha256", {})
+            if (ROOT / name).is_file()})
+        PROGRAM_RECORDER.exports[path] = record
+
+    @property
+    def active(self):
+        return PROGRAM_RECORDER is not None
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
@@ -729,6 +758,7 @@ def worker(payload):
         else:
             runpy.run_path(str(path), run_name="__main__", init_globals={
                 "_record_construction": recorded_construction,
+                "_program_records": ProgramRecords(),
                 "_selected_object_labels": payload.get("selected_objects")})
     if torch.cuda.get_device_properties(0).multi_processor_count != payload["sms"]:
         raise RuntimeError("exporter changed the synthetic SM count")

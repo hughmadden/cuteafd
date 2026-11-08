@@ -84,6 +84,18 @@ def export_jobs():
     return jobs
 
 
+def worker_command(payload, staging):
+    """compare-sm-exports.py --_worker, through the shared export cache when one is mounted.
+
+    WIP builds and republishes then reuse each other's programs (export-cache.py):
+    keys are what each program read and captured, not which tool asked for it.
+    """
+    worker = [sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--_worker", json.dumps(payload)]
+    if os.environ.get("CUTEAFD_EXPORT_CACHE", "off") in ("", "off"):
+        return worker
+    return [sys.executable, str(ROOT / "scripts/build/export-cache.py"), "run", "--build-dir", str(staging), "--", *worker]
+
+
 def verified_job_files(previous, name):
     metadata = json.loads((previous / "INPUTS.json").read_text())
     prefix = ".workers/" + name + "/"
@@ -174,8 +186,7 @@ def check_job_sm170(job, staging, previous, timeout, env, verify_all=False):
         # EXL3 exports multiple objects within one fork call: recompile its whole
         # touched job, but only compare and publish the requested changed records.
         with (output / "export.log").open("w") as log:
-            subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
-                            "--_worker", json.dumps(payload)], env=env, stdout=log,
+            subprocess.run(worker_command(payload, staging), env=env, stdout=log,
                            stderr=subprocess.STDOUT, check=True, timeout=timeout)
         secondary = json.loads((output / "program-records.json").read_text())
         for path in selected:
@@ -215,8 +226,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
                CUTEAFD_SPARKINFER_LOCK_FILE=str(ROOT / "third_party/sparkinfer.lock.json"))
     print(f"Placement export {name}: {extra}", flush=True)
     with (output / "export.log").open("w") as log:
-        subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"),
-                        "--_worker", json.dumps(payload)], env=env, stdout=log,
+        subprocess.run(worker_command(payload, staging), env=env, stdout=log,
                        stderr=subprocess.STDOUT, check=True, timeout=timeout)
     if skipped:
         verify_job_metadata(prior_directory, output, lock, name)
