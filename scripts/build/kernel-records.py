@@ -121,8 +121,10 @@ CUTEAFD_EXPORT_CONTEXT_SPACING_S HF_HUB_CACHE HF_HOME XDG_CACHE_HOME TRITON_DISA
 
 def export_environment():
     values = {name: os.environ.get(name) for name in sorted(EXPORT_ENVIRONMENT_NAMES)}
+    # The export cache's launcher variables name per-run paths (its read records,
+    # stats, build and output directories): control, never export semantics.
     values.update({name: value for name, value in sorted(os.environ.items())
-                   if name.startswith("CUTEAFD_")})
+                   if name.startswith("CUTEAFD_") and not name.startswith("CUTEAFD_EXPORT_CACHE_")})
     # These are forced by the offline worker, not inherited policy. Paths name
     # verified sources or disposable compiler storage rather than semantic inputs.
     values.update(CUTEAFD_BUILD_KIND=os.environ.get("CUTEAFD_BUILD_KIND", "development"),

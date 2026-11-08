@@ -213,6 +213,18 @@ def test_a_tool_cache_inside_the_build_tree_is_not_an_output(tree):
     assert run(tree, env={"TRITON_CACHE_DIR": str(triton)})[0] == "hit"
 
 
+def test_a_triton_cache_the_exporter_chooses_itself_is_not_an_output(tree):
+    # compare-sm-exports.py's worker points TRITON_CACHE_DIR into the build tree (#1531).
+    source, build = tree
+    (source / "python/tools/aot/export_fake.py").write_text(
+        (source / "python/tools/aot/export_fake.py").read_text()
+        + '\nos.environ["TRITON_CACHE_DIR"] = str(args.output_dir.parent / ".triton-cache-188")'
+          '\nos.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)'
+          '\nopen(os.environ["TRITON_CACHE_DIR"] + "/kernel.cubin", "w").write("x")\n')
+    assert run(tree)[0] == "miss"
+    assert run(tree)[0] == "hit"
+
+
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):
     event, detail = run(tree, mode="spawn")
     assert event == "uncacheable" and "spawn:" in detail, detail
@@ -278,3 +290,17 @@ def test_republish_workers_drop_path_dependent_line_info():
     records = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(records)
     assert records.export_environment()["TRITON_DISABLE_LINE_INFO"] == "1"
+
+
+def test_launcher_variables_stay_out_of_the_republish_identity(monkeypatch):
+    # Per-run paths in the stage-0 identity would make every republish job
+    # "job-global-inputs" and defeat --previous replay.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("kernel_records_launcher", ROOT / "scripts/build/kernel-records.py")
+    records = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(records)
+    before = records.export_environment()
+    for name in ("CUTEAFD_EXPORT_CACHE_READS", "CUTEAFD_EXPORT_CACHE_BUILD_DIR", "CUTEAFD_EXPORT_CACHE_OUTPUTS",
+                 "CUTEAFD_EXPORT_CACHE_STATS", "CUTEAFD_EXPORT_CACHE_SOURCE_ROOT", "CUTEAFD_EXPORT_CACHE_TRACE"):
+        monkeypatch.setenv(name, "/run/" + name)
+    assert records.export_environment() == before

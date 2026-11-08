@@ -146,6 +146,12 @@ class Roots:
     def _under(path: str, roots) -> bool:
         return any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
 
+    def tool_cache(self, resolved: str) -> bool:
+        """A tool-keyed cache, including one an exporter points Triton at after start (#1531)."""
+        triton = os.environ.get("TRITON_CACHE_DIR")
+        live = (os.path.realpath(triton),) if triton else ()
+        return self._under(resolved, self.scratch) or self._under(resolved, live)
+
     def aliases(self):
         """Other mount points of the source tree (the dev shell's /workspace/cuteafd)."""
         if not hasattr(self, "_aliases"):
@@ -164,7 +170,7 @@ class Roots:
             resolved = os.path.realpath(os.fsdecode(path))
         except (TypeError, ValueError):
             return None
-        if self._under(resolved, self.scratch):
+        if self.tool_cache(resolved):
             return None  # a tool-keyed cache, even one placed in the build tree
         for alias in self.aliases():
             if resolved == alias or resolved.startswith(alias + "/"):
@@ -189,7 +195,7 @@ class Roots:
         resolved = os.path.realpath(os.fsdecode(path))
         if "/__pycache__/" in resolved:
             return "scratch", None
-        if self._under(resolved, self.scratch):
+        if self.tool_cache(resolved):
             return "scratch", None
         if self._under(resolved, self.temporary):
             return "temp", resolved
