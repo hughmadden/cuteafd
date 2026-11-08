@@ -1080,13 +1080,8 @@ def check(rc):
     if rc: raise RuntimeError('CUDA/NVML status '+str(rc))
 check(nv.nvmlInit_v2())
 devices=[int(x) for x in os.environ['CARD_GPUS'].split(',')]
-# CDI filters numeric CUDA enumeration; UUIDs keep host identity and arm order.
-uuids=[]
-for physical in devices:
-    handle=c.c_void_p(); check(nv.nvmlDeviceGetHandleByIndex_v2(physical,c.byref(handle)))
-    uuid=c.create_string_buffer(96); check(nv.nvmlDeviceGetUUID(handle,uuid,len(uuid)))
-    uuids.append(uuid.value.decode('ascii'))
-os.environ['CUDA_VISIBLE_DEVICES']=','.join(uuids)
+# Both CUDA and NVML numeric indices are filtered by CDI inside this container.
+os.environ['CUDA_VISIBLE_DEVICES']=os.environ['CARD_GPU_UUIDS']
 for i in range(len(devices)):
     check(cuda.cudaSetDevice(i)); check(cuda.cudaFree(c.c_void_p()))
 while True:
@@ -1368,6 +1363,18 @@ def publish_observer_context(job):
     return True
 
 
+def observer_gpu_uuids(devices):
+    """Use the launcher's host-side identity resolver before CDI filtering."""
+    script = 'source "$1"\nrelease_resolve_coordinator_gpus "$2" "$3"\nprintf "%s\\n" "${RELEASE_COORDINATOR_GPU_UUIDS[@]}"'
+    resolved = run(['bash', '-c', script, 'observer-gpus',
+                    str(REPO / 'scripts/lib/release-common.sh'),
+                    ','.join(map(str, devices)), str(len(devices))], timeout=30)
+    uuids = resolved.stdout.splitlines()
+    if len(uuids) != len(devices) or any(not re.fullmatch(r'GPU-[A-Za-z0-9-]+', uuid) for uuid in uuids):
+        raise ValueError('launcher returned invalid observer GPU UUIDs')
+    return ','.join(uuids)
+
+
 def observe(job):
     dest = Path(job['state'])
     stop = Path(os.environ['CUTEAFD_SMOKE_STOP'])
@@ -1391,7 +1398,7 @@ def observe(job):
             gpu_list = ','.join(map(str, e['gpus']))
             image = e['set'].get('COORDINATOR_DOCKER_DEV', 'cuteafd-coordinator-dev')
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
-            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '-e', 'CUDA_VISIBLE_DEVICES=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
+            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '-e', 'CARD_GPU_UUIDS=' + observer_gpu_uuids(e['gpus']), '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
             lifetime = min(float(e['observer']['timeout_s']), 7200)
             for rank, host in enumerate(e.get('sparks', [])):

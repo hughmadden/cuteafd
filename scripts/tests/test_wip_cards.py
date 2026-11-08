@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 
 @pytest.fixture(autouse=True)
@@ -29,6 +30,7 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
+    monkeypatch.setattr(cards, 'observer_gpu_uuids', lambda devices: ','.join(f'GPU-host-{device}' for device in devices))
     monkeypatch.setattr(cards, 'preflight_deployment', lambda job, arm: {
         'spark_roles': [dict(rank=i, experts=True, audio_encoder=bool((job.get('needs') or {}).get('audio')))
                         for i in range(len(job['entry'].get('sparks', [])))],
@@ -3802,15 +3804,7 @@ def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypat
     uuids = ','.join(f'GPU-host-{device}' for device in devices)
     monkeypatch.setenv('CARD_GPUS', ','.join(map(str, devices)))
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', ','.join(map(str, devices)))
-
-    def handle_by_index(index, handle):
-        handle._obj.value = index + 1
-        events.append(('nvml', index))
-        return 0
-
-    def uuid(handle, buffer, size):
-        buffer.value = f'GPU-host-{handle.value - 1}'.encode()
-        return 0
+    monkeypatch.setenv('CARD_GPU_UUIDS', uuids)
 
     def cuda_device(index):
         # Numeric host ordinal 1 does not exist after CDI filters to one card.
@@ -3828,8 +3822,8 @@ def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypat
         rows[0].pid, rows[0].usedGpuMemory = os.getpid(), 20
         return 0
 
-    nv = SimpleNamespace(nvmlInit_v2=lambda: 0, nvmlDeviceGetHandleByIndex_v2=handle_by_index,
-        nvmlDeviceGetUUID=uuid, nvmlDeviceGetHandleByPciBusId_v2=lambda *args: 0,
+    # No numeric-index NVML lookup exists in the filtered-container fixture.
+    nv = SimpleNamespace(nvmlInit_v2=lambda: 0, nvmlDeviceGetHandleByPciBusId_v2=lambda *args: 0,
         nvmlDeviceGetComputeRunningProcesses_v3=processes)
     cuda = SimpleNamespace(cudaSetDevice=cuda_device, cudaFree=lambda *args: 0,
         cudaMemGetInfo=memory, cudaDeviceGetPCIBusId=lambda *args: 0)
@@ -3840,7 +3834,21 @@ def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypat
     sample = json.loads(capsys.readouterr().out)
     assert [row['gpu'] for row in sample['devices']] == devices
     assert all(row['sampler_bytes'] == 20 for row in sample['devices'])
-    assert events[:len(devices)] == [('nvml', device) for device in devices]
+    assert events[:len(devices)] == [('cuda', index) for index in range(len(devices))]
+
+
+def test_observer_uses_same_host_resolver_as_launcher(monkeypatch):
+    seen = []
+    def run(cmd, **kwargs):
+        seen.append(cmd)
+        assert cmd[-2:] == ['1,0', '2']
+        assert 'release_resolve_coordinator_gpus' in cmd[2]
+        assert cmd[4] == str(ROOT / 'scripts/lib/release-common.sh')
+        assert kwargs['timeout'] == 30
+        return SimpleNamespace(stdout='GPU-second\nGPU-first\n')
+    monkeypatch.setattr(cards, 'run', run)
+    assert OBSERVER_GPU_UUIDS([1, 0]) == 'GPU-second,GPU-first'
+    assert len(seen) == 1
 
 
 def test_observer_context_handoff_is_measured_atomic_and_logical(entry, tmp_path):
