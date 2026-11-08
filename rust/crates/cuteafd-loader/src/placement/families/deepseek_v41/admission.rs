@@ -409,7 +409,7 @@ fn bounded_curve(per_page: u64, tails: u64, cap: u64, maximum: u64) -> Result<By
     };
     let knee = cap.saturating_sub(tails);
     if knee == 0 {
-        return Ok(ByteCurve(vec![BytePiece {
+        return Ok(ByteCurve(vec![BytePiece { granularity: 1,
             first: 1,
             last: maximum,
             bytes_at_first: linear(1)?,
@@ -420,8 +420,8 @@ fn bounded_curve(per_page: u64, tails: u64, cap: u64, maximum: u64) -> Result<By
         return Ok(ByteCurve::linear(linear(1)?, per_page, maximum));
     }
     Ok(ByteCurve(vec![
-        BytePiece { first: 1, last: knee, bytes_at_first: linear(1)?, bytes_per_page: per_page },
-        BytePiece {
+        BytePiece { granularity: 1, first: 1, last: knee, bytes_at_first: linear(1)?, bytes_per_page: per_page },
+        BytePiece { granularity: 1,
             first: knee + 1,
             last: maximum,
             bytes_at_first: cap
@@ -954,7 +954,9 @@ pub fn expert_usage_geometry(config: &serde_json::Value) -> Result<cuteafd_core:
 }
 
 impl<'a> ProductionInput<'a> {
-    pub fn prepare(self) -> Result<PreparedV41<'a>, Refusal> {
+    pub fn prepare(mut self) -> Result<PreparedV41<'a>, Refusal> {
+        self.owners.extend(super::owners::packed_head_load_owners(&self.weight_arenas)
+            .map_err(|error| invalid(&error.to_string()))?);
         let routed = self.experts.len();
         if !(1..=2).contains(&self.gpus)
             || routed != 40

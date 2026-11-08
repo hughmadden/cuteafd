@@ -183,13 +183,8 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { host: super::admission::HostInputs {
-            memory: crate::plan::layout::recipe_host_memory(opts)?, cache_bytes: opts.host_cache_bytes,
-            headroom: 8 << 30,
-            retained_sync_h2d_bytes: contract.retained_sync_h2d_bytes()?,
-            attention_mount_load: contract.attention_mount_load(coordinators)?,
-            push: Some(super::admission::push_host_envelope(&contract, &model.cfg, coordinators)?),
-        }, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
+    let inputs = RuntimeInputs { host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
+            crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv,
         inventory,
         rows: usize::try_from(shape.span_rows)?,

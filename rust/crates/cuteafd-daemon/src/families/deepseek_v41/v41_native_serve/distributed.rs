@@ -114,8 +114,12 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     })?;
     memory_checkpoint("embedding weights")?;
     let vocab = [
-        devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 0..64640, 1 << 30, 16 << 20, Some(target_arenas.get(0)?)))?,
-        devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20, Some(target_arenas.get(1)?)))?,
+        devices[0].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 0..64640,
+            crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_bytes(&catalog, 0..64640)?,
+            16 << 20, Some(target_arenas.get(0)?)))?,
+        devices[1].own(|| crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_in(&lib, &catalog, 64640..129280,
+            crate::families::deepseek_v41::v41_tensors::VocabularyShard::load_bytes(&catalog, 64640..129280)?,
+            16 << 20, Some(target_arenas.get(1)?)))?,
     ];
     memory_checkpoint("vocabulary weights")?;
     let hw = devices[1].own(|| {
@@ -422,6 +426,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         None => None,
     };
     if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    for (rank, shard) in vocab.iter().enumerate() { devices[rank].run(|| shard.finish_push())?; }
     // Either the group committed or its records (vision included) filled through the mount.
     vision_push.commit()?;
     let pushed = if let Some(prepared) = prepared_draft {

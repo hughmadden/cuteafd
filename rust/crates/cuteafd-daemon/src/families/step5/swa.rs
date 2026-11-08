@@ -497,7 +497,7 @@ impl<'a> SwaLayer<'a> {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
             (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
-                &native.scratch_layout(rows)?, crate::shared::memory::Tag::workspace("step5/native-projection"))?)),
+                &native.scratch_layout(rows)?, if layer_id >= cfg.layers { crate::shared::memory::Tag::drafter_workspace("step5/mtp-attention-projection") } else { crate::shared::memory::Tag::workspace("step5/attention-projection") })?)),
         };
         Ok(owner)
     }

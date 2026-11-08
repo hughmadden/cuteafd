@@ -234,10 +234,15 @@ pub fn loaded_code_allowance(program_family: &str, experts: &str, split: bool, r
             return CodeAllowance { bytes, basis: Basis::Calibrated, future_library_bytes: 0 };
         }
     }
-    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "muse") {
-        return CodeAllowance { bytes: programs.map_or_else(
-            || ProgramSet::from_names(&[program_family], std::iter::empty()).module_bytes(),
-            ProgramSet::module_bytes),
+    // Migrated families keep BLAS and driver storage in disjoint typed owners.
+    if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "muse" | "step5") {
+        return CodeAllowance { bytes: if loaded_code_family(program_family) == "step5" {
+            programs.map_or(32 * MIB, ProgramSet::module_bytes)
+        } else {
+            programs.map_or_else(
+                || ProgramSet::from_names(&[program_family], std::iter::empty()).module_bytes(),
+                ProgramSet::module_bytes)
+        },
             basis: Basis::Estimated, future_library_bytes: 0 };
     }
     CodeAllowance { bytes: arch.cublas_bytes
@@ -1044,6 +1049,17 @@ mod tests {
         assert_eq!(allowance.pending(arch.context_bytes, arch.context_bytes), allowance.bytes);
         assert_eq!(allowance.pending(arch.context_bytes + 100, arch.context_bytes), allowance.bytes - 100);
         assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
+    }
+
+    #[test]
+    fn step5_code_allowance_does_not_duplicate_conditional_vocabulary_handles() {
+        let arch = &ARCH_CONTEXTS[1];
+        let programs = ProgramSet::from_names(&["step5", "step52"], ["step5_norm", "step52_norm"]);
+        for family in ["step5", "step52"] {
+            let allowance = loaded_code_allowance(family, "exl3", true, 0, arch, Some(&programs));
+            assert_eq!(allowance.bytes, programs.module_bytes());
+            assert_eq!(allowance.pending(u64::MAX, arch.context_bytes), 0);
+        }
     }
 
     #[test]

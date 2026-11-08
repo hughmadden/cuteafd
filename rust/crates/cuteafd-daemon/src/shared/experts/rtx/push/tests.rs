@@ -8,6 +8,15 @@ use cuteafd_loader::{plan::testing::{qwen4_config, qwen4_exl3, write_snapshot},
 use std::{fs::File, net::TcpStream, os::unix::fs::FileExt, time::Duration};
 
 #[test]
+fn packed_head_push_delivers_transient_source_before_arena_pack() -> Result<()> {
+    crate::families::deepseek_v41::v41_tensors::packed_head_push_delivers_transient_source_before_arena_pack(
+        |device, root, sockets, records| {
+            receive_pushed(device, None, root, sockets, records, None, 0, 0)?;
+            Ok(())
+        })
+}
+
+#[test]
 fn join_stage_errors_name_rank_device_stage_and_requested_bytes() {
     for (stage, bytes) in [("expert arena", 8 << 30), ("host-ring registration", 128 << 20)] {
         let error = join_stage::<()>(7, 6, 0, stage, bytes,

@@ -471,8 +471,8 @@ fn worker(
     let push_policy = PushPolicy::for_snapshot(&args.snapshot)?;
     push_policy.plan(|| {
         use crate::families::deepseek_v41::v41_tensors::{fp8_head, Fp8Head};
-        ensure!(!matches!(fp8_head(), Fp8Head::Packed | Fp8Head::Draft),
-            "V4.1 required push supports All or Off vocabulary mode, not Packed or Draft");
+        ensure!(fp8_head() != Fp8Head::Draft,
+            "V4.1 required push does not support Draft vocabulary mode");
         Ok(())
     })?;
     let embedding = admission::embedding_placement(args.embedding_placement, device_total);
@@ -704,6 +704,7 @@ fn worker(
     let mut pushed = coordinator.map(|planned| planned.receive(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         &catalog, &selected, resident_bytes)).transpose()?;
+    vocabulary.finish_push()?;
     // Owners serve only after the whole group (vision weights included) committed.
     vision_push.commit()?;
     drop(records);

@@ -123,7 +123,7 @@ pub(super) struct NativeScratch<'a> {
 impl<'a> NativeScratch<'a> {
     pub(super) fn allocate(device: Device<'a>, layout: &ProjectionScratchLayout, tag: crate::shared::memory::Tag) -> Result<Self> {
         let owned = ProjectionLayout { extents: layout.extents.clone(), rows: layout.rows };
-        Ok(Self { scratch: owned.allocate(device, tag)?, layout: layout.clone(), tag })
+        Ok(Self { scratch: owned.allocate_packed(device, tag)?, layout: layout.clone(), tag })
     }
     /// A private copy for another concurrently running lane.
     pub(super) fn sibling(&self, device: Device<'a>) -> Result<std::rc::Rc<Self>> {

@@ -159,12 +159,12 @@ impl<'a> NativeOwners<'a> {
                 let device = devices[rank];
                 let (_, rank_layout) = plan.layer(rank, 0)?;
                 let native_layout = native_scratch_layout(rank_layout, rows, count)?;
-                let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
+                let native_bytes = native_layout.as_ref().map(|l| l.packed_bytes()).transpose()?.unwrap_or(0);
                 // The arena holds the sequential attention/FFN regions and, after they
                 // retire, the MTP stage scratch. One backing keeps one kind and charge.
                 let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes,
                     Tag::workspace("step5/sequential-scratch"))?;
-                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/native-projection"))
+                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout, crate::shared::memory::Tag::workspace("step5/target-layer-projection"))
                     .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load_in(device, programs, &contract, super::weights::ROPE_PREFIX,
                     available[rank], &[], Some(&weight_arenas[rank]))?);
@@ -224,7 +224,7 @@ fn native_scratch_layout(layout: &RankWeightLayout, rows: usize, count: usize)
 }
 
 fn native_scratch_bytes(layout: &RankWeightLayout, rows: usize, count: usize) -> Result<u64> {
-    Ok(native_scratch_layout(layout, rows, count)?.map(|l| l.bytes()).transpose()?.unwrap_or(0) as u64)
+    Ok(native_scratch_layout(layout, rows, count)?.map(|l| l.packed_bytes()).transpose()?.unwrap_or(0) as u64)
 }
 
 /// The rank's FFN region starts after its largest loaded attention region.
@@ -700,7 +700,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 ensure!(ownership.ranks() == 2, "Step-5 TP2 onboarding needs two ranks");
                 let spec = ownership.execution().spec();
                 let (unit, lanes) = (usize::try_from(spec.rows)?, usize::try_from(spec.lanes)?);
-                use cuteafd_loader::plan::families::step5::admission::{tp2_exchange_bytes, Tp2Exchange};
+                use cuteafd_loader::plan::families::step5::admission::{tp2_exchange_requests, Tp2Exchange};
                 let kind = match &weights {
                     crate::shared::experts::rtx::Tp2Weights::Exl3(_) => Tp2Exchange::Exl3,
                     crate::shared::experts::rtx::Tp2Weights::Fp8(_) => Tp2Exchange::Fp8,
@@ -731,12 +731,21 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                         plane(1, lanes * scratch, Tag::workspace("step5/tp2-scratch"))?],
                     broadcast_logged: (0..count).map(|_| Cell::new(false)).collect(),
                 };
-                let charged = tp2_exchange_bytes(unit, lanes, kind)?;
+                let mut expected = tp2_exchange_requests(unit, lanes, kind)?;
+                if std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|value| value == "1") {
+                    expected.push(cuteafd_loader::serving_capacity::PeerStorageLayout::new(
+                        2 * lanes, scratch, true)?.progress_bytes as u64);
+                }
+                expected.sort_unstable();
+                let retained = onboard.pair.routes.allocation_buffers();
                 for rank in 0..2 {
                     let planes = [&onboard.partial[rank], &onboard.incoming[rank], &onboard.owner_incoming[rank],
                         &onboard.scratch[rank]];
-                    let bytes = planes.iter().map(|a| a.buffer.bytes as u64).sum::<u64>();
-                    ensure!(bytes <= charged, "Step-5 TP2 exchange planes exceed their admission ({bytes} > {charged})");
+                    let mut requests = planes.iter().map(|a| a.buffer.bytes as u64)
+                        .chain(retained.iter().filter(|(owner, _, _)| *owner == rank)
+                            .map(|(_, _, buffer)| buffer.bytes as u64)).collect::<Vec<_>>();
+                    requests.sort_unstable();
+                    ensure!(requests == expected, "Step-5 TP2 exchange requests differ from admission: {requests:?} != {expected:?}");
                 }
                 Some(onboard)
             }
@@ -1709,7 +1718,7 @@ mod tests {
                     &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
                 let head = rank == usize::from(ownership.execution().spec().head_gpu);
                 let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
-                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.bytes())
+                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.packed_bytes())
                     .transpose()?.unwrap_or(0) as u64 } else { 0 };
                 assert_eq!(admitted.immutable, head_scratch);
                 assert_eq!(admitted.weight_arenas[0].0, served);

@@ -96,7 +96,7 @@ impl HeadPlan {
         planes: &[usize; 4], kernel_rows: usize) -> Result<u64> {
         let native_bytes = native.map(|core| -> Result<u64> {
             (core.bytes as u64).checked_add(
-                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.bytes()? as u64)
+                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.packed_bytes()? as u64)
                 .context("Step-5 native head overflow")
         }).transpose()?.unwrap_or(0);
         weights.iter().map(|w| w.allocation_bytes)
@@ -117,7 +117,7 @@ impl HeadPlan {
     pub(super) fn private_scratch_bytes(&self) -> Result<u64> {
         self.native.as_ref().map(|name| -> Result<u64> {
             Ok(cuteafd_loader::formats::head::native_private_scratch(
-                self.layout.core[name].shape, self.kernel_rows)?.bytes()? as u64)
+                self.layout.core[name].shape, self.kernel_rows)?.packed_bytes()? as u64)
         }).transpose().map(|bytes| bytes.unwrap_or(0))
     }
 }
@@ -135,7 +135,7 @@ struct HeadWeights<'a> {
 pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
     stream: std::rc::Rc<crate::shared::memory::StandaloneStream<'a>>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     planes: Vec<Plane<'a>>,
     rows: usize,
     immutable: std::rc::Rc<HeadWeights<'a>>,
@@ -181,7 +181,7 @@ impl<'a> TargetHeadOwner<'a> {
         })
     }
 
-    /// Every lane has its own BLAS handle, stream, norm/logit planes and scratch.
+    /// Every lane has its own stream, planes and, only for BF16, BLAS handle.
     pub(super) fn new_lane(&self) -> Result<Self> {
         Self::workspace(self.stream.device, self.rows, self.immutable.clone(), None)
     }
@@ -191,9 +191,17 @@ impl<'a> TargetHeadOwner<'a> {
         device.run(|| {
             let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena,
                 crate::shared::memory::Tag::workspace("step5/target-scratch"))?;
-            // SAFETY: private workspace survives the private handle on this device.
-            let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
-                H as u32, rows as u32, V as u32, crate::shared::target_head::TargetHead::configured().native_mode())? };
+            let label = if immutable.predictor { "mtp" } else { "target" };
+            crate::shared::inventory::startup_probe(device.library, &[device.id],
+                &format!("step5/{label}-head-before-cublas-handle"), Default::default())?;
+            let head = if immutable.native.is_none() {
+                // SAFETY: private workspace survives the private handle on this device.
+                Some(unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
+                    H as u32, rows as u32, V as u32,
+                    crate::shared::target_head::TargetHead::configured().native_mode())? })
+            } else { None };
+            crate::shared::inventory::startup_probe(device.library, &[device.id],
+                &format!("step5/{label}-head-after-cublas-handle"), Default::default())?;
             let stream = scratch::standalone(device, arena);
             Ok(Self { stream, head, planes, rows, immutable })
         })
@@ -247,10 +255,10 @@ impl<'a> TargetHeadOwner<'a> {
                         linear.launch(count, buffer(input, count * H * 2), buffer(output.cast(), count * V * 4),
                             &scratch.scratch, stream.raw)?;
                     } else if self.immutable.predictor {
-                        crate::shared::draft::launch_bf16_head(&self.head, input.cast(),
+                        crate::shared::draft::launch_bf16_head(self.head.as_ref().context("Step-5 BF16 predictor head missing")?, input.cast(),
                             self.immutable.weights[1].buffer.ptr.cast(), output, count, stream.raw)?;
                     } else {
-                        target_head::launch(TargetHead::configured(), &self.head, input,
+                        target_head::launch(TargetHead::configured(), self.head.as_ref().context("Step-5 BF16 target head missing")?, input,
                             self.immutable.weights[1].buffer.ptr, output, count, stream.raw)?;
                     }
                 }
@@ -296,6 +304,8 @@ pub(super) mod tests {
         let plan = HeadPlan::prepare(&programs, &checkpoint, 1)?;
         let owner = TargetHeadOwner::load(device, &programs, &checkpoint, plan, u64::MAX, &[])?;
         let lane = owner.new_lane()?;
+        assert_eq!(owner.head.is_some(), owner.immutable.native.is_none());
+        assert_eq!(lane.head.is_some(), lane.immutable.native.is_none());
         ensure!(std::rc::Rc::ptr_eq(&owner.immutable, &lane.immutable)
             && owner.stream.get()?.raw != lane.stream.get()?.raw
             && owner.planes.iter().zip(&lane.planes).all(|(a, b)|
@@ -323,8 +333,8 @@ pub(super) mod tests {
             codebook: Exl3Codebook::Mcg };
         let norm = WeightOperand { name: "model.norm.weight".into(), sources: vec![], dtype: DType::F32,
             shape: vec![H], slice: WeightSlice::Replicated, allocation_bytes: (H * 4) as u64 };
-        for (unit, logits, private_scratch) in [(64, 64, 165511240), (256, 64, 400128072),
-            (256, 256, 400128072)] {
+        for (unit, logits, private_scratch) in [(64, 64, 165511432), (256, 64, 400128264),
+            (256, 256, 400128264)] {
             let planes = HeadPlan::plane_bytes(logits)?;
             let weights = vec![norm.clone()];
             let bytes = HeadPlan::owner_bytes(&weights, Some(&native), &planes, unit)?;
@@ -334,7 +344,7 @@ pub(super) mod tests {
                 epsilon: 1e-5, bytes, predictor: false, kernel_rows: unit };
             let owner_layout = cuteafd_loader::formats::head::native_private_scratch(native.shape, unit)?;
             assert_eq!(owner_layout.rows, unit);
-            assert_eq!(owner_layout.bytes()? as u64, private_scratch);
+            assert_eq!(owner_layout.packed_bytes()? as u64, private_scratch);
             assert_eq!(plan.immutable_bytes(), (H * 4 + core_bytes) as u64 + private_scratch);
             assert_eq!(plan.workspace_bytes(), (logits * (H * 4 + V * 4) + (4 << 20)) as u64);
             assert_eq!(plan.bytes(), plan.immutable_bytes() + plan.workspace_bytes());

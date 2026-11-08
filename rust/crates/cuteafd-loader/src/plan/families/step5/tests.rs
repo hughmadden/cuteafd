@@ -176,7 +176,8 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                 let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
                 let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
                     .expect("native charge").bytes;
-                assert_eq!(item("Step-5 private native scratch"), target.immutable + if rank == 0 { scratch } else { 0 });
+                assert_eq!(item("Step-5 private native scratch"), target.immutable);
+                assert_eq!(item("Step-5 MTP native scratch"), if rank == 0 { scratch } else { 0 });
                 assert!(!admitted.fixed.iter().any(|item| item.group == "Step-5 GPU embedding"
                     || item.group == "Step-5 native target and head"));
                 let workspace = if rank == 0 {
@@ -1831,13 +1832,24 @@ fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
     assert_eq!(owners.routed_source(3).unwrap(), Some(0));
     assert_eq!(owners.routed_source(51).unwrap(), Some(1));
     assert_eq!(owners.routed_source(4).unwrap(), None);
-    // One unit, three lanes: three F32 partial planes plus routes and wire each.
-    let per_lane = 3 * 2752 * 4096 * 4 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * (4096 + 128);
-    use super::admission::{tp2_exchange_bytes, Tp2Exchange};
-    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Exl3).unwrap(), 3 * per_lane as u64);
-    // FP8: BF16 partials and BF16 input rows.
-    let fp8 = 3 * 2752 * 4096 * 2 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * 4096 * 2;
-    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Fp8).unwrap(), 3 * fp8 as u64);
+    use super::admission::{tp2_exchange_bytes, tp2_exchange_requests, Tp2Exchange};
+    for (exchange, partial_bytes, input_bytes, total) in [
+        (Tp2Exchange::Exl3, 4, 4096 + 128, 512_004_608),
+        (Tp2Exchange::Fp8, 2, 4096 * 2, 407_384_576),
+    ] {
+        let (rows, lanes) = (2752usize, 3);
+        let routes = 2 * (rows * 8 * 4).next_multiple_of(16);
+        let scratch = routes + rows * input_bytes;
+        // Three lane-wide partials, producer scratch, two retained peer slots
+        // per lane, and separate 256-byte control and abort requests.
+        let mut requests = vec![(lanes * rows * 4096 * partial_bytes) as u64; 3];
+        requests.push((lanes * scratch) as u64);
+        requests.extend(vec![scratch as u64; 2 * lanes]);
+        requests.extend([256, 256]);
+        assert_eq!(tp2_exchange_requests(rows, lanes, exchange).unwrap(), requests);
+        assert_eq!(requests.iter().sum::<u64>(), total);
+        assert_eq!(tp2_exchange_bytes(rows, lanes, exchange).unwrap(), total);
+    }
     assert!(tp2_exchange_bytes(0, 1, Tp2Exchange::Exl3).is_err() && tp2_exchange_bytes(64, 5, Tp2Exchange::Exl3).is_err());
 }
 
@@ -2090,6 +2102,7 @@ fn hqa_push_envelope_covers_native_headers_and_preserves_compact_parent() -> any
 
 #[test]
 fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Result<()> {
+    use cuteafd_core::memory_layout::Category;
     use crate::placement::{inventory, Baseline, GpuBudget, Inventory};
     use super::admission::{self, MarkRule, RuntimeInputs};
     use crate::plan::checkpoint::{AttentionMode, CheckpointView};
@@ -2124,10 +2137,26 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 assert_eq!(target.resident_weights.0, resident);
                 let head = rank == usize::from(admitted.ownership.execution().spec().head_gpu);
                 let predictor = if head { native::mtp_native_scratch_from_contract(&checkpoint, &contract, depth, 64)? } else { 0 };
-                let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
-                    && owner.group == "Step-5 private native scratch").expect("named scratch owner");
-                assert_eq!(owner.resident_weights.0, 0);
-                assert_eq!(owner.bytes, target.immutable + predictor);
+                for (group, category, expected) in [
+                    ("Step-5 private native scratch", Category::Workspace, target.immutable),
+                    ("Step-5 MTP native scratch", Category::Drafter, predictor),
+                ] {
+                    let owner = admitted.fixed.iter().find(|owner| owner.gpu == rank as u8
+                        && owner.group == group).expect("named scratch owner");
+                    assert_eq!(owner.resident_weights.0, 0);
+                    assert_eq!(owner.category, category);
+                    assert_eq!(owner.bytes, expected);
+                }
+                let facts = &admitted.solved.facts;
+                let stream_owners = facts.allowances.iter().filter(|owner|
+                    owner.source.starts_with("step5/driver-stream-slabs/")
+                        && owner.location == crate::placement::planner::Location::coordinator(rank as u8))
+                    .collect::<Vec<_>>();
+                assert_eq!(stream_owners.len(), 1);
+                assert_eq!(admission::startup_peak_live_streams(), 7);
+                assert_eq!(stream_owners[0].bytes, 4 << 20);
+                assert_eq!(stream_owners[0].lifetime, crate::placement::planner::Lifetime::RESIDENT);
+                assert!(!stream_owners[0].assumed);
                 let mut arenas = target.weight_arenas.clone();
                 if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, crate::placement::ResidentWeights(mtp.resident_bytes), cuteafd_core::memory_layout::MemoryKind::DrafterWeights)); }
                 for (arena, logical, kind) in arenas {

@@ -65,9 +65,16 @@ struct Mapping {
     rows: Vec<usize>,
     bytes: ByteCurve,
 }
+struct Rounded {
+    activation: Activation,
+    rows: Vec<usize>,
+    opaque: bool,
+    bytes: ByteCurve,
+}
 pub(super) struct Compiled {
     starts: Vec<u64>,
     mappings: Vec<Mapping>,
+    rounded: Vec<Rounded>,
     pool_page_multiple: u64,
     phase_order: PhaseOrder,
     groups: Vec<Group>,
@@ -88,6 +95,7 @@ impl Compiled {
         let rows = memory_rows + contract.gpus;
         let mut groups = BTreeMap::<Activation, Vec<Vec<Cost>>>::new();
         let mut mappings = Vec::new();
+        let mut rounded = Vec::new();
         for component in &contract.components {
             let (charged_rows, opaque) = if let ComponentKind::ResidentWeight(owner) = &component.kind {
                 let Device::Coordinator(gpu) = owner.location.device else { continue };
@@ -108,17 +116,23 @@ impl Compiled {
                 _ => None,
             };
             if let Some(model) = driver.filter(|model| component.bytes.0.iter()
-                .any(|piece| piece.bytes_per_page % model.quantum() != 0)) {
+                .any(|piece| piece.bytes_per_page % model.quantum() != 0 || piece.granularity != 1)) {
                 mappings.push(Mapping { model, activation: component.activation.clone(), rows: charged_rows,
                     bytes: component.bytes.clone() });
                 continue;
+            }
+            if component.bytes.0.iter().any(|piece| piece.granularity != 1) {
+                rounded.push(Rounded { activation: component.activation.clone(), rows: charged_rows.clone(),
+                    opaque, bytes: component.bytes.clone() });
             }
             let costs = groups
                 .entry(component.activation.clone())
                 .or_insert_with(|| vec![vec![Cost::default(); rows]; starts.len() - 1]);
             for (index, &first) in starts[..starts.len() - 1].iter().enumerate() {
                 let piece = component.bytes.piece(first)?;
-                let bytes = component.bytes.at(first)?;
+                // Raw affine costs are a lower bound; each backing's exact
+                // round-up is applied separately when pricing a complete choice.
+                let bytes = piece.raw_at(first)?;
                 let (bytes, slope) = if let Some(model) = driver {
                     (model.bytes(bytes), piece.bytes_per_page / model.quantum() * model.bytes_per_quantum())
                 } else { (bytes, piece.bytes_per_page) };
@@ -135,6 +149,7 @@ impl Compiled {
         Ok(Self {
             starts,
             mappings,
+            rounded,
             pool_page_multiple: contract.pool_page_multiple,
             phase_order: contract.phase_order,
             rows,
@@ -185,44 +200,47 @@ impl Compiled {
     fn piece(&self, pages: u64) -> usize {
         self.starts.partition_point(|&start| start <= pages) - 1
     }
+    fn exact_costs(&self, selected: &[usize], pages: u64) -> Result<Vec<Cost>, Refusal> {
+        let index = self.piece(pages);
+        let mut costs = self.costs(selected, index)?.into_iter()
+            .map(|cost| cost.at(pages - self.starts[index])).collect::<Result<Vec<_>, _>>()?;
+        for rounded in self.rounded.iter().filter(|owner| owner.activation.active(selected)) {
+            let piece = rounded.bytes.piece(pages)?;
+            let tail = piece.at(pages)? - piece.raw_at(pages)?;
+            for &row in &rounded.rows {
+                costs[row].add(if rounded.opaque { Cost { opaque: tail, ..Cost::default() } }
+                    else { Cost { owned: tail, ..Cost::default() } })?;
+            }
+        }
+        for mapping in self.mappings.iter().filter(|mapping| mapping.activation.active(selected)) {
+            let bytes = mapping.model.bytes(mapping.bytes.at(pages)?);
+            for &row in &mapping.rows {
+                costs[row].add(Cost { opaque: bytes, ..Cost::default() })?;
+            }
+        }
+        Ok(costs)
+    }
     pub(super) fn phases(
         &self,
         budgets: &[Budget],
         selected: &[usize],
         pages: u64,
     ) -> Result<Vec<PhaseBudget>, Refusal> {
-        let piece = self.piece(pages);
-        let mut mapping_bytes = vec![0u64; self.memory_rows];
-        for mapping in self.mappings.iter().filter(|mapping| mapping.activation.active(selected)) {
-            let bytes = mapping.model.bytes(mapping.bytes.at(pages)?);
-            for &row in &mapping.rows {
-                mapping_bytes[row] = mapping_bytes[row].checked_add(bytes)
-                    .ok_or(Refusal::Overflow("driver page tables"))?;
-            }
-        }
-        self.costs(selected, piece)?
-            .into_iter()
-            .take(self.memory_rows)
-            .enumerate()
+        self.exact_costs(selected, pages)?.into_iter().take(self.memory_rows).enumerate()
             .map(|(row, cost)| {
-                let cost = cost.at(pages - self.starts[piece])?;
                 let budget = &budgets[row / self.phase_order.phases().len()];
                 Ok(PhaseBudget {
                     budget: budget.id.clone(),
                     phase: self.phase_order.phases()[row % self.phase_order.phases().len()],
                     owned: cost.owned,
-                    opaque: cost.opaque.checked_add(mapping_bytes[row])
-                        .ok_or(Refusal::Overflow("driver page table phase"))?,
+                    opaque: cost.opaque,
                     available: budget.available()?,
                 })
-            })
-            .collect()
+            }).collect()
     }
     fn weights(&self, selected: &[usize], pages: u64) -> Result<Vec<ResidentWeights>, Refusal> {
-        let piece = self.piece(pages);
-        self.costs(selected, piece)?.into_iter().skip(self.memory_rows)
-            .map(|cost| Ok(ResidentWeights(cost.at(pages - self.starts[piece])?.required()?)))
-            .collect()
+        self.exact_costs(selected, pages)?.into_iter().skip(self.memory_rows)
+            .map(|cost| Ok(ResidentWeights(cost.required()?))).collect()
     }
     pub(super) fn limit(
         &self,
@@ -239,6 +257,7 @@ impl Compiled {
             if first > last {
                 continue;
             }
+            let mut refine = !self.mappings.is_empty();
             for (row, cost) in self.costs(selected, piece)?.into_iter().enumerate() {
                 let cost = cost.at(first - self.starts[piece])?;
                 let available = self.available(row, budgets)?;
@@ -251,14 +270,28 @@ impl Compiled {
                 if slope != 0 {
                     last = last.min(first.saturating_add((available - required) / slope));
                 }
+                let mut rounded = self.rounded.iter()
+                    .filter(|owner| owner.activation.active(selected) && owner.rows.contains(&row));
+                if let Some(owner) = rounded.next() {
+                    let curve = owner.bytes.piece(first)?;
+                    if rounded.next().is_none() && slope == curve.bytes_per_page {
+                        // A single rounded request plus fixed owners has an
+                        // exact O(1) inverse, independent of the page domain.
+                        let fixed = required - curve.raw_at(first)?;
+                        last = curve.last_affordable(available - fixed)?.map_or(0, |n| last.min(n));
+                    } else {
+                        refine = true;
+                    }
+                }
             }
             last = last / self.pool_page_multiple * self.pool_page_multiple;
-            if first <= last && !self.mappings.is_empty() {
+            if first <= last && refine {
                 // Exact per-backing rounding is a monotone staircase, not a
                 // page-rounded affine slope. Refine only the analytical bound.
                 let fits = |pages| -> Result<bool, Refusal> {
-                    Ok(self.phases(budgets, selected, pages)?.iter()
-                        .all(|row| row.owned.checked_add(row.opaque).is_some_and(|bytes| bytes <= row.available)))
+                    Ok(self.exact_costs(selected, pages)?.into_iter().enumerate()
+                        .map(|(row, cost)| Ok(cost.required()? <= self.available(row, budgets)?))
+                        .collect::<Result<Vec<_>, Refusal>>()?.into_iter().all(|fits| fits))
                 };
                 if !fits(first)? { continue; }
                 let mut low = first / self.pool_page_multiple;
@@ -372,6 +405,10 @@ impl Compiled {
         lower: u64,
         upper: u64,
     ) -> Result<Vec<u64>, Refusal> {
+        if lower == upper && domains.iter().all(|domain| domain.len() == 1) {
+            return self.exact_costs(&selected(domains), lower)?.into_iter()
+                .map(Cost::required).collect();
+        }
         let mut result = vec![0u64; self.rows];
         let mut local = BTreeMap::<usize, Vec<Vec<u64>>>::new();
         for group in &self.groups {
@@ -807,6 +844,7 @@ pub fn solve(
 ) -> Result<ResolvedPlan, Refusal> {
     let started = std::time::Instant::now();
     let mut contract = recipe.prepare(&request)?;
+    contract.add_driver_page_tables();
     contract.resident_weight_limit = request.resident_weight_limit;
     let mut budgets = budgets;
     apply_reserve_override(&mut contract, &mut budgets);

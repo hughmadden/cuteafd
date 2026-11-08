@@ -1249,7 +1249,10 @@ mod admission_tests {
                         item.group.starts_with("cuBLAS handles:")
                             || item.group.starts_with("BLAS device initialization"))
                         .map(|item| item.bytes).sum::<u64>() as usize;
-                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + blas, total)
+                    let mappings = admitted.placement.items[gpu].iter()
+                        .filter(|item| item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP)
+                        .map(|item| item.bytes as usize).sum::<usize>();
+                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + blas + mappings, total)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(

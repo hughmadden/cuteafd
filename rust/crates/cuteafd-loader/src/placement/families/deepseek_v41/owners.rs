@@ -117,6 +117,20 @@ pub fn vocabulary_load_phase(arena: &crate::serving_capacity::WeightArenaLayout,
     Ok(Demand::new(0, Category::Staging, "vocabulary packing", bytes, Basis::Formula))
 }
 
+/// BF16 sources coexist with all push destinations and workspaces until the
+/// group commits. Charge them during Load, never as retained target weights.
+pub fn packed_head_load_owners(layouts: &[crate::serving_capacity::WeightArenaLayout])
+    -> Result<Vec<super::admission::Owner>> {
+    use crate::placement::planner::{Lifetime, Phase};
+    if !layouts.iter().any(|layout| layout.view("head.packed12").is_some()) { return Ok(Vec::new()); }
+    let heads = layouts.iter().filter(|layout| layout.view("head.packed12").is_some()).collect::<Vec<_>>();
+    let bytes = super::weight_layout::TargetLayout::vocabulary_transient_bytes(Fp8Head::Packed, heads.len())? as u64;
+    Ok(heads.iter().enumerate()
+        .map(|(rank, _)| super::admission::Owner::charged(rank as u8, Category::Staging,
+            "vocabulary BF16 push source", bytes)
+            .with_lifetime(Lifetime { first: Phase::Load, last: Phase::Load })).collect())
+}
+
 /// Retained device target weights as one demand per arena (extent B, resident
 /// B), replacing the per-tensor `resident_headers` device items. Load phases,
 /// the pre-draft sample and admission all see the arena exactly where the
@@ -651,6 +665,29 @@ mod tests {
                 assert_eq!(draft.len(), ranks + 1);
                 assert_eq!(draft.last().unwrap().location, crate::placement::planner::Location::coordinator((ranks - 1) as u8));
                 assert!(draft.last().unwrap().gemm);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn packed_push_source_coexists_with_all_load_owners_on_each_gpu() -> Result<()> {
+        use crate::placement::planner::{Lifetime, Phase};
+        use crate::serving_capacity::WeightArenaLayout;
+        assert!(packed_head_load_owners(&[])?.is_empty());
+        for ranks in [1, 2] {
+            let layouts = (0..ranks).map(|rank| WeightArenaLayout::new(format!("v41/target/gpu{rank}"),
+                super::super::weight_layout::head_requests(129280 / ranks, Fp8Head::Packed)?))
+                .collect::<Result<Vec<_>>>()?;
+            let owners = packed_head_load_owners(&layouts)?;
+            assert_eq!(owners.len(), ranks);
+            for (rank, owner) in owners.iter().enumerate() {
+                assert_eq!(owner.location, crate::placement::planner::Location::coordinator(rank as u8));
+                assert_eq!(owner.bytes, (129280 / ranks * 10240) as u64);
+                assert_eq!(owner.resident, 0);
+                assert_eq!(owner.category, Category::Staging);
+                assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
+                assert!(layouts[rank].view("head.bf16").is_none());
             }
         }
         Ok(())

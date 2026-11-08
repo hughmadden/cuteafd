@@ -442,15 +442,57 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     let ready = ledger.phases.iter().find(|row| row.budget == "host" && row.phase == Phase::Ready).unwrap();
     assert_eq!(ready.owned + ready.opaque, host.deferred_bytes + host.host_budget_bytes);
     assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
+    use crate::placement::planner::{Allocation, Lifetime, PhaseOrder, driver_page_table_bytes};
+    use crate::placement::planner::serving::{ServingOwners, SelectorOwners, HostPrefixOwners};
+    use crate::families::muse_spark::{core::CoreInventory, weight_layout::{LayerLayout, native_mount_load}};
+    use cuteafd_core::memory_layout::Category;
+    let opts = options.layout.as_ref().unwrap();
+    let slots = opts.resolved_state_slots("muse_spark");
+    let prefill = crate::serving_capacity::prefill_waves::PrefillPlan {
+        unit_rows: report.prefill_unit_rows.unwrap(), waves: report.prefill_waves.unwrap(),
+        span_rows: report.prefill_span_rows.unwrap() };
+    let placement = report.solver_placement.as_ref().unwrap();
+    let mut pinned = ServingOwners {
+        selector: SelectorOwners { location: Location::coordinator(1),
+            capacity: crate::families::muse_spark::lane::HEAD_ROWS, vocab: cfg.vocab_size, device_sampling: true },
+        prefix: HostPrefixOwners { quota_bytes: host.host_budget_bytes, chunk_bytes: chunk },
+    }.allocations().unwrap().into_iter().filter(|owner| owner.location == Location::PINNED).collect::<Vec<_>>();
+    let cutoff = crate::families::muse_spark::replies::Cutoff::with_formats(opts.muse_partial_bf16_max_rows,
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.spark_reply_formats).unwrap();
+    let transport = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, slots as usize, 6).unwrap();
+    for (id, bytes) in [("rings", transport.rings), ("egress", transport.egress), ("intake", transport.intake)] {
+        pinned.push(Allocation::buffer(id, Location::PINNED, bytes, Lifetime::RESIDENT, Category::Staging, id));
+    }
+    let core = CoreInventory::from_checkpoint(&cfg, input.checkpoint()).unwrap();
+    let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(&cfg, layer, 2, &core).unwrap()).collect::<Vec<_>>();
+    for gpu in 0..2 {
+        let mount = native_mount_load(layouts.iter().flat_map(|ranks| ranks[gpu].native.values())).unwrap();
+        pinned.extend(mount.allocations(&format!("muse.native.load.{gpu}")).into_iter()
+            .filter(|owner| owner.location == Location::PINNED));
+    }
+    let catalog = input.expert_catalog().unwrap();
+    let manifest = catalog.exl3().unwrap();
+    let validation = (0..2).map(|gpu| (0..placement.onboard_layers).map(|layer|
+        manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, gpu).unwrap().loads.iter()
+            .filter(|load| load.tensor.ends_with(".trellis")).count() as u64 * 4).sum()).collect();
+    // Dense staging is an estimated allowance, not a physical pinned root.
+    let push = crate::push_load::PushHostEnvelope::new(validation, vec![0; 2],
+        cuteafd_ffi::push_ring::DEFAULT_SLOTS as u64, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES as u64).unwrap();
+    pinned.extend(push.allocations("muse.push").unwrap().into_iter().filter(|owner| owner.location == Location::PINNED));
     for gpu in 0..2 {
         let id = format!("rtx{gpu}");
-        let placement = report.solver_placement.as_ref().unwrap();
         let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")
             .map(|item| item.bytes).sum::<u64>();
         for row in ledger.phases.iter().filter(|row| row.budget == id) {
-            assert_eq!(row.opaque, (160 << 20) + tails,
-                "estimated first-use GPU growth plus the separate target arena tail at every phase");
+            let mappings = pinned.iter().filter(|owner| owner.lifetime.contains(row.phase, PhaseOrder::TARGET_THEN_DRAFT))
+                .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
+            assert_eq!(row.opaque, (160 << 20) + tails + mappings,
+                "runtime, target arena tail and physical pinned mappings at {:?}", row.phase);
         }
+        let ready_mappings = pinned.iter().filter(|owner| owner.lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT))
+            .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
+        assert_eq!(placement.items[gpu].iter().filter(|item|
+            item.group == cuteafd_core::memory_layout::DRIVER_PAGE_TABLES_GROUP).map(|item| item.bytes).sum::<u64>(), ready_mappings);
     }
     options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
     let direct = input.plan(&options).unwrap();

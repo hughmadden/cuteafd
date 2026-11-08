@@ -20,6 +20,13 @@ pub struct RankAdmission {
     pub weight_arenas: Vec<(crate::serving_capacity::WeightArenaLayout, crate::placement::ResidentWeights, cuteafd_core::memory_layout::MemoryKind)>,
     /// Private scratch only; immutable weight storage is charged by `weight_arenas`.
     pub immutable: u64,
+    /// One request per independently retained private projection scratch.
+    pub private_requests: Vec<u64>,
+    pub drafter_requests: Vec<u64>,
+    /// Only BF16 vocabulary heads retain a cuBLAS/cuBLASLt handle pair.
+    pub vocabulary_heads: Vec<String>,
+    /// The layer scratch is separate from the reusable compute arena.
+    pub projection_bytes: u64,
     pub workspace: u64,
 }
 
@@ -352,7 +359,8 @@ pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
     Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
 }
 
-/// One sequential predictor scratch recipe, shared with the target arena.
+/// Predictor extent within the one Workspace sequential-scratch backing.
+/// Target and MTP reuse it in stream order; charge their maximum, not their sum.
 /// Only greedy token/status words survive across stages within a draft chain.
 pub fn mtp_forecast_workspace(rows: usize, depth: usize, kv_format: Qwen4KvCache) -> Result<u64> {
     ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
@@ -440,6 +448,8 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         .map_or(0, |w| w.allocation_bytes) } else { 0 };
     let logical = weights.checked_add(embedding).context("Step-5 target logical weights overflow")?;
     let mut immutable = 0u64;
+    let mut private_requests = Vec::new();
+    let projection_bytes = native_scratch_bytes(layout, unit)?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
@@ -449,8 +459,9 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
     if rank == ownership.execution().spec().head_gpu as usize {
         // Only logit planes reuse the arena; native scratch lives with the head's private owners.
         let head_scratch = layout.core.get("lm_head.weight").map(|core|
-            crate::formats::head::native_private_scratch(core.shape, unit)?.bytes())
+            crate::formats::head::native_private_scratch(core.shape, unit)?.packed_bytes())
             .transpose()?.unwrap_or(0) as u64;
+        if head_scratch > 0 { private_requests.push(head_scratch); }
         immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
         workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
     }
@@ -458,6 +469,11 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         resident_weights: crate::placement::ResidentWeights(weights),
         weight_arenas: vec![(arena, crate::placement::ResidentWeights(logical), cuteafd_core::memory_layout::MemoryKind::Weights)],
         immutable,
+        private_requests,
+        drafter_requests: Vec::new(),
+        vocabulary_heads: if rank == usize::from(ownership.execution().spec().head_gpu)
+            && !layout.core.contains_key("lm_head.weight") { vec!["target".into()] } else { vec![] },
+        projection_bytes,
         workspace,
     })
 }
@@ -471,7 +487,7 @@ pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u6
         let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
         match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
     }
-    Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+    Ok(merged.map(|layout| layout.packed_bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,9 +512,16 @@ pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, unit: usi
 
 pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
     depth: usize, unit: usize) -> Result<u64> {
+    mtp_native_scratch_requests(checkpoint, contract, depth, unit)?.into_iter()
+        .try_fold(0u64, |total, bytes| total.checked_add(bytes))
+        .context("Step-5 MTP native scratch overflow")
+}
+
+pub fn mtp_native_scratch_requests(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+    depth: usize, unit: usize) -> Result<Vec<u64>> {
     let rows = mtp_rows(unit)?;
     use crate::formats::trellis_core::ProjectionScratchLayout;
-    let mut total = 0u64;
+    let mut requests = Vec::new();
     for stage in 0..depth {
         let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
         let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
@@ -510,10 +533,10 @@ pub fn mtp_native_scratch_from_contract(checkpoint: &Checkpoint, contract: &Coor
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
         for layout in owners.values() {
-            total = total.checked_add(layout.bytes()? as u64).context("Step-5 MTP native scratch overflow")?;
+            requests.push(layout.packed_bytes()? as u64);
         }
     }
-    Ok(total)
+    Ok(requests)
 }
 
 pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
@@ -584,7 +607,7 @@ mod tests {
                 for (name, core) in &layout.core {
                     let [n, k] = core.shape;
                     if name.contains(".transformer.shared_head.") {
-                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.bytes()? as u64;
+                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.packed_bytes()? as u64;
                         continue;
                     }
                     let owner = if name.contains(".self_attn.") { "attention" }
@@ -595,9 +618,13 @@ mod tests {
                         None => { layer_owners.insert(owner, scratch); }
                     }
                 }
-                for layout in layer_owners.values() { expected += layout.bytes()? as u64; }
+                for layout in layer_owners.values() { expected += layout.packed_bytes()? as u64; }
             }
             assert_eq!(mtp_native_scratch_bytes(&checkpoint, 3, unit)?, expected);
+            let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+            let requests = mtp_native_scratch_requests(&checkpoint, &contract, 3, unit)?;
+            assert_eq!(requests.len(), 12, "four independent backings per MTP stage");
+            assert_eq!(requests.iter().sum::<u64>(), expected);
         }
         assert!(mtp_rows(0).is_err());
         assert!(mtp_rows(8256).is_err(), "a multi-wave span is not an allocation unit");
@@ -623,7 +650,7 @@ mod tests {
         assert!(arena.padding_bytes() > 0);
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
-            assert_eq!(admitted.immutable, 165511240);
+            assert_eq!(admitted.immutable, 165511432);
             assert_eq!(admitted.resident_weights.0, weights);
             assert_eq!(admitted.weight_arenas[0].0, arena);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?

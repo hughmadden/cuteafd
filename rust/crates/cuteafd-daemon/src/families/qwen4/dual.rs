@@ -84,8 +84,11 @@ impl Opened {
                 args.fp8_decode, args.mtp_fp8_head, &media, [args.device, peer])?;
             admission::dual_push_envelope(staging)
         }).context("Qwen dual coordinator push admission")?;
+        let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
+            u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?)?
+        } else { 0 };
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,
-            ple_info.map(|(row_bytes, _)| row_bytes),
+            ple_info.map(|(row_bytes, _)| row_bytes), host_embedding,
             dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect())?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),

@@ -212,10 +212,22 @@ impl<'a> QwenSingle<'a> {
     }
 
     pub fn budget(&self) -> Result<Budget, Refusal> {
+        let mut baseline = plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
+            "qwen4 single-owner")?;
+        if let PlanBaseline::Sampled { free, source, .. } = &mut baseline {
+            // TP1 loads the portable embedding before sampling. Credit its
+            // mapping here so only the named shared page-table row charges it.
+            let mapping = crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding);
+            *free = free.checked_add(mapping).filter(|bytes| *bytes <= self.inputs.capacity_bytes)
+                .ok_or_else(|| Refusal::InvalidFact(
+                    "Qwen single-owner embedding mapping credit exceeds physical capacity".into()))?;
+            if mapping > 0 {
+                source.push_str(&format!("; credited {mapping} B for qwen.host.embedding mapping charged by the recipe"));
+            }
+        }
         Ok(Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
             physical_bytes: self.inputs.capacity_bytes, logical_bytes: self.inputs.capacity_bytes,
-            baseline: plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
-                "qwen4 single-owner")?,
+            baseline,
             headroom: self.admission.headroom })
     }
 
@@ -1587,6 +1599,94 @@ mod tests {
         let (runtime, _) = intake(Baseline::Measured { free_bytes: 96 << 30 });
         assert!(!runtime.items[0].iter().any(|item| item.group == "Spark intake planes"));
         assert_eq!(runtime.pool_tokens, planned.pool_tokens);
+    }
+
+    fn assert_embedding_charge(control: &ResolvedPlan, embedded: &ResolvedPlan, bytes: u64, gpus: usize) {
+        let roots: Vec<_> = embedded.facts.allocations.iter()
+            .filter(|root| root.id == "qwen.host.embedding").collect();
+        assert_eq!(roots.len(), usize::from(bytes > 0));
+        if let Some(root) = roots.first() {
+            assert_eq!((root.location, root.bytes, root.view.as_ref()), (Location::PINNED, bytes, None));
+        }
+        let mapping = crate::placement::planner::driver_page_table_bytes(bytes);
+        for gpu in 0..gpus {
+            let rows: Vec<_> = embedded.facts.driver_page_tables.iter()
+                .filter(|row| row.backing == "qwen.host.embedding"
+                    && row.location == Location::coordinator(gpu as u8)).collect();
+            assert_eq!(rows.len(), usize::from(bytes > 0));
+            if let Some(row) = rows.first() { assert_eq!(row.bytes(), mapping); }
+        }
+        for (before, after) in control.phases.iter().zip(&embedded.phases) {
+            assert_eq!((&before.budget, before.phase), (&after.budget, after.phase));
+            assert_eq!(before.available, after.available);
+            let delta = if after.budget == host::HOST_BUDGET { bytes } else { mapping };
+            assert_eq!(after.owned + after.opaque, before.owned + before.opaque + delta,
+                "{} {:?}: mapping charged once beside the baseline", after.budget, after.phase);
+        }
+        assert_eq!(control.phases.len(), embedded.phases.len());
+    }
+
+    #[test]
+    fn single_host_embedding_mapping_is_charged_once_after_post_load_sample() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+        let capacity = 96u64 << 30;
+        let occupied = 4u64 << 20;
+        for measured in [false, true] {
+            let build = |bytes| {
+                let mapping = crate::placement::planner::driver_page_table_bytes(bytes);
+                let baseline = if measured { Baseline::Measured { free_bytes: capacity - occupied - mapping } }
+                    else { Baseline::Planned { context_bytes: occupied, loaded_bytes: 0 } };
+                let mut inputs = single_inputs(&cfg, baseline, 0, None, Some(131072), ResidentWeights(0), None);
+                inputs.host.host_embedding = bytes;
+                admitted(&inputs).unwrap().1
+            };
+            let control = build(0);
+            for bytes in [327_680, 327_681] {
+                let embedded = build(bytes);
+                assert_eq!(embedded.budgets[0].available().unwrap(), capacity - occupied);
+                assert_embedding_charge(&control, &embedded, bytes, 1);
+            }
+        }
+        let mut invalid = single_inputs(&cfg, Baseline::Measured { free_bytes: capacity },
+            0, None, Some(131072), ResidentWeights(0), None);
+        invalid.host.host_embedding = 512;
+        assert!(matches!(QwenSingle::new(&invalid).unwrap().budget(), Err(Refusal::InvalidFact(_))));
+    }
+
+    #[test]
+    fn dual_host_embedding_mapping_is_charged_once_per_preweight_context() {
+        let config = crate::plan::testing::qwen4_config(4);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        let (_dir, arenas) = dual_fixture(&config, false);
+        let extras = vec![Vec::new(); 4];
+        let experts = vec![None; 4];
+        let capacity = 96u64 << 30;
+        let occupied = 4u64 << 20;
+        for measured in [false, true] {
+            let build = |bytes| {
+                let mut host = QwenHost::ample(&cfg, 2, 4096).unwrap();
+                host.host_embedding = bytes;
+                let inputs = QwenDualInputs {
+                    resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
+                    admission: single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
+                        0, None, None, ResidentWeights(0), None).admission,
+                    owner_manifests: [None; 2],
+                    gpus: [GpuBudget { capacity_bytes: capacity, reserve_bytes: 0,
+                        baseline: if measured { Baseline::Measured { free_bytes: capacity - occupied } }
+                            else { Baseline::Planned { context_bytes: occupied, loaded_bytes: 0 } } }; 2],
+                    arenas: &arenas, layer_experts: &experts, layer_extra: &extras,
+                    fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
+                    max_context: 131072, requested_pool: Some(131072), spark_ranks: 0, onboard: Onboard::Auto,
+                    startup_graph_modes: None, host, encoders: Default::default(),
+                };
+                dual_admitted(&inputs).unwrap().1
+            };
+            let control = build(0);
+            for bytes in [327_680, 327_681] {
+                let embedded = build(bytes);
+                assert_embedding_charge(&control, &embedded, bytes, 2);
+            }
+        }
     }
 
     /// A lazy diagnostic run keeps the former growth reserve; a serving run

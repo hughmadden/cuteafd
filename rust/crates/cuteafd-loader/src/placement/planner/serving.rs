@@ -302,6 +302,49 @@ mod tests {
     }
 
     #[test]
+    fn blas_residency_and_portable_page_tables_charge_disjoint_owners() {
+        let order = PhaseOrder::TARGET_THEN_DRAFT;
+        let owners = (0..2).map(|gpu| BlasOwners {
+            name: format!("target {gpu}"), process: "coordinator".into(),
+            thread: "family/blas/serve".into(), location: Location::coordinator(gpu),
+            gemm: true, lt: true, lifetime: Lifetime::RESIDENT,
+            activation: Activation::always(),
+        }).collect::<Vec<_>>();
+        let mut pinned = Allocation::buffer("staging", Location::PINNED, 4096,
+            Lifetime::RESIDENT, Category::Staging, "host staging");
+        let mut allocations = vec![pinned.clone()];
+        pinned.id = "staging.alias".into();
+        pinned.view = Some(View { backing: "staging".into(), offset: 0 });
+        allocations.push(pinned);
+        for gpu in 0..2 {
+            allocations.push(Allocation::buffer(&format!("blas.scratch.{gpu}"),
+                Location::coordinator(gpu), 4 << 20, Lifetime::RESIDENT,
+                Category::Workspace, "private BLAS scratch"));
+        }
+        let facts = Facts { phase_order: order, allocations, deferred: vec![],
+            sequential: vec![], reservations: vec![], allowances: vec![],
+            resident_weights: vec![], allocation_granularity: vec![], driver_page_tables: vec![] };
+        let mut contract = Contract::fixed(64, 1, 2, facts);
+        contract.components.extend(blas_components("sm_120", &owners, 1, order).unwrap());
+        contract.add_driver_page_tables();
+        contract.add_driver_page_tables();
+        let facts = contract.facts(&[], 1).unwrap();
+        for gpu in 0..2 {
+            let location = Location::coordinator(gpu);
+            let mappings = facts.driver_page_tables.iter().filter(|owner| owner.location == location)
+                .collect::<Vec<_>>();
+            assert_eq!(mappings.len(), 1, "only the physical pinned backing registers");
+            assert_eq!(mappings[0].backing, "staging");
+            assert_eq!(mappings[0].bytes(), 8);
+            for &phase in order.phases() {
+                assert_eq!(facts.allowances.iter().filter(|owner| owner.location == location
+                    && owner.lifetime.contains(phase, order)).map(|owner| owner.bytes).sum::<u64>(),
+                    66 << 20, "opaque BLAS residency does not include portable mappings");
+            }
+        }
+    }
+
+    #[test]
     fn blas_backend_retention_does_not_cross_a_retired_pool_or_an_unselected_borrower() {
         let order = PhaseOrder::TARGET_THEN_DRAFT;
         let first = BlasOwners { name: "load GEMM".into(), process: "coordinator".into(),

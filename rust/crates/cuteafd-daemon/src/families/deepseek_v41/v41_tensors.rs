@@ -10,6 +10,8 @@ use cuteafd_core::memory_layout::ArenaTag;
 #[path = "v41_tensors/vocabulary_shard.rs"]
 mod vocabulary_shard;
 pub(crate) use vocabulary_shard::VocabularyShard;
+#[cfg(test)]
+pub(crate) use vocabulary_shard::tests::packed_head_push_delivers_transient_source_before_arena_pack;
 
 pub(crate) fn allocation<'a>(library: &'a NativeLibrary,
     arena: Option<&DeviceWeightArena<'a>>, name: &str, bytes: usize) -> Result<DeviceAllocation<'a>> {
@@ -166,9 +168,10 @@ pub(crate) struct VocabularyHead<'library> {
 
 /// Vocabulary heads (`CUTEAFD_V41_FP8_HEAD`): `draft` projects only the dSpark
 /// draft head through an E4M3 copy (outputs unchanged, acceptance may move),
-/// `all` (default) both heads from one E4M3 copy; `off` keeps BF16. E4M3 copies
+/// `all` runs both heads from one E4M3 copy; `off` keeps BF16. E4M3 copies
 /// use per-row x 128-K FP32 scales (`fp8_linear`, the better of amax and
-/// power-of-two per block) and the W8A16 tensor-core GEMV. `packed` keeps one
+/// power-of-two per block) and the W8A16 tensor-core GEMV. Unset/`auto` selects
+/// `packed`, which keeps one
 /// exact 12-bit copy of the BF16 head (`packed_head`): target logits read it
 /// exactly, the dSpark drafter its coarse plane. `all` and `packed` release BF16
 /// after packing; `draft` retains BF16 for target projections.
@@ -176,10 +179,14 @@ pub(crate) use cuteafd_loader::placement::families::deepseek_v41::resident::Fp8H
 pub(crate) fn fp8_head() -> Fp8Head {
     static MODE: std::sync::OnceLock<Fp8Head> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| {
-        let mode = Fp8Head::configured();
-        tracing::info!(?mode, "V4.1 vocabulary heads");
-        mode
+        publish_head(Fp8Head::configured())
     })
+}
+
+fn publish_head(mode: Fp8Head) -> Fp8Head {
+    cuteafd_bench::context::set_resolved("v41-fp8-head", mode.setting());
+    tracing::info!(?mode, "V4.1 vocabulary heads");
+    mode
 }
 
 /// The resident copy of the vocabulary a projection can read instead of BF16.
@@ -328,6 +335,26 @@ pub(crate) fn fp8_scratch<'a>(library: &'a NativeLibrary, copy: Option<HeadCopy<
 mod head_site_tests {
     use super::*;
 
+    #[test]
+    fn planner_and_serve_publish_the_same_resolved_head() {
+        for request in ["", "auto", "off", "draft", "all", "packed"] {
+            let planned = Fp8Head::parse(request);
+            let (served, settings) = cuteafd_bench::context::capture_resolved(|| publish_head(planned));
+            assert_eq!(served, planned);
+            assert_eq!(settings.0, [("v41-fp8-head".into(), planned.setting().into())]);
+            settings.assert_resolved();
+            for ranks in [1, 2] {
+                let source = 1_323_827_200 / ranks;
+                assert_eq!(served.resident(source), planned.resident(source));
+                if request.is_empty() || request == "auto" {
+                    assert_eq!(served, Fp8Head::Packed);
+                    assert_eq!(copy_site(served, Fp8Head::All), Some(false));
+                    assert_eq!(copy_site(served, Fp8Head::Draft), Some(true));
+                }
+            }
+        }
+    }
+
     /// `packed` sends both sites through the exact 12-bit copy (BF16 is gone):
     /// target logits exactly, the drafter through the coarse plane. `draft`
     /// keeps target logits on BF16; `off` never uses a copy.
@@ -370,6 +397,7 @@ impl<'library> VocabularyHead<'library> {
         budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'library>>) -> Result<Self> {
         Ok(Self { shard: VocabularyShard::load_in(library, catalog, 0..129280, budget, staging_bytes, arena)? })
     }
+    pub fn finish_push(&self) -> Result<()> { self.shard.finish_push() }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
     pub fn copy(&self) -> Option<HeadCopy<'_, 'library>> { self.shard.copy() }
