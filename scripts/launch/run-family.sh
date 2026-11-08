@@ -12,6 +12,11 @@ launch_argv=("$@")
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$repo_root/scripts/lib/release-common.sh"
 source "$repo_root/scripts/lib/cdi-gpus.sh"
+# A failed bounded smoke teardown must be resolved before another launch or
+# dry-run preflight can reuse this coordinator/fabric.
+for cleanup_marker in "$HOME"/.cache/cuteafd/instances/*/unconfirmed-containers.json; do
+  [[ ! -e "$cleanup_marker" ]] || release_die "unconfirmed container teardown: $cleanup_marker: $(cat "$cleanup_marker")"
+done
 namespace_root="$(readlink -f "${CUTEAFD_NAMESPACE_ROOT:-/mnt/sparknest}")"
 namespace_hf_home="$namespace_root/hf-home"
 # SparkNest is preferred whenever the selected namespace has a hub. An absent

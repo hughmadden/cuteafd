@@ -3493,6 +3493,21 @@ def test_spark_memory_boundary_real_failures_stay_hard(entry, tmp_path, monkeypa
     assert json.loads((Path(job['state']) / 'memory-phase-ready.json').read_text())['ready'] is True
 
 
+def test_launch_and_preflight_refuse_unconfirmed_cleanup_marker(tmp_path):
+    home = tmp_path / 'home'
+    marker = home / '.cache/cuteafd/instances/failed/unconfirmed-containers.json'
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps([dict(host='kiwi', container='cuteafd-spark-expert-kiwi-19441')]))
+    # The marker is checked before configs, checkpoints or Docker are touched,
+    # including the launcher's CPU-only dry-run used by card preflight.
+    for args in ([], ['--dry-run', '--total-capacity']):
+        result = subprocess.run(['bash', str(ROOT / 'scripts/launch/run-family.sh'), *args],
+                                env={**os.environ, 'HOME': str(home)}, capture_output=True, text=True, timeout=5)
+        assert result.returncode != 0
+        assert str(marker) in result.stderr and 'kiwi' in result.stderr
+        assert 'unconfirmed container teardown' in result.stderr
+
+
 def test_spark_memory_stream_has_bytes_no_cuda_and_stops_on_eof():
     command = cards.spark_memory_command(2, 'emu', 5)
     assert command[:2] == ['ssh', '-T'] and 'ConnectTimeout=5' in command

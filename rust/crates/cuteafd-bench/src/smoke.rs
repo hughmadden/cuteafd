@@ -308,18 +308,19 @@ const LOGS_S: u64 = 10;
 const RM_S: u64 = 10;
 const KILL_AFTER_S: u64 = 1;
 // The coordinator's steps run one after another (a worker's take less) after the launcher stops.
-const _: () = assert!(LAUNCHER_GRACE_S + INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + 4 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
+const _: () = assert!(LAUNCHER_GRACE_S + 2 * INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + 5 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
 
 /// Programs teardown runs (tests substitute logging fakes).
 #[derive(Debug, Clone)]
 struct Tools {
     docker: PathBuf,
     ssh: PathBuf,
+    instances: PathBuf,
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { docker: "docker".into(), ssh: "ssh".into() }
+        Self { docker: "docker".into(), ssh: "ssh".into(), instances: expand("~/.cache/cuteafd/instances") }
     }
 }
 
@@ -339,6 +340,7 @@ struct Inflight {
     signal: Arc<AtomicUsize>,
     launches: Mutex<BTreeMap<String, Launch>>,
     hooks: Mutex<BTreeMap<u32, Option<Vec<String>>>>,
+    drained: std::sync::atomic::AtomicBool,
     tools: Tools,
 }
 
@@ -423,6 +425,7 @@ impl Inflight {
     /// groups (running their cleanups), stops launchers, then tears down every
     /// launched entry in parallel. Returns the entries torn down.
     fn cancel_all(&self) -> Vec<String> {
+        self.drained.store(true, Ordering::SeqCst);
         let hooks: Vec<(u32, Option<Vec<String>>)> = self.hooks.lock().unwrap_or_else(|e| e.into_inner())
             .iter().map(|(pid, cleanup)| (*pid, cleanup.clone())).collect();
         let names: Vec<(String, PathBuf, PathBuf)> = self.launches.lock().unwrap_or_else(|e| e.into_inner())
@@ -443,16 +446,20 @@ impl Inflight {
                     };
                     let _ = writeln!(log, "cancelled: tearing down {name}");
                     match read_config(config) {
-                        Ok(config) => teardown(name, &config, &mut log, &self.tools, true),
+                        Ok(config) => match teardown(name, &config, &mut log, &self.tools, true) {
+                            Ok(()) => self.finished(name),
+                            Err(error) => {
+                                let _ = writeln!(log, "cancel teardown: {error:#}");
+                                eprintln!("smoke: {name}: {error:#}");
+                            }
+                        },
                         Err(error) => { let _ = writeln!(log, "cancel teardown: {error:#}"); }
                     }
                 });
             }
         });
-        for (name, _, _) in &names {
-            self.finished(name);
-        }
-        names.into_iter().map(|(name, _, _)| name).collect()
+        let remaining = self.launches.lock().unwrap_or_else(|e| e.into_inner());
+        names.into_iter().map(|(name, _, _)| name).filter(|name| !remaining.contains_key(name)).collect()
     }
 }
 
@@ -465,7 +472,9 @@ impl Drop for ServingCleanup {
         // Block late launches even if an entry thread has not registered yet.
         let _ = self.0.signal.compare_exchange(0, signal_hook::consts::SIGTERM as usize,
             Ordering::SeqCst, Ordering::SeqCst);
-        self.0.cancel_all();
+        if !self.0.drained.load(Ordering::SeqCst) {
+            self.0.cancel_all();
+        }
     }
 }
 
@@ -1121,7 +1130,8 @@ fn cancel_run(inflight: &Inflight, signal: i32, running: &[Entry], state: &mut B
     eprintln!("smoke: {reason}; tearing down {} running entr{}", running.len(), if running.len() == 1 { "y" } else { "ies" });
     let torn = inflight.cancel_all();
     for entry in running {
-        let error = if torn.contains(&entry.name) { format!("{reason}; its containers were torn down") } else { reason.to_string() };
+        let error = if torn.contains(&entry.name) { format!("{reason}; its containers were torn down") }
+            else { format!("{reason}; container cleanup unconfirmed; inspect instance unconfirmed-containers.json markers") };
         state.insert(entry.name.clone(), Outcome { key: entry.key(), build: build.to_string(), status: "cancelled".into(),
             error: Some(error), finished: crate::report::now_rfc3339(), ..Outcome::default() });
     }
@@ -1244,7 +1254,7 @@ fn tool(program: &Path, args: &[&str], bound: Option<u64>) -> Command {
 /// Removes the entry's coordinator and expert containers; the Spark workers in
 /// parallel with the coordinator. `cancelled` bounds every step (see
 /// [`CANCEL_TEARDOWN_S`]), including a graceful stop's own timeout.
-fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools: &Tools, cancelled: bool) {
+fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools: &Tools, cancelled: bool) -> Result<()> {
     let bound = |seconds: u64| cancelled.then_some(seconds);
     let stop_timeout = cancelled.then_some(STOP_S);
     let instance = config.get("INSTANCE").filter(|v| !v.is_empty());
@@ -1261,9 +1271,10 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
         args.extend_from_slice(remote);
         tool(&tools.ssh, &args, bound(seconds))
     };
+    let failures = Mutex::new(Vec::<Value>::new());
     std::thread::scope(|scope| {
         for host in &hosts {
-            let (base, port, ssh) = (&base, &port, &ssh);
+            let (base, port, ssh, failures) = (&base, &port, &ssh, &failures);
             scope.spawn(move || {
                 let worker = format!("cuteafd-spark-expert-{host}-{port}");
                 if let Some(file) = base.as_ref().and_then(|p| File::create(p.with_extension(format!("{host}.log"))).ok()) {
@@ -1271,8 +1282,14 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
                         .stdout(file.try_clone().map(Stdio::from).unwrap_or(Stdio::null()))
                         .stderr(Stdio::from(file)).status();
                 }
-                let _ = ssh(host, &[&worker_teardown_script(&worker, stop_timeout)], STOP_S + RM_S + 5)
+                let script = format!("{}; remaining=$(docker ps -aq --filter name=^{worker}$) || exit $?; test -z \"$remaining\"",
+                    worker_teardown_script(&worker, stop_timeout));
+                let removed = ssh(host, &[&script], STOP_S + RM_S + 5)
                     .stdout(Stdio::null()).stderr(Stdio::null()).status();
+                if !matches!(removed, Ok(status) if status.success()) {
+                    failures.lock().unwrap().push(serde_json::json!({"host": host, "container": worker,
+                        "error": format!("removal unconfirmed: {removed:?}")}));
+                }
             });
         }
         // A launcher that labels its coordinator cuteafd.graceful-stop=1 (a process
@@ -1295,9 +1312,42 @@ fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools:
             let _ = tool(&tools.docker, &["logs", &coordinator], bound(LOGS_S)).stdout(file.try_clone().map(Stdio::from)
                 .unwrap_or(Stdio::null())).stderr(Stdio::from(file)).status();
         }
-        let _ = tool(&tools.docker, &["rm", "-f", &coordinator], bound(RM_S)).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let removed = tool(&tools.docker, &["rm", "-f", &coordinator], bound(RM_S))
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let absent = tool(&tools.docker, &["ps", "-aq", "--filter", &format!("name=^{coordinator}$")], bound(INSPECT_S))
+            .stderr(Stdio::null()).output();
+        if !matches!(&absent, Ok(output) if output.status.success() && output.stdout.is_empty()) {
+            failures.lock().unwrap().push(serde_json::json!({"host": "raptor", "container": coordinator,
+                "error": format!("removal unconfirmed: {removed:?}; verification: {absent:?}")}));
+        }
     });
-    let _ = writeln!(log, "teardown {name} ({coordinator})");
+    let failures = failures.into_inner().unwrap();
+    let marker = cleanup_marker(config, &tools.instances);
+    if failures.is_empty() {
+        if marker.exists() { std::fs::remove_file(&marker)?; }
+        let _ = writeln!(log, "teardown {name} ({coordinator})");
+        Ok(())
+    } else {
+        std::fs::create_dir_all(marker.parent().context("cleanup marker parent")?)?;
+        std::fs::write(&marker, serde_json::to_vec_pretty(&failures)?)?;
+        bail!("unconfirmed container teardown: {} (marker {})", serde_json::to_string(&failures)?, marker.display());
+    }
+}
+
+fn cleanup_marker(config: &HashMap<String, String>, root: &Path) -> PathBuf {
+    root.join(config.get("INSTANCE").map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("default"))
+        .join("unconfirmed-containers.json")
+}
+
+fn check_cleanup_markers(root: &Path) -> Result<()> {
+    if !root.exists() { return Ok(()); }
+    for instance in std::fs::read_dir(root)? {
+        let marker = instance?.path().join("unconfirmed-containers.json");
+        if marker.exists() {
+            bail!("refusing launch: unconfirmed container teardown in {}: {}", marker.display(), std::fs::read_to_string(marker)?);
+        }
+    }
+    Ok(())
 }
 
 /// Advertised by `--dry-run` (`worker_stop=graceful`): wip-cards refuses a
@@ -1355,6 +1405,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     let result = (|| -> Result<Option<Report>> {
         let config_path = write_config(entry, repo, configs, parallel)?;
         let config = read_config(&config_path)?;
+        check_cleanup_markers(&inflight.tools.instances)?;
         let port = entry.port(&config);
         let mut command = Command::new(repo.join("run.sh"));
         command.arg("--config").arg(&config_path).arg("--restart").args(entry.run_args.clone().unwrap_or_default())
@@ -1586,10 +1637,20 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     // cancellation arriving during this teardown repeats it there, bounded.
     if launcher_started && inflight.cancelled().is_none() {
         inflight.stop_launcher(&entry.name);
-        if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
-            teardown(&entry.name, &config, &mut log, &inflight.tools, true);
+        let cleaned = read_config(&configs.join(format!("{}.config", entry.name)))
+            .and_then(|config| teardown(&entry.name, &config, &mut log, &inflight.tools, true));
+        match cleaned {
+            Ok(()) => inflight.finished(&entry.name),
+            Err(error) => {
+                let message = format!("serving cleanup failed for {}: {error:#}", entry.name);
+                eprintln!("smoke: {message}");
+                let _ = writeln!(log, "{message}");
+                outcome.status = "failed".into();
+                outcome.error = Some(message);
+                let _ = inflight.signal.compare_exchange(0, signal_hook::consts::SIGTERM as usize,
+                    Ordering::SeqCst, Ordering::SeqCst);
+            }
         }
-        inflight.finished(&entry.name);
     }
     if let Some(signal) = inflight.cancelled().filter(|_| outcome.status != "done") {
         outcome.status = "cancelled".into();
@@ -1790,7 +1851,7 @@ mod tests {
             std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >>'{}'\n", log.display())).unwrap();
             std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         }
-        Tools { docker: dir.join("docker"), ssh: dir.join("ssh") }
+        Tools { docker: dir.join("docker"), ssh: dir.join("ssh"), instances: dir.join("instances") }
     }
 
     fn wait_until(what: &str, done: impl Fn() -> bool) {
@@ -1918,6 +1979,55 @@ mod tests {
         assert!(calls.split("release").next().unwrap().contains("docker rm -f cuteafd-coordinator-scheduler-error"), "{calls}");
         assert!(inflight.launches.lock().unwrap().is_empty());
         assert!(inflight.cancelled().is_some());
+    }
+
+    #[test]
+    fn unconfirmed_teardown_retains_ownership_and_blocks_next_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let calls = root.path().join("calls.log");
+        let config_path = root.path().join("base.config");
+        std::fs::write(&config_path, "INSTANCE=unconfirmed\nSPARK_COUNT=1\nSPARK_0_HOST=kiwi\n").unwrap();
+        let config = read_config(&config_path).unwrap();
+        let tools = fake_tools(root.path(), &calls);
+        // Emulate an unreachable Spark; the local coordinator still cleans up.
+        std::fs::write(&tools.ssh, "#!/bin/sh\nexit 255\n").unwrap();
+        let inflight = Arc::new(Inflight { tools, ..Inflight::default() });
+        let log_path = root.path().join("entry.log");
+        let mut log = File::create(&log_path).unwrap();
+        inflight.launch("failed", &mut Command::new("true"), &config_path, &log_path).unwrap();
+        let error = teardown("failed", &config, &mut log, &inflight.tools, true).unwrap_err().to_string();
+        assert!(error.contains("kiwi") && error.contains("cuteafd-spark-expert-kiwi-19441"), "{error}");
+        let marker = cleanup_marker(&config, &inflight.tools.instances);
+        assert!(marker.exists());
+        assert!(check_cleanup_markers(&inflight.tools.instances).unwrap_err().to_string().contains("kiwi"));
+        // The bounded retry cannot silently unregister a still-unconfirmed host.
+        assert!(inflight.cancel_all().is_empty());
+        assert!(inflight.launches.lock().unwrap().contains_key("failed"));
+        assert!(marker.exists());
+        let attempted = std::fs::read_to_string(&calls).unwrap();
+        drop(ServingCleanup(inflight.clone()));
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), attempted, "scope exit must not restart the cancellation budget");
+        // Once cleanup can confirm absence, it clears the marker and ownership.
+        std::fs::write(&inflight.tools.ssh, "#!/bin/sh\nexit 0\n").unwrap();
+        inflight.cancel_all();
+        assert!(inflight.launches.lock().unwrap().is_empty());
+        assert!(!marker.exists());
+        check_cleanup_markers(&inflight.tools.instances).unwrap();
+    }
+
+    #[test]
+    fn timed_out_coordinator_removal_is_marked_unconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let tools = fake_tools(root.path(), &root.path().join("calls.log"));
+        // timeout(1)'s status, including failed verification: never treat its
+        // empty stdout as evidence of absence.
+        std::fs::write(&tools.docker, "#!/bin/sh\nexit 124\n").unwrap();
+        let config = HashMap::from([("INSTANCE".into(), "timed-out".into())]);
+        let mut log = File::create(root.path().join("entry.log")).unwrap();
+        let error = teardown("timeout", &config, &mut log, &tools, true).unwrap_err().to_string();
+        assert!(error.contains("raptor") && error.contains("cuteafd-coordinator-timed-out"), "{error}");
+        let marker = cleanup_marker(&config, &tools.instances);
+        assert!(std::fs::read_to_string(marker).unwrap().contains("raptor"));
     }
 
     #[test]
