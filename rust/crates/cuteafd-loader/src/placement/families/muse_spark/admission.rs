@@ -961,6 +961,45 @@ mod contract_tests {
     use super::*;
 
     #[test]
+    fn drafter_charge_table_matches_both_bf16_recipes() {
+        use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout,
+            gqa_arena_requests}, draft_representation::GlmDraftCapacity};
+        let target = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let configs = [
+            (include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/nvidia.json"),
+                8_768_324_864u64, [4_993_452_544u64, 4_782_361_088]),
+            (include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/radixark.json"),
+                9_774_959_104, [5_496_769_024, 5_285_677_568]),
+        ];
+        for (raw, old_single, old_pair) in configs {
+            let config = serde_json::from_str(raw).unwrap();
+            let cfg = GlmDflashConfig::from_value(&config).unwrap();
+            let draft = super::super::drafter_inventory(&target, &config, 16, 16, 202_112, 188,
+                crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+            assert_eq!(draft.weights.0, old_single);
+            let arena = draft.arena(0, 0).unwrap();
+            let floor_delta = if cfg.head_dim == 64 { 1_280 } else { 0 };
+            assert_eq!(arena.bytes() as u64, old_single + floor_delta);
+            assert_eq!((arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20)
+                - arena.bytes() as u64, 1_963_520);
+            let capacity = GlmDraftCapacity::new(16, 16, cfg.block).unwrap();
+            for (rank, old) in old_pair.into_iter().enumerate() {
+                let physical = GlmDflashPhysicalLayout::new(&cfg.for_tp(2).unwrap(),
+                    draft.representation, capacity, 188, 2,
+                    crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+                let payload = physical.weight_owners().filter(|owner| rank == 0 || !owner.id.starts_with("head."))
+                    .map(|owner| owner.bytes).sum::<u64>();
+                assert_eq!(payload, old);
+                let arena = crate::serving_capacity::WeightArenaLayout::new("draft", gqa_arena_requests(
+                    &cfg, draft.representation, rank, 2).unwrap()).unwrap();
+                assert_eq!(arena.bytes() as u64, old);
+                let tail = (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20) - arena.bytes() as u64;
+                assert_eq!(tail, if rank == 0 { 1_963_520 } else { 1_242_624 });
+            }
+        }
+    }
+
+    #[test]
     fn drafter_arena_contract_replaces_only_weights_and_preserves_chronology() {
         use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout,
             gqa_arena_requests}, draft_representation::GlmDraftCapacity};

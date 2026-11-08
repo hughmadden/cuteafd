@@ -257,9 +257,21 @@ mod tests {
             assert_eq!(host_load.opaque,
                 crate::placement::families::muse_spark::HOST_RUNTIME.bytes + 2 * dense_bound);
             let placement = report.solver_placement.context("Muse selected mode placement")?;
-            for rank in &placement.items {
-                let native = rank.iter().filter(|item| item.group == "Muse native attention values and block scales")
-                    .map(|item| item.bytes).sum::<u64>();
+            let checkpoint = input.checkpoint();
+            let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+            let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+            let global = super::super::weight_layout::GlobalLayout::new(&cfg, &core)?;
+            let layers = (0..cfg.layers).map(|layer|
+                super::super::weight_layout::LayerLayout::ranks(&cfg, layer, 2, &core))
+                .collect::<Result<Vec<_>>>()?;
+            for (gpu, rank) in placement.items.iter().enumerate() {
+                assert!(!rank.iter().any(|item| item.group == "Muse native attention values and block scales"));
+                let local = layers.iter().map(|ranks| &ranks[gpu]).collect::<Vec<_>>();
+                let arena = super::super::weight_layout::coordinator_arena(gpu, 2, &global, &local)?;
+                let root = rank.iter().find(|item| item.group == "weight arena").context("target arena root")?;
+                assert_eq!(root.bytes, arena.bytes() as u64);
+                let native = local.iter().flat_map(|layout| layout.native.values())
+                    .map(|layout| layout.bytes()).sum::<Result<u64>>()?;
                 let expected = match mode {
                     AttentionMode::Compact => 0,
                     AttentionMode::Hqa => 62 * 8192 * 4096 * 2,
@@ -267,9 +279,6 @@ mod tests {
                 };
                 assert_eq!(native, expected);
             }
-            let checkpoint = input.checkpoint();
-            let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
-            let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
             let layouts = super::super::weight_layout::LayerLayout::ranks(&cfg, 0, 2, &core)?;
             let load = super::super::weight_layout::native_mount_load(layouts[0].native.values())?;
             let owners = load.allocations("muse.native.load.0");

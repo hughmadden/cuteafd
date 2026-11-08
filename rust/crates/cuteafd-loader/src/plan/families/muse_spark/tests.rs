@@ -444,8 +444,12 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
     assert_eq!(ready.opaque, 1536 << 20, "census-rounded ordinary host allowance");
     for gpu in 0..2 {
         let id = format!("rtx{gpu}");
+        let placement = report.solver_placement.as_ref().unwrap();
+        let tails = placement.items[gpu].iter().filter(|item| item.group == "allocation granularity")
+            .map(|item| item.bytes).sum::<u64>();
         for row in ledger.phases.iter().filter(|row| row.budget == id) {
-            assert_eq!(row.opaque, 160 << 20, "estimated first-use GPU growth at every phase");
+            assert_eq!(row.opaque, (160 << 20) + tails,
+                "estimated first-use GPU growth plus the separate target arena tail at every phase");
         }
     }
     options.layout.as_mut().unwrap().host_memory = Some((256 << 30, 28 << 30));
