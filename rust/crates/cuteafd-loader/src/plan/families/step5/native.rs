@@ -23,6 +23,8 @@ pub struct RankAdmission {
     /// One request per independently retained private projection scratch.
     pub private_requests: Vec<u64>,
     pub drafter_requests: Vec<u64>,
+    /// Only BF16 vocabulary heads retain a cuBLAS/cuBLASLt handle pair.
+    pub vocabulary_heads: Vec<String>,
     /// The layer scratch is separate from the reusable compute arena.
     pub projection_bytes: u64,
     pub workspace: u64,
@@ -468,6 +470,8 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         immutable,
         private_requests,
         drafter_requests: Vec::new(),
+        vocabulary_heads: if rank == usize::from(ownership.execution().spec().head_gpu)
+            && !layout.core.contains_key("lm_head.weight") { vec!["target".into()] } else { vec![] },
         projection_bytes,
         workspace,
     })

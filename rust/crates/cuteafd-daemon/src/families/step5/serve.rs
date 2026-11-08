@@ -522,6 +522,7 @@ fn with_backend<T>(args: &ServeArgs,
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(embedding.allocation_receipts(coordinator, "step5.embedding")?);
+        census.normalize(admission.solved.facts.phase_order)?;
         crate::shared::inventory::startup_probe(&library, &ids, "step5/weights-loaded",
             crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
     }
@@ -638,6 +639,7 @@ mod tests {
     #[test]
     fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("census.normalize(admission.solved.facts.phase_order)?"));
         assert!(source.contains("args.attention.selected_view = Some(view)"));
         assert!(source.contains("Checkpoint::coordinator_view(&view"));
         assert!(source.contains("read_expert_catalog_view(&view)"));

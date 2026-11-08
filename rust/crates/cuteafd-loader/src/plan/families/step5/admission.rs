@@ -491,6 +491,9 @@ pub fn admit_mtp_with_contract(checkpoint: &Checkpoint, inputs: &RuntimeInputs, 
                 native.immutable = native.immutable.checked_add(immutable)
                     .context("Step-5 predictor weight forecast overflow")?;
                 native.drafter_requests.extend(private_requests.iter().copied());
+                native.vocabulary_heads.extend((0..depth).filter(|stage| !predictor.core.contains_key(
+                    &format!("model.layers.{}.transformer.shared_head.output.weight", cfg.layers + stage)))
+                    .map(|stage| format!("mtp-{stage}")));
                 native.workspace = native.workspace.max(workspace);
             }
             Ok(native)
@@ -606,6 +609,7 @@ mod tests {
                     immutable: 1 << 30,
                     private_requests: vec![1 << 30],
                     drafter_requests: vec![],
+                    vocabulary_heads: vec![],
                     projection_bytes: 0,
                     workspace: 1 << 20
                 };
@@ -740,8 +744,7 @@ mod tests {
                         total.checked_add(owner.bytes()?).context("Step-5 test physical tails overflow")
                     })?;
                 let payload = admission.reservations[rank].pages as u64;
-                let page = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
-                assert_eq!(charged, fixed + hops[rank] + payload.div_ceil(page) * page + tails);
+                assert_eq!(charged, fixed + hops[rank] + payload + tails);
             }
             assert_eq!(admission.ownership.execution().mode(3)?, WHOLE0);
             if ranks == 2 {
@@ -775,6 +778,7 @@ mod tests {
                     immutable: (1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 },
                     private_requests: vec![(1 << 30) + if rank == 0 && predictor { 32 << 30 } else { 0 }],
                     drafter_requests: vec![],
+                    vocabulary_heads: vec![],
                     projection_bytes: 0,
                     workspace: if rank == 0 && predictor { 512 << 20 } else { 1 << 20 },
                 }).collect()
@@ -1024,6 +1028,38 @@ mod tests {
     }
 
     #[test]
+    fn only_bf16_vocabulary_heads_retain_named_blas_owners() -> Result<()> {
+        use crate::placement::planner::{Location, Phase};
+        for native in [false, true] {
+            let fixture = if native { super::super::tests::exl3_snapshot() }
+                else { super::super::tests::snapshot("bf16") };
+            let checkpoint = Checkpoint::open(fixture.path())?;
+            let contract = super::super::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
+            for ranks in [1, 2] {
+                let input = inputs(ranks);
+                for depth in [0, 3] {
+                    let admitted = admit_mtp_with_contract(&checkpoint, &input, depth, &contract)?;
+                    let facts = &admitted.solved.facts;
+                    let handles = facts.allowances.iter().filter(|owner|
+                        owner.source.contains("step5/vocabulary-head-cublas/")).collect::<Vec<_>>();
+                    assert_eq!(handles.len(), if native { 0 } else { depth + 1 });
+                    if !native {
+                        for name in ["target".to_owned()].into_iter().chain((0..depth).map(|i| format!("mtp-{i}"))) {
+                            assert!(handles.iter().any(|owner| owner.source.contains(
+                                &format!("step5/vocabulary-head-cublas/{name} "))));
+                        }
+                    }
+                    let init = facts.allowances.iter().filter(|owner| owner.source.starts_with("BLAS device initialization")
+                        && owner.lifetime.contains(Phase::Growth, facts.phase_order)).collect::<Vec<_>>();
+                    assert_eq!(init.len(), usize::from(!native));
+                    assert!(handles.iter().chain(&init).all(|owner| owner.location == Location::coordinator(0)));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn runtime_request_tails_reference_exact_payload_owners_once() -> Result<()> {
         use crate::placement::planner::{allocation_granularity_forecast, Location};
         let admitted = run(&inputs(2))?;
@@ -1045,7 +1081,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(facts.allocation_granularity.len(), 2);
+        assert_eq!(facts.allocation_granularity.len(), 4);
         for rank in 0..2 {
             assert!(facts.allocation_granularity.iter().any(|owner| owner.location == Location::coordinator(rank)));
         }
@@ -1064,8 +1100,12 @@ mod tests {
         let page = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
         let owner = admitted.solved.facts.allocations.iter()
             .find(|owner| owner.id == "step5.records.0").unwrap();
-        assert_eq!(owner.bytes, payload.div_ceil(page) * page);
-        assert!(owner.bytes >= payload && owner.bytes - payload < page);
+        assert_eq!(owner.bytes, payload);
+        assert_eq!(owner.shape, vec![payload]);
+        let tail = admitted.solved.facts.allocation_granularity.iter()
+            .find(|tail| tail.id == "step5.records.0.tail").unwrap();
+        assert_eq!(tail.backings[0].requests, vec![payload]);
+        assert_eq!(payload + tail.bytes()?, payload.div_ceil(page) * page);
         Ok(())
     }
 
@@ -1082,7 +1122,9 @@ mod tests {
             crate::placement::planner::Phase::Growth && phase.budget == probe.solved.budgets[0].id).unwrap();
         let records = probe.solved.facts.allocations.iter().find(|owner|
             owner.id == "step5.records.0" && owner.location == location).unwrap();
-        let fixed = phase.owned + phase.opaque - records.bytes;
+        let tail = probe.solved.facts.allocation_granularity.iter()
+            .find(|owner| owner.id == "step5.records.0.tail").unwrap().bytes()?;
+        let fixed = phase.owned + phase.opaque - records.bytes - tail;
         let unit = probe.cache.geometry.ranks[0].persistent_unit_bytes;
         let quantum = crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
         let wanted = 22_096;

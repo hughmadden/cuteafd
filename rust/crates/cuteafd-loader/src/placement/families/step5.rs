@@ -44,6 +44,8 @@ struct Figures {
     weights: Vec<Component>,
     /// Physical requests behind fixed logical owners; weight arena tails are separate.
     granularity: Vec<Component>,
+    /// Retained BF16 vocabulary handles only; native heads create none.
+    blas: Vec<Component>,
     /// Residual receive slots, charged by the shared solver apart from `fixed`.
     hops: Vec<u64>,
 }
@@ -64,9 +66,11 @@ impl Figures {
             .context("Step-5 pool geometry rank")?
             .persistent_unit_bytes;
         let pool = pool_physical_bytes(unit, pages)?;
-        let weights = self.weights.iter().chain(&self.granularity).filter(|component| match &component.kind {
+        let weights = self.weights.iter().chain(&self.granularity).chain(&self.blas).filter(|component| match &component.kind {
             ComponentKind::Allocation { template, .. } => template.location == Location::coordinator(rank),
             ComponentKind::AllocationGranularity(owner) => owner.location == Location::coordinator(rank),
+            ComponentKind::Allowance(owner) => owner.location == Location::coordinator(rank)
+                && owner.lifetime.contains(Phase::Growth, PhaseOrder::TARGET_THEN_DRAFT),
             _ => false,
         }).try_fold(0u64, |sum, component| -> Result<u64> {
             sum.checked_add(component.bytes.at(pages)?).context("Step-5 arena charge overflow")
@@ -435,7 +439,14 @@ impl<'a> Step5Recipe<'a> {
                 }, maximum_pages)?);
             }
         }
-        Ok(Figures { cache, marks, fixed, weights, granularity, hops })
+        let heads = native.iter().enumerate().flat_map(|(rank, native)| native.vocabulary_heads.iter()
+            .map(move |head| serving::BlasOwners {
+                name: format!("step5/vocabulary-head-cublas/{head}"), process: "coordinator".into(),
+                location: Location::coordinator(rank as u8), cublas_handles: 1, lt_handles: 1,
+                lifetime: Lifetime::RESIDENT, activation: Activation::always(),
+            })).collect::<Vec<_>>();
+        let blas = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
+        Ok(Figures { cache, marks, fixed, weights, granularity, blas, hops })
     }
 
     /// The live/offline request: explicit CLI values stay strict, zero and
@@ -618,7 +629,7 @@ impl Recipe for Step5Recipe<'_> {
         } else {
             return Err(Refusal::Unsupported);
         }
-        contract.components.extend(self.figures.weights.iter().chain(&self.figures.granularity).cloned());
+        contract.components.extend(self.figures.weights.iter().chain(&self.figures.granularity).chain(&self.figures.blas).cloned());
         for demand in &self.figures.fixed {
             let location = Location::coordinator(demand.gpu);
             let owner = Allocation::buffer(
@@ -808,6 +819,34 @@ impl Step5Recipe<'_> {
                 && solved.pool_tokens >= self.inputs.serving_context.required(),
             "Step-5 resolved execution differs from prepared geometry"
         );
+        // Search prices physical backing bytes; receipts describe the actual cudaMalloc
+        // request and its one separate tail, without changing the selected phase costs.
+        let mut solved = solved.clone();
+        let pages = solved.pool_tokens / self.page_rows;
+        for rank in 0..self.gpus {
+            let id = format!("step5.records.{rank}");
+            let unit = self.figures.cache.geometry.ranks[rank].persistent_unit_bytes;
+            let bytes = unit.checked_mul(pages).context("Step-5 records request overflow")?;
+            if bytes == 0 { continue; }
+            let root = solved.facts.allocations.iter_mut().find(|owner| owner.id == id)
+                .context("Step-5 selected records owner missing")?;
+            ensure!(root.bytes == pool_physical_bytes(unit, pages)?, "Step-5 searched records cost changed");
+            root.bytes = bytes;
+            root.shape = vec![bytes];
+            if bytes > 0 {
+                solved.facts.allocation_granularity.push(AllocationGranularity {
+                    id: format!("{id}.tail"), location: root.location, lifetime: root.lifetime,
+                    backings: vec![GranularityBacking { backing: id, requests: vec![bytes] }],
+                    evidence: GranularityEvidence::Forecast,
+                });
+            }
+        }
+        let phases = evaluate(&solved.facts, &solved.budgets)?;
+        ensure!(phases.len() == solved.phases.len() && phases.iter().zip(&solved.phases).all(|(exact, searched)|
+            exact.budget == searched.budget && exact.phase == searched.phase && exact.available == searched.available
+                && exact.owned.checked_add(exact.opaque) == searched.owned.checked_add(searched.opaque)),
+            "Step-5 selected records refinement changed physical phase costs");
+        solved.phases = phases;
         let onboarded = solved.decisions.onboard_layers.first().cloned().unwrap_or_default();
         ensure!(
             solved.decisions.onboard_layers.iter().all(|layers| *layers == onboarded)

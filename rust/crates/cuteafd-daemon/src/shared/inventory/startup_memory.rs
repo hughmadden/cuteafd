@@ -345,6 +345,71 @@ mod tests {
     }
 
     #[test]
+    fn step5_tp2_target_mtp_embedding_census_normalizes_duplicate_arena_root() -> Result<()> {
+        use crate::shared::{memory::{device::Device, receipts::{Census, Inventory},
+            weight_arena::DeviceWeightArena}, token_io::{EmbedPlacement, EmbedSource, TokenEmbedding}};
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::{placement::{Baseline, GpuBudget, Inventory as PlacementInventory,
+            planner::{Context as ServingContext, CoordinatorDevices, Lifetime}},
+            plan::{checkpoint::Checkpoint, families::step5::admission::{self, HostInputs, MarkRule, RuntimeInputs}},
+            serving_capacity::WeightArenaLayout};
+        let root = tempfile::tempdir()?;
+        let snapshot = root.path().join("snapshot");
+        cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
+        let checkpoint = Checkpoint::open(&snapshot)?;
+        let inputs = RuntimeInputs {
+            host: HostInputs::default(), resident_weight_limit: None,
+            spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+            inventory: PlacementInventory { gpus: vec![GpuBudget { capacity_bytes: 96 << 30,
+                reserve_bytes: 0, baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
+                spark_ranks: 6, peer_access: true },
+            rows: 64, waves: 1, unit: 64, full_prefill_logits: false, sequences: 16,
+            context: 262144, serving_context: ServingContext::pinned(262144), requested_pool: Some(262144),
+            marks: MarkRule { lanes: 16, entries: 0, budget_bytes: 0, host: true },
+            peer_diagnostics: false, pending_code: vec![0; 2], onboard: None,
+        };
+        let admitted = admission::admit_mtp(&checkpoint, &inputs, 3)?;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let ids = [0, 1];
+        let devices = CoordinatorDevices::new(&ids)?;
+        let arena = |rank, id, tensors| DeviceWeightArena::new(Device { library: &library, id: rank },
+            WeightArenaLayout::new(id, tensors)?);
+        let target0 = arena(0, "step5/target/0", vec![("target".into(), 257), ("embedding.table".into(), 64)])?;
+        let target1 = arena(1, "step5/target/1", vec![("target".into(), 258)])?;
+        let mtp = arena(0, "step5/mtp/0", vec![("mtp".into(), 259)])?;
+        let table = root.path().join("embedding.bin");
+        std::fs::write(&table, [0; 64])?;
+        let (embedding, ()) = TokenEmbedding::load_with(&library, EmbedSource { path: table,
+            offset: 0, vocab: 4, hidden: 8, snapshot: None, tensor_name: "model.embed_tokens.weight".into() },
+            EmbedPlacement::Gpu, || Ok(()), |name, bytes| target0.view(name, bytes))?;
+        let mut weights = Inventory::new(devices, "step5.target", Lifetime::RESIDENT, Category::Weights, "step5 weights");
+        target0.view("target", 257)?.inventory(&mut weights, "target0")?;
+        target1.view("target", 258)?.inventory(&mut weights, "target1")?;
+        mtp.view("mtp", 259)?.inventory(&mut weights, "mtp")?;
+        let mut named = Census::default();
+        named.owners(weights.receipts);
+        named.owners(embedding.allocation_receipts(devices, "step5.embedding")?);
+        let roots = named.receipts.iter().filter(|receipt| receipt.allocation.view.is_none())
+            .map(|receipt| (receipt.address as usize, receipt.allocation.bytes as usize)).collect::<std::collections::BTreeSet<_>>();
+        let records = cuteafd_ffi::memory_ledger::allocations().into_iter()
+            .filter(|record| roots.contains(&(record.address, record.bytes))).collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(census(&named, &records, &ids).unwrap_err().to_string(), "duplicate canonical census backing");
+        named.normalize(admitted.solved.facts.phase_order)?;
+        assert_eq!(named.receipts.iter().filter(|receipt| receipt.allocation.view.is_none()).count(), 3);
+        assert_eq!(named.receipts.iter().filter(|receipt| receipt.allocation.view.is_some()).count(), 4);
+        let embedding = named.receipts.iter().find(|receipt| receipt.allocation.id == "step5.embedding.table").unwrap();
+        let view = embedding.allocation.view.as_ref().unwrap();
+        assert_eq!((view.backing.as_str(), view.offset), ("step5/target/0", 512));
+        assert_eq!(census(&named, &records, &ids)?["exact_native_coverage"], true);
+        Ok(())
+    }
+
+    #[test]
     fn pinned_page_union_preserves_requested_extents_without_double_charge() -> Result<()> {
         let make = |address, bytes| AllocationRecord { address, bytes, endpoint: None,
             key: cuteafd_ffi::memory_ledger::Key { tag: crate::shared::memory::TEST, space: Space::Pinned, device: -1, scope: "test",
