@@ -210,8 +210,11 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>, Vec<u6
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        let state = mul(cache.active_state_per_sequence_bytes, inputs.sequences, "V4 state")?
-            + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
+        // Window rings, compressor carry and the per-sequence records unit are
+        // named per-layer physical owners in `Recipe::prepare`; this keeps the
+        // pool-independent replay and lane-table state.
+        let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
+            + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
             crate::serving_capacity::prefill_return_bytes_with_format(inputs.prefill_waves, inputs.prefill_rows,
