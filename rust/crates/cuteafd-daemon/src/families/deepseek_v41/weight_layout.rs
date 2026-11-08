@@ -106,6 +106,79 @@ mod tests {
         Ok(())
     }
 
+    /// The admission switch on the installed checkpoint: every shipped layout
+    /// charges each arena as exactly its root B, a resident claim of B and one
+    /// tail, and the arena holds exactly the device weights the old per-tensor
+    /// charge priced (so B+tail replaces, never stacks on, the payload).
+    #[test]
+    fn installed_arena_charges_replace_per_tensor_weights() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::{owners, resident};
+        use cuteafd_loader::placement::planner::{allocation_granularity_forecast, weight_arena_components,
+            ComponentKind, Lifetime, Location};
+        let Some(snapshot) = super::super::coordinator_golden_tests::snapshot() else { return Ok(()) };
+        let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot)?;
+        let config = serde_json::from_slice(&std::fs::read(catalog.snapshot().join("config.json"))?)?;
+        let charge = |layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, gpu: u8| -> Result<(u64, u64)> {
+            let components = weight_arena_components(layout, Location::coordinator(gpu), Lifetime::RESIDENT, 1)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            ensure!(components.len() == 3, "one root, one claim, one tail");
+            let ComponentKind::Allocation { template: root, deferred, .. } = &components[0].kind else { anyhow::bail!("root") };
+            let ComponentKind::ResidentWeight(claim) = &components[1].kind else { anyhow::bail!("claim") };
+            let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { anyhow::bail!("tail") };
+            let b = layout.bytes() as u64;
+            ensure!(root.id == layout.id() && root.bytes == b && root.view.is_none() && !deferred
+                && root.lifetime == Lifetime::RESIDENT && claim.id == root.id
+                && claim.weights == cuteafd_loader::placement::ResidentWeights(b)
+                && tail.id == format!("{}.tail", layout.id()) && tail.requests() == [b]
+                && tail.backings[0].backing == root.id, "arena components differ from the layout");
+            let tail = tail.bytes().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            ensure!(tail == allocation_granularity_forecast(&[b]).map_err(|e| anyhow::anyhow!("{e:?}"))?);
+            Ok((b, tail))
+        };
+        for (ranks, gpu_embedding) in [(1, false), (1, true), (2, true), (2, false)] {
+            let placement = (ranks == 2).then(CachePlacement::encoder_decoder);
+            for head in [Fp8Head::All, Fp8Head::Off] {
+                // Fp8Head::configured() fixes the old charge's head format.
+                if head != Fp8Head::configured() && head != Fp8Head::All { continue; }
+                let layout = target_layout(&catalog, placement, gpu_embedding, head, false, false)?;
+                let old = resident::resident_headers(&config, catalog.tensors().iter().map(|t| &t.metadata), ranks, false)
+                    .ok_or_else(|| anyhow::anyhow!("unsupported residency"))?;
+                for (rank, arena) in layout.ranks.iter().enumerate() {
+                    let old_bytes = old[rank].iter().filter(|i| owners::is_arena_weight(i)
+                        && (gpu_embedding || i.category != cuteafd_core::memory_layout::Category::Embedding))
+                        .map(|i| i.bytes).sum::<u64>();
+                    let (b, tail) = charge(arena, rank as u8)?;
+                    // The arena holds the old charge's device weights: the same
+                    // payload, laid out with alignment; nothing extra, nothing missing.
+                    if head == Fp8Head::configured() {
+                        ensure!(arena.payload_bytes() as u64 == old_bytes,
+                            "TP{ranks} gpu{rank} embedding={gpu_embedding}: arena payload {} != old charge {old_bytes}",
+                            arena.payload_bytes());
+                    }
+                    eprintln!("V41_CHARGE layout=target TP{ranks} gpu{rank} embedding={gpu_embedding} head={head:?} \
+                        old={old_bytes} new={} B={b} tail={tail} padding={} delta={} rounding=no",
+                        b + tail, arena.padding_bytes(), (b + tail) as i128 - old_bytes as i128);
+                }
+            }
+        }
+        let draft = cuteafd_loader::placement::families::deepseek_v41::weight_layout::draft_layout(&catalog)?;
+        for ranks in [1, 2] {
+            let items = resident::resident_headers(&config, catalog.tensors().iter().map(|t| &t.metadata), ranks, true)
+                .ok_or_else(|| anyhow::anyhow!("unsupported draft residency"))?;
+            // Before this switch the dense draft was charged as its payload and scales;
+            // #1501 added the padding item, so its old charge already equalled B.
+            let old_payload = items[ranks - 1].iter().filter(|i| i.group == "dspark-auxiliary" && i.format != "arena-padding")
+                .map(|i| i.bytes).sum::<u64>();
+            let (b, tail) = charge(&draft, (ranks - 1) as u8)?;
+            ensure!(draft.payload_bytes() as u64 == old_payload, "dSpark dense payload differs from its old charge");
+            eprintln!("V41_CHARGE layout=dspark-dense TP{ranks} gpu{} old_payload={old_payload} old_with_padding={} \
+                new={} B={b} tail={tail} padding={} delta_vs_payload={} delta_vs_padded={} rounding=no",
+                ranks - 1, old_payload + draft.padding_bytes() as u64, b + tail, draft.padding_bytes(),
+                (b + tail) as i128 - old_payload as i128, tail);
+        }
+        Ok(())
+    }
+
     #[test]
     fn vocabulary_retains_only_selected_destinations() -> Result<()> {
         for rows in [64640, 129280] {
