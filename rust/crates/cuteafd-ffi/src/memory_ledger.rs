@@ -498,21 +498,34 @@ pub fn snapshot() -> Snapshot {
 pub struct FailureSnapshot {
     pub ledger: Snapshot,
     pub device_memory: BTreeMap<i32, (usize, usize)>,
+    source: anyhow::Error,
 }
 
 impl std::fmt::Display for FailureSnapshot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("native failure allocation snapshot")
+        std::fmt::Display::fmt(&self.source, formatter)
     }
 }
 
-impl std::error::Error for FailureSnapshot {}
+impl std::error::Error for FailureSnapshot {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source.as_ref()) }
+}
+
+impl FailureSnapshot {
+    pub fn new(source: anyhow::Error, ledger: Snapshot,
+        device_memory: BTreeMap<i32, (usize, usize)>) -> Self {
+        Self { ledger, device_memory, source }
+    }
+}
 
 pub(crate) fn capture_failure(error: anyhow::Error) -> anyhow::Error {
     let ledger = snapshot();
-    let device_memory = ledger.devices().into_iter()
-        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect();
-    error.context(FailureSnapshot { ledger, device_memory })
+    // Error reporting must not change the failing thread's selected device.
+    let devices = ledger.devices();
+    let device_memory = std::thread::spawn(move || devices.into_iter()
+        .filter_map(|device| device_memory(device).map(|memory| (device, memory))).collect())
+        .join().unwrap_or_default();
+    anyhow::Error::new(FailureSnapshot::new(error, ledger, device_memory))
 }
 
 fn loaded_cuda_runtime() -> Option<&'static libloading::os::unix::Library> {

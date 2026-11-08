@@ -190,12 +190,17 @@ mod budget_tests {
             .with_writer(move || writer.clone()).finish();
         tracing::subscriber::with_default(subscriber, || {
             assert_eq!(finish(Ok(7)).unwrap(), 7);
-            assert!(finish::<()>(Err(anyhow::anyhow!("startup fixture failure"))).is_err());
+            let failure = memory_ledger::FailureSnapshot::new(
+                anyhow::anyhow!("startup fixture failure"), memory_ledger::Snapshot::default(), BTreeMap::new());
+            let wrapped = anyhow::Error::new(crate::shared::experts::rtx::push::policy::PushStartupError::Planning(
+                anyhow::Error::new(failure))).context("family initialization");
+            assert!(finish::<()>(Err(wrapped)).is_err());
         });
         let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
         assert_eq!(text.matches("memory ledger").count(), 1, "{text}");
         assert!(text.contains(r#""stage":"failure""#), "{text}");
         assert!(text.contains("startup fixture failure"), "{text}");
+        assert!(text.contains(r#""pre_unwind":true"#), "{text}");
     }
 
     #[test]
