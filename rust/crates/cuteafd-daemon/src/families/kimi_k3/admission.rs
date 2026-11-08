@@ -2026,11 +2026,13 @@ pub(super) mod tests {
         let manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.path().join("config.json"))?)?;
         let cfg = KimiK3Config::from_hf(&config)?;
-        let expected = (0..cfg.layers).try_fold(GlobalLayout::pair(&cfg)?[0].bytes()? as u64,
-            |sum, layer| -> Result<_> {
-                sum.checked_add(LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit)?[0].bytes()? as u64)
-                    .context("native rank-zero resident weights overflow")
-            })?;
+        let globals = cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout::pair(&cfg)?;
+        let layers = (0..cfg.layers).map(|layer|
+            cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit))
+            .collect::<Result<Vec<_>>>()?;
+        let arena = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(0,
+            &globals[0], &layers.iter().map(|pair| &pair[0]).collect::<Vec<_>>())?;
+        let expected = arena.bytes() as u64;
         for (gib, accepted) in [(80u64, true), (1, false)] {
             let cli = crate::cli::Cli::try_parse_from([
                 "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
