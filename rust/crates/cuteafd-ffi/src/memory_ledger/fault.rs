@@ -8,8 +8,11 @@ const LIMITS: &[&str] = &[
     "plan: unavailable: accepted-plan registration not captured in this version",
     "arenas: partial: shared coordinator weight arenas only; native/private arenas not registered",
     "inputs: partial: daemon values; launcher provenance and unresolved family defaults not captured in this version",
-    "kv: unavailable: live pool capacity/page geometry not registered in this version",
-    "memory: partial: CUDA physical free/total only; opaque library allocations cannot be enumerated",
+    "kv: partial: resolved planner capacity/page geometry in inputs where available; live pool occupancy not captured in this version",
+    "memory: partial: CUDA physical free/total and current-pool telemetry; opaque library allocations cannot be enumerated",
+    "capture: partial: eight preopened reports per process; concurrent capture may retain only a stderr trigger; interrupted/disk-full files may be incomplete",
+    "identity: partial: host/role/thread/PID recorded; build/checkpoint/UUID provenance not captured in this version",
+    "trigger: partial: raw native API code recorded; translated ABI status remains in typed error chain, not the pre-cleanup JSON",
     "memory: unavailable: NVML/graph/host extensions not captured in this version",
     "workers: unavailable: Spark worker delivery not captured in this version",
     "ledger: partial: instrumented Rust/native backings only; third-party private allocations are opaque",
@@ -202,7 +205,9 @@ impl Serialize for Growth<'_> {
 type GetDevice = unsafe extern "C" fn(*mut i32) -> i32;
 type SetDevice = unsafe extern "C" fn(i32) -> i32;
 type MemInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
-struct CudaQueries { get: GetDevice, set: SetDevice, info: MemInfo }
+type GetPool = unsafe extern "C" fn(*mut *mut std::ffi::c_void, i32) -> i32;
+type PoolAttribute = unsafe extern "C" fn(*mut std::ffi::c_void, i32, *mut std::ffi::c_void) -> i32;
+struct CudaQueries { get: GetDevice, set: SetDevice, info: MemInfo, pool: Option<GetPool>, attribute: Option<PoolAttribute> }
 fn cuda_queries() -> Option<&'static CudaQueries> {
     static QUERIES: OnceLock<CudaQueries> = OnceLock::new();
     if let Some(queries) = QUERIES.get() { return Some(queries); }
@@ -210,16 +215,25 @@ fn cuda_queries() -> Option<&'static CudaQueries> {
     // SAFETY: symbols are the documented CUDA runtime query signatures and the
     // already-loaded DSO is retained for the lifetime of the process.
     let queries = unsafe { CudaQueries { get: *runtime.get::<GetDevice>(b"cudaGetDevice").ok()?,
-        set: *runtime.get::<SetDevice>(b"cudaSetDevice").ok()?, info: *runtime.get::<MemInfo>(b"cudaMemGetInfo").ok()? } };
+        set: *runtime.get::<SetDevice>(b"cudaSetDevice").ok()?, info: *runtime.get::<MemInfo>(b"cudaMemGetInfo").ok()?,
+        pool: runtime.get::<GetPool>(b"cudaDeviceGetMemPool").ok().map(|symbol| *symbol),
+        attribute: runtime.get::<PoolAttribute>(b"cudaMemPoolGetAttribute").ok().map(|symbol| *symbol) } };
     Some(QUERIES.get_or_init(|| queries))
 }
 #[derive(Serialize)]
-struct Observation { device: i32, free_bytes: Option<usize>, total_bytes: Option<usize>, status: &'static str, raw_status: Option<i32> }
+struct PoolObservation { bytes: [Option<u64>; 4], raw_status: [Option<i32>; 4], status: &'static str }
+impl PoolObservation {
+    fn unavailable() -> Self { Self { bytes: [None; 4], raw_status: [None; 4], status: "unavailable: CUDA current-pool API unsupported, skipped, or failed" } }
+}
+#[derive(Serialize)]
+struct Observation { device: i32, free_bytes: Option<usize>, total_bytes: Option<usize>, status: &'static str, raw_status: Option<i32>,
+    cuda_current_pool: PoolObservation }
 fn observe(device: i32, sticky: bool) -> Observation {
-    let unavailable = |reason| Observation { device, free_bytes: None, total_bytes: None, status: reason, raw_status: None };
+    let unavailable = |reason| Observation { device, free_bytes: None, total_bytes: None, status: reason, raw_status: None, cuda_current_pool: PoolObservation::unavailable() };
     if sticky { return unavailable("unavailable: context lost or sticky CUDA error; follow-up skipped"); }
     let Some(q) = cuda_queries() else { return unavailable("unavailable: CUDA runtime query API unsupported or not loaded"); };
     let (mut previous, mut free, mut total) = (-1, 0, 0);
+    let mut pool = PoolObservation::unavailable();
     // SAFETY: stack outputs are valid; only current/already-ledger-tracked
     // devices are queried. Restore selection even when the query fails.
     unsafe {
@@ -227,10 +241,23 @@ fn observe(device: i32, sticky: bool) -> Observation {
         if status != 0 { return Observation { raw_status: Some(status), ..unavailable("unavailable: cudaGetDevice failed") }; }
         let status = if device == previous { 0 } else { (q.set)(device) };
         let status = if status == 0 { (q.info)(&mut free, &mut total) } else { status };
+        if status == 0 { if let (Some(get_pool), Some(attribute)) = (q.pool, q.attribute) {
+            let mut handle = std::ptr::null_mut();
+            if get_pool(&mut handle, device) == 0 && !handle.is_null() {
+                for (index, id) in [5, 6, 7, 8].into_iter().enumerate() {
+                    let mut bytes = 0u64;
+                    let status = attribute(handle, id, (&mut bytes as *mut u64).cast());
+                    pool.raw_status[index] = Some(status);
+                    pool.bytes[index] = (status == 0).then_some(bytes);
+                }
+                pool.status = if pool.bytes.iter().all(Option::is_some) { "available: reserved_current,reserved_high,used_current,used_high bytes; physical telemetry, not additional ownership" }
+                    else { "partial: CUDA pool attribute query failed; null means unknown" };
+            }
+        } }
         let restored = if device != previous { (q.set)(previous) } else { 0 };
         if status != 0 || restored != 0 { return Observation { raw_status: Some(if status != 0 { status } else { restored }), ..unavailable("unavailable: CUDA memory query or selection restore failed") }; }
     }
-    Observation { device, free_bytes: Some(free), total_bytes: Some(total), status: "available: raw cudaMemGetInfo; device-wide, includes other processes", raw_status: Some(0) }
+    Observation { device, free_bytes: Some(free), total_bytes: Some(total), status: "available: raw cudaMemGetInfo; device-wide, includes other processes; GB10 reclaimable page cache is not allocatable headroom here", raw_status: Some(0), cuda_current_pool: pool }
 }
 
 fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureReport>> {
@@ -243,14 +270,17 @@ fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureRepor
     let mut devices = [-1i32; 32];
     let mut device_count = 0;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let mut out = Buffered { file: &mut file, buffer: service.scratch.as_mut_slice(), used: 0 };
+        let Service { scratch, host, role, .. } = &mut *service;
+        let mut out = Buffered { file: &mut file, buffer: scratch.as_mut_slice(), used: 0 };
         // Core records go first. No CUDA query runs while the ledger is locked.
         {
             let ledger = state().lock().map_err(|_| io::Error::other("ledger lock poisoned"))?;
             let data = attachments().lock().map_err(|_| io::Error::other("attachments lock poisoned"))?;
             out.write_all(b"{\"schema_version\":1,\"identity\":")?;
-            #[derive(Serialize)] struct Identity<'a> { utc: &'a str, pid: u32, pre_native_cleanup: bool }
-            serde_json::to_writer(&mut out, &Identity { utc: &timestamp, pid: std::process::id(), pre_native_cleanup: before_cleanup })?;
+            #[derive(Serialize)] struct ThreadIdentity<'a> { utc: &'a str, pid: u32, host: &'a str, role: &'a str, thread: u64, pre_native_cleanup: bool }
+            // SAFETY: gettid reads the calling Linux thread's identity without allocation.
+            let thread = unsafe { libc::syscall(libc::SYS_gettid) } as u64;
+            serde_json::to_writer(&mut out, &ThreadIdentity { utc: &timestamp, pid: std::process::id(), host, role, thread, pre_native_cleanup: before_cleanup })?;
             out.write_all(b",\"trigger\":")?;
             CONTEXT.with(|context| -> Result<(), serde_json::Error> {
                 let context = context.borrow();

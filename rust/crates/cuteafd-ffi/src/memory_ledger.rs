@@ -336,14 +336,14 @@ fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint:
     let caller = std::panic::Location::caller();
     let site = CONTEXT.with(|context| context.borrow().site).unwrap_or(caller);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(existing) = state.live.get_mut(&ptr) {
-        if existing.bytes == bytes && existing.key == key {
-            // The raw native allocation event may precede its Rust wrapper's
-            // ownership registration; it is one backing, not pointer reuse.
-            if endpoint.is_some() { existing.endpoint = endpoint; }
+    if endpoint.is_some() { if let Some(existing) = state.live.get_mut(&ptr) {
+        if existing.endpoint.is_none() && existing.bytes == bytes && existing.key == key {
+            // Only endpoint ownership enrichment deduplicates the raw pinned
+            // event; ordinary repeated addresses retain pointer-reuse history.
+            existing.endpoint = endpoint;
             return;
         }
-    }
+    } }
     let warn = key.scope == "other" && matches!(space, Space::Device | Space::Pinned | Space::Managed)
         && state.unscoped_sites.insert(site);
     if let (Some(name), Some(format)) = (name, key.format) {
