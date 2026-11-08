@@ -28,6 +28,7 @@
 use super::engine::{history_of, Allocator, Qwen4Engine, Qwen4Placement, BLOCK, INDEX_DIM, PAGE_ROWS,
     UNIT_ROWS};
 use crate::shared::memory::device::{Allocation, Device};
+use crate::shared::memory::Tag;
 use std::rc::Rc;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
@@ -95,7 +96,7 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         let arenas = if slots == 0 { Vec::new() } else {
             mark_layout.owners.iter().map(|&(id, bytes)| {
                 let bytes = slots.checked_mul(bytes).context("Qwen mark arena overflow")?;
-                Allocation::untagged(Device { library: engine.library, id }, bytes).map(Rc::new)
+                Allocation::new(Device { library: engine.library, id }, bytes, Tag::prefix("qwen4/prefix-marks")).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         };
         let streams = engine.owner_streams();

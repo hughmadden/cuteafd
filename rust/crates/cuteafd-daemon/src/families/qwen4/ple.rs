@@ -5,7 +5,7 @@
 //!
 //! Shards stay mapped; each step gathers rows into a shared pinned token-table pipeline.
 use crate::shared::mapped_table::MappedTableDevice;
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::NativeLibrary;
@@ -94,7 +94,7 @@ impl<'a> PleTable<'a> {
         } else {
             1.0
         };
-        let scale_dev = DeviceAllocation::untagged(library, 256)?;
+        let scale_dev = DeviceAllocation::new(library, 256, Tag::tables("qwen4/ple-scale"))?;
         library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: 4, ..scale_dev.buffer }, &scale.to_le_bytes())?;
         let started = Instant::now();
         let tensors: Vec<_> = shards.iter().map(|s| (s.shard.as_str(), &s.meta)).collect();

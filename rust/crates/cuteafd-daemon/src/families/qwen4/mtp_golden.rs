@@ -4,7 +4,7 @@
 use super::engine::{Allocator, MtpGroup, MtpOut, MtpRow, MtpSource, MtpTokens, Qwen4Engine, Qwen4Placement, DECODE_ROWS};
 use super::speculate::{self, DraftSeq, DraftTiming, MtpSeq, Verified};
 use super::{bf16s, similarity, GoldenArgs, Opened};
-use crate::shared::memory::DeviceAllocation;
+use crate::shared::memory::{DeviceAllocation, Tag};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -36,7 +36,7 @@ pub(super) fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &Qwen4Engin
     let streams = std::fs::read(args.golden.join(format!("layer{last:02}.bin")))?;
     let row = 4 * h * 2;
     ensure!(streams.len() == t * row, "golden layer {last} streams do not match the tokens");
-    let source = DeviceAllocation::untagged(&opened.library, streams.len())?;
+    let source = DeviceAllocation::new(&opened.library, streams.len(), Tag::staging("qwen4/golden-streams"))?;
     opened.library.copy_h2d(source.buffer, &streams)?;
     let ref_streams = std::fs::read(dir.join("mtp_streams.bin"))?;
     let ref_argmax = words(&dir.join("mtp_argmax.bin"))?;

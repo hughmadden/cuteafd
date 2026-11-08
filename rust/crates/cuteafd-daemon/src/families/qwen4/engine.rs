@@ -23,7 +23,7 @@
 use super::weights::{Qwen4Head, Qwen4Layer, Qwen4Weights};
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
-use crate::shared::memory::HostAllocation;
+use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::qwen::{GdnBank, LayerStateMap, REPLAY_ROWS};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner};
 use std::rc::Rc;
@@ -1011,8 +1011,8 @@ impl<'a> QwenTp2<'a> {
         }
         let layout = Tp2Rows::new(hidden, topk, max_rows, wire, experts[0].partial())?;
         let devices = ranks.map(|rank| Device { library, id: rank.device });
-        let zero = |rank: usize, bytes| -> Result<Allocation<'a>> {
-            let allocation = Allocation::untagged(devices[rank], bytes)?;
+        let zero = |rank: usize, bytes, tag| -> Result<Allocation<'a>> {
+            let allocation = Allocation::new(devices[rank], bytes, tag)?;
             devices[rank].run(|| library.cuda_zero_bytes(allocation.buffer, bytes))?;
             Ok(allocation)
         };
@@ -1023,8 +1023,12 @@ impl<'a> QwenTp2<'a> {
                 decode.transfer_bytes()
             })?;
         let combine = [devices[0].run(|| library.rtx_tp2_combine())?, devices[1].run(|| library.rtx_tp2_combine())?];
-        let send = [zero(0, layout.bytes)?, zero(1, layout.bytes)?];
-        let reduced = [zero(0, layout.reduction_bytes)?, zero(1, layout.reduction_bytes)?];
+        // Local wire-packing scratch for this rank's routed rows, and the reduce output of both
+        // ranks' partials. The exchange's own landing slots are the transport backing.
+        let send = [zero(0, layout.bytes, Tag::workspace("qwen4/tp2-send"))?,
+            zero(1, layout.bytes, Tag::workspace("qwen4/tp2-send"))?];
+        let reduced = [zero(0, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?,
+            zero(1, layout.reduction_bytes, Tag::workspace("qwen4/tp2-reduce"))?];
         let mut tp2 = Self { library, ranks: devices, experts: std::mem::ManuallyDrop::new(experts),
             exchange: std::mem::ManuallyDrop::new(exchange), combine, send, reduced,
             hidden, topk, max_rows, wire, layout };
@@ -1360,8 +1364,8 @@ impl<'a> Qwen4Engine<'a> {
                 }
             }
         }
-        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = Rc::new(Allocation::untagged(Device { library, id: library.cuda_get_device()? }, bytes.max(256))?);
+        let zeroed = |bytes: usize, tag: Tag| -> Result<Dev<'a>> {
+            let allocation = Rc::new(Allocation::new(Device { library, id: library.cuda_get_device()? }, bytes.max(256), tag)?);
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1377,9 +1381,9 @@ impl<'a> Qwen4Engine<'a> {
             let _layer_scope = device.enter()?;
             match layer.attention {
                 Qwen4Attention::Full => {
-                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes)?));
-                    index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
-                        zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)));
+                    kv.push(Some(zeroed(pages * PAGE_ROWS * kv_record_bytes, Tag::kv("qwen4/kv-records"))?));
+                    index.push(Some((zeroed(pages * PAGE_ROWS * INDEX_DIM * 2, Tag::kv("qwen4/kv-index-keys"))?,
+                        zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2, Tag::kv("qwen4/kv-pool-keys"))?)));
                 }
                 Qwen4Attention::Gdn => {
                     kv.push(None);
@@ -1402,15 +1406,18 @@ impl<'a> Qwen4Engine<'a> {
         }
         let (ple_state, ple_replay) = if weights.layers.len() > cfg.ple_layers.first().copied().unwrap_or(usize::MAX) {
             let _ple_scope = ranks[ple_owner.context("Qwen PLE state owner")?].0.enter()?;
-            (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2)?),
-             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2)?))
+            (Some(zeroed(slots * PLE_STATE_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-state"))?),
+             Some(zeroed(REPLAY_ROWS * cfg.hc_width() * 2, Tag::kv("qwen4/ple-replay"))?))
         } else {
             (None, None)
         };
+        // The MTP layer's own attention cache and its per-slot stash of target
+        // rows (snapshotted with the rest of a slot's state) are drafter state.
         let (mtp_kv, mtp_pending) = if weights.mtp.is_some() {
-            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes)?, zeroed(pages * PAGE_ROWS * INDEX_DIM * 2)?,
-                zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2)?)),
-             Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2)?))
+            (Some((zeroed(pages * PAGE_ROWS * kv_record_bytes, Tag::drafter_kv("qwen4/mtp-kv-records"))?,
+                zeroed(pages * PAGE_ROWS * INDEX_DIM * 2, Tag::drafter_kv("qwen4/mtp-kv-index-keys"))?,
+                zeroed(pool_pages * PAGE_ROWS * INDEX_DIM * 2, Tag::drafter_kv("qwen4/mtp-kv-pool-keys"))?)),
+             Some(zeroed(slots * MTP_PENDING_ROWS * HC * cfg.hidden * 2, Tag::drafter_kv("qwen4/mtp-stash"))?))
         } else {
             (None, None)
         };
@@ -1426,7 +1433,7 @@ impl<'a> Qwen4Engine<'a> {
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
-            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
+            mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
@@ -2135,8 +2142,13 @@ impl<'a> Qwen4Engine<'a> {
         }
     }
 
+    /// Per-step scratch of the executing step's workspace.
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        Ok(Rc::new(Allocation::untagged(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256))?))
+        self.alloc_tagged(bytes, Tag::workspace("qwen4/step-workspace"))
+    }
+
+    fn alloc_tagged(&self, bytes: usize, tag: Tag) -> Result<Dev<'a>> {
+        Ok(Rc::new(Allocation::new(Device { library: self.library, id: self.library.cuda_get_device()? }, bytes.max(256), tag)?))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2214,7 +2226,7 @@ impl<'a> Qwen4Engine<'a> {
                     let n = t * self.cfg.ple_rows();
                     let local = self.alloc(n * 8)?;
                     self.put(&local, &(0..n as i64).collect::<Vec<i64>>())?;
-                    Some((self.alloc(n * ple.row_bytes)?, local))
+                    Some((self.alloc_tagged(n * ple.row_bytes, Tag::staging("qwen4/ple-gather-rows"))?, local))
                 }
                 None => None,
             },
@@ -2243,7 +2255,8 @@ impl<'a> Qwen4Engine<'a> {
             argmax: self.alloc(logit_rows * 8)?,
             ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
-            logits_host: RefCell::new(HostAllocation::untagged(self.library, usize::try_from(host.logits)?)?),
+            logits_host: RefCell::new(HostAllocation::new(self.library,
+                usize::try_from(host.logits)?, Tag::staging("qwen4/logits-host"))?),
             staging: RefCell::new(crate::shared::token_table::RetainedUploads::new(
                 Device { library: self.library, id: self.library.cuda_get_device()? }, host.uploads)?),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
