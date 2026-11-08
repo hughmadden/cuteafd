@@ -1080,6 +1080,13 @@ def check(rc):
     if rc: raise RuntimeError('CUDA/NVML status '+str(rc))
 check(nv.nvmlInit_v2())
 devices=[int(x) for x in os.environ['CARD_GPUS'].split(',')]
+# CDI filters numeric CUDA enumeration; UUIDs keep host identity and arm order.
+uuids=[]
+for physical in devices:
+    handle=c.c_void_p(); check(nv.nvmlDeviceGetHandleByIndex_v2(physical,c.byref(handle)))
+    uuid=c.create_string_buffer(96); check(nv.nvmlDeviceGetUUID(handle,uuid,len(uuid)))
+    uuids.append(uuid.value.decode('ascii'))
+os.environ['CUDA_VISIBLE_DEVICES']=','.join(uuids)
 for i in range(len(devices)):
     check(cuda.cudaSetDevice(i)); check(cuda.cudaFree(c.c_void_p()))
 while True:

@@ -3795,6 +3795,54 @@ def test_spark_teardown_kills_all_before_reaping(entry, tmp_path, monkeypatch):
     assert all(child.stdin.closed for child in children)
 
 
+@pytest.mark.parametrize('devices', [[1], [1, 0]])
+def test_sampler_uses_host_uuids_before_cuda_in_cdi_filtered_container(monkeypatch, capsys, devices):
+    import ctypes
+    events = []
+    uuids = ','.join(f'GPU-host-{device}' for device in devices)
+    monkeypatch.setenv('CARD_GPUS', ','.join(map(str, devices)))
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', ','.join(map(str, devices)))
+
+    def handle_by_index(index, handle):
+        handle._obj.value = index + 1
+        events.append(('nvml', index))
+        return 0
+
+    def uuid(handle, buffer, size):
+        buffer.value = f'GPU-host-{handle.value - 1}'.encode()
+        return 0
+
+    def cuda_device(index):
+        # Numeric host ordinal 1 does not exist after CDI filters to one card.
+        assert os.environ['CUDA_VISIBLE_DEVICES'] == uuids
+        assert index < len(devices)
+        events.append(('cuda', index))
+        return 0
+
+    def memory(free, total):
+        free._obj.value, total._obj.value = 100, 200
+        return 0
+
+    def processes(handle, count, rows):
+        count._obj.value = 1
+        rows[0].pid, rows[0].usedGpuMemory = os.getpid(), 20
+        return 0
+
+    nv = SimpleNamespace(nvmlInit_v2=lambda: 0, nvmlDeviceGetHandleByIndex_v2=handle_by_index,
+        nvmlDeviceGetUUID=uuid, nvmlDeviceGetHandleByPciBusId_v2=lambda *args: 0,
+        nvmlDeviceGetComputeRunningProcesses_v3=processes)
+    cuda = SimpleNamespace(cudaSetDevice=cuda_device, cudaFree=lambda *args: 0,
+        cudaMemGetInfo=memory, cudaDeviceGetPCIBusId=lambda *args: 0)
+    monkeypatch.setattr(ctypes, 'CDLL', lambda name: nv if name == 'libnvidia-ml.so.1' else cuda)
+    monkeypatch.setattr(time, 'sleep', lambda _: (_ for _ in ()).throw(InterruptedError()))
+    with pytest.raises(InterruptedError):
+        exec(cards.CUDA_SAMPLER, {})
+    sample = json.loads(capsys.readouterr().out)
+    assert [row['gpu'] for row in sample['devices']] == devices
+    assert all(row['sampler_bytes'] == 20 for row in sample['devices'])
+    assert events[:len(devices)] == [('nvml', device) for device in devices]
+
+
 def test_observer_context_handoff_is_measured_atomic_and_logical(entry, tmp_path):
     entry.update(gpus=[1, 0], sparks=[], set={'SPARK_COUNT': '0'})
     job = cards.generate(entry, 'candidate', dict(instance='observer-context', slot='s'),
