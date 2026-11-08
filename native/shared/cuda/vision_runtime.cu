@@ -1,4 +1,5 @@
 #include "memory_failure.h"
+#include "blas_owner.h"
 // Resident owner and preallocated MiMo driver. Pointwise/attention arithmetic
 // is donated from Hugh Madden's mimo26f-afd v1.3.0 (see vision.cu).
 #include "vision.cu"

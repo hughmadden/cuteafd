@@ -148,6 +148,14 @@ def test_blas_handle_diagnostics_log_only_after_successful_creation():
     assert "CUTEAFD_TRACK_ALLOC" in linear and "CUTEAFD_TRACK_FREE" in linear
 
 
+def test_blas_borrowers_include_the_pool_header_directly():
+    borrowers = [path for path in (ROOT / "native").rglob("*.cu")
+                 if "cuteafd::borrow_blas(" in path.read_text()]
+    assert borrowers
+    for path in borrowers:
+        assert '#include "blas_owner.h"' in path.read_text(), str(path.relative_to(ROOT))
+
+
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/serve.rs").read_text()
     replay = source.split("let logits = if cold_replay_decode(", 1)[1].split(
