@@ -136,16 +136,17 @@ fn drafter_owners_track_pages_and_lower_the_compiled_extent() {
     assert_eq!(owner("draft.kv.0").lifetime, Lifetime { first: Phase::DraftLoad, last: Phase::Growth });
     assert!(plan.facts.resident_weights.contains(&ResidentWeight { id: "qwen3_5/mtp/gpu0".into(),
         location: Location::coordinator(0), weights: ResidentWeights(1280) }));
-    // Draft KV is a page-linear extent, so a smaller explicit pool pays for
-    // fewer pages rather than a fixed full-context reservation; its one
-    // cudaMalloc still rounds to the SM120 backing granularity.
-    let mut smaller = request();
-    smaller.context = (4 * PAGE_ROWS).into();
-    smaller.pool = Pin::Exact(4 * PAGE_ROWS);
-    let small = admit(smaller, budgets(), input).unwrap();
-    assert_eq!(small.pool_tokens, 4 * PAGE_ROWS);
-    assert_eq!(small.facts.allocations.iter().find(|owner| owner.id == "draft.kv.0").unwrap().bytes,
-        (4 * 4096u64).div_ceil(SM120_ALLOCATION_GRANULARITY_BYTES) * SM120_ALLOCATION_GRANULARITY_BYTES);
+    // Direct cudaMalloc requests through 1 MiB share driver blocks (#1607);
+    // only larger requests own a rounded 2 MiB backing, not a full-context pool.
+    for (pages, expected) in [(4, 16_384), (256, 1_048_576), (257, 2_097_152)] {
+        let mut smaller = request();
+        smaller.context = (pages * PAGE_ROWS).into();
+        smaller.pool = Pin::Exact(pages * PAGE_ROWS);
+        let small = admit(smaller, budgets(), input.clone()).unwrap();
+        assert_eq!(small.pool_tokens, pages * PAGE_ROWS);
+        assert_eq!(small.facts.allocations.iter().find(|owner| owner.id == "draft.kv.0").unwrap().bytes,
+            expected, "{pages} draft KV pages");
+    }
 }
 
 fn owned_rest() -> u64 { 4096 - 1024 }
