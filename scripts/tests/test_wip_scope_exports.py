@@ -1,7 +1,9 @@
 """WIP builds export only what their scope's cards run: V4.1 and vision follow the scope (CPU only)."""
 from __future__ import annotations
 
+import importlib.util
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -193,7 +195,9 @@ def source_copy(tmp_path):
              'scripts/build/kernel-records.py', 'scripts/build/compare-sm-exports.py',
              'scripts/build/export-placement-inputs.py', 'scripts/build/build-wip-artifacts.sh',
              'python/tools/aot/export_b12x_dsv4_aot.py', 'python/tools/lib/spark_packages.py',
-             'native/CMakeLists.txt', 'third_party/sparkinfer.lock.json']
+             'native/CMakeLists.txt', 'third_party/sparkinfer.lock.json',
+             'rust/crates/cuteafd-core/src/concurrency.rs', 'rust/crates/cuteafd-core/src/dspark_verify.rs',
+             'rust/crates/cuteafd-core/src/serving_capacity.rs', 'rust/crates/cuteafd-core/src/lib.rs']
     for name in files:
         (source / name).parent.mkdir(parents=True, exist_ok=True)
         (source / name).write_bytes((ROOT / name).read_bytes())
@@ -204,7 +208,8 @@ def source_copy(tmp_path):
 
 
 @pytest.mark.parametrize('name', ['scripts/build/kernel-records.py', 'scripts/build/compare-sm-exports.py',
-                                  'scripts/build/export-placement-inputs.py', 'python/tests/test_fixture.py'])
+                                  'scripts/build/export-placement-inputs.py', 'python/tests/test_fixture.py',
+                                  'rust/crates/cuteafd-core/src/lib.rs'])
 def test_non_input_tooling_leaves_the_native_key_unchanged(source_copy, tmp_path, name):
     before = native_key(source_copy, tmp_path)
     with (source_copy / name).open('a') as handle:
@@ -214,12 +219,31 @@ def test_non_input_tooling_leaves_the_native_key_unchanged(source_copy, tmp_path
 
 @pytest.mark.parametrize('name', ['python/tools/aot/export_b12x_dsv4_aot.py', 'python/tools/lib/spark_packages.py',
                                   'native/CMakeLists.txt', 'scripts/build/build-wip-artifacts.sh',
-                                  'scripts/build/kernel-input-rules.json'])
+                                  'scripts/build/kernel-input-rules.json',
+                                  'rust/crates/cuteafd-core/src/concurrency.rs',
+                                  'rust/crates/cuteafd-core/src/dspark_verify.rs',
+                                  'rust/crates/cuteafd-core/src/serving_capacity.rs'])
 def test_exporter_and_build_inputs_change_the_native_key(source_copy, tmp_path, name):
     before = native_key(source_copy, tmp_path)
     with (source_copy / name).open('a') as handle:
         handle.write('\n')
     assert native_key(source_copy, tmp_path) != before
+
+
+def test_native_key_covers_every_rust_source_the_native_build_reads():
+    # A Rust file CMake or an exporter reads for shared constants is an export
+    # input: missing from the key, editing it would restore stale exports.
+    spec = importlib.util.spec_from_file_location('native_key_files', ROOT / 'scripts/build/native-key-files.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    referenced = set()
+    pattern = re.compile(r'rust/crates/[A-Za-z0-9_./-]+\.rs')
+    for tree in ('native', 'python/tools/aot', 'python/tools/lib'):
+        for path in (ROOT / tree).rglob('*'):
+            if path.suffix in ('.txt', '.cmake', '.py') and '/tests/' not in path.as_posix():
+                referenced.update(pattern.findall(path.read_text()))
+    assert referenced, 'expected the native build to read Rust constants'
+    assert referenced <= set(module.EXTERNAL_INPUTS), sorted(referenced - set(module.EXTERNAL_INPUTS))
 
 
 def test_shipped_v4_pro_k2_config_scopes_the_k23_package_the_launcher_loads():
