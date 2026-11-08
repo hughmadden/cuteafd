@@ -24,7 +24,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.norm.get("norm.weight")?.device_id == buffers[0].buffer.device_id, "target norm device differs");
         Ok(Self { stream: LoadStream { library: lib, raw: lib.cuda_stream_create()? },
-            buffers, weights, hc: lib.v41_hc()?, graphs: crate::shared::decode_graph::RowGraphs::new(lib, "target_norm", capacity) })
+            buffers, weights, hc: lib.v41_hc()?, graphs: crate::shared::decode_graph::RowGraphs::new(lib, "target_norm", capacity, "deepseek_v41") })
     }
     unsafe fn enqueue(&self, rows: usize) -> Result<()> {
         unsafe {

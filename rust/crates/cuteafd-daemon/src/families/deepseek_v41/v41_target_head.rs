@@ -113,7 +113,7 @@ impl<'a> TargetHeadWeights<'a> {
             weights: self,
             head,
             capacity,
-            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
+            graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity, "deepseek_v41"),
             fp8_scratch: native,
             ready: None,
             origin: None,

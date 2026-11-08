@@ -8,7 +8,7 @@ pub(crate) use binding::BindingGraphs;
 mod watch;
 pub(crate) use watch::CaptureWatch;
 pub(crate) use native::{LayerGraphs, RowGraphs, LARGE_SHAPES};
-pub(crate) use bank::{missing_variants, note_missing, GraphBank, GraphDecision, GraphPolicy, GraphStats};
+pub(crate) use bank::{missing_variants, note_eager, GraphBank, GraphDecision, GraphPolicy, GraphStats};
 pub(crate) use owner::GraphOwner;
 
 pub(crate) fn fatal_drain(result: anyhow::Result<()>, site: &str) {

@@ -173,7 +173,7 @@ impl<'a> BackboneSharedWeights<'a> {
             storage, window: RowWindow::NONE,
             layer: self.layer,
             capacity,
-            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41"),
             weights: self,
             ready: None,
             origin: None,

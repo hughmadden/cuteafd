@@ -193,7 +193,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         ensure!(weights.tensors.get(&weights.names[0])?.device_id == storage.output.buffer.device_id,
             "Engram weights and storage devices differ");
         Ok(Self { capacity: storage.unit, storage, weights, window: RowWindow::NONE,
-            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS), ready_rows: None })
+            graphs: RowGraphs::new(weights.library, "engram", cuteafd_core::V41_VERIFY_ROWS, "deepseek_v41"), ready_rows: None })
     }
     /// Slot reuse, including all cross-stream readers, is drained by the caller.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {

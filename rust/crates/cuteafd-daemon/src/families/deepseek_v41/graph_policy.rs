@@ -113,7 +113,7 @@ mod tests {
         let input = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize);
+        let mut bank = RowGraphs::new(&library, "fixture", MAX_DECODE_ROWS as usize, "deepseek_v41");
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS as usize)
             .chain([80, 128, 2, 6, 96, 3, 48, 64, 56, 63, 64]).enumerate() {
@@ -163,7 +163,7 @@ mod tests {
         let other = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let output = DeviceAllocation::new(&library, 128 * 4, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41");
         bank.enable_small_shapes();
         let mut handles = BTreeMap::new();
         for (cycle, rows) in (1..=MAX_DECODE_ROWS).chain([80, 128, 2, 6, 96, 3, 2, 6, 48, 64, 56, 63, 64]).enumerate() {
@@ -222,7 +222,7 @@ mod tests {
         let weights = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
         let output = DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS);
+        let mut bank = LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41");
         bank.declare_startup(&[(0, 52), (0, 54)])?;
         for rows in [52, 54] {
             // SAFETY: records only real pinned allocations, without execution.
@@ -286,7 +286,7 @@ mod tests {
         let outputs = (0..2)
             .map(|_| DeviceAllocation::new(&library, 4096 * 4, crate::shared::memory::TEST))
             .collect::<Result<Vec<_>>>()?;
-        let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS), LayerGraphs::new(&library, MAX_DECODE_ROWS)];
+        let mut banks = [LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41"), LayerGraphs::new(&library, MAX_DECODE_ROWS, "deepseek_v41")];
         let mut captures = 0;
         let mut replays = 0;
         for rows in [1u32, 80, 4096] {

@@ -134,7 +134,7 @@ impl<'a> IndexQueryWeights<'a> {
         Ok(IndexQueryWave {
             capacity: storage.unit, storage, window: RowWindow::NONE,
             norm: self.library.v41_attention_ops()?, weights: self,
-            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),
+            graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41"),
             ready: None, pending: None, origin: None, tokens: Vec::new(),
         })
     }

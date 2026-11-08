@@ -39,11 +39,11 @@ pub(crate) struct MissingVariant {
 static MISSING: std::sync::Mutex<Vec<MissingVariant>> = std::sync::Mutex::new(Vec::new());
 
 /// Counts one eager execution of `shape` and reports whether it is the first,
-/// which is the only occurrence that warns. A bank miss is a mismatch between
-/// the sealed startup inventory and real traffic, so it is rare by construction.
-/// A family that owns its decode graph holder directly (Qwen) calls this too, so
-/// every family's misses land in the same process-wide /v1/stats inventory.
-pub(crate) fn note_missing(family: &'static str, shape: &str) -> bool {
+/// which is the only occurrence that warns. Every caller goes through
+/// `note_eager`, so misses are recorded and warned about in one place; a miss is
+/// a mismatch between the sealed startup inventory and real traffic, so it is
+/// rare by construction.
+fn note_missing(family: &'static str, shape: &str) -> bool {
     let mut missing = MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match missing.iter_mut().find(|entry| entry.family == family && entry.shape == shape) {
         Some(entry) => { entry.runs += 1; false }
@@ -54,6 +54,23 @@ pub(crate) fn note_missing(family: &'static str, shape: &str) -> bool {
 /// Every distinct startup-set miss, in first-seen order (its /v1/stats form).
 pub(crate) fn missing_variants() -> Vec<MissingVariant> {
     MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
+/// Counts one eager execution of `shape` outside a sealed startup set and
+/// reports whether it is the first for this family, which is the only one that
+/// warns. This is the single entry point for eager work: owners that hold their
+/// own executable and decide eager themselves (Qwen) call it directly, and
+/// `GraphBank::enqueue_with_context` calls it too, so every path lands in the
+/// same /v1/stats entry. The `context` is built only on a first miss.
+pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce() -> String) -> bool {
+    if !note_missing(family, shape) { return false; }
+    // Built outside the macro so the description is produced even when the
+    // current subscriber filters this target out.
+    let context = context();
+    tracing::warn!(target: "cuteafd::graph_capture", family = family, key = %shape,
+        context = %context,
+        "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
+    true
 }
 
 struct Entry<E> {
@@ -167,15 +184,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.stats.eager_runs += 1;
             // Eager requires a sealed (or declared) startup set, so every miss
             // is a shape the planner's inventory lacked.
-            let shape = format!("{key:?}");
-            if note_missing(self.family, &shape) {
-                // Built outside the macro so the description is produced even
-                // when the current subscriber filters this target out.
-                let context = context();
-                tracing::warn!(target: "cuteafd::graph_capture", family = self.family, key = %shape,
-                    context = %context, eager_runs = self.stats.eager_runs,
-                    "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
-            }
+            note_eager(self.family, &format!("{key:?}"), context);
         }
         (decision, self.launch(key))
     }
