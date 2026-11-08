@@ -17,20 +17,24 @@ const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 const SINGLE: ExecutorModes = ExecutorModes { family: "kimi_k3", modes: &[WHOLE],
     hops: false, attention: AttentionPlacement::Layers };
 const DRAFT_MARKS: &str = "Kimi exact draft windows";
-use cuteafd_loader::placement::families::kimi::ARENA_PADDING_GROUP as ARENA_PADDING;
-
 fn reconcile_arena(rank: usize, layout: &cuteafd_loader::serving_capacity::WeightArenaLayout,
-    items: &[cuteafd_core::memory_layout::Item]) -> Result<()> {
-    let payload = items.iter().filter(|item| item.category == Category::Weights
-        && (item.group == "Kimi global weights" || item.group == "layers" || item.group.starts_with("Kimi layer ")))
-        .try_fold(0u64, |sum, item| sum.checked_add(item.bytes).context("Kimi arena payload charge overflow"))?;
-    let padding = items.iter().filter(|item| item.category == Category::Weights && item.group == ARENA_PADDING)
-        .collect::<Vec<_>>();
-    ensure!(padding.len() == usize::from(layout.padding_bytes() > 0), "Kimi rank {rank} arena padding owner count differs");
-    let padding = padding.first().map_or(0, |item| item.bytes);
-    ensure!(payload == layout.payload_bytes() as u64 && padding == layout.padding_bytes() as u64
-        && payload.checked_add(padding) == Some(layout.bytes() as u64),
-        "Kimi rank {rank} packed arena differs from admission: payload={payload}, padding={padding}, packed={}", layout.bytes());
+    facts: &planner::Facts) -> Result<()> {
+    use planner::{GranularityBacking, Lifetime, Location};
+    let roots = facts.allocations.iter().filter(|owner| owner.id == layout.id()).collect::<Vec<_>>();
+    ensure!(roots.len() == 1, "Kimi rank {rank} arena root count differs");
+    let root = roots[0];
+    ensure!(root.location == Location::coordinator(rank as u8) && root.view.is_none()
+        && root.bytes == layout.bytes() as u64 && root.category == Category::Weights
+        && root.group == "weight arena" && root.lifetime == Lifetime::RESIDENT,
+        "Kimi rank {rank} arena differs from admitted backing");
+    let weights = facts.resident_weights.iter().filter(|owner| owner.id == layout.id()).collect::<Vec<_>>();
+    ensure!(weights.len() == 1 && weights[0].location == root.location && weights[0].weights.0 == root.bytes,
+        "Kimi rank {rank} arena resident-weight claim differs");
+    let tail_id = format!("{}.tail", layout.id());
+    let tails = facts.allocation_granularity.iter().filter(|owner| owner.id == tail_id).collect::<Vec<_>>();
+    ensure!(tails.len() == 1 && tails[0].location == root.location && tails[0].lifetime == root.lifetime
+        && tails[0].backings == [GranularityBacking { backing: root.id.clone(), requests: vec![root.bytes] }],
+        "Kimi rank {rank} arena tail differs from its single request");
     Ok(())
 }
 
@@ -219,6 +223,7 @@ impl<'a> Admission<'a> {
         scales: crate::shared::fp8_linear::Fp8Scales, rows: crate::shared::fp8_linear::Fp8Rows,
         exchange: Option<([Rc<Stream<'a>>; 2], Rc<crate::shared::peer_split::PeerExchange<'a>>)>)
         -> Result<DeviceOwner<'a, DflashDrafter<'a>>> {
+        let rank = self.devices.len() - 1;
         self.allocate_draft_with(device.id, |layout| device.own(|| {
             let split = if layout.context_split() {
                 let (streams, peer) = exchange.context("Kimi Context draft requires target exchange")?;
@@ -228,10 +233,10 @@ impl<'a> Admission<'a> {
             let requests = DflashDrafter::mla_arena_requests(snapshot, representation, device.id)?;
             let arena_layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
                 format!("kimi/draft/{}", device.id), requests[&device.id].clone())?;
-            // MLA's shipped dimensions are 256-aligned. Refuse a new unadmitted
-            // padding extent instead of silently growing the drafter owner.
-            ensure!(arena_layout.payload_bytes() as u64 == layout.weights().resident_bytes()?
-                && arena_layout.padding_bytes() == 0, "Kimi draft arena differs from admitted immutable weights");
+            let admitted = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+                format!("kimi/draft/{rank}"), layout.weight_arena_requests())?;
+            ensure!(arena_layout.bytes() == admitted.bytes() && arena_layout.views() == admitted.views(),
+                "Kimi draft binder differs from admitted immutable arena");
             let arena = crate::shared::memory::weight_arena::DeviceWeightArena::new(device, arena_layout)?;
             DflashDrafter::load_mla_with(device.library, programs, "kimik3", snapshot, file, stream, layout,
                 representation, scales, rows, split, |physical, name, bytes| {
@@ -254,8 +259,11 @@ impl<'a> Admission<'a> {
             "Kimi drafter startup peak requires allocation before target residency");
         let layout = self.draft.as_ref().context("Kimi drafter was not admitted")?;
         ensure!(draft::home(&self.placement) == Some(head as u8), "Kimi drafter must stay on target head owner");
+        let arena = cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+            format!("kimi/draft/{head}"), layout.weight_arena_requests())?;
+        reconcile_arena(head, &arena, &self.receipt.facts)?;
         let (demand, _) = layout.demands(head as u8)?;
-        for demand in demand.owned {
+        for demand in demand.owned.into_iter().filter(|owner| owner.group != "MLA DFlash owned weights") {
             let rank = usize::from(demand.gpu);
             ensure!(rank < self.devices.len(), "Kimi draft physical owner absent");
             let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
@@ -486,7 +494,7 @@ impl<'a> Admission<'a> {
             let layers = self.layouts.iter().map(|layouts| layouts[rank].shared_layout()).collect::<Vec<_>>();
             let layout = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
                 rank, &global, &layers.iter().collect::<Vec<_>>())?;
-            reconcile_arena(rank, &layout, &self.placement.items[rank])?;
+            reconcile_arena(rank, &layout, &self.receipt.facts)?;
             Ok(layout)
         }).collect::<Result<Vec<_>>>()?;
         records.arenas = Rc::new(devices.iter().zip(layouts).map(|(&device, layout)|
@@ -590,11 +598,11 @@ impl<'a> Admission<'a> {
         ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi global upload differs from admitted device");
         ensure!(!self.global_uploaded[rank], "Kimi global weights already uploaded");
         let layout = &self.global_layouts[rank];
-        let demand = layout.demand()?;
-        let charges = self.placement.items[rank].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
-        ensure!(charges.len() == 1 && charges[0].category == demand.category
-            && charges[0].basis == Basis::Exact && charges[0].bytes == demand.bytes,
-            "Kimi global allocation differs from accepted native weight charge");
+        let global = layout.shared_layout();
+        let layers = self.layouts.iter().map(|pair| pair[rank].shared_layout()).collect::<Vec<_>>();
+        let arena = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
+            rank, &global, &layers.iter().collect::<Vec<_>>())?;
+        reconcile_arena(rank, &arena, &self.receipt.facts)?;
         Ok(layout)
     }
 
@@ -817,7 +825,6 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
         fixed, owners: Vec::new(),
     };
-    recipe.allocation_granularity(cfg, &core)?;
     recipe.arena_padding(cfg, &core)?;
     recipe.blas_owners(core.get_weight("language_model.lm_head").is_some())?;
     let modes = recipe.resolved_attention();
@@ -906,17 +913,11 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let layouts = placement.layers.iter().enumerate().map(|(layer, assignment)|
         LayerLayout::ranks_with_core(cfg, layer, assignment.mode, &core, devices.len())).collect::<Result<Vec<_>>>()?;
     for rank in 0..RANKS {
-        let native = layouts.iter().try_fold(0u64, |sum, pair| sum.checked_add(pair[rank].bytes()? as u64)
-            .context("Kimi admitted native weight sum overflow"))?;
-        let charged = placement.items[rank].iter().filter(|item|
-            item.category == Category::Weights && (item.group == "layers" || item.group.starts_with("Kimi layer ")))
-            .try_fold(0u64, |sum, item| sum.checked_add(item.bytes).context("Kimi weight charge overflow"))?;
-        ensure!(native == charged, "Kimi rank {rank} native weights differ from shared admission: {native} != {charged}");
         let global = global_layouts[rank].shared_layout();
         let rank_layers = layouts.iter().map(|pair| pair[rank].shared_layout()).collect::<Vec<_>>();
         let arena = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(
             rank, &global, &rank_layers.iter().collect::<Vec<_>>())?;
-        reconcile_arena(rank, &arena, &placement.items[rank])?;
+        reconcile_arena(rank, &arena, &admitted.solved.facts)?;
     }
     let layer_owners = vec![vec![Weak::new(); devices.len()]; layouts.len()];
     let layer_uploaded = vec![vec![false; devices.len()]; layouts.len()];
@@ -1125,84 +1126,82 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use cuteafd_loader::placement::families::kimi::arena_padding_owner as padding_owner;
-
-    fn arena_item(group: &str, bytes: u64) -> cuteafd_core::memory_layout::Item {
-        cuteafd_core::memory_layout::Item { category: Category::Weights, group: group.into(),
-            format: String::new(), bytes, basis: cuteafd_core::memory_layout::Basis::Exact,
-            lifetime: cuteafd_core::memory_layout::ItemLifetime::ReadyResident }
-    }
-
-    #[test]
-    fn arena_padding_refuses_when_only_payload_fits() -> Result<()> {
-        use planner::{Allocation, Baseline, Budget, Contract, Facts, Lifetime, Location, PhaseOrder};
-        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("kimi/0",
-            [("a_log".into(), 384), ("next".into(), 256)])?;
-        assert_eq!((layout.payload_bytes(), layout.padding_bytes(), layout.bytes()), (640, 128, 768));
-        let facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![],
-            allocations: vec![Allocation::buffer("payload", Location::coordinator(0), 640,
-                Lifetime::RESIDENT, Category::Weights, "layers")], deferred: vec![], sequential: vec![],
-            reservations: vec![], allowances: vec![], driver_page_tables: vec![], allocation_granularity: vec![] };
-        let budget = |bytes| Budget { id: "gpu".into(), locations: vec![Location::coordinator(0)],
-            physical_bytes: bytes, logical_bytes: bytes, baseline: Baseline::Forecast {
-                occupied: 0, source: "exact test capacity".into(), assumed: false }, headroom: 0 };
-        let mut contract = Contract::fixed(64, 1, 1, facts);
-        contract.variables = vec![planner::Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
-            planner::Variable::Lanes(vec![1])];
-        planner::evaluate(&contract.facts(&[0, 0], 1)?, &[budget(640)])?;
-        contract.components.push(padding_owner(0, None, &layout, 1).unwrap());
-        let packed = contract.facts(&[0, 0], 1)?;
-        assert!(matches!(planner::evaluate(&packed, &[budget(640)]), Err(planner::Refusal::Capacity { .. })));
-        let phases = planner::evaluate(&packed, &[budget(768)])?;
-        assert!(phases.iter().all(|phase| phase.owned == 768));
-        Ok(())
-    }
-
-    #[test]
-    fn arena_reconciliation_requires_one_exact_padding_owner() -> Result<()> {
-        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("kimi/0",
-            [("a_log".into(), 384), ("next".into(), 256)])?;
-        let correct = vec![arena_item("Kimi global weights", 256), arena_item("Kimi layer 0", 384),
-            arena_item(ARENA_PADDING, 128)];
-        reconcile_arena(0, &layout, &correct)?;
-        assert!(reconcile_arena(0, &layout, &correct[..2]).is_err());
-        let mut stale = correct.clone();
-        stale[2].bytes -= 1;
-        assert!(reconcile_arena(0, &layout, &stale).is_err());
-        let mut duplicate = correct.clone();
-        duplicate.push(correct[2].clone());
-        assert!(reconcile_arena(0, &layout, &duplicate).is_err());
-        let mut payload = correct.clone();
-        payload[0].bytes += 1;
-        assert!(reconcile_arena(0, &layout, &payload).is_err());
-        let aligned = cuteafd_loader::serving_capacity::WeightArenaLayout::new("kimi/1", [("x".into(), 256)])?;
-        assert!(padding_owner(1, None, &aligned, 1).is_none());
-        reconcile_arena(1, &aligned, &[arena_item("layers", 256)])?;
-        assert!(reconcile_arena(1, &aligned, &[arena_item("layers", 256), arena_item(ARENA_PADDING, 1)]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn arena_padding_activates_only_its_selected_attention_profile() -> Result<()> {
-        use planner::{Contract, Facts, PhaseOrder, Variable};
-        let facts = Facts { phase_order: PhaseOrder::TARGET_THEN_DRAFT, resident_weights: vec![],
+    fn arena_facts(layout: &cuteafd_loader::serving_capacity::WeightArenaLayout, rank: u8) -> Result<planner::Facts> {
+        use planner::{Contract, Facts, Lifetime, Location, PhaseOrder};
+        let facts = Facts { phase_order: PhaseOrder::DRAFT_THEN_TARGET, resident_weights: vec![],
             allocations: vec![], deferred: vec![], sequential: vec![], reservations: vec![], allowances: vec![],
             driver_page_tables: vec![], allocation_granularity: vec![] };
-        let mut contract = Contract::fixed(64, 1, 2, facts);
-        contract.variables.push(Variable::AttentionProfiles { layers: vec![0], values: vec![vec![WHOLE], vec![LayerMode::HeadSplit]] });
-        contract.variables.extend([Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
-            Variable::Lanes(vec![1])]);
-        for (option, bytes) in [384, 320].into_iter().enumerate() {
-            let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("profile/{option}"),
-                [("a_log".into(), bytes), ("next".into(), 256)])?;
-            for rank in 0..2 { contract.components.push(padding_owner(rank, Some(option), &layout, 1).unwrap()); }
+        let mut contract = Contract::fixed(64, 1, usize::from(rank) + 1, facts);
+        contract.components = planner::weight_arena_components(layout, Location::coordinator(rank), Lifetime::RESIDENT, 1)?;
+        contract.variables = vec![planner::Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]),
+            planner::Variable::Lanes(vec![1])];
+        contract.facts(&[0, 0], 1).map_err(Into::into)
+    }
+
+    #[test]
+    fn arena_backing_and_tail_refuse_when_only_payload_fits() -> Result<()> {
+        use planner::{Baseline, Budget};
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("kimi/coordinator/0",
+            [("a_log".into(), 384), ("next".into(), 256)])?;
+        assert_eq!((layout.payload_bytes(), layout.padding_bytes(), layout.bytes()), (640, 128, 768));
+        let facts = arena_facts(&layout, 0)?;
+        let budget = |bytes| Budget { id: "gpu".into(), locations: vec![planner::Location::coordinator(0)],
+            physical_bytes: bytes, logical_bytes: bytes, baseline: Baseline::Forecast {
+                occupied: 0, source: "exact test capacity".into(), assumed: false }, headroom: 0 };
+        assert!(matches!(planner::evaluate(&facts, &[budget(768)]), Err(planner::Refusal::Capacity { .. })));
+        let phases = planner::evaluate(&facts, &[budget(2 << 20)])?;
+        assert!(phases.iter().all(|phase| phase.owned == 768 && phase.opaque == (2 << 20) - 768));
+        Ok(())
+    }
+
+    #[test]
+    fn arena_reconciliation_requires_one_exact_backing_and_tail() -> Result<()> {
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("kimi/coordinator/0",
+            [("a_log".into(), 384), ("next".into(), 256)])?;
+        let correct = arena_facts(&layout, 0)?;
+        reconcile_arena(0, &layout, &correct)?;
+        for case in 0..8 {
+            let mut stale = correct.clone();
+            match case {
+                0 => stale.allocations.clear(),
+                1 => stale.allocations[0].bytes -= 1,
+                2 => stale.allocations.push(stale.allocations[0].clone()),
+                3 => stale.allocations[0].location = planner::Location::coordinator(1),
+                4 => stale.resident_weights[0].weights.0 -= 1,
+                5 => stale.allocation_granularity.clear(),
+                6 => stale.allocation_granularity[0].backings[0].requests = vec![384, 384],
+                _ => stale.allocation_granularity.push(stale.allocation_granularity[0].clone()),
+            }
+            assert!(reconcile_arena(0, &layout, &stale).is_err(), "case {case}");
         }
-        for (option, expected) in [128, 192].into_iter().enumerate() {
+        Ok(())
+    }
+
+    #[test]
+    fn arena_components_activate_only_the_selected_attention_profile() -> Result<()> {
+        use planner::{Activation, Contract, Lifetime, Location, Variable};
+        let mut contract = Contract::fixed(64, 1, 2, arena_facts(
+            &cuteafd_loader::serving_capacity::WeightArenaLayout::new("unused", [("x".into(), 256)])?, 0)?);
+        contract.components.clear();
+        contract.variables = vec![Variable::AttentionProfiles { layers: vec![0], values: vec![vec![WHOLE], vec![LayerMode::HeadSplit]] },
+            Variable::Prefill(vec![planner::PrefillShape { rows: 64, waves: 1 }]), Variable::Lanes(vec![1])];
+        for (option, bytes) in [384, 320].into_iter().enumerate() {
+            for rank in 0..2 {
+                let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"),
+                    [("a_log".into(), bytes), ("next".into(), 256)])?;
+                let mut components = planner::weight_arena_components(&layout, Location::coordinator(rank), Lifetime::RESIDENT, 1)?;
+                for component in &mut components { component.activation = Activation::choice(0, option); }
+                contract.components.extend(components);
+            }
+        }
+        for option in 0..2 {
             let facts = contract.facts(&[option, 0, 0], 1)?;
             assert_eq!(facts.allocations.len(), 2);
-            for (rank, owner) in facts.allocations.iter().enumerate() {
-                assert_eq!(owner.location, planner::Location::coordinator(rank as u8));
-                assert_eq!((owner.bytes, owner.group.as_str(), owner.lifetime), (expected, ARENA_PADDING, planner::Lifetime::RESIDENT));
+            assert_eq!(facts.allocation_granularity.len(), 2);
+            for rank in 0..2 {
+                let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("kimi/coordinator/{rank}"),
+                    [("a_log".into(), [384, 320][option]), ("next".into(), 256)])?;
+                reconcile_arena(rank, &layout, &facts)?;
             }
         }
         Ok(())
@@ -1839,7 +1838,7 @@ pub(super) mod tests {
         admitted.placement.movables[0].1 = 0;
         assert!(admitted.check_draft(1).is_err());
         admitted.placement.movables[0].1 = 1;
-        let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "MLA DFlash owned weights").unwrap();
+        let charge = admitted.receipt.facts.allocations.iter_mut().find(|owner| owner.id == "kimi/draft/1").unwrap();
         charge.bytes -= 1;
         assert!(admitted.check_draft(1).is_err());
         assert!(admit(inputs(&cfg))?.check_draft(1).is_err());
@@ -1998,11 +1997,13 @@ pub(super) mod tests {
         // Each of the 69 whole KDA A_log views is 384 bytes, then aligns to 512.
         assert_eq!(arena.padding_bytes(), cfg.kda_layers() * 128);
         assert_eq!(arena.padding_bytes(), 8832);
+        reconcile_arena(0, &arena, &admitted.receipt.facts)?;
         for items in [&planned.items, &admitted.placement.items[0]] {
-            let padding = items.iter().filter(|item| item.group == ARENA_PADDING).collect::<Vec<_>>();
-            assert_eq!(padding.len(), 1);
-            assert_eq!(padding[0].bytes, arena.padding_bytes() as u64);
-            reconcile_arena(0, &arena, items)?;
+            let roots = items.iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].bytes, arena.bytes() as u64);
+            assert!(!items.iter().any(|item| item.group == "kimi arena padding" || item.group == "Kimi global weights"
+                || item.group == "layers" || item.group.starts_with("Kimi layer ")));
         }
         let runtime_bytes = admitted.placement.items[0].iter().map(|item| item.bytes).sum::<u64>();
         // The plan's named-reserve item (absent at the default 0) is the runtime's kept-free bytes.
@@ -2025,11 +2026,13 @@ pub(super) mod tests {
         let manifest = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
         let config = serde_json::from_slice(&std::fs::read(snapshot.path().join("config.json"))?)?;
         let cfg = KimiK3Config::from_hf(&config)?;
-        let expected = (0..cfg.layers).try_fold(GlobalLayout::pair(&cfg)?[0].bytes()? as u64,
-            |sum, layer| -> Result<_> {
-                sum.checked_add(LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit)?[0].bytes()? as u64)
-                    .context("native rank-zero resident weights overflow")
-            })?;
+        let globals = cuteafd_loader::families::kimi_k3::weight_layout::GlobalLayout::pair(&cfg)?;
+        let layers = (0..cfg.layers).map(|layer|
+            cuteafd_loader::families::kimi_k3::weight_layout::LayerLayout::pair(&cfg, layer, LayerMode::HeadSplit))
+            .collect::<Result<Vec<_>>>()?;
+        let arena = cuteafd_loader::families::kimi_k3::weight_layout::coordinator_arena(0,
+            &globals[0], &layers.iter().map(|pair| &pair[0]).collect::<Vec<_>>())?;
+        let expected = arena.bytes() as u64;
         for (gib, accepted) in [(80u64, true), (1, false)] {
             let cli = crate::cli::Cli::try_parse_from([
                 "cuteafd".into(), "plan".into(), snapshot.path().as_os_str().to_owned(),
@@ -2417,8 +2420,8 @@ pub(super) mod tests {
             assert_eq!(admitted.layouts[layer][nonowner].attention_bytes()?, 0);
             let bytes = admitted.layouts[layer][nonowner].bytes()? as u64;
             assert!(bytes > 0);
-            let group = format!("Kimi layer {layer} TP2 FFN/residual/router/latent");
-            assert_eq!(admitted.placement.items[nonowner].iter().find(|item| item.group == group).unwrap().bytes, bytes);
+            admitted.check_global(nonowner, nonowner as i32)?;
+            assert!(!admitted.placement.items[nonowner].iter().any(|item| item.group.starts_with("Kimi layer ")));
         }
         let working = admitted.working_set();
         assert!(working.rtx_layers.is_empty());
@@ -2466,8 +2469,7 @@ pub(super) mod tests {
             let expected_global=GlobalLayout::pair_with_core(&cfg,&core)?;
             for rank in 0..2 {
                 assert_eq!(mixed.global_layouts[rank],expected_global[rank]);
-                assert_eq!(mixed.placement.items[rank].iter().find(|item|item.group=="Kimi global weights").unwrap().bytes,
-                    expected_global[rank].bytes()? as u64);
+                mixed.check_global(rank, rank as i32)?;
                 assert_eq!(mixed.io_layouts[rank],IoLayout::with_core(&cfg,rank,mixed.lane_layouts[0][rank].rows(),&core)?);
             }
             assert!(mixed.global_layouts[1].bytes()?<original.global_layouts[1].bytes()?);
@@ -2481,9 +2483,7 @@ pub(super) mod tests {
                 }
             }
             for rank in 0..2 {
-                let charge=|a:&Admission<'_>|a.placement.items[rank].iter().filter(|item|
-                    item.category==Category::Weights && (item.group=="layers" || item.group.starts_with("Kimi layer ")))
-                    .map(|item|item.bytes).sum::<u64>();
+                let charge=|a:&Admission<'_>|a.layouts.iter().map(|pair| pair[rank].bytes().unwrap() as u64).sum::<u64>();
                 let baseline_same_placement=mixed.placement.layers.iter().enumerate().map(|(layer,assignment)|
                     LayerLayout::pair(&cfg,layer,assignment.mode).unwrap()[rank].bytes().unwrap() as u64).sum::<u64>();
                 assert_eq!(baseline_same_placement-charge(&mixed),freed[rank] as u64);
@@ -2681,13 +2681,13 @@ pub(super) mod tests {
         assert!(admitted.check_global(0, 0).is_err());
         for case in 0..5 {
             let mut admitted = admit(inputs(&cfg))?;
-            let charge = admitted.placement.items[1].iter_mut().find(|item| item.group == "Kimi global weights").unwrap();
+            let charge = admitted.receipt.facts.allocations.iter_mut().find(|owner| owner.id == "kimi/coordinator/1").unwrap();
             match case {
                 0 => charge.bytes -= 1,
                 1 => charge.category = Category::Workspace,
-                2 => charge.basis = Basis::Formula,
-                3 => { let duplicate = charge.clone(); admitted.placement.items[1].push(duplicate); }
-                _ => admitted.placement.items[1].retain(|item| item.group != "Kimi global weights"),
+                2 => charge.lifetime = planner::Lifetime::TARGET,
+                3 => { let duplicate = charge.clone(); admitted.receipt.facts.allocations.push(duplicate); }
+                _ => admitted.receipt.facts.allocations.retain(|owner| owner.id != "kimi/coordinator/1"),
             }
             assert!(admitted.check_global(1, 1).is_err(), "case {case}");
         }

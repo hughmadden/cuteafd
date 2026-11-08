@@ -12,19 +12,6 @@ use crate::formats::dflash::MlaDraftRuntimeLayout;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
-pub const ARENA_PADDING_GROUP: &str = "kimi arena padding";
-
-pub fn arena_padding_owner(rank: usize, option: Option<usize>,
-    layout: &crate::serving_capacity::WeightArenaLayout, maximum: u64) -> Option<Component> {
-    let bytes = layout.padding_bytes() as u64;
-    if bytes == 0 { return None; }
-    let owner = Allocation::buffer(format!("{ARENA_PADDING_GROUP}.{rank}"), Location::coordinator(rank as u8),
-        bytes, Lifetime::RESIDENT, Category::Weights, ARENA_PADDING_GROUP);
-    let mut component = Component::allocation(owner, ByteCurve::fixed(bytes, maximum), false, maximum);
-    if let Some(option) = option { component.activation = Activation::choice(0, option); }
-    Some(component)
-}
-
 /// One shared decode/prefill endpoint per lane, using the same finite probe
 /// candidates as execution. Its GPU intake is separately owned by the lane.
 pub fn production_links(gpu: u8, ranks: usize, lanes: u64, prefill: PrefillShape,
@@ -106,15 +93,6 @@ fn invalid(detail: &str) -> Refusal {
     Refusal::InvalidFact(format!("Kimi component contract: {detail}"))
 }
 
-/// Attention weight bytes one rank retains for a layer's resolved mode.
-fn attention_bytes(weights: &ModeBytes, mode: LayerMode, rank: usize) -> u64 {
-    match mode {
-        LayerMode::HeadSplit | LayerMode::ContextSplit => weights.split[rank],
-        LayerMode::Whole { gpu, .. } if usize::from(gpu) == rank => weights.whole,
-        LayerMode::Whole { .. } => 0,
-    }
-}
-
 /// One rank-fixed owner. `weights` is the retained-weight part of the same
 /// exact allocation, never a second charge.
 #[derive(Debug, Clone)]
@@ -180,6 +158,7 @@ pub struct DraftOwner {
 #[derive(Debug, Clone)]
 pub struct Draft {
     pub context_split: bool,
+    pub arena: Option<(u8, crate::serving_capacity::WeightArenaLayout)>,
     pub owners: Vec<DraftOwner>,
     pub staging_at_first: u64,
     pub staging_per_page: u64,
@@ -284,7 +263,13 @@ pub fn draft_facts(layout: &MlaDraftRuntimeLayout, page_rows: u64, maximum_pages
             weights_per_page })
     }).collect::<anyhow::Result<Vec<_>>>()?;
     let staging_per_page = step(staging_one, staging_last)?;
-    Ok(Draft { context_split: layout.context_split(), owners,
+    let arena = crate::serving_capacity::WeightArenaLayout::new(format!("kimi/draft/{gpu}"), layout.weight_arena_requests())?;
+    anyhow::ensure!(arena.payload_bytes() as u64 == layout.weights().resident_bytes()?,
+        "Kimi draft recipe differs from immutable payload");
+    let owners = owners.into_iter().filter(|owner| owner.group != "MLA DFlash owned weights").collect::<Vec<_>>();
+    anyhow::ensure!(owners.iter().all(|owner| owner.weights_at_first == 0 && owner.weights_per_page == 0),
+        "Kimi draft immutable owner outside its arena");
+    Ok(Draft { context_split: layout.context_split(), arena: Some((gpu, arena)), owners,
         staging_at_first: staging_one.checked_sub(staging_per_page * (multiple - 1)).context("Kimi draft staging intercept")?,
         staging_per_page })
 }
@@ -501,16 +486,18 @@ impl KimiRecipe {
         profiles[if self.gpus == 2 && self.placement == AttentionPlacement::Layers { middle.min(2) } else { 0 }].clone()
     }
 
-    /// The payload already has logical owners. Admit only exact inter-view padding,
-    /// not another copy of B; the unpacked granularity forecast is a separate port.
+    /// Reconstruct each selected physical arena, including exact inter-view padding.
+    /// Replace the old tensor payloads and forecasts with one backing and one tail.
     pub fn arena_padding(&mut self,
         cfg: &crate::families::kimi_k3::config::KimiK3Config,
         core: &crate::families::kimi_k3::core::CoreInventory) -> anyhow::Result<()> {
         use crate::families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout};
-        anyhow::ensure!(!self.fixed.iter().any(|owner| owner.group == ARENA_PADDING_GROUP)
-            && !self.owners.iter().any(|component| matches!(&component.kind,
-                ComponentKind::Allocation { template, .. } if template.group == ARENA_PADDING_GROUP)),
-            "Kimi arena padding supplied twice");
+        anyhow::ensure!(!self.owners.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allocation { template, .. } if template.id.starts_with("kimi/coordinator/"))),
+            "Kimi weight arenas supplied twice");
+        anyhow::ensure!(self.fixed.iter().filter(|owner| owner.category == Category::Weights)
+            .all(|owner| owner.group == "Kimi global weights" || owner.group.starts_with("Kimi layer ")),
+            "Kimi fixed weights contain an unknown immutable owner");
         let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
         let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
         for (option, modes) in self.attention_profiles().iter().enumerate() {
@@ -518,55 +505,27 @@ impl KimiRecipe {
                 LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)).collect::<anyhow::Result<Vec<_>>>()?;
             for (rank, global) in globals.iter().enumerate() {
                 let layout = coordinator_arena(rank, global, &layers.iter().map(|pair| &pair[rank]).collect::<Vec<_>>())?;
-                self.owners.extend(arena_padding_owner(rank, profiled.then_some(option), &layout, self.maximum_pages));
-            }
-        }
-        Ok(())
-    }
-
-    /// Price actual weight cudaMalloc requests, not aggregate layer demands.
-    /// Every alternative profile has its own physical request inventory.
-    pub fn allocation_granularity(&mut self,
-        cfg: &crate::families::kimi_k3::config::KimiK3Config,
-        core: &crate::families::kimi_k3::core::CoreInventory) -> anyhow::Result<()> {
-        use crate::families::kimi_k3::weight_layout::{GlobalLayout, LayerLayout};
-        anyhow::ensure!(!self.owners.iter().any(|component|
-            matches!(component.kind, ComponentKind::AllocationGranularity(_))),
-            "Kimi physical allocation inventory already prepared");
-        let globals = GlobalLayout::ranks_with_core(cfg, core, self.gpus)?;
-        let profiled = self.gpus == 2 && self.placement == AttentionPlacement::Layers;
-        for (option, modes) in self.attention_profiles().iter().enumerate() {
-            let mut backings = globals.iter().map(|layout| vec![GranularityBacking {
-                backing: format!("Kimi global weights.{}", layout.rank), requests: layout.allocation_extents(),
-            }]).collect::<Vec<_>>();
-            for (layer, &mode) in modes.iter().enumerate() {
-                for (rank, layout) in LayerLayout::ranks_with_core(cfg, layer, mode, core, self.gpus)?.iter().enumerate() {
-                    let selected = if self.gpus == 1 { None } else { Some(true) };
-                    let requests = layout.allocation_extents(selected)?;
-                    if !requests.is_empty() {
-                        backings[rank].push(GranularityBacking {
-                            backing: format!("layers.{layer}.{}.{rank}", if profiled { option } else { 0 }), requests,
-                        });
-                    }
-                    if self.gpus == 2 {
-                        let requests = layout.allocation_extents(Some(false))?;
-                        if !requests.is_empty() {
-                            backings[rank].push(GranularityBacking {
-                                backing: format!("Kimi layer {layer} TP2 FFN/residual/router/latent.{rank}"), requests,
-                            });
-                        }
-                    }
+                let fixed = self.fixed.iter().filter(|owner| owner.rank as usize == rank && owner.category == Category::Weights)
+                    .try_fold(0u64, |sum, owner| sum.checked_add(owner.bytes).ok_or_else(|| anyhow::anyhow!("Kimi fixed weight overflow")))?;
+                let attention = modes.iter().zip(&self.layer_attention).try_fold(0u64, |sum, (mode, weights)| {
+                    let bytes = match mode {
+                        LayerMode::HeadSplit | LayerMode::ContextSplit => weights.split[rank],
+                        LayerMode::Whole { gpu, .. } if usize::from(*gpu) == rank => weights.whole,
+                        LayerMode::Whole { .. } => 0,
+                    };
+                    sum.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("Kimi attention weight overflow"))
+                })?;
+                anyhow::ensure!(fixed.checked_add(attention) == Some(layout.payload_bytes() as u64),
+                    "Kimi arena differs from selected native payload");
+                let mut components = weight_arena_components(&layout, Location::coordinator(rank as u8),
+                    Lifetime::RESIDENT, self.maximum_pages)?;
+                if profiled {
+                    for component in &mut components { component.activation = Activation::choice(0, option); }
                 }
-            }
-            for (rank, backings) in backings.into_iter().enumerate() {
-                let mut component = allocation_granularity_component(AllocationGranularity {
-                    id: format!("kimi.weights.{rank}"), location: Location::coordinator(rank as u8),
-                    lifetime: Lifetime::RESIDENT, backings, evidence: GranularityEvidence::Forecast,
-                }, self.maximum_pages)?;
-                if profiled { component.activation = Activation::choice(0, option); }
-                self.owners.push(component);
+                self.owners.extend(components);
             }
         }
+        self.fixed.retain(|owner| owner.category != Category::Weights);
         Ok(())
     }
 
@@ -789,21 +748,6 @@ impl Recipe for KimiRecipe {
                 else { vec![modes[layer]] };
             for (option, mode) in domain.into_iter().enumerate() {
                 let activation = Activation::choice(if profiled { 0 } else { layer }, option);
-                for rank in 0..self.gpus {
-                    let weights = attention_bytes(&self.layer_attention[layer], mode, rank);
-                    if weights == 0 { continue; }
-                    let owner = Allocation::buffer(format!("layers.{layer}.{option}.{rank}"),
-                        Location::coordinator(rank as u8), weights, Lifetime::RESIDENT, Category::Weights, "layers");
-                    let mut weight = Component::resident_weight(
-                        ResidentWeight::from_allocation(&owner, ResidentWeights(weights)),
-                        ByteCurve::fixed(weights, self.maximum_pages));
-                    weight.activation = activation.clone();
-                    contract.components.push(weight);
-                    let mut allocation = Component::allocation(owner,
-                        ByteCurve::fixed(weights, self.maximum_pages), false, self.maximum_pages);
-                    allocation.activation = activation.clone();
-                    contract.components.push(allocation);
-                }
                 if whole.contains(&layer) {
                     let LayerMode::Whole { gpu, .. } = mode else { unreachable!() };
                     let bytes = self.records_per_page[0];
@@ -913,6 +857,9 @@ impl Recipe for KimiRecipe {
             // Kimi constructs the drafter before target loading, so its backing
             // already exists throughout Load (unlike post-target GQA drafters).
             let lifetime = Lifetime::RESIDENT;
+            if let Some((gpu, arena)) = &draft.arena {
+                contract.components.extend(weight_arena_components(arena, Location::coordinator(*gpu), lifetime, self.maximum_pages)?);
+            }
             for (index, owner) in draft.owners.iter().enumerate() {
                 let allocation = Allocation::buffer(format!("draft.{index}"),
                     Location::coordinator(owner.gpu), owner.bytes_at_first, lifetime,
@@ -1081,8 +1028,27 @@ mod tests {
             SparkReplyFormats::default())
     }
 
+    fn toy_weight_owners(recipe: &mut KimiRecipe) {
+        recipe.owners.clear();
+        let profiled = recipe.gpus == 2 && recipe.placement == AttentionPlacement::Layers;
+        for (option, modes) in recipe.attention_profiles().iter().enumerate() {
+            for rank in 0..recipe.gpus {
+                let bytes = modes.iter().zip(&recipe.layer_attention).map(|(mode, weights)| match mode {
+                    LayerMode::HeadSplit | LayerMode::ContextSplit => weights.split[rank],
+                    LayerMode::Whole { gpu, .. } if usize::from(*gpu) == rank => weights.whole,
+                    LayerMode::Whole { .. } => 0,
+                }).sum();
+                if bytes == 0 { continue; }
+                let mut components = weight_arena_extent_components(&format!("kimi/coordinator/{rank}"), bytes,
+                    Location::coordinator(rank as u8), Lifetime::RESIDENT, recipe.maximum_pages).unwrap();
+                if profiled { for component in &mut components { component.activation = Activation::choice(0, option); } }
+                recipe.owners.extend(components);
+            }
+        }
+    }
+
     fn recipe() -> KimiRecipe {
-        KimiRecipe {
+        let mut recipe = KimiRecipe {
             expert_usage: None,
             context: 256,
             gpus: 1,
@@ -1112,35 +1078,38 @@ mod tests {
             owners: vec![],
             fixed: vec![FixedOwner { rank: 0, category: Category::Prefix, group: "Kimi exact KDA marks".into(),
                 bytes: 32, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }],
-        }
+        };
+        toy_weight_owners(&mut recipe);
+        recipe
     }
 
     #[test]
     fn draft_resident_weights_are_counted_once_in_target_load_peak() {
         let mut recipe = recipe();
-        recipe.draft = Some(Draft { context_split: false, owners: vec![DraftOwner {
-            gpu: 0, category: Category::Drafter, group: "MLA DFlash owned weights".into(),
-            bytes_at_first: 512, bytes_per_page: 0, weights_at_first: 512, weights_per_page: 0,
-        }], staging_at_first: 128, staging_per_page: 0 });
+        let arena = crate::serving_capacity::WeightArenaLayout::new("kimi/draft/0", [("weights".into(), 512)]).unwrap();
+        recipe.draft = Some(Draft { context_split: false, arena: Some((0, arena)), owners: vec![],
+            staging_at_first: 128, staging_per_page: 0 });
         let contract = recipe.prepare(&single()).unwrap();
         let selected = vec![0; contract.variables.len()];
         let facts = contract.facts(&selected, 1).unwrap();
         assert_eq!(facts.phase_order, PhaseOrder::DRAFT_THEN_TARGET);
-        let owners = facts.allocations.iter().filter(|owner| owner.id == "draft.0").collect::<Vec<_>>();
+        let owners = facts.allocations.iter().filter(|owner| owner.id == "kimi/draft/0").collect::<Vec<_>>();
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].lifetime, Lifetime::RESIDENT);
-        assert_eq!(facts.resident_weights.iter().filter(|owner| owner.id == "draft.0")
+        assert_eq!(facts.resident_weights.iter().filter(|owner| owner.id == "kimi/draft/0")
             .map(|owner| owner.weights.0).sum::<u64>(), 512);
         let budget = Budget { id: "gpu0".into(), locations: vec![Location::coordinator(0)],
             physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
             baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false } };
         let with_draft = evaluate(&facts, &[budget.clone()]).unwrap();
         let mut without = facts.clone();
-        without.allocations.retain(|owner| !owner.id.starts_with("draft."));
-        without.resident_weights.retain(|owner| !owner.id.starts_with("draft."));
+        without.allocations.retain(|owner| !owner.id.starts_with("draft.") && owner.id != "kimi/draft/0");
+        without.resident_weights.retain(|owner| owner.id != "kimi/draft/0");
+        without.allocation_granularity.retain(|owner| owner.id != "kimi/draft/0.tail");
         let without_draft = evaluate(&without, &[budget]).unwrap();
         for (with, without) in with_draft.iter().zip(without_draft) {
             assert_eq!(with.owned - without.owned, if with.phase == Phase::DraftLoad { 640 } else { 512 });
+            assert_eq!(with.opaque - without.opaque, (2 << 20) - 512);
         }
     }
 
@@ -1154,8 +1123,9 @@ mod tests {
                         let mut recipe = recipe();
                         recipe.gpus = gpus;
                         recipe.lanes = lanes;
-                        recipe.draft = draft.then(|| Draft { context_split: false, owners: vec![],
+                        recipe.draft = draft.then(|| Draft { context_split: false, arena: None, owners: vec![],
                             staging_at_first: 0, staging_per_page: 0 });
+                        recipe.owners.clear();
                         recipe.blas_owners(core_head).unwrap();
                         let owners = recipe.owners.iter().map(|component| {
                             let ComponentKind::Allowance(owner) = &component.kind else { panic!("BLAS is opaque") };
@@ -1313,11 +1283,12 @@ mod tests {
         recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
         recipe.experts = None;
         recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
-        recipe.draft = Some(Draft { context_split: true, staging_at_first: 100,
+        recipe.draft = Some(Draft { context_split: true, arena: None, staging_at_first: 100,
             staging_per_page: 0, owners: (0..2).map(|gpu| DraftOwner { gpu,
                 category: Category::Drafter, group: "physical draft cache".into(),
                 bytes_at_first: 32, bytes_per_page: 32, weights_at_first: 0,
                 weights_per_page: 0 }).collect() });
+        toy_weight_owners(&mut recipe);
         let budget = budgets(&[(1 << 30, 1 << 30); 2], 0, &[0; 2], &[]).unwrap();
         let contract = recipe.prepare(&single()).unwrap();
         assert_eq!(contract.pool_page_multiple, 2);
@@ -1397,6 +1368,7 @@ mod tests {
             SparkOwner { count: 0, rank: 0, experts: 200, overhead: 0, runtime: 0 },
             SparkOwner { count: 1, rank: 0, experts: 100, overhead: 0, runtime: 0 },
         ];
+        toy_weight_owners(&mut recipe);
         let budgets = budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[150]).unwrap();
         let admitted = recipe.admit(single(), budgets).unwrap();
         assert_eq!(admitted.onboard, 1);
@@ -1429,6 +1401,7 @@ mod tests {
         recipe.fixed = [96_382_880_182, 100_432_126_894].into_iter().enumerate().map(|(rank, bytes)|
             FixedOwner { rank: rank as u8, category: Category::Runtime, group: "replayed max owners".into(),
                 bytes: bytes - 12 * per_layer, weights: 0, lifetime: Lifetime::RESIDENT, basis: Basis::Exact }).collect();
+        toy_weight_owners(&mut recipe);
         let request = request(recipe.context, Some(recipe.context), crate::placement::Onboard::Auto,
             recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), SparkReplyFormats::default());
         let started = std::time::Instant::now();

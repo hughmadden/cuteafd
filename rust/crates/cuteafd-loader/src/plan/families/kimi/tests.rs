@@ -135,21 +135,21 @@ fn single_owner_header_plan_never_synthesizes_a_peer_or_half_experts() {
 }
 
 #[test]
-fn header_and_installed_min_plans_share_the_physical_weight_granularity_forecast() -> Result<()> {
-    use crate::{families::kimi_k3::weight_layout::{GlobalLayout, LayerLayout},
+fn header_and_installed_min_plans_share_one_arena_backing_and_tail() -> Result<()> {
+    use crate::{families::kimi_k3::weight_layout::{coordinator_arena, GlobalLayout, LayerLayout},
         placement::{planner::{allocation_granularity_forecast, ALLOCATION_GRANULARITY_GROUP},
             FfnMode, LayerMode, OnboardSetting}};
     use cuteafd_core::memory_layout::Basis;
     let dir = snapshot(true);
     let input = testing::BudgetedPlanInput::open(dir.path())?;
     let model = Model::open(&Checkpoint::open(dir.path())?)?;
-    let mut requests = GlobalLayout::ranks_with_core(model.cfg(), &model.core, 1)?[0].allocation_extents();
-    for layer in 0..model.cfg().layers {
-        requests.extend(LayerLayout::ranks_with_core(model.cfg(), layer,
-            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, &model.core, 1)?[0].allocation_extents(None)?);
-    }
-    assert_eq!(requests.iter().sum::<u64>(), 113_509_532_032);
-    let expected = allocation_granularity_forecast(&requests)?;
+    let globals = GlobalLayout::ranks_with_core(model.cfg(), &model.core, 1)?;
+    let layers = (0..model.cfg().layers).map(|layer| LayerLayout::ranks_with_core(model.cfg(), layer,
+        LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }, &model.core, 1)).collect::<Result<Vec<_>>>()?;
+    let arena = coordinator_arena(0, &globals[0], &layers.iter().map(|pair| &pair[0]).collect::<Vec<_>>())?;
+    assert_eq!(arena.payload_bytes(), 113_509_532_032);
+    assert_eq!(arena.padding_bytes(), 8832);
+    let expected = allocation_granularity_forecast(&[arena.bytes() as u64])?;
     assert!(expected > 0);
     let package = tempfile::tempdir()?;
     let manifest = installed_inventory(package.path(), false);
@@ -172,7 +172,12 @@ fn header_and_installed_min_plans_share_the_physical_weight_granularity_forecast
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].basis, Basis::Estimated);
         assert_eq!(owners[0].bytes, expected);
-        charges.push(owners[0].bytes);
+        let roots = placed.items[0].iter().filter(|item| item.group == "weight arena").collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].bytes, arena.bytes() as u64);
+        assert!(!placed.items[0].iter().any(|item| item.group == "kimi arena padding"
+            || item.group == "Kimi global weights" || item.group == "layers" || item.group.starts_with("Kimi layer ")));
+        charges.push(roots[0].bytes + owners[0].bytes);
     }
     assert_eq!(charges[0], charges[1], "the same request inventory must not depend on PROGRAMS.json");
     Ok(())
@@ -191,9 +196,8 @@ fn single_owner_header_plan_refuses_mandatory_weights_above_default_cap() {
     layout.rtx_bytes = vec![192 << 30];
     layout.head_split = false;
     let report = input.plan(&options).unwrap();
-    // Unpacked uploads charge payload; allocation backing is a separate forecast.
-    // A future packed arena includes its own 8,832 bytes of inter-view padding.
-    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_532_032,
+    // The resident-weight cap charges B, including exact inter-view padding, but not its driver tail.
+    let refusal = PlacementError::ResidentWeightLimit { gpu: 0, required: 113_509_532_032 + 8832,
         limit: ResidentWeights::DEFAULT_LIMIT.0 };
     assert!(!report.fits && !report.placement_supported);
     assert!(report.solver_placement.is_none());
