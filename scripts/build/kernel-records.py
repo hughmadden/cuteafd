@@ -484,9 +484,15 @@ def change_report(previous, current, expected=None):
         elif new is None:
             category, entry = "removed", {"program": name, "group": group}
         else:
+            metadata = [record.get("planner_metadata") for record in (old, new)]
+            routes = [value.get("route_preparation") if isinstance(value, dict) else None for value in metadata]
+            if all(isinstance(route, dict) and route.get("content_sha256") for route in routes):
+                metadata = [{**value, "route_preparation": {key: item for key, item in route.items()
+                             if key != "sha256"}} for value, route in zip(metadata, routes)]
+            metadata_changed = metadata[0] != metadata[1]
             fields = ("object_sha256", "cubin_sha256", "ir_sha256", "resources", "scratch_bytes_at_capacity",
-                      "abi_sha256", "plan", "planner_metadata")
-            if all(old.get(field) == new.get(field) for field in fields):
+                      "abi_sha256", "plan")
+            if not metadata_changed and all(old.get(field) == new.get(field) for field in fields):
                 continue
             reads = old.get("source_reads_sha256", {})
             new_reads = new.get("source_reads_sha256", {})
@@ -495,7 +501,7 @@ def change_report(previous, current, expected=None):
                      "ir_changed": old.get("ir_sha256") != new.get("ir_sha256"),
                      "abi_changed": old.get("abi_sha256") != new.get("abi_sha256"),
                      "plan_changed": old.get("plan") != new.get("plan"),
-                     "planner_metadata_changed": old.get("planner_metadata") != new.get("planner_metadata"),
+                     "planner_metadata_changed": metadata_changed,
                      "triggering_sources": sorted(path for path in reads.keys() | new_reads.keys()
                                                   if reads.get(path) != new_reads.get(path)),
                      "resource_deltas": numeric_deltas(old.get("resources"), new.get("resources")),

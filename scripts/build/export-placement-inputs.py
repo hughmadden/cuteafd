@@ -381,6 +381,10 @@ def publication_records(staging, jobs):
         else:
             for manifest_path in directory.rglob("v41_exl3.json"):
                 manifest = json.loads(manifest_path.read_text())
+                route = manifest.get("route_preparation")
+                if route:
+                    route["content_sha256"] = compare.sha(verified_metadata_bytes(
+                        manifest_path.parent / route["manifest"], {}))
                 for record_path, record in job_records.items():
                     if Path(record_path).parent == manifest_path.parent.relative_to(directory):
                         record["scratch_bytes_at_capacity"] = {
