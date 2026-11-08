@@ -187,6 +187,32 @@ def test_a_pin_bump_never_reuses_a_whole_command(tree):
     assert json.loads((build / "out/manifest.json").read_text()) == {"sparkinfer_revision": "d" * 40}
 
 
+def test_the_launchers_own_log_in_an_output_directory_is_not_an_output(tree):
+    source, build = tree
+    (build / "out").mkdir()
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith(("CUTEAFD_", "B12X_", "TRITON_", "CUTE_"))}
+    environment.update({"CUTEAFD_EXPORT_CACHE": str(build.parent / "store"),
+                        "CUTEAFD_EXPORT_IMAGE_ID": "sha256:" + "0" * 64, "PYTHONDONTWRITEBYTECODE": "1"})
+    command = [sys.executable, str(source / "scripts/build/export-cache.py"), "run", "--build-dir", str(build),
+               "--", sys.executable, str(source / "python/tools/aot/export_fake.py"), "--output-dir", str(build / "out")]
+    for expected in ("miss", "hit"):
+        with open(build / "out/export.log", "w") as log:  # as export-placement-inputs.py opens it
+            subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True, timeout=120)
+        assert f"export cache {expected}:" in (build / "out/export.log").read_text()
+
+
+def test_a_tool_cache_inside_the_build_tree_is_not_an_output(tree):
+    source, build = tree
+    triton = build / ".triton-cache"
+    triton.mkdir()
+    (source / "python/tools/aot/export_fake.py").write_text(
+        (source / "python/tools/aot/export_fake.py").read_text()
+        + '\nopen(os.environ["TRITON_CACHE_DIR"] + "/kernel.cubin", "w").write("x")\n')
+    assert run(tree, env={"TRITON_CACHE_DIR": str(triton)})[0] == "miss"
+    assert run(tree, env={"TRITON_CACHE_DIR": str(triton)})[0] == "hit"
+
+
 def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):
     event, detail = run(tree, mode="spawn")
     assert event == "uncacheable" and "spawn:" in detail, detail

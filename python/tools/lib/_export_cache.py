@@ -159,11 +159,13 @@ class Roots:
         return self._aliases
 
     def name(self, path) -> str | None:
-        """'src:<rel>' or 'build:<rel>'; None outside both."""
+        """'src:<rel>' or 'build:<rel>'; None outside both (and for tool caches inside them)."""
         try:
             resolved = os.path.realpath(os.fsdecode(path))
         except (TypeError, ValueError):
             return None
+        if self._under(resolved, self.scratch):
+            return None  # a tool-keyed cache, even one placed in the build tree
         for alias in self.aliases():
             if resolved == alias or resolved.startswith(alias + "/"):
                 resolved = str(self.source) + resolved[len(alias):]

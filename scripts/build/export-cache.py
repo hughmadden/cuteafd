@@ -66,6 +66,18 @@ def output_roots(command, build: Path) -> list[Path]:
     return sorted(roots)
 
 
+def own_streams() -> set:
+    """(device, inode) of files the launcher's own stdout/stderr write: never outputs."""
+    streams = set()
+    for fd in (1, 2):
+        try:
+            info = os.fstat(fd)
+        except OSError:
+            continue
+        streams.add((info.st_dev, info.st_ino))
+    return streams
+
+
 def tree_state(roots) -> dict:
     """(size, mtime_ns, inode) of every file under each root."""
     state = {}
@@ -83,7 +95,7 @@ def _tree_state(root: Path) -> dict:
                 info = os.lstat(path)
             except FileNotFoundError:
                 continue
-            state[path] = (info.st_size, info.st_mtime_ns, info.st_ino)
+            state[path] = (info.st_size, info.st_mtime_ns, info.st_ino, info.st_dev)
     return state
 
 
@@ -143,7 +155,9 @@ def run(args) -> int:
     if not reason:
         # Every file the export created or changed must be one it was seen writing:
         # an entry restores exactly those, so an unseen write would be dropped.
-        changed = {path for path, state in after.items() if before.get(path) != state}
+        streams = own_streams()
+        changed = {path for path, state in after.items() if before.get(path) != state
+                   and (state[3], state[2]) not in streams}
         unseen = sorted(changed - {os.path.realpath(path) for path in record["written"]} - set(record["written"]))
         if unseen:
             reason = f"{len(unseen)} unrecorded writes, e.g. {normalized(unseen[0], roots)}"
