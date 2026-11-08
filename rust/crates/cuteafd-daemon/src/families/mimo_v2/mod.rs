@@ -1109,7 +1109,7 @@ impl Opened {
             fp8_scales: args.fp8_scales, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream }).collect(),
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)),
-            transient: Default::default() };
+            transient: Default::default(), arenas: Default::default() };
         use crate::shared::experts::rtx::push::{CoordinatorExperts, CoordinatorPush, PushPolicy};
         let mut pushed_experts = None;
         let embed_placement = args.token_io.embed_placement.context("MiMo embedding placement must resolve before admission")?;
@@ -1198,6 +1198,16 @@ impl Opened {
             Ok(loaded)
         })?;
         loader.release_transient();
+        if crate::shared::inventory::startup_probe_enabled() {
+            let physical = std::iter::once(args.device).chain(peer_stream.map(|(d, _)| d)).collect::<Vec<_>>();
+            let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
+            let mut census = crate::shared::memory::receipts::Census::default();
+            census.owners(model.allocation_receipts(&shares, &mtp_weights, devices)?);
+            census.owners(embedding.allocation_receipts(devices, "mimo.embedding")?);
+            census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+            crate::shared::inventory::startup_probe(&self.library, &physical, "mimo_v2/weights-loaded",
+                crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+        }
         let mtp = if args.mtp > 0 {
             let started = Instant::now();
             let zeroed = |bytes: usize| -> Result<crate::shared::memory::DeviceAllocation<'_>> {
@@ -1284,6 +1294,15 @@ impl Opened {
                         capacity.max_batch_sequences, representation, args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
                 tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "DFlash drafter resident");
+                if crate::shared::inventory::startup_probe_enabled() {
+                    let physical = devices.iter().map(|device| device.id).collect::<Vec<_>>();
+                    let mut census = crate::shared::memory::receipts::Census::default();
+                    census.owners(engine.drafter.as_ref().context("DFlash drafter just loaded")?
+                        .allocation_receipts(cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?)?);
+                    census.normalize(cuteafd_loader::placement::planner::PhaseOrder::TARGET_THEN_DRAFT)?;
+                    crate::shared::inventory::startup_probe(&self.library, &physical, "mimo_v2/drafter-loaded",
+                        crate::shared::inventory::StartupEvidence { census: Some(&census), ..Default::default() })?;
+                }
             }
             let moe_layers = (0..layers).filter(|&l| !self.cfg.dense[l]).collect::<Vec<_>>();
             engine.expert_input = args.expert_input;
