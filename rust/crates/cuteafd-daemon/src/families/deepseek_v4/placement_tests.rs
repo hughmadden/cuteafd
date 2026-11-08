@@ -366,9 +366,16 @@ fn planner_equals_runtime_deepseek_v4_fixture_context() {
             assert!(bytes(&context, gpu, group) > 0 && bytes(&heads, gpu, group) == 0, "rtx{gpu} {group}");
         }
         // Per 256-token unit: the two C4 layers' 45,888 B halve on each GPU, the C128 layer's 1,728 B
-        // stays whole (the window-only layer has none).
-        let per_unit = |p: &Placement| bytes(p, gpu, "records") / (p.pool_tokens / 256);
-        assert_eq!(per_unit(&heads) - per_unit(&context), 45_888, "rtx{gpu} C4 records halve");
+        // stays whole (the window-only layer has none). Each of the five record backings (records
+        // and index per C4 layer, C128 records) rounds its affine extent to the SM120 cudaMalloc
+        // granularity, so the extent difference carries that rounding on top of the exact payload.
+        assert_eq!(heads.pool_tokens, context.pool_tokens, "rtx{gpu}: attention placement keeps the pool");
+        let units = heads.pool_tokens / 256;
+        let delta = bytes(&heads, gpu, "records").abs_diff(bytes(&context, gpu, "records"));
+        let exact = 45_888 * units;
+        let rounding = 5 * cuteafd_loader::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES;
+        assert!(delta.abs_diff(exact) < rounding,
+            "rtx{gpu} C4 records halve: {delta} vs {exact} ± {rounding}");
     }
     // A build without the programs refuses both auto and explicit context.
     let plain = synthetic(&dir.path().join("plain").tap_dir());
