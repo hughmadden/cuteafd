@@ -1280,7 +1280,7 @@ impl Opened {
         let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-        let admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
+        let mut admitted = ProductionInput { expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             maximum_pool_tokens, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
                 && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some())), blas, target,
@@ -1758,7 +1758,21 @@ impl Opened {
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            let captures = engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            let declared = admitted.graphs.declared();
+            let measured = captures.iter().map(|capture|
+                cuteafd_loader::placement::inventory::CapturedGraphRank::measure(capture.rank as u8,
+                    &declared[capture.rank], &capture.keys, capture.before, capture.after)
+                    .map_err(anyhow::Error::msg)).collect::<Result<Vec<_>>>()?;
+            let reconciled = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
+                &mut admitted.solved, "glm.graphs", &admitted.graphs.set(),
+                admitted.graphs.fingerprints(), &measured).map_err(anyhow::Error::msg)?;
+            for (rank, (row, live)) in admitted.graphs.ranks().iter().zip(&reconciled.ranks).enumerate() {
+                tracing::info!(rank, executables = live.executables, measured = live.bytes,
+                    plan = row.bytes, "GLM startup graph capture reconciled");
+            }
+            if let Some(note) = admitted.graphs.capture_note(&reconciled) { tracing::warn!("{note}"); }
+            cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5 captured");
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }

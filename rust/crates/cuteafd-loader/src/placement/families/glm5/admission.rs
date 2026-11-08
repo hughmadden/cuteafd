@@ -4,7 +4,8 @@ use super::{PAGE_ROWS, weights::WeightInventory};
 use super::{buffers::TargetBuffers, exchanges::ExchangeBuffers, hooks::HookBuffers};
 use crate::families::glm5::GlmDsaConfig;
 use crate::placement::inventory::{DeclaredGraphSet, FigureAttribution, FigureIdentity, MemoryFigure};
-use crate::placement::{AttentionPlacement, LayerMode, planner::*};
+use crate::placement::{AttentionPlacement, GraphRank, GraphSet, LayerMode, planner::*};
+use cuteafd_core::memory_layout::Basis;
 use crate::serving_capacity::glm_graphs::{GlmGraphKey, GlmGraphLayer, glm_declared_graphs, glm_graph_shapes};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::{BTreeMap, BTreeSet};
@@ -679,7 +680,7 @@ pub struct PreparedGlm<'a> {
     local: BTreeMap<usize, super::local_physical::LocalPhysicalInventory>,
     decode_link: Option<crate::placement::PreparedSparkLink>,
     prefill_link: Option<crate::placement::PreparedSparkLink>,
-    pub runtime: RuntimeFigures,
+    pub runtime: DeviceFigures,
     pub load_overcharge_bytes: u64,
 }
 
@@ -692,7 +693,7 @@ pub struct AdmittedGlm {
     pub decode_link: Option<crate::placement::PreparedSparkLink>,
     pub prefill_link: Option<crate::placement::PreparedSparkLink>,
     pub graphs: StartupGraphs,
-    pub runtime: RuntimeFigures,
+    pub runtime: DeviceFigures,
     pub host: HostFigures,
     pub load_overcharge_bytes: u64,
 }
@@ -716,10 +717,10 @@ impl AdmittedGlm {
         let mut uses = Vec::new();
         for (rank, graph) in graphs.iter().enumerate() {
             let current = FigureIdentity { declared_graphs: graph, ..identity };
-            for (name, figure) in [("graph instantiate", self.graphs.figures()[rank]),
-                ("context/modules", self.runtime.context()[rank]), ("load residual", self.runtime.load()[rank]),
-                ("runtime residual", self.runtime.unattributed()[rank])] {
-                uses.push(FigureUse { name, figure, current });
+            uses.push(FigureUse { name: "graph instantiate", figure: self.graphs.figures()[rank], current });
+            uses.push(FigureUse { name: "context/modules", figure: self.runtime.context()[rank], current });
+            for (index, row) in self.runtime.stages().iter().enumerate().filter(|(_, row)| row.rank == rank) {
+                uses.push(FigureUse { name: row.label, figure: self.runtime.stage_figure(index), current });
             }
         }
         let current = FigureIdentity { declared_graphs: &host_graphs, ..identity };
@@ -855,7 +856,7 @@ impl<'a> ProductionInput<'a> {
         // Source-reference bytes are fixed before admission. Classification
         // against the canonical resolved layout happens after the single solve.
         let reference = if self.gpus == 1 { MIN_LAYOUT } else { MAX_LAYOUT };
-        let runtime = RuntimeFigures::new(self.gpus, reference)?;
+        let runtime = DeviceFigures::new(self.gpus)?;
         let host = HostFigures::for_layout(self.gpus, reference)?;
         let expert_usage = (self.expert_usage && !self.skip_routed_experts && routed > 0)
             .then(|| cuteafd_core::expert_usage::Geometry { layers: self.layers,
@@ -1110,12 +1111,8 @@ const fn measured(bytes: u64, graphs: &'static str, layout: &'static str,
 /// Measured parameters, #1242 min census (2026-11-04), retained under
 /// builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1.
 /// Context is normalized at preweight (context + streams + selected modules).
-/// Graph bytes are the signed immediate instantiate sum, not whole warm growth.
-/// These are not independently qualified bounds, receipts or post-Ready Growth.
 pub const GLM_MIN_CONTEXT: MemoryFigure = measured(598_999_040, MIN_GRAPHS, MIN_LAYOUT,
     "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/preweight");
-pub const GLM_MIN_GRAPH: MemoryFigure = measured(2_560_622_592, MIN_GRAPHS, MIN_LAYOUT,
-    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/instantiate");
 
 /// Measured parameters, #1242 max census (2026-11-04), retained under
 /// builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1.
@@ -1126,100 +1123,254 @@ pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
     measured(603_193_344, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
         "#1242 glm53-exl3-max-census-r1/preweight/rank1"),
 ];
-pub const GLM_MAX_GRAPH: [MemoryFigure; 2] = [
-    measured(3_042_967_552, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/instantiate/rank0"),
-    measured(2_971_664_384, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/instantiate/rank1"),
-];
 
-/// Measured #1242 peak over recorded startup phases after subtracting the
-/// normalized preweight context, exact native backings and signed instantiate
-/// bytes. Ready was the largest recorded remainder on all three ranks. These
-/// are observed peaks, not independently qualified bounds or attributed owners.
-pub const GLM_MIN_RUNTIME_UNATTRIBUTED: MemoryFigure = measured(621_275_328, MIN_GRAPHS, MIN_LAYOUT,
-    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/runtime-unattributed-peak");
-pub const GLM_MAX_RUNTIME_UNATTRIBUTED: [MemoryFigure; 2] = [
-    measured(912_069_460, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/runtime-unattributed-peak/rank0"),
-    measured(581_053_972, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/runtime-unattributed-peak/rank1"),
-];
-
-/// Recorded Load..Warmup residual peaks, including graphs-before-serving after
-/// subtracting signed instantiate bytes. Unknown FP8 conversion/upload device
-/// temporaries are covered opaquely, not enumerated owners; samples do not bound
-/// unobserved intra-operation peaks. Other layouts require a census.
-pub const GLM_MIN_LOAD_UNATTRIBUTED: MemoryFigure = measured(552_230_080, MIN_GRAPHS, MIN_LAYOUT,
-    "4a56925e7986a57e3194c0cca6df256838386519", "#1242 glm53-exl3-min-census-r1/load-through-warmup-unattributed-peak");
-pub const GLM_MAX_LOAD_UNATTRIBUTED: [MemoryFigure; 2] = [
-    measured(843_024_212, MAX_GRAPHS[0], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/load-through-warmup-unattributed-peak/rank0"),
-    measured(509_750_804, MAX_GRAPHS[1], MAX_LAYOUT, "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        "#1242 glm53-exl3-max-census-r1/load-through-warmup-unattributed-peak/rank1"),
-];
-
-/// Opaque non-graph runtime parameters, charged independently of physical
-/// weights, payloads, pinned storage and graph instantiate bytes.
-#[derive(Debug, Clone)]
-pub struct RuntimeFigures {
-    context: Vec<MemoryFigure>,
-    load: Vec<MemoryFigure>,
-    unattributed: Vec<MemoryFigure>,
+/// One measured startup-graph residency: the summed
+/// `CUTEAFD_GRAPH_CENSUS {"event":"capture"}` `instantiate_bytes` records of one
+/// census device, over exactly the declared key set that produced `fingerprint`.
+/// Graph instantiate storage is 2 MiB-quantized driver memory whose size follows
+/// the captured kernels, not the key count: one fingerprint measured on two
+/// builds differs (16,827 keys needed 3.73 GB at 9567fdf6 and 3.04 GB at
+/// 5d180b5c8), so a row is never scaled to another key set or another build.
+/// A declared set with no row is refused; measure it and add the row.
+#[derive(Debug, Clone, Copy)]
+struct MeasuredGraphSet {
+    keys: usize,
+    fingerprint: &'static str,
+    bytes: u64,
+    layout: &'static str,
+    census: &'static str,
+    commit: &'static str,
 }
 
-impl RuntimeFigures {
-    /// `layout` is the complete selected layout identity, not a graph count or
-    /// placement name. Uncovered layouts keep the measured bytes unchanged and
-    /// explicitly record the one-to-one derivation; staleness never adds bytes.
-    pub fn new(gpus: usize, layout: &str) -> Result<Self, Refusal> {
-        if !(1..=2).contains(&gpus) || layout.trim().is_empty() {
-            return Err(invalid("invalid runtime figure layout or rank count"));
+/// GLM 5.3 K6-HQA (#1242 census, revision 47af23347db743b4666d952e2eb48f2b01c3fede),
+/// GLM 5.3 K6 at 9567fdf6, and Mistral Large 4 at 9567fdf6. Each byte figure is
+/// one device's capture sum; count and fingerprint identify the set.
+const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
+    MeasuredGraphSet { keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_560_622_592, layout: MIN_LAYOUT,
+        census: "glm53-exl3-min-census-r1 device 0: 16827 capture instantiate records",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredGraphSet { keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
+        census: "glm53-exl3-max-census-r1 device 0: 16827 capture instantiate records",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredGraphSet { keys: 16_614, fingerprint: MAX_GRAPHS[1], bytes: 2_971_664_384, layout: MAX_LAYOUT,
+        census: "glm53-exl3-max-census-r1 device 1: 16614 capture instantiate records",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredGraphSet { keys: 16_827, fingerprint: "743e61e45b39ba6bdb04043401a1b5f9330863bda205bbb35615ff9512aea6dc",
+        bytes: 3_732_930_560, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
+        census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 0: 16827 capture instantiate records",
+        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+    MeasuredGraphSet { keys: 16_614, fingerprint: "b6f823f3b9defca4fcd752fab3567a19d8056921c5277355e8a5be925bae1d54",
+        bytes: 3_986_685_952, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
+        census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 1: 16614 capture instantiate records",
+        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+    MeasuredGraphSet { keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
+        bytes: 2_740_977_664, layout: "ml4-exl3; attention/Heads; 1 rank",
+        census: "ml4 1x census memory-census-20261108T172510Z-raptor-coordinator-57-0",
+        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+    MeasuredGraphSet { keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
+        bytes: 3_445_620_736, layout: "ml4-exl3; attention/Context; 2 ranks",
+        census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 0: 15549 capture instantiate records",
+        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+    MeasuredGraphSet { keys: 15_336, fingerprint: "4ca4be3bc0b20179dc457a8eff3ec0d9425bb6a4ef1a6851955a9f6a9d4073aa",
+        bytes: 3_720_347_648, layout: "ml4-exl3; attention/Context; 2 ranks",
+        census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 1: 15336 capture instantiate records",
+        commit: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
+];
+
+fn measured_graph_row(fingerprint: &str) -> Option<&'static MeasuredGraphSet> {
+    MEASURED_GLM_GRAPHS.iter().find(|row| row.fingerprint == fingerprint)
+}
+
+/// The measured row for one declared set, or nothing so the caller refuses with
+/// the geometry and the measurement that would cover it.
+fn graph_row(fingerprint: &str, keys: usize) -> Option<(u64, Basis, MemoryFigure)> {
+    if let Some(row) = measured_graph_row(fingerprint) {
+        if row.keys != keys { return None; }
+        return Some((row.bytes, Basis::Calibrated,
+            measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census)));
+    }
+    #[cfg(test)]
+    {
+        // Unit fixtures build plans on synthetic geometries no census covers;
+        // this path is never compiled into the engine.
+        if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
+            let bytes = keys as u64 * (2 << 20);
+            return Some((bytes, Basis::Estimated, MemoryFigure { bytes,
+                attribution: FigureAttribution::Estimated { derivation: "2 MiB per declared graph" },
+                evidence: "synthetic unit fixture", producing_commit: "test",
+                identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
+                    native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
+                    gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } }));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Unit fixtures plan synthetic geometries that no census covers. The
+    /// synthetic figure is only compiled into test builds; a test that needs
+    /// the production refusal turns it off.
+    static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+#[cfg(test)]
+pub(crate) fn refuse_unmeasured_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
+
+const MIN_CENSUS: &str = "builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1";
+const MAX_CENSUS: &str = "builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1";
+
+/// One device residency that no ledger allocation owns: the `cudaMemGetInfo`
+/// used-minus-tracked delta across the named census stage transition, where the
+/// named code path allocates it. `label` names the allocator, not a residual.
+#[derive(Debug, Clone, Copy)]
+struct MeasuredDeviceStage {
+    ranks: usize,
+    rank: usize,
+    label: &'static str,
+    first: Phase,
+    last: Phase,
+    bytes: u64,
+    stage: &'static str,
+    census: &'static str,
+    evidence: &'static str,
+    commit: &'static str,
+}
+
+/// Each row is charged exactly once, in the phase window where the memory is
+/// resident. Stage deltas partition Ready's untracked bytes beside the preweight
+/// context and the graph owner; no row overlaps another.
+const MEASURED_DEVICE_STAGES: [MeasuredDeviceStage; 15] = [
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "target weight load device staging", first: Phase::Load,
+        last: Phase::DraftLoad, bytes: 143_391_104,
+        stage: "programs-before-weights -> weights-before-draft-pool", census: MIN_CENSUS,
+        evidence: "target weight load device staging: programs-before-weights -> weights-before-draft-pool; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "drafter load device staging", first: Phase::Load,
+        last: Phase::Warmup, bytes: 123_296_064,
+        stage: "weights-before-draft-pool -> draft-before-kv", census: MIN_CENSUS,
+        evidence: "drafter load device staging: weights-before-draft-pool -> draft-before-kv; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
+        last: Phase::Growth, bytes: 122_782_976,
+        stage: "draft-before-kv -> pool-before-transport", census: MIN_CENSUS,
+        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "transport device staging", first: Phase::Load,
+        last: Phase::Warmup, bytes: 90_144_768,
+        stage: "pool-before-transport -> transport-before-graphs", census: MIN_CENSUS,
+        evidence: "transport device staging: pool-before-transport -> transport-before-graphs; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "startup prewarm module first touch", first: Phase::Warmup,
+        last: Phase::Growth, bytes: 72_615_168,
+        stage: "transport-before-graphs -> graphs-before-serving, minus that transition's measured instantiate sum",
+        census: MIN_CENSUS,
+        evidence: "startup prewarm module first touch: transport-before-graphs -> graphs-before-serving, minus that transition's measured instantiate sum; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 1, rank: 0, label: "first ready-step CUDA module touch", first: Phase::Ready,
+        last: Phase::Growth, bytes: 69_045_248,
+        stage: "graphs-before-serving -> ready", census: MIN_CENSUS,
+        evidence: "first ready-step CUDA module touch: graphs-before-serving -> ready; builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1",
+        commit: "4a56925e7986a57e3194c0cca6df256838386519" },
+    MeasuredDeviceStage { ranks: 2, rank: 0, label: "target weight load device staging", first: Phase::Load,
+        last: Phase::DraftLoad, bytes: 269_002_112,
+        stage: "programs-before-weights -> weights-before-draft-pool", census: MAX_CENSUS,
+        evidence: "target weight load device staging: programs-before-weights -> weights-before-draft-pool; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 0, label: "drafter load device staging", first: Phase::Load,
+        last: Phase::Warmup, bytes: 77_117_248,
+        stage: "weights-before-draft-pool -> draft-before-kv", census: MAX_CENSUS,
+        evidence: "drafter load device staging: weights-before-draft-pool -> draft-before-kv; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 0, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
+        last: Phase::Growth, bytes: 327_036_052,
+        stage: "draft-before-kv -> pool-before-transport", census: MAX_CENSUS,
+        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 0, label: "transport device staging", first: Phase::Load,
+        last: Phase::Warmup, bytes: 169_868_800,
+        stage: "pool-before-transport -> transport-before-graphs", census: MAX_CENSUS,
+        evidence: "transport device staging: pool-before-transport -> transport-before-graphs; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 0, label: "first ready-step CUDA module touch", first: Phase::Ready,
+        last: Phase::Growth, bytes: 69_045_248,
+        stage: "graphs-before-serving -> ready", census: MAX_CENSUS,
+        evidence: "first ready-step CUDA module touch: graphs-before-serving -> ready; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 1, label: "target weight load device staging", first: Phase::Load,
+        last: Phase::DraftLoad, bytes: 140_074_880,
+        stage: "programs-before-weights -> weights-before-draft-pool", census: MAX_CENSUS,
+        evidence: "target weight load device staging: programs-before-weights -> weights-before-draft-pool; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 1, label: "KV pool cudaMalloc backing", first: Phase::Warmup,
+        last: Phase::Growth, bytes: 339_612_820,
+        stage: "draft-before-kv -> pool-before-transport", census: MAX_CENSUS,
+        evidence: "KV pool cudaMalloc backing: draft-before-kv -> pool-before-transport; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 1, label: "transport device staging", first: Phase::Load,
+        last: Phase::Warmup, bytes: 27_965_952,
+        stage: "pool-before-transport -> transport-before-graphs", census: MAX_CENSUS,
+        evidence: "transport device staging: pool-before-transport -> transport-before-graphs; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+    MeasuredDeviceStage { ranks: 2, rank: 1, label: "first ready-step CUDA module touch", first: Phase::Ready,
+        last: Phase::Growth, bytes: 71_303_168,
+        stage: "graphs-before-serving -> ready", census: MAX_CENSUS,
+        evidence: "first ready-step CUDA module touch: graphs-before-serving -> ready; builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1",
+        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226" },
+];
+
+/// Every device residency a census found outside the ledger's named owners,
+/// beside the preweight context figure. One named allocator per row, charged
+/// once in the phase window where it is resident: no envelope, no margin, no
+/// max-of-samples padding and no unmeasured "unattributed" rest.
+#[derive(Debug, Clone)]
+pub struct DeviceFigures {
+    context: Vec<MemoryFigure>,
+    stages: Vec<&'static MeasuredDeviceStage>,
+}
+
+impl DeviceFigures {
+    pub fn new(gpus: usize) -> Result<Self, Refusal> {
+        if !(1..=2).contains(&gpus) {
+            return Err(invalid("invalid device figure rank count"));
         }
         let context = if gpus == 1 { vec![GLM_MIN_CONTEXT] } else { GLM_MAX_CONTEXT.to_vec() };
-        let unattributed = if gpus == 1 { vec![GLM_MIN_RUNTIME_UNATTRIBUTED] }
-            else { GLM_MAX_RUNTIME_UNATTRIBUTED.to_vec() };
-        let derive = |figures: Vec<MemoryFigure>, derivation| -> Result<_, Refusal> {
-            figures.into_iter().map(|figure| {
-                if layout == figure.identity.layout { Ok(figure) }
-                else { figure.scaled(1, 1, derivation).map_err(invalid) }
-            }).collect::<Result<Vec<_>, _>>()
-        };
-        Ok(Self {
-            context: derive(context,
-                "unchanged measured min/max preweight context; different layout, no finer context measurement")?,
-            load: derive(if gpus == 1 { vec![GLM_MIN_LOAD_UNATTRIBUTED] }
-                else { GLM_MAX_LOAD_UNATTRIBUTED.to_vec() },
-                "unchanged measured min/max Load..Warmup residual peak; unmodelled FP8 conversion/upload device temporaries, no finer load census")?,
-            unattributed: derive(unattributed,
-                "unchanged measured min/max recorded runtime-unattributed peak; different layout, no finer runtime measurement")?,
-        })
+        Ok(Self { context, stages: MEASURED_DEVICE_STAGES.iter().filter(|row| row.ranks == gpus).collect() })
     }
 
     pub fn context(&self) -> &[MemoryFigure] { &self.context }
-    pub fn load(&self) -> &[MemoryFigure] { &self.load }
-    pub fn unattributed(&self) -> &[MemoryFigure] { &self.unattributed }
+    pub fn stages(&self) -> &[&'static MeasuredDeviceStage] { &self.stages }
+
+    /// The row's receipt for the census recommendation; charged bytes live in
+    /// [`Self::components`] only.
+    pub fn stage_figure(&self, index: usize) -> MemoryFigure {
+        let row = self.stages[index];
+        measured(row.bytes, "", MIN_LAYOUT, row.commit, row.evidence)
+    }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
-        if maximum_pages == 0 { return Err(invalid("zero runtime figure pool extent")); }
-        Ok([("context and selected modules", &self.context, Lifetime::RESIDENT),
-            ("load unattributed (FP8 conversion/upload device temporaries; sampled, not fully modelled)",
-                &self.load, Lifetime { first: Phase::Load, last: Phase::Warmup }),
-            ("runtime unattributed", &self.unattributed,
-                Lifetime { first: Phase::Ready, last: Phase::Growth })]
-            .into_iter().flat_map(|(name, figures, lifetime)| {
-                figures.iter().enumerate().map(move |(rank, figure)| Component {
-                    activation: Activation::always(),
-                    bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
-                    kind: ComponentKind::Allowance(Allowance {
-                        location: Location::coordinator(rank as u8), bytes: figure.bytes,
-                        lifetime,
-                        source: format!("GLM {name}: {:?}; {}; producer {}",
-                            figure.attribution, figure.evidence, figure.producing_commit),
-                        assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
-                    }),
-                })
-            }).collect())
+        if maximum_pages == 0 { return Err(invalid("zero device figure pool extent")); }
+        let mut components = self.context.iter().enumerate().map(|(rank, figure)| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                bytes: figure.bytes, lifetime: Lifetime::RESIDENT,
+                source: format!("GLM context and selected modules: {:?}; {}; producer {}",
+                    figure.attribution, figure.evidence, figure.producing_commit),
+                assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+            }),
+        }).collect::<Vec<_>>();
+        components.extend(self.stages.iter().map(|row| Component {
+            activation: Activation::always(),
+            bytes: ByteCurve::fixed(row.bytes, maximum_pages),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(row.rank as u8),
+                bytes: row.bytes, lifetime: Lifetime { first: row.first, last: row.last },
+                source: format!("GLM {}: measured census stage delta {}; {}; producer {}",
+                    row.label, row.stage, row.census, row.commit),
+                assumed: false,
+            }),
+        }));
+        Ok(components)
     }
 }
 
@@ -1309,14 +1460,19 @@ fn ordinary_heap_subset(component: &Component) -> bool {
     }
 }
 
-/// Independently declared full-context keys plus maintained whole-set figures.
-/// No per-executable calibration, margin or invented post-Ready reserve.
+/// Independently declared full-context keys plus one measured instantiate row
+/// per rank. The row is keyed by that rank's declared fingerprint; an
+/// undeclared fingerprint is a refusal naming it and the measurement that would
+/// cover it. No scaling, margin or invented post-Ready reserve.
 #[derive(Debug, Clone)]
 pub struct StartupGraphs {
     context: u64,
+    shapes: u64,
     attention: AttentionPlacement,
     layers: Vec<GlmGraphLayer>,
     declared: Vec<DeclaredGraphSet<GlmGraphKey>>,
+    fingerprints: Vec<String>,
+    ranks: Vec<GraphRank>,
     figures: Vec<MemoryFigure>,
 }
 
@@ -1325,45 +1481,57 @@ impl StartupGraphs {
         layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
         if context == 0 { return Err(invalid("zero graph context")); }
         let extent = usize::try_from(context).map_err(|_| Refusal::Overflow("GLM graph context"))?;
-        let declared = glm_declared_graphs(&glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize)),
-            attention, gpus, layers, return_ranks).map_err(Refusal::InvalidFact)?;
-        let mut figures = Vec::with_capacity(gpus);
+        let shapes = glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize));
+        let declared = glm_declared_graphs(&shapes, attention, gpus, layers, return_ranks)
+            .map_err(Refusal::InvalidFact)?;
+        let (mut fingerprints, mut ranks, mut figures) = (Vec::new(), Vec::new(), Vec::new());
         for (rank, keys) in declared.iter().enumerate() {
-            let source = if gpus == 1 { GLM_MIN_GRAPH } else { GLM_MAX_GRAPH[rank] };
-            let identity = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
-            figures.push(if identity == source.identity.declared_graphs { source } else {
-                // Layers splits a layer into phase executables, not multiple whole
-                // layers. Retain their real declarations but scale the whole-set
-                // census by layer/shape equivalents, not phase-segment count.
-                let equivalents = if attention == AttentionPlacement::Layers {
-                    layers.len() * glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize)).len()
-                } else { keys.len() };
-                source.scaled(equivalents as u64, if rank == 0 { 16_827 } else { 16_614 },
-                    "whole measured min/max instantiate bytes * whole-layer shape equivalents / measured declared keys; phase segmentation is not per-executable calibration")
-                    .map_err(|error| invalid(error))?
-            });
+            let fingerprint = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
+            let Some((bytes, basis, figure)) = graph_row(&fingerprint, keys.len()) else {
+                return Err(Refusal::InvalidFact(format!(
+                    "GLM startup graphs: no measured instantiate row for declared key set {fingerprint} \
+                     ({n} keys, rank {rank}, attention {attention:?}, {gpus} coordinator GPU(s), context {context}); \
+                     launch this layout with a memory census and sum the CUTEAFD_GRAPH_CENSUS capture \
+                     instantiate_bytes for device {rank}, then add that row to MEASURED_GLM_GRAPHS", n = keys.len())));
+            };
+            figures.push(figure);
+            ranks.push(GraphRank { executables: keys.len() as u64, bytes, margin: 0, basis });
+            fingerprints.push(fingerprint);
         }
-        Ok(Self { context, attention, layers: layers.to_vec(), declared, figures })
+        Ok(Self { context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
+            declared, fingerprints, ranks, figures })
     }
 
     pub fn declared(&self) -> &[DeclaredGraphSet<GlmGraphKey>] { &self.declared }
+    pub fn fingerprints(&self) -> &[String] { &self.fingerprints }
+    pub fn ranks(&self) -> &[GraphRank] { &self.ranks }
     pub fn figures(&self) -> &[MemoryFigure] { &self.figures }
+
+    /// The same inventory the daemon reconciles its live capture against.
+    pub fn set(&self) -> GraphSet {
+        GraphSet { ranks: self.ranks.clone(), lifetime: crate::placement::Lifetime::Startup, shapes: self.shapes }
+    }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero graph pool extent")); }
-        Ok(self.figures.iter().enumerate().map(|(rank, figure)| Component {
-            activation: Activation::always(),
-            bytes: ByteCurve::fixed(figure.bytes, maximum_pages),
-            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
-                bytes: figure.bytes, lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
-                source: format!("GLM startup graph instantiate: {:?}; {}; exact {} declared keys at context {}; producer {}",
-                    figure.attribution, figure.evidence, self.declared[rank].len(), self.context, figure.producing_commit),
-                assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
-            }),
-        }).collect())
+        self.ranks.iter().enumerate().map(|(rank, graph)|
+            crate::placement::planner::serving::startup_graph_component(
+                &format!("glm.graphs.{rank}"), Location::coordinator(rank as u8), *graph, maximum_pages)
+        ).collect()
+    }
+
+    /// The measured rows beside the live capture, so a build whose captured
+    /// executable residency moved away from its row is reported, not absorbed.
+    pub fn capture_note(&self, measured: &GraphSet) -> Option<String> {
+        let drift: Vec<_> = self.ranks.iter().zip(&measured.ranks).enumerate()
+            .filter_map(|(rank, (row, live))| (row.bytes != live.bytes)
+                .then(|| format!("rank {rank}: row {} -> captured {}", row.bytes, live.bytes)))
+            .collect();
+        (!drift.is_empty()).then(|| format!(
+            "GLM startup graph capture differs from the measured row ({}); update MEASURED_GLM_GRAPHS for this build",
+            drift.join(", ")))
     }
 }
-
 struct Domains<'a> {
     prefill: (usize, &'a [PrefillShape]),
     lanes: (usize, &'a [u64]),
