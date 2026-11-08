@@ -173,6 +173,32 @@ mod budget_tests {
     use super::*;
 
     #[test]
+    fn command_error_emits_one_final_failure_report() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone)]
+        struct Output(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Output {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let output = Output(Arc::new(Mutex::new(Vec::new())));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert_eq!(finish(Ok(7)).unwrap(), 7);
+            assert!(finish::<()>(Err(anyhow::anyhow!("startup fixture failure"))).is_err());
+        });
+        let text = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("memory ledger").count(), 1, "{text}");
+        assert!(text.contains(r#""stage":"failure""#), "{text}");
+        assert!(text.contains("startup fixture failure"), "{text}");
+    }
+
+    #[test]
     fn only_memory_refusals_are_kv_shortfalls() {
         use cuteafd_core::serving_capacity::CapacityError;
         let no_room = anyhow::Error::from(NoKvRoom { free_after_reserve: vec![-1_024, 4_096] });

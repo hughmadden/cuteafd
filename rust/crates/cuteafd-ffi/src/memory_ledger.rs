@@ -609,6 +609,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_failure_retains_owners_before_unwind() {
+        let _ledger = test_guard();
+        let address = 0x7600_0000_0000usize;
+        let _scope = scope("workspace/failure-fixture");
+        record_alloc(Space::Device, 31, address, 512);
+        let error = capture_failure(anyhow::anyhow!("native fixture error"));
+        record_free(address);
+        let saved = error.downcast_ref::<FailureSnapshot>().unwrap();
+        assert_eq!(saved.ledger.by_scope(Space::Device, 31)["workspace/failure-fixture"], 512);
+        assert_eq!(snapshot().total(Space::Device, 31), 0);
+        assert!(format!("{error:#}").contains("native fixture error"));
+    }
+
+    #[test]
+    fn unscoped_allocations_report_distinct_sites_once() {
+        use tracing::{Event, Metadata, Subscriber, span::{Attributes, Id, Record}};
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+        impl Subscriber for Warnings {
+            fn enabled(&self, _: &Metadata<'_>) -> bool { true }
+            fn new_span(&self, _: &Attributes<'_>) -> Id { Id::from_u64(1) }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                struct Fields(String);
+                impl tracing::field::Visit for Fields {
+                    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+                let mut fields = Fields(String::new());
+                event.record(&mut fields);
+                if event.metadata().level() == &tracing::Level::WARN {
+                    self.0.lock().unwrap().push(fields.0);
+                }
+            }
+        }
+        let _ledger = test_guard();
+        let warnings = Warnings::default();
+        let _owner = owner("unscoped-fixture");
+        tracing::subscriber::with_default(warnings.clone(), || {
+            for address in [0x7700_0000_0000, 0x7700_0000_0001] {
+                record_alloc(Space::Device, 32, address, 32);
+                record_free(address);
+            }
+            record_alloc(Space::Pinned, -1, 0x7700_0000_0002, 64);
+            record_free(0x7700_0000_0002);
+            let _scope = scope("workspace/fixture");
+            record_alloc(Space::Device, 32, 0x7700_0000_0003, 32);
+            record_free(0x7700_0000_0003);
+        });
+        let warnings = warnings.0.lock().unwrap();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().all(|message| message.contains("unscoped native allocation")
+            && message.contains("unscoped-fixture") && message.contains("site=")));
+    }
+
+    #[test]
     fn startup_history_preserves_transients_reuse_and_initial_owners() {
         let _ledger = test_guard();
         let base = 0x7300_0000_0000usize;
