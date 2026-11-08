@@ -681,6 +681,19 @@ mod source_format_tests {
             }
         }
     }
+
+    #[test]
+    fn native_modules_load_inside_the_measured_pre_baseline_window() {
+        let source = include_str!("mod.rs");
+        let window = source
+            .split("// Load only selected modules, then measure the admission baseline before tensors.")
+            .nth(1).unwrap()
+            .split("let preflight = admission::preflight").next().unwrap();
+        let sampled = window.find("let after = self.library.cuda_memory_info()").unwrap();
+        let native = window.find("self.library.tp2_native_initialize()?").unwrap();
+        assert!(native < sampled, "Spark intake native modules must be sampled on TP1 too (#1554)");
+        assert_eq!(window.matches("tp2_native_initialize").count(), 1);
+    }
 }
 
 impl EngineArgs {
@@ -1061,6 +1074,9 @@ impl Opened {
                     family, split_family: Some(split_cfg.program_family()?),
                 };
                 programs.load_matching(|name| selected.contains(name))?;
+                // Spark intake loads every registered native module even on TP1.
+                // Load before sampling, so admission sees its exact occupancy (#1554).
+                self.library.tp2_native_initialize()?;
                 let after = self.library.cuda_memory_info()?.0;
                 let module_bytes = before.saturating_sub(after) as u64;
                 ensure!(module_bytes <= module_bound,
