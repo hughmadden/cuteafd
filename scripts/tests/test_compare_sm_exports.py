@@ -1564,6 +1564,27 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
         publisher.publish(target, tmp_path / 'other-staging', 1, 1)
 
 
+def test_v41_allocation_metadata_is_bound_to_publication_records(tmp_path):
+    publisher = compare_sm.load_file("test_v41_placement_records", ROOT / "scripts/build/export-placement-inputs.py")
+    for name, (source, _) in publisher.V41_MANIFESTS.items():
+        directory = tmp_path / name
+        directory.mkdir()
+        records = {"z.o": {"object_sha256": "z"}, "a.o": {"object_sha256": "a"}}
+        (directory / "program-records.json").write_text(json.dumps(records))
+        manifest = {"variants": [{"capacity": 4096, "scratch_bytes": 123}],
+                    "artifacts": {"a.o": "a"}, "physical_sms": 188, "sparkinfer_revision": "old"}
+        (directory / source).write_text(json.dumps(manifest))
+        jobs = [(name, "export.py", [])]
+        published = publisher.publication_records(tmp_path, jobs)
+        assert published[name + "/a.o"]["planner_metadata"] == {"variants": manifest["variants"]}
+        assert "planner_metadata" not in published[name + "/z.o"]
+        manifest["variants"][0]["scratch_bytes"] = 456
+        (directory / source).write_text(json.dumps(manifest))
+        changed = publisher.publication_records(tmp_path, jobs)
+        report = publisher.kernel_records.change_report(published, changed)
+        assert [entry["program"] for entry in report["changed"]] == [name + "/a.o"]
+
+
 def test_installed_placement_export_jobs_cover_live_native_families_and_packages():
     publisher = compare_sm.load_file("test_placement_jobs", ROOT / "scripts/build/export-placement-inputs.py")
     jobs = publisher.export_jobs()

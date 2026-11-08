@@ -1418,13 +1418,6 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     if "KV_POOL_SIZE" in config:
         assert plans[0][plans[0].index("--kv-pool-size") + 1] == config["KV_POOL_SIZE"]
     assert "prefill reserve does not fit" not in result.stderr
-    if not (programs.parent / "V41_FP8_AOT.json").is_file():
-        # The CPU gate's placement inputs carry only the exporter manifest; the
-        # launcher must surface the missing native export as the typed refusal.
-        assert result.returncode != 0, result.stderr
-        assert "missing V4.1 native FP8 allocation manifest" in result.stderr, result.stderr
-        assert "invalid deployment specification" in result.stderr, result.stderr
-        return
     assert result.returncode == 0, result.stderr
     deployment = _read_real_deployment(output)
     assert deployment["family"] == "deepseek_v41", deployment

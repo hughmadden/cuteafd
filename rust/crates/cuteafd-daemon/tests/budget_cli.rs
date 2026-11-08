@@ -735,9 +735,12 @@ fn installed_v41_sim5090_head_pools_preserve_1m() {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let programs = installed_example_programs(
         std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
-    let snapshot = require_installed_snapshot("V4.1 sim5090",
-        "deepseek-ai/DeepSeek-V4.1-Flash", None, &hf_home);
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let config = std::fs::read_to_string(root.join("examples/configs/deepseek-v41-mxfp4-min.config")).unwrap();
+    let config = config.lines().filter_map(|line| line.split_once('='))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let snapshot = require_installed_snapshot("V4.1 sim5090", config["MODEL_ID"],
+        config.get("MODEL_REVISION").copied(), &hf_home);
     assert_v41_sim5090_head_pools(&root, &snapshot, &programs, &hf_home);
 }
 
