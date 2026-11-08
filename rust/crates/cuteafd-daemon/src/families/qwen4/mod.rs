@@ -785,7 +785,7 @@ impl Opened {
                 _ => Vec::new(),
             };
             let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
-                cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?
+                u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?)?
             } else { 0 };
             let host = admission::host_owners(args, &self.cfg, layers, model.mtp.is_some(), 1, source.spark_ranks(),
                 self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), host_embedding, window_push)?;

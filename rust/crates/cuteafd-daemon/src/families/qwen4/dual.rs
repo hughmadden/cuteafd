@@ -85,7 +85,7 @@ impl Opened {
             admission::dual_push_envelope(staging)
         }).context("Qwen dual coordinator push admission")?;
         let host_embedding = if args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host {
-            cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?
+            u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&self.checkpoint)?)?
         } else { 0 };
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, 0, false,
             ple_info.map(|(row_bytes, _)| row_bytes), host_embedding,

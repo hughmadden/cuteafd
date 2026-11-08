@@ -898,7 +898,7 @@ mod tests {
             if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let host_embedding = if host {
-                cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?
+                u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
             } else { 0 };
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
