@@ -255,7 +255,7 @@ weights and scratch alongside the KV pool and routed experts.
 | --- | --- | --- | --- |
 | `EXLR8_MANIFEST` | published `bit325` | manifest name (`up1`, `bit325`, …) | Native EXLR8 experts; needs 1–2 RTX and 1–8 Sparks. |
 | `EXLR8_PREFILL_ACTIVATIONS` | `a16` | `a16`, `a8` | Native EXLR8 trellis prefill activations; decode stays A16. |
-| `V41_FP8_HEAD` | engine `all` | `off`, `draft`, `all`, `packed` | V4.1 vocabulary heads from one E4M3 copy. |
+| `V41_FP8_HEAD` | `auto` (engine `packed`) | `auto`, `off`, `draft`, `all`, `packed` | V4.1: unset/`auto` selects the exact packed BF16 target head and coarse dSpark plane on single/dual RTX, including push loading. `all` uses E4M3 for both; `off` keeps BF16; `draft` keeps BF16 plus E4M3 and requires mounted loading. Packed adds 300.214 MiB total over `all` (150.107 MiB/GPU on dual RTX); ordinary admission decides fit. |
 | `FP8_SCALES` | `amax` | `amax`, `pow2`, `best` | Scale rule for FP8 copies made at load. |
 | `L2_PREFETCH` | `off` | `off`, `auto`, MiB | Pull the next layer's weights into L2 during one-lane decode. |
 | `QWEN_FP8_DECODE` | unset | `on`, `off` | Qwen GDN/attention projections to resident E4M3. |

@@ -8,8 +8,8 @@ pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
 /// One mode parser for checkpoint residency, startup packing and native execution
 /// (`CUTEAFD_V41_FP8_HEAD`): `off` keeps the BF16 head; `draft` adds an E4M3 copy
-/// for dSpark; `all` (default) keeps only the E4M3 copy, for both; `packed` keeps
-/// only the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
+/// for dSpark; `all` keeps only the E4M3 copy, for both; unset/`auto` selects
+/// `packed`, the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
 /// target logits read it exactly, dSpark its coarse plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8Head { Off, Draft, All, Packed }
@@ -22,13 +22,18 @@ impl Fp8Head {
         match mode {
             "off" | "0" | "bf16" => Self::Off,
             "draft" => Self::Draft,
-            "packed" => Self::Packed,
+            "" | "auto" | "packed" => Self::Packed,
             _ => Self::All,
         }
     }
 
     pub fn configured() -> Self {
         Self::parse(&std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default())
+    }
+
+    /// Resolved setting shared by planner, execution and benchmark provenance.
+    pub fn setting(self) -> &'static str {
+        match self { Self::Off => "off", Self::Draft => "draft", Self::All => "all", Self::Packed => "packed" }
     }
 
     /// Target logits project through a resident copy (and its scratch), not BF16.
@@ -93,7 +98,7 @@ pub fn packed_expert_bytes(package: &str, experts: u64, hidden: u64, intermediat
 /// Default backbone/dSpark weights, without routed backbone experts. Vision
 /// is admitted separately by the encoder placement. Target embedding lives on RTX0, target normalization
 /// on the decoder (RTX1 under CED), and vocabulary is evenly partitioned
-/// in the default single-copy FP8 representation.
+/// in the default exact packed representation.
 /// dSpark weights stay on the decoder; default experts are full copies there.
 /// Unsupported native format changes return None instead of an exact claim.
 pub fn resident_weights(checkpoint: &Checkpoint, ranks: usize, dspark: bool)
@@ -392,7 +397,8 @@ mod tests {
         let packed12 = 997_395_712;
         for (text, mode) in [("off", Fp8Head::Off), ("0", Fp8Head::Off),
             ("bf16", Fp8Head::Off), ("draft", Fp8Head::Draft),
-            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All),
+            ("", Fp8Head::Packed), ("auto", Fp8Head::Packed),
+            ("all", Fp8Head::All), ("other", Fp8Head::All),
             ("packed", Fp8Head::Packed)] {
             assert_eq!(Fp8Head::parse(text), mode);
             assert_eq!(mode.target(), matches!(mode, Fp8Head::All | Fp8Head::Packed));
@@ -433,7 +439,14 @@ mod tests {
     fn vocabulary_counts_single_fp8_copy_and_explicit_overrides() {
         let source = 129280 * 5120 * 2;
         let packed = 129280 * (5120 + 40 * 4);
-        assert_eq!(Fp8Head::parse("").resident(source), (packed, "fp8-row128"));
+        for text in ["", "auto", "packed"] {
+            let mode = Fp8Head::parse(text);
+            assert_eq!(mode.setting(), "packed");
+            for ranks in [1, 2] {
+                assert_eq!(mode.resident(source / ranks),
+                    (Fp8Head::packed12_bytes(source / ranks), "bf16-packed12"));
+            }
+        }
         assert_eq!(Fp8Head::parse("all").resident(source), (packed, "fp8-row128"));
         assert_eq!(Fp8Head::parse("off").resident(source), (source, "bf16"));
         assert_eq!(Fp8Head::parse("draft").resident(source), (source + packed, "bf16+fp8-row128"));
@@ -454,7 +467,7 @@ mod tests {
             view: None, snapshot: Default::default(), quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             config: serde_json::json!({"num_hidden_layers":40,"hidden_size":5120}),
             tensors: vec![tensor("embed.weight", DType::Bf16, 100, 200),
-                tensor("head.weight", DType::Bf16, 100, 200),
+                tensor("head.weight", DType::Bf16, 129280 * 5120, 1_323_827_200),
                 tensor("norm.weight", DType::Bf16, 10, 20),
                 tensor("layers.0.attn.wq_a.weight", DType::F8E4M3, 3200, 3200),
                 tensor("layers.20.attn.wq_a.weight", DType::F8E4M3, 6400, 6400),
@@ -465,9 +478,10 @@ mod tests {
         let single = resident_weights(&checkpoint, 1, false).unwrap();
         let dual = resident_weights(&checkpoint, 2, false).unwrap();
         let sum = |items: &[Item]| items.iter().map(|i| i.bytes).sum::<u64>();
-        assert_eq!(sum(&single[0]), 200 + 103 + 20 + 3300 + 6600 + 3300 + 100);
-        assert_eq!(sum(&dual[0]), 200 + 51 + 3300 + 1650);
-        assert_eq!(sum(&dual[1]), 51 + 20 + 6600 + 1650);
+        let head = Fp8Head::configured();
+        assert_eq!(sum(&single[0]), 200 + head.resident(1_323_827_200).0 + 20 + 3300 + 6600 + 3300 + 100);
+        assert_eq!(sum(&dual[0]), 200 + head.resident(661_913_600).0 + 3300 + 1650);
+        assert_eq!(sum(&dual[1]), head.resident(661_913_600).0 + 20 + 6600 + 1650);
     }
 }
 
