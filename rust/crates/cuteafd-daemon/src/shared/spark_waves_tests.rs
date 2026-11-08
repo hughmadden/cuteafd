@@ -1998,3 +1998,25 @@ fn omitted_phase_settings_keep_all_combined_replies_bf16() {
     }
     assert!(!combined_reply_eligible([(1, true), (2, false)]));
 }
+
+#[test]
+fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    for device in [0, 1] {
+        library.cuda_set_device(device)?;
+        let before = fixture.events()?;
+        assert!(native_initialize_before_waits(&library).is_err());
+        assert_eq!(fixture.events()?, before, "guard must not be the first loader");
+        crate::shared::inventory::preload_native_modules(&library)?;
+        let loaded = fixture.events()?;
+        assert_eq!(loaded.matches('N').count(), device as usize + 1);
+        native_initialize_before_waits(&library)?;
+        native_initialize_before_waits(&library)?;
+        assert_eq!(fixture.events()?, loaded, "Spark start must not load again");
+    }
+    library.cuda_set_device(0)?;
+    native_initialize_before_waits(&library)?;
+    assert_eq!(fixture.events()?.matches('N').count(), 2);
+    Ok(())
+}

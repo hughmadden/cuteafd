@@ -544,3 +544,34 @@ def test_inventory_signature_matches_installed_toolkit_without_cuda_initializati
     subprocess.run([compiler, "-std=c++17", "-I", str(tmp_path),
                     "-I", str(header.parents[1]), "-fsyntax-only", str(SOURCE)],
                    check=True, capture_output=True)
+
+
+def test_every_family_measures_shared_native_preload_before_its_baseline():
+    daemon = ROOT / "rust/crates/cuteafd-daemon/src"
+    inventory = (daemon / "shared/inventory.rs").read_text()
+    window = inventory.split("let (before, _) = library.cuda_memory_info()?;", 1)[1].split("let tracked", 1)[0]
+    assert window.index("if phase == InventoryPhase::PreWeight { preload_native_modules(library)?; }") < window.index("|| library.cuda_memory_info()")
+    assert "library.tp2_native_initialize()" in inventory.split("pub(crate) fn preload_native_modules", 1)[1]
+    for family, paths in {
+        "deepseek_v4": ["mod.rs"],
+        "deepseek_v41": ["v41_native_serve.rs", "v41_native_serve/distributed.rs"],
+        "glm5": ["mod.rs"], "glm5_flash": ["mod.rs"],
+        "kimi_k3": ["startup.rs"], "muse_spark": ["serve.rs"],
+        "qwen4": ["mod.rs", "dual.rs"], "step5": ["serve.rs"],
+    }.items():
+        for path in paths:
+            source = (daemon / "families" / family / path).read_text()
+            assert "RuntimeInventory::measure(" in source, (family, path)
+            assert "InventoryPhase::PreWeight" in source, (family, path)
+            assert "library.tp2_native_initialize()?" not in source, (family, path)
+    for family, path, sample in [
+        ("mimo_v2", "mod.rs", "let after = self.library.cuda_memory_info()"),
+        ("qwen3_5", "engine.rs", "let (free, total) = library.cuda_memory_info()"),
+    ]:
+        source = (daemon / "families" / family / path).read_text()
+        source = source.split("// Load only selected modules, then measure the admission baseline before tensors.", 1)[-1]
+        assert source.index("crate::shared::inventory::preload_native_modules(") < source.index(sample)
+    spark = (daemon / "shared/spark_waves.rs").read_text()
+    guard = spark.split("fn native_initialize_before_waits", 1)[1].split("impl<'a> Waves", 1)[0]
+    assert guard.index("ensure!(library.native_modules_preloaded()?") < guard.index("library.tp2_native_initialize()")
+    assert "native_initialize_before_waits(library)?;" in spark.split("pub(crate) fn start", 1)[1]
