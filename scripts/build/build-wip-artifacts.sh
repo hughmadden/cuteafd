@@ -225,9 +225,10 @@ wip_phase_mark() {
 native_store_root="${CUTEAFD_WIP_NATIVE_STORE:-$(dirname "$build_dir")/../cache/native-store}"
 native_store_root="$(realpath -m "$native_store_root")"
 native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json V41_EXPERT_WORKSPACES exl3 fp8)
+source "$source_dir/scripts/build/wip-native-store.sh"
 wip_native_key() {
   {
-    printf 'schema 1\nrole %s\narch %s %s\n' "$role" "$cuda_arch" "$(uname -m)"
+    printf 'schema 2\nrole %s\narch %s %s\n' "$role" "$cuda_arch" "$(uname -m)"
     # The dev image (wip.sh passes its ID) fixes CUDA, CuTe-DSL, Triton and torch.
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
@@ -237,6 +238,11 @@ wip_native_key() {
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s v41 %s %s %s vision %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" \
       "$coordinator_aot" "$xgrammar" "$v41_expert_aot" "$v41_coordinator_aot" "$v41_nvfp4_aot" "$vision_attention_aot"
+    # Bind the resolved scope, even when these are shell defaults rather than
+    # exported environment variables. Packages installed below use this scope.
+    printf 'expert-families %s\nbf16-families %s\nspark-tp-roles %s\nhost-isas %s\n' \
+      "$expert_families" "$bf16_families" "$spark_tp_roles" "${host_isas[*]}"
+    wip_native_required_items
     # The CuTe DSL host target the exporters pin (#127; python/tools/lib/_pinned_sparkinfer.py):
     # an override, or "native", changes every exported object's host code.
     printf 'cute-host-target %s\n' "${CUTEAFD_CUTE_HOST_TARGET-<pinned default>}"
@@ -265,11 +271,13 @@ fi
 native_key=""
 native_entry=""
 native_hit=0
+# The host probe reads this same inventory before skipping its export turn.
+wip_native_required_items >"$output_dir/.native-cache-required"
 if [[ "${CUTEAFD_WIP_NATIVE_CACHE:-on}" == on && "${CUTEAFD_BUILD_CACHES:-on}" != off && -n "${CUTEAFD_WIP_DEV_IMAGE_ID:-}" ]]; then
   native_key_started=$SECONDS
   native_key="$(wip_native_key)"
   native_entry="$native_store_root/$role-$cuda_arch/$native_key"
-  if [[ -f "$native_entry/COMPLETE" ]] && (cd "$native_entry/output" && sha256sum --quiet --strict -c ../NATIVE_SHA256SUMS); then
+  if wip_native_store_valid "$native_entry" "$output_dir/.native-cache-required"; then
     native_hit=1
   fi
   [[ "$phase" == native || "$phase" == export ]] ||

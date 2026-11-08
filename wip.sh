@@ -1180,11 +1180,15 @@ fi
 # native_store_has HOST ROOT OUTPUT: the per-instance store holds a complete entry
 # for the key the rust phase recorded.
 native_store_has() {
-  local probe='read -r scope key <"$1/output/$2/.native-cache-key" && test -f "$1/cache/native-store/$scope/$key/COMPLETE"'
+  local probe
+  probe="$(cat "$repo_root/scripts/build/wip-native-store.sh")"'
+read -r scope key <"$1/output/$2/.native-cache-key" &&
+  wip_native_store_valid "$1/cache/native-store/$scope/$key" "$1/output/$2/.native-cache-required"
+'
   if [[ -z "$1" ]]; then
-    bash -c "$probe" native-store "$2" "$3" 2>/dev/null
+    bash -c "$probe" native-store "$2" "$3"
   else
-    ssh -o BatchMode=yes "$1" bash -c "$(printf '%q' "$probe")" native-store "$2" "$3" 2>/dev/null
+    ssh -o BatchMode=yes "$1" bash -c "$(printf '%q' "$probe")" native-store "$2" "$3"
   fi
 }
 

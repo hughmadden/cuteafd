@@ -138,7 +138,7 @@ def test_finalize_records_key_and_phases(tmp_path):
     assert [(p['phase'], p['seconds']) for p in meta['build_phases']] == [('rust', 12), ('native', 3)]
 
 
-def _wip_coordinator(tmp_path, hit, exports_cached=False):
+def _wip_coordinator(tmp_path, hit, exports_cached=False, incomplete=False):
     text = (ROOT / 'wip.sh').read_text()
     helpers = ''
     helpers += text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_expert() (')]
@@ -155,9 +155,15 @@ def _wip_coordinator(tmp_path, hit, exports_cached=False):
     (state / 'output/coordinator').mkdir(parents=True)
     (state / 'output/coordinator/.native-cache-key').write_text('coordinator-120 ' + KEY + '\n')
     if hit:
-        entry = state / 'cache/native-store/coordinator-120' / KEY
-        entry.mkdir(parents=True)
-        (entry / 'COMPLETE').write_text(KEY)
+        required = native_inventory(tmp_path)
+        (state / 'output/coordinator/.native-cache-required').write_bytes(required.read_bytes())
+        entry = native_entry(tmp_path, required)
+        cached_entry = state / 'cache/native-store/coordinator-120' / KEY
+        cached_entry.parent.mkdir(parents=True)
+        entry.rename(cached_entry)
+        if incomplete:
+            (cached_entry / 'output/exl3/exl3-qwen4-k4/manifest.json').unlink()
+            seal_native_entry(cached_entry)
     setup = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
 state_dir={str(state)!r}
@@ -181,6 +187,13 @@ def test_native_cache_hit_takes_no_gpu_turn(tmp_path):
     assert not any(line.startswith('turn ') for line in lines)
     native = [line for line in lines if line.endswith('/wip/output/coordinator native')]
     assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
+
+
+def test_incomplete_native_cache_entry_falls_through_to_rebuild(tmp_path):
+    stdout, lines = _wip_coordinator(tmp_path, hit=True, incomplete=True)
+    assert 'native cache hit, no GPU turn' not in stdout
+    assert 'done by capped' in stdout and 'capped' in lines
+    assert not any('CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in line for line in lines)
 
 
 def test_native_cache_miss_probes_capped_without_queueing(tmp_path):
@@ -231,6 +244,132 @@ def test_native_key_covers_every_native_input():
     # A hit restores every native output and nothing else; the daemon always comes from Cargo.
     assert 'native_items=(libcuteafd_native.so lib-variants PROGRAMS.json V41_EXPERT_AOT.json V41_EXPERT_TP_AOT.json V41_FP8_AOT.json V41_EXPERT_WORKSPACES exl3 fp8)' in script
     assert script.index('cp -a "$native_entry/output/." "$output_dir/"') < script.index('install -m 0755 "$(cuteafd_host_isa_daemon "$CARGO_TARGET_DIR" "${host_isas[0]}")"')
+
+
+def native_inventory(tmp_path, *, families='qwen4:exl3-k4;mimo:fp8', role='coordinator',
+                     bf16='', v41='ON', nvfp4='ON'):
+    required = tmp_path / '.native-cache-required'
+    command = '''set -euo pipefail
+source "$1/scripts/build/wip-native-store.sh"
+role="$2"; expert_families="$3"; bf16_families="$4"
+v41_coordinator_aot="$5"; v41_nvfp4_aot="$6"; exl3_aot=ON
+host_isas=(x86-64-v4 x86-64-v2)
+wip_native_required_items
+'''
+    result = subprocess.run(['bash', '-c', command, 'test', str(ROOT), role, families, bf16, v41, nvfp4],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    required.write_text(result.stdout)
+    return required
+
+
+def native_entry(tmp_path, required):
+    entry = tmp_path / 'entry'
+    output = entry / 'output'
+    output.mkdir(parents=True)
+    for line in required.read_text().splitlines():
+        kind, name = line.split(' ', 1)
+        path = output / name
+        if kind == 'dir':
+            path.mkdir(parents=True, exist_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'fixture')
+    (entry / 'COMPLETE').write_text(KEY + '\n')
+    seal_native_entry(entry)
+    return entry
+
+
+def seal_native_entry(entry):
+    output = entry / 'output'
+    (entry / 'NATIVE_SHA256SUMS').write_text(''.join(
+        f'{sha(path.read_bytes())}  ./{path.relative_to(output)}\n'
+        for path in sorted(output.rglob('*')) if path.is_file()))
+
+
+def validate_native_entry(entry, required):
+    return subprocess.run(['bash', '-c', 'set -euo pipefail\nsource "$1"\n'
+                           'wip_native_store_valid "$2" "$3"', 'test',
+                           str(ROOT / 'scripts/build/wip-native-store.sh'), str(entry), str(required)],
+                          capture_output=True, text=True, timeout=30)
+
+
+def test_complete_native_store_entry_is_accepted(tmp_path):
+    required = native_inventory(tmp_path)
+    entry = native_entry(tmp_path, required)
+    assert validate_native_entry(entry, required).returncode == 0
+
+
+@pytest.mark.parametrize('missing', ['exl3', 'fp8', 'PROGRAMS.json', 'V41_EXPERT_AOT.json',
+                                    'V41_EXPERT_TP_AOT.json', 'V41_FP8_AOT.json',
+                                    'V41_EXPERT_WORKSPACES', 'lib-variants',
+                                    'exl3/exl3-qwen4-k4/manifest.json',
+                                    'fp8/fp8-mimo/manifest.json',
+                                    'V41_EXPERT_WORKSPACES/mxfp4_rtx_tp2.json',
+                                    'V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json',
+                                    'lib-variants/x86-64-v2/libcuteafd_native.so'])
+def test_native_store_rejects_scope_limited_or_incomplete_entry(tmp_path, missing):
+    import shutil
+    required = native_inventory(tmp_path)
+    entry = native_entry(tmp_path, required)
+    absent = entry / 'output' / missing
+    shutil.rmtree(absent) if absent.is_dir() else absent.unlink()
+    # The partial entry's checksums are internally valid: completeness must be
+    # checked against this build's inventory, not just the stored file list.
+    seal_native_entry(entry)
+    result = validate_native_entry(entry, required)
+    assert result.returncode == 1 and 'missing required' in result.stderr
+    assert (entry / 'COMPLETE').is_file()  # refusal never removes old entries
+
+
+def test_native_store_rejects_corrupt_payload(tmp_path):
+    required = native_inventory(tmp_path)
+    entry = native_entry(tmp_path, required)
+    (entry / 'output/libcuteafd_native.so').write_bytes(b'corrupt')
+    result = validate_native_entry(entry, required)
+    assert result.returncode == 1 and 'native checksums failed' in result.stderr
+
+
+def test_limited_native_scope_does_not_require_unrequested_packages(tmp_path):
+    required = native_inventory(tmp_path, families='', v41='OFF', nvfp4='OFF')
+    entry = native_entry(tmp_path, required)
+    assert not (entry / 'output/exl3').exists()
+    assert not (entry / 'output/fp8').exists()
+    assert validate_native_entry(entry, required).returncode == 0
+
+
+@pytest.mark.parametrize('families,role,bf16,packages', [
+    ('mimo:fp8', 'expert', 'mimo', ['fp8-mimo', 'fp8-mimo-bf16']),
+    ('qwen4:nvfp4', 'coordinator', '', ['fp8-qwen4-nvfp4', 'fp8-qwen4-nvfp4a4', 'fp8-qwen4']),
+    ('step5:bf16;step5:nvfp4', 'expert', '', ['fp8-step5-bf16-weights', 'fp8-step5-nvfp4a4']),
+])
+def test_native_inventory_requires_every_staged_package_sibling(tmp_path, families, role, bf16, packages):
+    required = native_inventory(tmp_path, families=families, role=role, bf16=bf16)
+    manifests = [line.split('/')[1] for line in required.read_text().splitlines() if line.startswith('file fp8/')]
+    assert manifests == packages
+
+
+def test_host_native_probe_uses_the_same_validation_before_skipping_export(tmp_path):
+    required = native_inventory(tmp_path)
+    entry = native_entry(tmp_path, required)
+    root = tmp_path / 'instance'
+    output = root / 'output/coordinator'
+    output.mkdir(parents=True)
+    (output / '.native-cache-key').write_text(f'coordinator-120 {KEY}\n')
+    (output / '.native-cache-required').write_bytes(required.read_bytes())
+    cached = root / 'cache/native-store/coordinator-120' / KEY
+    cached.parent.mkdir(parents=True)
+    entry.rename(cached)
+    script = (ROOT / 'wip.sh').read_text()
+    start = script.index('native_store_has() {')
+    function = script[start:script.index('\n}\n', start) + 3]
+    command = 'set -euo pipefail\nrepo_root="$1"\n' + function + '\nnative_store_has "" "$2" coordinator'
+    args = ['bash', '-c', command, 'test', str(ROOT), str(root)]
+    assert subprocess.run(args, capture_output=True, timeout=30).returncode == 0
+    (cached / 'output/exl3/exl3-qwen4-k4/manifest.json').unlink()
+    seal_native_entry(cached)
+    rejected = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    assert rejected.returncode == 1 and 'missing required' in rejected.stderr
 
 
 def test_source_checkout_initializes_only_build_submodules_from_local_stores():
