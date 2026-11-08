@@ -344,6 +344,8 @@ pub(super) mod tests {
             assert_eq!(admitted.immutable, 1000 + private_scratch);
             assert_eq!(admitted.workspace, arena);
             assert_eq!(admitted.bytes()?, 1000 + private_scratch + arena);
+            assert!(super::super::execution::RankAdmission { immutable: u64::MAX, workspace: 0 }
+                .with_head(&plan).is_err());
         }
         Ok(())
     }

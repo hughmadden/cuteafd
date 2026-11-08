@@ -353,7 +353,15 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn serving_admission(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         ownership: &ExecutionOwnership, rank: usize, rows: usize, span: usize, logits: usize) -> Result<RankAdmission> {
         let plan = NativePlan::new(checkpoint, ownership, Rc::new(CoordinatorContract::from_checkpoint(checkpoint)?))?;
-        Self::serving_admission_with_plan(programs, checkpoint, ownership, rank, rows, span, logits, &plan)
+        let mut admission = Self::serving_admission_with_plan(programs, checkpoint, ownership, rank, rows, span, logits, &plan)?;
+        // Standalone goldens have no solved ledger reserving their target backing.
+        let arena = super::weights::target_arena(&plan.layouts[rank], Some(&plan.contract.rope_tables),
+            rank as i32, 92, false)?;
+        let bytes = arena.bytes() as u64;
+        let tail = cuteafd_loader::placement::planner::allocation_granularity_forecast(&[bytes])?;
+        admission.immutable = admission.immutable.checked_add(bytes).and_then(|n| n.checked_add(tail))
+            .context("Step-5 standalone target backing overflow")?;
+        Ok(admission)
     }
 
     pub(super) fn serving_admission_with_plan(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -2085,13 +2093,15 @@ mod admission_tests {
     }
 
     #[test]
-    fn final_head_weights_and_private_blas_workspace_are_included() -> Result<()> {
+    fn final_head_only_adds_private_scratch_and_reuses_workspace() -> Result<()> {
         let head = super::super::head::tests::admission_plan(64);
         let base = RankAdmission { immutable: 1000, workspace: 2000 };
         let plan = base.with_head(&head)?;
-        assert_eq!(plan.bytes()?, base.immutable + head.private_scratch_bytes()? + head.workspace_bytes());
+        assert_eq!(head.private_scratch_bytes()?, 0);
+        assert_eq!(plan.immutable, base.immutable);
+        assert_eq!(plan.bytes()?, base.immutable + head.workspace_bytes());
         assert!(plan.check(plan.bytes()? - 1, &[]).is_err());
-        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head).is_err());
+        assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head)?.bytes().is_err());
         assert_eq!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head)?.workspace, u64::MAX);
         Ok(())
     }

@@ -183,6 +183,29 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
                     target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
                 } else { target.workspace };
                 assert_eq!(item("Step-5 native workspace"), workspace);
+                let mut arenas = target.weight_arenas.clone();
+                if rank == usize::from(admitted.ownership.execution().spec().head_gpu) && depth > 0 {
+                    let predictor = coordinator::RankWeightLayout::mtp_from_contract(&cp, &contract, depth)?;
+                    arenas.push((predictor.mtp_arena(rank as i32)?, ResidentWeights(predictor.resident_bytes)));
+                }
+                for (arena, logical) in arenas {
+                    let roots = admitted.solved.facts.allocations.iter().filter(|owner| owner.id == arena.id())
+                        .collect::<Vec<_>>();
+                    assert_eq!(roots.len(), 1, "one backing per arena");
+                    assert_eq!(roots[0].bytes, arena.bytes() as u64);
+                    let tail = admitted.solved.facts.allocation_granularity.iter()
+                        .find(|owner| owner.id == format!("{}.tail", arena.id())).expect("arena tail");
+                    assert_eq!(tail.requests(), [arena.bytes() as u64]);
+                    assert_eq!(tail.bytes()?, (arena.bytes() as u64).div_ceil(2 << 20) * (2 << 20)
+                        - arena.bytes() as u64);
+                    assert_eq!(admitted.solved.facts.resident_weights.iter()
+                        .find(|owner| owner.id == arena.id()).expect("arena logical weights").weights, logical);
+                    eprintln!("Step-5 arena charge {}", serde_json::json!({
+                        "kv": format!("{kv_format:?}"), "depth": depth, "rank": rank, "id": arena.id(),
+                        "old": arena.bytes(), "old_rounding": "no", "backing": arena.bytes(),
+                        "tail": tail.bytes()?, "new": arena.bytes() as u64 + tail.bytes()?,
+                        "logical_weights": logical.0 }));
+                }
                 assert_eq!(item("Step-5 exact retained marks"), admitted.reservations[rank].marks as u64);
                 assert_eq!(item("Step-5 active sequence state"), admitted.reservations[rank].active as u64);
             }
@@ -234,7 +257,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             eprintln!("Step-5 full-context forecast {}", serde_json::json!({
                 "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
                 "sequences": inputs.sequences, "rows": inputs.rows,
-                "marks": admitted.marks, "predictor_weights": weights,
+                "marks": admitted.marks, "predictor_weights": coordinator::RankWeightLayout::mtp_weight_charge(&cp, &contract, depth)?,
                 "owners": admitted.ownership.execution().modes().iter().map(|mode| format!("{mode:?}")).collect::<Vec<_>>(),
                 "ranks": by_category }));
         }
@@ -2105,7 +2128,7 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
                 assert_eq!(owner.resident_weights.0, 0);
                 assert_eq!(owner.bytes, target.immutable + predictor);
                 let mut arenas = target.weight_arenas.clone();
-                if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, ResidentWeights(mtp.resident_bytes))); }
+                if head && depth > 0 { arenas.push((mtp.mtp_arena(rank as i32)?, crate::placement::ResidentWeights(mtp.resident_bytes))); }
                 for (arena, logical) in arenas {
                     let facts = &admitted.solved.facts;
                     let roots = facts.allocations.iter().filter(|owner| owner.id == arena.id()).collect::<Vec<_>>();
