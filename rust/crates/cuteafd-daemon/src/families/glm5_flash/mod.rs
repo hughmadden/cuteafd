@@ -3088,7 +3088,7 @@ impl Opened {
 impl Opened {
     /// The checkpoint's `embed_tokens` (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
-        let name = format!("{}embed_tokens.weight", weights::PREFIX);
+        let name = format!("{}embed_tokens.weight", weight_layout::PREFIX);
         let at = self.checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(&name))
             .map_err(|_| anyhow::anyhow!("checkpoint has no {name}"))?;
         let tensor = &self.checkpoint.tensors[at];

@@ -204,7 +204,7 @@ fn installed_arena_cpu_inventory() -> Result<()> {
     let selection = cuteafd_loader::plan::exlr8::dense::DenseSelection::from_hf(&config)?;
     for ranks in [1, 2] {
         let records = (0..ranks).map(|rank|
-            crate::shared::experts::exlr8::dense_weights::NativeDenseRecords::new(&root, cfg.layers, ranks, rank, &BTreeMap::new()))
+            cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(&root, cfg.layers, ranks, rank, &BTreeMap::new()))
             .collect::<Result<Vec<_>>>()?;
         let plans = records.iter().map(|r| r.plan.clone()).collect::<Vec<_>>();
         let mut inventory = WeightInventory::from_native(&selection, cfg.layers, &plans)?;
@@ -902,7 +902,7 @@ fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Resul
     for world in [1, 2] {
         let dense = (0..world)
             .map(|rank| {
-                dense_weights::NativeDenseRecords::new(
+                cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(
                     &root,
                     cfg.layers,
                     world,
@@ -966,7 +966,7 @@ fn installed_native_dense_shared_and_vocabulary_equal_reader_requests() -> Resul
                 } else {
                     "head"
                 };
-                for (suffix, bytes) in crate::shared::token_io::native::row_requests(slice)? {
+                for (suffix, bytes) in cuteafd_loader::plan::exlr8::dense::requests::row_requests(slice)? {
                     add(rank, format!("vocabulary.{table}.{suffix}"), bytes);
                 }
             }

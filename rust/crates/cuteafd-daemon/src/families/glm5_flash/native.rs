@@ -1,6 +1,6 @@
 //! Flash adapter facts; execution and storage remain in the shared native backend.
 use super::{engine, fp8, EngineArgs, GlmNextConfig};
-use crate::shared::experts::exlr8::dense_weights::NativeDenseRecords;
+use cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords;
 use crate::shared::token_io::native::VocabularyPlan;
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::plan::checkpoint::CheckpointFormat;
@@ -117,39 +117,10 @@ impl Admission {
         Self::target_layouts(&self.facts, &self.dense, cfg, embedding_rank)
     }
 
+    /// The loader recipe admission charges; this loader binds its views.
     fn target_layouts(facts: &DenseFacts, dense: &[NativeDenseRecords], cfg: &GlmNextConfig, embedding_rank: usize)
         -> Result<Vec<cuteafd_loader::serving_capacity::WeightArenaLayout>> {
-        use crate::shared::{experts::exlr8::dense_weights::{layer_requests, PlainPack}, token_io::native::row_requests};
-        ensure!(!dense.is_empty() && embedding_rank < dense.len(), "native Flash arena rank");
-        let mut requests = vec![Vec::new(); dense.len()];
-        for (rank, records) in dense.iter().enumerate() {
-            for source in &records.layers {
-                let p = format!("{}layers.{}", super::weights::PREFIX, source.layer);
-                let packs = if cfg.attention[source.layer] == cuteafd_loader::families::glm5_flash::GlmNextAttention::Kda {
-                    vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
-                        .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
-                } else { vec![] };
-                layer_requests(source, &packs, |request| {
-                    requests[rank].extend(request.owners.into_iter().map(|(name, bytes)|
-                        (format!("layers.{}.{name}", source.layer), bytes)));
-                    Ok(())
-                })?;
-            }
-        }
-        requests[0].push((format!("{}norm.weight", super::weights::PREFIX),
-            exlr8::dense::DenseTransform::Identity.allocation_bytes(&dense[0].norm)?));
-        let vocabulary = VocabularyPlan::new(&facts.records, &facts.selection, dense.len(), 0,
-            cfg.hidden, cfg.vocab_size)?;
-        for (i, slice) in vocabulary.dense_plan().tensors.iter().enumerate() {
-            let rank = if i == 0 { embedding_rank } else { 0 };
-            let name = if i == 0 { "embedding" } else { "head" };
-            requests[rank].extend(row_requests(slice)?.into_iter().map(|(suffix, bytes)|
-                (format!("{name}.{suffix}"), bytes)));
-        }
-        // The embedding facade has its own final placeholder, not a BF16 vocabulary source.
-        requests[0].push(("embedding.table".into(), 256));
-        requests.into_iter().enumerate().map(|(rank, requests)|
-            cuteafd_loader::serving_capacity::WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)).collect()
+        cuteafd_loader::families::glm5_flash::weight_layout::native_target(facts, dense, cfg, embedding_rank)
     }
 
     pub(super) fn load_owners(&self, cfg: &GlmNextConfig)
@@ -320,7 +291,7 @@ mod tests {
             for embedding_rank in 0..world {
                 let layouts = Admission::target_layouts(&facts, &dense, &cfg, embedding_rank)?;
                 let vocabulary = VocabularyPlan::new(&facts.records, &selection, world, 0, cfg.hidden, cfg.vocab_size)?;
-                let embedding_bytes = crate::shared::token_io::native::row_requests(&vocabulary.dense_plan().tensors[0])?
+                let embedding_bytes = cuteafd_loader::plan::exlr8::dense::requests::row_requests(&vocabulary.dense_plan().tensors[0])?
                     .into_iter().map(|(_, bytes)| bytes).sum::<usize>();
                 for (rank, layout) in layouts.iter().enumerate() {
                     let expected = body[rank].resident_bytes + if rank == 0 { vocabulary.resident_bytes() - embedding_bytes + 256 } else { 0 }

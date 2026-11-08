@@ -152,6 +152,40 @@ pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
         format!("glm5_flash/target/{rank}"), requests)).collect()
 }
 
+/// Native EXLR8 target arenas, one per rank: every layer's records (KDA conv
+/// weights in one plain pack), rank zero's final norm, the row-FP8 embedding on
+/// `embedding_rank` and head on rank zero, and the embedding facade on rank
+/// zero. Shared experts are a separate format-level arena.
+pub fn native_target(facts: &crate::plan::exlr8::native::DenseFacts,
+    dense: &[crate::plan::exlr8::dense::requests::NativeDenseRecords], cfg: &GlmNextConfig,
+    embedding_rank: usize) -> Result<Vec<WeightArenaLayout>> {
+    use crate::plan::exlr8::dense::{requests::{layer_requests, row_requests, vocabulary_records, PlainPack},
+        DensePlan, DenseTransform};
+    ensure!(!dense.is_empty() && embedding_rank < dense.len(), "native Flash arena rank");
+    let mut requests = vec![Vec::new(); dense.len()];
+    for (rank, records) in dense.iter().enumerate() {
+        for source in &records.layers {
+            let p = format!("{PREFIX}layers.{}", source.layer);
+            let packs = if cfg.attention[source.layer] == GlmNextAttention::Kda {
+                vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
+                    .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
+            } else { vec![] };
+            requests[rank].extend(layer_requests(source, &packs)?);
+        }
+    }
+    requests[0].push((format!("{PREFIX}norm.weight"), DenseTransform::Identity.allocation_bytes(&dense[0].norm)?));
+    let vocabulary = DensePlan::for_rank(&vocabulary_records(&facts.records, &facts.selection,
+        cfg.hidden, cfg.vocab_size)?, dense.len(), 0)?;
+    for (i, slice) in vocabulary.tensors.iter().enumerate() {
+        let (rank, name) = if i == 0 { (embedding_rank, "embedding") } else { (0, "head") };
+        requests[rank].extend(row_requests(slice)?.into_iter().map(|(suffix, bytes)| (format!("{name}.{suffix}"), bytes)));
+    }
+    // The embedding facade has its own final placeholder, not a BF16 vocabulary source.
+    requests[0].push(("embedding.table".into(), 256));
+    requests.into_iter().enumerate().map(|(rank, requests)|
+        WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

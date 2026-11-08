@@ -7,7 +7,6 @@ mod packed_check;
 pub(crate) mod serve;
 pub(crate) mod ml4_media;
 pub(crate) mod landing;
-use crate::shared::experts::exlr8::dense_weights;
 pub(crate) mod push;
 pub(crate) mod weights;
 pub(crate) mod core_runtime;
@@ -1030,7 +1029,7 @@ impl Opened {
             .map(|(layer, &rank)| (layer, usize::from(rank))).collect()).unwrap_or_default();
         let native_records = native.then(|| cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)).transpose()?;
         let native_dense_records = if native {
-            (0..devices.len()).map(|rank| dense_weights::NativeDenseRecords::new(
+            (0..devices.len()).map(|rank| cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords::new(
                 &self.snapshot, layers, devices.len(), rank, &whole_mla))
                 .collect::<Result<Vec<_>>>()?
         } else { Vec::new() };
@@ -1899,7 +1898,7 @@ impl Opened {
     /// Native vocabulary, dense operands and drafter share the existing group.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn load_native<'s>(&'s self, args: &EngineArgs, admitted: &cuteafd_loader::placement::families::glm5::admission::NativeLoad, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
-        per_rank: &[dense_weights::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
+        per_rank: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords], owners: Option<&[u8]>, layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
         loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, _peer_stream: Option<(i32, *mut c_void)>,
         push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>,
         media: &crate::shared::experts::rtx::dense::Records,
