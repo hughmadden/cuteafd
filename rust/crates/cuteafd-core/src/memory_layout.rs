@@ -477,6 +477,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn canonical_ledger_roots_have_real_categories() {
+        for (scope, expected) in [
+            ("weights/target", Category::Weights), ("embedding", Category::Embedding),
+            ("experts/onboard", Category::Experts), ("drafter/weights", Category::Drafter),
+            ("drafter/workspace", Category::Drafter), ("kv/pool", Category::Kv),
+            ("prefix/marks", Category::Prefix), ("workspace/lane", Category::Workspace),
+            ("transport/rdma", Category::Transport), ("staging/upload", Category::Staging),
+            ("mapped-table", Category::Tables),
+        ] { assert_eq!(Category::of_scope(scope), expected, "{scope}"); }
+    }
+
+    #[test]
     fn host_admission_charges_future_owners_but_not_resident_bytes_twice() {
         let resident = Item::new(Category::Transport, "transport/rdma-rings", "", 20, Basis::Exact);
         let future = Item::new(Category::Workspace, "scoring/full-logits", "", 10, Basis::Formula)

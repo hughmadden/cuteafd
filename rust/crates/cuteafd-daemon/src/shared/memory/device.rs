@@ -145,7 +145,9 @@ impl<'a> Allocation<'a> {
         Ok(allocation)
     }
 
+    #[track_caller]
     pub fn new(device: Device<'a>, bytes: usize) -> Result<Self> {
+        let _site = cuteafd_ffi::memory_ledger::allocation_site(std::panic::Location::caller());
         let buffer = device.run(|| device.library.alloc_device_buffer(bytes))?;
         Ok(Self { device, buffer, backing: None, weight_id: None })
     }

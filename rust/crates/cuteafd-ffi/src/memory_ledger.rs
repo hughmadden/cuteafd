@@ -38,6 +38,7 @@ impl Space {
 #[derive(Default)]
 struct Context {
     scopes: Vec<&'static str>,
+    site: Option<&'static std::panic::Location<'static>>,
     /// The owner tag ([`owner`]): survives nested category scopes.
     owner: Option<&'static str>,
     tensor: Option<&'static str>,
@@ -80,6 +81,7 @@ struct State {
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
     audits: Vec<Weak<Mutex<AuditEvents>>>,
+    unscoped_sites: HashSet<&'static std::panic::Location<'static>>,
 }
 
 /// An actual native allocation, before aggregation removes pointer identity.
@@ -280,6 +282,20 @@ impl Drop for Format {
     }
 }
 
+/// Preserve an owning wrapper's caller through device-selection closures.
+#[must_use]
+pub struct AllocationSite(Option<&'static std::panic::Location<'static>>);
+
+pub fn allocation_site(site: &'static std::panic::Location<'static>) -> AllocationSite {
+    AllocationSite(CONTEXT.with(|context| context.borrow_mut().site.replace(site)))
+}
+
+impl Drop for AllocationSite {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| context.borrow_mut().site = self.0);
+    }
+}
+
 fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
     CONTEXT.with(|context| {
         let context = context.borrow();
@@ -294,20 +310,30 @@ fn current_key(space: Space, device: i32) -> (Key, Option<&'static str>) {
     })
 }
 
+#[track_caller]
 pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize) {
     record_backing(space, device, ptr, bytes, None);
 }
 
+#[track_caller]
 pub(crate) fn record_endpoint_alloc(space: Space, ptr: usize, bytes: usize, endpoint: usize) {
     record_backing(space, -1, ptr, bytes, Some(endpoint));
 }
 
+#[track_caller]
 fn record_backing(space: Space, device: i32, ptr: usize, bytes: usize, endpoint: Option<usize>) {
     if ptr == 0 || bytes == 0 {
         return;
     }
     let (key, name) = current_key(space, device);
+    let site = CONTEXT.with(|context| context.borrow().site).unwrap_or_else(std::panic::Location::caller);
     let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    if key.scope == "other" && matches!(space, Space::Device | Space::Pinned | Space::Managed)
+        && state.unscoped_sites.insert(site) {
+        tracing::warn!(target: "cuteafd::memory", %site, owner = key.owner,
+            tensor = key.tensor, name, bytes, device, space = space.label(),
+            "unscoped native allocation");
+    }
     if let (Some(name), Some(format)) = (name, key.format) {
         if !format.ends_with("scale") {
             let formats = state.formats.entry((device, name)).or_default();

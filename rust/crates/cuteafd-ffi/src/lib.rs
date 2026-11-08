@@ -2384,6 +2384,7 @@ impl NativeLibrary {
 
 
 
+    #[track_caller]
     pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
         let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
         let mut buffer = CuteafdHostBuffer::default();
@@ -2578,6 +2579,7 @@ impl NativeLibrary {
         Ok(bytes)
     }
 
+    #[track_caller]
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
@@ -2588,6 +2590,7 @@ impl NativeLibrary {
         Ok(buffer)
     }
 
+    #[track_caller]
     pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
         let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
