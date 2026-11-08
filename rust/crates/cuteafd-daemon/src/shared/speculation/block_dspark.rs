@@ -175,42 +175,12 @@ fn validate_target_taps(taps: &[super::target::HiddenTap], layers: &[usize], hid
     Ok(())
 }
 
-struct LayerWeights<T, M> {
-    input_norm: T, post_norm: T, qkv: M, q_norm: T, k_norm: T, o: M, gate_up: M, down: M,
-}
-struct BlockWeights<T, M> {
-    layers: Vec<LayerWeights<T, M>>, fc: M, hidden_norm: T, norm: T,
-    markov_w1: T, markov_w2: T, confidence_w: T, confidence_b: T,
-}
-
-fn weight_recipe<T, M>(cfg: &DsparkConfig,
-    mut tensor: impl FnMut(&str, &[usize]) -> Result<T>,
-    mut matrix: impl FnMut(&[(&str, usize)], usize) -> Result<M>) -> Result<BlockWeights<T, M>> {
-    let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-    let layers = (0..cfg.layers).map(|l| -> Result<_> {
-        let p = format!("layers.{l}");
-        let a = format!("{p}.self_attn");
-        Ok(LayerWeights {
-            input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
-            post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-            qkv: matrix(&[(&format!("{a}.q_proj.weight"), cfg.q_width()), (&format!("{a}.k_proj.weight"), kv),
-                (&format!("{a}.v_proj.weight"), kv)], h)?,
-            q_norm: tensor(&format!("{a}.q_norm.weight"), &[cfg.head_dim])?,
-            k_norm: tensor(&format!("{a}.k_norm.weight"), &[cfg.head_dim])?,
-            o: matrix(&[(&format!("{a}.o_proj.weight"), h)], cfg.q_width())?,
-            gate_up: matrix(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
-                (&format!("{p}.mlp.up_proj.weight"), inter)], h)?,
-            down: matrix(&[(&format!("{p}.mlp.down_proj.weight"), h)], inter)?,
-        })
-    }).collect::<Result<Vec<_>>>()?;
-    let markov_w2 = tensor("markov_head.markov_w2.weight", &[cfg.vocab, cfg.rank])?;
-    Ok(BlockWeights { layers, markov_w2,
-        fc: matrix(&[("fc.weight", h)], cfg.taps.len() * h)?,
-        hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-        markov_w1: tensor("markov_head.markov_w1.weight", &[cfg.vocab, cfg.rank])?,
-        confidence_w: tensor("confidence_head.proj.weight", &[1, h + cfg.rank])?,
-        confidence_b: tensor("confidence_head.proj.bias", &[1])?,
-    })
+/// The loader's single drafter recipe: the runtime load and admission bind the same owners.
+fn weight_recipe<T, M>(snapshot: &Path, tensor: impl FnMut(&str, &[usize]) -> Result<T>,
+    matrix: impl FnMut(&[(&str, usize)], usize) -> Result<M>)
+    -> Result<cuteafd_loader::formats::block_dspark::BlockDsparkWeights<T, M>> {
+    let cfg = cuteafd_loader::formats::block_dspark::BlockDsparkConfig::read(snapshot)?;
+    cuteafd_loader::formats::block_dspark::block_dspark_weight_recipe(&cfg, tensor, matrix)
 }
 
 struct DraftLayer<'a> {
@@ -375,41 +345,12 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 impl<'a> DsparkDrafter<'a> {
     /// Actual physical CUDA device is supplied by the binding, not inferred from rank.
+    /// The loader's request list (`block_dspark_arena_requests`) on one physical device.
     pub fn arena_requests(snapshot: &Path, representation: GlmDraftRepresentation, device: i32)
         -> Result<std::collections::BTreeMap<i32, Vec<(String, usize)>>> {
         ensure!(device >= 0, "negative block dSpark device");
-        let cfg = DsparkConfig::read(snapshot)?;
-        let source = Source::open(snapshot)?;
-        let requests = RefCell::new(Vec::new());
-        weight_recipe(&cfg, |name, shape| {
-            let rect = source.rect(name, shape)?;
-            requests.borrow_mut().push((name.to_owned(), rect.bytes().max(256)));
-            Ok(())
-        }, |parts, cols| {
-            let rects = parts.iter().map(|(name, rows)| source.rect(name, &[*rows, cols]))
-                .collect::<Result<Vec<_>>>()?;
-            let name = parts.iter().map(|(name, _)| *name).collect::<Vec<_>>().join("+");
-            let bytes = rects.iter().try_fold(0usize, |n, r| n.checked_add(r.bytes()))
-                .context("block dSpark matrix extent overflow")?;
-            if representation == GlmDraftRepresentation::Bf16Only {
-                requests.borrow_mut().push((name, bytes.max(256)));
-            } else {
-                let rows = parts.iter().try_fold(0usize, |n, (_, rows)| n.checked_add(*rows))
-                    .context("block dSpark matrix rows overflow")?;
-                ensure!(rows > 0 && rows % 16 == 0 && cols > 0 && cols % 128 == 0,
-                    "block dSpark FP8 shape {rows}/{cols}");
-                let payload = bytes / 2;
-                requests.borrow_mut().extend([(format!("{name}.payload"), payload),
-                    (format!("{name}.scales"), payload / 128 * 4)]);
-            }
-            Ok(())
-        })?;
-        requests.borrow_mut().push(("markov_norms".into(), cfg.vocab.checked_mul(4)
-            .context("block dSpark norms extent overflow")?));
-        if let Some(rotary) = &cfg.rotary {
-            requests.borrow_mut().push(("inv_freq".into(), std::mem::size_of_val(rotary.inv_freq.as_slice()).max(256)));
-        }
-        Ok(std::collections::BTreeMap::from([(device, requests.into_inner())]))
+        Ok(std::collections::BTreeMap::from([(device,
+            cuteafd_loader::formats::block_dspark::block_dspark_arena_requests(snapshot, representation)?)]))
     }
 
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
@@ -535,7 +476,7 @@ impl<'a> DsparkDrafter<'a> {
             Ok(allocation)
         };
         let (h, kv, inter) = (cfg.hidden, cfg.kv_width(), cfg.intermediate);
-        let weights = weight_recipe(&cfg, |name, shape| load.tensor(name, shape),
+        let weights = weight_recipe(snapshot, |name, shape| load.tensor(name, shape),
             |parts, cols| load.matrix(parts, cols, representation == GlmDraftRepresentation::Fp8Only, scales, stream))?;
         let layers = weights.layers.into_iter().map(|layer| -> Result<_> {
             Ok(DraftLayer { input_norm: layer.input_norm, post_norm: layer.post_norm, qkv: layer.qkv,
@@ -1264,7 +1205,7 @@ mod tests {
             std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
             let cfg = DsparkConfig::read(&snapshot)?;
             let shapes = RefCell::new(Vec::new());
-            weight_recipe(&cfg, |name, shape| { shapes.borrow_mut().push(t(name,"BF16",shape)); Ok(()) },
+            weight_recipe(&snapshot, |name, shape| { shapes.borrow_mut().push(t(name,"BF16",shape)); Ok(()) },
                 |parts,cols| { for (name,rows) in parts { shapes.borrow_mut().push(t(*name,"BF16",&[*rows,cols])); } Ok(()) })?;
             let path = snapshot.join("model.safetensors");
             write_safetensors(&path,&shapes.into_inner());
