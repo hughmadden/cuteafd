@@ -38,7 +38,7 @@ function(cuteafd_vision_owner_entry name)
     add_custom_command(OUTPUT ${outputs}
       COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-        "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
+        ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
         --output-dir "${directory}" --capability ${CUTEAFD_VISION_CAPABILITY} ${E_ARGS}
       DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
         ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
@@ -78,7 +78,7 @@ function(cuteafd_vision_owner_entry name)
       add_custom_command(OUTPUT ${pointwise_outputs}
       COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
       COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-        "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
+        ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
         --output-dir "${pointwise_directory}" --capability ${CUTEAFD_VISION_CAPABILITY} ${E_POINTWISE_ARGS}
       DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
         ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
@@ -102,7 +102,7 @@ add_custom_command(
   OUTPUT ${CUTEAFD_VISION_ATTENTION_OUTPUTS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
+    ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     --output-dir "${CUTEAFD_VISION_ATTENTION_DIR}" --capability ${CUTEAFD_VISION_CAPABILITY}
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

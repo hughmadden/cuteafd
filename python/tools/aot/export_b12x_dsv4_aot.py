@@ -31,6 +31,9 @@ from pathlib import Path
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
 import _pinned_sparkinfer
+import contextlib
+# Present only when the export cache's recorder runs this process (sitecustomize).
+_export_cache = _sys.modules.get("_export_cache")
 
 SCALAR_KINDS = {"int32": "i", "int64": "l", "float32": "f"}
 PAGE_ROWS = 64
@@ -1579,6 +1582,14 @@ def main() -> None:
     if "native_attention" not in geometries and any(name in geometries for name in
             ("glm", "glm2", "kimik3", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]
+    # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
+    # cache's recorder. Programs compile independently of which others the
+    # geometry list requests; their recipes read every argument except these.
+    program_cache = _export_cache.ProgramCache(output) if _export_cache else None
+    if program_cache is not None:
+        program_cache.start()
+    recipe_arguments = {key: value for key, value in sorted(vars(args).items())
+                        if key not in ("output_dir", "geometry", "only")}
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
@@ -1598,25 +1609,43 @@ def main() -> None:
             label = stem if sms is None else f"{stem}_sm{sms}"
             if object_selection is not None and label not in object_selection:
                 continue
-            def construct():
-                with exportable_compilation():
-                    program = thunk() if sms is None else thunk(sm_count=sms)
-                # Include scratch callbacks in the measured dependency set.
-                return program, program.scratch_bytes(capacity)
-            program, plan_scratch = globals().get("_record_construction", lambda fn: fn())(construct)
-            validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
-            minimum_sms = max(minimum_sms, program_minimum_sms(stem, program.geometry))
-            if abi is not None and program.abi != abi:
+            identity = {"exporter": "export_b12x_dsv4_aot.py", "family": family, "suffix": suffix, "op": op,
+                        "params": params, "label": label, "plan_sms": sms, "capacity": capacity,
+                        "device": [props.major, props.minor, props.multi_processor_count],
+                        "diagnostic": selected is not None, "arguments": recipe_arguments}
+            reused = program_cache.lookup(identity) if program_cache is not None and object_selection is None else None
+            if reused is not None:
+                geometry, plan_scratch, program_abi, checked = (
+                    reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
+            else:
+                def construct():
+                    with exportable_compilation():
+                        program = thunk() if sms is None else thunk(sm_count=sms)
+                    # Include scratch callbacks in the measured dependency set.
+                    return program, program.scratch_bytes(capacity)
+                with (program_cache.scope() if program_cache is not None else contextlib.nullcontext()) as scope:
+                    program, plan_scratch = globals().get("_record_construction", lambda fn: fn())(construct)
+                    # The serving-table gate precedes writing any object.
+                    validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
+                    program.export_to_c(str(output), label, "cuteafd_" + label)
+                    checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+                # The JSON form, as a reused program carries it, so plans compare alike.
+                geometry, program_abi = json.loads(json.dumps(dict(program.geometry))), json.loads(json.dumps(program.abi))
+            program_abi = {**program_abi, "scalars": [tuple(item) for item in program_abi["scalars"]]}
+            validate_table_residency(stem, geometry, diagnostic=selected is not None)
+            minimum_sms = max(minimum_sms, program_minimum_sms(stem, geometry))
+            if abi is not None and program_abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
-            abi = program.abi
-            kinds, public_scalars = native_scalar_abi(stem, program.geometry, abi["scalars"])
-            program.export_to_c(str(output), label, "cuteafd_" + label)
-            checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+            abi = program_abi
+            kinds, public_scalars = native_scalar_abi(stem, geometry, abi["scalars"])
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
+            if reused is None and program_cache is not None:
+                program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], {
+                    "geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi})
             for key, size in plan_scratch.items():
                 scratch[key] = max(scratch.get(key, 0), size)
-            plans.append({"sm_count": sms, "label": label, "geometry": dict(program.geometry),
+            plans.append({"sm_count": sms, "label": label, "geometry": dict(geometry),
                           "scratch_bytes_at_capacity": plan_scratch, "entry": checked["symbol"],
                           "object_sha256": hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()})
             includes.append(f'#include "{label}.h"')
@@ -1633,6 +1662,8 @@ def main() -> None:
         extra = ", " + modules[1] if len(modules) > 1 else ""
         entries.append(f'{{"{stem}", {modules[0]}, {len(abi["pointers"])}, "{kinds}", {minimum_sms}{extra}}}')
         print(f"exported {stem}: {len(abi['pointers'])} pointers, scalars '{kinds}', plans {plan_sms}", flush=True)
+    if program_cache is not None:
+        program_cache.report()
     if not entries:
         raise SystemExit("no programs selected")
     (output / "dsv4_programs.h").write_text("\n".join([

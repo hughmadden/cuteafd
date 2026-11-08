@@ -348,6 +348,16 @@ cmake \
   -DCUTEAFD_XGRAMMAR_LOCK_FILE="$source_dir/third_party/xgrammar.lock.json" \
   -DPython3_EXECUTABLE="$(command -v python3)" \
   -DCUTEAFD_CUDA_ARCHITECTURES="$cuda_arch"
+# Exports run through the content-addressed export cache (scripts/build/export-cache.py):
+# keyed by the compiler image and what each export read, shared by every build on
+# this host. Without the mounted store or an image ID each export just runs.
+if [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && -n "${CUTEAFD_WIP_DEV_IMAGE_ID:-}" && -n "${CUTEAFD_EXPORT_CACHE:-}" && "${CUTEAFD_EXPORT_CACHE}" != off ]]; then
+  export CUTEAFD_EXPORT_IMAGE_ID="$CUTEAFD_WIP_DEV_IMAGE_ID"
+  export CUTEAFD_EXPORT_CACHE_STATS="$build_dir/export-cache-stats.jsonl"
+  rm -f "$CUTEAFD_EXPORT_CACHE_STATS"
+else
+  export CUTEAFD_EXPORT_CACHE=off
+fi
 # One process budget shared by variant workers across all Ninja package jobs.
 export CUTEAFD_EXPORT_SLOT_DIR="${CUTEAFD_EXPORT_SLOT_DIR:-$build_dir/cache/export-slots}"
 export CUTEAFD_EXPORT_HOST_CLASS="${CUTEAFD_EXPORT_HOST_CLASS:-$( [[ "$role" == coordinator ]] && echo raptor || echo remote )}"
@@ -507,8 +517,14 @@ if [[ -n "${native_key:-}" ]] && ((${native_hit:-0} == 0)); then
     sort -rn | tail -n +"$((${CUTEAFD_WIP_NATIVE_KEEP:-16} + 1))" | cut -d' ' -f2- |
     while IFS= read -r stale; do rm -rf "$stale"; done
 fi
+export_cache_summary=""
+if [[ -s "${CUTEAFD_EXPORT_CACHE_STATS:-/nonexistent}" ]] && ((${native_hit:-0} == 0)); then
+  export_cache_summary="$(python3 -c 'import collections,json,sys
+c=collections.Counter(json.loads(l)["event"] for l in open(sys.argv[1]) if l.strip())
+print(" ".join(f"{k} {c[k]}" for k in ("hit","miss","uncacheable") if c[k]))' "$CUTEAFD_EXPORT_CACHE_STATS")"
+fi
 [[ -z "${native_started:-}" ]] ||
-  wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)"
+  wip_phase_mark native $((SECONDS - native_started)) "$([[ ${native_hit:-0} == 1 ]] && echo reused || echo built)${export_cache_summary:+; exports $export_cache_summary}"
 
 [[ "${phase:-all}" != export ]] || exit 0
 (

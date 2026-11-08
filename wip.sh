@@ -1200,6 +1200,26 @@ wip_coordinator_export_modes() {
   esac
 }
 
+# wip_cached_exports BUILD...: the native phase with every AOT export required
+# to come from the export cache (scripts/build/export-cache.py exits 3 before an
+# exporter would start). CMake and host C++ run; no export touches a GPU. On a
+# miss Ninja keeps the restored outputs and the caller takes the export turn.
+wip_cached_exports() {
+  [[ "${CUTEAFD_BUILD_CACHES:-on}" != off && "${CUTEAFD_WIP_EXPORT_CACHE_FIRST:-on}" == on ]] || return 1
+  local started=$SECONDS status=0 log
+  log="$(mktemp "${TMPDIR:-/tmp}/wip-cached-exports.XXXXXXXX")"
+  "$@" >"$log" 2>&1 || status=$?
+  echo "WIP cached exports: $(grep -oE '^export cache [a-z-]+' "$log" | sort | uniq -c | awk '{printf "%s %s, ", $4, $1}')"
+  if ((status == 0)); then
+    rm -f "$log"
+    echo "WIP phase cached-exports: $((SECONDS - started))s"
+    return 0
+  fi
+  grep -h 'export cache required-hit-missed' "$log" | head -3 >&2 || true
+  echo "WIP cached exports: not every export is cached (exit $status, log $log); taking the export turn" >&2
+  return 1
+}
+
 # wip_remote_export: the native key's entry from CUTEAFD_EXPORT_HOST, through
 # sparknest, then restored here with REQUIRE_HIT (no GPU turn on raptor).
 wip_remote_export() {
@@ -1378,6 +1398,8 @@ build_coordinator() {
     # The build re-verifies the entry; one that vanished fails rather than exporting unlocked.
     docker exec -e CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP native restore failed"
+  elif wip_cached_exports docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 "${coordinator_build[@]:2}" native; then
+    echo "WIP coordinator export: every export restored from the export cache, no GPU turn"
   else
     # Remote first when configured; otherwise take one bounded fair GPU turn.
     # The seed lease and Cargo slot are already released before this phase.
@@ -1461,6 +1483,9 @@ build_expert() (
     echo "WIP Spark export: native cache hit, no export turn"
     timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" "$restore_command" ||
       release_die "Spark WIP native restore on $seed_host failed"
+  elif wip_cached_exports timeout --kill-after=30 7260 ssh -o BatchMode=yes "$seed_host" \
+      "${build_command/docker exec /docker exec -e CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1 } native"; then
+    echo "WIP Spark export: every export restored from the export cache, no export turn"
   else
     # The seed's CPU lease admits other builds; its GPU export is one at a time.
     wip_seed_export_turn

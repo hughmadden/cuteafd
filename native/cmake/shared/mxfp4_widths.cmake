@@ -71,7 +71,7 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
     OUTPUT "${dir}/v41_experts.json" "${dir}/${variant_header}" ${objects} ${headers}
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-      "${Python3_EXECUTABLE}"
+      ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       --geometry "${family}" --role "${role}" --output-dir "${dir}"
       --rows "${width_rows_arg}" --width "${slice}" --standard-names

@@ -48,7 +48,7 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
       ${nvfp4_objects} ${nvfp4_headers}
     COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
     COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-      "${Python3_EXECUTABLE}"
+      ${CUTEAFD_EXPORT_LAUNCHER} "${Python3_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_nvfp4_aot.py"
       --output-dir "${nvfp4_dir}" --role "${role}"
       --rows "${CUTEAFD_V41_NVFP4_CAPACITY_ARG}"

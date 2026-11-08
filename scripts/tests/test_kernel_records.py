@@ -483,8 +483,10 @@ def test_export_policy_environment_changes_invalidate_identity(monkeypatch):
 
 def test_export_environment_covers_every_source_read(monkeypatch):
     import ast
+    # _export_cache.py is cache tooling like kernel-records.py: it reads only its
+    # own control variables and replays recorded names, never export semantics.
     paths = [*sorted((ROOT / "python/tools/aot").glob("*.py")),
-             *sorted((ROOT / "python/tools/lib").glob("*.py")),
+             *sorted(path for path in (ROOT / "python/tools/lib").glob("*.py") if path.name != "_export_cache.py"),
              ROOT / "scripts/build/compare-sm-exports.py",
              ROOT / "scripts/build/export-placement-inputs.py"]
     names = set()

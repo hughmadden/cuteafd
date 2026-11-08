@@ -138,14 +138,16 @@ def test_finalize_records_key_and_phases(tmp_path):
     assert [(p['phase'], p['seconds']) for p in meta['build_phases']] == [('rust', 12), ('native', 3)]
 
 
-def _wip_coordinator(tmp_path, hit):
+def _wip_coordinator(tmp_path, hit, exports_cached=False):
     text = (ROOT / 'wip.sh').read_text()
     helpers = ''
     helpers += text[text.index('# Native/AOT outputs are cached by input key'):text.index('build_expert() (')]
     tools = tmp_path / 'tools'
     tools.mkdir()
     trace = tmp_path / 'trace'
-    for name, body in {'docker': 'printf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"',
+    cached = 'true' if exports_cached else 'false'
+    for name, body in {'docker': 'printf "docker %s\\n" "$*" >> "$TRACE"\nprintf "image-id\\n"\n'
+                                 'case "$*" in *CUTEAFD_EXPORT_CACHE_REQUIRE_HIT=1*) ' + cached + ' || exit 3;; esac',
                        'python3': 'printf "turn %s\\n" "$*" >> "$TRACE"'}.items():
         (tools / name).write_text('#!/bin/sh\n' + body + '\n')
         (tools / name).chmod(0o755)
@@ -186,6 +188,12 @@ def test_native_cache_miss_probes_capped_without_queueing(tmp_path):
     assert 'done by capped' in stdout
     assert 'capped' in lines
     assert not any('hwlock.py --locks gpu1' in line for line in lines)
+
+
+def test_native_cache_miss_with_every_export_cached_takes_no_gpu_turn(tmp_path):
+    stdout, lines = _wip_coordinator(tmp_path, hit=False, exports_cached=True)
+    assert 'every export restored from the export cache, no GPU turn' in stdout
+    assert 'capped' not in lines and not any(line.startswith('turn ') for line in lines)
 
 
 def test_native_store_moves_entries_between_instance_and_host_store(tmp_path):
