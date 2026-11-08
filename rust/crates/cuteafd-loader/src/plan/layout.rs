@@ -368,13 +368,17 @@ mod scoring_workspace_tests {
     use super::*;
 
     #[test]
-    fn unknown_package_runtime_item_uses_manifest_formula() {
-        let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
-        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
+    fn migrated_runtime_item_excludes_blas_but_unmigrated_formula_keeps_it() {
+        let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}, {"name":"unmigrated_decode"}]});
         let arch = crate::placement::ArchContext::for_device("sm_120", 96 << 30);
-        assert_eq!(item.basis, Basis::Formula);
-        assert_eq!(item.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
-        assert!(item.bytes > arch.context_bytes);
+        let item = runtime_item(Some(&manifest), &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
+        assert_eq!(item.basis, Basis::Estimated);
+        assert_eq!(item.bytes, arch.context_bytes + 34 * MIB);
+        let fallback = runtime_item(None, &["qwen4".into()], "unmeasured", false, 0, 96 << 30);
+        assert_eq!(fallback.bytes, item.bytes);
+        let unmigrated = runtime_item(Some(&manifest), &["unmigrated".into()], "unmeasured", false, 0, 96 << 30);
+        assert_eq!(unmigrated.basis, Basis::Formula);
+        assert_eq!(unmigrated.bytes, arch.context_bytes + arch.cublas_bytes + 34 * MIB);
     }
 
     #[test]

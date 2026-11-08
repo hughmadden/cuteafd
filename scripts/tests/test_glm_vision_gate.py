@@ -156,6 +156,34 @@ def test_blas_borrowers_include_the_pool_header_directly():
         assert '#include "blas_owner.h"' in path.read_text(), str(path.relative_to(ROOT))
 
 
+def test_generic_linear_blas_remains_outside_serving():
+    # A serving caller needs pre-Ready preparation and named pool/scratch owners.
+    forbidden = (".linear_bf16(", "cuteafd_cuda_linear_bf16", "cuteafd_cuda_mla_scalar_qa_batched_norm_candidate_async",
+                 "cuteafd_cuda_dspark_terminal_greedy_bf16_async")
+    for path in (ROOT / "rust/crates/cuteafd-daemon/src").rglob("*.rs"):
+        source = path.read_text()
+        assert not any(symbol in source for symbol in forbidden), str(path.relative_to(ROOT))
+
+
+def test_glmf_blas_owners_follow_resolved_head_not_checkpoint_dtype():
+    module = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/mod.rs").read_text()
+    runtime = module.split("blas_head: args.resolved_target_head().blas_head(", 1)[1].split("representation, resident", 1)[0]
+    assert '!self.native && core.get_weight("lm_head").is_none()' in runtime
+    assert "representation.head == head::GlmfHeadFormat::Bf16" in runtime
+    layout = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
+    assert layout.index("representation.head.resolve(") < layout.index("blas_head:")
+    selection = layout.split("blas_head:", 1)[1].split("resident, workspace", 1)[0]
+    assert 'exlr8.is_some() || core.get_weight("lm_head").is_some()' in selection
+    assert "representation.head != resident::GlmfHeadFormat::Bf16" in selection
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine.rs").read_text()
+    assert "native_head: head.bf16().is_none()" in engine
+    assert "head: if shape.lead && !self.native_head" in engine
+    draft = engine.split("pub fn draft_head(", 1)[1].split("/// Launches", 1)[0]
+    packed = draft.split("packed @ GlmfHead::Packed", 1)[1]
+    assert "TargetHead::Launch" in packed and "launch_packed(" in packed
+    assert "rows, true, None, stream" in packed
+
+
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/serve.rs").read_text()
     replay = source.split("let logits = if cold_replay_decode(", 1)[1].split(

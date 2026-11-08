@@ -1101,8 +1101,11 @@ mod admission_tests {
                     ResidentWeights(draft.peer_half)));
             }
             fixed.extend(draft.runtime.iter().cloned());
+            // Its retained storage is in `fixed`, but the loaded drafter still
+            // borrows the serving pool's Markov GEMM backend.
+            let loaded_draft = DraftInventory::default();
             let original = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
-                &fixed, &[], &[], None)?;
+                &fixed, &[], &[], Some(&loaded_draft))?;
             assert_eq!(moved.cache_bytes, original.cache_bytes);
             for gpu in 0..ranks {
                 let total = |items: &[cuteafd_core::memory_layout::Item]| items.iter().map(|i| i.bytes).sum::<u64>();
@@ -1242,7 +1245,11 @@ mod admission_tests {
                         + families::deepseek_v41::runtime_reserve(total as u64, ranks)
                             as usize
                         + graph_reserve_bytes(total, (ranks == 2).then_some(gpu));
-                    (bytes + reserve + deferred[gpu] as usize + usage_bytes, total)
+                    let blas = admitted.placement.items[gpu].iter().filter(|item|
+                        item.group.starts_with("cuBLAS handles:")
+                            || item.group.starts_with("BLAS device initialization"))
+                        .map(|item| item.bytes).sum::<u64>() as usize;
+                    (bytes + reserve + deferred[gpu] as usize + usage_bytes + blas, total)
                 })
                 .collect::<Vec<_>>();
             assert_eq!(

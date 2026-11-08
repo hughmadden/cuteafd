@@ -3521,6 +3521,15 @@ fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
     assert_eq!(weights(&bf16) - weights(&fp8), 524_288 - 270_336);
     assert_eq!(weights(&packed) - weights(&fp8), 395_776 - 270_336);
     assert_eq!([draft_scratch(&bf16), draft_scratch(&fp8), draft_scratch(&packed)], [0, 0, 1 << 20]);
+    for (ranks, resolved) in [(1, GlmfHeadFormat::Packed), (2, GlmfHeadFormat::Fp8)] {
+        let report = planned(GlmfHeadFormat::Auto, ranks);
+        assert!(report.placement_supported, "auto TP{ranks}: {:?}", report.hints);
+        let memory = report.memory_layout.unwrap();
+        assert!(memory.notes.iter().any(|note|
+            note.contains(&format!("shared target/draft head: {}", resolved.name()))));
+        assert!(memory.devices.iter().flat_map(|device| &device.items).all(|item|
+            !item.group.starts_with("cuBLAS handles:") && !item.group.starts_with("BLAS device initialization")));
+    }
     let split = planned(GlmfHeadFormat::Packed, 2);
     assert!(!split.placement_supported);
     assert!(split.hints.iter().any(|hint| hint.what.contains("one coordinator GPU")), "{:?}", split.hints);
@@ -4268,9 +4277,14 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
 
 #[test]
 fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
+    use crate::families::glm5_flash::resident::GlmfHeadFormat;
     use cuteafd_core::memory_layout::Category;
     let dir = snapshot(glm5_flash_config(2), &glm5_flash_tensors(&glm5_flash_config(2)));
+    for head in [GlmfHeadFormat::Auto, GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed] {
+    let bf16 = head.resolve(false, 1) == GlmfHeadFormat::Bf16;
     let options = |disabled| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
+        glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+            head, ..Default::default() },
         glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
     let enabled = plan(dir.path(), &options(false)).unwrap().memory_layout.unwrap();
     let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
@@ -4285,7 +4299,9 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         owner.bytes
     };
     assert!(graphs(&disabled) < graphs(&enabled), "disabled={} enabled={}", graphs(&disabled), graphs(&enabled));
-    for (layout, handles) in [(&enabled, 3), (&disabled, 2)] {
+    // Packed (including TP1 auto) and FP8 serve both projections natively;
+    // only BF16 target Lt and its enabled drafter's GEMM borrow BLAS.
+    for (layout, draft) in [(&enabled, true), (&disabled, false)] {
         let items = &layout.devices[0].items;
         assert!(!items.iter().any(|i| i.group == "workspace runtime overhead"));
         let context = items.iter().find(|i| i.group == "context+modules").unwrap().bytes;
@@ -4294,9 +4310,10 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         let code = items.iter().find(|i| i.group.starts_with("selected-program loaded code estimate")).unwrap();
         assert_eq!(code.basis, cuteafd_core::memory_layout::Basis::Estimated);
         assert_eq!(items.iter().filter(|i| i.group.starts_with("cuBLAS handles:"))
-            .map(|i| i.bytes).sum::<u64>(), handles * (64 << 20));
+            .map(|i| i.bytes).sum::<u64>(), u64::from(bf16 && draft) * (64 << 20));
         assert_eq!(items.iter().filter(|i| i.group.starts_with("BLAS device initialization"))
-            .map(|i| i.bytes).sum::<u64>(), 2 << 20);
+            .map(|i| i.bytes).sum::<u64>(), u64::from(bf16) * (2 << 20));
+    }
     }
 }
 
@@ -4723,7 +4740,11 @@ fn v41_vision_off_removes_only_the_tower_from_fixed_layout() {
         checkpoint.tensors.iter().map(|tensor| &tensor.meta)).unwrap();
     let vision_b = vision.bytes() as u64;
     let vision_tail = crate::placement::planner::allocation_granularity_forecast(&[vision_b]).unwrap();
-    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(), local_tower + vision_b + vision_tail);
+    let handles = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|item| item.group.starts_with("cuBLAS handles:")).map(|item| item.bytes).sum::<u64>();
+    assert_eq!(handles(&local.devices[0]) - handles(&off.devices[0]), 64 << 20);
+    assert_eq!(local.devices[0].used_bytes() - off.devices[0].used_bytes(),
+        local_tower + vision_b + vision_tail + (64 << 20));
     assert_eq!(auto.pool_tokens, off.pool_tokens);
     assert_eq!(local.pool_tokens, off.pool_tokens);
     use cuteafd_core::memory_layout::Category;
@@ -4896,10 +4917,33 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert_eq!((capped.prefill_reserve_rows, capped.prefill_unit_rows, capped.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
     assert_eq!(capped.memory_layout.as_ref().unwrap().pool_tokens, 1 << 20);
-    // Less physical capacity must still refuse, not retry with a smaller
-    // reserve to make room for KV.
-    let limited = PlanOptions { layout: Some(layout::LayoutOptions {
+    // The BLAS/code split retires the mixed 2 GiB row, not the independent
+    // graph/runtime reserves. This synthetic 31 GiB card now fits as well.
+    let compact = PlanOptions { layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![31 << 30], ..layout.clone() }), ..sparks(4) };
+    let compact = plan_spark_count(dir.path(), &compact, 6, Some(4)).unwrap();
+    assert!(compact.executable(), "{}", render(&compact));
+    assert_eq!((compact.prefill_reserve_rows, compact.prefill_unit_rows, compact.prefill_waves),
+        (Some(8192), Some(2752), Some(3)));
+    let items = &compact.memory_layout.as_ref().unwrap().devices[0].items;
+    let bytes = |prefix: &str| items.iter().filter(|item| item.group.starts_with(prefix))
+        .map(|item| item.bytes).sum::<u64>();
+    let arch = crate::placement::ArchContext::coordinator(31 << 30, None);
+    assert_eq!(bytes("CUDA context"), arch.context_bytes);
+    let modules = bytes("V4.1 selected native modules");
+    assert!(modules >= 34 << 20);
+    let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
+    assert_eq!(blas, 66 << 20);
+    assert_eq!(bytes("V4.1 lazy graph capture envelope"),
+        crate::placement::families::deepseek_v41::graph_reserve(31 << 30, 1));
+    assert_eq!(bytes("V4.1 runtime growth reserve"),
+        crate::placement::families::deepseek_v41::runtime_reserve(31 << 30, 1));
+    assert_eq!(bytes("native LoadedCode estimate"), 0);
+    let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
+    eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; graph/runtime unchanged");
+    // Less physical capacity still refuses rather than shrinking the reserve.
+    let limited = PlanOptions { layout: Some(layout::LayoutOptions {
+        rtx_bytes: vec![29 << 30], ..layout.clone() }), ..sparks(4) };
     let limited = plan_spark_count(dir.path(), &limited, 6, Some(4)).unwrap();
     assert!(!limited.executable(), "{}", render(&limited));
     assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),

@@ -188,7 +188,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     match host.as_ref().map_err(|error| anyhow::anyhow!("Qwen host owners: {error:#}")).and_then(|host|
         placement(input, report, options, &mut devices[0], shape.manifest.as_deref(),
             PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp },
-            host.clone(), encoders.clone(), &mut notes)) {
+            host.clone(), encoders.clone(), &mut sparks, &mut notes)) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
             let reason = format!("Qwen admission: {error:#}");
@@ -211,14 +211,6 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
             .map_or_else(Vec::new, super::super::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
         sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
-        if let Some(encoder) = &report.encoder {
-            for rank in encoder.spark_ranks() {
-                if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
-                    device.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", encoder.weights, Basis::Formula));
-                    device.items.push(Item::new(Category::Workspace, "vision scratch", "resident", encoder.scratch, Basis::Formula));
-                }
-            }
-        }
     }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -238,7 +230,7 @@ struct PlanShape {
 /// head, drafter, resident experts and their package scratch, encoder).
 fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: &LayoutOptions,
     device: &mut DeviceLayout, manifest: Option<&serde_json::Value>, shape: PlanShape,
-    host: qwen4::QwenHost, encoders: qwen4::QwenEncoders, notes: &mut Vec<String>) -> anyhow::Result<u64> {
+    host: qwen4::QwenHost, encoders: qwen4::QwenEncoders, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) -> anyhow::Result<u64> {
     use crate::serving_capacity::qwen_graphs::*;
     let checkpoint = input.checkpoint();
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
@@ -301,7 +293,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         placement.onboard_layers = cfg.layers;
     }
     publish_host(report, options, &inputs.host, &solved)?;
-    adopt_encoder(report, &inputs.encoders, &solved, notes);
+    adopt_encoder(report, &inputs.encoders, &solved, sparks, notes)?;
     report.prefill_span_rows = Some(span);
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
@@ -430,14 +422,25 @@ fn qwen_encoders(report: &mut PlanReport, options: &LayoutOptions, sparks: &[Dev
     }
     anyhow::ensure!(!encoders.is_empty() || report.vision == MediaMode::Off,
         "requested Qwen vision placement has no executable device");
+    use crate::placement::planner::{Baseline, Budget, Device, Domain, Location};
+    let spark_budgets = sparks.iter().map(|device| Budget {
+        id: format!("spark{}", device.index),
+        locations: vec![Location { device: Device::Spark(device.index as u8), domain: Domain::Managed }],
+        physical_bytes: device.capacity_bytes,
+        logical_bytes: device.used_bytes().saturating_add(
+            super::spark_encoder_headroom(device, options.spark_allocation_budget_bytes)),
+        baseline: Baseline::Forecast { occupied: device.used_bytes(),
+            source: "Qwen Spark worker before vision tower and BLAS".into(), assumed: false },
+        headroom: 0,
+    }).collect();
     Ok(qwen4::QwenEncoders { candidates: encoders, media_cache: options.media_cache_bytes.unwrap_or_else(||
-        (8u64 << 30).min(host_sample(options).map_or(0, |(total, _)| total) / 20)) })
+        (8u64 << 30).min(host_sample(options).map_or(0, |(total, _)| total) / 20)), spark_budgets })
 }
 
 /// Adopt the solve's encoder: the chosen candidate, its device items, and the
 /// component bookkeeping `resolve_encoder` kept for an Off tower.
 fn adopt_encoder(report: &mut PlanReport, encoders: &qwen4::QwenEncoders,
-    solved: &crate::placement::planner::ResolvedPlan, notes: &mut Vec<String>) {
+    solved: &crate::placement::planner::ResolvedPlan, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) -> Result<()> {
     use super::super::encoder::{EncoderKind, EncoderPlacement};
     let encoder = encoders.admitted(solved).unwrap_or_else(|| EncoderPlacement { kind: EncoderKind::Off,
         weights: 0, scratch: 0, replicas: Vec::new(), reason: "disabled or no checkpoint tower".into(), shortfall: 0 });
@@ -457,6 +460,12 @@ fn adopt_encoder(report: &mut PlanReport, encoders: &qwen4::QwenEncoders,
     notes.push(format!("vision {:?}: {}; {} bytes admitted; shortfall {} bytes", encoder.kind, encoder.reason,
         encoder.admitted_bytes(), encoder.shortfall));
     report.encoder = Some(encoder);
+    for device in sparks {
+        device.items.extend(solved.items(crate::placement::planner::Location {
+            device: crate::placement::planner::Device::Spark(device.index as u8),
+            domain: crate::placement::planner::Domain::Managed })?);
+    }
+    Ok(())
 }
 
 /// A refused solve still names its vision decision: the requested tower
@@ -595,7 +604,9 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
             if let Err(error) = publish_host(report, options, &host, &solved) {
                 report.refuse_placement(format!("Qwen host ledger: {error:#}"), "Report the host owner geometry.");
             }
-            adopt_encoder(report, &encoders, &solved, &mut notes);
+            if let Err(error) = adopt_encoder(report, &encoders, &solved, &mut sparks, &mut notes) {
+                report.refuse_placement(format!("Qwen Spark encoder ledger: {error:#}"), "Report the solved encoder owners.");
+            }
             report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
             report.refuse_placement(format!("Qwen dual admission: {error:#}"),
@@ -609,14 +620,6 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     let media_ranks: std::collections::BTreeSet<usize> = report.encoder.as_ref()
         .map_or_else(Vec::new, super::super::encoder::EncoderPlacement::spark_ranks).into_iter().collect();
     sparks.retain(|device| media_ranks.contains(&(device.index as usize)));
-    if let Some(encoder) = &report.encoder {
-        for rank in encoder.spark_ranks() {
-            if let Some(device) = sparks.iter_mut().find(|device| device.index as usize == rank) {
-                device.items.push(Item::new(Category::Weights, "vision tower", "BF16 + FP32 vectors", encoder.weights, Basis::Formula));
-                device.items.push(Item::new(Category::Workspace, "vision scratch", "resident", encoder.scratch, Basis::Formula));
-            }
-        }
-    }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste: Vec::new(), notes }
 }

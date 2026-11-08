@@ -212,7 +212,9 @@ impl CodeAllowance {
 pub fn loaded_code_allowance(program_family: &str, _experts: &str, split: bool, _rank: u8,
     arch: &ArchContext, programs: Option<&ProgramSet>) -> CodeAllowance {
     if matches!(loaded_code_family(program_family), "glmf" | "glmf-k6" | "kimik3" | "qwen4" | "mimo" | "dsv4" | "muse") {
-        return CodeAllowance { bytes: programs.map_or(32 * MIB, ProgramSet::module_bytes),
+        return CodeAllowance { bytes: programs.map_or_else(
+            || ProgramSet::from_names(&[program_family], std::iter::empty()).module_bytes(),
+            ProgramSet::module_bytes),
             basis: Basis::Estimated, future_library_bytes: 0 };
     }
     CodeAllowance { bytes: arch.cublas_bytes
@@ -1053,7 +1055,10 @@ mod tests {
                     assert_eq!(code.bytes, programs.module_bytes());
                     assert_eq!(code.pending(u64::MAX, arch.context_bytes), 0);
                     let missing = loaded_code_allowance(family, package, split, rank, arch, None);
-                    assert_eq!(missing.bytes, 32 * MIB);
+                    let empty = ProgramSet::from_names(&[family], std::iter::empty());
+                    let runtime = loaded_code_allowance(family, package, split, rank, arch, Some(&empty));
+                    assert_eq!(missing.bytes, runtime.bytes);
+                    assert_eq!(missing.bytes, 34 * MIB);
                     assert_eq!(missing.basis, Basis::Estimated);
                 }
             }

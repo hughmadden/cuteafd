@@ -3,7 +3,7 @@
 //! beside the pool it chooses instead of a pre-solve guess at the KV target.
 use crate::plan::encoder::{EncoderKind, EncoderPlacement};
 use crate::placement::planner::{
-    Activation, Allocation, ByteCurve, Component, Lifetime, Location, Refusal, ResidentWeight, Variable,
+    Activation, Allocation, Budget, ByteCurve, Component, Lifetime, Location, Refusal, ResidentWeight, Variable,
 };
 use cuteafd_core::memory_layout::Category;
 
@@ -15,6 +15,8 @@ pub struct QwenEncoders {
     pub candidates: Vec<EncoderPlacement>,
     /// Host embedding cache, live only while a tower is active.
     pub media_cache: u64,
+    /// Spark occupancy before the candidate tower and its BLAS owners load.
+    pub spark_budgets: Vec<Budget>,
 }
 
 impl QwenEncoders {
@@ -60,12 +62,18 @@ impl QwenEncoders {
                     "Qwen encoder candidate names coordinator {gpu} outside {gpus} owners"))),
                 EncoderKind::Spark { .. } => {
                     for rank in encoder.spark_ranks() {
+                        let location = Location { device: crate::placement::planner::Device::Spark(rank as u8),
+                            domain: crate::placement::planner::Domain::Managed };
                         blas.push(BlasOwners { name: format!("Qwen vision {option}/worker{rank}"),
                             process: format!("qwen-media-worker-{rank}"), thread: "qwen4/blas/media".into(),
-                            location: Location { device: crate::placement::planner::Device::Spark(rank as u8),
-                                domain: crate::placement::planner::Domain::Managed },
-                            gemm: true, lt: false, lifetime: Lifetime::RESIDENT,
+                            location, gemm: true, lt: false, lifetime: Lifetime::RESIDENT,
                             activation: Activation::choice(variable, option) });
+                        for (part, bytes, category) in [("tower", encoder.weights, Category::Weights),
+                            ("scratch", encoder.scratch, Category::Workspace)] {
+                            let owner = Allocation::buffer(format!("qwen.encoder.{option}.spark{rank}.{part}"),
+                                location, bytes, Lifetime::RESIDENT, category, format!("vision {part}"));
+                            owners.push(Component::allocation(owner, ByteCurve::fixed(bytes, maximum_pages), false, maximum_pages));
+                        }
                     }
                 }
                 EncoderKind::SparkIdle { .. } => {}
@@ -117,7 +125,7 @@ mod tests {
                 EncoderKind::Rtx { gpu: 1 }, EncoderKind::Spark { rank: 2 }] {
                 let encoders = QwenEncoders { candidates: vec![EncoderPlacement { kind: encoder.clone(),
                     weights: 1024, scratch: 4096, replicas: vec![], reason: "test".into(), shortfall: 0 }],
-                    media_cache: 0 };
+                    media_cache: 0, ..Default::default() };
                 let mut components = Vec::new();
                 encoders.extend(&mut vec![], &mut components, 2, head, 16).unwrap();
                 let handles = |location| components.iter().filter_map(|component| match &component.kind {

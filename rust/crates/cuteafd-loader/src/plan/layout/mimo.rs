@@ -705,7 +705,11 @@ mod tests {
                             let total: u64 = admitted.steady.devices[rank].reservations.iter().map(|r| r.bytes).sum::<u64>()
                                 + (32768 / admitted.steady.pool_unit_rows) * admitted.steady.devices[rank].pool_unit_bytes
                                 + crate::placement::families::mimo_v2::admission::POST_READY_RUNTIME_BYTES;
-                            assert_eq!(devices[rank].used_bytes(), total, "mapped planner items equal admission total");
+                            let blas = devices[rank].items.iter().filter(|item|
+                                item.group.starts_with("cuBLAS handles:") || item.group.starts_with("BLAS device initialization"))
+                                .map(|item| item.bytes).sum::<u64>();
+                            assert_eq!(blas, u64::from(!pro && rank == 0) * (2 << 20));
+                            assert_eq!(devices[rank].used_bytes(), total + blas, "mapped planner items equal admission total");
                             assert_eq!(planned.steady.devices[rank].reservations, admitted.steady.devices[rank].reservations,
                                 "pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
                             assert_eq!(planned.steady.devices[rank].pool_unit_bytes, admitted.steady.devices[rank].pool_unit_bytes);
@@ -1045,13 +1049,17 @@ mod tests {
         let tails = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
             .filter(|item| item.group == crate::placement::planner::ALLOCATION_GRANULARITY_GROUP)
             .map(|item| item.bytes).sum::<u64>();
+        let blas = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+            .filter(|item| item.group.starts_with("BLAS device initialization"))
+            .map(|item| item.bytes).sum::<u64>();
+        assert_eq!(blas, 2 << 20);
         let ledger = report.phase_ledger.unwrap();
         let baseline = &ledger.budgets.iter().find(|b| b.id == "rtx0").unwrap().baseline;
         let crate::placement::planner::Baseline::Forecast { occupied, .. } = baseline else { panic!("forecast") };
         assert_eq!(*occupied, 575 << 20);
         let ready = ledger.phases.iter().find(|row| row.budget == "rtx0"
             && row.phase == crate::placement::planner::Phase::Ready).unwrap();
-        let runtime = ready.opaque - tails;
+        let runtime = ready.opaque - tails - blas;
         assert_eq!(runtime, 570 << 20);
         let measured_baseline = 1_179_189_248u64 - 576_716_800;
         let measured_owned = 97_985_769_216u64;

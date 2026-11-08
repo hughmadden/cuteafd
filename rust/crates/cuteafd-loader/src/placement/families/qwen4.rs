@@ -220,7 +220,9 @@ impl<'a> QwenSingle<'a> {
     }
 
     pub fn admit(&self) -> Result<ResolvedPlan, Refusal> {
-        solve(self.request()?, vec![self.budget()?, self.inputs.host.budget()?], self)
+        let mut budgets = vec![self.budget()?, self.inputs.host.budget()?];
+        budgets.extend(self.inputs.encoders.spark_budgets.iter().cloned());
+        solve(self.request()?, budgets, self)
     }
 
     /// Mechanical executor output: the admitted owners, not a second solve.
@@ -894,6 +896,7 @@ impl<'a> QwenDual<'a> {
                 &format!("qwen4 dual owner{gpu}"))?,
             headroom: budget.reserve_bytes })).collect::<Result<Vec<_>, Refusal>>()?;
         budgets.push(self.inputs.host.budget()?);
+        budgets.extend(self.inputs.encoders.spark_budgets.iter().cloned());
         Ok(budgets)
     }
 
@@ -1449,6 +1452,86 @@ mod tests {
             capacity_bytes: 96 * gib, baseline, pending_code_bytes: 0, max_context: 131072,
             requested_pool, spark_ranks, startup_graph_modes,
             host: QwenHost::ample(cfg, 1, 4096).unwrap(), encoders: Default::default() }
+    }
+
+    fn check_spark_encoder_budgets(mut admit: impl FnMut(QwenEncoders) -> Result<ResolvedPlan, Refusal>) {
+        use crate::plan::encoder::{EncoderKind, EncoderPlacement};
+        use crate::placement::planner::{Device, Domain};
+        for replicas in [vec![], vec![2]] {
+            let tower = EncoderPlacement { kind: EncoderKind::Spark { rank: 0 }, weights: 1024,
+                scratch: 4096, replicas, reason: "test".into(), shortfall: 0 };
+            let mut encoders = QwenEncoders { candidates: vec![tower.clone()], media_cache: 0,
+                spark_budgets: tower.spark_ranks().into_iter().map(|rank| Budget {
+                    id: format!("spark{rank}"),
+                    locations: vec![Location { device: Device::Spark(rank as u8), domain: Domain::Managed }],
+                    physical_bytes: 1 << 30, logical_bytes: 1 << 30, headroom: 0,
+                    baseline: PlanBaseline::Forecast { occupied: 64 << 20, source: "existing worker".into(), assumed: false },
+                }).collect() };
+            let roomy = admit(encoders.clone()).unwrap();
+            for budget in &mut encoders.spark_budgets {
+                let location = budget.locations[0];
+                let items = roomy.items(location).unwrap();
+                assert_eq!(items.iter().filter(|item| item.group.starts_with("vision "))
+                    .map(|item| item.bytes).sum::<u64>(), tower.admitted_bytes());
+                assert_eq!(items.iter().filter(|item| item.group.starts_with("cuBLAS handles:"))
+                    .map(|item| item.bytes).sum::<u64>(), 67_508_224);
+                assert_eq!(items.iter().filter(|item| item.group.starts_with("cuBLAS first use"))
+                    .map(|item| item.bytes).sum::<u64>(), 158_674_944);
+                let required = roomy.phases.iter().filter(|phase| phase.budget == budget.id)
+                    .map(|phase| phase.owned + phase.opaque).max().unwrap();
+                budget.physical_bytes = (64 << 20) + required;
+                budget.logical_bytes = budget.physical_bytes;
+            }
+            let exact = admit(encoders.clone()).unwrap();
+            assert_eq!(exact.pool_tokens, roomy.pool_tokens);
+            for index in 0..encoders.spark_budgets.len() {
+                let mut short = encoders.clone();
+                short.spark_budgets[index].logical_bytes -= 1;
+                assert!(matches!(admit(short.clone()), Err(Refusal::Capacity { .. })));
+                short.candidates.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0,
+                    scratch: 0, replicas: vec![], reason: "off fallback".into(), shortfall: 0 });
+                let off = admit(short).unwrap();
+                assert_eq!(off.decisions.encoder, Some(1));
+                assert_eq!(off.pool_tokens, roomy.pool_tokens);
+                for budget in &encoders.spark_budgets {
+                    assert!(off.items(budget.locations[0]).unwrap().is_empty());
+                }
+            }
+            let mut missing = encoders;
+            missing.spark_budgets.clear();
+            assert!(matches!(admit(missing), Err(Refusal::InvalidFact(_))));
+        }
+    }
+
+    #[test]
+    fn single_and_dual_price_spark_tower_blas_and_replicas_in_one_physical_budget() {
+        let config = crate::plan::testing::qwen4_config(4);
+        let cfg = Qwen4Config::from_hf(&config).unwrap();
+        check_spark_encoder_budgets(|encoders| {
+            let mut inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 },
+                0, None, Some(131072), ResidentWeights(0), None);
+            inputs.encoders = encoders;
+            QwenSingle::new(&inputs)?.admit()
+        });
+        let (_dir, arenas) = dual_fixture(&config, false);
+        let experts = vec![Some(tp2_cost()); cfg.layers];
+        let extra = vec![vec![]; cfg.layers];
+        check_spark_encoder_budgets(|encoders| {
+            let inputs = QwenDualInputs {
+                blas_head: crate::placement::planner::serving::BlasHead::Native,
+                resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
+                admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
+                    kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
+                    mark_bytes: 0, full_prefill_logits: 0, ple: None, future_expert_bytes: 0, headroom: 0 },
+                owner_manifests: [None; 2], gpus: [GpuBudget { capacity_bytes: 96 << 30, reserve_bytes: 0,
+                    baseline: Baseline::Measured { free_bytes: 96 << 30 } }; 2],
+                arenas: &arenas, layer_experts: &experts, layer_extra: &extra, fixed: vec![],
+                tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
+                max_context: 131072, requested_pool: Some(131072), spark_ranks: 0, onboard: Onboard::Auto,
+                startup_graph_modes: None, host: QwenHost::ample(&cfg, 2, 4096).unwrap(), encoders,
+            };
+            QwenDual::new(&inputs)?.admit()
+        });
     }
 
     /// Plan-time and serve-time baselines describe the same owners; the recipe
