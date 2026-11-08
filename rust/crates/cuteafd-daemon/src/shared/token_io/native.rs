@@ -9,6 +9,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::dense::{
     DenseEncoding, DensePlan, DenseRange, DenseRecord, DenseSelection, DenseSlice, ShardSide,
 };
+use cuteafd_loader::plan::exlr8::dense::requests::row_requests;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
 const HEAD: &str = "lm_head.weight";
@@ -30,71 +31,9 @@ impl VocabularyPlan {
         hidden: usize,
         vocabulary: usize,
     ) -> Result<Self> {
-        ensure!(
-            hidden > 0 && vocabulary > 0,
-            "native vocabulary has empty dimensions"
-        );
-        let mut selected = Vec::new();
-        for name in selection.vocabulary_names() {
-            let mut matches = records.iter().filter(|r| r.tensor == name);
-            let record = matches
-                .next()
-                .with_context(|| format!("missing native vocabulary {name}"))?;
-            ensure!(
-                matches.next().is_none(),
-                "duplicate native vocabulary {name}"
-            );
-            ensure!(
-                record.encoding == DenseEncoding::RowFp8
-                    && record.shape == [vocabulary, hidden]
-                    && record.side == ShardSide::Output
-                    && record.rotation.is_none()
-                    && record.rotation_id == 0,
-                "native vocabulary {name} requires unrotated output-major row-FP8"
-            );
-            let payload = vocabulary
-                .checked_mul(hidden)
-                .context("native vocabulary extent overflow")?;
-            let scales = vocabulary
-                .checked_mul(4)
-                .context("native vocabulary scale extent overflow")?;
-            ensure!(
-                record.components.len() == 2,
-                "native vocabulary component count"
-            );
-            for (component, suffix, dtype, shape, bytes) in [
-                (
-                    &record.components[0],
-                    "fp8",
-                    "U8",
-                    vec![vocabulary, hidden],
-                    payload,
-                ),
-                (
-                    &record.components[1],
-                    "scale",
-                    "F32",
-                    vec![vocabulary],
-                    scales,
-                ),
-            ] {
-                ensure!(
-                    component.suffix == suffix
-                        && component.dtype == dtype
-                        && component.shape == shape
-                        && component.source.bytes == bytes,
-                    "native vocabulary {name} component {suffix} layout"
-                );
-                component
-                    .source
-                    .offset
-                    .checked_add(bytes as u64)
-                    .context("native vocabulary file extent overflow")?;
-            }
-            // Validate the complete native partition even on the non-owning rank.
-            record.slice(0, vocabulary)?;
-            selected.push(record.clone());
-        }
+        // One validation recipe for loading and admission.
+        let selected = cuteafd_loader::plan::exlr8::dense::requests::vocabulary_records(
+            records, selection, hidden, vocabulary)?;
         let dense = DensePlan::for_rank(&selected, world, rank)?;
         // Vocabulary streams native units, not Mount's component batches and row cache.
         let staging_bytes = dense.unit_staging_bytes()?;
@@ -438,11 +377,6 @@ fn record_rows(slice: &DenseSlice, buffers: [CuteafdDeviceBuffer; 2],
     Ok(())
 }
 
-pub(crate) fn row_requests(slice: &DenseSlice) -> Result<Vec<(String, usize)>> {
-    row_lands(slice)?;
-    slice.components.iter().map(|component| Ok((component.suffix.clone(),
-        cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity.allocation_bytes(component)?))).collect()
-}
 
 fn load_rows<'a>(
     library: &'a NativeLibrary,

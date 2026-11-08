@@ -484,11 +484,11 @@ impl GlmfWorkingSetExt for GlmfWorkingSet {
     }
 }
 
-/// The fixed embedding demand is also the executor's immutable table home.
-/// Host-mapped tables have no device demand and retain the entry GPU's alias.
+/// The zero-byte embedding alias records its home without charging the table twice.
+/// Host-mapped tables have no device alias and retain the entry GPU's home.
 pub fn embedding_home(placed: &Placement) -> u8 {
     placed.items.iter().position(|items| items.iter().any(|item|
-        item.category == Category::Embedding && item.group == "embedding" && item.bytes > 0))
+        item.category == Category::Embedding && item.group == "embedding"))
         .unwrap_or(0) as u8
 }
 
@@ -1265,7 +1265,7 @@ pub(crate) mod tests {
         input.drafter_scratch = scratch;
         let actual = contract(&input).unwrap().placement;
         assert_eq!(actual.movables, [(MovableId::Drafter, 0)]);
-        assert_eq!(actual.items[0].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
+        assert_eq!(actual.items[0].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident - owned.resident_weights.0);
         assert_eq!(actual.items[0].iter().find(|d| d.group == "DFlash linear/attention scratch").unwrap().bytes,
             30_491_648 + row_max_bytes + attention[0]);
         assert!(actual.items[1].iter().all(|d| d.group != "DFlash" && d.group != "DFlash linear/attention scratch"));
@@ -1339,7 +1339,7 @@ pub(crate) mod tests {
             process.allocations.clear();
             let actual = admission::prepare(&input, 188, true, process).unwrap().admit().unwrap().placement;
             assert_eq!(actual.movables, [(MovableId::Drafter, home)]);
-            assert_eq!(actual.items[home as usize].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident);
+            assert_eq!(actual.items[home as usize].iter().filter(|d| d.group == "DFlash").map(|d| d.bytes).sum::<u64>(), owned.memory.resident - owned.resident_weights.0);
             for rank in 0..2 {
                 let bridge = actual.items[rank].iter().filter(|d| d.group.starts_with("DFlash bridge"))
                     .map(|d| d.bytes).sum::<u64>();
@@ -1388,7 +1388,7 @@ pub(crate) mod tests {
             for rank in 0..2 {
                 let bytes = |placed: &Placement, group: &str| placed.items[rank].iter()
                     .filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
-                assert_eq!(bytes(&p, "DFlash"), if rank == expected_home as usize { owned.memory.resident } else { 0 });
+                assert_eq!(bytes(&p, "DFlash"), if rank == expected_home as usize { owned.memory.resident - owned.resident_weights.0 } else { 0 });
                 for demand in &bridge.demands {
                     if demand.gpu as usize != rank { continue; }
                     let expected = if expected_home == 1 { demand.bytes } else { 0 };
@@ -1708,9 +1708,12 @@ pub(crate) mod tests {
             assert_eq!(selected.0, runtime.0);
             let resident = if expected == 0 { &input.resident } else { &alternate.resident };
             for rank in 0..2 {
-                let bytes: u64 = selected.0.items[rank].iter().filter(|i| i.group == "target weights")
+                let bytes: u64 = selected.0.items[rank].iter().filter(|i| i.group == "weight arena")
                     .map(|i| i.bytes).sum();
-                assert_eq!(bytes, resident[rank].weights);
+                assert_eq!(bytes, resident[rank].weights
+                    + if embedding_home(&selected.0) as usize == rank { resident.iter().map(|r| r.embedding).sum::<u64>()
+                        + (256 - resident[rank].weights % 256) % 256 } else { 0 }
+                    + if rank == 0 { input.drafter_weights.0 } else { 0 });
             }
         }
     }
@@ -1736,7 +1739,10 @@ pub(crate) mod tests {
                 for rank in 0..2 {
                     let charged: u64 = planned.items[rank].iter().filter(|item|
                         item.category == Category::Embedding).map(|item| item.bytes).sum();
-                    assert_eq!(charged, if rank == expected { bytes } else { 0 });
+                    assert_eq!(charged, 0, "embedding is an uncharged alias of its target arena");
+                    let arena: u64 = planned.items[rank].iter().filter(|i| i.group == "weight arena").map(|i| i.bytes).sum();
+                    assert_eq!(arena, input.resident[rank].weights + if rank == expected { bytes } else { 0 }
+                        + if rank == 0 { input.drafter_weights.0 } else { 0 });
                 }
                 let mut sampled = input.clone();
                 for (capacity, baseline) in &mut sampled.gpus {
@@ -1819,8 +1825,11 @@ pub(crate) mod tests {
             let placed = contract(&input).unwrap().placement;
             for rank in 0..2 {
                 let charged: u64 = placed.items[rank].iter()
-                    .filter(|item| item.group == "target weights").map(|item| item.bytes).sum();
-                assert_eq!(charged, input.resident[rank].weights);
+                    .filter(|item| item.group == "weight arena").map(|item| item.bytes).sum();
+                assert_eq!(charged, input.resident[rank].weights
+                    + if embedding_home(&placed) as usize == rank { input.resident.iter().map(|r| r.embedding).sum::<u64>()
+                        + (256 - input.resident[rank].weights % 256) % 256 } else { 0 }
+                    + if rank == 0 { input.drafter_weights.0 } else { 0 });
                 assert!(charged >= routers);
                 assert!(!placed.items[rank].iter().any(|item| item.group == "router replica"),
                     "routers are part of target weights, never an extra demand");

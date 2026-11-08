@@ -1,5 +1,5 @@
 //! Native dense launches over validated checkpoint geometry and borrowed lane storage.
-use super::dense_weights::NativeProjection;
+use cuteafd_loader::plan::exlr8::dense::requests::NativeProjection;
 use anyhow::{Context, Result, ensure};
 use cuteafd_ffi::native_dense::{DenseLinear, Encoding};
 use cuteafd_ffi::native_dense_glue::{Companion, Op};

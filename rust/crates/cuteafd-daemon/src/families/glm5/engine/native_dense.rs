@@ -90,7 +90,7 @@ impl<'a> GlmEngine<'a> {
         let s = self.native_scratch(rank, w)?;
         let projection_geometry = layer.native_projections.get(projection).context("native projection geometry")?;
         self.on(rank, || programs.linear(projection_geometry,
-            |component| layer.native(&crate::shared::experts::exlr8::dense_weights::key(projection, component)),
+            |component| layer.native(&cuteafd_loader::plan::exlr8::dense::requests::key(projection, component)),
             s.linear.view(),
             x, rows, bf16_out, self.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8,
             self.stream_of(rank)))
@@ -159,7 +159,7 @@ impl<'a> GlmEngine<'a> {
         self.on(rank, || unsafe { programs.companion("exlr8_dense_f32_narrow_pack_n128_p160")?
             .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 0, stream).map_err(anyhow::Error::from) })?;
         self.on(rank, || unsafe { programs.companion("exlr8_dense_bf16_index_weights")?
-            .launch(&[x.ptr, layer.native(&crate::shared::experts::exlr8::dense_weights::key("index_w", "bf16"))?.ptr, s.linear.view().acc.ptr],
+            .launch(&[x.ptr, layer.native(&cuteafd_loader::plan::exlr8::dense::requests::key("index_w", "bf16"))?.ptr, s.linear.view().acc.ptr],
                 rows as u32, 0, stream)?;
             programs.companion("exlr8_dense_f32_narrow_pack_n32_p160")?
                 .launch(&[s.linear.view().acc.ptr, s.kw.buffer.ptr], rows as u32, 128, stream).map_err(anyhow::Error::from) })?;

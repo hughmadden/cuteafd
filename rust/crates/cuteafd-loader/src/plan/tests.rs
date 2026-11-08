@@ -3579,6 +3579,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
+        process.target(&checkpoint, &input, None).unwrap();
         process.serving(&input, 0, 0, 0, 0).unwrap();
         process.spark_link(&input, checkpoint.spark_input_is_bf16()).unwrap();
         let selected = glmf::admission::prepare(&input, 188, true, process).unwrap().admit().unwrap();
@@ -4108,8 +4109,10 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
     let draft = tempfile::tempdir().unwrap();
     let config = json!({"hidden_size":4096, "intermediate_size":12288, "num_hidden_layers":5,
         "num_attention_heads":32, "num_key_value_heads":8, "head_dim":128, "vocab_size":154880,
+        "rms_norm_eps":1e-5, "sliding_window":2048, "rope_theta":10000,
         "dflash_config":{"target_layer_ids":[0,8,16,24,32], "conv_group_size":16,
-            "selector_rank":256, "block_size":8}});
+            "conv_kernel_size":2, "mask_token_id":0, "selector_rank":256,
+            "selector_top_k":16, "block_size":8}});
     std::fs::write(draft.path().join("config.json"), config.to_string()).unwrap();
     for draft_kv_cache in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
@@ -4130,18 +4133,22 @@ fn glm5_flash_layout_uses_physical_candidate_scratch_without_double_counting_ove
             &[170,188],GlmDraftRepresentation::Fp8Only,2, draft_kv_cache).unwrap();
         let owned = native_draft.memory.resident;
         let natural = run(&options);
-        assert_eq!(bytes(&natural,0,Category::Drafter), owned);
+        assert_eq!(bytes(&natural,0,Category::Drafter), owned - native_draft.resident_weights.0);
         assert_eq!(bytes(&natural,0,Category::Workspace), scratch[0]);
         assert_eq!(bytes(&natural,1,Category::Workspace), 0);
         options.physical_sms = Some(188);
         let simulated = run(&options);
-        assert_eq!(bytes(&simulated,0,Category::Drafter), owned);
+        assert_eq!(bytes(&simulated,0,Category::Drafter), owned - native_draft.resident_weights.0);
         assert_eq!(bytes(&simulated,0,Category::Workspace), scratch[1]);
         options.drafter_bytes = native_draft.resident_weights.0;
         // An explicit weight-only override has no inferred runtime scratch.
         options.glmf_drafter_snapshot = None;
         let explicit = run(&options);
-        assert_eq!(bytes(&explicit,0,Category::Drafter), options.drafter_bytes);
+        assert_eq!(bytes(&explicit,0,Category::Drafter), 0);
+        let weight_bytes = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices.iter()
+            .filter(|d| d.kind == DeviceKind::Rtx).flat_map(|d| &d.items)
+            .filter(|i| i.group == "weight arena").map(|i| i.bytes).sum::<u64>();
+        assert!(weight_bytes(&explicit) >= options.drafter_bytes);
         assert_eq!(bytes(&explicit,0,Category::Workspace), 0);
         assert_eq!(explicit.pool_tokens, simulated.pool_tokens);
         options.glmf_drafter_disabled = true;
@@ -4222,7 +4229,9 @@ fn glm5_flash_disabled_draft_omits_arenas_and_speculative_graphs() {
         glmf_drafter_disabled: disabled, context_tokens: 131_072, ..Default::default() }), ..sparks(4) };
     let enabled = plan(dir.path(), &options(false)).unwrap().memory_layout.unwrap();
     let disabled = plan(dir.path(), &options(true)).unwrap().memory_layout.unwrap();
-    assert!(enabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
+    let weights = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
+        .filter(|i| i.group == "weight arena").map(|i| i.bytes).sum::<u64>();
+    assert_eq!(weights(&enabled) - weights(&disabled), 256 << 20);
     assert!(!disabled.devices[0].items.iter().any(|i| i.category == Category::Drafter));
     let graphs = |layout: &cuteafd_core::memory_layout::MemoryLayout| {
         let owner = layout.devices[0].items.iter()

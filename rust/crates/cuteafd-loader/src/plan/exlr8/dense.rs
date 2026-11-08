@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 mod ownership;
 pub mod programs;
+pub mod requests;
 pub mod scratch;
 pub use ownership::{DenseAxis, DenseExecution, DenseOwnership, DenseRole, DenseSelection, DenseTransform, VocabularyRole, KvBGeometry, KvBLayout};
 

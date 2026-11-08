@@ -1,15 +1,21 @@
 //! Final, header-derived requests for the independently retired target weight set.
-use super::{weights::PREFIX, fp8::KdaFp8};
+//! The daemon binds exactly these views and admission charges exactly these layouts.
+use super::{core::CoreInventory, GlmNextAttention, GlmNextConfig};
+use crate::{placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
-use cuteafd_loader::{families::glm5_flash::{GlmNextAttention, GlmNextConfig, core::CoreInventory},
-    placement::LayerMode, plan::Checkpoint, serving_capacity::WeightArenaLayout};
 use std::collections::BTreeMap;
 
-pub(super) fn joined(names: &[String]) -> String { names.join("+") }
+/// Checkpoint tensor-name prefix of the text model.
+pub const PREFIX: &str = "model.language_model.";
 
-pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
-    ranks: usize, kda_fp8: KdaFp8, output_shard: bool, fp8_head: bool,
+pub fn joined(names: &[String]) -> String { names.join("+") }
+
+/// `kda_fp8` selects FP8 KDA input/output projections; the FP8 scale layout
+/// (row128 or channel) does not change any extent.
+#[allow(clippy::too_many_arguments)]
+pub fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
+    ranks: usize, kda_fp8: bool, output_shard: bool, fp8_head: bool,
     embedding: Option<(usize, usize)>) -> Result<Vec<WeightArenaLayout>> {
     ensure!(matches!(ranks, 1 | 2) && modes.len() <= cfg.layers, "Flash arena rank/layer extent");
     let core = CoreInventory::from_checkpoint(cfg, checkpoint)?;
@@ -48,8 +54,8 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
     }
     one(&mut requests[0], format!("{PREFIX}norm.weight"))?;
     if let Some(head) = core.get_weight("lm_head") {
-        let layout = cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
-            cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
+        let layout = crate::formats::trellis_core::CoreWeightLayout::new(head,
+            crate::formats::dense_trellis::TrellisSide::Output, 0, 1)?;
         for (name, bytes) in layout.arena_tensors(&layout.stem)? {
             ensure!(requests[0].insert(name.clone(), bytes).is_none(), "duplicate Flash K6 view {name}");
         }
@@ -87,7 +93,7 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
                         let values = inputs.iter().enumerate().map(|(i, name)| elements(name)
                             .map(|bytes| bytes / if matches!(i, 3 | 4) { 1 } else { ranks })).collect::<Result<Vec<_>>>()?
                             .into_iter().sum::<usize>();
-                        if kda_fp8 != KdaFp8::Off {
+                        if kda_fp8 {
                             let key = joined(&inputs);
                             insert(out, format!("{key}.payload"), values)?;
                             insert(out, format!("{key}.scales"), values/128*4)?;
@@ -146,6 +152,63 @@ pub(super) fn target(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[Laye
         format!("glm5_flash/target/{rank}"), requests)).collect()
 }
 
+/// Complete target alternatives for every legal embedding home. The offline
+/// planner and serving admission use this same header-derived recipe.
+pub fn target_options(checkpoint: &Checkpoint, cfg: &GlmNextConfig, modes: &[LayerMode],
+    ranks: usize, representation: super::resident::GlmfRepresentation, embedding_bytes: u64,
+    native: Option<&crate::plan::exlr8::native::DenseFacts>) -> Result<Vec<Vec<WeightArenaLayout>>> {
+    let homes = if embedding_bytes == 0 { 1 } else { ranks };
+    if let Some(facts) = native {
+        use crate::plan::exlr8::dense::requests::NativeDenseRecords;
+        let owners = modes.iter().enumerate().filter_map(|(layer, mode)| match mode {
+            LayerMode::Whole { gpu, .. } if cfg.attention[layer] == GlmNextAttention::Mla && ranks > 1 =>
+                Some((layer, usize::from(*gpu))), _ => None,
+        }).collect();
+        let dense = (0..ranks).map(|rank| NativeDenseRecords::from_records(&facts.records, &facts.selection,
+            modes.len(), ranks, rank, &owners)).collect::<Result<Vec<_>>>()?;
+        return (0..homes).map(|home| native_target(facts, &dense, cfg, home)).collect();
+    }
+    (0..homes).map(|home| target(checkpoint, cfg, modes, ranks, representation.kda_fp8,
+        representation.output_shard, representation.fp8_head,
+        (embedding_bytes > 0).then_some((home, usize::try_from(embedding_bytes)?)))).collect()
+}
+
+/// Native EXLR8 target arenas, one per rank: every layer's records (KDA conv
+/// weights in one plain pack), rank zero's final norm, the row-FP8 embedding on
+/// `embedding_rank` and head on rank zero, and the embedding facade on rank
+/// zero. Shared experts are a separate format-level arena.
+pub fn native_target(facts: &crate::plan::exlr8::native::DenseFacts,
+    dense: &[crate::plan::exlr8::dense::requests::NativeDenseRecords], cfg: &GlmNextConfig,
+    embedding_rank: usize) -> Result<Vec<WeightArenaLayout>> {
+    use crate::plan::exlr8::dense::{requests::{layer_requests, row_requests, vocabulary_records, PlainPack},
+        DensePlan, DenseTransform};
+    ensure!(!dense.is_empty() && embedding_rank < dense.len(), "native Flash arena rank");
+    let mut requests = vec![Vec::new(); dense.len()];
+    for (rank, records) in dense.iter().enumerate() {
+        for source in &records.layers {
+            let p = format!("{PREFIX}layers.{}", source.layer);
+            let packs = if cfg.attention[source.layer] == GlmNextAttention::Kda {
+                vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
+                    .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
+            } else { vec![] };
+            requests[rank].extend(layer_requests(source, &packs)?);
+        }
+    }
+    requests[0].push((format!("{PREFIX}norm.weight"), DenseTransform::Identity.allocation_bytes(&dense[0].norm)?));
+    let vocabulary = DensePlan::for_rank(&vocabulary_records(&facts.records, &facts.selection,
+        cfg.hidden, cfg.vocab_size)?, dense.len(), 0)?;
+    for (i, slice) in vocabulary.tensors.iter().enumerate() {
+        let (rank, name) = if i == 0 { (embedding_rank, "embedding") } else { (0, "head") };
+        requests[rank].extend(row_requests(slice)?.into_iter().map(|(suffix, bytes)| (format!("{name}.{suffix}"), bytes)));
+    }
+    // The embedding facade has its own final placeholder, not a BF16 vocabulary source.
+    requests[0].push(("embedding.table".into(), 256));
+    requests.into_iter().enumerate().map(|(rank, mut requests)| {
+        requests.sort_by(|left, right| left.0.cmp(&right.0));
+        WeightArenaLayout::new(format!("glm5_flash/target/{rank}"), requests)
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,17 +229,17 @@ mod tests {
 
     #[test]
     fn final_requests_match_residency_for_tp_and_selected_representations() -> Result<()> {
-        use cuteafd_loader::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
-        use cuteafd_loader::families::glm5_flash::resident::{resident_weights, GlmfRepresentation};
+        use crate::plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot};
+        use super::super::resident::{resident_weights, GlmfRepresentation};
         let root = tempfile::tempdir()?;
         let config = glm5_flash_config(6);
         write_snapshot(root.path(), &config, &glm5_flash_tensors(&config), None);
         let checkpoint = Checkpoint::open(root.path())?;
         let cfg = GlmNextConfig::from_hf(&config)?;
-        for ranks in [1, 2] { for kda_fp8 in [KdaFp8::Off, KdaFp8::Row128, KdaFp8::Channel] {
+        for ranks in [1, 2] { for kda_fp8 in [false, true] {
             for fp8_head in [false, true] { for output_shard in [false, true] {
-                if output_shard && (ranks == 1 || kda_fp8 == KdaFp8::Off) { continue; }
-                let repr = GlmfRepresentation { kda_fp8: kda_fp8 != KdaFp8::Off, fp8_head, output_shard };
+                if output_shard && (ranks == 1 || !kda_fp8) { continue; }
+                let repr = GlmfRepresentation { kda_fp8, fp8_head, output_shard };
                 let old = resident_weights(&checkpoint, &cfg, cfg.layers, ranks, repr).map_err(anyhow::Error::msg)?;
                 let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
                     kda_fp8, output_shard, fp8_head, Some((0, old[0].embedding as usize)))?;
@@ -192,9 +255,9 @@ mod tests {
 
     #[test]
     fn whole_mla_and_k6_keep_rank_local_views() -> Result<()> {
-        use cuteafd_loader::{plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot, t},
-            placement::{AttentionPlacement, FfnMode},
-            families::glm5_flash::{core, resident::{resident_weights_placed, GlmfRepresentation}}};
+        use crate::{plan::testing::{glm5_flash_config, glm5_flash_tensors, write_snapshot, t},
+            placement::{AttentionPlacement, FfnMode}};
+        use super::super::{core, resident::{resident_weights_placed, GlmfRepresentation}};
         let root = tempfile::tempdir()?;
         let mut config = glm5_flash_config(4);
         config["text_config"]["vocab_size"] = serde_json::json!(256);
@@ -226,7 +289,7 @@ mod tests {
             }).collect::<Vec<_>>();
             let old = resident_weights_placed(&checkpoint, &cfg, cfg.layers, ranks,
                 GlmfRepresentation::default(), attention, first_owner).map_err(anyhow::Error::msg)?;
-            let layouts = target(&checkpoint, &cfg, &modes, ranks, KdaFp8::Row128, false, true, None)?;
+            let layouts = target(&checkpoint, &cfg, &modes, ranks, true, false, true, None)?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 assert_eq!(layout.payload_bytes() as u64, old[rank].weights, "native rank {rank}/{ranks}");
@@ -249,14 +312,20 @@ mod tests {
             let embedding = checkpoint.tensors.iter().find(|t| t.meta.name == format!("{PREFIX}embed_tokens.weight"))
                 .context("installed embedding header")?.meta.byte_length as usize;
             let layouts = target(&checkpoint, &cfg, &vec![LayerMode::HeadSplit; cfg.layers], ranks,
-                KdaFp8::Row128, ranks == 2, true, Some((0, embedding)))?;
+                true, ranks == 2, true, Some((0, embedding)))?;
             for (rank, layout) in layouts.iter().enumerate() {
                 check(layout);
                 let large = layout.views().values().filter(|view| view.bytes() > 1 << 20).collect::<Vec<_>>();
                 let slack: usize = large.iter().map(|v| v.bytes().div_ceil(2 << 20)*(2 << 20)-v.bytes()).sum();
                 let tail = layout.bytes().div_ceil(2 << 20)*(2 << 20)-layout.bytes();
+                let old = super::super::resident::resident_weights(&checkpoint, &cfg, cfg.layers, ranks,
+                    super::super::resident::GlmfRepresentation::default()).map_err(anyhow::Error::msg)?;
+                let old = old[rank].weights + old[rank].embedding;
+                assert_eq!(old, layout.payload_bytes() as u64);
                 eprintln!("FLASH_INVENTORY ranks={ranks} rank={rank} allocations={} payload={} large_count={} large_bytes={} old_slack={slack} arena={} padding={} tail={tail}",
                     layout.views().len(), layout.payload_bytes(), large.len(), large.iter().map(|v| v.bytes()).sum::<usize>(), layout.bytes(), layout.padding_bytes());
+                eprintln!("FLASH_CHARGE target ranks={ranks} rank={rank} old={old} B={} tail={tail} new={} delta={} old_rounding=no",
+                    layout.bytes(), layout.bytes() + tail, (layout.bytes() + tail) as i128 - i128::from(old));
             }
         }
         Ok(())

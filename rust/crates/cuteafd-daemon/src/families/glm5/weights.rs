@@ -44,10 +44,10 @@ pub(crate) struct GlmLayer<'a> {
     /// Set only after this rank's attention operands have loaded successfully.
     attention_resident: bool,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
-    /// The EXLR8 checkpoint's own dense operands (`dense_weights::key`), when
+    /// The EXLR8 checkpoint's own dense operands (`requests::key`), when
     /// the layer runs natively; empty on the official path.
     pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
-    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
+    pub(crate) native_projections: HashMap<&'static str, cuteafd_loader::plan::exlr8::dense::requests::NativeProjection>,
     /// Standard HF K6 payload/vector owners, separate from EXLR8 encodings.
     pub(crate) core: std::collections::BTreeMap<&'static str, CoreWeights<'a>>,
     pub(crate) attention_native: std::collections::BTreeMap<&'static str, crate::shared::memory::device::DeviceOwner<'a, crate::shared::native_attention::NativeAttentionWeights<'a>>>,
@@ -106,7 +106,7 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
     // Input transform, payload, output transform; scaled native formats keep
     // their payload/scale order. Only this rank's resident components enter.
     ["suh", "trellis", "svh", "q4", "s4", "fp8", "e8m0", "scale", "bf16", "fp32"]
-        .into_iter().filter_map(|component| range(&crate::shared::experts::exlr8::dense_weights::key(name, component))).collect()
+        .into_iter().filter_map(|component| range(&cuteafd_loader::plan::exlr8::dense::requests::key(name, component))).collect()
 }
 
 impl GlmLayer<'_> {
@@ -1179,7 +1179,7 @@ impl<'a> GlmLoader<'a> {
         let name = name.strip_prefix(&prefix).context("native GLM allocation layer differs")?;
         let key = if name.starts_with("w_") {
             format!("operand.{name}")
-        } else if name == crate::shared::experts::exlr8::dense_weights::key("router", "bf16") {
+        } else if name == cuteafd_loader::plan::exlr8::dense::requests::key("router", "bf16") {
             "operand.gate".into()
         } else if let Some((key, _)) = cfg.plain_owners(layer).into_iter().find(|(_, tensor)| tensor == name) {
             format!("operand.{key}")
@@ -1197,7 +1197,7 @@ impl<'a> GlmLoader<'a> {
     /// Routed experts and the shared expert stay on their native owners.
     #[allow(clippy::type_complexity)]
     pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
-        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords], owners: Option<&[u8]>, load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        records: &[cuteafd_loader::plan::exlr8::dense::requests::NativeDenseRecords], owners: Option<&[u8]>, load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
         vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
         -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
         ensure!(self.arenas.is_some(), "native GLM target model requires admitted coordinator arenas");
@@ -1231,7 +1231,7 @@ impl<'a> GlmLoader<'a> {
                         if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
                     }
                     // The router (BF16 record) on rank 0, as on the official path.
-                    if let Some(gate) = native.remove(&crate::shared::experts::exlr8::dense_weights::key("router", "bf16")) {
+                    if let Some(gate) = native.remove(&cuteafd_loader::plan::exlr8::dense::requests::key("router", "bf16")) {
                         operands.insert("gate", gate);
                     }
                     let dense = layer < cfg.first_moe_layer;
