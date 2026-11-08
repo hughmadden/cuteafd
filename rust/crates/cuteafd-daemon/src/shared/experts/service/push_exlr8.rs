@@ -2,6 +2,7 @@
 #[cfg(test)]
 #[path = "push_exlr8/tests.rs"]
 mod tests;
+use crate::shared::memory::Tag;
 use super::NativeExpertServiceConfig;
 use crate::shared::{experts::{exlr8::Exlr8Weights, layer::ExpertLoadBudget}, memory::{
     device::Device, push_consumer, push_exlr8::RankPlan, push_initialize,
@@ -51,7 +52,7 @@ fn receive<'a>(library: &'a NativeLibrary, plan: RankPlan,
     let joined = (|| -> Result<_> {
         let expected = ExpectedCoverage::from_plan(checked, u32::try_from(rank_id)?)?;
         let arena = LoadingArena::new(device, plan.layout.clone(), expected, ArenaTag::experts("experts/spark-exlr8"))?;
-        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)?;
+        let ring = RegisteredRing::new(library, DEFAULT_SLOTS, DEFAULT_SLOT_BYTES, Tag::staging("experts/spark-push-ring"))?;
         let rank = client.join(JoinArgs { group, token, rank: u32::try_from(rank_id)?,
             ring_fd: ring.fd().as_raw_fd(), slots: u32::try_from(ring.slots())?,
             slot_bytes: u32::try_from(ring.slot_bytes())? })?;

@@ -250,8 +250,8 @@ mod tests {
             eprintln!("skip GPU suffix test: CUTEAFD_ENCODER_SUFFIX_LIBRARY unset"); return Ok(());
         };
         let lib = unsafe { NativeLibrary::load(path)? };
-        let residual = DeviceAllocation::new(&lib, 80 * 40960, cuteafd_ffi::memory_ledger::TEST)?;
-        let pre = DeviceAllocation::new(&lib, 80 * 16, cuteafd_ffi::memory_ledger::TEST)?;
+        let residual = DeviceAllocation::new(&lib, 80 * 40960, crate::shared::memory::TEST)?;
+        let pre = DeviceAllocation::new(&lib, 80 * 16, crate::shared::memory::TEST)?;
         for end in [1, 127, 128, 129, 257, 2049] {
             let mut suffix = EncoderSuffix::new(&lib, end, EncoderSuffix::device_bytes(end)?)?;
             assert!(suffix.output().is_err());

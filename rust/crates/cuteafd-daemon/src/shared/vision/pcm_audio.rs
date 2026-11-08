@@ -60,7 +60,7 @@ impl PcmTowerSpec {
         if admitted < self.required_bytes(library)? {
             return Err(VisionError::Unsupported("PCM admission below requirement".into()));
         }
-        let native = NativePcmAudio::prepare(library, &self.native, device, admitted)?;
+        let native = NativePcmAudio::prepare(library, &self.native, device, admitted, cuteafd_ffi::memory_ledger::MediaTags::new("media/pcm-audio"))?;
         self.check_ledger(&native)?;
         Ok(PcmTower { native })
     }
@@ -92,7 +92,7 @@ impl PcmTowerSpec {
             )));
         }
         let weights = self.plan.read_weights(self.plan.weight_bytes())?;
-        let native = NativePcmAudio::load(library, &self.native, device, admitted, &weights)?;
+        let native = NativePcmAudio::load(library, &self.native, device, admitted, &weights, cuteafd_ffi::memory_ledger::MediaTags::new("media/pcm-audio"))?;
         self.check_ledger(&native)?;
         Ok(PcmTower { native })
     }

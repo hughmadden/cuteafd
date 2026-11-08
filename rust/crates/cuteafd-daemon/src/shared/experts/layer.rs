@@ -347,14 +347,14 @@ mod format_dispatch_tests {
             let mut fused = vec![0; stored * 5120];
             fused[..sources[1].1.len()].copy_from_slice(&sources[1].1);
             fused[stored * 2560..stored * 2560 + sources[0].1.len()].copy_from_slice(&sources[0].1);
-            let raw = DeviceAllocation::new(library, fused.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let raw = DeviceAllocation::new(library, fused.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(raw.buffer, &fused)?;
-            let raw_down = DeviceAllocation::new(library, sources[2].1.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let raw_down = DeviceAllocation::new(library, sources[2].1.len(), crate::shared::memory::TEST)?;
             library.copy_h2d(raw_down.buffer, &sources[2].1)?;
             for plane in [0u32, 2] {
                 let bytes = if plane == 0 { stored * 5120 } else { stored * 2560 };
-                let mounted = DeviceAllocation::new(library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
-                let pushed = DeviceAllocation::new(library, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+                let mounted = DeviceAllocation::new(library, bytes, crate::shared::memory::TEST)?;
+                let pushed = DeviceAllocation::new(library, bytes, crate::shared::memory::TEST)?;
                 library.copy_h2d(pushed.buffer, &vec![0xa5; bytes])?;
                 // SAFETY: live disjoint buffers on this device; drained before reads.
                 unsafe {

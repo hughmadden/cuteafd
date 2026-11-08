@@ -276,7 +276,7 @@ mod shared_cache_tests {
         let (offset,count,step)=(metadata[4] as usize,metadata[3] as usize,metadata[5] as usize);
         assert!(count>0);
         let bytes=(offset+(count-1)*step+1)*256;
-        let saved=[Allocation::new(peer,bytes, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(peer,bytes, cuteafd_ffi::memory_ledger::TEST)?];
+        let saved=[Allocation::new(peer,bytes, crate::shared::memory::TEST)?,Allocation::new(peer,bytes, crate::shared::memory::TEST)?];
         let read=|buffer:CuteafdDeviceBuffer,device:Device<'_>|->Result<Vec<u8>> {
             let mut raw=vec![0;bytes];device.run(||lib.copy_d2h(&mut raw,CuteafdDeviceBuffer {bytes,..buffer}))?;
             Ok((0..count).flat_map(|row|raw[(offset+row*step)*256..(offset+row*step+1)*256].iter().copied()).collect())

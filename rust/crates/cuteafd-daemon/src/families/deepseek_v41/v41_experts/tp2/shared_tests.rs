@@ -269,9 +269,9 @@ fn inputs<'a>(
         .into_iter()
         .map(|device| {
             let buffers = [
-                Allocation::new(device, wire.len(), cuteafd_ffi::memory_ledger::TEST)?,
-                Allocation::new(device, ids.len(), cuteafd_ffi::memory_ledger::TEST)?,
-                Allocation::new(device, routing.len(), cuteafd_ffi::memory_ledger::TEST)?,
+                Allocation::new(device, wire.len(), crate::shared::memory::TEST)?,
+                Allocation::new(device, ids.len(), crate::shared::memory::TEST)?,
+                Allocation::new(device, routing.len(), crate::shared::memory::TEST)?,
             ];
             device.run(|| {
                 for (buffer, data) in buffers.iter().zip([&wire, &ids, &routing]) {
@@ -342,8 +342,8 @@ fn shared_native_v41_byte_exact() -> Result<()> {
         Box::new(NativeTp2::load(devices[1], &catalog, 1, vec![0], capacity, 8_000_000_000)?),
     ];
     let copied = [
-        Allocation::new(devices[0], capacity * 5120 * 4, cuteafd_ffi::memory_ledger::TEST)?,
-        Allocation::new(devices[1], capacity * 5120 * 4, cuteafd_ffi::memory_ledger::TEST)?,
+        Allocation::new(devices[0], capacity * 5120 * 4, crate::shared::memory::TEST)?,
+        Allocation::new(devices[1], capacity * 5120 * 4, crate::shared::memory::TEST)?,
     ];
     let mut reduction = OwnerReduce::new(
         devices,

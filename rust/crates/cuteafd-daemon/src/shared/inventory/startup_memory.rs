@@ -217,6 +217,7 @@ pub(super) fn host(records: &[AllocationRecord], stage: &str) -> Result<Value> {
 pub(super) fn record(record: &AllocationRecord) -> Value {
     json!({"address": record.address, "bytes": record.bytes, "space": record.key.space.label(),
         "device": record.key.device, "scope": record.key.scope, "owner": record.key.owner,
+        "kind": record.key.tag.map(|tag| tag.kind.label()), "component": record.key.tag.map(|tag| tag.owner),
         "tensor": record.key.tensor, "format": record.key.format, "endpoint": record.endpoint})
 }
 

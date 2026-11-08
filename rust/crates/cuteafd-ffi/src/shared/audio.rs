@@ -171,14 +171,13 @@ type Encode = unsafe extern "C" fn(
 ) -> i32;
 type Ledger = unsafe extern "C" fn(*mut c_void, *mut AudioLedger) -> i32;
 type Backend = unsafe extern "C" fn(*mut u8, u64) -> i32;
-type Destroy = unsafe extern "C" fn(*mut c_void) -> i32;
 
 pub struct NativeAudio {
     _library: Library,
     owner: *mut c_void,
     encode: Encode,
     ledger: Ledger,
-    destroy: Destroy,
+    backings: super::media_backings::MediaBackings,
     max_samples: usize,
     output_width: usize,
     _thread: PhantomData<Rc<()>>,
@@ -191,6 +190,7 @@ impl NativeAudio {
         device: i32,
         admitted_bytes: u64,
         weights: &[u8],
+        tags: crate::memory_ledger::MediaTags,
     ) -> Result<Self, AudioError> {
         Self::load(
             path,
@@ -198,6 +198,7 @@ impl NativeAudio {
             device,
             admitted_bytes,
             weights,
+            tags,
             AudioTables {
                 hann: &[],
                 mel_filterbank: &[],
@@ -243,12 +244,15 @@ impl NativeAudio {
         device: i32,
         admitted_bytes: u64,
         weights: &[u8],
+        tags: crate::memory_ledger::MediaTags,
         tables: AudioTables<'_>,
     ) -> Result<Self, AudioError> {
-        Self::load_inner(path, spec, device, admitted_bytes, Some(weights), tables)
+        Self::load_inner(path, spec, device, admitted_bytes, Some(weights), tags, tables)
     }
-    pub fn prepare(path: &Path, spec: &AudioSpec, device: i32, admitted: u64) -> Result<Self, AudioError> {
-        Self::load_inner(path, spec, device, admitted, None, AudioTables {
+    /// `tags` name the tower's weight arena and scratch arena in the ledger.
+    pub fn prepare(path: &Path, spec: &AudioSpec, device: i32, admitted: u64, tags: crate::memory_ledger::MediaTags)
+        -> Result<Self, AudioError> {
+        Self::load_inner(path, spec, device, admitted, None, tags, AudioTables {
             hann: &[], mel_filterbank: &[], codec_rotary: &[], patch_rotary: &[],
         })
     }
@@ -267,7 +271,7 @@ impl NativeAudio {
         unsafe { check(self._library.get::<unsafe extern "C" fn(*mut c_void) -> i32>(b"cuteafd_audio_commit_weights")?(self.owner)) }
     }
     fn load_inner(path: &Path, spec: &AudioSpec, device: i32, admitted_bytes: u64,
-        weights: Option<&[u8]>, tables: AudioTables<'_>) -> Result<Self, AudioError> {
+        weights: Option<&[u8]>, tags: crate::memory_ledger::MediaTags, tables: AudioTables<'_>) -> Result<Self, AudioError> {
         audio_geometry(spec.max_samples as usize)?;
         let mel_capacity = 6000.min(spec.max_samples as usize / 240 + 1);
         let embedded = tables.hann.is_empty()
@@ -317,7 +321,7 @@ impl NativeAudio {
                 owner: std::ptr::null_mut(),
                 encode: *library.get::<Encode>(b"cuteafd_audio_encode")?,
                 ledger: *library.get::<Ledger>(b"cuteafd_audio_get_ledger")?,
-                destroy: *library.get::<Destroy>(b"cuteafd_audio_destroy")?,
+                backings: Default::default(),
                 _library: library,
                 max_samples: spec.max_samples as usize,
                 output_width: spec.output_width as usize,
@@ -327,6 +331,9 @@ impl NativeAudio {
             if result.owner.is_null() {
                 return Err(AudioError::InvalidInput("null audio owner"));
             }
+            // A query failure leaves nothing recorded; Drop destroys the owner.
+            result.backings = super::media_backings::MediaBackings::record(&result._library, "cuteafd_audio",
+                result.owner, device, tags).map_err(AudioError::Native)?;
             if let Some(weights) = weights {
             check(upload(
                 result.owner,
@@ -406,7 +413,8 @@ impl Drop for NativeAudio {
         if !self.owner.is_null() {
             // SAFETY: exclusively owned native pointer, library still live. Native
             // destruction drains queued work before releasing modules/storage.
-            let status = unsafe { (self.destroy)(self.owner) };
+            // Only backings native reports as freed leave the ledger.
+            let status = unsafe { self.backings.destroy(&self._library, "cuteafd_audio", self.owner) };
             if status != 0 {
                 tracing::warn!(status, "audio owner destruction reported an error");
             }
@@ -447,11 +455,11 @@ mod tests {
             patch_rotary: &[],
         };
         assert!(matches!(
-            NativeAudio::load_embedded(absent, &spec, 0, 0, &[]),
+            NativeAudio::load_embedded(absent, &spec, 0, 0, &[], crate::memory_ledger::MediaTags::new("test/tower")),
             Err(AudioError::Library(_))
         ));
         assert!(matches!(
-            NativeAudio::load(absent, &spec, 0, 0, &[], empty()),
+            NativeAudio::load(absent, &spec, 0, 0, &[], crate::memory_ledger::MediaTags::new("test/tower"), empty()),
             Err(AudioError::Library(_))
         ));
         assert!(matches!(
@@ -461,6 +469,7 @@ mod tests {
                 0,
                 0,
                 &[],
+                crate::memory_ledger::MediaTags::new("test/tower"),
                 AudioTables {
                     hann: &[0.0; 960],
                     ..empty()
@@ -477,6 +486,7 @@ mod tests {
                 0,
                 0,
                 &[],
+                crate::memory_ledger::MediaTags::new("test/tower"),
                 AudioTables {
                     hann: &[f32::NAN; 960],
                     mel_filterbank: &[0.0; 481 * 128],
@@ -489,7 +499,7 @@ mod tests {
             ))
         ));
         assert!(matches!(
-            NativeAudio::load_embedded(absent, &spec, 0, 0, &[0]),
+            NativeAudio::load_embedded(absent, &spec, 0, 0, &[0], crate::memory_ledger::MediaTags::new("test/tower")),
             Err(AudioError::InvalidInput(
                 "audio weight/table extent mismatch"
             ))

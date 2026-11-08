@@ -6,6 +6,7 @@
 pub(crate) mod tests;
 mod policy;
 pub(crate) use policy::{PushPolicy, PushStartupError};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{push_consumer::PushDestination, push_coordinator::CoordinatorExpertPlan};
 use anyhow::{ensure, Context, Result};
 use cuteafd_loader::{push_load::{builder::CheckedPlan, PushHostEnvelope}, OfficialV41Catalog, V41Exl3Layer};
@@ -240,7 +241,7 @@ pub(crate) fn receive_rank<'a, D: PushDestination<Delivered = ()>>(
         }).transpose()?;
         let ring_bytes = slots.checked_mul(slot_bytes).context("push ring bytes overflow")?;
         let ring = join_stage(group, rank, device.id, "host-ring registration", ring_bytes,
-            || RegisteredRing::new(library, slots, slot_bytes))?;
+            || RegisteredRing::new(library, slots, slot_bytes, Tag::staging("experts/rtx-push-ring")))?;
         let joined = join_stage(group, rank, device.id, "SparkNest client.join", ring_bytes, || {
             Ok(client.join(cuteafd_loader::push_load::JoinArgs { group, token,
                 rank: u32::try_from(rank)?, ring_fd: ring.fd().as_raw_fd(),

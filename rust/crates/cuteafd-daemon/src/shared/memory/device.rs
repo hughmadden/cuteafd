@@ -127,13 +127,15 @@ pub(crate) struct Allocation<'a> {
     pub device: Device<'a>,
     pub buffer: CuteafdDeviceBuffer,
     backing: Option<std::rc::Rc<Allocation<'a>>>,
-    weight_id: Option<String>,
+    weight_id: Option<(String, super::MemoryKind)>,
     arena_registration: Option<cuteafd_ffi::memory_ledger::fault::ArenaRegistration>,
 }
 
 pub(crate) struct WeightArenaBacking<'b> {
     pub id: &'b str,
     pub buffer: CuteafdDeviceBuffer,
+    /// The arena's kind, as its backing receipt reports it.
+    pub kind: super::MemoryKind,
 }
 
 impl<'a> Allocation<'a> {
@@ -173,7 +175,7 @@ impl<'a> Allocation<'a> {
     #[track_caller]
     pub(super) fn weight_arena(device: Device<'a>, bytes: usize, id: &str, tag: super::Tag) -> Result<Self> {
         let mut allocation = Self::new(device, bytes, tag)?;
-        allocation.weight_id = Some(id.into());
+        allocation.weight_id = Some((id.into(), tag.kind));
         Ok(allocation)
     }
 
@@ -183,7 +185,7 @@ impl<'a> Allocation<'a> {
 
     pub(crate) fn weight_backing(&self) -> Option<WeightArenaBacking<'_>> {
         if let Some(backing) = &self.backing { return backing.weight_backing(); }
-        self.weight_id.as_deref().map(|id| WeightArenaBacking { id, buffer: self.buffer })
+        self.weight_id.as_ref().map(|(id, kind)| WeightArenaBacking { id, buffer: self.buffer, kind: *kind })
     }
 
     pub(crate) fn inventory(&self, inventory: &mut super::receipts::Inventory<'_>, name: &str) -> Result<()> {
@@ -242,7 +244,7 @@ mod allocation_lifetime_tests {
             std::fs::write(std::env::var("CUTEAFD_FATAL_SYNC_EVIDENCE")?, fixture.directory().join("events").to_str().unwrap())?;
             let library = fixture.load()?;
             let device = Device { library: &library, id: 0 };
-            let allocation = Allocation::new(device, 256, cuteafd_ffi::memory_ledger::TEST)?;
+            let allocation = Allocation::new(device, 256, crate::shared::memory::TEST)?;
             let stream = Stream { device, raw: std::ptr::null_mut() };
             fixture.configure_pack(&library, 0, 1)?;
             match path {
@@ -307,7 +309,7 @@ mod allocation_lifetime_tests {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
-        let allocation = Allocation::new(device, 256, cuteafd_ffi::memory_ledger::TEST)?;
+        let allocation = Allocation::new(device, 256, crate::shared::memory::TEST)?;
         let stream = Stream { device, raw: std::ptr::null_mut() };
         fixture.configure_pack(&library, 0, 1)?;
         assert!(stream.drain().is_err());
@@ -326,7 +328,7 @@ mod allocation_lifetime_tests {
         for quarantined in [false, true] {
             let fixture = Fixture::build()?;
             let library = fixture.load()?;
-            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256, cuteafd_ffi::memory_ledger::TEST)?;
+            let allocation = Allocation::new(Device { library: &library, id: 1 }, 256, crate::shared::memory::TEST)?;
             assert_eq!(library.cuda_get_device()?, 0, "allocation must restore the current device");
             if quarantined { library.quarantine_module_after_failed_drain(); }
             drop(allocation);
@@ -694,9 +696,9 @@ mod tests {
         lib.cuda_set_device(0)?;
         let d0 = Device { library: &lib, id: 0 };
         let d1 = Device { library: &lib, id: 1 };
-        let source = Allocation::new(d0, 4096, cuteafd_ffi::memory_ledger::TEST)?;
-        let mut destination = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
-        let output = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let source = Allocation::new(d0, 4096, crate::shared::memory::TEST)?;
+        let mut destination = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let output = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
         let producer = Stream::new(d0)?;
         let independent = Stream::new(d1)?;
         let mut transfer = PeerTransfer::new(d0, d1)?;
@@ -747,10 +749,10 @@ mod tests {
         assert!(failed.is_err());
         assert_eq!(lib.cuda_get_device()?, 0);
         const BYTES: usize = 1024 * 1024;
-        let source_a = Allocation::new(a, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
-        let source_b = Allocation::new(b, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
-        let mut target_a = Allocation::new(a, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
-        let mut target_b = Allocation::new(b, BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let source_a = Allocation::new(a, BYTES, crate::shared::memory::TEST)?;
+        let source_b = Allocation::new(b, BYTES, crate::shared::memory::TEST)?;
+        let mut target_a = Allocation::new(a, BYTES, crate::shared::memory::TEST)?;
+        let mut target_b = Allocation::new(b, BYTES, crate::shared::memory::TEST)?;
         let producer_a = Stream::new(a)?;
         let producer_b = Stream::new(b)?;
         let mut ab = PeerTransfer::new(a, b)?;
@@ -790,10 +792,10 @@ mod tests {
         let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         lib.cuda_set_device(0)?;
         let (d0, d1) = (Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 });
-        let source = Allocation::new(d0, 4096, cuteafd_ffi::memory_ledger::TEST)?;
-        let mut staging = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
-        let out = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
-        let check = Allocation::new(d1, 4096, cuteafd_ffi::memory_ledger::TEST)?;
+        let source = Allocation::new(d0, 4096, crate::shared::memory::TEST)?;
+        let mut staging = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let out = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
+        let check = Allocation::new(d1, 4096, crate::shared::memory::TEST)?;
         let (producer, reader) = (Stream::new(d0)?, Stream::new(d1)?);
         let mut transfer = PeerTransfer::new(d0, d1)?;
         let guard = ScratchGuard::new(&lib, &[0, 1])?;

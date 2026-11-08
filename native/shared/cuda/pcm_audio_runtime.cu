@@ -78,13 +78,21 @@ extern "C" int32_t cuteafd_pcm_required(const cuteafd_pcm_spec* spec,cuteafd_pcm
   if(!spec||!out||!valid(*spec))return cudaErrorInvalidValue;
   Owner o;o.s=*spec;*out={spec->weight_bytes,scratch(&o),2,0};return 0;
 }
-extern "C" int32_t cuteafd_pcm_destroy(void* p){
-  if(!p)return 0;auto* o=static_cast<Owner*>(p);int device=-1;int first=cudaGetDevice(&device);
+extern "C" int32_t cuteafd_pcm_get_backings(void* p,cuteafd_media_backings* out){
+  if(!p||!out)return cudaErrorInvalidValue;auto* o=static_cast<Owner*>(p);
+  *out={o->weights,o->weights?o->ledger.weights:0,o->arena,o->arena?o->ledger.scratch:0};return 0;
+}
+extern "C" int32_t cuteafd_pcm_destroy(void* p){uint32_t released=0;return cuteafd_pcm_destroy_backings(p,&released);}
+extern "C" int32_t cuteafd_pcm_destroy_backings(void* p,uint32_t* released){
+  if(released)*released=0;
+  if(!p)return 0;if(!released)return cudaErrorInvalidValue;
+  auto* o=static_cast<Owner*>(p);int device=-1;int first=cudaGetDevice(&device);
   if(!first&&device!=o->device)return cudaErrorInvalidDevice;
   auto save=[&](int e){if(!first)first=e;};
   if(o->stream)save(cudaStreamSynchronize(o->stream));
   if(o->modules)save(cuteafd_pcm_support_destroy(o->modules));
-  if(o->arena)save(CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena)));if(o->weights)save(CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights)));
+  if(o->arena){int e=CUTEAFD_TRACK_FREE(o->arena, cudaFree(o->arena));if(!e)*released|=CUTEAFD_MEDIA_RELEASED_WORKSPACE;save(e);}
+  if(o->weights){int e=CUTEAFD_TRACK_FREE(o->weights, cudaFree(o->weights));if(!e)*released|=CUTEAFD_MEDIA_RELEASED_WEIGHTS;save(e);}
   if(o->stream)save(cudaStreamDestroy(o->stream));delete o;return first;
 }
 extern "C" int32_t cuteafd_pcm_create(const cuteafd_pcm_spec* spec,int32_t device,uint64_t admitted,void** out){

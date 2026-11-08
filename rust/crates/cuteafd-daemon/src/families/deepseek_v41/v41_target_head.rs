@@ -1098,7 +1098,7 @@ mod sampler_wiring_tests {
             use super::recording_sampler as rec;
             let library: &'static NativeLibrary = Box::leak(Box::new(wiring_library()?));
             let mut wave = TargetSamplingWave::allocate(library, rec::stages(), rows, SAMPLING_VOCAB).unwrap();
-            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, cuteafd_ffi::memory_ledger::TEST).unwrap();
+            let logits_buffer = library.alloc_device_buffer(rows * vocab * 4, crate::shared::memory::TEST).unwrap();
             let values = logits(rows, vocab);
             library.copy_h2d(logits_buffer, &logit_bytes(&values)).unwrap();
             wave.upload(&plan.rows, Some(arena), cuteafd_ffi::cuteafd_sampler_mask_words(vocab),
@@ -1590,7 +1590,7 @@ mod sampler_device_tests {
             .map(|mask| vec![mask.clone()]).collect();
         build_sampling_masks(&row_masks, &mut arena)?;
 
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         // One wave for both launches: its buffers must not be freed under the
@@ -1744,7 +1744,7 @@ mod sampler_device_tests {
             let plan = build_target_sampling_plan(&members, &inputs)?;
             let mut arena = vec![0u32; rows * words];
             build_sampling_masks(&vec![vec![None]; rows], &mut arena)?;
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let mut host_rows = vec![0u8; rows * VOCAB * 4];
             let stream = library.cuda_stream_create()?;
@@ -1833,7 +1833,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(!plan.routes_need_ordered_tail());
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1877,10 +1877,10 @@ mod sampler_device_tests {
         // the kernel stage only.
         let rows = 48usize;
         let values = smooth_narrow(rows);
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
-        let indices = library.alloc_device_buffer(rows * 4, cuteafd_ffi::memory_ledger::TEST)?;
-        let scores = library.alloc_device_buffer(rows * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let indices = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
+        let scores = library.alloc_device_buffer(rows * 4, crate::shared::memory::TEST)?;
         let stream = library.cuda_stream_create()?;
         let mut greedy_us = Vec::new();
         for iteration in 0..60 {
@@ -1918,7 +1918,7 @@ mod sampler_device_tests {
             let inputs: Vec<Vec<u32>> = vec![vec![0]; rows];
             let plan = build_target_sampling_plan(&members, &inputs)?;
             assert!(plan.route.iter().all(|route| *route == crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingRoute::DeviceGreedy));
-            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+            let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits_buffer, &bytes(&values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(&library, rows, SAMPLING_VOCAB)?;
@@ -1970,7 +1970,7 @@ mod sampler_device_tests {
         {
             let rows = 8usize;
             let values = smooth_narrow(rows);
-            let buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+            let buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(buffer, &bytes(&values))?;
             let mut host = vec![0u8; VOCAB * 4];
             let mut one_row = buffer;
@@ -2168,7 +2168,7 @@ mod sampler_device_tests {
         let plan = build_target_sampling_plan(&members, &inputs)?;
         let mut arena = vec![0u32; rows * words];
         build_sampling_masks(&[vec![Some(mask.clone())], vec![None]], &mut arena)?;
-        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let logits_buffer = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
         library.copy_h2d(logits_buffer, &bytes(&values))?;
         let stream = library.cuda_stream_create()?;
         let result = (|| -> Result<Vec<u32>> {
@@ -2235,7 +2235,7 @@ mod sampler_device_tests {
         fn new(library: &'a NativeLibrary, rows: usize, values: &[f32],
             plan: &crate::families::deepseek_v41::v41_native_serve::scheduler::SamplingPlan, arena: Option<&[u32]>,
         ) -> Result<Self> {
-            let logits = library.alloc_device_buffer(rows * VOCAB * 4, cuteafd_ffi::memory_ledger::TEST)?;
+            let logits = library.alloc_device_buffer(rows * VOCAB * 4, crate::shared::memory::TEST)?;
             library.copy_h2d(logits, &bytes(values))?;
             let stream = library.cuda_stream_create()?;
             let mut wave = TargetSamplingWave::new(library, rows, SAMPLING_VOCAB)?;

@@ -18,7 +18,7 @@ fn glm_expert_census_resides_weights_before_kv_only() -> Result<()> {
     let owner = |id: &str| Receipt { allocation: Allocation::buffer(id, Location::coordinator(0), 64,
         Lifetime::TARGET, Category::Experts, "resident expert owners"), address: 0x10000 };
     let mut root = owner("experts.exl3.gpu.1.selection");
-    root.allocation.category = Category::Weights;
+    root.allocation.category = Category::Experts;
     root.allocation.group = "weight arena".into();
     let mut alias = owner("glm.expert.routed.rank.0.weight.3.0");
     alias.allocation.view = Some(View { backing: root.allocation.id.clone(), offset: 0 });

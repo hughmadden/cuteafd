@@ -1055,7 +1055,7 @@ mod host_order_tests {
         fixture.immediate_copies(&library)?;
         fixture.trace_stream_queries(&library)?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
-        let storage = DeviceAllocation::new(&library, 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let storage = DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
         let pass = StageChain::new(&library)?;
         pass.set_device_order(false);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -1222,7 +1222,7 @@ mod shared_storage_tests {
                 let f = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
                 ((f.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, hidden.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let source = DeviceAllocation::new(&lib, hidden.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |wave: &BackboneRouterWave<'_, '_>| -> Result<Vec<Vec<u8>>> {

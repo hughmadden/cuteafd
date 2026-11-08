@@ -447,8 +447,8 @@ mod tests {
             for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
                 for (heads, dim, ring_rows) in [(1, 64, 1024), (2, 128, 1024), (8, 128, 2048)] {
                     let row = format.plane_record_bytes(heads, dim);
-                    let ring = Allocation::new(device, 3 * ring_rows * row, cuteafd_ffi::memory_ledger::TEST)?;
-                    let arena = Allocation::new(device, ring_rows * row + 32, cuteafd_ffi::memory_ledger::TEST)?;
+                    let ring = Allocation::new(device, 3 * ring_rows * row, crate::shared::memory::TEST)?;
+                    let arena = Allocation::new(device, ring_rows * row + 32, crate::shared::memory::TEST)?;
                     let state = RingState { rank: 0, buffer: ring.buffer, row, ring_rows,
                         rows: ring_rows - 128, offset: 16, draft: true };
                     for len in [1, 63, 64, 65, ring_rows - 1, ring_rows, ring_rows + 1,

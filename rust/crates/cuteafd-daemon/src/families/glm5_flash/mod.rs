@@ -392,7 +392,7 @@ mod draft_cli_tests {
         let _owner = memory_ledger::owner(&tag);
         let staging_bytes = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
             .get(tag.as_str()).copied().unwrap_or(0);
-        let mut target = DeviceAllocation::new(&library, 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let mut target = DeviceAllocation::new(&library, 512, crate::shared::memory::TEST)?;
         library.copy_h2d(target.buffer, &[1; 64])?;
         assert_eq!(staging_bytes(), 64);
         assert_eq!(fixture.events()?, "DAH");
@@ -415,11 +415,11 @@ mod draft_cli_tests {
         }, |_| {
             assert_eq!(staging_bytes(), 0, "first prime must not retain loader staging");
             assert!(fixture.events()?.ends_with("HF"), "release must follow the last upload");
-            let prime = DeviceAllocation::new(&library, 16, cuteafd_ffi::memory_ledger::TEST)?;
+            let prime = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
             drop(prime);
             with_startup_graphs(false, Some((1, draft)), (1, false), |_, _| {
                 assert_eq!(staging_bytes(), 0);
-                let warm = DeviceAllocation::new(&library, 16, cuteafd_ffi::memory_ledger::TEST)?;
+                let warm = DeviceAllocation::new(&library, 16, crate::shared::memory::TEST)?;
                 drop(warm);
                 Ok(())
             }, || unreachable!("no TP2 diagnostics in this fixture"), || {

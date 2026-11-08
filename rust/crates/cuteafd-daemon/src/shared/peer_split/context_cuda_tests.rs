@@ -56,7 +56,7 @@ struct Buffer<'a> {
 impl<'a> Buffer<'a> {
     fn new(library: &'a NativeLibrary, device: i32, bytes: usize) -> Result<Self> {
         let allocation = on_device(library, device, || {
-            let allocation = DeviceAllocation::new(library, bytes.max(256), cuteafd_ffi::memory_ledger::TEST)?;
+            let allocation = DeviceAllocation::new(library, bytes.max(256), crate::shared::memory::TEST)?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         })?;

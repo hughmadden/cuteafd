@@ -827,7 +827,7 @@ mod tests {
                 }
             }
         }
-        let source = DeviceAllocation::new(&library, 1024, cuteafd_ffi::memory_ledger::TEST)?;
+        let source = DeviceAllocation::new(&library, 1024, crate::shared::memory::TEST)?;
         assert!(exchange.push(0, 0, source.buffer.ptr, 272).is_err());
         assert!(exchange.push(0, sizes.len(), source.buffer.ptr, 16).is_err());
         assert!(PeerExchange::new_sized(&library, ranks, &[0], 256).is_err());

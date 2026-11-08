@@ -103,7 +103,7 @@ fn oracle(tensors: &Fp8ExpertTensors, layer: usize, tp: usize, rank: usize,
 }
 
 fn upload<'a>(library: &'a NativeLibrary, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-    let owner = DeviceAllocation::new(library, bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
+    let owner = DeviceAllocation::new(library, bytes.len(), crate::shared::memory::TEST)?;
     library.copy_h2d(owner.buffer, bytes)?;
     Ok(owner)
 }
@@ -167,7 +167,7 @@ fn native_fp8_two_stream_slots_are_byte_exact_against_serial() -> Result<()> {
         .flat_map(|at| ((at % info.experts) as i32).to_le_bytes()).collect::<Vec<_>>())?;
     let routing = upload(&library, &(0..capacity * info.topk)
         .flat_map(|_| (1.0f32 / info.topk as f32).to_le_bytes()).collect::<Vec<_>>())?;
-    let outputs = (0..2).map(|_| DeviceAllocation::new(&library, capacity * info.hidden * 2, cuteafd_ffi::memory_ledger::TEST))
+    let outputs = (0..2).map(|_| DeviceAllocation::new(&library, capacity * info.hidden * 2, crate::shared::memory::TEST))
         .collect::<Result<Vec<_>>>()?;
     // Declared last: these streams drain before any slot, weights or I/O is freed on every exit.
     let streams = (0..2).map(|_| Ok(LoadStream { library: &library, raw: library.cuda_stream_create()? }))
@@ -254,7 +254,7 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
     let x = upload(&library, &all_input)?;
     let ids = upload(&library, &ids)?;
     let weights = upload(&library, &routing)?;
-    let outputs = (0..groups.len()).map(|_| DeviceAllocation::new(&library, 64 * 4096 * 2, cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
+    let outputs = (0..groups.len()).map(|_| DeviceAllocation::new(&library, 64 * 4096 * 2, crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     for rows in [1, 16, 64] {
         let launch = || -> Result<()> {

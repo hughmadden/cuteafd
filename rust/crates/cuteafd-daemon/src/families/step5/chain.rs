@@ -737,7 +737,7 @@ mod tests {
                 cache.borrow().bytes() as u64,
                 staging.allocation_bytes() as u64,
             ], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
-        let input = Allocation::new(device, 64 * H * 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let input = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
             device.run(|| library.copy_d2h(&mut result, buffer))?;

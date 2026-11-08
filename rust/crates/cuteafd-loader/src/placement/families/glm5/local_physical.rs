@@ -194,7 +194,7 @@ impl LocalPhysicalSource {
                 let format = if self.format == GlmLocalFormat::Exl3 { "exl3" } else { "fp8" };
                 let layout = WeightArenaLayout::new(expert_weight_arena_id(format, rank as i32, &regions)?, regions)?;
                 out.record(Allocation::buffer(layout.id(), location, u64::try_from(layout.bytes())?,
-                    Lifetime::RESIDENT, Category::Weights, "weight arena"));
+                    Lifetime::RESIDENT, Category::Experts, "weight arena"));
                 Some(layout)
             } else { None };
             let mut rank_backing: Option<String> = None;

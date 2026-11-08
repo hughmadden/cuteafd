@@ -26,7 +26,7 @@ fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()>
     let views = tensors.iter().map(|(name, data)| arena.view(name, data.len())).collect::<Result<Vec<_>>>()?;
     assert_eq!(views[1].buffer.ptr as usize - views[0].buffer.ptr as usize, 768);
     for ((_, data), view) in tensors.iter().zip(&views) {
-        let tensor = Allocation::new(device, data.len(), cuteafd_ffi::memory_ledger::TEST)?;
+        let tensor = Allocation::new(device, data.len(), crate::shared::memory::TEST)?;
         device.run(|| {
             library.copy_h2d(tensor.buffer, data)?;
             library.copy_h2d(view.buffer, data)?;
@@ -309,5 +309,44 @@ fn real_v41_full_plan_interleaved_sources_and_file_replay() -> Result<()> {
         plan.plan.check(&plan.file_sizes, &plan.arenas)?;
         simulate(&plan, rank, "V4.1 full-layer native")?;
     }
+    Ok(())
+}
+
+/// One physical backing per arena, recorded once under the arena's tag; every
+/// view reports that tag, and the arena-less standalone tag never applies to a view.
+#[test]
+fn arena_views_inherit_one_backing_tag() -> Result<()> {
+    use cuteafd_core::memory_layout::{arena_class, ArenaTag, MemoryKind};
+    use cuteafd_ffi::{memory_ledger, native_library_lifetime_fixture::Fixture};
+    let fixture = Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 1, 1 << 20)?;
+    let device = Device { library: &library, id: 0 };
+    let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("test/kv-arena/0",
+        [("pages".to_string(), 4096), ("index".to_string(), 512)])?;
+    let audit = memory_ledger::AllocationAudit::begin();
+    let start = audit.checkpoint();
+    let arena: DeviceArena<'_, arena_class::FixedPool> = DeviceArena::new(device, layout, ArenaTag::kv("test/kv-arena"))?;
+    let views = [arena.view("pages", 4096)?, arena.view("index", 512)?];
+    let history = audit.finish();
+    // The audit sees every thread; this test's owner is unique to it.
+    let backings = history.events[start..].iter().filter_map(|event| match event {
+        memory_ledger::AllocationEvent::Allocated(record)
+            if record.key.tag.is_some_and(|tag| tag.owner == "test/kv-arena") => Some(*record),
+        _ => None }).collect::<Vec<_>>();
+    assert_eq!(backings.len(), 1, "an arena records exactly one backing: {backings:?}");
+    assert_eq!(backings[0].key.tag, Some(memory_ledger::Tag::kv("test/kv-arena")));
+    assert_eq!(backings[0].bytes, arena.layout().bytes());
+    for view in &views {
+        assert_eq!(view.tag(), Some(arena.tag()));
+        assert_eq!(view.tag().unwrap().kind, MemoryKind::Kv);
+    }
+    // A weight arena view ignores the standalone tag a caller passes.
+    let weights = DeviceWeightArena::new(device, cuteafd_loader::serving_capacity::WeightArenaLayout::new(
+        "test/weight-arena/0", [("w".to_string(), 256)])?, ArenaTag::weights("test/weight-arena"))?;
+    let view = weight_allocation(device, Some(&weights), "w", 256, ArenaTag::drafter_weights("test/elsewhere"))?;
+    assert_eq!(view.tag(), Some(memory_ledger::Tag::weights("test/weight-arena")));
+    let standalone = weight_allocation(device, None, "w", 256, ArenaTag::drafter_weights("test/elsewhere"))?;
+    assert_eq!(standalone.tag(), Some(memory_ledger::Tag::drafter_weights("test/elsewhere")));
     Ok(())
 }

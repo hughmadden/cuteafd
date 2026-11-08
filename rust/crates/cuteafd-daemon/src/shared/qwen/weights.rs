@@ -356,7 +356,7 @@ mod tests {
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
         }
         device.run(|| {
-            assert!(reader.upload_with("bad", &[1], |_, bytes| Allocation::new(device, bytes + 1, cuteafd_ffi::memory_ledger::TEST)).is_err());
+            assert!(reader.upload_with("bad", &[1], |_, bytes| Allocation::new(device, bytes + 1, crate::shared::memory::TEST)).is_err());
             Ok(())
         })?;
         Ok(())

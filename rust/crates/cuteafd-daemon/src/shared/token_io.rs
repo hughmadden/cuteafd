@@ -1348,7 +1348,7 @@ mod tests {
         let load = dense::DenseLoad::push(&library);
         let ((peer_embedding, model), mut combined) = dense::recording(|| devices[1].run(||
             TokenEmbedding::load(&library, source.clone(), EmbedPlacement::Gpu, || devices[0].run(|| {
-                let model = DeviceAllocation::new(&library, source.bytes(), cuteafd_ffi::memory_ledger::TEST)?;
+                let model = DeviceAllocation::new(&library, source.bytes(), crate::shared::memory::TEST)?;
                 load.operand(dense::Operand { device: 0, buffer: model.buffer, bytes: source.bytes(),
                     lands: vec![(dense::Rect { name: "model.weight".into(), path: path.clone(), base: 7,
                         row_bytes: source.bytes(), rows: 0..1, cols: 0..source.bytes() }, 0)] })?;

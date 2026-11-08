@@ -275,7 +275,7 @@ mod tests {
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
         fixture.immediate_copies(&library)?;
-        let ids = DeviceAllocation::new(&library, 4, cuteafd_ffi::memory_ledger::TEST)?;
+        let ids = DeviceAllocation::new(&library, 4, crate::shared::memory::TEST)?;
         library.copy_h2d(ids.buffer, &7u32.to_le_bytes())?;
         let mut probe = RoundProbe::new(&library, vec![false; 2], 1, 1)?;
         probe.collect_timing = true;
@@ -319,7 +319,7 @@ mod tests {
         let _owner = memory_ledger::owner(&tag);
         let pinned = || memory_ledger::snapshot().by_owner(Space::Pinned, -1)
             .get(tag.as_str()).copied().unwrap_or(0);
-        let target = DeviceAllocation::new(&library, 256, cuteafd_ffi::memory_ledger::TEST)?;
+        let target = DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?;
         library.copy_h2d(target.buffer, &[1; 128])?;
         // SAFETY: the fixture retains this destination and its ordered source until the drain below.
         unsafe { library.copy_h2d_ordered(target.buffer, &[2; 256], 1usize as *mut c_void)?; }

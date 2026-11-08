@@ -27,7 +27,7 @@ pub(crate) fn assert_receipts(receipts: &[cuteafd_loader::placement::planner::Re
     use cuteafd_core::memory_layout::Category;
     use std::collections::BTreeMap;
     let roots = receipts.iter().filter(|receipt| receipt.allocation.view.is_none()
-        && receipt.allocation.category == Category::Weights && receipt.allocation.group == "weight arena")
+        && receipt.allocation.category == Category::Experts && receipt.allocation.group == "weight arena")
         .map(|receipt| (receipt.allocation.id.as_str(), receipt.allocation.bytes)).collect::<Vec<_>>();
     let actual = roots.iter().copied().collect::<BTreeMap<_, _>>();
     let expected = layouts.iter().map(|layout| (layout.id(), layout.bytes() as u64)).collect::<BTreeMap<_, _>>();

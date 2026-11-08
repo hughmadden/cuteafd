@@ -144,9 +144,9 @@ fn native_host_embedding_exact_512() -> Result<()> {
             }
         }
         for width in [5, 7] {
-            let ids = DeviceAllocation::new(&lib, 16 * 4, cuteafd_ffi::memory_ledger::TEST)?;
-            let residual = DeviceAllocation::new(&lib, 16 * width * 40960, cuteafd_ffi::memory_ledger::TEST)?;
-            let pre = DeviceAllocation::new(&lib, 16 * width * 16, cuteafd_ffi::memory_ledger::TEST)?;
+            let ids = DeviceAllocation::new(&lib, 16 * 4, crate::shared::memory::TEST)?;
+            let residual = DeviceAllocation::new(&lib, 16 * width * 40960, crate::shared::memory::TEST)?;
+            let pre = DeviceAllocation::new(&lib, 16 * width * 16, crate::shared::memory::TEST)?;
             lib.copy_h2d(ids.buffer, &tokens[..16].iter().flat_map(|t| t.to_ne_bytes()).collect::<Vec<_>>())?;
             let ops = lib.v41_attention_ops_width(width)?;
             // SAFETY: immutable table and owned disjoint buffers live through both drains.

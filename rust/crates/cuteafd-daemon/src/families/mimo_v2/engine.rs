@@ -3179,7 +3179,7 @@ mod tests {
         impl Fixture<'_> {
             fn upload(&mut self, words: &[u32]) -> Result<CuteafdDeviceBuffer> {
                 let data = words.iter().flat_map(|n| n.to_ne_bytes()).collect::<Vec<_>>();
-                let buffer = self.library.alloc_device_buffer(data.len(), cuteafd_ffi::memory_ledger::TEST)?;
+                let buffer = self.library.alloc_device_buffer(data.len(), crate::shared::memory::TEST)?;
                 self.buffers.push(buffer);
                 self.library.copy_h2d(buffer, &data)?;
                 Ok(buffer)
@@ -3285,7 +3285,7 @@ mod tests {
             library.cuda_set_device(rank)?;
             let stream = (rank as usize + 1) as *mut std::ffi::c_void;
             for extent in [8192, 4096, 2048, 1024, 256] {
-                let mut buffer = library.alloc_device_buffer(extent, cuteafd_ffi::memory_ledger::TEST)?;
+                let mut buffer = library.alloc_device_buffer(extent, crate::shared::memory::TEST)?;
                 super::ordered_table_upload(&library, buffer, &[3; 16], stream)?;
                 let first = fixture.events()?;
                 super::ordered_table_upload(&library, buffer, &vec![7; extent], stream)?;
@@ -3309,7 +3309,7 @@ mod tests {
         let library = fixture.load()?;
         let (rows, hidden, rope, topk, slots) = (64, 4096, 64, 8, 3);
         let alloc = |bytes: usize| -> anyhow::Result<Dev<'_>> {
-            let owner = Rc::new(DeviceAllocation::new(&library, bytes, cuteafd_ffi::memory_ledger::TEST)?);
+            let owner = Rc::new(DeviceAllocation::new(&library, bytes, crate::shared::memory::TEST)?);
             Ok(Dev { buffer: owner.buffer, _owner: owner })
         };
         let head_workspace = alloc(slots * VOCABULARY_HEAD_WORKSPACE)?;

@@ -311,7 +311,7 @@ mod retained_tests {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, Location};
         let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
         let library = fixture.load()?;
-        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024, cuteafd_ffi::memory_ledger::TEST)?;
+        let allocation = Allocation::new(Device { library: &library, id: 1 }, 1024, crate::shared::memory::TEST)?;
         let owner = allocation.buffer;
         let view = Buffer { ptr: (owner.ptr as usize + 128) as *mut c_void, bytes: 256, ..owner };
         let mut scratch = ProjectionScratch { _owners: BTreeMap::from([("workspace", allocation)]),

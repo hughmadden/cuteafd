@@ -467,7 +467,7 @@ mod tests {
                 let value = (((i * 7 + layer * 11 + 2 * 13) % 23) as f32 / 23.0 - 0.3).to_bits();
                 ((value >> 16) as u16).to_ne_bytes()
             }).collect();
-            let source = DeviceAllocation::new(&lib, input.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let source = DeviceAllocation::new(&lib, input.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(source.buffer, &input)?;
             Ok(source)
         }).collect::<Result<Vec<_>>>()?;
@@ -564,7 +564,7 @@ mod tests {
             expected.push(read(&reference, lease)?);
         }
         let sources = [input(0), input(1)].map(|host| -> Result<DeviceAllocation<'_>> {
-            let buffer = DeviceAllocation::new(&lib, host.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let buffer = DeviceAllocation::new(&lib, host.len(), crate::shared::memory::TEST)?;
             lib.copy_h2d(buffer.buffer, &host)?;
             Ok(buffer)
         }).into_iter().collect::<Result<Vec<_>>>()?;

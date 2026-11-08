@@ -864,8 +864,8 @@ mod tests {
         fixture.immediate_copies(&library)?;
         let bridge = Bridge::Local { stream: Stream::new(device)?, terminal: Cell::new(TerminalState::Active) };
         let target = Stream::new(device)?;
-        let source = Allocation::new(device, 64, cuteafd_ffi::memory_ledger::TEST)?;
-        let destination = Allocation::new(device, 32, cuteafd_ffi::memory_ledger::TEST)?;
+        let source = Allocation::new(device, 64, crate::shared::memory::TEST)?;
+        let destination = Allocation::new(device, 32, crate::shared::memory::TEST)?;
         let bytes = (0u8..64).collect::<Vec<_>>();
         device.run(|| library.copy_h2d(source.buffer, &bytes))?;
         let mut producer = crate::shared::memory::device::Event::new(device)?;

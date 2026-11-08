@@ -414,7 +414,7 @@ pub struct VitRuntime {
 }
 impl VitRuntime {
     fn prepare(spec: TowerSpec, library: &Path, device: i32, admitted: u64) -> Result<Self> {
-        let native = NativeVision::prepare(library, &spec.native, device, admitted)?;
+        let native = NativeVision::prepare(library, &spec.native, device, admitted, cuteafd_ffi::memory_ledger::MediaTags::new("media/vision"))?;
         Ok(Self { native, spec })
     }
     fn weight_arena(&self) -> Result<usize> {
@@ -432,7 +432,7 @@ impl VitRuntime {
             )));
         }
         let weights = spec.load_weights()?;
-        let native = NativeVision::load(library, &spec.native, device, admitted_bytes, &weights)?;
+        let native = NativeVision::load(library, &spec.native, device, admitted_bytes, &weights, cuteafd_ffi::memory_ledger::MediaTags::new("media/vision"))?;
         Ok(Self { native, spec })
     }
     pub fn encode_into(

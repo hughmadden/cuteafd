@@ -245,7 +245,7 @@ pub(crate) mod tests {
         fixture.immediate_copies(&library)?;
         fixture.quiet_events(&library, true)?;
         let device = Device { library: &library, id: 0 };
-        let allocation = DeviceAllocation::new(&library, mounted.len(), cuteafd_ffi::memory_ledger::TEST)?;
+        let allocation = DeviceAllocation::new(&library, mounted.len(), crate::shared::memory::TEST)?;
         let mut actual = vec![0; mounted.len()];
         library.copy_h2d(allocation.buffer, &actual)?;
         // The real vision prepare initializes this region independently of pushed payloads.

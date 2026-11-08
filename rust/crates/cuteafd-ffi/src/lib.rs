@@ -2633,6 +2633,21 @@ impl NativeLibrary {
         self.alloc_device_buffer_with(bytes, Some(tag))
     }
 
+    /// The tag this thread last asked a native allocator for, whether or not
+    /// that allocation succeeded (failure reports name the attempted owner).
+    pub fn last_allocation_tag(&self) -> Result<Option<memory_ledger::Tag>> {
+        type LastTag = unsafe extern "C" fn(*mut u32, *mut c_char, usize) -> CuteafdStatus;
+        // SAFETY: versioned native ABI writing into local, bounded outputs.
+        let last: libloading::Symbol<LastTag> = unsafe { self.lib.get(b"cuteafd_last_allocation_tag")? };
+        let (mut kind, mut owner) = (0u32, [0 as c_char; 256]);
+        let status = unsafe { last(&mut kind, owner.as_mut_ptr(), owner.len()) };
+        self.status_to_result("cuteafd_last_allocation_tag", status)?;
+        let Some(kind) = memory_ledger::MemoryKind::from_raw(kind) else { return Ok(None) };
+        // SAFETY: native wrote a NUL-terminated string inside `owner`.
+        let owner = unsafe { CStr::from_ptr(owner.as_ptr()) }.to_str().context("allocation owner is not UTF8")?;
+        Ok(Some(memory_ledger::tag(kind, owner)))
+    }
+
     /// Legacy untagged entry point; removed once every caller states a tag.
     #[track_caller]
     pub fn alloc_device_buffer_untagged(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {

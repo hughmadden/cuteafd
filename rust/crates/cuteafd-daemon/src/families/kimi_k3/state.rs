@@ -354,7 +354,7 @@ mod tests {
             Ok(bytes)
         };
         let upload = |bytes: &[u8]| -> Result<Allocation<'_>> {
-            let allocation = Allocation::new(device, bytes.len(), cuteafd_ffi::memory_ledger::TEST)?;
+            let allocation = Allocation::new(device, bytes.len(), crate::shared::memory::TEST)?;
             device.run(|| library.copy_h2d(allocation.buffer, bytes))?;
             Ok(allocation)
         };
@@ -389,9 +389,9 @@ mod tests {
                 let first = upload(&first.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
                 let input = bf16_ones(rows * 7168)?;
                 let projected = (0..4).map(|_| bf16_ones(rows * width)).collect::<Result<Vec<_>>>()?;
-                let output = Allocation::new(device, rows * width * 2, cuteafd_ffi::memory_ledger::TEST)?;
+                let output = Allocation::new(device, rows * width * 2, crate::shared::memory::TEST)?;
                 let kernel = &kernels[usize::from(rows > 64)];
-                let scratch = Allocation::new(device, kernel.scratch_bytes(), cuteafd_ffi::memory_ledger::TEST)?;
+                let scratch = Allocation::new(device, kernel.scratch_bytes(), crate::shared::memory::TEST)?;
                 for (lane, stream) in readers.iter().enumerate() {
                     let [state, conv_state, replay] = bank.layer(0, lane)?;
                     device.run(|| Ok(kernel.launch(weights, KimiKdaCoreBatch { rows, sequences,
@@ -523,7 +523,7 @@ mod tests {
         let reader = || Rc::new(Stream { device, raw: std::ptr::null_mut() });
         let readers = vec![reader(), reader()];
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let allocation = || Allocation::new(device, 16, cuteafd_ffi::memory_ledger::TEST).map(Rc::new);
+        let allocation = || Allocation::new(device, 16, crate::shared::memory::TEST).map(Rc::new);
         let bank = KdaBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
             state: allocation()?, conv: allocation()?, marks: Some(allocation()?),
             replay: vec![allocation()?, allocation()?], tables: vec![allocation()?, allocation()?],

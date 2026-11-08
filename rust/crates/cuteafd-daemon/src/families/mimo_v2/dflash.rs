@@ -476,7 +476,7 @@ mod mask_tests {
             if recording { std::fs::rename(hidden, &path)?; }
             let mut owners = owners?;
             let (row, source) = mask_source(&dir, cfg.hidden)?;
-            let owner = DeviceAllocation::new(&library, row.len().max(256), cuteafd_ffi::memory_ledger::TEST)?;
+            let owner = DeviceAllocation::new(&library, row.len().max(256), crate::shared::memory::TEST)?;
             DenseLoad::mount(&library).operand(Operand { device: 0, buffer: owner.buffer,
                 bytes: row.len(), lands: vec![(source, 0)] })?;
             owners.push(owner);

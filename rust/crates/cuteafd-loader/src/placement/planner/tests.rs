@@ -445,7 +445,7 @@ fn shared_arena_reconciliation_maps_physical_ids_without_changing_the_plan() -> 
                 let layout = WeightArenaLayout::new(expert_weight_arena_id("exl3", rank as i32, &selection)?, selection.clone())?;
                 let physical_id = expert_weight_arena_id("exl3", ordinal, &selection)?;
                 let root = Allocation::buffer(layout.id(), location, layout.bytes() as u64,
-                    Lifetime::TARGET, Category::Weights, "weight arena");
+                    Lifetime::TARGET, Category::Experts, "weight arena");
                 let address = 0x10000 + rank as u64 * 0x10000 + if label == "draft" { 0x8000 } else { 0 };
                 planned.push(root.clone());
                 runtime.push(Receipt { allocation: Allocation { id: physical_id.clone(), ..root }, address });
@@ -542,7 +542,7 @@ fn shared_arena_remap_preserves_derived_backings_and_all_owner_scopes() -> anyho
                         let selection = vec![(label.into(), bytes as usize)];
                         let id = expert_weight_arena_id("exl3", ordinal, &selection)?;
                         let root = Allocation::buffer(&id, location, bytes, lifetime,
-                            Category::Weights, "weight arena");
+                            Category::Experts, "weight arena");
                         if scope == 2 {
                             sequential.push(root);
                             continue;

@@ -159,7 +159,7 @@ mod tests {
                 library: &library,
                 id: 0,
             },
-            layout.bytes(), cuteafd_ffi::memory_ledger::TEST
+            layout.bytes(), crate::shared::memory::TEST
         )?;
         assert_eq!(allocation.buffer.bytes, 517);
         assert!(RegionLayout::packed(std::iter::repeat_n(1, 5000)).is_err());

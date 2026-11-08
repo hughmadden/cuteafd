@@ -46,7 +46,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
         .run(|| {
             let kernel = lib.v41_sparse_attention()?;
             let allocate = |bytes, value| -> Result<DeviceAllocation<'_>> {
-                let allocation = DeviceAllocation::new(&lib, bytes, cuteafd_ffi::memory_ledger::TEST)?;
+                let allocation = DeviceAllocation::new(&lib, bytes, crate::shared::memory::TEST)?;
                 lib.copy_h2d(allocation.buffer, &vec![value; bytes])?;
                 Ok(allocation)
             };
@@ -101,7 +101,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
             let appended_scales = allocate(V41Kv::COMPRESSED_SCALE_BYTES, 0x40)?;
             let destination = allocate(8, 0)?;
             lib.copy_h2d(destination.buffer, &1u64.to_ne_bytes())?;
-            let mut append_end = HostAllocation::new(&lib, 8, cuteafd_ffi::memory_ledger::TEST)?;
+            let mut append_end = HostAllocation::new(&lib, 8, crate::shared::memory::TEST)?;
             append_end.bytes_mut().copy_from_slice(&2u64.to_ne_bytes());
             let outputs = allocate(64 * 65536, 0)?;
             let kv = lib.v41_compressed_kv()?;
@@ -216,7 +216,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             assert_eq!(wave.input().ptr,input);
             assert_eq!(wave.storage.split_scratch.buffer.bytes,64*10*32*514*4);
             let allocate=|bytes,value|->Result<DeviceAllocation<'_>> {
-                let allocation=DeviceAllocation::new(&lib,bytes, cuteafd_ffi::memory_ledger::TEST)?;
+                let allocation=DeviceAllocation::new(&lib,bytes, crate::shared::memory::TEST)?;
                 lib.copy_h2d(allocation.buffer,&vec![value;bytes])?;Ok(allocation)
             };
             let values=allocate(128*512,0x38)?;

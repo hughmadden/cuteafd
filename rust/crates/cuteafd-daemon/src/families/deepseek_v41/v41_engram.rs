@@ -334,12 +334,12 @@ mod tests {
     fn layer14_ordering(lib: &NativeLibrary, guarded: bool, held: bool) -> Result<()> {
         use crate::shared::memory::chain::StageChain;
         let mut owner = EngramDeviceRows::new(lib, 1, EngramDeviceRows::device_bytes(1)?)?;
-        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(1), cuteafd_ffi::memory_ledger::TEST)?;
+        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(1), crate::shared::memory::TEST)?;
         queue_layer(&mut owner, &mut source, 0)?;
         owner.synchronize()?;
         assert!(source.copy_ready()?);
         let read = LoadStream { library: lib, raw: lib.cuda_stream_create()? };
-        let observed = DeviceAllocation::new(lib, 24 * 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let observed = DeviceAllocation::new(lib, 24 * 512, crate::shared::memory::TEST)?;
         let chain = StageChain::new(lib)?;
         chain.set_device_order(true);
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -377,12 +377,12 @@ mod tests {
     fn consume_does_not_join_copy(lib: &NativeLibrary, wrong_stream: bool, held: bool) -> Result<()> {
         use crate::shared::memory::chain::StageChain;
         let mut owner = EngramDeviceRows::new(lib, 1, EngramDeviceRows::device_bytes(1)?)?;
-        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(1), cuteafd_ffi::memory_ledger::TEST)?;
+        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(1), crate::shared::memory::TEST)?;
         queue_layer(&mut owner, &mut source, 0)?;
         owner.synchronize()?; assert!(source.copy_ready()?);
         let hold = LoadStream { library: lib, raw: lib.cuda_stream_create()? };
         let read = LoadStream { library: lib, raw: lib.cuda_stream_create()? };
-        let observed = DeviceAllocation::new(lib, 24 * 512, cuteafd_ffi::memory_ledger::TEST)?;
+        let observed = DeviceAllocation::new(lib, 24 * 512, crate::shared::memory::TEST)?;
         let fence = lib.cuda_event_create_ordering()?;
         let done = lib.cuda_event_create_ordering()?;
         let chain = StageChain::new(lib)?; chain.set_device_order(true);
@@ -455,7 +455,7 @@ mod tests {
         let mut owners = (0..k + 1).map(|_| EngramDeviceRows::new(lib, rows,
             EngramDeviceRows::device_bytes(rows)?)).collect::<Result<Vec<_>>>()?;
         let mut sources = (0..k + 1).map(|_| lib.pinned_bytes(
-            cuteafd_loader::EngramBatchStaging::payload_bytes(rows), cuteafd_ffi::memory_ledger::TEST)).collect::<Result<Vec<_>>>()?;
+            cuteafd_loader::EngramBatchStaging::payload_bytes(rows), crate::shared::memory::TEST)).collect::<Result<Vec<_>>>()?;
         let hold = LoadStream { library: lib, raw: lib.cuda_stream_create()? };
         let fence = lib.cuda_event_create_ordering()?;
         // The watchdog also covers a driver blocking inside cudaMemcpyAsync.
@@ -529,7 +529,7 @@ mod tests {
         }
         let mut owners = (0..k + 1).map(|_| EngramDeviceRows::new(lib, rows,
             EngramDeviceRows::device_bytes(rows)?)).collect::<Result<Vec<_>>>()?;
-        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(rows), cuteafd_ffi::memory_ledger::TEST)?;
+        let mut source = lib.pinned_bytes(cuteafd_loader::EngramBatchStaging::payload_bytes(rows), crate::shared::memory::TEST)?;
         let holds = (0..k).map(|_| Ok(LoadStream { library: lib, raw: lib.cuda_stream_create()? }))
             .collect::<Result<Vec<_>>>()?;
         let mut gates = Vec::new();

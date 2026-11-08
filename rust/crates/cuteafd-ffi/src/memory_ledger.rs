@@ -75,8 +75,11 @@ pub struct Key {
     pub tag: Option<Tag>,
     /// Innermost context scope; the tag's owner when no scope is open.
     pub scope: &'static str,
-    /// The enclosing [`owner`] tag, if any. Category scopes nested inside an
-    /// owner (`sampler`, `workspace/fp8-linear`) relabel `scope` but keep it.
+    /// The enclosing accounting [`owner`] guard, if any: what plan == runtime
+    /// checks sum with [`Snapshot::by_owner`]. Distinct from `tag.owner` (the
+    /// component that made the allocation): a tag never sets or replaces it, so
+    /// removing a guard drops its bytes from those checks. Category scopes nested
+    /// inside an owner (`sampler`, `workspace/fp8-linear`) relabel `scope` but keep it.
     pub owner: Option<&'static str>,
     pub tensor: Option<&'static str>,
     pub format: Option<&'static str>,
@@ -732,10 +735,11 @@ pub fn current_cuda_memory_snapshot() -> Option<serde_json::Value> {
     }
 }
 
-/// Scratch allocated by tests and oracles. Absent from production builds, so
-/// serving code cannot borrow it instead of stating what it allocates.
-#[cfg(any(test, feature = "test-support"))]
-pub const TEST: Tag = Tag::new(MemoryKind::Workspace, "test/scratch");
+/// Scratch allocated by this crate's tests. Strictly `cfg(test)`: no feature
+/// exposes it, so no serving build can borrow it instead of stating a kind.
+/// Each consuming crate declares its own test-only constant.
+#[cfg(test)]
+pub(crate) const TEST: Tag = Tag::new(MemoryKind::Workspace, "test/scratch");
 
 /// Hold for the whole test, including allocation cleanup: audits observe all
 /// threads' events, not just the allocations owned by the current test.
@@ -885,6 +889,27 @@ mod tests {
         for ptr in base..base + 3 { record_free(ptr); }
         record_released(base + 3);
         assert_eq!(snapshot().total(Space::Device, 41), 0);
+    }
+
+    /// Accounting owners come only from `owner()` guards; a tag's component
+    /// owner never fills or overrides them, so by_owner sums stay exactly the
+    /// guarded allocations.
+    #[test]
+    fn tag_owner_is_not_an_accounting_owner() {
+        let _ledger = test_guard();
+        let base = 0x7900_0000_0000usize;
+        record_alloc(Space::Device, 42, base, 64, Some(Tag::workspace("test/component")));
+        {
+            let _owner = owner("test/accounting");
+            record_alloc(Space::Device, 42, base + 1, 128, Some(Tag::workspace("test/component")));
+        }
+        let snap = snapshot();
+        assert_eq!(snap.by_owner(Space::Device, 42).into_iter().collect::<Vec<_>>(), [("test/accounting", 128)]);
+        let rows = snap.rows.iter().filter(|r| r.key.device == 42).collect::<Vec<_>>();
+        assert!(rows.iter().all(|r| r.key.tag.unwrap().owner == "test/component"));
+        assert_eq!(rows.iter().filter(|r| r.key.owner.is_none()).map(|r| r.bytes).sum::<usize>(), 64);
+        record_free(base);
+        record_free(base + 1);
     }
 
     #[test]

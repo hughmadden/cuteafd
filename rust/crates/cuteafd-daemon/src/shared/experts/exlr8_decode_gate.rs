@@ -103,8 +103,8 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
                 ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }],
             spark_rings(config.max_frame_bytes)?, super::tp_gate::gate_executions(&catalog, MAX_ROWS as u32)?)?,
         Some(&manifest))?.select(&peers)?;
-    let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
-    let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, cuteafd_ffi::memory_ledger::TEST)?;
+    let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, crate::shared::memory::TEST)?;
+    let output = DeviceAllocation::new(&library, MAX_ROWS * row_bytes, crate::shared::memory::TEST)?;
     library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     let mut link = SparkLink::new(&library, spark_world, &peers, MAX_ROWS as u32, config, row_bytes)?;

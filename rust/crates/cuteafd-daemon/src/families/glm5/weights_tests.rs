@@ -255,7 +255,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
         let checked = layout.checked(root.path(), world, sparks + gpu as usize)?;
         let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
         device.run(|| -> Result<()> {
-            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES, crate::shared::memory::TEST)?;
             let fake = crate::shared::experts::rtx::dense::testing::FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
             let arena = DenseArena::new(device, layout, expected)?;
             crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)

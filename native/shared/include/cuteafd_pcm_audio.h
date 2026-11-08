@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include "cuteafd_media_backings.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -42,6 +43,11 @@ int32_t cuteafd_pcm_encode(void*, const uint16_t* padded_pcm, uint32_t samples,
                           cuteafd_pcm_observer, void* context);
 int32_t cuteafd_pcm_get_ledger(void*, cuteafd_pcm_ledger*);
 int32_t cuteafd_pcm_destroy(void*);
+// Passive: the owner's two device backings; no device change or synchronization.
+int32_t cuteafd_pcm_get_backings(void* owner, cuteafd_media_backings* out);
+// Destroy, reporting which backings were freed (CUTEAFD_MEDIA_RELEASED_*). A
+// backing whose free failed stays live and its bit stays clear.
+int32_t cuteafd_pcm_destroy_backings(void* owner, uint32_t* released);
 #ifdef __cplusplus
 }
 #endif

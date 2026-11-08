@@ -200,7 +200,7 @@ impl AudioRuntime {
         match config {
             AudioOwnerConfig::Pcm { spec, admitted_bytes } => Ok(Self::Pcm(spec.prepare(library, device, admitted_bytes)?)),
             AudioOwnerConfig::Mimo { spec, admitted_bytes } => {
-                let native = NativeAudio::prepare(library, spec.native(), device, admitted_bytes)?;
+                let native = NativeAudio::prepare(library, spec.native(), device, admitted_bytes, cuteafd_ffi::memory_ledger::MediaTags::new("media/mimo-audio"))?;
                 Ok(Self::Mimo { native, spec: *spec.native() })
             }
         }
@@ -224,7 +224,7 @@ impl AudioRuntime {
             )));
         }
         let weights = tower.plan.load_weights(admitted_bytes)?;
-        let native = NativeAudio::load_embedded(library, &spec, device, admitted_bytes, &weights)?;
+        let native = NativeAudio::load_embedded(library, &spec, device, admitted_bytes, &weights, cuteafd_ffi::memory_ledger::MediaTags::new("media/mimo-audio"))?;
         Ok(Self::Mimo { native, spec })
     }
     pub(super) fn ledger(&self) -> Result<AudioLedger> {

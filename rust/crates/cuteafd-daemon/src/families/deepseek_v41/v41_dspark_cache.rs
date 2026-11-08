@@ -490,11 +490,11 @@ mod reservation_tests {
         let first_write = window.prepare_async_write(&[chunk(first, 2)], 2)?;
         let second_write = window.prepare_async_write(&[chunk(second, 2)], 2)?;
         assert!(window.attention_read(&[(first, 2)]).is_err());
-        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, cuteafd_ffi::memory_ledger::TEST)?;
+        let ring = DeviceAllocation::new(&lib, V41DsparkCache::SLOT_BYTES, crate::shared::memory::TEST)?;
         assert!(window.capture_ring(first, ring.buffer).is_err());
         assert!(window.release(first).is_err());
         assert_eq!(window.committed_end(first)?, Some(2));
-        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, cuteafd_ffi::memory_ledger::TEST)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, cuteafd_ffi::memory_ledger::TEST)?];
+        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, crate::shared::memory::TEST)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES, crate::shared::memory::TEST)?];
         lib.copy_h2d(descriptors[0].buffer, first_write.descriptor_bytes())?;
         lib.copy_h2d(descriptors[1].buffer, second_write.descriptor_bytes())?;
         // Declare streams last: error unwinding drains them before tickets/buffers.

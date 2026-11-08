@@ -2152,8 +2152,8 @@ mod tests {
         for ranks in [2, 3, 4, 6] {
             let intake = SparkIntake::new(&library, IntakeMode::Pinned, ranks, 4096, 10240)?;
             let stream = WarmStream::new(&library)?;
-            let shared = DeviceAllocation::new(&library, 4096 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
-            let output = DeviceAllocation::new(&library, 4096 * 10240, cuteafd_ffi::memory_ledger::TEST)?;
+            let shared = DeviceAllocation::new(&library, 4096 * 10240, crate::shared::memory::TEST)?;
+            let output = DeviceAllocation::new(&library, 4096 * 10240, crate::shared::memory::TEST)?;
             let reducer = library.v41_compact_reducer()?;
             for rows in [1, 6, 80, 81, 256, 1024, 4096, 6] {
                 intake.before_dispatch()?;

@@ -333,7 +333,7 @@ mod tests {
             Rc::new(vec![Weights::load(devices[1], &catalog, 0, Weights::load_peak_device_bytes())?]),
         ];
         let mut lanes = [Wave::new(weights.clone(), capacity)?, Wave::new(weights, capacity)?];
-        let inputs = [Allocation::new(devices[0], capacity as usize*5120*2, cuteafd_ffi::memory_ledger::TEST)?, Allocation::new(devices[1], capacity as usize*5120*2, cuteafd_ffi::memory_ledger::TEST)?];
+        let inputs = [Allocation::new(devices[0], capacity as usize*5120*2, crate::shared::memory::TEST)?, Allocation::new(devices[1], capacity as usize*5120*2, crate::shared::memory::TEST)?];
         let producers = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         for (rows, nonzero) in [(1, false), (capacity, true), (1, true), (capacity, false)] {
@@ -381,7 +381,7 @@ mod tests {
             let device = Device { library: &lib, id };
             let weights = Rc::new(vec![Weights::load(device, &catalog, 0, Weights::load_peak_device_bytes())?]);
             ranks.push((RankWave::new(weights.clone(), 16)?, RankWave::new(weights, 16)?,
-                Allocation::new(device, 16*5120*2, cuteafd_ffi::memory_ledger::TEST)?, Stream::new(device)?));
+                Allocation::new(device, 16*5120*2, crate::shared::memory::TEST)?, Stream::new(device)?));
         }
         for nonzero in [false, true] {
             for (first, second, input, producer) in &mut ranks {
@@ -435,8 +435,8 @@ mod shared_storage_tests {
         let weights=[Rc::new(vec![Weights::load(devices[0],&catalog,0,Weights::load_peak_device_bytes())?]),
             Rc::new(vec![Weights::load(devices[1],&catalog,0,Weights::load_peak_device_bytes())?])];
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
-        let inputs=[ [Allocation::new(devices[0],16*10240, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(devices[1],16*10240, cuteafd_ffi::memory_ledger::TEST)?],
-            [Allocation::new(devices[0],16*10240, cuteafd_ffi::memory_ledger::TEST)?,Allocation::new(devices[1],16*10240, cuteafd_ffi::memory_ledger::TEST)?] ];
+        let inputs=[ [Allocation::new(devices[0],16*10240, crate::shared::memory::TEST)?,Allocation::new(devices[1],16*10240, crate::shared::memory::TEST)?],
+            [Allocation::new(devices[0],16*10240, crate::shared::memory::TEST)?,Allocation::new(devices[1],16*10240, crate::shared::memory::TEST)?] ];
         for (seed,pair) in inputs.iter().enumerate() {for input in pair {
             input.device.run(||lib.copy_h2d(input.buffer,&(if seed==0 {0x3e80u16}else {0xbe80u16}).to_ne_bytes().repeat(16*5120)))?;
         }}
@@ -452,7 +452,7 @@ mod shared_storage_tests {
             runtime.block_on(unsafe {slot.execute(0,16,i,inputs[i].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
         }
         let rank=storage.execution.try_lock().unwrap().ranks[0].output.buffer;
-        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), cuteafd_ffi::memory_ledger::TEST)?;
+        let reader=Stream::new(devices[1])?;let saved=Allocation::new(devices[1],want.len(), crate::shared::memory::TEST)?;
         devices[1].run(||unsafe {lib.copy_peer_async(saved.buffer,rank,want.len(),reader.raw)})?;reader.drain()?;
         let chains=[StageChain::on_devices(&lib,&[0,1])?,StageChain::on_devices(&lib,&[0,1])?];
         let gate=devices[1].run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;

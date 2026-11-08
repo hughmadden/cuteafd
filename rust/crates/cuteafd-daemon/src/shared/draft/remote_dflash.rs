@@ -312,7 +312,7 @@ mod tests {
             && head_tensor.meta.dtype == cuteafd_core::DType::Bf16, "component target head geometry/dtype");
         let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource::new(&target_path,
             &embedding_tensor.shard, &embedding_tensor.meta, cfg.hidden)?, EmbedPlacement::Gpu, || Ok(()))?;
-        let head = DeviceAllocation::new(&library, usize::try_from(head_tensor.meta.byte_length)?, cuteafd_ffi::memory_ledger::TEST)?;
+        let head = DeviceAllocation::new(&library, usize::try_from(head_tensor.meta.byte_length)?, crate::shared::memory::TEST)?;
         let mut head_bytes = vec![0; head.buffer.bytes];
         std::fs::File::open(target_path.join(&head_tensor.shard))?
             .read_exact_at(&mut head_bytes, head_tensor.meta.byte_offset)?;
