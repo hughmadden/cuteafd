@@ -148,6 +148,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 if "--split-device" in before["command"] and "--dspark" in before["command"]:
                     before["command"].insert(before["command"].index("--dspark") + 1, "--tp2-dspark-experts")
             if entry["family"] == "glm5_flash":
+                # Plan and serve defer auto to the shared checkpoint/topology resolver.
+                # The server publishes the resolved head in report settings and its load log.
+                head = after["command"].index("--fp8-head")
+                assert after["command"].count("--fp8-head") == 1
+                assert after["command"][head + 1] == "auto"
+                before["command"][before["command"].index("--fp8-head") + 1] = "auto"
                 # Preserve historical whole-drafter commands with the now-explicit choice.
                 # On max pairs this is the mock planner's selection, not a fit assertion.
                 position = after["command"].index("--tp2-dflash")

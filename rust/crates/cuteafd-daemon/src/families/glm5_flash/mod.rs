@@ -623,6 +623,14 @@ mod draft_cli_tests {
             native::normalize_head(&mut serve, native);
             assert_eq!(plan.head_format.resolve(native, ranks), expected);
             assert_eq!(serve.head_format, expected);
+            let mut context = cuteafd_bench::context::ServerContext::default();
+            context.require_resolved("fp8-head");
+            for (name, value) in native::resolved_settings(&serve) { context.resolve(name, &value); }
+            let settings = context.report_settings();
+            let reported = settings.iter().find(|setting| setting.name == "fp8-head").unwrap();
+            assert_eq!(reported.source, "resolved");
+            assert_eq!(reported.value.as_deref(), Some(expected.setting()));
+            assert_ne!(reported.value.as_deref(), Some("auto"));
         }
     }
 

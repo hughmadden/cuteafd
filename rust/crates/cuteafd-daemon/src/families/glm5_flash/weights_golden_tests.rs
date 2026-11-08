@@ -64,7 +64,8 @@ fn packed_head_push_delivers_one_transient_source_before_arena_pack() -> Result<
     assert_eq!(records.operands[0].buffer.ptr, source.allocations()[0].ptr);
     assert_eq!(records.operands[0].bytes, vocab * hidden * 2);
     assert_eq!(records.operands[0].lands.len(), 1);
-    let sockets = tempfile::tempdir_in(fixture.directory())?;
+    // AF_UNIX paths must fit even when the Cargo fixture lives under a long task root.
+    let sockets = tempfile::Builder::new().prefix("glmf-").tempdir_in("/tmp")?;
     crate::shared::experts::rtx::push::tests::receive_pushed(Device { library: &library, id: 0 },
         None, root.path(), sockets.path(), &records, None, 0, 0)?;
     let packed = source.pack(&library, vocab, hidden, loader.arenas.get(&0))?;

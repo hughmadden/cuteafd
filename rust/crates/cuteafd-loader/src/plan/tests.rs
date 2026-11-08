@@ -3503,8 +3503,10 @@ fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
             glmf_representation: GlmfRepresentation { head, ..Default::default() }, ..Default::default() }), ..sparks(4) };
         plan(dir.path(), &options).unwrap()
     };
+    // Arena tails inherit Weights; compare requested bytes, not rounded physical backings.
     let weights = |memory: &MemoryLayout| memory.devices[0].items.iter()
-        .filter(|item| item.category == Category::Weights).map(|item| item.bytes).sum::<u64>();
+        .filter(|item| item.category == Category::Weights && item.group == "weight arena")
+        .map(|item| item.bytes).sum::<u64>();
     let draft_scratch = |memory: &MemoryLayout| memory.devices[0].items.iter()
         .filter(|item| item.group == "packed head draft scratch").map(|item| item.bytes).sum::<u64>();
     let [bf16, fp8, packed] = [GlmfHeadFormat::Bf16, GlmfHeadFormat::Fp8, GlmfHeadFormat::Packed].map(|head| {
