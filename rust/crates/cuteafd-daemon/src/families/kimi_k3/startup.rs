@@ -193,6 +193,10 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-context-attention")?;
     let diagnostics = std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").is_ok_and(|v| v == "1");
     let inventory = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight, |_| {
+        // Load the TP2 native module set inside the measured baseline on both
+        // layouts: `Waves::start` would otherwise load it after admission, where
+        // its module images are an uncharged owner.
+        library.tp2_native_initialize()?;
         if RANKS == 2 {
             library.peer_exchange_initialize()?;
             library.peer_abort_initialize()?;
@@ -341,11 +345,19 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         for rank in 0..RANKS {
             let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
             let count = set.inventory.ranks[rank].executables;
+            let reserved = set.inventory.bytes(rank);
             tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = set.inventory.bytes(rank), reserve = "estimated",
+                reserved_bytes = reserved, reserve = "estimated",
                 "Kimi startup graph census");
-            ensure!(bytes <= set.inventory.bytes(rank), "Kimi startup graphs exceed admitted reserve");
+            if bytes > reserved {
+                let per_executable = bytes.div_ceil(count.max(1));
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserved,
+                    bytes_per_executable = per_executable,
+                    "Kimi startup capture exceeds its calibrated estimate; update \
+                     cuteafd_loader::families::kimi_k3::allocation::GRAPH_CENSUS_BYTES with this capture");
+            }
+            ensure!(bytes <= reserved, "Kimi startup graphs exceed admitted reserve");
         }
     }
     Ok(Loaded { engine, admission_free, admitted_bytes, ownership })
@@ -411,6 +423,17 @@ mod tests {
         for mode in [None, Some(AttentionPlacement::Heads), Some(AttentionPlacement::Layers)] {
             assert!(check_attention(mode, 2, false).is_ok());
         }
+    }
+
+    #[test]
+    fn native_modules_load_inside_the_measured_baseline_on_every_layout() {
+        let source = include_str!("startup.rs");
+        let measured = source.split("RuntimeInventory::measure(library, &options.devices, InventoryPhase::PreWeight")
+            .nth(1).unwrap().split("let lane_layouts").next().unwrap();
+        let native = measured.find("library.tp2_native_initialize()?").unwrap();
+        let peer = measured.find("if RANKS == 2 {").unwrap();
+        assert!(native < peer, "Spark intake native modules must be sampled on one rank too");
+        assert_eq!(measured.matches("library.tp2_native_initialize()?").count(), 1);
     }
 
     fn projection(stem:&str)->CoreProjection {
