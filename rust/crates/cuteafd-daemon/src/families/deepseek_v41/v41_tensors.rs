@@ -370,6 +370,7 @@ impl<'library> VocabularyHead<'library> {
         budget: usize, staging_bytes: usize, arena: Option<&DeviceWeightArena<'library>>) -> Result<Self> {
         Ok(Self { shard: VocabularyShard::load_in(library, catalog, 0..129280, budget, staging_bytes, arena)? })
     }
+    pub fn finish_push(&self) -> Result<()> { self.shard.finish_push() }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.shard.weight() }
     pub fn device_id(&self) -> i32 { self.shard.device_id() }
     pub fn copy(&self) -> Option<HeadCopy<'_, 'library>> { self.shard.copy() }

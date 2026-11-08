@@ -14,7 +14,7 @@ use crate::shared::memory::Tag;
 pub(crate) struct PackedHead<'a> {
     storage: DeviceAllocation<'a>,
     layout: PackedHeadLayout,
-    status: PackStatus,
+    status: std::cell::Cell<Option<PackStatus>>,
     pub n: usize,
     pub k: usize,
 }
@@ -46,11 +46,31 @@ impl<'a> PackedHead<'a> {
     pub fn pack_with(library: &'a NativeLibrary, w: *const c_void, n: usize, k: usize, stream: *mut c_void,
         allocate: impl FnMut(&str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>)
         -> Result<Self> {
+        let head = Self::allocate_with(library, n, k, allocate)?;
+        head.initialize(w, stream)?;
+        Ok(head)
+    }
+
+    /// Reserve the final arena view before push delivery and workspace construction.
+    /// Projections are refused until `initialize` has drained and verified the pack.
+    pub fn allocate_with(library: &'a NativeLibrary, n: usize, k: usize,
+        allocate: impl FnMut(&str, usize) -> Result<crate::shared::memory::device::Allocation<'a>>)
+        -> Result<Self> {
         let layout = PackedHeadLayout::new(n, k)?;
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };
         let storage = DeviceAllocation::from_allocation(crate::shared::memory::weight_arena::checked_weight_allocation(
             device, "packed12", layout.total_bytes(), allocate)?);
-        let status = status_buffer(storage.buffer, &layout);
+        Ok(Self { storage, layout, status: std::cell::Cell::new(None), n, k })
+    }
+
+    /// Pack a delivered BF16 source once, retaining all operands through the drain.
+    pub fn initialize(&self, w: *const c_void, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(self.status.get().is_none(), "packed head already initialized");
+        let library = self.storage.library;
+        anyhow::ensure!(library.cuda_get_device()? == self.storage.buffer.device_id,
+            "packed head initialized on another device");
+        let (storage, layout, n, k) = (&self.storage, &self.layout, self.n, self.k);
+        let status = status_buffer(storage.buffer, layout);
         // SAFETY: `w` is a live [n, k] BF16 weight; the planes and status are regions of `storage`,
         // sized by `layout` for this shape and `layout.capacity` table entries.
         let launched = unsafe { library.packed_head_pack(w, &planes(storage.buffer, &layout), layout.capacity, n, k,
@@ -60,7 +80,6 @@ impl<'a> PackedHead<'a> {
         if let Err(drain) = unsafe { library.cuda_stream_synchronize(stream) } {
             // Completion is unknown: retain the destination until process teardown.
             library.quarantine_module_after_failed_drain();
-            std::mem::forget(storage);
             let error = launched.err().unwrap_or_else(|| anyhow::anyhow!("packed head [{n}, {k}] pack"));
             return Err(error.context(format!(
                 "packed head destination and native module quarantined after failed drain: {drain}")));
@@ -70,7 +89,8 @@ impl<'a> PackedHead<'a> {
         library.copy_d2h(&mut words, status)?;
         let status = PackStatus::from_bytes(&words);
         status.check(layout.capacity).with_context(|| format!("packed head [{n}, {k}]"))?;
-        Ok(Self { storage, layout, status, n, k })
+        self.status.set(Some(status));
+        Ok(())
     }
 
     /// Device bytes of the head (the planner's [`PackedHeadLayout::bytes`]).
@@ -85,7 +105,9 @@ impl<'a> PackedHead<'a> {
     pub fn buffer(&self) -> CuteafdDeviceBuffer { self.storage.buffer }
 
     /// Values outside their rows' windows, and the most in any row.
-    pub fn exceptions(&self) -> (u64, u64) { (self.status.exceptions, self.status.max_row_exceptions) }
+    pub fn exceptions(&self) -> (u64, u64) {
+        self.status.get().map_or((0, 0), |status| (status.exceptions, status.max_row_exceptions))
+    }
 
     /// `out` [rows, n] (BF16, or FP32 with `out_f32`) = `x` [rows, k] @ W^T: the exact BF16
     /// weights, or with `coarse` the coarse plane alone (mantissa bits 3..0 at their midpoint).
@@ -96,6 +118,7 @@ impl<'a> PackedHead<'a> {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn apply(&self, library: &NativeLibrary, x: *const c_void, out: *mut c_void, out_f32: bool, rows: usize,
         coarse: bool, scratch: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        anyhow::ensure!(self.status.get().is_some(), "packed head has not been initialized");
         // SAFETY: the caller's contract; the planes are this head's live regions.
         unsafe { library.packed_head_linear(x, &planes(self.storage.buffer, &self.layout), out, out_f32, rows, self.k,
             self.n, coarse, scratch.ptr, scratch.bytes, stream) }
@@ -143,8 +166,14 @@ mod tests {
         let baseline = device.run(|| PackedHead::pack(&library, source.buffer.ptr, n, k, std::ptr::null_mut()))?;
         let layout = PackedHeadLayout::new(n,k)?;
         let arena = DeviceWeightArena::new(device, WeightArenaLayout::new("test/head", [("packed12".into(), layout.total_bytes())])?, crate::shared::memory::TEST_ARENA)?;
-        let packed = device.run(|| PackedHead::pack_with(&library, source.buffer.ptr, n, k, std::ptr::null_mut(),
+        let packed = device.run(|| PackedHead::allocate_with(&library, n, k,
             |name, bytes| arena.view(name, bytes)))?;
+        assert!(packed.status.get().is_none());
+        let scratch = device.run(|| super::scratch(&library, 1, &[(k,n)]))?;
+        assert!(unsafe { packed.apply(&library, std::ptr::null(), std::ptr::null_mut(), true, 1,
+            false, &scratch, std::ptr::null_mut()) }.is_err());
+        device.run(|| packed.initialize(source.buffer.ptr, std::ptr::null_mut()))?;
+        assert!(device.run(|| packed.initialize(source.buffer.ptr, std::ptr::null_mut())).is_err());
         drop(arena);
         let expected = [(Region::Coarse, reference.coarse),
             (Region::Fine, reference.fine.iter().flat_map(|v| v.to_le_bytes()).collect()),
