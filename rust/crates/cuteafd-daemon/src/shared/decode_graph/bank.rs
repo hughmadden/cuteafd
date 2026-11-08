@@ -26,6 +26,34 @@ pub(crate) enum GraphDecision {
     Eager,
 }
 
+/// One distinct shape a sealed startup set did not contain, with every eager
+/// execution of it. Kept process-wide rather than per bank so /v1/stats reports
+/// it without threading a bank handle through the scheduler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingVariant {
+    pub family: &'static str,
+    pub shape: String,
+    pub runs: u64,
+}
+
+static MISSING: std::sync::Mutex<Vec<MissingVariant>> = std::sync::Mutex::new(Vec::new());
+
+/// Counts one eager execution of `shape` and reports whether it is the first,
+/// which is the only occurrence that warns. A bank miss is a mismatch between
+/// the sealed startup inventory and real traffic, so it is rare by construction.
+fn note_missing(family: &'static str, shape: &str) -> bool {
+    let mut missing = MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match missing.iter_mut().find(|entry| entry.family == family && entry.shape == shape) {
+        Some(entry) => { entry.runs += 1; false }
+        None => { missing.push(MissingVariant { family, shape: shape.to_owned(), runs: 1 }); true }
+    }
+}
+
+/// Every distinct startup-set miss, in first-seen order (its /v1/stats form).
+pub(crate) fn missing_variants() -> Vec<MissingVariant> {
+    MISSING.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+}
+
 struct Entry<E> {
     exec: E,
     launched: u64,
@@ -37,6 +65,7 @@ pub(crate) struct GraphBank<K, E> {
     entries: HashMap<K, Entry<E>>,
     seen: HashSet<K>,
     policy: GraphPolicy,
+    family: &'static str,
     startup: Option<DeclaredGraphSet<K>>,
     startup_sealed: bool,
     clock: u64,
@@ -53,7 +82,13 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn with_policy(policy: GraphPolicy) -> Self {
-        Self { entries: HashMap::new(), seen: HashSet::new(), policy, startup: None, startup_sealed: false,
+        Self::with_family(policy, "shared")
+    }
+
+    /// Names the owning family in startup-miss warnings and /v1/stats, so a
+    /// shared bank's miss is attributable without looking up its construction.
+    pub fn with_family(policy: GraphPolicy, family: &'static str) -> Self {
+        Self { entries: HashMap::new(), seen: HashSet::new(), policy, family, startup: None, startup_sealed: false,
             clock: 0, stats: GraphStats::default(), measured_bytes: 0, measured: 0,
             frozen: None, retired: Vec::new() }
     }
@@ -114,15 +149,30 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn enqueue(&mut self, key: &K) -> (GraphDecision, Option<&E>) {
+        self.enqueue_with_context(key, String::new)
+    }
+
+    /// A sealed startup miss runs eagerly and already costs the request its
+    /// graphed path, so it warns once per distinct variant with the family, the
+    /// shape key and the caller's request context. `context` is evaluated only
+    /// on that first miss, leaving replay and warm-startup paths untouched.
+    pub fn enqueue_with_context(&mut self, key: &K, context: impl FnOnce() -> String)
+        -> (GraphDecision, Option<&E>) {
         let decision = if self.entries.contains_key(key) { GraphDecision::Replay }
             else if self.capture_allowed(key) { GraphDecision::Capture }
             else { GraphDecision::Eager };
         if decision == GraphDecision::Eager {
             self.stats.eager_runs += 1;
-            let count = self.stats.eager_runs;
-            if count <= 8 || count.is_power_of_two() {
-                tracing::info!(target: "cuteafd::graph_capture", bank = self as *const Self as usize, ?key, eager_runs = count,
-                    "fixed startup unknown graph key executed eagerly");
+            // Eager requires a sealed (or declared) startup set, so every miss
+            // is a shape the planner's inventory lacked.
+            let shape = format!("{key:?}");
+            if note_missing(self.family, &shape) {
+                // Built outside the macro so the description is produced even
+                // when the current subscriber filters this target out.
+                let context = context();
+                tracing::warn!(target: "cuteafd::graph_capture", family = self.family, key = %shape,
+                    context = %context, eager_runs = self.stats.eager_runs,
+                    "graph shape outside the startup set ran eagerly; consider adding it to the startup graph set");
             }
         }
         (decision, self.launch(key))
@@ -231,7 +281,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 impl<K, E> Drop for GraphBank<K, E> {
     fn drop(&mut self) {
         if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
-            tracing::info!(target: "cuteafd::graph_capture", bank = self as *const Self as usize,
+            tracing::info!(target: "cuteafd::graph_capture", family = self.family, bank = self as *const Self as usize,
                 eager_runs = self.stats.eager_runs, captures = self.stats.captures,
                 "fixed startup graph bank final counters");
         }
@@ -258,6 +308,26 @@ mod tests {
         let mut duplicate = GraphBank::with_policy(GraphPolicy::FixedStartup);
         assert!(duplicate.warm(&[1, 1], |key| Ok((*key, None))).is_err());
     }
+    #[test]
+    fn sealed_miss_counts_once_per_variant_and_builds_context_only_for_the_first() {
+        const FAMILY: &str = "bank-test-startup-miss";
+        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, FAMILY);
+        bank.warm(&[1u32], |key| Ok((*key, Some(10)))).unwrap();
+        assert_eq!(bank.enqueue_with_context(&1, || panic!("replay must not build a context")).0,
+            GraphDecision::Replay);
+        let contexts = std::cell::Cell::new(0);
+        for _ in 0..3 {
+            assert_eq!(bank.enqueue_with_context(&2, || { contexts.set(contexts.get() + 1); "batch=2".into() }),
+                (GraphDecision::Eager, None));
+        }
+        assert_eq!(bank.enqueue(&3).0, GraphDecision::Eager);
+        assert_eq!(contexts.get(), 1, "only a variant's first miss describes its request");
+        let ours: Vec<_> = missing_variants().into_iter().filter(|miss| miss.family == FAMILY).collect();
+        assert_eq!(ours.iter().map(|miss| (miss.shape.as_str(), miss.runs)).collect::<Vec<_>>(),
+            vec![("2", 3), ("3", 1)]);
+        assert_eq!(bank.stats().eager_runs, 4);
+    }
+
     #[test]
     fn startup_inventory_fails_closed_on_missing_or_extra_keys() {
         let mut bank = GraphBank::new(None);

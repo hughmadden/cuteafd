@@ -41,7 +41,7 @@
 //! homes. The LM head stays on rank 0; the drafter follows its admitted movable placement.
 //! Explicit per-layer placement keeps KDA/FFNs split and assigns each MLA layer
 //! (complete operands, KV and index state) to one owner with BF16 residual handoff.
-use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphStats};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy, GraphStats};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -1799,7 +1799,7 @@ impl<'a> GlmfEngine<'a> {
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
-            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), prewarming_graphs: std::cell::Cell::new(false),
@@ -2110,7 +2110,8 @@ impl<'a> GlmfEngine<'a> {
                 self.terminal_links(|link| link.terminal_release())?;
                 self.layer_waves.borrow_mut().clear();
                 for rank in 0..self.ranks() {
-                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+                    self.on(rank, || { *self.graphs_of(rank).borrow_mut() =
+                    GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash"); Ok(()) })?;
                 }
                 Ok(())
             },
@@ -2795,7 +2796,7 @@ impl<'a> GlmfEngine<'a> {
                 self.caches.pool_marks)?;
             Ok(GlmfPeer { device, stream, layers, caches,
                 decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
-                graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
+                graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: self.graphs.borrow().budget() }, "glm5_flash")), l2: None })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(std::rc::Rc::new(exchange));
@@ -4556,9 +4557,14 @@ impl<'a> GlmfEngine<'a> {
         self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
+        // Only a startup-set miss builds this context, describing which rank
+        // and warm-up phase needed a shape its declared inventory lacked.
+        let prewarming = self.prewarming_graphs.get();
+        let calibrating = graphs.borrow().calibrating();
         let (decision, cached) = {
             let mut graphs = graphs.borrow_mut();
-            let (decision, graph) = graphs.enqueue(&key);
+            let (decision, graph) = graphs.enqueue_with_context(&key, || format!(
+                "rank={rank} prewarming={prewarming} calibrating={calibrating}"));
             (decision, graph.map(|graph| graph.raw))
         };
         if let Some(exec) = cached {
