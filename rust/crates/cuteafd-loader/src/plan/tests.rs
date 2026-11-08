@@ -3093,22 +3093,26 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             assert!(workspace_tail > 0 && tails >= workspace_tail, "{workspace_tail} {tails}");
             let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
             assert_eq!(runtime[0].pool_unit_device_bytes, (2 * crate::serving_capacity::V4_PACKED_MEMBERS as u64 + 64) * 4);
-            // Pool-scaled owners: each per-layer records/index slice and each
-            // lane's C4 page table is its own cudaMalloc, rounded independently.
+            // Each per-layer records/index slice and lane's C4 page table is
+            // one direct cudaMalloc: <=1 MiB shares blocks, larger requests
+            // round independently to 2 MiB (#1607).
             let sequences = cuteafd_core::serving_capacity::default_concurrency(total);
             let units = 32768 / 256 + sequences;
-            let round = |bytes: u64| bytes.div_ceil(2 << 20) * (2 << 20);
+            let backing = |bytes: u64| if bytes <= (1 << 20) { bytes }
+                else { bytes.div_ceil(2 << 20) * (2 << 20) };
+            assert!(units * 1_728 <= (1 << 20), "C128 records share driver blocks");
+            assert!(units * 8_448 > (1 << 20), "C4 records/index round independently");
             let records = device.items.iter().find(|item| item.group == "records").unwrap();
             let expected: u64 = cfg.compress_ratios.iter().map(|&ratio| match ratio {
-                4 => round(units * 37_440) + round(units * 8_448),
-                128 => round(units * 1_728),
+                4 => backing(units * 37_440) + backing(units * 8_448),
+                128 => backing(units * 1_728),
                 _ => 0,
             }).sum();
             assert_eq!(records.bytes, expected);
             let lane = crate::serving_capacity::deepseek_v4_lane_page_tables(64).unwrap();
             let tables = device.items.iter().find(|item| item.group == "lane page tables").unwrap();
-            assert_eq!(tables.bytes, runtime[0].prefill_waves * round(units * lane.prefill_unit_bytes
-                + lane.prefill_fixed_bytes) + round(units * lane.decode_unit_bytes));
+            assert_eq!(tables.bytes, runtime[0].prefill_waves * backing(units * lane.prefill_unit_bytes
+                + lane.prefill_fixed_bytes) + backing(units * lane.decode_unit_bytes));
             assert_eq!(cache.ranks[0].persistent_unit_bytes, cfg.compress_ratios.iter()
                 .map(|&ratio| crate::serving_capacity::deepseek_v4_layer_unit_bytes(ratio)).sum::<u64>());
             // The named reserve is the V4 family constant (0), independent of
