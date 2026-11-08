@@ -77,6 +77,13 @@ impl<'a> MuseDraft<'a> {
             (vec![device.id], 0)
         };
         let arenas = drafter_arenas(device, snapshot, &devices, head_rank, representation)?;
+        for rank in 0..devices.len() {
+            let exchange_rank = if rank == 0 { head_rank } else { 1 - head_rank };
+            let id = devices[exchange_rank];
+            let arena = arenas.get(&id).context("Muse admitted drafter arena device")?;
+            ensure!(*arena.layout() == admitted.arena(rank, u8::try_from(id)?)?,
+                "Muse drafter arena differs from its admitted immutable recipe");
+        }
         let allocate = |id, name: &str, bytes| {
             let arena = arenas.get(&id).context("Muse drafter requested an unplanned physical device")?;
             weight_allocation(Device { library: device.library, id }, Some(arena), name, bytes)
@@ -186,7 +193,16 @@ mod tests {
         fixture.extent_only(&library)?;
         fixture.strict_device_free(&library, true)?;
         for id in 0..2 { fixture.configure_memory(&library, id, 96usize << 30)?; }
+        let target = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
+        let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let draft = cuteafd_loader::placement::families::muse_spark::drafter_inventory(
+            &target, &config, 16, 16, 202_112, 188,
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?;
         for devices in [vec![1], vec![0, 1], vec![1, 0]] {
+            let admitted = if devices.len() == 2 {
+                draft.clone().with_tp2(&snapshot, &[188; 2],
+                    cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8)?
+            } else { draft.clone() };
             let head_rank = devices.len() - 1;
             let head = Device { library: &library, id: devices[head_rank] };
             let requests = DflashDrafter::arena_requests(&snapshot, Bf16Only, &devices, head_rank)?;
@@ -196,6 +212,16 @@ mod tests {
             let topology = CoordinatorDevices::new(&devices)?;
             for (&id, requests) in &requests {
                 let arena = arenas.get(&id).context("missing Muse drafter arena")?;
+                let rank = if id == devices[head_rank] { 0 } else { 1 };
+                let planned = admitted.arena(rank, u8::try_from(id)?)?;
+                assert_eq!(arena.layout(), &planned, "planner/runtime exact views and offsets");
+                let expected = match (devices.len(), rank) {
+                    (1, 0) => (8_768_326_144usize, 1_963_520usize),
+                    (2, 0) => (4_993_452_544, 1_963_520),
+                    (2, 1) => (4_782_361_088, 1_242_624),
+                    _ => unreachable!(),
+                };
+                assert_eq!((planned.bytes(), planned.bytes().div_ceil(2 << 20) * (2 << 20) - planned.bytes()), expected);
                 let device = Device { library: &library, id };
                 let mut inventory = Inventory::new(topology, &format!("muse.draft.{id}"),
                     Lifetime { first: Phase::DraftLoad, last: Phase::Growth }, Category::Drafter, "Muse drafter");

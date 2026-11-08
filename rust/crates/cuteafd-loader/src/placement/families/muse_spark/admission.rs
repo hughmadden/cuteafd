@@ -866,6 +866,21 @@ impl Recipe for MuseRecipe<'_> {
             let home = u8::try_from(self.gpus - 1).map_err(|_| Refusal::Overflow("Muse GPUs"))?;
             let variable = contract.variables.len();
             contract.variables.push(Variable::DraftHome(vec![home]));
+            let activation = Activation::choice(variable, 0);
+            let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            let ranks = if drafter.tp2.is_empty() { 1 } else { 2 };
+            if drafter.arena_requests.len() != ranks {
+                return Err(invalid("Muse drafter arena recipes differ from its rank count"));
+            }
+            for rank in 0..ranks {
+                let gpu = if ranks == 1 { home } else { (1 - rank) as u8 };
+                let arena = drafter.arena(rank, gpu).map_err(anyhow_refusal)?;
+                for mut component in weight_arena_components(&arena, Location::coordinator(gpu),
+                    lifetime, self.maximum_pages)? {
+                    component.activation = activation.clone();
+                    contract.components.push(component);
+                }
+            }
             if !drafter.tp2.is_empty() {
                 if self.gpus != 2 || drafter.tp2.len() != 2 {
                     return Err(invalid("Muse TP2 drafter needs two rank-local layouts"));
@@ -873,27 +888,26 @@ impl Recipe for MuseRecipe<'_> {
                 for (rank, layout) in drafter.tp2.iter().enumerate() {
                     let location = Location::coordinator((1 - rank) as u8);
                     let prefix = format!("muse.drafter.rank{rank}");
-                    for owner in layout.allocations(&prefix, location) {
+                    let weights = layout.weight_owners().map(|owner| format!("{prefix}.{}", owner.id))
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for owner in layout.allocations(&prefix, location).into_iter()
+                        .filter(|owner| !weights.contains(&owner.id)) {
                         let bytes = ByteCurve::fixed(owner.bytes, self.maximum_pages);
-                        contract.components.push(Component::allocation(owner, bytes, false, self.maximum_pages));
-                    }
-                    for owner in layout.weight_owners() {
-                        contract.components.push(Component::resident_weight(ResidentWeight {
-                            id: format!("{prefix}.{}", owner.id), location,
-                            weights: ResidentWeights(owner.bytes),
-                        }, ByteCurve::fixed(owner.bytes, self.maximum_pages)));
+                        let mut component = Component::allocation(owner, bytes, false, self.maximum_pages);
+                        component.activation = activation.clone();
+                        contract.components.push(component);
                     }
                 }
             }
             let owned = if drafter.tp2.is_empty() {
-                drafter.owned.checked_add(drafter.scratch).ok_or(Refusal::Overflow("Muse drafter"))?
+                drafter.owned.checked_sub(drafter.weights.0).and_then(|bytes| bytes.checked_add(drafter.scratch))
+                    .ok_or(Refusal::Overflow("Muse drafter nonweight storage"))?
             } else { 0 };
-            let resident = if drafter.tp2.is_empty() { drafter.weights.0 } else { 0 };
             let bytes = [owned, drafter.head_scratch, drafter.runtime].into_iter()
                 .try_fold(0u64, |sum, bytes| sum.checked_add(bytes)).ok_or(Refusal::Overflow("Muse drafter"))?;
-            for mut component in weights("muse.drafter".into(), Location::coordinator(home), bytes,
-                resident, Category::Drafter, "Drafter", self.maximum_pages)? {
-                component.activation = Activation::choice(variable, 0);
+            if let Some(mut component) = buffer("muse.drafter".into(), Location::coordinator(home), bytes,
+                Lifetime::RESIDENT, Category::Drafter, "Drafter", self.maximum_pages) {
+                component.activation = activation;
                 contract.components.push(component);
             }
         }
@@ -945,6 +959,77 @@ impl PreparedMuse<'_> {
 #[cfg(test)]
 mod contract_tests {
     use super::*;
+
+    #[test]
+    fn drafter_arena_contract_replaces_only_weights_and_preserves_chronology() {
+        use crate::families::glm5::{draft_physical::{GlmDflashConfig, GlmDflashPhysicalLayout,
+            gqa_arena_requests}, draft_representation::GlmDraftCapacity};
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let config = serde_json::from_str(include_str!(
+            "../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/nvidia.json")).unwrap();
+        let draft_cfg = GlmDflashConfig::from_value(&config).unwrap();
+        let base = super::super::drafter_inventory(&cfg, &config, 16, 16, 202_112, 188,
+            crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+        for ranks in [1, 2] {
+            let mut draft = base.clone();
+            if ranks == 2 {
+                let capacity = GlmDraftCapacity::new(16, 16, draft.block).unwrap();
+                for rank in 0..2 {
+                    let physical = GlmDflashPhysicalLayout::new(&draft_cfg.for_tp(2).unwrap(),
+                        draft.representation, capacity, 188, 2,
+                        crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+                    // Synthetic rank owners exercise the immutable/nonweight filter;
+                    // the installed fixture covers read_tp's real peer exclusions.
+                    draft.tp2.push(physical);
+                    if rank == 0 { draft.arena_requests.clear(); }
+                    draft.arena_requests.push(gqa_arena_requests(&draft_cfg, draft.representation, rank, 2).unwrap());
+                }
+            }
+            let off = EncoderPlacement { kind: crate::plan::encoder::EncoderKind::Off,
+                weights: 0, scratch: 0, replicas: vec![], reason: String::new(), shortfall: 0 };
+            let prefill = PrefillShape { rows: 64, waves: 1 };
+            let recipe = MuseRecipe { cfg: &cfg, context: 64, gpus: 2, maximum_pages: 1, prefill,
+                attention: vec![LayerMode::HeadSplit; cfg.layers], spark_ranks: 6,
+                encoders: vec![(off.clone(), off)], modes: (MediaMode::Off, MediaMode::Off),
+                cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1], local: LocalPackage::Unknown,
+                drafter: Some(draft.clone()) };
+            let request = production_request(64, None, Onboard::Auto, prefill, Operation::Serving, None,
+                SparkReplyFormats::default());
+            let contract = recipe.prepare(&request).unwrap();
+            assert_eq!(contract.phase_order, PhaseOrder::TARGET_THEN_DRAFT);
+            let variable = contract.variables.iter().position(|value| matches!(value, Variable::DraftHome(_))).unwrap();
+            for component in &contract.components {
+                assert_eq!(component.activation, Activation::choice(variable, 0));
+            }
+            let selected = vec![0; contract.variables.len()];
+            let facts = contract.facts(&selected, 1).unwrap();
+            assert_eq!(facts.resident_weights.len(), ranks);
+            assert_eq!(facts.allocation_granularity.len(), ranks);
+            for rank in 0..ranks {
+                let gpu = if ranks == 1 { 1 } else { (1 - rank) as u8 };
+                let arena = draft.arena(rank, gpu).unwrap();
+                let root = facts.allocations.iter().find(|owner| owner.id == arena.id()).unwrap();
+                assert_eq!((root.location, root.bytes, root.lifetime), (Location::coordinator(gpu),
+                    arena.bytes() as u64, Lifetime { first: Phase::DraftLoad, last: Phase::Growth }));
+                let tail = facts.allocation_granularity.iter().find(|owner| owner.id == format!("{}.tail", root.id)).unwrap();
+                assert_eq!(tail.lifetime, root.lifetime);
+                assert_eq!(tail.backings, [GranularityBacking { backing: root.id.clone(), requests: vec![root.bytes] }]);
+                if ranks == 2 {
+                    let layout = &draft.tp2[rank];
+                    let weights = layout.weight_owners().map(|owner| owner.id.as_str()).collect::<std::collections::BTreeSet<_>>();
+                    for owner in layout.owners() {
+                        let id = format!("muse.drafter.rank{rank}.{}", owner.id);
+                        assert_eq!(facts.allocations.iter().any(|allocation| allocation.id == id), !weights.contains(owner.id.as_str()));
+                    }
+                }
+            }
+            let nonweights = facts.allocations.iter().find(|owner| owner.id == "muse.drafter").unwrap();
+            assert_eq!(nonweights.bytes, draft.head_scratch + draft.runtime + if ranks == 1 {
+                draft.owned - draft.weights.0 + draft.scratch
+            } else { 0 });
+            assert_eq!(nonweights.lifetime, Lifetime::RESIDENT);
+        }
+    }
 
     #[test]
     fn capped_sample_keeps_physical_occupied_bytes() {
