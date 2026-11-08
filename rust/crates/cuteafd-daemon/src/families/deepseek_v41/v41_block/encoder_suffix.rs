@@ -1,4 +1,5 @@
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::DeviceAllocation;
 use cuteafd_loader::placement::families::deepseek_v41::owners;
 
@@ -51,8 +52,8 @@ impl<'a> EncoderSuffix<'a> {
     }
     /// A startup arena of `rows` suffix rows, at rest (no prompt bound).
     fn arena(library: &'a NativeLibrary, rows: usize) -> Result<Self> {
-        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::untagged(library, rows * 40960)?),
-            pre: std::rc::Rc::new(DeviceAllocation::untagged(library, rows * 16)?), tokens: Vec::new(),
+        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960, Tag::workspace("v41/encoder-suffix"))?),
+            pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/encoder-suffix"))?), tokens: Vec::new(),
             next: 0, end: 0, binding: QueryBinding::new(19)?, invalid: true, packed: None })
     }
     /// One serially reused arena, charged before KV pool admission.

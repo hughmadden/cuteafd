@@ -4,7 +4,7 @@ use crate::shared::memory::LoadStream;
 use cuteafd_ffi::{V41Compressor, V41SparseSource, V41SparseWindow};
 
 fn filled<'a>(lib: &'a NativeLibrary, bytes: &[u8]) -> Result<DeviceAllocation<'a>> {
-    let allocation = DeviceAllocation::untagged(lib, bytes.len())?;
+    let allocation = DeviceAllocation::new(lib, bytes.len(), crate::shared::memory::TEST)?;
     lib.copy_h2d(allocation.buffer, bytes)?;
     Ok(allocation)
 }
@@ -36,7 +36,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
     let scales = filled(&library, &vec![127; 256 * 4])?;
     let kv = filled(&library, &vec![0x22; 256 * KV_VALUES])?; // E2M1 ones
     let kv_scales = filled(&library, &vec![0x38; 256 * KV_SCALES])?;
-    let workspace = DeviceAllocation::untagged(&library, V41Compressor::WORKSPACE_BYTES)?;
+    let workspace = DeviceAllocation::new(&library, V41Compressor::WORKSPACE_BYTES, crate::shared::memory::TEST)?;
     let compressor = unsafe { library.v41_compressor(workspace.buffer)? };
     let encoding = library.v41_compressed_kv()?;
     unsafe {
@@ -86,7 +86,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
     let metadata = filled(&library, &u64s(&[0, 256]))?;
     let overlay_metadata = filled(&library, &u64s(&[0, 256, 256, 0, 0, 1]))?;
     let candidates = filled(&library, &u64s(&[255, 256, u64::MAX]))?;
-    let scores = DeviceAllocation::untagged(&library, 12)?;
+    let scores = DeviceAllocation::new(&library, 12, crate::shared::memory::TEST)?;
     let scoring = library.v41_index_scores()?;
     for overlay in [false, true] {
         unsafe {
@@ -156,7 +156,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
     let zeros = filled(&library, &vec![0; 128 * 512])?;
     let zero_scales = filled(&library, &vec![127; 128 * 16])?;
     let end = filled(&library, &u64s(&[0]))?;
-    let output = DeviceAllocation::untagged(&library, 65536)?;
+    let output = DeviceAllocation::new(&library, 65536, crate::shared::memory::TEST)?;
     let window = V41SparseWindow {
         values: zeros.buffer,
         scales: zero_scales.buffer,

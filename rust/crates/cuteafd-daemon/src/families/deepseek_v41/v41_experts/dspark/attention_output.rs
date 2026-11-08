@@ -1,6 +1,7 @@
 //! Inverse RoPE -> grouped FP8 wo_a -> native FP8 wo_b in caller stream order.
 use crate::shared::decode_graph::{fatal_drain, BindingGraphs};
 use super::{DsparkProjection, DsparkWeights, ProjectionKind};
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
@@ -35,8 +36,8 @@ impl<'library> DsparkWeights<'library> {
             "dSpark attention output exceeds budget"
         );
         let grouped = library.v41_fp8_matrix_plan(capacity, 32768, 8192)?;
-        let grouped_scratch = DeviceAllocation::untagged(library, grouped.info().scratch_bytes as usize)?;
-        let alpha = DeviceAllocation::untagged(library, 4)?;
+        let grouped_scratch = DeviceAllocation::new(library, grouped.info().scratch_bytes as usize, Tag::drafter_workspace("v41/draft-attention-output"))?;
+        let alpha = DeviceAllocation::new(library, 4, Tag::drafter_workspace("v41/draft-attention-output"))?;
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };
         let initialized = unsafe { grouped.initialize_scratch(grouped_scratch.buffer, alpha.buffer, stream.raw) };
         initialized.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
@@ -53,8 +54,8 @@ impl<'library> DsparkWeights<'library> {
             scales: self.grouped_output_scales[stage].buffer,
             projection,
             weight: self.auxiliary.get(&format!("mtp.{stage}.attn.wo_a.weight"))?,
-            input: DeviceAllocation::untagged(library, capacity as usize * 65536)?,
-            frequencies: DeviceAllocation::untagged(library, capacity as usize * 256)?,
+            input: DeviceAllocation::new(library, capacity as usize * 65536, Tag::drafter_workspace("v41/draft-attention-output"))?,
+            frequencies: DeviceAllocation::new(library, capacity as usize * 256, Tag::drafter_workspace("v41/draft-attention-output"))?,
             capacity,
             graph: BindingGraphs::new(library)?,
             ready: None,

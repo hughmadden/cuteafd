@@ -1,4 +1,5 @@
 //! Serialized native ViT/aligner owner. No request KV or text execution state.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Result};
@@ -109,11 +110,11 @@ impl<'a> VisionRuntime<'a> {
         )?;
         super::weight_layout::probe_weights(lib, &[lib.cuda_get_device()?], "v41/vision-weights-loaded",
             |inventory| weights.inventory(inventory))?;
-        let workspace = DeviceAllocation::untagged(lib, V41VisionOps::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(lib, V41VisionOps::WORKSPACE_BYTES, Tag::workspace("v41/vision"))?;
         let ops = unsafe { lib.v41_vision_ops(workspace.buffer)? };
         let buffers = Self::buffer_sizes(capacity)?
             .into_iter()
-            .map(|n| DeviceAllocation::untagged(lib, n))
+            .map(|n| DeviceAllocation::new(lib, n, Tag::workspace("v41/vision")))
             .collect::<Result<Vec<_>>>()?;
         let stream = LoadStream {
             library: lib,

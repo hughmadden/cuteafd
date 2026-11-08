@@ -3,6 +3,7 @@ use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_attention_query::AttentionQueryOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexProposal;
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LayerStaging, LoadStream};
 use crate::families::deepseek_v41::v41_window::WindowProposal;
 use anyhow::{ensure, Context, Result};
@@ -90,9 +91,9 @@ impl<'a, const HEADS: usize> SparseAttentionStorage<'a, HEADS> {
         Ok(std::rc::Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             kernel: if HEADS == 64 { library.v41_sparse_attention()? } else { library.v41_sparse_attention_heads32()? },
-            query: DeviceAllocation::untagged(library, query)?, output: DeviceAllocation::untagged(library, output)?,
-            split_scratch: DeviceAllocation::untagged(library, split)?, descriptors: DeviceAllocation::untagged(library, descriptors)?,
-            replay_begins: DeviceAllocation::untagged(library, replay)?, metadata: DeviceAllocation::untagged(library, metadata)?,
+            query: DeviceAllocation::new(library, query, Tag::workspace("v41/sparse-attention"))?, output: DeviceAllocation::new(library, output, Tag::workspace("v41/sparse-attention"))?,
+            split_scratch: DeviceAllocation::new(library, split, Tag::workspace("v41/sparse-attention"))?, descriptors: DeviceAllocation::new(library, descriptors, Tag::workspace("v41/sparse-attention"))?,
+            replay_begins: DeviceAllocation::new(library, replay, Tag::workspace("v41/sparse-attention"))?, metadata: DeviceAllocation::new(library, metadata, Tag::workspace("v41/sparse-attention"))?,
             guard: crate::shared::memory::row_window::ScratchGuard::new(library, readers)?, unit,
         }))
     }
@@ -225,9 +226,9 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         if rows <= self.batch_rows { return Ok(()); }
         ensure!(self.attention_plan.is_none(), "attention workspace is immutable after plan admission");
         let library = self.storage.stream.library;
-        let scratch = DeviceAllocation::untagged(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS)?;
+        let scratch = DeviceAllocation::new(library, V41SparseAttention::split_scratch_bytes(rows, 10)?/64*HEADS, Tag::workspace("v41/sparse-attention"))?;
         let bytes = V41SparseAttention::batch_descriptor_bytes(rows)?;
-        let descriptors = DeviceAllocation::untagged(library, bytes)?;
+        let descriptors = DeviceAllocation::new(library, bytes, Tag::workspace("v41/sparse-attention"))?;
         let staging = LayerStaging::new(library, bytes, 40, "v41/sparse-decode-rows")?;
         let additional_device_bytes = scratch.buffer.bytes + descriptors.buffer.bytes
             - self.storage.split_scratch.buffer.bytes - self.storage.descriptors.buffer.bytes;

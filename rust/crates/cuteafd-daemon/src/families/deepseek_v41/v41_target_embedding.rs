@@ -1,4 +1,5 @@
 //! Token initialization and image replacement before the first target mHC block.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use crate::shared::decode_graph::RowGraphs;
@@ -83,11 +84,11 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         Ok(Rc::new(TargetEmbeddingStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             guard: ScratchGuard::new(library, &[library.cuda_get_device()?])?,
-            ids: DeviceAllocation::untagged(library, unit * 4)?,
-            residual: DeviceAllocation::untagged(library, unit * 40960)?,
-            pre: DeviceAllocation::untagged(library, unit * 16)?,
-            image_features: DeviceAllocation::untagged(library, unit * 10240)?,
-            image_indices: DeviceAllocation::untagged(library, unit * 4)?, rows, unit,
+            ids: DeviceAllocation::new(library, unit * 4, Tag::workspace("v41/target-embedding"))?,
+            residual: DeviceAllocation::new(library, unit * 40960, Tag::workspace("v41/target-embedding"))?,
+            pre: DeviceAllocation::new(library, unit * 16, Tag::workspace("v41/target-embedding"))?,
+            image_features: DeviceAllocation::new(library, unit * 10240, Tag::workspace("v41/target-embedding"))?,
+            image_indices: DeviceAllocation::new(library, unit * 4, Tag::workspace("v41/target-embedding"))?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(library: &'a NativeLibrary, table: &'w NativeRtxTensors<'a>,
@@ -98,8 +99,8 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         let capacity = storage.unit;
         Ok(Self { storage, window: RowWindow::NONE,
             ops: library.v41_attention_ops()?, table,
-            staging: HostAllocation::untagged(library, capacity * 4)?,
-            image_staging: HostAllocation::untagged(library, capacity * (10240 + 4))?, capacity,
+            staging: HostAllocation::new(library, capacity * 4, Tag::staging("v41/target-embedding"))?,
+            image_staging: HostAllocation::new(library, capacity * (10240 + 4), Tag::staging("v41/target-embedding"))?, capacity,
             graphs: RowGraphs::new(library, "target_embedding", cuteafd_core::V41_VERIFY_ROWS),
             tokens: Vec::with_capacity(capacity), positions: Vec::with_capacity(capacity), ready: false, destinations: None,
         })

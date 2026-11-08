@@ -1,4 +1,5 @@
 //! Shared shifted mHC boundaries for backbone and dSpark sublayers.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -37,15 +38,15 @@ impl<'library> HcStorage<'library> {
         Ok(std::rc::Rc::new(Self {
             stream: if standalone.is_none() { Some(LoadStream { library, raw: library.cuda_stream_create()? }) } else { None },
             standalone,
-            residual: DeviceAllocation::untagged(library, rows * 40960)?,
-            incoming_pre: DeviceAllocation::untagged(library, rows * 16)?,
-            next_pre: DeviceAllocation::untagged(library, rows * 16)?,
-            post: DeviceAllocation::untagged(library, rows * 16)?,
-            comb: DeviceAllocation::untagged(library, rows * 64)?,
-            collapsed: DeviceAllocation::untagged(library, rows * 10240)?,
-            normalized: DeviceAllocation::untagged(library, rows * 10240)?,
-            sublayer: DeviceAllocation::untagged(library, rows * 10240)?,
-            output: DeviceAllocation::untagged(library, rows * 40960)?,
+            residual: DeviceAllocation::new(library, rows * 40960, Tag::workspace("v41/hc"))?,
+            incoming_pre: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
+            next_pre: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
+            post: DeviceAllocation::new(library, rows * 16, Tag::workspace("v41/hc"))?,
+            comb: DeviceAllocation::new(library, rows * 64, Tag::workspace("v41/hc"))?,
+            collapsed: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
+            normalized: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
+            sublayer: DeviceAllocation::new(library, rows * 10240, Tag::workspace("v41/hc"))?,
+            output: DeviceAllocation::new(library, rows * 40960, Tag::workspace("v41/hc"))?,
             rows,
         }))
     }

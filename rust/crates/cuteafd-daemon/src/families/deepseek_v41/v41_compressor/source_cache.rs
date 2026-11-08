@@ -101,15 +101,15 @@ impl<'a> SourceCache<'a> {
     }
     pub fn new(library: &'a NativeLibrary, pages: usize, slots: usize) -> Result<Self> {
         Self::device_bytes(pages, slots)?;
-        let lengths = DeviceAllocation::untagged(library, slots * 8)?;
+        let lengths = DeviceAllocation::new(library, slots * 8, Tag::kv("v41/compressed-cache"))?;
         library.copy_h2d(lengths.buffer, &vec![0; slots * 8])?;
         Ok(Self {
-            page_table: DeviceAllocation::untagged(library, slots * pages.min(4096) * 4)?,
+            page_table: DeviceAllocation::new(library, slots * pages.min(4096) * 4, Tag::kv("v41/compressed-cache"))?,
             lengths,
-            staging: HostAllocation::untagged(library, slots * 8)?,
+            staging: HostAllocation::new(library, slots * 8, Tag::staging("v41/compressed-cache"))?,
             stride: pages.min(4096),
-            packed: DeviceAllocation::untagged(library, pages * PAGE_ROWS * 64)?,
-            scales: DeviceAllocation::untagged(library, pages * PAGE_ROWS * 4)?,
+            packed: DeviceAllocation::new(library, pages * PAGE_ROWS * 64, Tag::kv("v41/compressed-cache"))?,
+            scales: DeviceAllocation::new(library, pages * PAGE_ROWS * 4, Tag::kv("v41/compressed-cache"))?,
             kv_values: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_VALUES, "compressed cache values", Tag::kv("v41/compressed-cache"))?,
             kv_scales: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_SCALES, "compressed cache scales", Tag::kv("v41/compressed-cache"))?,
             capacity: pages * PAGE_ROWS,

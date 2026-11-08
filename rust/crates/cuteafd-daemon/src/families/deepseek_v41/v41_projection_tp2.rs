@@ -1,4 +1,5 @@
 //! Output-channel FP8 projection shards with lane-owned exchange storage.
+use crate::shared::memory::Tag;
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, Stream}};
 use anyhow::{ensure, Context, Result};
 use crate::shared::decode_graph::LayerGraphs;
@@ -57,8 +58,8 @@ impl<'a> Weights<'a> {
         let weight=crate::shared::memory::weight_arena::weight_allocation(device,arena,&weight_name,k*n, ArenaTag::weights("v41/target"))?;
         let scales=crate::shared::memory::weight_arena::weight_allocation(device,arena,
             &cuteafd_loader::placement::families::deepseek_v41::weight_layout::packed_scale_name(&weight_name),k*n/32, ArenaTag::weights("v41/target"))?;
-        let raw_scales=Allocation::untagged(device,k*n/1024)?;
-        let mut staging=HostAllocation::untagged(device.library,k*n)?;
+        let raw_scales=Allocation::new(device,k*n/1024,Tag::staging("v41/projection-load"))?;
+        let mut staging=HostAllocation::new(device.library,k*n,Tag::staging("v41/projection"))?;
         for (name,target) in [(&weight_name,&weight),(&scale_name,&raw_scales)] {
             let bytes=catalog.read_coordinator_tp2_into(name,0,rank,staging.bytes_mut(),&mut [])?;
             ensure!(bytes==target.buffer.bytes,"projection shard payload size differs");
@@ -105,13 +106,13 @@ impl<'a> RankStorage<'a> {
         let plan = device.run(|| device.library.v41_fp8_matrix_plan(capacity, k as u32, (n / 2) as u32))?;
         let stream = Stream::new(device)?;
         let [scratch_bytes, alpha_bytes, input_bytes, output_bytes] = Self::allocation_sizes(plan.info().scratch_bytes as usize, kind, capacity);
-        let scratch = Allocation::untagged(device, scratch_bytes)?;
-        let alpha = Allocation::untagged(device, alpha_bytes)?;
+        let scratch = Allocation::new(device, scratch_bytes, Tag::workspace("v41/projection"))?;
+        let alpha = Allocation::new(device, alpha_bytes, Tag::workspace("v41/projection"))?;
         let initialized = device.run(|| unsafe { plan.initialize_scratch(scratch.buffer, alpha.buffer, stream.raw) });
         initialized.and(stream.drain())?;
         Ok(Rc::new(Self { stream, plan, copy: device.run(|| device.library.v41_peer_copy())?,
-            input: Allocation::untagged(device, input_bytes)?,
-            output: Allocation::untagged(device, output_bytes)?, scratch, alpha,
+            input: Allocation::new(device, input_bytes, Tag::workspace("v41/projection"))?,
+            output: Allocation::new(device, output_bytes, Tag::workspace("v41/projection"))?, scratch, alpha,
             guard: ScratchGuard::new(device.library, readers)?,
         }))
     }
@@ -197,7 +198,7 @@ impl<'a> Storage<'a> {
         for i in 0..2 { devices[i].run(|| devices[i].library.cuda_enable_peer(devices[1-i].id))?; }
         Ok(Rc::new(Self {
             ranks: [RankStorage::new(devices[0], kind, unit, &readers)?, RankStorage::new(devices[1], kind, unit, &readers)?],
-            output: Allocation::untagged(devices[owner], unit as usize * kind.geometry().1 * 2)?,
+            output: Allocation::new(devices[owner], unit as usize * kind.geometry().1 * 2, Tag::workspace("v41/projection"))?,
             peer_done: Event::new(devices[1-owner])?,
             input_ready: [Event::new(devices[0])?, Event::new(devices[1])?],
             guard: ScratchGuard::new(devices[0].library, &readers)?, owner, unit, kind,

@@ -3,6 +3,7 @@ pub(crate) mod distributed;
 pub(crate) mod distributed_target;
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::BlockOutput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::{NativeRtxTensors, VocabularyHead};
 use anyhow::{Context, Result, ensure};
@@ -84,11 +85,11 @@ impl<'a> TargetHeadWeights<'a> {
             "target head wave exceeds budget"
         );
         let workspace =
-            DeviceAllocation::untagged(self.library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+            DeviceAllocation::new(self.library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
         let projection = unsafe { self.library.v41_vocabulary_head(workspace.buffer)? };
         let buffers = STRIDES
             .into_iter()
-            .map(|n| DeviceAllocation::untagged(self.library, n * capacity))
+            .map(|n| DeviceAllocation::new(self.library, n * capacity, Tag::workspace("v41/target-head")))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             head.device_id() == buffers[0].buffer.device_id
@@ -114,7 +115,7 @@ impl<'a> TargetHeadWeights<'a> {
             origin: None,
             selected: Vec::new(),
             tokens: Vec::new(),
-            greedy_staging: HostAllocation::untagged(self.library, capacity * 8)?,
+            greedy_staging: HostAllocation::new(self.library, capacity * 8, Tag::staging("v41/target-head"))?,
             greedy_ready: false,
             sampling: TargetSamplingWave::new(self.library, capacity, SAMPLING_VOCAB)?,
             download: crate::shared::memory::RowDownload::new(self.library, capacity * STRIDES[4])?,

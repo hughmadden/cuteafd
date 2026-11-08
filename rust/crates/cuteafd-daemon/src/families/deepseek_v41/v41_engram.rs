@@ -1,6 +1,7 @@
 //! Unit-owned Engram row windows, serial layer gathers and H2D source fences.
 pub(crate) mod layer;
 pub(crate) mod placement;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::shared::memory::row_window::{RowWindow, ScratchGuard, MAX_RESERVE_ROWS};
 use anyhow::{ensure, Context, Result};
@@ -63,10 +64,10 @@ impl<'a> EngramDeviceRows<'a> {
             "invalid Engram row storage dimensions");
         Ok(Rc::new(EngramRowsStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            weights: DeviceAllocation::untagged(library, rows * 24 * 256)?,
-            scales: DeviceAllocation::untagged(library, rows * 24 * 8)?,
-            embeddings: DeviceAllocation::untagged(library, rows * 24 * 512)?,
-            text_mask: DeviceAllocation::untagged(library, rows)?, rows, unit,
+            weights: DeviceAllocation::new(library, rows * 24 * 256, Tag::staging("v41/engram-gather"))?,
+            scales: DeviceAllocation::new(library, rows * 24 * 8, Tag::staging("v41/engram-gather"))?,
+            embeddings: DeviceAllocation::new(library, rows * 24 * 512, Tag::workspace("v41/engram-gather"))?,
+            text_mask: DeviceAllocation::new(library, rows, Tag::workspace("v41/engram-gather"))?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(storage: Rc<EngramRowsStorage<'a>>) -> Result<Self> {

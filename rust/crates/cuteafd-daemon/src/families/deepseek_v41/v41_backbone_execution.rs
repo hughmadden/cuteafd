@@ -1,5 +1,6 @@
 //! Cache producers and the complete per-layer backbone execution handoff.
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache, CacheBatch, CacheStage, CachePlacement};
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
@@ -388,8 +389,8 @@ impl<'a> WindowBatch<'a> {
         Ok(Self {
             library,
             stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
-            staging: crate::shared::memory::HostAllocation::untagged(library, bytes)?,
-            table: crate::shared::memory::DeviceAllocation::untagged(library, bytes)?,
+            staging: crate::shared::memory::HostAllocation::new(library, bytes, Tag::staging("v41/window-batch"))?,
+            table: crate::shared::memory::DeviceAllocation::new(library, bytes, Tag::staging("v41/window-batch"))?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
         })

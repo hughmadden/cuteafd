@@ -1,5 +1,6 @@
 //! Reusable private inputs for one lane's peer attention half.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{device::Allocation,proposal_replica::{ProposalReplica,ProposalFormat}};
 use crate::families::deepseek_v41::v41_index_selection::IndexSelectionOutput;
 use crate::families::deepseek_v41::v41_compressor::IndexBinding;
@@ -183,7 +184,7 @@ impl<'a> PeerAttentionInputs<'a> {
         let source_buffer=||ProposalReplica::new(source,peer,capacity,ProposalFormat::CompressedFp4);
         Ok(Self { device:peer,window:ProposalReplica::new(source,peer,capacity,ProposalFormat::WindowFp8)?,
             sources:[source_buffer()?,source_buffer()?,source_buffer()?,source_buffer()?],
-            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::untagged(peer,capacity*2048)?,
+            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::new(peer,capacity*2048,Tag::workspace("v41/peer-attention-inputs"))?,
             copy:peer.run(||peer.library.v41_peer_copy())?,capacity })
     }
     /// # Safety

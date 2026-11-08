@@ -35,7 +35,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         let occupied = devices.map(|d| d.run(|| { let (free, total) = lib.cuda_memory_info()?; Ok(total - free) }))
             .into_iter().collect::<Result<Vec<_>>>()?;
         tracing::info!(stage, occupied_bytes=?occupied, "dual RTX startup memory");
-        cuteafd_ffi::memory_ledger::relabel_other(cuteafd_ffi::memory_ledger::intern(&format!("v41/{stage}")));
         crate::shared::inventory::startup_probe(&lib, &[0, 1], &format!("v41/{stage}"), Default::default())?;
         Ok(())
     };

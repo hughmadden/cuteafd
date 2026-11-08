@@ -1,4 +1,5 @@
 //! One coordinator wave owns TP route planes through final native reduction.
+use crate::shared::memory::Tag;
 use super::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
@@ -196,7 +197,7 @@ impl<'a> NativeTp4Wave<'a> {
         Ok(Self {
             link: None,
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            output: DeviceAllocation::untagged(library, capacity as usize * 5120 * 2)?,
+            output: DeviceAllocation::new(library, capacity as usize * 5120 * 2, Tag::workspace("v41/expert-wave"))?,
             library,
             ready_rows: None,
             local: None,

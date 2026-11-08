@@ -1,5 +1,6 @@
 //! Per-lane vocabulary projection on two GPUs, with compact GPU winner merging.
 use super::*;
+use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Device, DeviceOwner, Stream, Allocation};
 use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
@@ -26,16 +27,16 @@ fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<Cut
 }
 impl<'w, 'a> Rank<'w, 'a> {
     fn new(library: &'a NativeLibrary, weights: &'w VocabularyShard<'a>, capacity: usize) -> Result<Self> {
-        let workspace = DeviceAllocation::untagged(library, V41VocabularyProjection::WORKSPACE_BYTES)?;
+        let workspace = DeviceAllocation::new(library, V41VocabularyProjection::WORKSPACE_BYTES, Tag::workspace("v41/target-head"))?;
         let projection = unsafe { library.v41_vocabulary_shard(workspace.buffer, weights.tokens().len())? };
-        let input = DeviceAllocation::untagged(library, capacity * 10240)?;
+        let input = DeviceAllocation::new(library, capacity * 10240, Tag::workspace("v41/target-head"))?;
         ensure!(input.buffer.device_id == weights.device_id(), "vocabulary rank weight device differs");
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             draft_timing: None,
             projection, _workspace: workspace, input,
-            logits: DeviceAllocation::untagged(library, capacity * weights.tokens().len() * 4)?,
-            candidates: DeviceAllocation::untagged(library, capacity * 8)?,
+            logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4, Tag::workspace("v41/target-head"))?,
+            candidates: DeviceAllocation::new(library, capacity * 8, Tag::workspace("v41/target-head"))?,
             weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: None,
             sm: Some(library.v41_peer_copy()?),
         })
@@ -201,8 +202,8 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             ranks: [devices[0].own(|| Rank::new(devices[0].library, weights[0], capacity))?,
                 devices[1].own(|| Rank::new(devices[1].library, weights[1], capacity))?],
             merge_stream: Stream::new(devices[1])?,
-            remote: Allocation::untagged(devices[1], capacity * 8)?,
-            merged: Allocation::untagged(devices[1], capacity * 8)?,
+            remote: Allocation::new(devices[1], capacity * 8, Tag::transport("v41/target-merge"))?,
+            merged: Allocation::new(devices[1], capacity * 8, Tag::workspace("v41/target-merge"))?,
             capacity, split, ready: None, greedy_ready: false, pending_logits: None, copy_pending: false,
         })
     }

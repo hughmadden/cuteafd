@@ -1,6 +1,7 @@
 //! Backbone inverse rotary, grouped FP8 wo_a and native FP8 wo_b.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_sparse_attention::SparseAttentionOutput;
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
@@ -137,13 +138,13 @@ impl<'a> AttentionOutputWeights<'a> {
         let storage = AttentionOutputStorage {
             stream,
             grouped,
-            grouped_scratch: DeviceAllocation::untagged(self.library, grouped_bytes)?,
-            scratch: kernel.as_ref().map(|_|DeviceAllocation::untagged(self.library, down_bytes)).transpose()?,
+            grouped_scratch: DeviceAllocation::new(self.library, grouped_bytes, Tag::workspace("v41/attention-output"))?,
+            scratch: kernel.as_ref().map(|_|DeviceAllocation::new(self.library, down_bytes, Tag::workspace("v41/attention-output"))).transpose()?,
             kernel,
-            alpha: DeviceAllocation::untagged(self.library, alpha_bytes)?,
+            alpha: DeviceAllocation::new(self.library, alpha_bytes, Tag::workspace("v41/attention-output"))?,
             buffers: planes
                 .into_iter()
-                .map(|n| DeviceAllocation::untagged(self.library, n))
+                .map(|n| DeviceAllocation::new(self.library, n, Tag::workspace("v41/attention-output")))
                 .collect::<Result<Vec<_>>>()?,
             rows,
             unit,
@@ -163,7 +164,7 @@ impl<'a> AttentionOutputWeights<'a> {
         ensure!(storage.kernel.is_some() == self.scales.is_some(), "attention output storage plans differ from the weights");
         let value = AttentionOutputWave {
             norm: self.library.v41_attention_ops()?,
-            position_staging: HostAllocation::untagged(self.library, storage.unit as usize * 8)?,
+            position_staging: HostAllocation::new(self.library, storage.unit as usize * 8, Tag::staging("v41/attention-output"))?,
             weights: self,
             capacity: storage.unit,
             graphs: LayerGraphs::new(self.library, cuteafd_core::V41_VERIFY_ROWS as u32),

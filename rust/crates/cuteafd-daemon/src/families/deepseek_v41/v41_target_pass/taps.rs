@@ -2,6 +2,7 @@
 use crate::families::deepseek_v41::v41_backbone_cache::CacheBatch;
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_block::PreparedBlockInput;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Result};
 use std::rc::Rc;
@@ -92,7 +93,7 @@ impl<'a> TargetTapWave<'a> {
             && unit <= rows, "invalid target tap storage dimensions");
         Ok(Rc::new(TargetTapStorage {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            values: DeviceAllocation::untagged(library, rows * 30720)?, rows, unit,
+            values: DeviceAllocation::new(library, rows * 30720, Tag::workspace("v41/target-taps"))?, rows, unit,
         }))
     }
     pub(crate) fn on_storage(storage: Rc<TargetTapStorage<'a>>) -> Result<Self> {

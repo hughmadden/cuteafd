@@ -2,6 +2,7 @@
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
 use crate::families::deepseek_v41::v41_block::FfnInput;
 use crate::shared::decode_graph::LayerGraphs;
+use crate::shared::memory::Tag;
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
@@ -49,7 +50,7 @@ impl<'a> BackboneRouterStorage<'a> {
         Ok(Rc::new(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             buffers: Self::allocation_sizes(rows).into_iter()
-                .map(|n| DeviceAllocation::untagged(library, n)).collect::<Result<_>>()?,
+                .map(|n| DeviceAllocation::new(library, n, Tag::workspace("v41/backbone-router"))).collect::<Result<_>>()?,
             rows, unit,
         }))
     }
@@ -149,9 +150,9 @@ impl<'a> BackboneRouterWeights<'a> {
             // Decode/verification benefits from batching small DMA transfers.
             // Large prefill retains direct downloads to avoid another host copy.
             // Route ids (24 B per row); also the non-deferred mask staging.
-            request_staging: HostAllocation::untagged(self.library, capacity as usize * 24)?,
-            mask_staging: HostAllocation::untagged(self.library, capacity as usize)?,
-            route_ring: Some(HostAllocation::untagged(self.library, 40 * capacity as usize * 24)?),
+            request_staging: HostAllocation::new(self.library, capacity as usize * 24, Tag::staging("v41/backbone-router"))?,
+            mask_staging: HostAllocation::new(self.library, capacity as usize, Tag::staging("v41/backbone-router"))?,
+            route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24, Tag::staging("v41/backbone-router"))?),
             ring_capture: false,
             ring_pending: Vec::with_capacity(40),
             weights: self,

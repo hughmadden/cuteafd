@@ -68,7 +68,7 @@ impl<'a> WindowReplica<'a> {
         ensure!(state.slots.iter().all(|slot|slot.request.is_none()) && state.writing.get()==0,
             "window replica requires no live requests");
         device.run(||device.library.cuda_enable_peer(state.values.buffer.device_id))?;
-        let ends=Allocation::untagged(device,state.ends.buffer.bytes)?;
+        let ends=Allocation::new(device,state.ends.buffer.bytes,Tag::kv("v41/window-cache-replica"))?;
         device.run(||device.library.copy_h2d(ends.buffer,&vec![0;ends.buffer.bytes]))?;
         Ok(Self { copy:device.run(||device.library.v41_peer_copy())?,
             values:Allocation::attention_plane(device,state.values.buffer.bytes/512,512,"peer window cache values", Tag::kv("v41/window-cache-replica"))?,
