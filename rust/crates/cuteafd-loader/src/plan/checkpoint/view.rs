@@ -38,6 +38,8 @@ pub struct CheckpointView {
     quantize_config: Option<Arc<Value>>,
     weight_map: Option<Arc<BTreeMap<String, String>>>,
     attention: Option<Arc<crate::formats::exl3_contract::AttentionContract>>,
+    /// Validated native headers used to classify a role, never its payload inventory.
+    pub(super) classification_headers: Arc<Vec<super::CheckpointTensor>>,
 }
 
 fn metadata_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -174,7 +176,7 @@ impl CheckpointView {
         }
         Ok(Self { snapshot: snapshot.into(), mode, config_name: config_name.into(), index_name,
             quant_names, fingerprint: format!("{:x}", hash.finalize()), config: Arc::new(config),
-            quantize_config, weight_map, attention, metadata_digests })
+            quantize_config, weight_map, attention, metadata_digests, classification_headers: Arc::default() })
     }
 
     pub fn snapshot(&self) -> &Path { &self.snapshot }
