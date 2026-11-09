@@ -419,6 +419,11 @@ fn serving_stats_keep_counters_live_while_sampling_only_occupancy_walks() {
     assert_eq!(sampled.marks_in_use, exact.marks_in_use);
     assert_eq!(sampled.pages_retained, 0, "detail is cached inside one second");
     assert!(exact.pages_retained > 0);
+    // The request retires within the sample interval, then the scheduler parks.
+    cache.release(&fake, &p.pages).unwrap();
+    cache.refresh_serving_stats();
+    assert_eq!(cache.serving_stats(), cache.stats(), "final idle publication is exact");
+    assert_eq!(cache.serving_stats().pages_retained, cache.pool().capacity() - cache.pool().free());
 }
 
 #[test]
