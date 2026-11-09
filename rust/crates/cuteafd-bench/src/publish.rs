@@ -1294,9 +1294,8 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let placed = scan(&root).unwrap();
-        let rendered = results(&placed, &matrix).unwrap();
-        // The next release's pending matrix may lead the README's measured table.
-        // Rendering must still preserve every pinned historical card's provenance.
+        let rendered = retired_results(&placed, &matrix.retired).unwrap();
+        // Retired provenance remains renderable before the next release is measured.
         assert!(!matrix.rows.is_empty());
         assert!(!matrix.retired.is_empty());
         let retired = rendered.split_once("\n### Retired").unwrap().1;
@@ -1643,17 +1642,26 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
+    fn checked_in_matrix_resolves_measured_rows_and_defers_unmeasured_rows() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
-        let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), matrix.rows.len());
-        for row in rows {
-            assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // Every published checkpoint has at least one PRO card; other cells say why not.
-            assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
-            assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
+        assert!(!matrix.rows.is_empty());
+        for row in &matrix.rows {
+            assert!(row.cells[1..].iter().any(|cell| cell.status != Status::Na));
+            let single = Matrix { rows: vec![row.clone()], retired: Vec::new() };
+            if row.cells.iter().any(|cell| cell.status == Status::Current) {
+                let resolved = select(&placed, &single).unwrap();
+                assert_eq!(resolved.len(), 1);
+                assert!(resolved[0].cells.iter().any(|cell| matches!(cell, Resolved::Card(_))));
+            } else {
+                assert!(row.cells.iter().any(|cell| cell.status == Status::Pending));
+                let error = match select(&placed, &single) {
+                    Err(error) => error,
+                    Ok(_) => panic!("unmeasured row must not publish"),
+                };
+                assert!(error.to_string().contains("no cell publishes a report"));
+            }
         }
     }
 
