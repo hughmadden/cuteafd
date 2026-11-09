@@ -9,15 +9,21 @@
 //! falls back to the bootstrap startup set and `traced: false`, and startup
 //! warns that its list is provisional.
 //!
-//! **Untraced shapes are provisional.** Until V4's own trace cards run, the
-//! reserve keeps the graph growth charge this family admitted before the
-//! bounded cache (#1617/#1614): 0.35 GiB per GPU on the 1x shape and
-//! 0.40/0.25 GiB on the 2x shape's lead/peer ranks, exactly `GRAPH_BYTES[role]`.
-//! All of it is `reserve_extra_bytes` because no measured prewarm arena exists
-//! to separate a base from capture headroom, and the bootstrap is a one-graph
-//! estimate. A trace card replaces these numbers, the entries and the pins
-//! through `scripts/dev/graph-prewarm-from-trace.py`; the consumer schema does
-//! not change.
+//! **Untraced shapes are provisional.** A shape without its own trace card
+//! keeps the graph growth charge this family admitted before the bounded cache
+//! (#1617/#1614): 0.35 GiB per GPU on the 1x shapes and 0.40/0.25 GiB on the 2x
+//! shape's lead/peer ranks, exactly `GRAPH_BYTES[role]`, all of it
+//! `reserve_extra_bytes` because no measured prewarm arena exists to separate a
+//! base from headroom, plus a one-graph bootstrap estimate. Today that is only
+//! `rtx1-local`; startup names the missing trace.
+//!
+//! A traced shape carries its own cards' measurements: `reserve_base_bytes` is
+//! the emitted prewarm set's own measured captures per rank (the trace's whole
+//! charged arena also holds lazy captures and is not the base),
+//! `reserve_extra_bytes` is that arena's 2 MiB allocation tail, and
+//! `bootstrap_bytes` is its largest measured capture. `scripts/dev/
+//! graph-prewarm-from-trace.py` replaces one shape at a time; the consumer
+//! schema does not change.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -79,10 +85,12 @@ pub struct V4PrewarmEntry {
 pub struct V4LayoutPrewarm {
     /// Whether a trace card has replaced the provisional numbers.
     pub traced: bool,
-    /// Measured prewarm arena high-water per rank; a best-effort warm target,
-    /// never a seal.
+    /// The emitted prewarm set's own measured captures per rank; a best-effort
+    /// warm target, never a seal. A trace's charged arena also holds lazy
+    /// captures, which are not part of this base.
     pub reserve_base_bytes: Vec<u64>,
-    /// One largest capture of extra room for lazy captures, per rank.
+    /// The prewarm arena's allocation tail per rank. Capture headroom for lazy
+    /// graphs is a separate shared policy key, never hand-picked here.
     pub reserve_extra_bytes: Vec<u64>,
     /// The estimate a device uses until it has a measured capture, per rank.
     pub bootstrap_bytes: Vec<u64>,
@@ -121,9 +129,9 @@ pub fn v4_traced(gpus: usize, sparks: bool) -> Result<bool, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).traced)
 }
 
-/// Per-rank graph reserve: the prewarm arena plus one capture of headroom.
-/// A bare `GPU_GRAPH_RESERVE` replaces this on every coordinator device, and
-/// `gpuN=` selectors override individual ranks.
+/// Per-rank graph reserve: the prewarm arena plus its tail, further widened by
+/// the shared capture-headroom policy. A bare `GPU_GRAPH_RESERVE` replaces this
+/// on every coordinator device, and `gpuN=` selectors override individual ranks.
 pub fn v4_reserves(gpus: usize, sparks: bool) -> Result<Vec<u64>, String> {
     Ok(v4_reserve_policies(gpus, sparks)?.into_iter().map(|reserve| reserve.bytes).collect())
 }
@@ -198,24 +206,54 @@ mod tests {
     }
 
     #[test]
-    fn provisional_reserve_matches_the_replaced_growth_charge() {
+    fn the_untraced_shape_keeps_the_replaced_growth_charge() {
         // The numbers retired from `families::deepseek_v4::GRAPH_BYTES`.
-        assert_eq!(v4_reserves(1, true).unwrap(), [gib(35)]);
-        assert_eq!(v4_reserves(2, false).unwrap(), [gib(40), gib(25)]);
-        assert_eq!(v4_bootstraps(1, true).unwrap(), [8 << 20]);
+        let entry = &v4_prewarm_list().layouts["rtx1-local"];
+        assert!(!entry.traced);
+        assert_eq!(entry.reserve_base_bytes, [0]);
+        assert_eq!(entry.reserve_extra_bytes, [gib(35)]);
+        assert_eq!(entry.bootstrap_bytes, [8 << 20]);
+        // No trace card for this shape, so there is no startup set to warm.
+        assert!(entry.entries.is_empty());
+        assert!(v4_prewarm(1, false).unwrap().is_empty());
+        assert!(v4_pinned(1, false).unwrap().is_empty());
         assert!(v4_reserves(3, true).is_err());
         assert!(v4_bootstraps(0, true).is_err());
-        // The one-GPU shapes leave every backbone expert on Sparks, so their
-        // startup set is empty; the two-GPU ones prewarm the decode row classes.
-        for sparks in [true, false] {
-            assert!(v4_prewarm(1, sparks).unwrap().is_empty());
-            assert!(v4_pinned(1, sparks).unwrap().is_empty());
-        }
-        let rows: Vec<_> = v4_prewarm(2, false).unwrap().iter().map(|entry| entry.rows).collect();
-        assert_eq!(rows, (1..=16).collect::<Vec<_>>());
-        // The never-evicted startup set stays pinned through a trace refresh.
-        assert_eq!(v4_pinned(2, false).unwrap(), rows.iter().map(|&rows| (rows, 0)).collect::<Vec<_>>());
         assert!(v4_pinned(3, false).is_err());
+    }
+
+    #[test]
+    fn traced_layouts_carry_their_cards_measured_numbers() {
+        let list = v4_prewarm_list();
+        let one = &list.layouts["rtx1-spark"];
+        assert!(one.traced);
+        // The prewarm set's own captures, its arena tail, one measured capture.
+        assert_eq!(one.reserve_base_bytes, [75_497_472]);
+        assert_eq!(one.reserve_extra_bytes, [2 << 20]);
+        assert_eq!(one.bootstrap_bytes, [2 << 20]);
+        let spark = &list.layouts["rtx2-spark"];
+        assert!(spark.traced);
+        assert_eq!(spark.reserve_base_bytes, [203_423_744, 184_549_376]);
+        let local = &list.layouts["rtx2-local"];
+        assert!(local.traced);
+        assert_eq!(local.reserve_base_bytes, [201_326_592, 186_646_528]);
+        for entry in [one, spark, local] {
+            assert_eq!(entry.reserve_extra_bytes, vec![2 << 20; entry.reserve_base_bytes.len()]);
+            assert_eq!(entry.bootstrap_bytes, vec![2 << 20; entry.reserve_base_bytes.len()]);
+        }
+    }
+
+    #[test]
+    fn every_traced_shape_pins_its_boot_warmed_row_classes() {
+        for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
+            let entries = v4_prewarm(gpus, sparks).unwrap();
+            assert!(entries.iter().all(|entry| entry.pin));
+            let startup: Vec<_> = entries.iter().take(16)
+                .map(|entry| (entry.rows, entry.table_width)).collect();
+            assert_eq!(startup, (1..=16usize).map(|rows| (rows, 0)).collect::<Vec<_>>());
+            // The never-evicted startup set stays pinned through a trace refresh.
+            assert_eq!(v4_pinned(gpus, sparks).unwrap()[..16], startup);
+        }
     }
 
     #[test]
@@ -224,9 +262,8 @@ mod tests {
         for (gpus, sparks) in [(1, true), (1, false), (2, true), (2, false)] {
             let layout = v4_layout(gpus, sparks).unwrap();
             assert!(keys.insert(layout.key()));
+            // Every shape but `rtx1-local` has its own trace card.
             assert_eq!(v4_traced(gpus, sparks).unwrap(), layout_entry(layout).traced);
-            // Both traced shapes attach Sparks; the shipped 2-RTX local card
-            // and the 1-GPU shapes stay provisional until their own trace.
             assert_eq!(layout.ranks(), gpus);
         }
         assert!(v4_traced(3, true).is_err());
