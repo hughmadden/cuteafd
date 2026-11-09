@@ -38,7 +38,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
     /// and the captured norm follow the chain head and become it.
     unsafe fn execute_chained(&mut self, block: &BlockOutput<'_>, selected: &[usize]) -> Result<()> {
         let rows = selected.len();
-        let graph = self.graphs.get(rows).context("chained target norm needs a warm shape")?;
+        let graph = self.graphs.cached_launch(rows);
         let lib = self.weights.library;
         unsafe {
             crate::shared::memory::chain::join(lib, self.stream.raw)?;
@@ -53,7 +53,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 first += count;
             }
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                Some(graph), || self.enqueue(rows))?;
+                graph, || self.enqueue(rows))?;
             crate::shared::memory::chain::finish(lib, self.stream.raw)
         }
     }
@@ -71,7 +71,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 first += count;
             }
             crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"head", rows,
-                self.graphs.get(rows), || self.enqueue(rows))
+                self.graphs.cached_launch(rows), || self.enqueue(rows))
         } })();
         let drained = self.stream.wait().await;
         queued.and(drained)?;
@@ -81,20 +81,24 @@ impl<'w, 'a> Normalize<'w, 'a> {
         if self.graphs.get(rows).is_none() && self.graphs.capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.weights.library;
+            let Some(ticket) = self.graphs.cache_ticket(&rows, rows == 1, None) else {
+                crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
+                return Ok(());
+            };
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows) };
-            let captured = unsafe { lib.cuda_graph_end_capture(self.stream.raw) };
+            let captured = unsafe { lib.cuda_graph_end_capture_topology(self.stream.raw) };
             match (queued, captured) {
-                (Ok(()), Ok(graph)) => {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                     // SAFETY: eager execution drained, Normalize pins all captured buffers.
                     unsafe {
-                        if let Err(error) = self.graphs.insert(rows, graph) {
+                        if let Err(error) = self.graphs.cache_insert(rows, graph, ticket, nodes as u64, width, spans) {
                             lib.cuda_graph_exec_destroy(graph)?;
                             return Err(error);
                         }
                     }
                 },
-                (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
+                (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
         }
@@ -157,9 +161,8 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
         device.run(|| {
             let norm = self.normalize.get_mut();
             norm.stream.require_complete()?;
-            norm.graphs.declare_startup(rows)?;
             for &row in rows { norm.capture_ready(row)?; }
-            norm.graphs.finish_startup()
+            Ok(())
         })?;
         self.vocabulary.capture_startup(rows)
     }

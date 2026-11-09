@@ -80,7 +80,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             }
             let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                self.graphs[mode].get(rows), || self.enqueue(rows, greedy))?;
+                self.graphs[mode].cached_launch(rows), || self.enqueue(rows, greedy))?;
             if let Some(timing) = &self.draft_timing { timing.end(span, self.stream.raw)?; }
             Ok(())
         }
@@ -90,20 +90,24 @@ impl<'w, 'a> Rank<'w, 'a> {
         if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
+            let Some(ticket) = self.graphs[mode].cache_ticket(&rows, rows == 1, None) else {
+                crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
+                return Ok(());
+            };
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows, greedy) };
-            let captured = unsafe { lib.cuda_graph_end_capture(self.stream.raw) };
+            let captured = unsafe { lib.cuda_graph_end_capture_topology(self.stream.raw) };
             match (queued, captured) {
-                (Ok(()), Ok(graph)) => {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                     // SAFETY: rank storage is stable and the eager projection drained.
                     unsafe {
-                        if let Err(error) = self.graphs[mode].insert(rows, graph) {
+                        if let Err(error) = self.graphs[mode].cache_insert(rows, graph, ticket, nodes as u64, width, spans) {
                             lib.cuda_graph_exec_destroy(graph)?;
                             return Err(error);
                         }
                     }
                 },
-                (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
+                (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
                 (Ok(()), Err(error)) => return Err(error),
             }
@@ -169,14 +173,12 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
                 let rank = rank.get_mut();
                 rank.stream.require_complete()?;
                 for mode in 0..2 {
-                    rank.graphs[mode].declare_startup(rows)?;
                     for &row in rows {
                         ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
                         // SAFETY: capture records the exact projection/argmax
                         // operations without executing or publishing logits.
                         unsafe { rank.capture_ready(row, mode == 1)?; }
                     }
-                    rank.graphs[mode].finish_startup()?;
                 }
                 Ok(())
             })?;

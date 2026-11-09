@@ -169,18 +169,20 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
         weights:&'w BackboneHcWeights<'a>,binding:QueryBinding,rows:usize,
         projected:CuteafdDeviceBuffer,stream:*mut std::ffi::c_void)->Result<()> {
         self.device.run(||unsafe {
+            let Some(ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
+                super::graph_policy::pinned_shape(rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
             self.device.library.cuda_graph_begin_capture(stream)?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=self.device.library.cuda_graph_end_capture(stream);
+            let captured=self.device.library.cuda_graph_end_capture_topology(stream);
             match (queued,captured) {
-                (Ok(_),Ok(graph))=> {
-                    if let Err(error)=self.bank.insert(binding.layer(),weights,rows as u32,graph) {
+                (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
+                    if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {
                         self.device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
+                (Err(error),Ok((graph,..)))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
                 (Err(error),Err(_)) | (Ok(_),Err(error))=>Err(error),
             }
         })
@@ -290,7 +292,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let weights=&lane.weights.layers[lane.layer].hc;
             let graphs=lane.tp2_ffn_graphs.as_mut().context("TP2 FFN graph owner absent")?;
             let windowed=lane.window.is_windowed();
-            let cached=if windowed { None } else { graphs.bank.get_shape(lane.layer,weights,rows as u32) };
+            let cached=if windowed { None } else { graphs.bank.cached_launch(lane.layer,weights,rows as u32) };
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {

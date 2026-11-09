@@ -184,12 +184,6 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         }
         if self.destinations.is_some() || self.window.is_windowed() || !super::graph_policy::captures_shape(rows as u32)
             || crate::shared::decode_graph::census::eager("layer_row") {
-            if self.destinations.is_none() && !self.window.is_windowed()
-                && super::graph_policy::captures_shape(rows as u32)
-                && self.graphs.get(rows).is_none() && !self.graphs.capture_allowed(rows) {
-                super::graph_policy::note_miss(format!("target_embedding rows={rows}"),
-                    || format!("capacity={} destinations={}", self.capacity, self.destinations.is_some()));
-            }
             let launched = unsafe { crate::shared::decode_graph::census::dispatch(
                 self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
             if let Err(error) = launched { self.synchronize()?; return Err(error); }
@@ -200,40 +194,34 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             self.ready = true;
             return self.output();
         }
-        if self.graphs.get(rows).is_none() {
+        if let Some(graph) = self.graphs.cached_launch(rows) {
+            let launched = unsafe { crate::shared::decode_graph::census::dispatch(
+                self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows,
+                Some(graph), || self.enqueue(rows)) };
+            launched.and(self.synchronize())?;
+        } else {
             let warmup = unsafe { self.enqueue(rows) };
             warmup.and(self.synchronize())?;
-            unsafe {
-                self.storage.stream
-                    .library
-                    .cuda_graph_begin_capture(self.storage.stream.raw)?;
-            }
-            let launched = unsafe { self.enqueue(rows) };
-            let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
-            match (launched, captured) {
-                (Ok(()), Ok(graph)) => {
-                    // SAFETY: eager warmup drained; capture has not been launched.
-                    if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
-                        // SAFETY: this new graph has no queued launches.
-                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(graph)?; }
+            if let Some(ticket) = self.graphs.cache_ticket(&rows,
+                super::graph_policy::pinned_shape(rows as u32), None) {
+                // SAFETY: warmup completed and the wave pins all recorded storage.
+                unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+                let launched = unsafe { self.enqueue(rows) };
+                let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+                match (launched, captured) {
+                    (Ok(()), Ok((raw, nodes, width, spans, _))) => {
+                        // SAFETY: this owner retains the executable before any replay.
+                        unsafe { self.graphs.cache_insert(rows, raw, ticket, nodes as u64, width, spans)?; }
+                    }
+                    (Err(error), Ok((raw, ..))) => {
+                        // SAFETY: failed capture has never launched.
+                        unsafe { self.storage.stream.library.cuda_graph_exec_destroy(raw)?; }
                         return Err(error);
                     }
-                },
-                (Err(e), Ok(graph)) => {
-                    unsafe {
-                        self.storage.stream.library.cuda_graph_exec_destroy(graph)?;
-                    }
-                    return Err(e);
+                    (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
                 }
-                (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
             }
         }
-        let graph = self.graphs.get(rows).context("target embedding graph missing")?;
-        let launched = unsafe {
-            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows,
-                Some(graph), || self.enqueue(rows))
-        };
-        launched.and(self.synchronize())?;
         self.tokens.extend_from_slice(tokens);
         self.positions.extend_from_slice(positions);
         self.ready = true;
@@ -331,6 +319,11 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             positions: &self.positions,
             _owner: PhantomData,
         })
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.storage.ids.buffer.device_id, "target_embedding", false, &mut self.graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();
