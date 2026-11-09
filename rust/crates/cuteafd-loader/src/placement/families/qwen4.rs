@@ -194,7 +194,7 @@ fn graph_reserve_owner(shape: QwenGraphShapeKey, rank: usize, location: Location
     let (base, extra) = qwen_reserve(shape, rank)
         .ok_or_else(|| Refusal::InvalidFact(format!("Qwen {shape:?} graph reserve has no rank {rank}")))?;
     let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)
-        .map_err(Refusal::InvalidFact)?;
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     Ok(allowance(&crate::placement::graph_reserve::source(&format!("qwen4.graphs.{rank}")),
         location, reserve.bytes, PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, maximum))
 }

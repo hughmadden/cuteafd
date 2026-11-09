@@ -1482,7 +1482,10 @@ impl<'a> Qwen4Engine<'a> {
                 basis: Basis::Bytes,
                 spans_devices: self.gdn_banks.len() > 1,
             })?;
+            crate::shared::decode_graph::device::set_reserve_policy(self.gdn_banks[owner].device.id, resolved)?;
             tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
+                base = resolved.base_bytes, base_source = resolved.base_source,
+                extra = resolved.effective_extra_bytes, extra_source = resolved.extra_source,
                 bootstrap = cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
                 prewarm_shapes = prewarm.trace.as_ref().map_or(
                     cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_list().bootstrap.entries.len(),

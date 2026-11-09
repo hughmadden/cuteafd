@@ -175,8 +175,13 @@ pub fn qwen_prewarm_shapes(key: QwenGraphShapeKey, context: usize, pages: usize,
             .filter(|shape| allowed.contains(&(shape.rows, shape.spec, shape.geometry()))).collect();
     };
     let allowed = qwen_serving_graph_shapes(context, pages, dense, sequences, speculation);
-    trace.entries.iter().map(|entry| entry.shape)
-        .filter(|shape| allowed.contains(&(shape.rows, shape.spec, shape.geometry()))).collect()
+    let mut shapes: Vec<QwenGraphShape> = trace.entries.iter().map(|entry| entry.shape)
+        .filter(|shape| allowed.contains(&(shape.rows, shape.spec, shape.geometry()))).collect();
+    // The traced list is sized to the base by construction; warming its pinned
+    // (trace-chosen hot) shapes first means an explicit user total below the
+    // base evicts the rare tail rather than a hot shape.
+    shapes.sort_by_key(|shape| !trace.entries.iter().any(|entry| entry.pin && entry.shape == *shape));
+    shapes
 }
 
 /// The shapes `key` prewarms that pin their cache entry.
