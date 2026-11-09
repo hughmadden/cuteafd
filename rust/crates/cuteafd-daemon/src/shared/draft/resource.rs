@@ -535,7 +535,7 @@ pub(crate) fn observe_drafted(policy: &mut DraftPolicy, requests: &[Verified<'_>
         draft: (width > 0).then_some(DraftPass { width, requests: drafted_requests }), predicted })
 }
 
-static SNAPSHOT: Mutex<Option<serde_json::Value>> = Mutex::new(None);
+static SNAPSHOT: Mutex<Option<std::sync::Arc<serde_json::Value>>> = Mutex::new(None);
 
 fn publication_due(rounds: u64, last: Option<u64>) -> bool {
     last.is_none_or(|last| rounds < last || rounds.saturating_sub(last) >= 32)
@@ -543,7 +543,18 @@ fn publication_due(rounds: u64, last: Option<u64>) -> bool {
 
 /// The latest published policy state for the serving `stats` payload.
 pub(crate) fn snapshot() -> serde_json::Value {
-    SNAPSHOT.lock().ok().and_then(|slot| slot.clone()).unwrap_or(serde_json::Value::Null)
+    trace_snapshot().0.as_deref().cloned().unwrap_or(serde_json::Value::Null)
+}
+
+/// Cheap owned view for asynchronous trace serialization.
+pub(crate) struct TraceSnapshot(Option<std::sync::Arc<serde_json::Value>>);
+impl serde::Serialize for TraceSnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_deref().serialize(serializer)
+    }
+}
+pub(crate) fn trace_snapshot() -> TraceSnapshot {
+    TraceSnapshot(SNAPSHOT.lock().ok().and_then(|slot| slot.clone()))
 }
 
 /// Publish at startup/reset and at most every 32 observed rounds. The policy
@@ -615,7 +626,7 @@ pub(crate) fn publish(policy: &DraftPolicy, observed: u64, skipped: u64, ring: O
             "samples": snapshot.draft[4] },
         "route_ring_check": ring.map(|(layers, mismatched)| serde_json::json!({"layers": layers, "mismatched": mismatched})),
     });
-    if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(value); }
+    if let Ok(mut slot) = SNAPSHOT.lock() { *slot = Some(std::sync::Arc::new(value)); }
 }
 
 #[cfg(test)]

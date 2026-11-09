@@ -430,8 +430,9 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         self.verify_rows(sequences, speculative, ungraphed_kind(speculative, kind))
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts}))
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;

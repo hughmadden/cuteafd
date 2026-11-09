@@ -1865,18 +1865,20 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
     /// Called only for the opt-in per-cycle trace, after the device work completes.
-    pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
+    pub(crate) fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let full_layers = self.weights.layers.iter().filter(|l| l.attention == Qwen4Attention::Full).count();
         let records: usize = contexts.iter().flatten().map(|&n| n.min(SPARSE_TOPK)).sum();
         let hint = self.attention_plan.rows();
         let splits = if hint == 1 { 64 } else if hint <= 4 { 32 } else { 16 };
-        serde_json::json!({"program": format!("qwen4_{}_m64", self.kv_stem("sparse_gqa")),
+        let program = self.kv_stem("sparse_gqa");
+        let record_bytes = self.kv_record_bytes;
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"program": format!("qwen4_{program}_m64"),
             "route": "selected_split", "physical_rows": rows, "splits": splits,
             "qk_tile": [16, 32, 16], "pv_tile": [16, 256, 16], "kv_warps": 2,
-            "record_bytes": self.kv_record_bytes, "target_full_layers": full_layers,
+            "record_bytes": record_bytes, "target_full_layers": full_layers,
             "logical_records_per_layer_upper_bound": records,
-            "logical_record_bytes_upper_bound": records as u64 * self.kv_record_bytes as u64 * full_layers as u64,
-            "traffic_scope": "target verify; exact for dense contexts, upper bound for sparse; excludes index/query, padding and MTP draft; not DRAM bytes"})
+            "logical_record_bytes_upper_bound": records as u64 * record_bytes as u64 * full_layers as u64,
+            "traffic_scope": "target verify; exact for dense contexts, upper bound for sparse; excludes index/query, padding and MTP draft; not DRAM bytes"}))
     }
 
     pub fn captured_graphs(&self) -> usize {

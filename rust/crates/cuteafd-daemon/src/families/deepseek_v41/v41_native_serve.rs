@@ -59,9 +59,9 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(cuteafd_bench::shutdown_signal())
         .await?;
-    tokio::task::spawn_blocking(move || worker_thread.join())
-        .await?
-        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))?;
+    let mut worker = Some(tokio::task::spawn_blocking(move || worker_thread.join()
+        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))));
+    crate::shared::api::finish_scheduler(&mut worker, "deepseek_v41").await?;
     Ok(())
 }
 

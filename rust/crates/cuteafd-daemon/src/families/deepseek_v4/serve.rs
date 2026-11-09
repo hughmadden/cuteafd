@@ -118,11 +118,14 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "DeepSeek V4 API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
         served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+            .into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(cuteafd_bench::shutdown_signal()) => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "deepseek_v4").await?;
     Ok(())
 }
 

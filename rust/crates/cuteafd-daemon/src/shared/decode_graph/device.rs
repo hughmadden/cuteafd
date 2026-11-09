@@ -133,6 +133,7 @@ const HIT_INTERVAL_MS: u64 = 10_000;
 const HIT_INTERVALS: usize = 60;
 
 /// Owned by a resident or bounded ARC ghost; forgetting the key frees its history.
+#[derive(Clone)]
 struct KeyStats {
     count: u64,
     hits: u64,
@@ -188,7 +189,7 @@ impl KeyStats {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct SizeClass { total: u64, samples: u64, largest: u64 }
 
 /// Optional #1612 rates and node count. Estimates decide capture permission;
@@ -371,7 +372,8 @@ pub(crate) struct DeviceCache {
     clock_ms: u64,
     last_report: Instant,
     interval_evictions: u64,
-    trace: Option<std::path::PathBuf>,
+    trace: Option<TraceWriter>,
+    retired_trace: Option<TraceSnapshot>,
     last_trace: Instant,
 }
 
@@ -384,7 +386,10 @@ impl DeviceCache {
             chain_only: true, unmeasured: false, pending_destroy: 0,
             observer: GrowthObserver::default(),
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
-            interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
+            interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
+                TraceWriter::new(std::path::PathBuf::from(path).with_extension(format!("device-{device}.json")))
+                    .map_err(|error| tracing::warn!(%error, "graph trace open failed")).ok()
+            }), retired_trace: None,
             last_trace: Instant::now() - Duration::from_secs(1) }
     }
 
@@ -727,6 +732,20 @@ impl DeviceCache {
     }
 
     pub fn remove_bank(&mut self, bank: u64) {
+        // The first retiring bank still sees the complete cache. Preserve that
+        // final view until serving resumes, rather than accumulating retired rows.
+        if self.trace.is_some() {
+            if self.retired_trace.is_none() { self.retired_trace = Some(self.trace_snapshot()); }
+            // Each retiring bank flushes its last pinned hits just before here.
+            if let Some(snapshot) = &mut self.retired_trace {
+                for row in snapshot.records.iter_mut().filter(|r| r.identity.bank == bank) {
+                    if let Some(record) = self.identities.get(&row.identity).and_then(|id| self.records.get(id)) {
+                        *row = RawRecord::copy(record);
+                    }
+                }
+                snapshot.cache.cycles = self.counters.clone();
+            }
+        }
         let ids: Vec<_> = self.records.iter().filter(|(_, r)| r.identity.bank == bank).map(|(&id, _)| id).collect();
         self.remove_drained(&ids);
     }
@@ -759,26 +778,35 @@ impl DeviceCache {
 
     pub fn boundary(&mut self) {
         self.sample_clock();
+        self.retired_trace = None;
         self.report_due(self.last_report.elapsed());
-        if let Some(path) = &self.trace {
-            // Trace mode counts every hit, but serializing thousands of keys
-            // on every token would perturb the concurrency being observed.
-            if self.last_trace.elapsed() < Duration::from_secs(1) { return; }
+        if self.trace.is_some() && self.last_trace.elapsed() >= Duration::from_secs(1) {
             self.last_trace = Instant::now();
-            // Each device has its own snapshot file, avoiding concurrent writers.
-            let path = path.with_extension(format!("device-{}.json", self.device));
-            let now = self.started.elapsed().as_millis() as u64;
-            let mut rows: Vec<_> = self.records.values().map(|record| self.row(record, now)).collect();
-            rows.sort_by(|a, b| (a.identity.site, a.identity.bank, &a.identity.shape)
-                .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)));
-            let document = serde_json::json!({"schema_version": 2, "cache": self.snapshot(), "graphs": rows,
-                "sites": self.classes.iter().map(|(name, class)| (*name, serde_json::json!({
-                    "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
-                }))).collect::<HashMap<_, _>>()});
-            let result = serde_json::to_vec(&document).map_err(std::io::Error::other)
-                .and_then(|bytes| std::fs::write(&path, bytes));
-            if let Err(error) = result { tracing::warn!(%error, path = %path.display(), "graph trace write failed"); }
+            self.publish_trace();
         }
+    }
+
+    fn trace_snapshot(&self) -> TraceSnapshot {
+        let records = self.records.values().map(RawRecord::copy).collect();
+        TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve,
+            reserve_policy: self.reserve_policy, charged: self.charged,
+            pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
+            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
+            basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
+            telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(),
+            top_hits: Vec::new(), top_churn: Vec::new() },
+            records, classes: self.classes.clone() }
+    }
+
+    fn publish_trace(&self) {
+        if let Some(trace) = &self.trace { trace.submit(self.trace_snapshot()); }
+    }
+
+    fn finish_trace(&mut self) -> Option<TraceWriter> {
+        if let Some(trace) = &self.trace {
+            trace.submit(self.retired_trace.take().unwrap_or_else(|| self.trace_snapshot()));
+        }
+        self.trace.take()
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -801,6 +829,11 @@ impl DeviceCache {
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
+        raw_row(self.device, self.basis, &RawRecord::copy(record), now)
+    }
+}
+
+fn raw_row(device: i32, basis: Basis, record: &RawRecord, now: u64) -> TraceRow {
         let stats = &record.stats;
         let end = now / HIT_INTERVAL_MS;
         let start = end.saturating_sub(HIT_INTERVALS as u64 - 1);
@@ -809,22 +842,133 @@ impl DeviceCache {
                 stats.hit_intervals[interval as usize % HIT_INTERVALS]
             } else { 0 }
         }).collect();
-        TraceRow { device: self.device, identity: record.identity.clone(), cycle: record.cycle,
+        TraceRow { device: device, identity: record.identity.clone(), cycle: record.cycle,
             count: stats.count, cycles: [Cycle::Decode, Cycle::Verify, Cycle::Prefill, Cycle::Wave, Cycle::Other]
                 .into_iter().map(|cycle| (cycle, stats.cycles[cycle as usize])).collect(),
             first_seen_ms: stats.first_seen_ms, hits: stats.hits, misses: stats.misses, captures: stats.captures,
             evictions: stats.evictions, recaptures: stats.recaptures, ghost_hits: stats.ghost_hits,
             last_hit_ms: stats.last_hit_ms, hit_histogram: HitHistogram {
                 rolling: true, interval_ms: HIT_INTERVAL_MS, start_ms: start * HIT_INTERVAL_MS, counts },
-            capture_bytes: stats.capture_bytes, nodes: stats.native_nodes.or_else(|| matches!(self.basis, Basis::Nodes { .. }).then_some(record.nodes)),
-            executables: 1, basis: self.basis,
-            permanent_bytes: match self.basis {
+            capture_bytes: stats.capture_bytes, nodes: stats.native_nodes.or_else(|| matches!(basis, Basis::Nodes { .. }).then_some(record.nodes)),
+            executables: 1, basis,
+            permanent_bytes: match basis {
                 Basis::Bytes => record.bytes,
                 Basis::Nodes { node_rate, graph_rate } => record.nodes.saturating_mul(node_rate).saturating_add(graph_rate),
             }, pinned: record.pinned, declared_capture_streams: stats.declared_capture_streams,
             max_parallel_width: stats.max_parallel_width, spans_devices: stats.spans_devices }
+ }
+
+impl Drop for DeviceCache {
+    fn drop(&mut self) { drop(self.finish_trace()); }
+}
+
+pub(crate) fn shutdown_traces() {
+    let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
+        .values().cloned().collect();
+    for cache in caches {
+        let writer = cache.lock().unwrap_or_else(|p| p.into_inner()).finish_trace();
+        // No cache lock is held while waiting for JSON or filesystem work.
+        drop(writer);
     }
 }
+
+#[derive(Clone)]
+struct RawRecord {
+    identity: Identity,
+    cycle: Cycle,
+    bytes: u64,
+    nodes: u64,
+    pinned: bool,
+    stats: KeyStats,
+}
+impl RawRecord {
+    fn copy(record: &Record) -> Self {
+        Self { identity: record.identity.clone(), cycle: record.cycle, bytes: record.bytes,
+            nodes: record.nodes, pinned: record.pinned, stats: (*record.stats).clone() }
+    }
+}
+struct TraceSnapshot {
+    cache: Snapshot,
+    records: Vec<RawRecord>,
+    classes: HashMap<&'static str, SizeClass>,
+}
+impl TraceSnapshot {
+    fn bytes(mut self) -> std::io::Result<Vec<u8>> {
+        let mut rows: Vec<_> = self.records.iter().map(|r| raw_row(self.cache.device,
+            self.cache.basis, r, self.cache.sampled_at_ms)).collect();
+        rows.sort_by(|a, b| (a.identity.site, a.identity.bank, &a.identity.shape)
+            .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)));
+        let ranked = |churn: bool| {
+            let score = |r: &TraceRow| if churn { r.evictions + r.recaptures } else { r.hits };
+            let mut ranked: Vec<_> = rows.iter().filter(|r| score(r) > 0).collect();
+            ranked.sort_unstable_by(|a, b| score(b).cmp(&score(a)).then_with(||
+                (a.identity.site, a.identity.bank, &a.identity.shape)
+                    .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape))));
+            ranked.into_iter().take(16).cloned().collect()
+        };
+        self.cache.top_hits = ranked(false);
+        self.cache.top_churn = ranked(true);
+        let document = serde_json::json!({"schema_version": 2, "cache": self.cache, "graphs": rows,
+            "sites": self.classes.iter().map(|(name, class)| (*name, serde_json::json!({
+                "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
+            }))).collect::<HashMap<_, _>>()});
+        serde_json::to_vec(&document).map_err(std::io::Error::other)
+    }
+}
+
+#[derive(Default)]
+struct TraceSlot { pending: Option<TraceSnapshot>, closed: bool }
+struct TraceWriter {
+    slot: Arc<(Mutex<TraceSlot>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl TraceWriter {
+    fn new(path: std::path::PathBuf) -> std::io::Result<Self> {
+        Self::with_sink(move |snapshot| {
+            let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+            let result = snapshot.bytes().and_then(|bytes| std::fs::write(&temporary, bytes))
+                .and_then(|()| std::fs::rename(&temporary, &path));
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&temporary);
+                tracing::warn!(%error, path = %path.display(), "graph trace write failed");
+            }
+        })
+    }
+    fn with_sink(mut sink: impl FnMut(TraceSnapshot) + Send + 'static) -> std::io::Result<Self> {
+        let slot = Arc::new((Mutex::new(TraceSlot::default()), std::sync::Condvar::new()));
+        let worker_slot = slot.clone();
+        let thread = std::thread::Builder::new().name("graph-trace".into()).spawn(move || loop {
+            let snapshot = {
+                let (lock, wake) = &*worker_slot;
+                let mut state = lock.lock().unwrap_or_else(|p| p.into_inner());
+                while state.pending.is_none() && !state.closed {
+                    state = wake.wait(state).unwrap_or_else(|p| p.into_inner());
+                }
+                match state.pending.take() { Some(snapshot) => snapshot, None => break }
+            };
+            sink(snapshot);
+        })?;
+        Ok(Self { slot, thread: Some(thread) })
+    }
+    fn submit(&self, snapshot: TraceSnapshot) {
+        let (lock, wake) = &*self.slot;
+        let old = lock.lock().unwrap_or_else(|p| p.into_inner()).pending.replace(snapshot);
+        wake.notify_one();
+        // Free superseded data outside the mailbox lock.
+        drop(old);
+    }
+}
+impl Drop for TraceWriter {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.slot;
+        lock.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        wake.notify_one();
+        if self.thread.take().is_some_and(|thread| thread.join().is_err()) {
+            tracing::warn!("graph trace writer panicked");
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -836,6 +980,138 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn sigterm_http_shutdown_writes_complete_nonempty_final_traces() {
+        const CHILD: &str = "CUTEAFD_TRACE_SIGTERM_TEST_CHILD";
+        if let Some(directory) = std::env::var_os(CHILD) {
+            let directory = std::path::PathBuf::from(directory);
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let mut cache = DeviceCache::new(-710, 100);
+                cache.trace = Some(TraceWriter::new(directory.join("graph.json")).unwrap());
+                let a = capture(&mut cache, 1, false);
+                cache.hit(a);
+                let trace = crate::shared::speculation_trace::Trace::open().unwrap().unwrap();
+                trace.write(crate::shared::speculation_trace::record! { final_record: true }).unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut shutdown = Box::pin(cuteafd_bench::shutdown_signal());
+                // Poll once so both signal subscriptions precede the ready line.
+                tokio::select! { biased; _ = &mut shutdown => panic!("premature signal"), _ = std::future::ready(()) => () }
+                println!("TRACE_SERVER_READY {}", std::process::id());
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                axum::serve(listener, axum::Router::new()).with_graceful_shutdown(shutdown).await.unwrap();
+                drop(cache);
+                drop(trace);
+                crate::shared::speculation_trace::shutdown();
+            });
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new("/usr/bin/timeout")
+            .args(["--signal=KILL", "30"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "shared::decode_graph::device::tests::sigterm_http_shutdown_writes_complete_nonempty_final_traces", "--nocapture"])
+            .env(CHILD, directory.path()).env("CUTEAFD_SPECULATION_TRACE", directory.path().join("speculation.jsonl"))
+            .env_remove("CUTEAFD_GRAPH_TRACE")
+            .stdout(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut signalled = false;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if let Some((_, pid)) = line.split_once("TRACE_SERVER_READY ") {
+                assert!(std::process::Command::new("/bin/kill").args(["-TERM", pid.trim()]).status().unwrap().success());
+                signalled = true;
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(signalled);
+        let graph: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.path().join("graph.json")).unwrap()).unwrap();
+        assert_eq!(graph["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(graph["graphs"][0]["hits"], 1);
+        assert_eq!(std::fs::read(directory.path().join("speculation.jsonl")).unwrap(), b"{\"final_record\":true}\n");
+    }
+
+    #[test]
+    fn trace_coalesces_busy_writer_and_drop_flushes_latest() {
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let seen = written.clone();
+        let mut first = true;
+        let writer = TraceWriter::with_sink(move |snapshot| {
+            if first { first = false; entered.send(()).unwrap(); gate.recv().unwrap(); }
+            seen.lock().unwrap().push(snapshot.cache.charged);
+        }).unwrap();
+        let mut cache = DeviceCache::new(-700, 100);
+        writer.submit(cache.trace_snapshot());
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        for charged in 1..=10 { cache.charged = charged; writer.submit(cache.trace_snapshot()); }
+        release.send(()).unwrap();
+        drop(writer);
+        assert_eq!(*written.lock().unwrap(), [0, 10]);
+    }
+
+    #[test]
+    fn controller_drop_keeps_all_retired_banks_and_atomic_final_trace() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.json");
+        let mut cache = DeviceCache::new(-701, 100);
+        cache.trace = Some(TraceWriter::new(path.clone()).unwrap());
+        let a = capture(&mut cache, 1, false);
+        cache.hit(a);
+        let mut identity = key(2); identity.bank = 2;
+        assert!(matches!(cache.miss(identity, site(Preference::Capture), None, false), Miss::Capture(_)));
+        cache.measured_capture(10);
+        cache.remove_bank(1);
+        cache.remove_bank(2);
+        drop(cache);
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["graphs"].as_array().unwrap().len(), 2);
+        assert_eq!(value["graphs"][0]["hits"], 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn trace_schema_bytes_match_legacy_fixture() {
+        let mut cache = DeviceCache::new(-702, 100);
+        let a = capture(&mut cache, 1, false);
+        cache.records.get_mut(&a).unwrap().stats.first_seen_ms = 0;
+        cache.clock_ms = 20_000;
+        cache.hit(a);
+        let mut snapshot = cache.trace_snapshot();
+        snapshot.cache.sampled_at_ms = 30_000;
+        snapshot.cache.telemetry_bytes = 0;
+        let bytes = snapshot.bytes().unwrap();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), include_str!("trace-schema.json").trim());
+    }
+
+    #[test]
+    #[ignore = "CPU trace boundary microbenchmark; run explicitly with --nocapture"]
+    fn trace_snapshot_microseconds() {
+        use std::hint::black_box;
+        let mut cache = DeviceCache::new(-703, 100_000);
+        for n in 0..5_000 { let id = capture(&mut cache, n, false); cache.hit(id); }
+        let repeats = 50;
+        let start = Instant::now();
+        for _ in 0..repeats { black_box(cache.trace_snapshot()); }
+        let copy = start.elapsed().as_secs_f64() * 1e6 / repeats as f64;
+        let start = Instant::now();
+        for _ in 0..repeats {
+            let mut rows: Vec<_> = cache.records.values().map(|r| cache.row(r, 600_000)).collect();
+            rows.sort_by(|a, b| (a.identity.site, a.identity.bank, &a.identity.shape)
+                .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)));
+            let document = serde_json::json!({"schema_version": 2, "cache": cache.snapshot(), "graphs": rows,
+                "sites": cache.classes.iter().map(|(name, class)| (*name, serde_json::json!({
+                    "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
+                }))).collect::<HashMap<_, _>>()});
+            black_box(serde_json::to_vec(&document).unwrap());
+        }
+        println!("graph trace 5000 records: legacy {:.1} us -> raw copy {:.1} us (no filesystem, {} iterations)",
+            start.elapsed().as_secs_f64() * 1e6 / repeats as f64, copy, repeats);
+    }
+
     #[test]
     fn reserve_policy_snapshot_distinguishes_admission_from_live_arena() {
         let policy = cuteafd_loader::placement::graph_reserve::resolve_with_extra(

@@ -217,8 +217,11 @@ pub(crate) fn run_scheduler(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow
     }
     result
 }
-pub(crate) async fn watch_scheduler(worker: tokio::task::JoinHandle<anyhow::Result<()>>) {
-    let reason = match worker.await {
+pub(crate) async fn watch_scheduler(worker: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>) {
+    let Some(handle) = worker.as_mut() else { std::future::pending::<()>().await; return };
+    let result = handle.await;
+    worker.take();
+    let reason = match result {
         Ok(Ok(())) => "scheduler stopped".into(),
         Ok(Err(error)) => format!("scheduler stopped: {error:#}"),
         Err(error) => format!("scheduler stopped: {error}"),
@@ -228,6 +231,19 @@ pub(crate) async fn watch_scheduler(worker: tokio::task::JoinHandle<anyhow::Resu
     // Stay pending so select keeps polling the HTTP server after worker death.
     std::future::pending::<()>().await;
 }
+/// Only called after the listener stops: a broken peer must not prevent trace drain.
+pub(crate) async fn finish_scheduler(worker: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>, family: &str) -> anyhow::Result<()> {
+    let Some(worker) = worker.take() else { return Ok(()) };
+    finish_scheduler_with_timeout(worker, family, std::time::Duration::from_secs(10)).await
+}
+
+async fn finish_scheduler_with_timeout(worker: tokio::task::JoinHandle<anyhow::Result<()>>, family: &str, timeout: std::time::Duration) -> anyhow::Result<()> {
+    match tokio::time::timeout(timeout, worker).await {
+        Ok(result) => result.context("serving worker join")?,
+        Err(_) => { tracing::warn!(family, ?timeout, "serving worker did not stop; draining available traces"); Ok(()) }
+    }
+}
+
 fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
     profile.engine_health = Some(HealthWitness(Arc::new(cuteafd_transport::health::failure_reason)));
     profile
@@ -235,6 +251,25 @@ fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn scheduler_join_is_only_after_http_ends_and_is_bounded() {
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let mut worker = Some(tokio::spawn(async { let _ = wait.await; Ok(()) }));
+        let mut served = false;
+        tokio::select! {
+            _ = async { served = true; } => (),
+            _ = watch_scheduler(&mut worker) => panic!("watch must stay pending"),
+        }
+        assert!(served && worker.is_some());
+        finish.send(()).unwrap();
+        finish_scheduler(&mut worker, "fixture").await.unwrap();
+        assert!(worker.is_none());
+        let worker = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let abort = worker.abort_handle();
+        finish_scheduler_with_timeout(worker, "stuck fixture", std::time::Duration::from_millis(1)).await.unwrap();
+        abort.abort();
+    }
+
     #[test]
     fn scheduler_error_is_logged_before_request_owners_close() {
         use tracing_subscriber::{layer::SubscriberExt, Layer};

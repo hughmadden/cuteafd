@@ -243,9 +243,11 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         self.cache_keys.clear();
         self.retired.clear();
         if let Some(binding) = &mut self.device {
-            binding.pinned_hits = 0;
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            binding.flush(&mut cache);
             binding.pinned_counts.clear();
-            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
+            cache.remove_bank(binding.bank);
         }
     }
 
@@ -528,9 +530,11 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 impl<K, E> Drop for GraphBank<K, E> {
     fn drop(&mut self) {
         if let Some(binding) = &mut self.device {
-            binding.pinned_hits = 0;
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            binding.flush(&mut cache);
             binding.pinned_counts.clear();
-            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
+            cache.remove_bank(binding.bank);
         }
         if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
             tracing::info!(target: "cuteafd::graph_capture", family = self.family, bank = self as *const Self as usize,

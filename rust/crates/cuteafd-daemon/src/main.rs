@@ -362,9 +362,13 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
-    let result = shared::memory_report::finish(
-        tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run()));
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let result = shared::memory_report::finish(runtime.block_on(run()));
+    shared::decode_graph::device::shutdown_traces();
+    shared::speculation_trace::shutdown();
     cuteafd_ffi::memory_ledger::fault::shutdown();
+    // Blocking CUDA workers cannot be cancelled; a stuck peer must not hang exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     result
 }
 

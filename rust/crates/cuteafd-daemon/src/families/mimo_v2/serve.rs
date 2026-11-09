@@ -194,11 +194,14 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "MiMo V2 API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
         served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+            .into_make_service_with_connect_info::<std::net::SocketAddr>())
+            .with_graceful_shutdown(cuteafd_bench::shutdown_signal()) => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "mimo_v2").await?;
     Ok(())
 }
 
@@ -1350,21 +1353,21 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
         resource::publish(&shared.policy, lane.observed_rounds, lane.skipped_rounds, None);
     }
     if let Some(trace) = trace.as_mut() {
-        let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
-            "draft_width": drafted_width, "drafted_requests": drafted_requests,
-            "lengths": sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
-            "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
-            "neural_lengths": drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
-            "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
-            "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
-            "copy_windows": copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
-                serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "copy_agreement": copy_agreement,
-            "copy_neural_prefix": copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
-            "copy_lengths": copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
-            "prior": priors, "predicted_us": predicted, "policy": resource::snapshot()});
-        if let Err(error) = trace.write(&line) {
+        let line = crate::shared::speculation_trace::record! {rows: sequences.iter().map(Vec::len).sum::<usize>(),
+            draft_width: drafted_width, drafted_requests: drafted_requests,
+            lengths: sequences.iter().map(|s| s.len()-1).collect::<Vec<_>>(),
+            accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            neural_lengths: drafted.iter().map(|d| d.as_ref().map_or(0, |d| d.tokens.len())).collect::<Vec<_>>(),
+            request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            copy_windows: copy_windows.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            copy_agreement: copy_agreement,
+            copy_neural_prefix: copies.iter().map(|c| c.as_ref().map(|c| c.neural)).collect::<Vec<_>>(),
+            copy_lengths: copies.iter().map(|c| c.as_ref().map_or(0, |c| c.tokens.len())).collect::<Vec<_>>(),
+            prior: priors, predicted_us: predicted, policy: resource::trace_snapshot()};
+        if let Err(error) = trace.write(line) {
             tracing::warn!(%error, "MiMo speculation trace write failed");
         }
     }

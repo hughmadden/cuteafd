@@ -560,9 +560,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         else { self.immediate(sequences, pool, source, None).map(Some) }
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
-            "attention":"eager_per_sequence", "arithmetic":"eager"})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
+            "attention":"eager_per_sequence", "arithmetic":"eager"}))
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
