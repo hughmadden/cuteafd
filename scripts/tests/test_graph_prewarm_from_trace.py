@@ -540,6 +540,50 @@ def test_qwen_regeneration_reproduces_a_checked_in_generation_exactly():
     assert generated == expected
 
 
+def qwen_list():
+    def shape(name, owners):
+        return {"shape": name, "reserve_base_bytes": [5 << 30] * owners,
+                "reserve_extra_bytes": [2 << 20] * owners, "trace": None}
+    return {"schema_version": 1, "family": "qwen4", "provenance": "bootstrap",
+            "bootstrap": {"entries": []},
+            "shapes": [shape("single_0spark", 1), shape("single_sparks", 1),
+                       shape("dual_0spark", 2), shape("dual_sparks", 2)]}
+
+
+def fixture_traces():
+    fixture = Path(__file__).resolve().parent / "fixtures" / "qwen-prewarm-trace"
+    return [json.loads(path.read_text()) for path in sorted(fixture.glob("trace.device-*.json"))]
+
+
+def test_qwen_merge_replaces_only_the_traced_shape():
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    merged = MODULE.merge_qwen(qwen_list(), generated)
+    installed = {prewarm["shape"]: prewarm for prewarm in merged["shapes"]}
+    assert installed["single_0spark"] == generated
+    assert installed["dual_0spark"]["trace"] is None
+    assert installed["dual_0spark"]["reserve_base_bytes"] == [5 << 30, 5 << 30]
+    assert "single_0spark" in merged["provenance"]
+    assert "dual_sparks" in merged["provenance"], "untraced shapes are named"
+    assert MODULE.merge_qwen(merged, generated) == merged, "merging is idempotent"
+
+
+def test_qwen_merge_installs_the_generated_base_and_extra_exactly():
+    fixture = Path(__file__).resolve().parent / "fixtures" / "qwen-prewarm-trace"
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    merged = MODULE.merge_qwen(qwen_list(), generated)
+    installed = next(prewarm for prewarm in merged["shapes"] if prewarm["shape"] == "single_0spark")
+    assert installed == json.loads((fixture / "expected-single_0spark.json").read_text())
+
+
+def test_qwen_merge_rejects_a_list_without_the_shape():
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    document = qwen_list()
+    document["shapes"] = [prewarm for prewarm in document["shapes"]
+                          if prewarm["shape"] != "single_0spark"]
+    with pytest.raises(ValueError, match="no single_0spark"):
+        MODULE.merge_qwen(document, generated)
+
+
 def test_qwen_single_shape_needs_exactly_one_device_trace():
     assert len(MODULE.generate_qwen([qwen_trace()], "single_0spark")["reserve_base_bytes"]) == 1
     with pytest.raises(ValueError):
