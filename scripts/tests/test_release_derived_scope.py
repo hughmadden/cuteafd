@@ -17,6 +17,13 @@ P = 'CUTEAFD_RELEASE_'
 GLM_PROGRAMS = ['dense_trellis_k6', 'glm', 'glm2', 'glm2_stage', 'glm_stage']
 
 
+def test_default_matrix_cli_ignores_publisher_override(monkeypatch, capsys):
+    monkeypatch.setenv('CUTEAFD_RELEASE_MATRIX', '/not/the/shipping/matrix.json')
+    monkeypatch.setattr('sys.argv', ['release-scope.py', 'default-matrix'])
+    SCOPE.main()
+    assert capsys.readouterr().out.strip() == SCOPE.DEFAULT_MATRIX
+
+
 @pytest.fixture
 def matrix(tmp_path):
     (tmp_path / 'glm.config').write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=4\nRTX_GPUS=1\n')

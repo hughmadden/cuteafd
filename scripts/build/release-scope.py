@@ -445,7 +445,7 @@ def revision_requirements(repo, revision):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('derive', 'requirements', 'check-image', 'check-files'))
+    parser.add_argument('action', choices=('default-matrix', 'derive', 'requirements', 'check-image', 'check-files'))
     parser.add_argument('--repo', type=Path, default=None)
     parser.add_argument('--matrix', type=Path)
     parser.add_argument('--revision')
@@ -456,6 +456,9 @@ def main():
     parser.add_argument('--root', type=Path)
     parser.add_argument('--requirements')
     args = parser.parse_args()
+    if args.action == 'default-matrix':
+        print(DEFAULT_MATRIX)
+        return
     try:
         # Inventory checks supplied with requirements work when sent over stdin,
         # without resolving __file__ or assuming a remote working directory.
