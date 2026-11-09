@@ -1937,3 +1937,19 @@ def test_muse_latest_snapshot_and_physical_rank_costs_are_not_borrowed():
 def test_muse_synthetic_trace_regeneration_is_byte_stable():
     expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n"
     assert json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n" == expected
+
+
+def test_muse_cli_reports_onboard_geometry_and_reproduces_output(tmp_path):
+    import subprocess
+    import sys
+
+    trace_path = tmp_path / "trace.json"
+    output = tmp_path / "prewarm.json"
+    trace_path.write_text(json.dumps(muse_trace()))
+    expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n"
+    result = subprocess.run([sys.executable, str(SCRIPT), "--family", "muse_spark",
+                             "--trace", str(trace_path), "--ranks", "1", "--onboard-layers", "2",
+                             "--output", str(output)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "Muse 1 ranks onboard_layers=2: 2 geometries" in result.stdout
+    assert output.read_text() == expected

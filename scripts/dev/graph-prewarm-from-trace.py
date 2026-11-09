@@ -1815,7 +1815,7 @@ def main():
     else:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
     if args.family == "muse_spark":
-        print(f"Muse {result['ranks']} ranks sparks={result['sparks']}: {len(result['entries'])} geometries; "
+        print(f"Muse {result['ranks']} ranks onboard_layers={result['onboard_layers']}: {len(result['entries'])} geometries; "
               f"base={result['reserve_base_bytes']} extra={result['reserve_extra_bytes']}")
         return
     if args.family == "deepseek_v4":
