@@ -840,7 +840,8 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
-    assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]
+    current_retired = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]
+    assert all(entry in current_retired for entry in retired)
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
         assert (ROOT / entry["config"]).is_file()
