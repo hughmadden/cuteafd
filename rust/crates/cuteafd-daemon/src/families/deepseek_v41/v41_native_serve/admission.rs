@@ -256,10 +256,17 @@ fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// `modules` is each coordinator GPU's measured module-image extent: the
+/// free-memory drop across the pre-weight preload window
+/// (`RuntimeInventory::measure`, `InventoryPhase::PreWeight`). That measurement
+/// is the predicted runtime base's module half, in place of the offline
+/// layout's generic program-count estimate. Empty means no predicted base is
+/// charged and the sampled pre-weight availability stays the budget baseline.
 pub(super) fn admit_startup(
     lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
+    modules: &[u64],
 ) -> Result<Admitted> {
     use super::*;
     validate_owner_modes(args)?;
@@ -282,14 +289,6 @@ pub(super) fn admit_startup(
     let weights = owners::target_arena_demands(&target_layout);
     let manifest = owners::native_manifest(&args.native_lib, "V41_FP8_AOT.json")?;
     let programs = owners::NativePrograms::new(&manifest, u32::try_from(lib.sm_count()?)?)?;
-    // The predicted runtime base's module half: every selected native program
-    // image this GPU resolves, priced by the same table the offline layout
-    // charges, at the same draft bucket the drafter will load.
-    let draft_rows = args.dspark.then(|| owners::draft_rows(
-        u64::from(args.concurrency),
-        if args.draft_length.draft_length.unwrap_or(5) > 5 { 7 } else { 5 }));
-    let modules = programs.modules(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity),
-        ranks, draft_rows)?.iter().map(ProgramSet::module_bytes).collect::<Vec<u64>>();
     // Every owner serve allocates: two decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
     let passes = shape.waves;
@@ -356,7 +355,7 @@ pub(super) fn admit_startup(
     }
     lib.cuda_set_device(0)?;
     let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
-        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), &modules)
+        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), modules)
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
     tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
         host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");
@@ -824,31 +823,39 @@ pub(super) fn expert_demands(
 /// within this of the device at Ready needs no further attribution.
 const RUNTIME_BASE_RESIDUAL_BAR: u64 = 50 << 20;
 
-/// Report the predicted runtime base against the device at Ready. Verification
-/// only: the pool already exists, so a residual never changes placement; it
-/// reports the part of the runtime base the two predicted owners (CUDA context
-/// and selected native program images) do not name.
-pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary,
-    plan: &cuteafd_loader::placement::planner::ResolvedPlan, ranks: usize) -> Result<()> {
-    use families::deepseek_v41::admission::{runtime_base_check, whole_gpu_reserve};
+/// Report the predicted runtime base against the device at Ready, component by
+/// component: the calibrated CUDA context and the measured module-image extent,
+/// read back from the owners admission charged. Verification only: the pool
+/// already exists, so a residual never changes placement; it reports the part
+/// of the device's runtime base the two predicted owners do not name.
+pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admitted) -> Result<()> {
+    use families::deepseek_v41::admission::{runtime_base_check, runtime_base_components, whole_gpu_reserve};
     // With a whole-GPU reserve the sample is the budget's baseline and no
     // predicted owner exists to verify.
     if whole_gpu_reserve() { return Ok(()); }
+    let ranks = admitted.placement.items.len();
     let current = lib.cuda_get_device()?;
     for gpu in 0..ranks {
         lib.cuda_set_device(gpu as i32)?;
         let (free, total) = lib.cuda_memory_info()?;
         let used = (total as u64).saturating_sub(free as u64);
-        let (predicted, measured) = runtime_base_check(&plan.facts, gpu as u8, used)
+        let components = runtime_base_components(&admitted.solved.facts, gpu as u8);
+        let (predicted, measured) = runtime_base_check(&admitted.solved.facts, gpu as u8, used)
             .with_context(|| format!("V4.1 runtime base verification on GPU {gpu}"))?;
+        ensure!(components.total() == predicted,
+            "V4.1 runtime base on GPU {gpu} reports {} charged bytes against a prediction of {predicted}",
+            components.total());
         let residual = i128::from(measured) - i128::from(predicted);
         if residual.unsigned_abs() > u128::from(RUNTIME_BASE_RESIDUAL_BAR) {
-            tracing::warn!(gpu, predicted_bytes = predicted, measured_bytes = measured,
-                residual_bytes = %residual, bar_bytes = RUNTIME_BASE_RESIDUAL_BAR,
-                "V4.1 predicted runtime base leaves a residual (program images and library state beyond the exported module estimate)");
+            tracing::warn!(gpu, context_bytes = components.context_bytes,
+                module_bytes = components.module_bytes, predicted_bytes = predicted,
+                measured_bytes = measured, residual_bytes = %residual,
+                bar_bytes = RUNTIME_BASE_RESIDUAL_BAR,
+                "V4.1 predicted runtime base leaves a residual (device state beyond the CUDA context and module images)");
         } else {
-            tracing::info!(gpu, predicted_bytes = predicted, measured_bytes = measured,
-                residual_bytes = %residual, "V4.1 predicted runtime base");
+            tracing::info!(gpu, context_bytes = components.context_bytes,
+                module_bytes = components.module_bytes, predicted_bytes = predicted,
+                measured_bytes = measured, residual_bytes = %residual, "V4.1 predicted runtime base");
         }
     }
     lib.cuda_set_device(current)?;

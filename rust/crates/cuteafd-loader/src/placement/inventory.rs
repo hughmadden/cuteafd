@@ -409,9 +409,13 @@ impl ProgramSet {
             .is_some_and(|prefix| self.families.iter().any(|f| f == prefix))
     }
 
-    /// Module bytes the family's programs take on one device: measured
-    /// 35,651,584 B for a family's selected set (MiMo, 2026-10-09) on SM120;
-    /// a 2 MiB-granular charge per 16 programs bounds the observed sets.
+    /// Offline estimate of the module bytes a family's programs take on one
+    /// device: calibrated on MiMo's selected set (35,651,584 B, SM120,
+    /// 2026-10-09), scaled 2 MiB per 16 programs over an unverified 32 MiB
+    /// base. It prices `plan --layout` only, as `Basis::Estimated`: V4.1's
+    /// selected set measures 83,886,080 B, so this understates it, and serve
+    /// charges the measured pre-weight drop instead
+    /// (`deepseek_v41::admission::runtime_base`).
     pub fn module_bytes(&self) -> u64 {
         (self.names.len() as u64).div_ceil(16).max(1) * 2 * MIB + 32 * MIB
     }

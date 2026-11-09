@@ -55,12 +55,13 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     let slots = prefill_shape.waves;
     let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
-    let _inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
         Ok(())
     })?;
     memory_checkpoint("after native preload")?;
-    let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    let modules = inventory.gpus.iter().map(|gpu| gpu.module_bytes).collect::<Vec<_>>();
+    let pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -569,7 +570,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     vision.connect()?;
     // Same Ready-boundary verification as the single-rank worker: both GPUs'
     // predicted runtime bases against what their devices hold.
-    admission::log_runtime_base(&lib, &pool.solved, 2)?;
+    admission::log_runtime_base(&lib, &pool)?;
     memory_checkpoint("ready")?;
     ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;

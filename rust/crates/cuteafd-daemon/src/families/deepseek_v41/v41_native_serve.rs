@@ -445,16 +445,18 @@ fn worker(
     let slots = admitted.waves;
     let decode_rows = DECODE_LANE_ROWS;
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
-    let _inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
+    let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
-        // RuntimeInventory::measure loads every runtime-registered native
-        // module inside this window (#1554, #1600), so first-use module growth
-        // in a decode lane, a prefill slot or the drafter is never an
-        // untracked post-baseline owner.
+        // This measured window loads every runtime-registered native module
+        // (#1554, #1600), so first-use module growth in a decode lane, a
+        // prefill slot or the drafter is never an untracked post-baseline
+        // owner. Its free-memory delta is the measured module half of the
+        // predicted runtime base.
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
-    let pool = admission::admit_startup(&lib, &catalog, &args)?;
+    let modules = inventory.gpus.iter().map(|gpu| gpu.module_bytes).collect::<Vec<_>>();
+    let pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -773,7 +775,7 @@ fn worker(
     // Every other Ready owner is priced by now: weights, workspaces, KV,
     // transports, BLAS handles, page tables and arena tails. Report the two
     // predicted runtime-base owners against what the device actually holds.
-    admission::log_runtime_base(&lib, &pool.solved, 1)?;
+    admission::log_runtime_base(&lib, &pool)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready
         .take()
@@ -1273,15 +1275,24 @@ mod tests {
     /// First-use module load is post-baseline growth if it happens after the
     /// admission sample. The shared measured window loads every
     /// runtime-registered native module itself (#1600), so the family must not
-    /// also load modules by hand inside it.
+    /// also load modules by hand inside it, and the predicted runtime base's
+    /// module half is that window's measured free-memory drop — never the
+    /// offline program-count estimate.
     #[test]
     fn native_modules_load_once_inside_the_measured_window() {
-        let source = include_str!("v41_native_serve.rs");
-        let measured = source.split("RuntimeInventory::measure").nth(1).unwrap()
-            .split("let mut pool = admission::admit_startup").next().unwrap();
-        assert!(measured.contains("admission::preload("),
-            "the selected V4.1 programs still warm before admission");
-        assert!(!source.contains(concat!("tp2_native", "_initialize")),
-            "module loading belongs to the shared measured window, not the family");
+        // Anchors are assembled so this test's own text cannot satisfy them.
+        let start = concat!("let inventory = crate::shared::inventory::", "RuntimeInventory::measure");
+        let end = concat!("let pool = admission::", "admit_startup");
+        for source in [include_str!("v41_native_serve.rs"), include_str!("v41_native_serve/distributed.rs")] {
+            let measured = source.split(start).nth(1).unwrap().split(end).next().unwrap();
+            assert!(measured.contains("admission::preload("),
+                "the selected V4.1 programs still warm before admission");
+            assert!(measured.contains("gpu.module_bytes"),
+                "admission charges the measured pre-weight module window");
+            assert!(!source.contains(concat!("tp2_native", "_initialize")),
+                "module loading belongs to the shared measured window, not the family");
+            assert!(!source.contains(concat!("ProgramSet::", "module_bytes")),
+                "the offline program-count estimate never prices the served runtime base");
+        }
     }
 }

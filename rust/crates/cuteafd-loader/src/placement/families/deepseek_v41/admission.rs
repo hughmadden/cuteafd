@@ -170,18 +170,23 @@ pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
 ///
 /// cuBLAS handles, BLAS device initialization and driver page tables are
 /// already named owners of their own (`planner::serving::blas_components` and
-/// the plan's page-table mapping), so they are not repeated here. The AOT
-/// coordinator programs the family resolves lazily add further module storage
-/// after this sample; that class has no exported size to predict from, so it
-/// stays measured (`runtime_base_check`) and reported.
+/// the plan's page-table mapping), so they are not repeated here. The preload
+/// window loads the selected program set; program storage that a later first
+/// use resolves (per-shape warm-up) is outside the prediction, reported by
+/// `runtime_base_check` at Ready and covered after Ready by the runtime growth
+/// reserve.
 pub const CONTEXT_OWNER: &str = "CUDA context";
 pub const MODULE_OWNER: &str = "module images";
 pub const RUNTIME_OWNERS: [&str; 2] = [CONTEXT_OWNER, MODULE_OWNER];
 
 /// The two predicted runtime-base owners of one coordinator GPU. The context
 /// figure is the calibrated `ArchContext` probe; the module figure is the
-/// selected native program set's estimate (the same pair `plan --layout`
-/// declares), never a free-memory remainder.
+/// measured free-memory drop across the pre-weight preload window
+/// (`RuntimeInventory::measure`, `InventoryPhase::PreWeight`) — the modules the
+/// launch actually resolved on that device, never a program-count estimate and
+/// never a free-memory remainder. The offline layout's generic estimate
+/// (`ProgramSet::module_bytes`, calibrated on MiMo) prices `plan --layout` only;
+/// on V4.1 it understates the measured set, so serve charges the measurement.
 pub fn runtime_base(gpu: u8, arch: &crate::placement::ArchContext, module_bytes: u64) -> Vec<Owner> {
     [(CONTEXT_OWNER, arch.context_bytes), (MODULE_OWNER, module_bytes)]
         .into_iter()
@@ -225,6 +230,40 @@ pub fn runtime_base_check(facts: &Facts, gpu: u8, used: u64)
         others = others.checked_add(owner.bytes()?).ok_or(Refusal::Overflow("V4.1 arena-tail check"))?;
     }
     Ok((predicted, used.saturating_sub(others)))
+}
+
+/// The charged components of one GPU's predicted runtime base, named: the
+/// calibrated context and the measured module extent, exactly the allocations
+/// `runtime_base_check` sums into `predicted`. A Ready report prints these
+/// beside the measured occupancy, so a residual is always read against what
+/// was actually predicted.
+pub fn runtime_base_components(facts: &Facts, gpu: u8) -> RuntimeBaseComponents {
+    let location = Location::coordinator(gpu);
+    let mut components = RuntimeBaseComponents::default();
+    for allocation in &facts.allocations {
+        if allocation.location != location || allocation.view.is_some()
+            || !allocation.lifetime.contains(Phase::Ready, facts.phase_order) {
+            continue;
+        }
+        let slot = match allocation.group.as_str() {
+            CONTEXT_OWNER => &mut components.context_bytes,
+            MODULE_OWNER => &mut components.module_bytes,
+            _ => continue,
+        };
+        *slot = slot.saturating_add(allocation.bytes);
+    }
+    components
+}
+
+/// One GPU's predicted runtime base, component by component.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeBaseComponents {
+    pub context_bytes: u64,
+    pub module_bytes: u64,
+}
+
+impl RuntimeBaseComponents {
+    pub fn total(&self) -> u64 { self.context_bytes.saturating_add(self.module_bytes) }
 }
 
 fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Result<Component, Refusal> {
@@ -1684,7 +1723,7 @@ mod runtime_base_tests {
     }
 
     #[test]
-    fn runtime_base_is_the_calibrated_context_plus_the_selected_modules() {
+    fn runtime_base_is_the_calibrated_context_plus_the_measured_modules() {
         let arch = crate::placement::ArchContext::coordinator(
             crate::placement::inventory::PRO_TOTAL_BYTES, None);
         let context_only = runtime_base(0, &arch, 0);
@@ -1746,5 +1785,13 @@ mod runtime_base_tests {
         let (predicted, measured) = runtime_base_check(&facts, 0, used).unwrap();
         assert_eq!(predicted, arch.context_bytes + (40 << 20));
         assert_eq!(measured, arch.context_bytes + (40 << 20) + 1234);
+        // The Ready report names exactly the owners the check sums, so its
+        // components add up to the prediction it is compared against.
+        let components = runtime_base_components(&facts, 0);
+        assert_eq!(components, RuntimeBaseComponents {
+            context_bytes: arch.context_bytes, module_bytes: 40 << 20 });
+        assert_eq!(components.total(), predicted);
+        assert_eq!(runtime_base_components(&facts, 1), RuntimeBaseComponents::default(),
+            "another GPU's owners are never reported as this one's");
     }
 }
