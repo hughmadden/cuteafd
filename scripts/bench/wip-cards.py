@@ -2870,6 +2870,7 @@ def main():
     parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
     parser.add_argument('--prefill-repeat', action='store_true', help='each prefill point\'s timed request re-sends its '
                         'warm-up\'s corpus behind a fresh nonce (nominal warm: the same mapped-table rows, no prefix-cache reuse)')
+    parser.add_argument('--prefill-idle-seconds', type=float, help='idle after each ordinary prefill warm-up before the timed request (default 0)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
@@ -2999,6 +3000,9 @@ def main():
         parser.error('--post-load-repeat needs --post-load-c1')
     if args.prefill_repeat and not args.prefill_lengths:
         parser.error('--prefill-repeat needs --prefill-lengths')
+    if args.prefill_idle_seconds is not None and (not args.prefill_lengths or not math.isfinite(args.prefill_idle_seconds)
+                                                or not 0 <= args.prefill_idle_seconds < 2**64):
+        parser.error('--prefill-idle-seconds needs --prefill-lengths and finite nonnegative representable seconds')
     if args.sweep_tokens is not None and not (args.levels and 0 <= args.sweep_tokens <= 8192):
         parser.error('--sweep-tokens needs --levels and 0 (omit max_tokens) or 1..8192 tokens')
     levels = None
@@ -3062,6 +3066,8 @@ def main():
             card['lossless_dump'] = lossless_dump
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
+            if args.prefill_idle_seconds is not None:
+                card['prefill_idle_seconds'] = args.prefill_idle_seconds
             if args.prefill_repeat:
                 card['prefill_repeat'] = True
         if levels:
@@ -3209,6 +3215,7 @@ def main():
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
         (['prefill_repeat'] if args.prefill_repeat else []) + \
+        (['prefill_idle_seconds'] if args.prefill_idle_seconds is not None else []) + \
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \

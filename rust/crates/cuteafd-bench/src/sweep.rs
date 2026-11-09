@@ -67,6 +67,9 @@ pub struct PrefillPoint {
     pub prompt_tokens: u64,
     pub tok_s: f64,
     pub ttft_s: f64,
+    /// Idle time after the ordinary warm request, outside the timed interval.
+    #[serde(default)]
+    pub idle_seconds: f64,
     /// GPU throttle report over the timed request (`/v1/thermal`; absent without one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thermal: Option<Value>,
@@ -110,9 +113,17 @@ pub struct PrefillOptions<'a> {
     /// The timed request re-sends its warm-up's corpus behind a fresh leading
     /// nonce (no prefix-cache reuse): table rows the warm-up read are the same.
     pub repeat: bool,
+    pub idle_seconds: f64,
     /// A cold purge (e.g. `nest drop-caches`), run before each point's warm-up
     /// and again before its timed request.
     pub purge: Option<&'a dyn Fn() -> Result<()>>,
+}
+
+impl PrefillOptions<'_> {
+    pub fn idle_duration(&self) -> Result<std::time::Duration> {
+        std::time::Duration::try_from_secs_f64(self.idle_seconds)
+            .context("prefill idle seconds must be finite, nonnegative and representable")
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -248,6 +259,7 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
 /// measured request, so both start from the same cold state.
 fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed)
     -> Result<Vec<PrefillPoint>> {
+    let idle = options.idle_duration()?;
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
         client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(seed, words)), 1), None)
     };
@@ -263,6 +275,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
         ask(words, warm_seed).with_context(|| format!("{length}-token prefill warm-up"))?;
+        if !idle.is_zero() { std::thread::sleep(idle); }
         timed(on_timed)?;
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
@@ -277,7 +290,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
         points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            thermal, fabric, mapped_tables, expert_usage });
+            idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
     }
     Ok(points)
 }
@@ -333,6 +346,7 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     if tokens > MAX_TOKENS {
         bail!("sweep tokens must be {OMIT_TOKENS} (omit max_tokens) or 1..={MAX_TOKENS}, got {tokens}");
     }
+    prefill_options.idle_duration()?;
     if post_load_repeat && !(post_load_c1 && levels.contains(&1)) {
         bail!("post_load_repeat needs post_load_c1 and a levels list that includes 1 (it replays the levels C1)");
     }
@@ -458,6 +472,19 @@ mod tests {
         let (warm, timed) = prefill_seeds(8192, false);
         assert_ne!(corpus(warm, 512), corpus(timed, 512));
         assert_ne!(prefill_seeds(8192, true), prefill_seeds(65536, true));
+    }
+
+    #[test]
+    fn prefill_idle_defaults_to_zero_and_rejects_invalid_durations() {
+        assert!(PrefillOptions::default().idle_duration().unwrap().is_zero());
+        for idle_seconds in [-1.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            let options = PrefillOptions { idle_seconds, ..Default::default() };
+            assert!(options.idle_duration().is_err());
+        }
+        let options = PrefillOptions { idle_seconds: 1.5, ..Default::default() };
+        assert_eq!(options.idle_duration().unwrap(), std::time::Duration::from_millis(1500));
+        let point = PrefillPoint { idle_seconds: options.idle_seconds, ..Default::default() };
+        assert_eq!(serde_json::to_value(point).unwrap()["idle_seconds"], 1.5);
     }
 
     #[test]

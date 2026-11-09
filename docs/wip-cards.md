@@ -98,6 +98,9 @@ and arms for cleanup. Source worktrees are retained for inspection.
   `quality` naming the failing cases; each case's probe pair (prompt ids,
   generated ids, row hashes, top two) stays in `report.json` under the pass's
   `evidence`. The baseline's single `spec_lossless` check is unchanged.
+- `--prefill-idle-seconds N` waits after each ordinary prefill warm-up before
+  the timed request (default 0). Each prefill point records `idle_seconds` in
+  `sweep.json`; the wait is outside TTFT and the timed thermal window.
 - `--trace` gives every job `SPECULATION_TRACE=<job>/speculation-trace.jsonl`.
   The observer notes it after warm-up; a speculating arm that wrote nothing
   fails its row. `--set CARD:PROFILE=census,transport-timing,expert-timing`

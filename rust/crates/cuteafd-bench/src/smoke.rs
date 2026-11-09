@@ -132,6 +132,9 @@ pub struct Entry {
     /// a fresh nonce (nominal warm: the same table rows, no prefix-cache reuse).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_repeat: Option<bool>,
+    /// Idle seconds between each ordinary prefill warm-up and timed request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_idle_seconds: Option<f64>,
     /// A cold purge run before each prefill point's warm-up and again before its
     /// timed request (e.g. `nest drop-caches`); the window's own hooks are untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -503,6 +506,7 @@ impl Entry {
             post_load_repeat: self.post_load_repeat.or(defaults.post_load_repeat),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
             prefill_repeat: self.prefill_repeat.or(defaults.prefill_repeat),
+            prefill_idle_seconds: self.prefill_idle_seconds.or(defaults.prefill_idle_seconds),
             prefill_purge: self.prefill_purge.clone().or_else(|| defaults.prefill_purge.clone()),
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             sweep_c1: self.sweep_c1.clone().or_else(|| defaults.sweep_c1.clone()),
@@ -986,9 +990,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
             bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
         }
-        if (entry.prefill_repeat == Some(true) || entry.prefill_purge.is_some()) && entry.prefill_lengths.is_none() {
-            bail!("{}: prefill_repeat and prefill_purge need prefill_lengths", entry.name);
+        if (entry.prefill_repeat == Some(true) || entry.prefill_purge.is_some() || entry.prefill_idle_seconds.is_some()) && entry.prefill_lengths.is_none() {
+            bail!("{}: prefill_repeat, prefill_purge and prefill_idle_seconds need prefill_lengths", entry.name);
         }
+        crate::sweep::PrefillOptions { idle_seconds: entry.prefill_idle_seconds.unwrap_or(0.0), ..Default::default() }
+            .idle_duration().with_context(|| format!("{}: prefill_idle_seconds", entry.name))?;
         let set = entry.lossless_set.as_ref().map(|path| crate::panels::lossless::CaseSet::load(&args.repo.join(path))
             .with_context(|| format!("{}: lossless_set", entry.name))).transpose()?;
         if let Some(dump) = &entry.lossless_dump {
@@ -1022,10 +1028,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_idle_seconds={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
-                e.prefill_repeat.unwrap_or(false), e.prefill_purge.is_some(),
+                e.prefill_repeat.unwrap_or(false), e.prefill_idle_seconds.unwrap_or(0.0), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
@@ -1484,6 +1490,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             let purge = entry.prefill_purge.as_ref()
                 .map(|hook| move || window_hook("prefill-purge", hook, purge_url, purge_config));
             let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
+                idle_seconds: entry.prefill_idle_seconds.unwrap_or(0.0),
                 purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
             let sweep = if let Some(options) = &entry.sweep_c1 {
                 crate::sweep::run_c1_windowed(&url, api_key.as_deref(), options,
@@ -1727,6 +1734,14 @@ mod tests {
         entry.levels = Some(vec![1]);
         entry.prefill_lengths = Some(vec![8192]);
         assert!(check_post_load(&entry).is_err());
+    }
+
+    #[test]
+    fn prefill_idle_seconds_merge_and_preserve_explicit_zero() {
+        let defaults = Entry { prefill_idle_seconds: Some(1.5), ..Entry::default() };
+        assert_eq!(Entry::default().merged(&defaults).prefill_idle_seconds, Some(1.5));
+        let entry = Entry { prefill_idle_seconds: Some(0.0), ..Entry::default() }.merged(&defaults);
+        assert_eq!(entry.prefill_idle_seconds, Some(0.0));
     }
 
     #[test]
