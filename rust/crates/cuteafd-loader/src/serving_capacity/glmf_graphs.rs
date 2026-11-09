@@ -6,7 +6,6 @@ pub const UNIT_ROWS: usize = PAGE_ROWS * UNIT_PAGES;
 pub const DECODE_ROWS: usize = 64;
 pub const PLAIN_DECODE_BUCKETS: [usize; 6] = [1, 4, 8, 16, 32, 64];
 pub const SPEC_DECODE_BUCKETS: [usize; 6] = [2, 4, 8, 16, 32, 64];
-use crate::placement::inventory::{CapturedGraphRank, DeclaredGraphSet, GraphRank};
 use serde::{Deserialize, Serialize};
 
 pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {
@@ -40,24 +39,110 @@ impl DecodeBuckets {
     }
 }
 
-/// Whole historical observations are fallback estimates, not qualified census
-/// rows: exact keys and code provenance were not retained (#1463). No margin.
-pub fn estimated_graph_rank(graphs: u64, role: usize) -> GraphRank {
-    let (bytes, count) = [(1_946_157_056, 13_800), (2_231_369_728, 13_800),
-        (2_283_798_528, 13_500)][role.min(2)];
-    GraphRank::estimate(graphs, bytes, count).expect("GLMF historical graph estimate fits u64")
+/// One checked-in prewarm shape: a masked decode step's row, spec flag and
+/// table geometry. A shape warms every layer segment that shares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmfPrewarmEntry {
+    pub rows: usize,
+    pub spec: bool,
+    pub long: bool,
+    pub pool_width: usize,
+    pub page_stride: usize,
+    pub pool_stride: usize,
+    pub pin: bool,
 }
 
-pub fn graph_reserve_bytes(graphs: usize) -> u64 {
-    estimated_graph_rank(graphs as u64, 0).bytes
+impl GlmfPrewarmEntry {
+    pub fn shape(&self) -> (usize, bool, GraphGeometry) {
+        (self.rows, self.spec, GraphGeometry { pool_width: self.pool_width,
+            page_stride: self.page_stride, pool_stride: self.pool_stride, long: self.long })
+    }
 }
 
-/// The startup decode graph set's bytes per rank: `buckets` (the engine's sets) over every geometry.
+/// The provisional set is the former startup capture set (`300` shapes at a
+/// 1M context, `13,800` executables on one RTX PRO 6000), and its price is the
+/// measured arena of exactly that capture (#1636: 2,313,158,656 B / 13,800
+/// graphs, HQA `e0ecc3d5`, min config `glm53f-exl3-k4-core-k6-min`). Pinning
+/// is explicit, never inferred from order; a trace replaces the set.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmfPrewarmList {
+    pub schema_version: u32,
+    pub family: String,
+    pub measured_bytes: u64,
+    pub measured_executables: u64,
+    pub reserve_extra_bytes: u64,
+    pub entries: Vec<GlmfPrewarmEntry>,
+}
+
+impl GlmfPrewarmList {
+    /// Measured bytes per executable, rounded up: the per-capture bootstrap a
+    /// device uses until its own sample replaces it.
+    pub fn executable_bytes(&self) -> u64 {
+        self.measured_bytes.div_ceil(self.measured_executables.max(1)).max(1)
+    }
+
+    /// The measured arena scaled to `executables` captures, without per-graph
+    /// rounding: exactly `measured_bytes` at `measured_executables`.
+    pub fn arena_bytes(&self, executables: u64) -> u64 {
+        let measured = u64::from(self.measured_executables.max(1));
+        (u128::from(executables) * u128::from(self.measured_bytes)).div_ceil(u128::from(measured)) as u64
+    }
+}
+
+pub fn glmf_prewarm_list() -> GlmfPrewarmList {
+    let list: GlmfPrewarmList = serde_json::from_str(include_str!("glmf_prewarm.json"))
+        .expect("checked-in GLM Flash prewarm list");
+    assert_eq!(list.schema_version, 1);
+    assert_eq!(list.family, "glm5_flash");
+    list
+}
+
+/// The prewarm shapes this launch can request, in the startup set's order:
+/// checked-in pinned entries restricted to the launch's own geometries and
+/// row buckets. A context or row set the list does not cover warms nothing.
+pub fn glmf_prewarm_shapes(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, buckets: &DecodeBuckets) -> Vec<(usize, bool, GraphGeometry)> {
+    let allowed = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense,
+        sequences, speculation, buckets);
+    let list = glmf_prewarm_list();
+    allowed.into_iter().filter(|shape| list.entries.iter()
+        .any(|entry| entry.pin && entry.shape() == *shape)).collect()
+}
+
+/// Per-device graph reserve: the packed measured arena of this launch's
+/// prewarm set (the reserve base), the list's packed capture headroom and the
+/// per-capture bootstrap estimate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlmfGraphReserve {
+    /// Packed measured arena per coordinator device (a rank 0 head split
+    /// carries its extra head segment).
+    pub reserves: Vec<u64>,
+    pub executables: Vec<u64>,
+    pub extra: u64,
+    pub bootstraps: Vec<u64>,
+    pub shapes: Vec<(usize, bool, GraphGeometry)>,
+}
+
+pub const GRAPH_CHUNK: u64 = 2 << 20;
+
+fn packed(bytes: u64) -> u64 { bytes.div_ceil(GRAPH_CHUNK).saturating_mul(GRAPH_CHUNK) }
+
+/// The graph reserve one launch charges per coordinator device, before KV
+/// sizing, from the checked-in prewarm list and its measured per-graph price.
 #[allow(clippy::too_many_arguments)]
-pub fn serving_graph_reserve(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
-    startup_set(context, pool_tokens, dense, sequences, speculation, layers, peer, buckets)
-        .inventory.ranks.iter().map(|rank| rank.bytes).collect()
+pub fn glmf_graph_reserve(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
+    speculation: bool, layers: usize, gpus: usize, decode_rows: usize, sms: usize) -> GlmfGraphReserve {
+    let buckets = DecodeBuckets::new(verify_budget(decode_rows, sms));
+    let shapes = glmf_prewarm_shapes(context, pool_tokens, dense, sequences.min(decode_rows), speculation, &buckets);
+    let list = glmf_prewarm_list();
+    let each = list.executable_bytes();
+    let extra = packed(list.reserve_extra_bytes);
+    let executables: Vec<u64> = (0..gpus).map(|rank|
+        shapes.len() as u64 * (layers + usize::from(rank == 0)) as u64).collect();
+    let reserves = executables.iter().map(|&count| packed(list.arena_bytes(count))).collect();
+    GlmfGraphReserve { reserves, executables, extra, bootstraps: vec![each; gpus], shapes }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,32 +220,7 @@ pub fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequence
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn graph_solver_shrinks_without_oscillation_and_preserves_lazy_fallback() {
-        let mut seen = Vec::new();
-        let answer = solve_graph_pool(2048, |pool| -> Result<_, ()> {
-            seen.push(pool);
-            Ok((if pool > 1024 { 768 } else { 1280 }, true))
-        }).unwrap();
-        assert_eq!(answer, (768, true));
-        assert_eq!(seen, [2048, 768]);
-        assert_eq!(solve_graph_pool(2048, |_| -> Result<_, ()> { Ok((512, false)) }).unwrap(), (512, false));
-    }
-
-    #[test]
-    fn graph_admission_retries_only_memory_refusals() {
-        let startup = Some(StartupGraphReserve { reserve: 200, allowance: 100 });
-        let mut calls = Vec::new();
-        assert_eq!(admit_beside_decode_graphs(startup, |graphs| {
-            calls.push(graphs);
-            if graphs.is_some() { Err("memory") } else { Ok(1024) }
-        }, |error| *error == "memory", |retry, _| retry), Ok((1024, false)));
-        assert_eq!(calls, [Some(200), None]);
-        assert_eq!(admit_beside_decode_graphs(startup, |_| Err("geometry"),
-            |error| *error == "memory", |retry, _| retry), Err("geometry"));
-        assert_eq!(admit_beside_decode_graphs(startup, |graphs| Err(if graphs.is_some() { "startup memory" } else { "lazy memory" }),
-            |error| error.ends_with("memory"), |retry, _| retry), Err("startup memory"));
-    }
+    use std::collections::HashSet;
 
     #[test]
     fn exchange_matches_peer_slots_and_control_floor() {
@@ -168,15 +228,48 @@ mod tests {
         assert_eq!(peer_exchange_bytes(2, 4096, 4096, 2, false), 268_435_712);
     }
 
+    /// The checked-in provisional set is exactly the former startup capture
+    /// set at the reference launch (300 shapes x 46 executable keys), and its
+    /// reserve is the measured arena #1636 recorded for that capture.
     #[test]
-    fn startup_counts_match_rc3_and_peer_has_no_head_graph() {
+    fn provisional_prewarm_covers_the_reference_startup_set_and_its_measured_price() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
         assert_eq!(shapes.len(), 300);
-        let bytes = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-        assert_eq!(bytes, vec![estimated_graph_rank(13_800, 1).bytes, estimated_graph_rank(13_500, 2).bytes]);
+        assert_eq!(glmf_prewarm_shapes(1_048_576, 2_097_152, 2051, 16, true, &buckets), shapes);
+        let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, 64, 188);
+        assert_eq!(plan.shapes.len(), 300);
+        assert_eq!(plan.reserves, [2_313_158_656]);
+        assert_eq!(plan.executables, [13_800]);
+        assert_eq!(plan.extra, 0);
+        assert_eq!(plan.bootstraps, [167_621]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
+    }
+
+    #[test]
+    fn prewarm_shapes_filter_to_the_launch_and_stay_unique() {
+        let list = glmf_prewarm_list();
+        assert_eq!(list.schema_version, 1);
+        assert_eq!(list.family, "glm5_flash");
+        assert_eq!(list.executable_bytes(), 167_621);
+        assert_eq!(list.reserve_extra_bytes, 0);
+        let mut identities = HashSet::new();
+        for entry in &list.entries {
+            assert!(identities.insert(entry.shape()), "duplicate prewarm geometry");
+            assert!(entry.pin, "the provisional set is pinned; a trace chooses pins");
+        }
+        // A small context uses the geometries it has, never one it cannot key.
+        let buckets = DecodeBuckets::new(64);
+        let small = glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets);
+        assert!(!small.is_empty());
+        for shape in &small {
+            assert!(serving_graph_shapes(65_536, 65_536 / PAGE_ROWS, 2051, 4, false, &buckets).contains(shape));
+            assert!(!shape.1, "no speculation shapes without speculation");
+        }
+        let plan = glmf_graph_reserve(65_536, 65_536, 2051, 4, false, 45, 2, 64, 188);
+        assert_eq!(plan.reserves.len(), 2);
+        assert!(plan.reserves[0] > plan.reserves[1], "rank 0 captures its head segment");
     }
 }
 
@@ -200,90 +293,8 @@ impl GraphKey {
     }
 }
 
-pub fn executable_keys(shapes: &[(usize, bool, GraphGeometry)], layers: usize, rank: usize) -> Vec<GraphKey> {
-    shapes.iter().flat_map(|&(rows, spec, geometry)| (0..layers + usize::from(rank == 0))
-        .map(move |segment| GraphKey::new(segment, rows, spec, geometry))).collect()
-}
-
-pub fn declared_fingerprints(shapes: &[(usize, bool, GraphGeometry)], layers: usize, ranks: usize)
-    -> Result<Vec<String>, String> {
-    (0..ranks).map(|rank| DeclaredGraphSet::new(&executable_keys(shapes, layers, rank))?
-        .fingerprint(rank as u8)).collect()
-}
-
-/// Capture bytes and exact retained executable identities; never a count-only proof.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartupCapture {
-    pub ranks: Vec<CapturedGraphRank>,
-}
-
-/// One immutable geometry list and estimated per-rank ledger for both admission and capture.
-#[allow(clippy::too_many_arguments)]
-pub fn startup_set(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
-    speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets)
-    -> crate::placement::inventory::StartupGraphs<(usize, bool, GraphGeometry)> {
-    use crate::placement::inventory::{GraphSet, Lifetime};
-    let keys = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences, speculation, buckets);
-    let shapes = keys.len() as u64;
-    let ranks = std::iter::once(shapes * (layers + 1) as u64)
-        .chain(peer.then_some(shapes * layers as u64)).enumerate().map(|(rank, executables)| {
-            let role = if peer { 1 + rank } else { 0 };
-            estimated_graph_rank(executables, role)
-        }).collect();
-    GraphSet { ranks, shapes, lifetime: Lifetime::Startup }.startup(keys)
-        .expect("startup geometry list and ledger are constructed together")
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn serving_graph_counts(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
-    speculation: bool, layers: usize, peer: bool, buckets: &DecodeBuckets) -> Vec<u64> {
-    let shapes = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense, sequences,
-        speculation, buckets).len() as u64;
-    std::iter::once(shapes * (layers + 1) as u64).chain(peer.then_some(shapes * layers as u64)).collect()
-}
-
 /// Every exchange slot owns its payload, completion word and native control storage.
 pub fn peer_exchange_bytes(lanes: u64, rows: u64, hidden: u64, partial_bytes: u64, output_shard: bool) -> u64 {
     let slots = lanes * if output_shard { 6 } else { 4 };
     slots * (rows.max(64) * hidden * partial_bytes).max(256) + ((slots + 1) * 16).max(256)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StartupGraphReserve {
-    pub reserve: u64,
-    pub allowance: u64,
-}
-
-/// Retry only a memory refusal caused by startup bytes above the lazy allowance.
-/// Error classification and contextual diagnostics belong to the caller's edge.
-pub fn admit_beside_decode_graphs<E>(
-    startup: Option<StartupGraphReserve>,
-    mut admit: impl FnMut(Option<u64>) -> Result<usize, E>,
-    shortfall: impl Fn(&E) -> bool,
-    retry_error: impl FnOnce(E, E) -> E,
-) -> Result<(usize, bool), E> {
-    let Some(graphs) = startup else { return Ok((admit(None)?, false)) };
-    let refused = match admit(Some(graphs.reserve)) {
-        Ok(tokens) => return Ok((tokens, true)),
-        Err(error) if graphs.reserve > graphs.allowance && shortfall(&error) => error,
-        Err(error) => return Err(error),
-    };
-    match admit(None) {
-        Ok(tokens) => Ok((tokens, false)),
-        Err(retry) if shortfall(&retry) => Err(refused),
-        Err(retry) => Err(retry_error(retry, refused)),
-    }
-}
-
-/// Re-evaluate an automatic admission at its own graph geometry. Shrinking only avoids
-/// oscillation across graph-shape thresholds; the returned reservation describes the pool.
-/// The closure returns `(pool_tokens, startup_graphs)`, preserving lazy-fallback policy.
-pub fn solve_graph_pool<E>(initial: usize, mut admit: impl FnMut(usize) -> Result<(usize, bool), E>)
-    -> Result<(usize, bool), E> {
-    let mut candidate = initial;
-    loop {
-        let (pool, startup) = admit(candidate)?;
-        if !startup || pool >= candidate { return Ok((candidate.min(pool), startup)); }
-        candidate = pool;
-    }
 }
