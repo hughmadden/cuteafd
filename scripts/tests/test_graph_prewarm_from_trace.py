@@ -70,8 +70,8 @@ def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0,
             "count": count, "capture_bytes": capture_bytes, "executables": 1}
 
 
-def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20):
-    return {"schema_version": 2, "cache": {"device": 0, "charged": charged},
+def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20, device=0):
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
             "sites": {"glm5_flash.decode": {"largest_bytes": 3 << 20}},
             "graphs": graphs if graphs is not None else
             [flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0,
@@ -88,13 +88,12 @@ def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     result = MODULE.generate([flash_trace()], "glm5_flash", coverage=0.99)
     assert result["family"] == "glm5_flash"
     # The base is the selected entries' measured capture bytes (three rows of
-    # 1 MiB), not the 16 MiB whole-session arena the trace held.
-    assert result["measured_bytes"] == 4 << 20
-    assert result["measured_executables"] == 3
+    # 1 MiB on device 0), not the 16 MiB whole-session arena the trace held.
+    assert result["measured_bytes"] == [4 << 20]
+    assert result["measured_executables"] == [3]
     # Startup prewarms every traced shape, so the reserve base holds the whole
-    # request demand; the headroom is one largest measured capture (3 MiB,
-    # packed to 4 MiB) for a shape the trace did not cover.
-    assert result["reserve_extra_bytes"] == 4 << 20
+    # request demand; the tail is the fixed 2 MiB allocation headroom.
+    assert result["reserve_extra_bytes"] == 2 << 20
     # 99% coverage keeps the two hot shapes (190 and 30 hits); only the peak is pinned.
     assert result["entries"] == [
         {"rows": 4, "spec": False, "long": False, "pool_width": 0,
@@ -121,16 +120,16 @@ def test_flash_startup_prewarm_is_not_request_demand():
     assert [(entry["rows"], entry["pin"]) for entry in result["entries"]] == [(4, True)]
 
 
-def test_flash_selected_entries_price_the_largest_measured_device():
-    small = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10)],
+def test_flash_each_device_keeps_its_own_measured_base():
+    first = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10)],
                         charged=8 << 20)
-    large = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10,
-                                     capture_bytes=2 << 20)],
-                        charged=24 << 20)
-    result = MODULE.generate([small, large], "glm5_flash")
-    # One selected shape whose measured share is 2 MiB on the costlier device;
-    # its own executable count prices the base, never a mix with the cheap one.
-    assert (result["measured_bytes"], result["measured_executables"]) == (2 << 20, 1)
+    second = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10,
+                                      capture_bytes=3 << 20)],
+                         charged=24 << 20, device=1)
+    result = MODULE.generate([first, second], "glm5_flash")
+    # One selected shape per device, 1 MiB and 3 MiB; each packs once to its
+    # own 2 MiB / 4 MiB base, never scaled from the other rank's price.
+    assert (result["measured_bytes"], result["measured_executables"]) == ([2 << 20, 4 << 20], [1, 1])
 
 
 def test_flash_a_selected_shape_without_a_measured_share_fails():
@@ -148,6 +147,7 @@ def test_flash_a_selected_shape_without_a_measured_share_fails():
 @pytest.mark.parametrize("change", [
     lambda t: t["graphs"][0].update(shape="GlmGraphKey { rows: 1 }"),
     lambda t: t["graphs"][0].update(capture_bytes=None),
+    lambda t: t["cache"].update(device=1),
     lambda t: t.update(graphs=[flash_graph(0, "false", "false", 0, 64, 0, 5)]),
     lambda t: t.update(graphs=[flash_graph(4, "false", "true", 1, 64, 0, 5)]),
 ])
@@ -174,8 +174,8 @@ def test_flash_shapes_are_priced_separately_by_resolved_shape(tmp_path):
     assert set(result["layouts"]) == {"1-sparks", "2"}
     # Each layout prices its own selected entries: the same four rows of
     # captures, 4 MiB at the 1 MiB row price and 12 MiB at the 3 MiB row price.
-    assert result["layouts"]["1-sparks"]["measured_bytes"] == 4 << 20
-    assert result["layouts"]["2"]["measured_bytes"] == 12 << 20
+    assert result["layouts"]["1-sparks"]["measured_bytes"] == [4 << 20]
+    assert result["layouts"]["2"]["measured_bytes"] == [12 << 20]
     # A shape entry carries only its own trace's prices, never the document's
     # schema or another shape's arena.
     assert "schema_version" not in result["layouts"]["1-sparks"]
@@ -185,8 +185,8 @@ def test_flash_shapes_are_priced_separately_by_resolved_shape(tmp_path):
 def test_flash_prices_a_layout_from_the_costlier_quant(tmp_path):
     # One layout traced twice, as an EXL3 and an FP8 checkpoint would be. The
     # entries are the same request shapes either way; the price is the costlier
-    # quant's selected-entry sum and largest capture, taken as that trace's own
-    # (bytes, executables) pair, never a mix of the two.
+    # quant's selected-entry sum, taken as that trace's own (bytes, executables)
+    # pair, never a mix of the two.
     cheap = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0),
                          flash_graph(4, "false", "false", 0, 64, 0, 90, segment=1)], charged=16 << 20)
     dear = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0,
@@ -201,8 +201,8 @@ def test_flash_prices_a_layout_from_the_costlier_quant(tmp_path):
         paths.append(path)
     groups = MODULE.layout_groups([f"1-sparks={path}" for path in paths], "glm5_flash")
     layout = MODULE.generate_layouts(groups, "glm5_flash")["layouts"]["1-sparks"]
-    assert (layout["measured_bytes"], layout["measured_executables"]) == (6 << 20, 2)
-    assert layout["reserve_extra_bytes"] == 6 << 20
+    assert (layout["measured_bytes"], layout["measured_executables"]) == ([6 << 20], [2])
+    assert layout["reserve_extra_bytes"] == 2 << 20
     assert [(entry["rows"], entry["spec"]) for entry in layout["entries"]] == [(4, False)]
 
 

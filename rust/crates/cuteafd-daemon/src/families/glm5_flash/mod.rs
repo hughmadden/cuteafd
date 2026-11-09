@@ -2951,14 +2951,15 @@ impl Opened {
         probe("packing")?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
-                engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.bootstraps)?;
+                engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves,
+                    &admitted_graphs.bootstraps, admitted_graphs.extra)?;
                 let prewarm = admitted_graphs.prewarm_bytes();
-                let extra = admitted_graphs.extra_bytes();
                 for (rank, &charge) in admitted_graphs.charged.iter().enumerate() {
                     let resolved = cuteafd_loader::placement::graph_reserve::current(rank, false,
                         admitted_graphs.reserves[rank], admitted_graphs.extra).map_err(anyhow::Error::msg)?;
                     tracing::info!(rank, reserve = charge, default = resolved.bytes, source = %resolved.source,
-                        prewarm_bytes = prewarm[rank], capture_headroom = extra[rank],
+                        prewarm_bytes = prewarm[rank], capture_headroom = resolved.effective_extra_bytes,
+                        extra_source = %resolved.extra_source, cap_source = %resolved.cap_source,
                         executables = admitted_graphs.executables[rank], prewarm_shapes = admitted_graphs.shapes,
                         bootstrap = admitted_graphs.bootstraps[rank], "GLM Flash graph reserve");
                 }

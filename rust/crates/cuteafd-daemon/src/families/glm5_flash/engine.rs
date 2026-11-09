@@ -1858,7 +1858,10 @@ impl<'a> GlmfEngine<'a> {
         Ok(true)
     }
 
-    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
+    /// Bind each rank's banks at its admitted charge, then record the shared
+    /// reserve policy that charge came from: the traced base plus the fixed
+    /// allocation tail, with runtime capture headroom from the shared extra.
+    pub fn configure_graph_cache(&self, charged: &[u64], bases: &[u64], bootstraps: &[u64], tail: u64) -> Result<()> {
         use crate::shared::decode_graph::device::{Cycle, Preference, Site};
         let basis = self.graph_basis();
         if basis == crate::shared::decode_graph::device::Basis::Bytes {
@@ -1866,11 +1869,13 @@ impl<'a> GlmfEngine<'a> {
         }
         for rank in 0..self.ranks() {
             let device = if rank == 0 { self.device } else { self.peer()?.device };
-            self.graphs_of(rank).borrow_mut().attach_device(device, reserves[rank], Site {
+            self.graphs_of(rank).borrow_mut().attach_device(device, charged[rank], Site {
                 name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis,
                 spans_devices: self.ranks() > 1 || self.peer.is_some(),
             })?;
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
     }
@@ -1892,8 +1897,8 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Whether this launch's layout's checked-in prewarm list pins this shape:
-    /// only what that layout's trace shows is always hot (or, for a layout with
-    /// no trace, its bootstrap set).
+    /// only what that layout's trace shows is always hot. A layout with no
+    /// trace prewarms its bootstrap set unpinned and lets ARC decide.
     fn graph_pinned(&self, key: &GraphKey) -> bool {
         let shape = (key.rows, key.spec, GraphGeometry { pool_width: key.pool_width,
             page_stride: key.page_stride, pool_stride: key.pool_stride, long: key.long });
@@ -5953,7 +5958,7 @@ mod prefill_lane_tests {
             // Startup prewarms every traced shape this context admits; the long
             // geometries only exist at the wide context, so the wide reserve is
             // a superset and pays for the trace's whole demand.
-            assert_eq!(wide.executables[0], 644);
+            assert_eq!(wide.executables[0], 690);
             assert!(narrow.shapes.iter().all(|shape| wide.shapes.contains(shape)));
             assert!(narrow.reserves[0] <= wide.reserves[0]);
         }
@@ -6030,7 +6035,7 @@ mod prefill_lane_tests {
             let warm = glmf_prewarm_shapes(32768, 2_097_152, 2051, sequences, true, &buckets, layout);
             assert_eq!(plan.executables, [warm.len() as u64 * 46]);
             let list = glmf_prewarm_list().layout(layout).expect("the min column is traced");
-            let packed = |count: u64| list.arena_bytes(count).div_ceil(2 << 20) * (2 << 20);
+            let packed = |count: u64| list.arena_bytes(0, count).div_ceil(2 << 20) * (2 << 20);
             assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46)]);
             assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
             assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);

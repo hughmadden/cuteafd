@@ -213,22 +213,19 @@ def glmf_identity(shape):
 def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     """A GLM Flash startup list: every selected shape prewarms at startup, the
     always-hot ones are pinned, and the reserve base is what those selected
-    shapes measured, device by device, plus one largest capture of headroom for
-    a shape the trace did not cover. Startup prewarm itself runs as Other, never
-    as request demand. The whole-session arena in `cache.charged` also holds
-    captures outside the coverage set (startup warmups and one-off shapes this
-    launch never prewarms), so it is not the base."""
+    shapes measured, device by device, plus the fixed 2 MiB allocation tail.
+    Startup prewarm itself runs as Other, never as request demand. The
+    whole-session arena in `cache.charged` also holds captures outside the
+    coverage set (startup warmups and one-off shapes this launch never
+    prewarms), so it is not the base. Runtime capture headroom comes from the
+    shared extra keys, not the trace."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
     counts = {}
-    largest = 0
     for trace in traces:
         if trace.get("schema_version") != 2:
             raise ValueError("expected GRAPH_TRACE schema_version=2")
         matching = [graph for graph in trace["graphs"] if graph["site"].startswith("glm5_flash.")]
-        for site, values in trace.get("sites", {}).items():
-            if site.startswith("glm5_flash."):
-                largest = max(largest, int(values["largest_bytes"]))
         device_counts = {}
         for graph in matching:
             key = glmf_identity(graph["shape"])
@@ -256,14 +253,14 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
                 "page_stride": key[4], "pool_stride": key[5], "pin": key in pinned}
                for key in sorted(selected)]
     # Price exactly the entries this list prewarms: sum each selected shape's
-    # measured capture bytes on one device, and let the costliest device across
-    # the layout's traces (and quants) set the base. A selected shape with no
-    # measured share means the trace cannot price this list; it is missing data,
-    # never a zero.
+    # measured capture bytes on one device, take the costliest quant traced for
+    # that device, and keep one base per coordinator device. A selected shape
+    # with no measured share means the trace cannot price this list; it is
+    # missing data, never a zero.
     wanted = set(selected)
-    shares = []
+    shares = {}
     for trace in traces:
-        device = trace["cache"].get("device")
+        device = int(trace["cache"].get("device", 0))
         seen = set()
         captured = 0
         executables = 0
@@ -284,17 +281,23 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
             raise ValueError(f"GLM Flash trace for device {device} lacks selected shapes "
                              f"{sorted(wanted - seen)}; its measured base is unknown")
         if captured > 0 and executables > 0:
-            shares.append((captured, executables))
+            previous = shares.get(device)
+            if previous is None or (packed(captured), executables) > previous:
+                shares[device] = (packed(captured), executables)
     if not shares:
         raise ValueError("trace has no measured GLM Flash arena")
-    charged, executables = max(shares)
+    devices = sorted(shares)
+    if devices != list(range(len(devices))):
+        raise ValueError(f"GLM Flash traces must cover devices 0..n-1; saw {devices}")
+    measured_bytes = [shares[device][0] for device in devices]
+    measured_executables = [shares[device][1] for device in devices]
     # Startup prewarms every selected shape, so the reserve base already holds
-    # the whole request demand; only a shape outside the trace (a new context
-    # width or row bucket) needs room, and one largest capture keeps it free
-    # so that first capture never has to evict a pinned shape.
-    extra = packed(largest)
+    # the whole request demand. The fixed allocation tail is the arena's own
+    # headroom for its single physical allocation; runtime capture headroom is
+    # the shared extra keys' (never a trace-derived largest capture).
+    extra = CHUNK
     return {"schema_version": 1, "family": "glm5_flash",
-            "measured_bytes": packed(charged), "measured_executables": executables,
+            "measured_bytes": measured_bytes, "measured_executables": measured_executables,
             "reserve_extra_bytes": extra, "entries": entries}
 
 

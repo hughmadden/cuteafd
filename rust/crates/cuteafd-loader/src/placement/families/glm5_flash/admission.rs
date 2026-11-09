@@ -442,8 +442,6 @@ impl GlmfGraphs {
     pub fn prewarm_bytes(&self) -> Vec<u64> {
         self.charged.iter().map(|charged| charged.saturating_sub(self.extra)).collect()
     }
-    /// Headroom the reserve keeps for runtime captures, per device.
-    pub fn extra_bytes(&self) -> Vec<u64> { vec![self.extra; self.charged.len()] }
 }
 
 /// A launch's reserve at `context` and `pool_tokens`, from the checked-in list
@@ -460,7 +458,7 @@ fn graph_components(graphs: &glmf_graphs::GlmfGraphReserve, maximum: u64)
     -> Result<Vec<p::Component>, p::Refusal> {
     (0..graphs.reserves.len()).map(|gpu| {
         let resolved = crate::placement::graph_reserve::current(gpu, false, graphs.reserves[gpu], graphs.extra)
-            .map_err(p::Refusal::InvalidFact)?;
+            .map_err(|error| p::Refusal::InvalidFact(error.to_string()))?;
         let id = format!("glmf.graphs.{gpu}");
         let mut component = p::serving::startup_graph_component(&id, p::Location::coordinator(gpu as u8),
             crate::placement::GraphRank::estimated(graphs.executables[gpu], resolved.bytes), maximum)?;
@@ -1150,7 +1148,7 @@ impl PreparedGlmf<'_> {
         for gpu in 0..i.gpus.len() {
             let id = format!("glmf.graphs.{gpu}");
             let resolved = crate::placement::graph_reserve::current(gpu, false, prepared.reserves[gpu], prepared.extra)
-                .map_err(p::Refusal::InvalidFact)?;
+                .map_err(|error| p::Refusal::InvalidFact(error.to_string()))?;
             let source = crate::placement::graph_reserve::source(&id);
             let owner = solved.facts.allowances.iter_mut().find(|owner| owner.source == source)
                 .ok_or_else(|| invalid("missing admitted graph reserve owner"))?;

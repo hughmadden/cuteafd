@@ -102,7 +102,7 @@ fn is_bootstrap_shape(shape: &(usize, bool, GraphGeometry)) -> bool {
 
 /// One layout's prewarm set: the request demand a device graph trace of that
 /// layout recorded on default adaptive drafts, the always-hot shapes pinned
-/// against eviction, and the arena both sides need priced at the layout's
+/// against eviction, and the arena both sides need priced at each device's
 /// measured bytes per graph. Startup prewarms every entry, so requests hit
 /// their graphs instead of capturing on latency. Provenance lives in the
 /// checked-in document (`glmf_prewarm.json`); pinning is explicit, never
@@ -111,29 +111,51 @@ fn is_bootstrap_shape(shape: &(usize, bool, GraphGeometry)) -> bool {
 /// The entries are the same for every quant of the checkpoint: a shape is a
 /// pure function of the launch geometry, and one decode site captures it
 /// whatever the expert format. The price is not: a captured graph's
-/// executable memory follows its kernels' node structure, so a layout traced
-/// on more than one quant charges the costlier quant's measured arena.
+/// executable memory follows its kernels' node structure, so each device of a
+/// layout traced on more than one quant holds the costlier quant's measured
+/// base for that device.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmLayout {
-    pub measured_bytes: u64,
-    pub measured_executables: u64,
+    /// Per coordinator rank, the selected entries' summed measured capture
+    /// bytes on that device under the costlier quant traced for it.
+    pub measured_bytes: Vec<u64>,
+    /// The executable count each of those per-device sums held.
+    pub measured_executables: Vec<u64>,
     pub reserve_extra_bytes: u64,
     pub entries: Vec<GlmfPrewarmEntry>,
 }
 
 impl GlmfPrewarmLayout {
-    /// Measured bytes per executable, rounded up: the per-capture bootstrap a
-    /// device uses until its own sample replaces it.
-    pub fn executable_bytes(&self) -> u64 {
-        self.measured_bytes.div_ceil(self.measured_executables.max(1)).max(1)
+    /// `rank`'s measured base; a rank past the trace's devices falls back to
+    /// the last traced one (a launch never serves more ranks than the resolved
+    /// shape it read this entry for).
+    fn measured(&self, rank: usize) -> (u64, u64) {
+        let at = rank.min(self.measured_bytes.len().saturating_sub(1));
+        (self.measured_bytes.get(at).copied().unwrap_or(0),
+         self.measured_executables.get(at).copied().unwrap_or(0))
     }
 
-    /// The measured arena scaled to `executables` captures, without per-graph
-    /// rounding: exactly `measured_bytes` at `measured_executables`.
-    pub fn arena_bytes(&self, executables: u64) -> u64 {
-        let measured = u64::from(self.measured_executables.max(1));
-        (u128::from(executables) * u128::from(self.measured_bytes)).div_ceil(u128::from(measured)) as u64
+    /// Measured bytes per executable on `rank`, rounded up: the per-capture
+    /// bootstrap a device uses until its own sample replaces it.
+    pub fn executable_bytes(&self, rank: usize) -> u64 {
+        let (bytes, executables) = self.measured(rank);
+        bytes.div_ceil(executables.max(1)).max(1)
+    }
+
+    /// `rank`'s measured arena scaled to `executables` captures, without
+    /// per-graph rounding: exactly that device's `measured_bytes` at its own
+    /// measured executable count.
+    pub fn arena_bytes(&self, rank: usize, executables: u64) -> u64 {
+        let (bytes, measured) = self.measured(rank);
+        (u128::from(executables) * u128::from(bytes)).div_ceil(u128::from(measured.max(1))) as u64
+    }
+
+    /// The dearest measured per-graph price among this layout's devices, for
+    /// an untraced shape that has no per-device sample of its own.
+    pub fn dearest_executable_bytes(&self) -> u64 {
+        (0..self.measured_bytes.len().max(1))
+            .map(|rank| self.executable_bytes(rank)).max().unwrap_or(1)
     }
 }
 
@@ -141,7 +163,8 @@ impl GlmfPrewarmLayout {
 /// `<devices>[-sparks]`. A key the document does not hold warms the bootstrap
 /// set instead of borrowing another shape's list. A layout traced on more than
 /// one quant of the checkpoint holds one entry set (the shapes are
-/// quant-independent) priced at the costlier quant measured on that layout.
+/// quant-independent) priced per device at the costlier quant measured for
+/// that device.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmList {
@@ -157,10 +180,10 @@ impl GlmfPrewarmList {
     }
 
     /// The measured price an untraced layout borrows for its bootstrap set: the
-    /// dearest measured per-graph cost among the traced keys, never a shape
-    /// list. Provenance for that estimate is the traced entry it came from.
+    /// dearest measured per-graph cost among the traced keys' devices, never a
+    /// shape list. Provenance for that estimate is the traced entry it came from.
     pub fn priciest(&self) -> &GlmfPrewarmLayout {
-        self.layouts.values().max_by_key(|layout| layout.executable_bytes())
+        self.layouts.values().max_by_key(|layout| layout.dearest_executable_bytes())
             .expect("a checked-in GLM Flash list holds at least one traced layout")
     }
 }
@@ -178,7 +201,13 @@ pub fn glmf_prewarm_list() -> &'static GlmfPrewarmList {
             assert!(matches!(key.as_str(), "1" | "1-sparks" | "2" | "2-sparks"),
                 "unknown GLM Flash layout key {key}");
             assert!(!layout.entries.is_empty(), "{key} traces no shapes");
-            assert!(layout.measured_executables >= layout.entries.len() as u64,
+            assert!(!layout.measured_bytes.is_empty()
+                && layout.measured_bytes.len() == layout.measured_executables.len(),
+                "{key} carries one measured base per coordinator device");
+            assert!(layout.measured_bytes.iter().all(|&bytes| bytes > 0),
+                "{key} has an empty measured base");
+            assert!(layout.measured_executables.iter()
+                    .all(|&count| count >= layout.entries.len() as u64),
                 "{key} prices fewer executables than it warms");
             let mut shapes = std::collections::HashSet::new();
             for entry in &layout.entries {
@@ -196,8 +225,10 @@ fn warn_untraced(layout: GlmfLayout) {
     let mut warned = WARNED.get_or_init(Default::default).lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if warned.insert(layout.key()) {
-        tracing::warn!(layout = %layout, "no GLM Flash graph prewarm trace for this layout; \
-            warming the bootstrap startup set — trace this shape (RTX count and Sparks attached) to price it");
+        let traced: Vec<_> = glmf_prewarm_list().layouts.keys().cloned().collect();
+        tracing::warn!(layout = %layout, traced = ?traced,
+            "no GLM Flash graph prewarm trace for this layout in glmf_prewarm.json; \
+            warming the bootstrap startup set unpinned — trace this shape (RTX count and Sparks attached) to price it");
     }
 }
 
@@ -265,13 +296,14 @@ pub fn glmf_graph_reserve(context: usize, pool_tokens: usize, dense: usize, sequ
     let traced = list.layout(layout);
     if traced.is_none() { warn_untraced(layout); }
     let price = traced.unwrap_or_else(|| list.priciest());
-    let each = price.executable_bytes();
     let extra = packed(price.reserve_extra_bytes);
     let executables: Vec<u64> = (0..gpus).map(|rank|
         shapes.len() as u64 * (layers + usize::from(rank == 0)) as u64).collect();
-    let reserves = executables.iter().map(|&count| packed(price.arena_bytes(count))).collect();
+    let reserves = executables.iter().enumerate()
+        .map(|(rank, &count)| packed(price.arena_bytes(rank, count))).collect();
+    let bootstraps = (0..gpus).map(|rank| price.executable_bytes(rank)).collect();
     GlmfGraphReserve { layout, traced: traced.is_some(), reserves, executables, extra,
-        bootstraps: vec![each; gpus], shapes }
+        bootstraps, shapes }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -360,7 +392,7 @@ mod tests {
     /// The checked-in set is the sizing trace's demand (690 graphs at the
     /// reference launch), every traced shape prewarms at startup, its two
     /// always-hot shapes are pinned against eviction, and its reserve prices
-    /// the whole demand plus one largest capture.
+    /// the whole demand plus the fixed allocation tail.
     #[test]
     fn traced_prewarm_holds_the_pinned_shape_and_prices_the_traced_demand() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
@@ -381,8 +413,9 @@ mod tests {
         assert_eq!(plan.layout, layout);
         assert!(plan.traced);
         assert_eq!(plan.shapes, warm);
-        // The traced demand (690 graphs) is the base; one packed largest
-        // capture is headroom for a shape the trace did not cover.
+        // The traced demand (690 graphs) is the base; the fixed 2 MiB
+        // allocation tail is the arena's own slice headroom, and runtime
+        // capture headroom comes from the shared extra keys.
         assert_eq!(plan.reserves, [119_537_664]);
         assert_eq!(plan.executables, [690]);
         assert_eq!(plan.extra, 2_097_152);
@@ -415,7 +448,7 @@ mod tests {
         assert_eq!(plan.shapes, warm);
         assert_eq!(plan.executables, [warm.len() as u64 * 46]);
         let dearest = glmf_prewarm_list().priciest();
-        assert_eq!(plan.bootstraps, [dearest.executable_bytes()]);
+        assert_eq!(plan.bootstraps, [dearest.executable_bytes(0)]);
         assert_eq!(plan.extra, packed(dearest.reserve_extra_bytes));
     }
 
@@ -430,8 +463,11 @@ mod tests {
         for (key, priced) in &list.layouts {
             assert!(!priced.entries.is_empty(), "{key} has no shapes");
             assert!(priced.entries.iter().any(|entry| entry.pin), "{key} pins nothing");
-            assert!(priced.measured_executables >= priced.entries.len() as u64);
-            assert!(priced.measured_bytes >= priced.measured_executables);
+            assert_eq!(priced.measured_bytes.len(), priced.measured_executables.len());
+            assert!(priced.measured_executables.iter()
+                .all(|&count| count >= priced.entries.len() as u64));
+            assert!(priced.measured_bytes.iter().zip(&priced.measured_executables)
+                .all(|(&bytes, &executables)| bytes >= executables));
         }
         // The shipping min column is traced; its absence would silently price a
         // bootstrap set, so the key must never drift out of the document.
@@ -442,11 +478,12 @@ mod tests {
         assert_eq!(two.layout, GlmfLayout::resolved(2, false));
         assert!(two.traced, "a 2-RTX launch with local TP2 experts is traced");
         assert_eq!(two.executables.len(), 2);
-        // The `2` base is its selected entries' measured capture bytes on the
-        // costlier device (K6 locally: 136,314,880 B for 690 executables), and
-        // its head segment prices the second device's 675 executables.
-        assert_eq!(two.reserves, [136_314_880, 134_217_728]);
-        assert_eq!(two.bootstraps, [197_558, 197_558]);
+        // Each rank prices its own selected entries' measured capture bytes
+        // under the costlier quant (K6 locally: 136,314,880 B / 690 execs on
+        // rank 0 and 123,731,968 B / 675 on rank 1), never the other rank's
+        // per-executable price.
+        assert_eq!(two.reserves, [136_314_880, 123_731_968]);
+        assert_eq!(two.bootstraps, [197_558, 183_307]);
         // Sparks idle behind a 2-RTX local-expert launch are not an expert
         // attachment: that launch keys `2`, the same resolved shape it serves.
         assert_eq!(GlmfLayout::resolved(2, false).key(), two.layout.key());
@@ -456,7 +493,7 @@ mod tests {
     fn prewarm_shapes_filter_to_the_launch_and_stay_unique() {
         let list = glmf_prewarm_list();
         let min = list.layout(GlmfLayout::resolved(1, true)).expect("the min column is traced");
-        assert_eq!(min.executable_bytes(), 173_243);
+        assert_eq!(min.executable_bytes(0), 173_243);
         assert_eq!(min.reserve_extra_bytes, 2_097_152);
         let mut identities = HashSet::new();
         for entry in &min.entries {
