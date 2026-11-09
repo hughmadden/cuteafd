@@ -121,7 +121,7 @@ impl DenseEngine<'_> {
 
     /// Qualification only: compare identical decode shapes without changing the
     /// eager evaluate path or rebuilding the engine's captured backing.
-    pub(super) fn golden_decode_graphs(&mut self, tokens: &[u32], positions: &[usize], chunk: usize)
+    pub(crate) fn golden_decode_graphs(&mut self, tokens: &[u32], positions: &[usize], chunk: usize)
         -> Result<Option<(Vec<f32>, Vec<f32>)>> {
         use crate::shared::speculation::target::{VerifyRequest, VerifyRow};
         use sha2::{Digest, Sha256};
