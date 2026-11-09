@@ -1614,6 +1614,7 @@ impl<'a> MimoEngine<'a> {
     fn step_units(&self, placement: &MimoPlacement, tokens: &[u32], all_logits: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
+        self.graph_cycle_prefill();
         self.prepare_scoring_prefill()?;
         let waves = self.prefill_waves();
         let units = sequence_units(tokens.len(), self.prefill_rows, waves, self.weights.layers.len())?;
@@ -1638,6 +1639,7 @@ impl<'a> MimoEngine<'a> {
         self.unit_index.set(None);
         result?;
         self.finish_tp2_route_step()?;
+        self.graph_end_of_step()?;
         Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
             if all_logits { tokens.len() } else { 1 }, false)))
     }
@@ -1728,6 +1730,7 @@ impl<'a> MimoEngine<'a> {
         let segments = crate::shared::prefill_packing::plan(&sequences.iter()
             .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits())?;
         self.submit(|| {
+            self.graph_cycle_prefill();
             self.prepare_scoring_prefill()?;
             let owned = self.workspace.borrow();
             let base = owned.as_ref().context("prefill workspace")?;
@@ -1760,6 +1763,7 @@ impl<'a> MimoEngine<'a> {
             self.unit_index.set(None);
             result?;
             self.finish_tp2_route_step()?;
+            self.graph_end_of_step()?;
             for (placement, tokens) in sequences.iter_mut() { placement.len += tokens.len(); }
             let outcomes = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
                 self.launch_head(&work[0], segments[i].end_row(), 1, false)?;
@@ -2293,6 +2297,15 @@ impl<'a> MimoEngine<'a> {
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(cycle); }
     }
 
+    /// A prefill unit or wave is its own graph boundary. MiMo graphs no prefill
+    /// chunk, so this only classifies the cycle and flushes any earlier step's
+    /// pinned-hit counts.
+    fn graph_cycle_prefill(&self) {
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Prefill);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Prefill); }
+    }
+
     /// Attaches one bounded device cache per physical rank: the resolved
     /// layout's reserve and one byte basis for the whole device. MiMo has no
     /// #1612 node calibration, so every capture is priced from bytes.
@@ -2458,6 +2471,11 @@ impl<'a> MimoEngine<'a> {
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "MiMo startup graph inventory already captured");
         let layout = self.graph_layout.as_ref().context("MiMo decode graph layout was not admitted")?.clone();
+        // Startup captures are not request heat: attribute them to Other so the
+        // trace never reads the provisional prewarm as decode demand.
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Other);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         let max_rows = max_rows.clamp(1, DECODE_ROWS);
         let rows = layout.rows.iter().copied().filter(|&rows| rows <= max_rows).collect::<Vec<_>>();
         ensure!(!rows.is_empty(), "MiMo decode graph prewarm list is empty for {max_rows} rows");
