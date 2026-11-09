@@ -85,11 +85,14 @@ SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
 GLMF_GEOMETRY = re.compile(
     r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
-EXTRA_BYTES = 2 << 20
 QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_SHAPES = ("single_0spark", "single_sparks", "dual_0spark", "dual_sparks")
+KIMI_ROWS = re.compile(r"rows=(\d+)")
+KIMI_RANK = re.compile(r"rank=(\d+)")
+KIMI_OP = re.compile(r"op=(\w+)")
+KIMI_SPEC = re.compile(r"spec=(\d)")
 
 
 V41_DECODE_ROWS = 64
@@ -171,6 +174,220 @@ def prewarmable(family, shape):
         return True
     match = V4_GEOMETRY.search(shape)
     return match is None or int(match[3]) > 0 or match[2] != "tail"
+
+
+def kimi_geometry(shape):
+    """Kimi keys print `rows=.. op=.. spec=..`; the prewarm identity is the
+    replay width and whether it is a verify capture."""
+    rows = KIMI_ROWS.search(shape)
+    op = KIMI_OP.search(shape)
+    if rows is None or op is None:
+        raise ValueError(f"cannot parse kimi_k3 graph geometry: {shape!r}")
+    if int(rows.group(1)) <= 0:
+        raise ValueError("unsupported prewarm geometry")
+    spec = KIMI_SPEC.search(shape)
+    kind = op.group(1)
+    if kind not in ("ffn", "attention", "context"):
+        raise ValueError(f"unknown Kimi operation: {kind}")
+    return (int(rows.group(1)), kind != "ffn" and spec is not None and spec.group(1) == "1", kind)
+
+
+def kimi_lifetime_pins(identities):
+    """Project per-key lifetime demand onto geometry, without treating the final
+    rolling window as a whole-run history. Startup-only counts never qualify."""
+    reasons = {}
+    classes = {}
+    verify = {}
+    for (device, *_), (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        request_count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+        if request_count <= 0:
+            continue
+        if key[0] == 1 and not key[1]:
+            reasons.setdefault(key, set()).add("plain_c1")
+        # Capture misses are not hits; cap lifetime hits by request activity so
+        # startup Other replays cannot manufacture a hot tier.
+        hits = min(int(graph.get("hits", 0)), request_count)
+        if hits > 0:
+            classes.setdefault((device, key[2]), []).append((hits, key))
+        if key[1] and key[2] in ("attention", "context"):
+            geometry = (device, key[2], key[0])
+            verify[geometry] = verify.get(geometry, 0) + int(cycles.get("verify", 0))
+    for rows in classes.values():
+        rows.sort(key=lambda row: -row[0])
+        total = sum(hits for hits, _ in rows)
+        covered = 0
+        cutoff = None
+        for hits, key in rows:
+            if cutoff is not None and hits < cutoff:
+                break
+            reasons.setdefault(key, set()).add("lifetime_hit_tier")
+            covered += hits
+            if covered * 2 >= total and cutoff is None:
+                cutoff = hits
+    # Pick a dominant verify width per device, preferring attention over Context,
+    # then pin its flagless FFN and peer Context siblings.
+    for device in {owner[0] for owner in verify}:
+        candidates = [(count, rows) for (owner, op, rows), count in verify.items()
+                      if owner == device and op == "attention" and count > 0]
+        if not candidates:
+            candidates = [(count, rows) for (owner, _, rows), count in verify.items()
+                          if owner == device and count > 0]
+        if not candidates:
+            continue
+        _, rows = min(candidates, key=lambda row: (-row[0], row[1]))
+        for (owner, *_), (key, graph) in identities.items():
+            if owner != device or key[0] != rows or not graph.get("cycles", {}).get("verify", 0):
+                continue
+            if key[2] == "ffn" or key[1]:
+                reasons.setdefault(key, set()).add("dominant_verify")
+    return reasons
+
+
+def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
+    """One layout row: lifetime-hot and rolling/churn pins plus unpinned request
+    coverage. Prefill rows stay eager and never replay (#1646)."""
+    if ranks < 1 or not layout:
+        raise ValueError("kimi_k3 needs a coordinator rank count and layout name")
+    if not 0 < coverage <= 1:
+        raise ValueError("coverage must be in (0, 1]")
+    counts = {}
+    lifetime_hits = {}
+    reasons = {}
+    identities = {}
+    latest = {}
+    for trace in traces:
+        version = trace.get("schema_version")
+        if version not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        cache = trace["cache"]
+        device = int(cache["device"])
+        inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
+                            len(graph.get("hit_histogram", {}).get("counts", [])) *
+                            int(graph.get("hit_histogram", {}).get("interval_ms", 0))
+                            for graph in trace["graphs"]), default=0)
+        snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
+        if device not in latest or snapshot_time >= latest[device][0]:
+            latest[device] = (snapshot_time, trace)
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("kimi_k3."):
+                continue
+            identity = (device, graph["site"], graph.get("bank", 0),
+                        graph.get("key_id", graph["shape"]))
+            key = kimi_geometry(graph["shape"])
+            if key[0] <= 64:
+                identities[identity] = (key, graph)
+    replayed = {}
+    for identity, (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        request_count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+        if request_count <= 0 or int(graph.get("hits", 0)) < 1:
+            continue
+        replayed[identity] = (key, graph)
+        device_counts = counts.setdefault(identity[0], {})
+        device_counts[key] = device_counts.get(key, 0) + request_count
+        device_hits = lifetime_hits.setdefault(identity[0], {})
+        device_hits[key] = device_hits.get(key, 0) + min(int(graph.get("hits", 0)), request_count)
+        why = reasons.setdefault(key, set())
+        histogram = graph.get("hit_histogram", {})
+        histogram_end = int(histogram.get("start_ms", 0)) + \
+            len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+        if histogram_end >= latest[identity[0]][0] and sustained(graph):
+            why.add("sustained_heat")
+        if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
+            why.add("repeated_recapture")
+    counts = {key: max(rows.get(key, 0) for rows in counts.values())
+              for key in {key for rows in counts.values() for key in rows}}
+    if not counts:
+        raise ValueError("trace contains no replayed Kimi request identities")
+    lifetime_reasons = kimi_lifetime_pins(replayed)
+    for key, why in lifetime_reasons.items():
+        reasons.setdefault(key, set()).update(why)
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
+    total = sum(counts.values())
+    covered = 0
+    selected = set()
+    for key in ranked:
+        selected.add(key)
+        covered += counts[key]
+        if covered >= total * coverage:
+            break
+    selected.update(key for key, why in reasons.items() if why)
+    heat = {key: max(rows.get(key, 0) for rows in lifetime_hits.values()) for key in selected}
+    ordered = sorted(selected, key=lambda key: (not bool(reasons.get(key)), -heat[key], key))
+    entries = [{"rows": rows, "speculative": speculative, "op": op,
+                "pin": bool(reasons.get((rows, speculative, op)))}
+               for rows, speculative, op in ordered]
+    # Charge only emitted geometry, including startup-only siblings. The
+    # completed-step shares are physical growth; zero is valid allocator reuse.
+    bases = [None] * ranks
+    costs = {key: [None] * ranks for key in selected}
+    for device, (_, trace) in latest.items():
+        owners = {int(match.group(1)) for graph in trace["graphs"]
+                  if graph["site"].startswith("kimi_k3.")
+                  and (match := KIMI_RANK.search(graph["shape"])) is not None}
+        if len(owners) != 1:
+            raise ValueError(f"Kimi device {device} needs exactly one physical rank")
+        rank = owners.pop()
+        if not 0 <= rank < ranks or bases[rank] is not None:
+            raise ValueError("Kimi trace device/rank mapping is not one-to-one")
+        shares = []
+        for (owner, *_), (geometry, graph) in identities.items():
+            if owner != device or geometry not in selected:
+                continue
+            share = graph.get("capture_bytes")
+            if not isinstance(share, int) or isinstance(share, bool) or share < 0:
+                raise ValueError(f"Kimi emitted geometry has missing or invalid capture_bytes: {graph['shape']}")
+            shares.append(share)
+            costs[geometry][rank] = (costs[geometry][rank] or 0) + share
+        bases[rank] = packed(sum(shares))
+    if any(base is None for base in bases):
+        raise ValueError("Kimi trace is missing a physical rank")
+    for entry, key in zip(entries, ordered):
+        entry["capture_bytes"] = costs[key]
+    if pin_report is not None:
+        for key in sorted(selected):
+            for device in sorted(latest):
+                graphs = [graph for (owner, *_), (geometry, graph) in identities.items()
+                          if owner == device and geometry == key]
+                if not graphs:
+                    continue
+                known = all("permanent_bytes" in graph for graph in graphs)
+                pin_report.append({"device": device, "rows": key[0], "speculative": key[1],
+                                   "op": key[2],
+                                   "pin": bool(reasons.get(key)), "reasons": sorted(reasons.get(key, [])),
+                                   "rolling_pin": "sustained_heat" in reasons.get(key, set()),
+                                   "lifetime_pin": key in lifetime_reasons,
+                                   "whole_run_interval_spread": None,
+                                   "lifetime_request_hits": sum(min(int(graph.get("hits", 0)),
+                                       sum(int(graph.get("cycles", {}).get(cycle, 0))
+                                           for cycle in ("decode", "verify"))) for graph in graphs),
+                                   "zero_hit_sibling_identities": sum(int(graph.get("hits", 0)) == 0 for graph in graphs),
+                                   "zero_hit_sibling_bytes": sum(int(graph.get("capture_bytes") or 0)
+                                       for graph in graphs if int(graph.get("hits", 0)) == 0),
+                                   "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
+                                   "observed_permanent_lower_bound_bytes":
+                                       sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None,
+                                   "observed_capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
+                                   "full_geometry_cost_bytes": None})
+    return {"ranks": ranks, "layout": layout,
+            "reserve_base_bytes": bases, "reserve_extra_bytes": CHUNK,
+            "entries": entries}
+
+
+
+def merge_kimi_layout(path, row):
+    """Replace one layout row so a min and a max trace update one list."""
+    data = {"schema_version": 1, "family": "kimi_k3", "layouts": []}
+    if path.exists():
+        data = json.loads(path.read_text())
+        if data.get("family") != "kimi_k3" or data.get("schema_version") != 1:
+            raise ValueError(f"{path} is not a Kimi K3 prewarm list")
+    layouts = [layout for layout in data["layouts"] if int(layout["ranks"]) != row["ranks"]] + [row]
+    data["layouts"] = sorted(layouts, key=lambda layout: int(layout["ranks"]))
+    path.write_text(json.dumps(data, indent=2) + "\n")
+
 
 
 def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency=0.9,
@@ -1365,8 +1582,8 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2")))
-    parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3")))
+    parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
     parser.add_argument("--list", type=Path,
@@ -1382,7 +1599,7 @@ def main():
                         help="qwen4 only: install the generated shape into this prewarm list in place")
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
-    parser.add_argument("--ranks", type=int, help="MiMo physical coordinator ranks")
+    parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
     parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
@@ -1407,8 +1624,8 @@ def main():
         if layout not in ("1", "2"):
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
-    elif layout is not None and args.family != "deepseek_v4":
-        parser.error("--layout applies to mistral_large4, deepseek_v4 and deepseek_v41 only")
+    elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
+        parser.error("--layout applies to mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
@@ -1418,6 +1635,11 @@ def main():
                               ranks=args.ranks, variant=args.variant,
                               sparks=None if args.sparks is None else args.sparks == "yes",
                               arena_report=arenas)
+        elif args.family == "kimi_k3":
+            if args.ranks is None or args.layout is None:
+                raise ValueError("kimi_k3 needs --ranks and --layout")
+            result = generate_kimi([json.loads(Path(path).read_text()) for path in args.trace],
+                                   args.ranks, args.layout, args.coverage, report)
         elif args.family == "qwen4":
             traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
@@ -1433,7 +1655,9 @@ def main():
                                       args.family, args.coverage, args.pin_frequency, report, layout)
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
-    if args.merge is not None:
+    if args.family == "kimi_k3":
+        merge_kimi_layout(args.output, result)
+    elif args.merge is not None:
         document = merge_qwen(json.loads(args.merge.read_text()), result)
         args.merge.write_text(json.dumps(document, indent=2) + "\n")
     else:

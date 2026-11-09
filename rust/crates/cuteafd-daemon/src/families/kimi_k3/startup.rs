@@ -39,6 +39,7 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub devices: [i32; RANKS],
     pub attention: Option<cuteafd_loader::placement::AttentionPlacement>,
     pub native_lib: &'a Path,
+    pub manifest: &'a Path,
     pub peers: Vec<SocketAddr>,
     pub rtx_expert_layers: cuteafd_loader::placement::OnboardSetting,
     /// Lane rows: `waves` prefill units of `rows / waves` each.
@@ -220,6 +221,13 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     } else if RANKS == 1 || options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Heads) {
         super::graphs::inventory_for_ranks(cfg, 1, unit, options.slots, verify_rows, RANKS, |_, _| true)
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
+    // One configured arena per physical device: admission owns it, and the
+    // startup capture boundary measures inside it.
+    let reserve_demands = if graph_set.is_some() {
+        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(RANKS)?
+    } else { Vec::new() };
+    let reserves: [u64; RANKS] = std::array::from_fn(|rank|
+        reserve_demands.get(rank).map_or(0, |demand| demand.bytes));
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
     if core.native_attention_split(RANKS) {
         for rank in 0..RANKS {
@@ -258,10 +266,31 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         peer_access: RANKS == 2, spark_ranks, attention: options.attention, context: context_layout, serving_context: options.context, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, full_prefill_logits: options.full_prefill_logits, lane_layouts, fixed,
-        startup: graph_set.as_ref().map_or_else(Vec::new, |set|
-            (0..RANKS).map(|rank| super::graphs::demand(&set.inventory, rank)).collect()), pool_bounded: vec![], rtx,
+        startup: reserve_demands, pool_bounded: vec![], rtx,
         spark_budget: Some(spark_budget), draft: draft_layout.clone(), verify_rows, prefix: options.prefix })?;
     options.max_context = usize::try_from(options.context.served(admitted.placement.pool_tokens))?;
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "kimi_k3",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(options.native_lib)?, "programs_sha256": hash(options.manifest)?,
+                "layout": format!("{RANKS} RTX/{spark_ranks} Sparks; attention/{:?}; context/{}; slots/{}",
+                    options.attention, options.max_context, options.slots),
+                "devices": inventory.gpus, "spark_world": spark_ranks,
+                "onboard_layers": admitted.placement.onboard_layers,
+                "graph_basis": "uncalibrated Kimi byte fallback"
+            }
+        }));
+    }
     memory.sample("admission-resolved")?;
     let graph_set = admitted.graph_set.take();
     let spark_layers = admitted.working_set().spark_layers;
@@ -333,34 +362,50 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("pre-capture")?;
     stop_before_capture(memory.enabled())?;
     if let Some(set) = graph_set {
-        let before = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let before = engine.graph_free_bytes()?;
         let capture_started = std::time::Instant::now();
-        engine.warm_graphs(&set.keys)?;
+        // Prewarm reachable decode/verify geometry only; row-window prefill
+        // stays eager and unselected replayable geometry can capture lazily.
+        let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), options.slots, unit);
+        let policies = (0..RANKS).map(|rank| {
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS, rank);
+            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)
+        }).collect::<std::result::Result<Vec<_>, _>>()?;
+        let bases = policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
+        let bootstraps = (0..RANKS).map(|rank|
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_bootstrap(RANKS, rank)).collect::<Vec<_>>();
+        let prewarm = super::graphs::fit_prewarm(prewarm,
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), &bases, &bootstraps);
+        tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
+            .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
+            "Kimi selected startup prewarm keys");
+        let warmup = engine.warm_graphs(&prewarm, &reserves)?;
+        let captured = warmup.captured;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
-        let after = RuntimeInventory::measure(library, &options.devices, InventoryPhase::PostLoad, |_| Ok(()))?;
+        let after = engine.graph_free_bytes()?;
         let census_table = if RANKS == 2 { "GRAPH_CENSUS_TP2" } else { "GRAPH_CENSUS_BYTES" };
-        let mut measured = [0u64; RANKS];
         for rank in 0..RANKS {
-            let bytes = before.gpus[rank].free_bytes.saturating_sub(after.gpus[rank].free_bytes);
-            let count = set.inventory.ranks[rank].executables;
+            let first_touch_bytes = before[rank].saturating_sub(warmup.before_capture[rank]);
+            let bytes = warmup.before_capture[rank].saturating_sub(after[rank]);
+            let count = prewarm.iter().filter(|key| key.rank == rank).count() as u64;
             let reserved = set.inventory.bytes(rank);
-            measured[rank] = bytes;
-            tracing::info!(rank, executables = count, measured_bytes = bytes, capture_elapsed_ms,
+            tracing::info!(rank, first_touch_bytes, owner = "KDA eager first-use storage",
+                "Kimi startup first-touch census (excluded from graph arena)");
+            let charged = crate::shared::decode_graph::device::snapshots().into_iter()
+                .find(|sample| sample.device == options.devices[rank]).map_or(0, |sample| sample.charged);
+            let capture_delta = i128::from(bytes) - i128::from(charged);
+            tracing::info!(rank, executables = count, captured, measured_bytes = bytes,
+                graph_charged_bytes = charged, capture_delta_bytes = %capture_delta, capture_elapsed_ms,
                 bytes_per_executable = bytes.div_ceil(count.max(1)),
-                reserved_bytes = reserved, reserve = "estimated",
+                census_estimate_bytes = reserved, reserve = reserves[rank], reserve_basis = "checked-in layout row",
                 "Kimi startup graph census");
-            if bytes > reserved {
-                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserved_bytes = reserved,
+            if bytes > reserves[rank] {
+                tracing::warn!(rank, executables = count, measured_bytes = bytes, reserve = reserves[rank],
                     bytes_per_executable = bytes.div_ceil(count.max(1)), census = census_table,
-                    "Kimi startup capture exceeds its calibrated estimate; update \
-                     cuteafd_loader::families::kimi_k3::allocation::{census_table} with this capture");
+                    "Kimi startup capture exceeds its graph reserve; update \
+                     cuteafd_loader::serving_capacity::kimi_prewarm with this capture");
             }
-        }
-        // Every rank's capture is logged before any rank refuses, so a failing
-        // launch still reports the complete census.
-        for rank in 0..RANKS {
-            ensure!(measured[rank] <= set.inventory.bytes(rank),
-                "Kimi startup graphs on rank {rank} exceed admitted reserve");
         }
     }
     Ok(Loaded { engine, admission_free, admitted_bytes, ownership })

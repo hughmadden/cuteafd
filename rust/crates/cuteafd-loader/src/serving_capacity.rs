@@ -67,6 +67,7 @@ pub mod v41_graphs;
 pub mod mimo_graphs;
 pub mod glm_graph_nodes;
 pub mod glmf_graphs;
+pub mod kimi_prewarm;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
     glmf_step_scratch, glmf_core_step_scratch, glmf_step_request_pairs, GlmfCoreScratch,

@@ -634,8 +634,8 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
 
     fn begin_local_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         ensure!(owner == Some(0) && self.pending.is_none(), "Kimi single-owner FFN binding");
-        self.local[0].residual(MixSite::Ffn(layer), self.rows)?;
         let dense = self.local[0].config().dense[layer];
+        if !dense { self.local[0].residual(MixSite::Ffn(layer), self.rows)?; }
         let rtx = !dense && self.experts[0].as_ref().is_some_and(|expert| expert.layers().contains(&layer));
         let spark = if dense { None } else {
             let tally = self.execution.expert_usage.as_ref().map(|usage|
@@ -714,7 +714,12 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         ensure!(layer == self.completed && self.pending.is_none(), "Kimi layer order differs from shared pipeline");
         for local in self.local.iter_mut() {
             if layer == 0 { local.seed(self.rows)?; }
-            local.residual(MixSite::Attention(layer), self.rows)?;
+            // Packed members and context buckets stage metadata between the
+            // live-row residual and attention; ordinary attention folds it in.
+            if self.packed.is_some() || self.execution.plan.modes()[layer] == LayerMode::ContextSplit
+                || local.windowed() || !local.attention_resident(layer)?.0 {
+                local.residual(MixSite::Attention(layer), self.rows)?;
+            }
         }
         Ok(())
     }
@@ -941,8 +946,10 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<FfnTicket> {
         if self.local.len() == 1 { return self.begin_local_ffn(layer, owner); }
         ensure!(owner.is_none() && self.pending.is_none(), "Kimi FFN owner or unfinished wave");
-        for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
         let dense = self.local[0].config().dense[layer];
+        if !dense {
+            for local in self.local.iter_mut() { local.residual(MixSite::Ffn(layer), self.rows)?; }
+        }
         let owner = if dense { 0 } else { super::weights::routed_owner(self.local[0].config(), layer)? };
         let rtx = !dense && self.experts.iter().any(|expert|
             expert.as_ref().is_some_and(|e| e.layers().contains(&layer)));

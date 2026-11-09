@@ -541,6 +541,9 @@ struct ContextUnit {
 impl Drop for LocalLane<'_> {
     fn drop(&mut self) {
         self.lane.stream.drain_or_abort("Kimi persistent local lane");
+        // Every consumer has drained: retire this lane's executables and drop
+        // the bank's records from the shared device cache.
+        if let Some(graphs) = self.graphs.as_mut() { graphs.clear(); }
         drop(self.graphs.take());
     }
 }
@@ -590,6 +593,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
 
     pub(super) fn rows(&self) -> usize { self.lane.rows() }
+    pub(super) fn windowed(&self) -> bool { self.lane.window.is_some() }
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
     pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
     pub(super) fn max_context(&self) -> usize { self.lane.layout.max_context() }
@@ -722,7 +726,7 @@ impl<'a> LocalLane<'a> {
                 if self.context.is_some() && self.cfg.attention[layer]
                     == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
                     self.context_gathered(layer, metadata.rows)?;
-                } else { self.attention(layer, metadata.rows, false)?; }
+                } else { self.attention_body(layer, metadata.rows, false, 1)?; }
                 first += metadata.rows;
             }
             Ok(())
@@ -755,20 +759,24 @@ impl<'a> LocalLane<'a> {
     }
 
     fn check_startup_keys(&self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
-        ensure!(self.graphs.is_none() && keys.iter().all(|key|
+        ensure!(self.graph_untouched() && keys.iter().all(|key|
             rank == self.rank && key.lane == self.lane_index && key.rank == rank && key.rows <= self.rows()),
             "Kimi startup graph keys differ from local binding");
         Ok(())
     }
 
+    /// Startup-only state changes run before any executable is resident.
+    fn graph_untouched(&self) -> bool {
+        self.graphs.as_ref().is_none_or(super::graphs::Graphs::is_empty)
+    }
+
     fn submit_startup_graph(&mut self, key: super::graphs::Key) -> Result<()> {
         use super::graphs::Op;
         match key.op {
-            Op::Residual(site) => { self.residual(site, key.rows)?; }
             Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
             Op::Context { layer, speculative } => self.context_step(layer, key.rows, speculative)?,
-            Op::Attention { layer, sequences, speculative } => {
-                self.attention = Some(AttentionShape { rows: key.rows, sequences });
+            Op::Attention { layer, speculative } => {
+                self.attention = Some(AttentionShape { rows: key.rows, sequences: 1 });
                 self.attention(layer, key.rows, speculative)?;
             }
         }
@@ -783,9 +791,9 @@ impl<'a> LocalLane<'a> {
         let staged = self.attention.take();
         let result = (|| {
             for &key in keys {
-                let super::graphs::Op::Attention { layer, sequences, .. } = key.op else { continue; };
+                let super::graphs::Op::Attention { layer, .. } = key.op else { continue; };
                 if self.cfg.attention.get(layer) != Some(&KimiAttention::Kda) { continue; }
-                let metadata = super::state::startup_metadata(key.rows, sequences, self.kda.slots())?;
+                let metadata = super::state::startup_metadata(key.rows, 1, self.kda.slots())?;
                 let stream = self.stream().clone();
                 let input = self.plane("normalized", key.rows, 7168)?;
                 stream.device.run(|| {
@@ -800,7 +808,10 @@ impl<'a> LocalLane<'a> {
                     }
                     Ok(())
                 })?;
-                self.submit_startup_graph(key)?;
+                // First-touch only KDA with zero normalized input. The folded
+                // residual must not mutate live residual history during warm-up.
+                self.attention = Some(AttentionShape { rows: key.rows, sequences: 1 });
+                self.attention_body(layer, key.rows, key.op.speculative(), 1)?;
             }
             Ok(())
         })();
@@ -809,18 +820,50 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn restore_startup_kda(&self) -> Result<()> {
-        ensure!(self.graphs.is_none(), "Kimi startup state restore after graph sealing");
+        ensure!(self.graph_untouched(), "Kimi startup state restore after graph capture");
         self.kda.zero_startup_state()
     }
 
-    pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize) -> Result<()> {
+    /// Attach this lane to its device's bounded cache and prewarm the pinned
+    /// geometry. Returns how many executables were captured; a refusal only
+    /// leaves that geometry lazy.
+    pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize,
+        reserve: u64) -> Result<usize> {
         self.check_startup_keys(keys, rank)?;
         let stream = self.stream().clone();
         let staged = self.attention.take();
-        let graphs = super::graphs::Graphs::capture(&stream, keys, |key| self.submit_startup_graph(key));
+        let mut graphs = super::graphs::Graphs::new();
+        let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve)
+            .and_then(|()| graphs.prewarm(&stream, self.programs.ranks, keys,
+                |key| self.submit_startup_graph(key)));
         self.attention = staged;
-        self.graphs = Some(graphs?);
-        Ok(())
+        let captured = result?;
+        self.graphs = Some(graphs);
+        Ok(captured)
+    }
+
+    pub(crate) fn graph_cycle(&mut self, cycle: crate::shared::decode_graph::device::Cycle) {
+        if let Some(graphs) = self.graphs.as_mut() { graphs.cycle(cycle); }
+    }
+
+    pub(crate) fn graph_needs_boundary(&self) -> bool {
+        self.graphs.as_ref().is_some_and(super::graphs::Graphs::needs_boundary)
+    }
+
+    pub(crate) fn graph_tick(&mut self) {
+        if let Some(graphs) = self.graphs.as_mut() { graphs.tick(); }
+    }
+
+    pub(crate) fn graph_owner(&mut self) -> Option<&mut dyn crate::shared::decode_graph::CacheAttached> {
+        self.graphs.as_mut().map(super::graphs::Graphs::owner)
+    }
+
+    pub(crate) fn graph_device(&self) -> Option<i32> {
+        self.graphs.as_ref().filter(|graphs| graphs.attached()).map(super::graphs::Graphs::device)
+    }
+
+    pub(crate) fn graph_spans_devices(&self) -> bool {
+        self.graphs.as_ref().is_some_and(super::graphs::Graphs::spans_devices)
     }
 
     pub(crate) fn commit_kda(&self, tables: &[i32]) -> Result<()> {
@@ -865,26 +908,31 @@ impl<'a> LocalLane<'a> {
 
     pub(crate) fn enable_replay(&mut self, enabled: bool) { self.replay_enabled = enabled; }
     pub(crate) fn graph_replays(&self) -> u64 { self.graphs.as_ref().map_or(0, |graphs| graphs.replays()) }
-    /// Diagnostic A/B only, before startup graphs are captured.
+    /// Diagnostic A/B only, before any graph is captured.
     pub(crate) fn set_grouped_kda(&self, enabled: bool) -> Result<()> {
-        ensure!(self.graphs.is_none(), "Kimi grouped KDA selection after graph capture");
+        ensure!(self.graph_untouched(), "Kimi grouped KDA selection after graph capture");
         if let Some(core) = &self.programs.core { core.set_grouped(enabled); }
         Ok(())
     }
 
-    fn replay(&mut self, rows: usize, op: super::graphs::Op) -> Result<bool> {
+    /// Run one step body through the bounded graph cache: replay a resident
+    /// executable, capture and launch a miss, or run the body eagerly. The
+    /// body owns the whole recorded segment, so nested sites run eagerly.
+    fn graph_step(&mut self, rows: usize, op: super::graphs::Op,
+        mut body: impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
         if !super::graphs::replay_allowed(op, self.replay_enabled, self.lane.window.is_some())? {
-            return Ok(false);
+            return body(self);
         }
-        let rank = self.rank;
-        let key = super::graphs::Key { lane: self.lane_index, rank, rows, op };
+        let Some(mut graphs) = self.graphs.take() else { return body(self) };
         let stream = self.stream().clone();
-        // Only a startup-set miss builds this: rows, lane geometry and replay
-        // selection are outside the key, so they say which traffic needed it.
-        let (lane, window, replay_enabled) = (self.lane_index, self.lane.window.clone(), self.replay_enabled);
-        let attention = self.attention.as_ref().map(|shape| (shape.rows, shape.sequences));
-        self.graphs.as_mut().map_or(Ok(false), |graphs| graphs.launch(key, &stream,
-            || format!("lane={lane} window={window:?} replay_enabled={replay_enabled} attention={attention:?}")))
+        let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
+        let pinned = super::graphs::pinned(self.programs.ranks, key);
+        // A golden capture records its own sites inside the body; a recorded
+        // stream cannot contain those reads.
+        let allow_capture = self.capture.is_none();
+        let result = graphs.graph(&stream, key, allow_capture, pinned, || body(self));
+        self.graphs = Some(graphs);
+        result
     }
 
     /// Enqueue only rank-local attention. KDA and head-split MLA return a TP2
@@ -898,18 +946,28 @@ impl<'a> LocalLane<'a> {
         } else { 1 };
         // Speculative keys replay the verify programs (replay records, verify MLA);
         // slots, pages and frontiers are device metadata staged outside capture.
-        if self.replay(rows, super::graphs::Op::Attention { layer, sequences, speculative })? {
-            return self.attention_result(layer,rows);
-        }
+        ensure!(sequences > 0 && sequences <= rows && sequences <= self.kda.slots(),
+            "Kimi attention sequence geometry");
+        // Sequence layout is read from stable device slots/first tables; only
+        // rows and the verify program change the recorded launch sequence.
+        self.graph_step(rows, super::graphs::Op::Attention { layer, speculative }, |lane| {
+            if lane.lane.window.is_none() { lane.residual_body(MixSite::Attention(layer), rows)?; }
+            lane.attention_body(layer, rows, speculative, sequences)
+        })?;
+        self.attention_result(layer, rows)
+    }
+
+    /// The recorded attention segment: enqueue only, host state already staged.
+    fn attention_body(&mut self, layer: usize, rows: usize, speculative: bool, sequences: usize) -> Result<()> {
         let weights = self.layer(layer)?;
-        if self.native_attention(layer)? {return self.attention_core(layer,rows,speculative);}
+        if self.native_attention(layer)? { self.attention_core(layer, rows, speculative)?; return Ok(()) }
         let output = self.plane("attention output", rows, 7168)?;
         let device = self.lane.stream.device;
         match self.programs.w8.cfg.attention.get(layer) {
             Some(cuteafd_loader::families::kimi_k3::config::KimiAttention::Kda) => {
                 let [state, conv_state, replay] = self.kda.layer(layer, self.lane_index)?;
                 let weights = weights.kda()?;
-                let batch = cuteafd_ffi::KimiKdaBatch { rows, sequences: shape.sequences, state_slots: self.kda.slots(),
+                let batch = cuteafd_ffi::KimiKdaBatch { rows, sequences, state_slots: self.kda.slots(),
                     speculative, input: self.plane("normalized", rows, 7168)?, state, conv_state,
                     slots: self.lane.buffer("KDA slots")?, first: self.lane.buffer("KDA first")?,
                     normalized: self.lane.buffer("KDA normalized")?, output,
@@ -935,7 +993,7 @@ impl<'a> LocalLane<'a> {
             }
             None => bail!("Kimi attention layer outside inventory"),
         }
-        Ok(output)
+        Ok(())
     }
 
     fn context_slot(&self, layer: usize) -> Result<crate::shared::peer_split::context::SlotBuffers> {
@@ -1039,7 +1097,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn context_decode(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
         ensure!(self.lane.window.is_none() && self.lane.metadata_bank == 0,
             "Kimi context decode needs its fixed metadata bank");
-        ensure!(self.graphs.is_some(), "Kimi context decode requires startup graphs");
+        ensure!(self.graphs.is_some(), "Kimi context decode requires the graph cache");
         let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
         let bucket = context.ranks[self.rank].decode().dispatch_rows(rows, speculative)?;
         let input = context.ranks[self.rank].buffer("decode input")?;
@@ -1056,9 +1114,8 @@ impl<'a> LocalLane<'a> {
         let splits = super::context::split_bucket(self.context_pages[0], bucket,
             self.context.as_ref().unwrap().1.sms)? as i32;
         context.ranks[self.rank].upload("active splits", 0, &splits.to_le_bytes(), &stream)?;
-        if !self.replay(bucket, super::graphs::Op::Context { layer, speculative })? {
-            self.context_step(layer, bucket, speculative)?;
-        }
+        self.graph_step(bucket, super::graphs::Op::Context { layer, speculative },
+            |lane| lane.context_step(layer, bucket, speculative))?;
         // Both replay and eager submission write the persistent F32 lane plane.
         if self.native_f32_attention(layer)? { return Ok(()); }
         let rank = self.rank;
@@ -1425,9 +1482,11 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
-        if self.replay(rows, super::graphs::Op::Residual(site))? {
-            return self.plane("normalized", rows, 7168);
-        }
+        self.residual_body(site, rows)?;
+        self.plane("normalized", rows, 7168)
+    }
+
+    fn residual_body(&mut self, site: MixSite, rows: usize) -> Result<()> {
         let (score_weight, norm_weight) = match site {
             MixSite::Attention(layer) => (self.layer(layer)?.buffer("attention.score")?, self.layer(layer)?.buffer("attention.norm")?),
             MixSite::Ffn(layer) => (self.layer(layer)?.buffer("ffn.score")?, self.layer(layer)?.buffer("ffn.norm")?),
@@ -1444,23 +1503,28 @@ impl<'a> LocalLane<'a> {
                     &[("prefix", prefix, 7168, "BF16"), ("normalized", output, 7168, "BF16")], None)?;
             }
         }
-        Ok(output)
+        Ok(())
     }
 
     /// Returns a TP2 partial. The shared executor meets both ranks before this
     /// partial can become the next fused residual's delta.
     pub(crate) fn ffn(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
-        if self.replay(rows, super::graphs::Op::Ffn(layer))? {
-            return self.ffn_result(layer,rows);
-        }
+        self.graph_step(rows, super::graphs::Op::Ffn(layer), |lane| {
+            if lane.cfg.dense[layer] { lane.residual_body(MixSite::Ffn(layer), rows)?; }
+            lane.ffn_body(layer, rows)
+        })?;
+        self.ffn_result(layer, rows)
+    }
+
+    fn ffn_body(&mut self, layer: usize, rows: usize) -> Result<()> {
         let weights = self.layer(layer)?;
-        if weights.is_core("ffn.down") {return self.ffn_core(layer,rows);}
+        if weights.is_core("ffn.down") { self.ffn_core(layer, rows)?; return Ok(()) }
         let output = self.plane("ffn output", rows, 7168)?;
         let batch = KimiFfnBatch { rows, input: self.plane("normalized", rows, 7168)?,
             gate_up_weight: weights.buffer("ffn.gate_up")?, down_weight: weights.buffer("ffn.down")?,
             gate_up: self.lane.buffer("gate-up")?, activated: self.lane.buffer("activated")?, output };
         self.lane.stream.device.run(|| self.programs.w8.ffn(layer, batch, self.lane.stream.raw))?;
-        Ok(output)
+        Ok(())
     }
 
     /// Route and quantize on this device; normal RouteStaging/SparkLane reads

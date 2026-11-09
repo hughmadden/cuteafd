@@ -562,29 +562,6 @@ impl KimiRecipe {
         Ok(())
     }
 
-    /// Graph bytes follow the same finite boundary as weights and KV. Callers
-    /// build the executable keys only after admission selects that boundary.
-    pub fn balance_graphs(&mut self, cfg: &crate::families::kimi_k3::config::KimiK3Config,
-        slots: usize, verify: usize) -> anyhow::Result<()> {
-        if self.gpus != 2 || self.placement != AttentionPlacement::Layers { return Ok(()); }
-        self.fixed.retain(|owner| owner.group != allocation::GRAPH_RESERVE);
-        for (option, modes) in self.attention_profiles().iter().enumerate() {
-            let graphs = allocation::graphs_for_ranks(cfg, self.lanes as usize, self.prefill.rows as usize,
-                slots, verify, self.gpus, |rank, layer|
-                    !matches!(modes[layer], LayerMode::Whole { gpu, .. } if usize::from(gpu) != rank))?;
-            for rank in 0..self.gpus {
-                let demand = allocation::graph_demand(&graphs, rank);
-                let owner = Allocation::buffer(format!("graphs.{option}.{rank}"), Location::coordinator(rank as u8),
-                    demand.bytes, Lifetime::RESIDENT, demand.category, demand.group);
-                let mut component = Component::allocation(owner, ByteCurve::fixed(demand.bytes, self.maximum_pages),
-                    false, self.maximum_pages);
-                component.activation = Activation::choice(0, option);
-                self.owners.push(component);
-            }
-        }
-        Ok(())
-    }
-
     fn kind_order(&self) -> Vec<AttentionClass> {
         self.kinds.clone()
     }

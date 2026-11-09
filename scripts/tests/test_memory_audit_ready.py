@@ -310,7 +310,46 @@ def test_typed_reports_use_kinds_not_scope_names():
     assert cats == {"kv": 400, "drafter": 200, "untagged": 50, "staging": 50, "runtime": 100}
 
 
+def test_kimi_reconciliation_uses_shared_ready_first_request_and_stats_paths():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src"
+    startup = (root / "families/kimi_k3/startup.rs").read_text()
+    assert '"memory_reconciliation_provenance"' in startup
+    for field in ["source_commit", "native_sha256", "programs_sha256", "devices"]:
+        assert f'"{field}"' in startup
+    assert '"devices": inventory.gpus' in startup
+    assert "hash(options.manifest)?" in startup
+    for name in ["serve.rs", "golden.rs"]:
+        assert "manifest: &args.manifest" in (root / "families/kimi_k3" / name).read_text()
+    assert 'memory_report::log("ready")' in (root / "families/kimi_k3/serve.rs").read_text()
+    assert 'if stage == "ready" { reconcile::capture(&stage); }' in (root / "shared/memory_report.rs").read_text()
+    scheduler = (root / "shared/qwen/scheduler.rs").read_text()
+    hook = '''    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
+    }'''
+    assert hook in scheduler
+    assert scheduler.count('reconcile::capture("first_request")') == 1
+    assert 'memory_reconciliation' in (root / "shared/probe.rs").read_text()
+
+
 def test_kind_category_mirrors_every_memory_kind():
     source = (Path(__file__).parents[2] / "rust/crates/cuteafd-core/src/memory_layout.rs").read_text()
     labels = re.findall(r'Self::\w+ => "(\w+)",', source.split("pub const fn label(self)", 1)[1].split("}", 1)[0])
     assert sorted(labels) == sorted(memory_audit.KIND_CATEGORY)
+
+
+def test_kimi_startup_capture_window_excludes_eager_first_touch():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/kimi_k3"
+    engine = (root / "engine.rs").read_text().split("pub(crate) fn warm_graphs(", 1)[1]
+    assert engine.index("restore_startup_kda()?") < engine.index("let before_capture =")
+    assert engine.index("let before_capture =") < engine.index("observe_device(")
+    assert engine.index("let mut controllers =") < engine.index("device_cache(")
+    assert engine.index("controllers.push(") < engine.index("local.warm_graphs(")
+    assert engine.index("local.warm_graphs(") < engine.index("drop(controllers)")
+    assert engine.index("set_reserve_policy(") < engine.index("local.warm_graphs(")
+    assert engine.index("observe_device(") < engine.index("local.warm_graphs(")
+    assert engine.index("self.graph_settle()?") < engine.index("Ok(GraphWarmup")
+    startup = (root / "startup.rs").read_text()
+    assert "let bytes = warmup.before_capture[rank]" in startup
+    assert "cuda_physical_memory_info()?" in (root / "engine.rs").read_text()
+    assert "first_touch_bytes" in startup and "capture_delta_bytes" in startup

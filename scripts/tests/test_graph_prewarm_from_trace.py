@@ -1304,3 +1304,351 @@ def test_mimo_order_is_pinned_then_latest_request_replay_hits_with_row_ties():
         assert [(entry["rows"], entry["pin"]) for entry in layout["entries"]] == \
             [(2, True), (1, True), (4, False), (8, False), (16, False)]
         assert layout["entry_capture_bytes"] == [[value << 20 for value in [2, 1, 4, 3, 5]]]
+
+def kimi_trace(device=0, charged=600 << 20, rows=1, speculative=False, cycles=None):
+    shape = (f"lane=0 rank={device} rows={rows} op="
+             + (f"attention layer=0 spec={int(speculative)}" if speculative
+                else "ffn layer=0"))
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
+            "sites": {"kimi_k3.step": {"largest_bytes": 3 << 20}},
+            "graphs": [{"device": device, "site": "kimi_k3.step", "bank": 0, "shape": shape,
+                        "count": 100, "cycles": cycles if cycles is not None else {"decode": 100},
+                        "hits": 100, "evictions": 0, "recaptures": 0, "first_seen_ms": 0,
+                        "capture_bytes": 3 << 20,
+                        "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                                          "counts": [25, 25, 25, 25, 0]}}]}
+
+
+def test_kimi_layout_row_keeps_replay_widths_and_skips_prefill():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+                                shape="lane=0 rank=0 rows=4096 op=ffn layer=0",
+                                cycles={"prefill": 50}))
+    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=0.999)
+    assert row["entries"] == [{"rows": 1, "speculative": False, "op": "ffn", "pin": True, "capture_bytes": [3 << 20]}]
+    assert row["reserve_base_bytes"] == [4 << 20]
+    assert row["reserve_extra_bytes"] == 2 << 20
+
+
+def test_kimi_verify_width_is_its_own_pin(tmp_path):
+    trace = kimi_trace(rows=4, speculative=True)
+    row = MODULE.generate_kimi([trace, kimi_trace(device=1, rows=4, speculative=True)], 2, "kimi-k3-exl3-k6-max")
+    assert row["entries"] == [{"rows": 4, "speculative": True, "op": "attention", "pin": True, "capture_bytes": [3 << 20, 3 << 20]}]
+    out = tmp_path / "kimi_prewarm.json"
+    MODULE.merge_kimi_layout(out, MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min"))
+    MODULE.merge_kimi_layout(out, row)
+    layouts = json.loads(out.read_text())["layouts"]
+    assert [layout["ranks"] for layout in layouts] == [1, 2]
+    assert layouts[1]["layout"] == "kimi-k3-exl3-k6-max"
+
+
+def test_kimi_startup_only_geometry_is_neither_selected_nor_pinned():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+        shape="lane=0 rank=0 rows=16 op=attention layer=0 spec=0",
+        cycles={"other": 1000}, count=1000, capture_bytes=None,
+        evictions=3, recaptures=3))
+    row = MODULE.generate_kimi([trace], 1, "min")
+    assert row["entries"] == [
+        {"rows": 1, "speculative": False, "op": "ffn", "pin": True, "capture_bytes": [3 << 20]}]
+    assert row["reserve_base_bytes"] == [4 << 20]
+
+
+def test_kimi_cold_shape_outside_lifetime_tier_is_listed_but_unpinned():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+        shape="lane=0 rank=0 rows=16 op=ffn layer=0", cycles={"decode": 1}, hits=1,
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0,
+                       "counts": [1, 0, 0, 0, 0]}))
+    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=1)
+    assert row["entries"] == [
+        {"rows": 1, "speculative": False, "op": "ffn", "pin": True, "capture_bytes": [3 << 20]},
+        {"rows": 16, "speculative": False, "op": "ffn", "pin": False, "capture_bytes": [3 << 20]}]
+
+
+@pytest.mark.parametrize("shape", ["bad", "lane=0 rank=0 rows=0 op=ffn layer=0"])
+def test_kimi_invalid_shape_fails(shape):
+    trace = kimi_trace()
+    trace["graphs"][0]["shape"] = shape
+    with pytest.raises(ValueError):
+        MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min")
+
+
+def test_kimi_unreachable_rows_are_not_proposed_even_with_decode_counts():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+                                shape="lane=0 rank=0 rows=4096 op=ffn layer=0"))
+    assert MODULE.generate_kimi([trace], 1, "min")["entries"] == [
+        {"rows": 1, "speculative": False, "op": "ffn", "pin": True, "capture_bytes": [3 << 20]}]
+
+
+def test_kimi_row_only_attention_trace_has_no_sequence_dimension():
+    data = kimi_trace(rows=20, speculative=True)
+    row = MODULE.generate_kimi([data], 1, "min")
+    assert row["entries"] == [{"rows": 20, "speculative": True, "op": "attention",
+                               "pin": True, "capture_bytes": [3 << 20]}]
+
+
+def test_kimi_geometry_preserves_operation_and_verify_variant():
+    data = kimi_trace(rows=20, speculative=True)
+    data["graphs"].append(dict(data["graphs"][0],
+        shape="lane=0 rank=0 rows=20 op=context layer=1 spec=1"))
+    row = MODULE.generate_kimi([data], 1, "max")
+    assert row["entries"] == [
+        {"rows": 20, "speculative": True, "op": "attention", "pin": True, "capture_bytes": [3 << 20]},
+        {"rows": 20, "speculative": True, "op": "context", "pin": True, "capture_bytes": [3 << 20]}]
+
+
+def test_kimi_base_sums_selected_latest_identity_shares_per_rank():
+    import copy
+    first = kimi_trace()
+    first["cache"]["sampled_at_ms"] = 40_000
+    graph = first["graphs"][0]
+    graph.update(key_id=1, capture_bytes=1)
+    sibling = dict(graph, bank=2, cycles={"other": 1}, count=1, capture_bytes=2)
+    first["graphs"] += [dict(graph), sibling,
+                        dict(graph, key_id=3, shape="lane=0 rank=0 rows=64 op=ffn layer=0",
+                             cycles={"other": 1}, capture_bytes=900 << 20)]
+    old = copy.deepcopy(first)
+    old["cache"]["sampled_at_ms"] = 39_000
+    old["graphs"][0]["capture_bytes"] = 100 << 20
+    second = kimi_trace(device=1)
+    second["graphs"][0]["capture_bytes"] = (2 << 20) + 1
+    for inputs in ([old, first, second], [second, first, old]):
+        row = MODULE.generate_kimi(inputs, 2, "max")
+        assert row["reserve_base_bytes"] == [2 << 20, 4 << 20]
+        assert row["entries"][0]["capture_bytes"] == [3, (2 << 20) + 1]
+
+
+def test_kimi_bases_follow_logical_rank_not_cuda_ordinal():
+    rank0 = kimi_trace(device=7)
+    rank0["graphs"][0].update(shape="lane=0 rank=0 rows=1 op=ffn layer=0",
+                               capture_bytes=1)
+    rank1 = kimi_trace(device=3)
+    rank1["graphs"][0].update(shape="lane=0 rank=1 rows=1 op=ffn layer=0",
+                               capture_bytes=(2 << 20) + 1)
+    row = MODULE.generate_kimi([rank1, rank0], 2, "max")
+    assert row["reserve_base_bytes"] == [2 << 20, 4 << 20]
+    assert row["entries"][0]["capture_bytes"] == [1, (2 << 20) + 1]
+    rank1["graphs"][0]["shape"] = rank0["graphs"][0]["shape"]
+    with pytest.raises(ValueError, match="one-to-one"):
+        MODULE.generate_kimi([rank0, rank1], 2, "max")
+
+
+@pytest.mark.parametrize("share", [None, -1, "0", True])
+def test_kimi_missing_or_invalid_selected_capture_share_fails(share):
+    data = kimi_trace()
+    data["graphs"][0]["capture_bytes"] = share
+    with pytest.raises(ValueError, match="capture_bytes"):
+        MODULE.generate_kimi([data], 1, "min")
+    del data["graphs"][0]["capture_bytes"]
+    with pytest.raises(ValueError, match="capture_bytes"):
+        MODULE.generate_kimi([data], 1, "min")
+
+
+def test_kimi_lifetime_hot_tier_survives_aged_out_rolling_window():
+    data = kimi_trace()
+    data["cache"]["sampled_at_ms"] = 900_000
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=ffn layer=0",
+        hits=hits, count=hits, cycles={"decode": hits},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 310_000, "counts": [0] * 60})
+        for index, (rows, hits) in enumerate([(1, 1), (4, 60), (8, 25), (16, 14)])]
+    report = []
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1, pin_report=report)
+    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [4, 1]
+    assert not any(entry["rolling_pin"] for entry in report)
+    assert {entry["rows"] for entry in report if entry["lifetime_pin"]} == {1, 4}
+    assert all(entry["whole_run_interval_spread"] is None for entry in report)
+
+
+def test_kimi_lifetime_tier_uses_per_key_counts_and_keeps_cutoff_ties():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=ffn layer={index}",
+        hits=hits, cycles={"verify": hits},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+        for index, (rows, hits) in enumerate([(4, 40), (8, 30), (16, 30), (32, 1)])]
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert [entry["rows"] for entry in row["entries"] if entry["pin"]] == [4, 8, 16]
+
+
+def test_kimi_prewarm_orders_pins_then_lifetime_replay_heat_not_requests():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"] = [dict(seed, key_id=index,
+        shape=f"lane=0 rank=0 rows={rows} op=ffn layer=0",
+        hits=hits, cycles={"verify": requests}, capture_bytes=rows,
+        hit_histogram={"interval_ms": 10000, "start_ms": 0, "counts": [0] * 5})
+        for index, (rows, hits, requests) in enumerate([
+            (1, 1, 1), (4, 100, 100), (8, 2, 1000), (16, 20, 20), (32, 20, 20)])]
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert [(entry["rows"], entry["pin"]) for entry in row["entries"]] == [
+        (4, True), (1, True), (16, False), (32, False), (8, False)]
+    assert [entry["capture_bytes"] for entry in row["entries"]] == [[4], [1], [16], [32], [8]]
+    data["graphs"].reverse()
+    assert MODULE.generate_kimi([data], 1, "min", coverage=1) == row
+
+
+def test_kimi_dominant_verify_pins_attention_and_flagless_siblings():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    shapes = [
+        ("rows=20 op=attention layer=0 spec=1", 100),
+        ("rows=24 op=attention layer=0 spec=1", 10),
+        ("rows=20 op=context layer=1 spec=1", 100),
+        ("rows=20 op=ffn layer=1", 1),
+        ("rows=1 op=ffn layer=0", 1),
+        ("rows=4 op=ffn layer=2", 100),
+    ]
+    data["graphs"] = [dict(seed, key_id=index, shape="lane=0 rank=0 " + shape,
+        hits=count, cycles={"decode" if "rows=1 " in shape else "verify": count},
+        hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+        for index, (shape, count) in enumerate(shapes)]
+    report = []
+    MODULE.generate_kimi([data], 1, "min", coverage=1, pin_report=report)
+    dominant = [entry for entry in report if "dominant_verify" in entry["reasons"]]
+    assert {entry["op"] for entry in dominant} == {"attention", "context", "ffn"}
+    assert all(entry["rows"] == 20 for entry in dominant)
+    assert any(entry["rows"] == 1 and "plain_c1" in entry["reasons"] for entry in report)
+
+
+def test_kimi_lifetime_tiers_are_independent_per_device_and_operation():
+    traces = [kimi_trace(device=rank) for rank in (0, 1)]
+    for rank, data in enumerate(traces):
+        seed = data["graphs"][0]
+        data["graphs"] = [dict(seed, key_id=index,
+            shape=f"lane=0 rank={rank} rows={rows} op={op} layer=0" +
+                  (" spec=1" if op == "context" else ""),
+            hits=hits, cycles={"verify": hits},
+            hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [0] * 5})
+            for index, (rows, op, hits) in enumerate([
+                (4, "ffn", 100 if rank == 0 else 1),
+                (8, "ffn", 1 if rank == 0 else 100),
+                (16, "context", 2)])]
+    row = MODULE.generate_kimi(traces, 2, "max", coverage=1)
+    assert {(entry["rows"], entry["op"]) for entry in row["entries"] if entry["pin"]} == {
+        (4, "ffn"), (8, "ffn"), (16, "context")}
+
+
+def test_kimi_zero_replay_geometry_stays_lazy_even_with_hot_request_counts():
+    data = kimi_trace()
+    seed = data["graphs"][0]
+    data["graphs"].append(dict(seed, key_id=2,
+        shape="lane=0 rank=0 rows=4 op=attention layer=0 spec=1",
+        hits=0, cycles={"verify": 10000}, capture_bytes=None,
+        evictions=10, recaptures=10))
+    row = MODULE.generate_kimi([data], 1, "min", coverage=1)
+    assert len(row["entries"]) == 1
+    assert row["entries"][0]["rows"] == 1
+    data["graphs"][0]["hits"] = 0
+    with pytest.raises(ValueError, match="no replayed"):
+        MODULE.generate_kimi([data], 1, "min")
+
+
+def test_kimi_one_replay_selects_whole_geometry_and_charges_zero_hit_sibling():
+    data = kimi_trace()
+    graph = data["graphs"][0]
+    graph.update(hits=1, cycles={"decode": 2}, capture_bytes=3)
+    data["graphs"].append(dict(graph, bank=2, hits=0, capture_bytes=7))
+    report = []
+    row = MODULE.generate_kimi([data], 1, "min", pin_report=report)
+    assert row["entries"][0]["capture_bytes"] == [10]
+    assert report[0]["zero_hit_sibling_identities"] == 1
+    assert report[0]["zero_hit_sibling_bytes"] == 7
+
+
+def test_kimi_old_replayed_geometry_cannot_survive_latest_zero_replay_inventory():
+    import copy
+    old = kimi_trace(rows=4, speculative=True)
+    old["cache"]["sampled_at_ms"] = 100
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 200
+    new["graphs"][0].update(hits=0, cycles={"verify": 1}, capture_bytes=None)
+    plain = kimi_trace()["graphs"][0]
+    new["graphs"].append(plain)
+    for traces in ([old, new], [new, old]):
+        row = MODULE.generate_kimi(traces, 1, "min")
+        assert [entry["rows"] for entry in row["entries"]] == [1]
+
+
+def test_kimi_entry_costs_sum_to_each_once_rounded_base():
+    traces = [kimi_trace(device=rank) for rank in (0, 1)]
+    for rank, data in enumerate(traces):
+        seed = data["graphs"][0]
+        data["graphs"] = [dict(seed, key_id=index,
+            shape=f"lane=0 rank={rank} rows={rows} op=ffn layer=0",
+            hits=hits, cycles={"decode": hits}, capture_bytes=cost)
+            for index, (rows, hits, cost) in enumerate([(1, 100, 0), (4, 10, 13 + rank)])]
+    row = MODULE.generate_kimi(traces, 2, "max", coverage=1)
+    assert [entry["capture_bytes"] for entry in row["entries"]] == [[0, 0], [13, 14]]
+    assert row["reserve_base_bytes"] == [MODULE.packed(sum(entry["capture_bytes"][rank]
+        for entry in row["entries"])) for rank in (0, 1)]
+    traces[1]["graphs"] = traces[1]["graphs"][:1]
+    row = MODULE.generate_kimi(traces, 2, "max", coverage=1)
+    assert row["entries"][1]["capture_bytes"] == [13, None]
+
+
+def test_kimi_seeded_grouped_trace_reproduces_checked_in_layouts():
+    fixture = json.loads((SCRIPT.parents[1] / "tests/fixtures/kimi-prewarm-seeded.json").read_text())
+    checked = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/kimi_prewarm.json").read_text())
+    for layout in fixture["layouts"]:
+        traces = []
+        for rank, device in enumerate(layout["devices"]):
+            data = kimi_trace(device=device["device"])
+            seed = data["graphs"][0]
+            data["graphs"] = []
+            data["cache"]["sampled_at_ms"] = device["sampled_at_ms"]
+            for index, group in enumerate(device["groups"]):
+                rows, spec, op, hits, cycles, histogram_index, first_bin, identities, cost = group
+                histogram = device["histograms"][histogram_index]
+                shape = f"lane=0 rank={rank} rows={rows} op={op} layer=0"
+                if op != "ffn":
+                    shape += f" spec={int(spec)}"
+                share, tail = divmod(cost, identities)
+                # Exact histogram/cycle classes preserve selection and pin heat;
+                # summed raw shares preserve the once-rounded physical base.
+                first_seen = (0 if first_bin == 0 else
+                    histogram["start_ms"] + first_bin * histogram["interval_ms"])
+                for sibling in range(identities):
+                    data["graphs"].append(dict(seed, key_id=f"{index}-{sibling}", shape=shape,
+                        hits=hits, cycles=cycles, first_seen_ms=first_seen,
+                        capture_bytes=share + (sibling < tail), hit_histogram=histogram))
+            traces.append(data)
+        result = MODULE.generate_kimi(traces, layout["ranks"], layout["layout"], coverage=fixture["coverage"])
+        expected = next(row for row in checked["layouts"] if row["ranks"] == layout["ranks"])
+        assert result == expected
+        for rank in range(layout["ranks"]):
+            assert MODULE.packed(sum(entry["capture_bytes"][rank] or 0
+                for entry in result["entries"])) == result["reserve_base_bytes"][rank]
+        assert result["reserve_extra_bytes"] == MODULE.CHUNK
+
+
+def test_kimi_cleaned_fixture_prewarms_replayed_late_widths_without_pinning():
+    checked = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/kimi_prewarm.json").read_text())
+    minimum, maximum = checked["layouts"]
+    entries = {(entry["rows"], entry["op"], entry["speculative"]): entry
+               for entry in minimum["entries"]}
+    for rows, op in [(50, "attention"), (56, "attention"),
+                     (55, "ffn"), (56, "ffn"), (58, "ffn")]:
+        assert not entries[(rows, op, op == "attention")]["pin"]
+    for rows in [52, 55, 58]:
+        assert (rows, "attention", True) not in entries
+    assert not any(entry["rows"] == 62 and entry["op"] in ("attention", "ffn")
+                   for entry in maximum["entries"])
+    assert all(entry["op"] != "residual" and "sequences" not in entry
+               for layout in checked["layouts"] for entry in layout["entries"])
+
+
+def test_kimi_zero_share_is_valid_and_missing_rank_fails():
+    data = kimi_trace()
+    data["graphs"][0]["capture_bytes"] = 0
+    row = MODULE.generate_kimi([data], 1, "min")
+    assert row["reserve_base_bytes"] == [0]
+    assert row["entries"][0]["capture_bytes"] == [0]
+    with pytest.raises(ValueError, match="missing a physical rank"):
+        MODULE.generate_kimi([data], 2, "max")
