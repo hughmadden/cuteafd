@@ -2282,10 +2282,10 @@ impl<'a> GlmEngine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_cancel(ticket);
-            if let Ok((raw, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
+            if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
-        let (raw, nodes, width, spans_devices) = match exec {
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
                 graphs.borrow_mut().cache_cancel(ticket);
@@ -2293,6 +2293,11 @@ impl<'a> GlmEngine<'a> {
                 return segment();
             }
         };
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "glm5.decode", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
+        }
         let graph = GraphExec(raw, self.library);
         crate::shared::decode_graph::census::capture_key("glm5", "decode",
             graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);

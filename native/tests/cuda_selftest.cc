@@ -1,6 +1,7 @@
 #include "cuteafd_native.h"
 #include "cuteafd_peer_copy.h"
 #include "../shared/cuda/peer_copy_internal.h"
+#include "cuteafd_graph_diagnostics.h"
 
 #include <cuda_runtime_api.h>
 
@@ -2657,6 +2658,70 @@ void test_cuda_graph_topology_chain_and_fork() {
   free_buffer(&buffer);
 }
 
+void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
+  constexpr size_t bytes = 5120 * sizeof(uint16_t);
+  auto input = device_buffer(bytes);
+  auto output = device_buffer(2 * bytes);
+  require_cuda(cudaMemset(input.ptr, 0, bytes), "programmatic input");
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "programmatic stream");
+  const uint16_t* planes[8] = {static_cast<const uint16_t*>(input.ptr)};
+  auto reduce = [&](size_t slot) {
+    return static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        planes, nullptr, static_cast<uint16_t*>(output.ptr) + slot * 5120, 1, 1, stream));
+  };
+  require_cuda(reduce(0), "programmatic eager warmup");
+  require_cuda(cudaStreamSynchronize(stream), "programmatic warmup complete");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "programmatic begin");
+  require_cuda(reduce(0), "programmatic first kernel");
+  require_cuda(reduce(1), "programmatic second kernel");
+  cudaGraph_t graph = nullptr;
+  require_cuda(cudaStreamEndCapture(stream, &graph), "programmatic capture");
+  size_t edges = 1;
+  cudaGraphNode_t from = nullptr, to = nullptr;
+  cudaGraphEdgeData data{};
+  require_cuda(cudaGraphGetEdges(graph, &from, &to, &data, &edges), "programmatic original edge");
+  if (edges != 1) std::abort();
+  require_cuda(cudaGraphRemoveDependencies(graph, &from, &to, &data, 1), "programmatic remove dependency");
+  data.from_port = cudaGraphKernelNodePortLaunchCompletion;
+  data.type = cudaGraphDependencyTypeProgrammatic;
+  require_cuda(cudaGraphAddDependencies(graph, &from, &to, &data, 1), "programmatic dependency");
+  size_t nodes = 0, width = 0;
+  int spans = -1;
+  require_cuda(cuteafd::inspect_graph_topology(graph, &nodes, &width, &spans), "programmatic inspect");
+  if (nodes != 2 || width != 1 || spans != 0) std::abort();
+
+  cudaGraphExec_t exec = nullptr;
+  require_cuda(cudaGraphInstantiate(&exec, graph, 0), "programmatic instantiate");
+  // Reproduce the exact CUDA 402 from the failed GLM trace, not a fabricated
+  // status: a lossy metadata query poisons the next cudaGetLastError check.
+  auto lossy = +[](cudaGraph_t g, cudaGraphNode_t* f, cudaGraphNode_t* t,
+                   cudaGraphEdgeData*, size_t* n) -> cudaError_t {
+    return cudaGraphGetEdges(g, f, t, nullptr, n);
+  };
+  const auto failed = cuteafd::inspect_graph_topology(graph, &nodes, &width, &spans, lossy);
+  if (failed != cudaErrorLossyQuery || width != 0 || cudaPeekAtLastError() != cudaSuccess) std::abort();
+  require_cuda(cudaGraphLaunch(exec, stream), "programmatic launch after inspection failure");
+  require_cuda(reduce(0), "eager compact reducer after inspection failure");
+  require_cuda(cudaStreamSynchronize(stream), "programmatic recovered completion");
+  std::vector<uint16_t> actual(10240, 0xffff);
+  require_cuda(cudaMemcpy(actual.data(), output.ptr, 2 * bytes, cudaMemcpyDeviceToHost), "programmatic results");
+  if (!std::all_of(actual.begin(), actual.end(), [](uint16_t value) { return value == 0; })) std::abort();
+  require_cuda(cudaGraphExecDestroy(exec), "programmatic exec destroy");
+  // Exercise the production capture wrapper against the annotated source graph.
+  require_cuda(cudaStreamBeginCaptureToGraph(stream, graph, nullptr, nullptr, 0,
+      cudaStreamCaptureModeThreadLocal), "programmatic recapture");
+  void* retained = nullptr;
+  require_status(cuteafd_cuda_graph_end_capture_topology(stream, &retained, &nodes, &width, &spans), "programmatic topology wrapper");
+  if (nodes != 2 || width != 1 || spans != 0 || !retained) std::abort();
+  require_status(cuteafd_cuda_graph_launch(retained, stream), "programmatic retained launch");
+  require_cuda(cudaStreamSynchronize(stream), "programmatic retained completion");
+  require_status(cuteafd_cuda_graph_exec_destroy(retained), "programmatic retained destroy");
+  require_cuda(cudaStreamDestroy(stream), "programmatic stream destroy");
+  free_buffer(&output);
+  free_buffer(&input);
+}
+
 void test_cuda_graph_peer_attribution() {
   int devices = 0;
   require_cuda(cudaGetDeviceCount(&devices), "peer graph device count");
@@ -3053,7 +3118,8 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-topology-only") == 0) {
     test_cuda_graph_topology_chain_and_fork();
-    std::cout << "test result: ok. 2 passed; 0 failed\n";
+    test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
+    std::cout << "test result: ok. 3 passed; 0 failed\n";
     return 0;
   }
   test_peer_copy_optional_query_failure_is_recoverable();
@@ -3105,6 +3171,7 @@ int main(int argc, char** argv) {
   test_cuda_mla_compressed_attention_reads_interleaved_cache_formats();
   test_cuda_mla_kv_mxfp4_pack_roundtrip_matches_representable_values();
   test_cuda_graph_topology_chain_and_fork();
+  test_cuda_graph_programmatic_edges_and_diagnostic_recovery();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();

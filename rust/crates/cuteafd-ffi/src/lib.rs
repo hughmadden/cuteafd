@@ -2979,7 +2979,7 @@ impl NativeLibrary {
     /// # Safety
     /// The stream is in capture mode and all captured storage remains live.
     pub unsafe fn cuda_graph_end_capture_topology(&self, stream: *mut c_void)
-        -> Result<(*mut c_void, usize, usize, bool)> {
+        -> Result<(*mut c_void, usize, usize, bool, Option<String>)> {
         let _failure_boundary = memory_ledger::fault::boundary();
         let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
             .unwrap_or_else(|e| e.into_inner()));
@@ -2988,6 +2988,7 @@ impl NativeLibrary {
         // SAFETY: outputs are valid and stream's capture is caller-owned.
         let status = unsafe { end(stream, &mut exec, &mut nodes, &mut width, &mut spans) };
         self.status_to_result("cuteafd_cuda_graph_end_capture_topology", status)?;
+        let inspection_error = (width == 0).then(|| self.last_error().unwrap_or_default());
         if coordinator_gpu_budget().is_some() {
             if let Err(error) = self.cuda_memory_info() {
                 // SAFETY: the executable has not launched and owns no queued work.
@@ -2995,7 +2996,7 @@ impl NativeLibrary {
                 return Err(error.context("graph executable exceeds coordinator GPU budget"));
             }
         }
-        Ok((exec, nodes, width, spans != 0))
+        Ok((exec, nodes, width, spans != 0, inspection_error))
     }
 
     pub unsafe fn cuda_graph_launch(

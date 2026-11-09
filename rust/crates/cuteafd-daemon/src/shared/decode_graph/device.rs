@@ -364,7 +364,7 @@ impl DeviceCache {
         let nodes = metadata.nodes.unwrap_or(estimate);
         let next_nodes = self.pools.live_nodes.saturating_add(nodes);
         let next_execs = self.pools.live_execs.saturating_add(1);
-        let chain = self.chain_only && metadata.parallel_width <= 1 && !site.spans_devices;
+        let chain = self.chain_only && metadata.parallel_width == 1 && !site.spans_devices;
         if !chain { self.chain_only = false; }
         let projected = if chain {
             self.basis.pool_bytes(next_nodes.max(self.pools.node_high_water),
@@ -450,12 +450,16 @@ impl DeviceCache {
 
     pub fn captured_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
         let Some(record) = self.records.get_mut(&id) else { return };
-        if width > 1 || spans_devices {
+        if width != 1 || spans_devices {
+            // Previously reserved chain discounts are no longer justified,
+            // including pending captures elsewhere on this device.
+            self.pending_growth = self.pending_growth.max(self.pending_bytes);
             self.chain_only = false;
             tracing::warn!(device = self.device, site = record.identity.site, width, spans_devices,
                 "non-chain graph capture; disabling high-water reuse assumption");
         }
-        if let Basis::Nodes { .. } = self.basis {
+        // Unknown metadata cannot erase the caller's node estimate.
+        if (nodes != 0 || width != 0) && matches!(self.basis, Basis::Nodes { .. }) {
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes).saturating_add(nodes);
             record.nodes = nodes;
         }
@@ -719,6 +723,25 @@ mod tests {
         assert_eq!(cache.pending_growth, 4 << 20);
         cache.measured_capture(4 << 20);
         assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (10, 10));
+    }
+
+    #[test]
+    fn unknown_topology_restores_full_pending_reservation_and_forbids_reuse() {
+        let mut cache = DeviceCache::new(-212, 100);
+        cache.pools.node_high_water = 1000;
+        cache.pools.exec_high_water = 100;
+        cache.charged = 60;
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        assert_eq!(cache.pending_growth, 0);
+        cache.captured_topology(id, 0, 0, false);
+        assert!(!cache.chain_only);
+        assert_eq!(cache.pending_growth, 10);
+        assert_eq!(cache.records[&id].nodes, 10);
+        for n in 2..4 {
+            assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Capture(_)));
+        }
+        assert_eq!(cache.pending_growth, 30);
+        assert!(matches!(cache.miss(key(4), site(Preference::Capture), None, false), Miss::Eager));
     }
 
     #[test]
