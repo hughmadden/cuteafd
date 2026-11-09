@@ -593,6 +593,7 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> { self.lane.buffer(name) }
 
     pub(super) fn rows(&self) -> usize { self.lane.rows() }
+    pub(super) fn windowed(&self) -> bool { self.lane.window.is_some() }
     pub(super) fn lane_index(&self) -> usize { self.lane_index }
     pub(super) fn config(&self) -> &KimiK3Config { &self.cfg }
     pub(super) fn max_context(&self) -> usize { self.lane.layout.max_context() }
@@ -725,7 +726,7 @@ impl<'a> LocalLane<'a> {
                 if self.context.is_some() && self.cfg.attention[layer]
                     == cuteafd_loader::families::kimi_k3::config::KimiAttention::Mla {
                     self.context_gathered(layer, metadata.rows)?;
-                } else { self.attention(layer, metadata.rows, false)?; }
+                } else { self.attention_body(layer, metadata.rows, false, 1)?; }
                 first += metadata.rows;
             }
             Ok(())
@@ -772,11 +773,10 @@ impl<'a> LocalLane<'a> {
     fn submit_startup_graph(&mut self, key: super::graphs::Key) -> Result<()> {
         use super::graphs::Op;
         match key.op {
-            Op::Residual(site) => { self.residual(site, key.rows)?; }
             Op::Ffn(layer) => { self.ffn(layer, key.rows)?; }
             Op::Context { layer, speculative } => self.context_step(layer, key.rows, speculative)?,
-            Op::Attention { layer, sequences, speculative } => {
-                self.attention = Some(AttentionShape { rows: key.rows, sequences });
+            Op::Attention { layer, speculative } => {
+                self.attention = Some(AttentionShape { rows: key.rows, sequences: 1 });
                 self.attention(layer, key.rows, speculative)?;
             }
         }
@@ -791,9 +791,9 @@ impl<'a> LocalLane<'a> {
         let staged = self.attention.take();
         let result = (|| {
             for &key in keys {
-                let super::graphs::Op::Attention { layer, sequences, .. } = key.op else { continue; };
+                let super::graphs::Op::Attention { layer, .. } = key.op else { continue; };
                 if self.cfg.attention.get(layer) != Some(&KimiAttention::Kda) { continue; }
-                let metadata = super::state::startup_metadata(key.rows, sequences, self.kda.slots())?;
+                let metadata = super::state::startup_metadata(key.rows, 1, self.kda.slots())?;
                 let stream = self.stream().clone();
                 let input = self.plane("normalized", key.rows, 7168)?;
                 stream.device.run(|| {
@@ -808,7 +808,10 @@ impl<'a> LocalLane<'a> {
                     }
                     Ok(())
                 })?;
-                self.submit_startup_graph(key)?;
+                // First-touch only KDA with zero normalized input. The folded
+                // residual must not mutate live residual history during warm-up.
+                self.attention = Some(AttentionShape { rows: key.rows, sequences: 1 });
+                self.attention_body(layer, key.rows, key.op.speculative(), 1)?;
             }
             Ok(())
         })();
@@ -943,8 +946,14 @@ impl<'a> LocalLane<'a> {
         } else { 1 };
         // Speculative keys replay the verify programs (replay records, verify MLA);
         // slots, pages and frontiers are device metadata staged outside capture.
-        self.graph_step(rows, super::graphs::Op::Attention { layer, sequences, speculative },
-            |lane| lane.attention_body(layer, rows, speculative, sequences))?;
+        ensure!(sequences > 0 && sequences <= rows && sequences <= self.kda.slots(),
+            "Kimi attention sequence geometry");
+        // Sequence layout is read from stable device slots/first tables; only
+        // rows and the verify program change the recorded launch sequence.
+        self.graph_step(rows, super::graphs::Op::Attention { layer, speculative }, |lane| {
+            if lane.lane.window.is_none() { lane.residual_body(MixSite::Attention(layer), rows)?; }
+            lane.attention_body(layer, rows, speculative, sequences)
+        })?;
         self.attention_result(layer, rows)
     }
 
@@ -1473,7 +1482,7 @@ impl<'a> LocalLane<'a> {
     }
 
     pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
-        self.graph_step(rows, super::graphs::Op::Residual(site), |lane| lane.residual_body(site, rows))?;
+        self.residual_body(site, rows)?;
         self.plane("normalized", rows, 7168)
     }
 
@@ -1500,7 +1509,10 @@ impl<'a> LocalLane<'a> {
     /// Returns a TP2 partial. The shared executor meets both ranks before this
     /// partial can become the next fused residual's delta.
     pub(crate) fn ffn(&mut self, layer: usize, rows: usize) -> Result<CuteafdDeviceBuffer> {
-        self.graph_step(rows, super::graphs::Op::Ffn(layer), |lane| lane.ffn_body(layer, rows))?;
+        self.graph_step(rows, super::graphs::Op::Ffn(layer), |lane| {
+            if lane.cfg.dense[layer] { lane.residual_body(MixSite::Ffn(layer), rows)?; }
+            lane.ffn_body(layer, rows)
+        })?;
         self.ffn_result(layer, rows)
     }
 

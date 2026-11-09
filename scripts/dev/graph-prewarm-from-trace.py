@@ -138,10 +138,10 @@ def kimi_geometry(shape):
     if kind not in ("residual", "ffn", "attention", "context"):
         raise ValueError(f"unknown Kimi operation: {kind}")
     sequences = KIMI_SEQUENCES.search(shape)
-    if kind == "attention" and (sequences is None or not 0 < int(sequences.group(1)) <= int(rows.group(1))):
+    if kind == "attention" and sequences is not None and not 0 < int(sequences.group(1)) <= int(rows.group(1)):
         raise ValueError("Kimi attention requires 0 < sequences <= rows")
     return (int(rows.group(1)), kind not in ("residual", "ffn") and spec is not None and spec.group(1) == "1",
-            kind, int(sequences.group(1)) if kind == "attention" else None)
+            kind, (int(sequences.group(1)) if sequences is not None else 1) if kind == "attention" else None)
 
 
 def kimi_lifetime_pins(identities):

@@ -297,8 +297,8 @@ pub fn verify_graph_rows(verify: usize, slots: usize, capacity: usize) -> std::o
 }
 
 /// Every captured row count: the plain buckets plus each exact verify width.
-/// Plain attention (and multi-sequence KDA) keys stay on the plain buckets; the
-/// added widths capture speculative single-sequence attention, residual and FFN.
+/// Plain attention stays on the plain buckets; the added widths capture
+/// speculative attention and FFN sections. Residuals have no standalone keys.
 pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
     let mut rows = GRAPH_ROWS.into_iter().chain(verify_graph_rows(verify, 1, capacity))
         .filter(|&r| r <= capacity).collect::<Vec<_>>();
@@ -331,12 +331,11 @@ pub fn graphs_with_context(cfg: &KimiK3Config, lanes: usize, capacity: usize, sl
     let mut counts = vec![0; ranks];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
-            *count += (3 * cfg.layers + usize::from(rank == ranks - 1)) as u64;
+            *count += cfg.layers as u64;
             for layer in 0..cfg.layers {
                 if resident(rank, layer) && !context(layer) {
                     if GRAPH_ROWS.contains(&rows) {
-                        *count += 1 + u64::from(cfg.attention[layer] == KimiAttention::Kda
-                            && (2..=slots).contains(&rows));
+                        *count += 1;
                     }
                     if verify_graph_rows(verify, 1, capacity).contains(&rows) { *count += 1; }
                 }

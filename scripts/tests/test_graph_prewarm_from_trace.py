@@ -1382,6 +1382,14 @@ def test_kimi_unreachable_rows_are_not_proposed_even_with_decode_counts():
         {"rows": 1, "speculative": False, "op": "residual", "pin": True, "capture_bytes": [3 << 20]}]
 
 
+def test_kimi_row_only_attention_trace_uses_one_canonical_prewarm_marker():
+    data = kimi_trace(rows=20, speculative=True)
+    data["graphs"][0]["shape"] = "lane=0 rank=0 rows=20 op=attention layer=0 spec=1"
+    row = MODULE.generate_kimi([data], 1, "min")
+    assert row["entries"] == [{"rows": 20, "speculative": True, "op": "attention",
+                               "sequences": 1, "pin": True, "capture_bytes": [3 << 20]}]
+
+
 def test_kimi_geometry_preserves_operation_and_attention_sequence_count():
     trace = kimi_trace(rows=20, speculative=True)
     trace["graphs"][0]["shape"] = "lane=0 rank=0 rows=20 op=attention layer=0 seq=4 spec=1"
