@@ -85,6 +85,45 @@ assert.ok(m.graphIdentity(key).full.includes(key.shape));
 assert.equal(m.graphIdentity({...key,shape:key.shape.replace('Full','Planes(4)')}).label,'L0 r16 w16 prev-planes4');
 const provenance=m.segments({cap:1000,items:[{category:'runtime',name:'module touch: measured graphs-before-serving delta',bytes:500}]});
 assert.equal(provenance[0].group,'runtime');
+// Remove weights before folding: even tiny weight owners must not leak into Other small.
+const filterDomain={cap:1000,items:[...domain.items,{category:'embedding',name:'tiny embedding',bytes:1},{category:'tables',name:'tables',bytes:2},{category:'experts',name:'experts',bytes:3},{category:'drafter',name:'draft weights',bytes:20}]};
+const before=JSON.stringify(filterDomain), visible=m.reservationView(filterDomain,true), full=m.reservationView(filterDomain);
+assert.equal(visible.hidden,906);
+assert.equal(visible.total,26);
+assert.equal(visible.scale,26);
+assert.equal(full.scale,1000);
+assert.equal(full.total,932);
+assert.equal(JSON.stringify(filterDomain),before);
+assert.ok(visible.parts.every(s=>s.group!=='weights'&&s.members.every(i=>!['weights','embedding','tables','experts'].includes(i.category))));
+assert.ok(visible.parts.some(s=>s.name==='draft weights'&&s.group==='workspace'));
+for(const s of visible.parts) assert.equal(s.variant,full.parts.find(p=>p.key===s.key).variant);
+assert.equal(m.reservationView({items:[]},true).scale,1);
+assert.equal(m.reservationView({items:[]},true).total,0);
+assert.equal(m.reservationView({items:[],reason:'not published'},true).hidden,0);
+assert.equal(m.segmentLabel(2**30,13.99),'');
+assert.equal(m.segmentLabel(2**30,14),'1.00 GiB');
+assert.equal(m.labelInk('#000000'),'#ffffff');
+assert.equal(m.labelInk('#ffffff'),'#000000');
+// Both themes and all owner shades select the stronger WCAG text contrast.
+for(const color of ['#3987e5','#d95926','#199e70','#c98500','#d55181','#008300','#9085e9','#2a78d6','#eb6834','#159569','#bd8100','#cc608b','#6250d6']) for(const variant of [0,1,2]) {
+  const overlay=variant===1?255:0,alpha=variant===0?0:.1;
+  const rgb=color.slice(1).match(/../g).map(c=>(parseInt(c,16)*(1-alpha)+overlay*alpha)/255);
+  const linear=rgb.map(v=>v<=.04045?v/12.92:((v+.055)/1.055)**2.4);
+  const l=linear[0]*.2126+linear[1]*.7152+linear[2]*.0722;
+  const contrast=m.labelInk(color,variant)==='#000000'?(l+.05)/.05:1.05/(l+.05);
+  assert.ok(contrast>=4.5,`${color} shade ${variant}: ${contrast}`);
+}
+const stored=new Map(),viewer={localStorage:{getItem:k=>stored.get(k),setItem:(k,v)=>stored.set(k,v)}};
+assert.equal(m.weightPreference(viewer),false);
+assert.equal(m.weightPreference(viewer,true),true);
+assert.equal(m.weightPreference(viewer),true);
+assert.equal(m.weightPreference(viewer,false),false);
+assert.equal(m.weightPreference(viewer),false);
+const denied={get localStorage(){throw Error('denied');}};
+assert.equal(m.weightPreference(denied),false);
+assert.equal(m.weightPreference(denied,true),true);
+assert.equal(m.weightPreference({}),false);
+assert.equal(m.weightPreference({},true),true);
 console.log('memory model: real-card fixture and edge cases pass');
 """, str(JS), str(FIXTURE)], check=True, timeout=20)
 

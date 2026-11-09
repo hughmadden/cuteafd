@@ -16,7 +16,7 @@ p { color:var(--ink-2); } .intro { max-width:840px; } .panel { padding:20px; mar
 #notice { margin:16px 0; font:12px var(--mono); } .domain-bars { display:flex; gap:20px; overflow-x:auto; padding:10px 0; align-items:flex-start; } .domain { flex:1 0 125px; min-width:125px; max-width:240px; }
 .domain svg { width:100%; height:455px; overflow:visible; } .domain p { margin:5px 0; } .capacity { font:11px var(--mono); display:block; }
 .domain-select { display:block; font:14px var(--mono); margin-bottom:10px; } .detail-panel { border-top:1px solid var(--line); padding-top:16px; } #owner-detail { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,350px),1fr)); gap:10px 22px; } .owner-detail { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 14px; text-align:left; min-width:0; padding:10px; } .owner-detail span { overflow-wrap:anywhere; } .owner-detail strong { font:11px var(--mono); } .owner-detail svg { grid-column:1/-1; width:100%; height:12px; }
-.segment { cursor:help; stroke:var(--panel); stroke-width:.7px; } .segment:focus,.segment.active { outline:none; stroke:var(--ink); stroke-width:3px; } .dim { opacity:.24; }
+.segment { cursor:help; stroke:var(--panel); stroke-width:.7px; } .segment:focus,.segment.active { outline:none; stroke:var(--ink); stroke-width:3px; } .dim,.segment.dim + .segment-label { opacity:.24; } .segment-label { font:9px var(--mono); font-weight:600; pointer-events:none; } .legend-controls { display:flex; align-items:center; gap:8px; padding:14px 0; border-top:1px solid var(--line); font:12px var(--mono); } .legend-controls input { accent-color:var(--mem-blue); }
 .legend { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,230px),1fr)); flex-wrap:wrap; gap:8px; padding:16px 0 6px; border-top:1px solid var(--line); }
 .legend-group { min-width:0; } .legend-group h3 { text-transform:uppercase; margin:8px 0; } .legend button { display:flex; width:100%; overflow-wrap:anywhere; gap:8px; align-items:center; text-align:left; font:12px var(--mono); min-height:36px; } .swatch { width:20px; height:20px; flex-shrink:0; } .legend button.active { outline:2px solid var(--ink); }
 .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,330px),1fr)); gap:16px; } .card { border:1px solid var(--line); border-radius:8px; padding:16px; min-width:0; }
@@ -31,13 +31,13 @@ h1 { font-size:23px; } }
 <body>
 <main class="app" id="app">
 <header id="header"></header>
-<div class="intro"><h1>Where memory goes</h1><p>Accepted reservations beside the owners using them. Observe a rolling five-minute window while this page is open; nothing is stored.</p></div>
+<div class="intro"><h1>Where memory goes</h1><p>Accepted reservations beside the owners using them. Observe a rolling five-minute window while this page is open; no telemetry is stored. Only your bar-display preference is remembered.</p></div>
 <div class="controls"><button id="pause" type="button">Pause</button><label>Appearance <select id="theme"><option value="dark">Dark</option><option value="light">Light</option></select></label><span class="hint" id="window">Waiting for the first sample</span></div>
 <p class="hint" id="fixture-note"></p>
 <p id="notice" role="status">Connecting to memory telemetry...</p>
-<section class="panel"><div class="section-head"><h2>Reservations</h2><span class="hint">Each bar uses its own capacity scale</span></div>
+<section class="panel"><div class="section-head"><h2>Reservations</h2><span class="hint" id="reservation-scale">Each bar uses its own capacity scale</span></div>
 <p class="hint">Accepted serving-growth owners, including lazy reserves, not current occupancy. Blank space is unreserved capacity, not necessarily free RAM. Main bars fold incidental owners only below both 0.2% and 16 MiB into Other small; graph, workspace, transport and padding stay named. Expanded detail never folds owners. Hues identify groups, shades identify owners; subtle textures separate related shades; hover or focus to inspect exact bytes.</p>
-<div id="reservations" class="domain-bars"></div><div id="legend" class="legend" aria-label="Reservation categories"></div>
+<div id="reservations" class="domain-bars"></div><label class="legend-controls"><input id="hide-weights" type="checkbox"> Hide weights <span class="hint">Rescale each bar to its remaining owners; exact accounting stays unchanged.</span></label><div id="legend" class="legend" aria-label="Reservation categories"></div>
 <div class="detail-panel"><div class="section-head"><h3>Beyond weights &amp; KV</h3><label>Domain <select id="detail-domain" aria-label="Detail domain"></select></label></div><p id="detail-summary" class="hint"></p><div id="owner-detail"></div></div>
 <details><summary>Exact reservation owners</summary><div class="table-scroll"><table><caption>Named owners are counted once; physical budgets combine shared memory domains.</caption><thead><tr><th>Domain / owner</th><th>Category</th><th>Bytes</th></tr></thead><tbody id="owners"></tbody></table></div></details>
 </section>
