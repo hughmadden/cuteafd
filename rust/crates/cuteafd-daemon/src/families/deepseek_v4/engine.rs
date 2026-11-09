@@ -34,6 +34,8 @@ mod prefill;
 mod packing;
 #[cfg(test)]
 mod packed_check;
+#[cfg(test)]
+mod warm_exchange_tests;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
@@ -1057,7 +1059,8 @@ impl<'a> Engine<'a> {
     ) -> Result<Logits> {
         // The startup warm runs a synthetic step: no route diagnostic and no
         // Spark request belongs to it, and its captures are the point.
-        let warming = self.graph_warming.get() || self.capture_only.get();
+        let mode = StepMode::of(self.graph_warming.get(), self.capture_only.get());
+        let warming = mode != StepMode::Serve;
         if !warming {
             self.begin_route_step();
         }
@@ -1209,10 +1212,13 @@ impl<'a> Engine<'a> {
                 self.write_draft_kv(w, lane, t, cap)?;
                 self.head_launch(&lane.stream_a, t, t, 0, w)
             };
-            // The tail is never part of the startup prewarm set, so a warm runs
-            // it eagerly and leaves its capture to the first request.
+            // The tail is never part of the startup prewarm set, so the eager
+            // pass runs it for first touch and leaves its capture to the first
+            // request. A capture pass cannot: it records graph bodies and runs
+            // none of them, so the tail's TP2 close would wait for the peer
+            // push that only a segment body issues.
             if warming {
-                tail()?;
+                if mode.tail_runs() { tail()?; }
             } else {
                 self.replay(key, tail)?;
             }
@@ -2359,6 +2365,38 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// What a step executes. A serving step and a warm's first-touch eager pass
+/// run every graph body; the warm's capture pass records bodies without
+/// running any. Eager, unwrapped work that is coupled across ranks (the tail's
+/// TP2 close) must therefore run exactly where the bodies do: its peer push or
+/// wait is inside the other rank's segment body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepMode {
+    Serve,
+    EagerWarm,
+    CaptureWarm,
+}
+
+impl StepMode {
+    fn of(graph_warming: bool, capture_only: bool) -> Self {
+        match (graph_warming, capture_only) {
+            (false, false) => Self::Serve,
+            (true, false) => Self::EagerWarm,
+            (false, true) => Self::CaptureWarm,
+            (true, true) => unreachable!("the eager pass and the capture pass are exclusive"),
+        }
+    }
+
+    /// Graph-wrapped segment bodies run in this mode, and with them each
+    /// rank's peer pushes and waits inside those bodies.
+    fn segments_run(self) -> bool { self != Self::CaptureWarm }
+
+    /// The eager tail runs only where segment bodies run. Its post is a peer
+    /// push/wait, and the peer's match is inside a segment body this mode
+    /// either runs everywhere or nowhere.
+    fn tail_runs(self) -> bool { self.segments_run() }
+}
+
 /// One Spark request for `rows` wire rows (FP8, UE8M0 scales per 32) with
 /// `topk` routes each; the response is compact BF16 partials.
 fn spark_request(dim: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
@@ -2402,6 +2440,31 @@ impl Logits {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::StepMode;
+
+    #[test]
+    fn a_capture_pass_runs_no_coupled_eager_work() {
+        // Serving and the eager warm pass run every graph body, and with them
+        // each rank's peer pushes and waits. The capture pass records bodies
+        // and runs none. The eager tail is the step's only rank-coupled work
+        // outside a body, so its TP2 close may run only where bodies do: on
+        // both ranks or on neither. An asymmetric graph reserve across ranks
+        // changes which rank captures or eagers (every outcome runs the body
+        // once), never whether a rank's body runs, so it cannot desynchronize
+        // the two ranks' peer sequences.
+        for (graph_warming, capture_only, mode) in [
+            (false, false, StepMode::Serve),
+            (true, false, StepMode::EagerWarm),
+            (false, true, StepMode::CaptureWarm),
+        ] {
+            assert_eq!(StepMode::of(graph_warming, capture_only), mode);
+            assert_eq!(mode.tail_runs(), mode.segments_run(), "{mode:?} runs the tail iff bodies run");
+        }
+        assert!(StepMode::Serve.segments_run() && StepMode::Serve.tail_runs());
+        assert!(StepMode::EagerWarm.segments_run() && StepMode::EagerWarm.tail_runs());
+        assert!(!StepMode::CaptureWarm.segments_run() && !StepMode::CaptureWarm.tail_runs());
+    }
+
     #[test]
     fn pinned_geometry_spares_tails_of_startup_rows() {
         let key = |attention, rows, table_width| super::GraphKey { layer: 3, rows, chunked: false,
