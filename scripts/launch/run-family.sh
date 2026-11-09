@@ -2511,7 +2511,7 @@ audio_encoder_hash=""
   plan_profile_env=()
   if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
-      [[ "$family" == glm5 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
+      [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
     done
   fi

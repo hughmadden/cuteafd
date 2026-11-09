@@ -85,7 +85,6 @@ SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
 GLMF_GEOMETRY = re.compile(
     r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
-EXTRA_BYTES = 2 << 20
 QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
