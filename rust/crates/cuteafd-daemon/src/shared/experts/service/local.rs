@@ -225,8 +225,20 @@ fn measured_worker_runtime(library: &NativeLibrary,
     let (workspace_bytes, pinned_workspace_bytes) = retained_workspace(
         baseline.total(Space::Device, device), retained.total(Space::Device, device), resident,
         baseline.total(Space::Pinned, -1), retained.total(Space::Pinned, -1))?;
-    Ok(cuteafd_core::SparkRuntimeInventory { detail: census.detail(baseline, &retained, device)?, sample: inventory.gpus.into_iter().next()
-        .context("worker runtime sample missing")?, workspace_bytes, pinned_workspace_bytes })
+    let sample = inventory.gpus.into_iter().next().context("worker runtime sample missing")?;
+    let mut detail = census.detail(baseline, &retained, device)?;
+    let (free, total) = library.cuda_physical_memory_info()?;
+    detail.memory_reconciliation = Some(serde_json::json!({"schema_version": 1,
+        "cuda_free_bytes": free, "cuda_total_bytes": total, "cuda_used_bytes": total.saturating_sub(free),
+        "admission_free_bytes": sample.free_bytes, "admission_total_bytes": sample.total_bytes,
+        "admission_measurement": "GB10 MemAvailable/cgroup-bounded headroom; discrete CUDA allocatable",
+        "cuda_measurement": "raw CUDA physical total minus free; not NVML; page cache may differ",
+        "device": device, "arch": sample.arch, "driver": sample.driver,
+        "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+        "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+        "graph_capture_sites": [], "graph_status": "live worker Execution::launch uses eager execution; no capture/replay call sites"
+    }));
+    Ok(cuteafd_core::SparkRuntimeInventory { detail, sample, workspace_bytes, pinned_workspace_bytes })
 }
 
 struct Admission {
@@ -771,6 +783,25 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 Ok(processed) => {
                     progressed |= processed;
                     if processed && executed && pending_steady_log {
+                        let (free, total) = library.cuda_physical_memory_info()?;
+                        let (admission_free, admission_total) = library.cuda_allocatable_memory_info()?;
+                        let device = library.cuda_get_device()?;
+                        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+                        let charged = ledger.total(cuteafd_ffi::memory_ledger::Space::Device, device)
+                            + ledger.total(cuteafd_ffi::memory_ledger::Space::Managed, device);
+                        let measured = total.saturating_sub(free);
+                        tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::json!({
+                            "schema_version": 1, "stage": "first_request", "rank": config.rank,
+                            "cuda_free_bytes": free, "cuda_total_bytes": total, "measured_bytes": measured,
+                            "admission_free_bytes": admission_free, "admission_total_bytes": admission_total,
+                            "charged_bytes": charged, "padding_bytes": 0,
+                            "measured_minus_charged_bytes": i128::try_from(measured).unwrap() - i128::try_from(charged).unwrap(),
+                            "charge_basis": "worker ledger backing owners only; planner charge available only at coordinator Ready",
+                            "planner_measured_minus_charged_bytes": null,
+                            "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                            "graph_status": "eager worker execution; no live capture/replay sites",
+                            "method": "raw CUDA physical and admission allocatable samples side by side; no NVML"
+                        }), "Spark first-request memory reconciliation");
                         if census.enabled() {
                             library.cuda_device_synchronize()?;
                             census.sample("steady_after_first_expert_request", Some(&library))?;

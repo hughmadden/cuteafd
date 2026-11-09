@@ -232,6 +232,7 @@ impl PendingSparkAdmission {
             .with_context(|| format!("Spark worker admission failed (timeout {} s)", self.timeout.as_secs()))?;
         self.plan.reconcile(&reports)?;
         for report in reports {
+            super::memory_report::reconcile::spark_ready(&report);
             tracing::info!(rank = report.rank, resident_bytes = report.resident_bytes,
                 workspace_bytes = report.runtime.workspace_bytes, ring_bytes = report.mapped_ring_bytes,
                 slices = ?report.slices, "Spark checkpoint assignment reconciled before transport connection");

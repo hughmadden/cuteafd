@@ -38,6 +38,9 @@ pub(crate) struct Site {
     /// Family estimate used only until the device has a measured graph.
     pub bootstrap: u64,
     pub basis: Basis,
+    /// Declared by the caller: kernel arguments can contain peer pointers that
+    /// CUDA's generic graph inspection cannot safely identify.
+    pub spans_devices: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -347,11 +350,18 @@ impl DeviceCache {
         let nodes = metadata.nodes.unwrap_or(estimate);
         let next_nodes = self.pools.live_nodes.saturating_add(nodes);
         let next_execs = self.pools.live_execs.saturating_add(1);
-        let projected = self.basis.pool_bytes(next_nodes.max(self.pools.node_high_water),
-            next_execs.max(self.pools.exec_high_water)).saturating_sub(
-                self.basis.pool_bytes(self.pools.node_high_water, self.pools.exec_high_water));
+        let chain = self.chain_only && metadata.parallel_width <= 1 && !site.spans_devices;
+        if !chain { self.chain_only = false; }
+        let projected = if chain {
+            self.basis.pool_bytes(next_nodes.max(self.pools.node_high_water),
+                next_execs.max(self.pools.exec_high_water)).saturating_sub(
+                    self.basis.pool_bytes(self.pools.node_high_water, self.pools.exec_high_water))
+        } else {
+            // Unqualified topology cannot reuse the calibrated chain pools.
+            self.pending_growth.saturating_add(estimate)
+        };
         let growth = projected.saturating_sub(self.pending_growth);
-        let reuse = projected == 0 && metadata.parallel_width <= 1 && self.chain_only && !self.unmeasured;
+        let reuse = chain && projected == 0 && !self.unmeasured;
         let allowed = site.preference != Preference::Eager && estimate > 0;
         let room = may_capture(site.preference, growth, headroom, self.reserve,
             self.charged, self.pending_growth, self.pending_bytes, reuse);
@@ -374,6 +384,7 @@ impl DeviceCache {
             self.pools.live_execs = next_execs;
             if let Some(row) = self.trace_rows.get_mut(&self.records[&id].identity) {
                 row.declared_capture_streams = metadata.parallel_width;
+                row.spans_devices |= site.spans_devices;
             }
             if metadata.parallel_width > 1 {
                 tracing::warn!(site = site.name, width = metadata.parallel_width,
@@ -437,7 +448,7 @@ impl DeviceCache {
         record.parallel_width = width;
         if let Some(row) = self.trace_rows.get_mut(&record.identity) {
             row.max_parallel_width = width;
-            row.spans_devices = spans_devices;
+            row.spans_devices |= spans_devices;
         }
     }
 
@@ -554,7 +565,7 @@ impl DeviceCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes } }
+    fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes, spans_devices: false } }
     fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", shape: n.to_string() } }
     fn capture(cache: &mut DeviceCache, n: u64, pinned: bool) -> u64 {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
@@ -690,6 +701,24 @@ mod tests {
         assert_eq!(cache.pending_growth, 4 << 20);
         cache.measured_capture(4 << 20);
         assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (10, 10));
+    }
+
+    #[test]
+    fn non_chain_and_declared_peer_sites_reserve_each_capture_below_old_peaks() {
+        for peer in [false, true] {
+            let mut cache = DeviceCache::new(-211, 100);
+            cache.pools.node_high_water = 1000;
+            cache.pools.exec_high_water = 100;
+            cache.charged = 60;
+            cache.chain_only = peer;
+            let mut declared = site(Preference::Capture);
+            declared.spans_devices = peer;
+            for n in 0..3 {
+                assert!(matches!(cache.miss(key(n), declared, None, false), Miss::Capture(_)));
+            }
+            assert_eq!(cache.pending_growth, 30);
+            assert!(matches!(cache.miss(key(4), declared, None, false), Miss::Eager));
+        }
     }
 
     #[test]

@@ -686,7 +686,7 @@ mod budget_tests {
 mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
-    fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes } }
+    fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
     #[test]
     fn device_eviction_destroys_only_after_successful_drain() {
         use std::{cell::Cell, rc::Rc};

@@ -627,10 +627,15 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
 #[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
-            "draft_policy": crate::shared::draft::resource::snapshot()});
+            "draft_policy": crate::shared::draft::resource::snapshot(),
+            "memory_reconciliation": crate::shared::memory_report::reconcile::snapshot()});
     }
 }
 

@@ -10,6 +10,8 @@ use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+pub(crate) mod reconcile;
+
 pub(crate) fn register_inputs(matches: &clap::ArgMatches, policy: &cuteafd_core::memory_policy::MemoryPolicy, weight_budget: Option<f64>) {
     let mut inputs = serde_json::to_value(policy).unwrap_or(Value::Null).as_object().cloned().unwrap_or_default();
     inputs.insert("coordinator_weight_budget_gib".into(), json!(weight_budget.unwrap_or(80.0)));
@@ -142,7 +144,10 @@ pub(crate) fn log(stage: &str) {
         tracing::info!(target: "cuteafd::memory", "{summary}");
     }
     let stage = stage.to_owned();
-    let value = std::thread::spawn(move || report(&stage)).join();
+    let value = std::thread::spawn(move || {
+        if stage == "ready" { reconcile::capture(&stage); }
+        report(&stage)
+    }).join();
     if let Ok(mut value) = value {
         // Bounded diagnostic boundary: the process-wide stream census and the
         // current device's CUDA pool retention. Both are queries: no

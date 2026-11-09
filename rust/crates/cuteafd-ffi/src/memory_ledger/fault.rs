@@ -68,6 +68,14 @@ pub fn set_inputs(inputs: serde_json::Value) {
     }
 }
 
+/// A copy of the daemon's allowlisted, resolved admission inputs.
+/// This performs no CUDA calls and never exposes arbitrary environment values.
+pub fn inputs() -> serde_json::Value {
+    let data = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    serde_json::Value::Object(data.inputs.as_object().into_iter().flatten()
+        .map(|(key, value)| (key.clone(), value["value"].clone())).collect())
+}
+
 struct Service { spools: Vec<(File, PathBuf)>, directory: PathBuf, host: String, role: String, scratch: Box<[u8; 65536]> }
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
 static TRIGGERS: OnceLock<(File, PathBuf)> = OnceLock::new();

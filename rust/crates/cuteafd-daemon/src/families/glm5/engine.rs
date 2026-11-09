@@ -1582,6 +1582,7 @@ impl<'a> GlmEngine<'a> {
                 name: "glm5.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
                 basis: self.graph_basis(),
+                spans_devices: self.ranks() > 1,
             })?;
         }
         Ok(())

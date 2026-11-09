@@ -169,6 +169,15 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
+    fn checked_in_prewarm_list_roundtrips_and_filters_to_supported_shapes() {
+        let list = glm_prewarm_list();
+        assert!(!list.entries.is_empty());
+        let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
+        let allowed = glm_graph_shapes(4096, 32);
+        for entry in glm_prewarm_shapes(4096, 32) { assert!(allowed.contains(&entry.shape)); }
+    }
+
+    #[test]
     fn split_declarations_match_rank_local_segments_and_terminal_head() {
         let layers = [
             GlmGraphLayer { dense: true, local: false, attention_owner: None },

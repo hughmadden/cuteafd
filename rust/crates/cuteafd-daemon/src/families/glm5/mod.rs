@@ -1315,6 +1315,17 @@ impl Opened {
             let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{:?}; host-prefix/{}; replies/{:?}",
                 self.snapshot.display(), args.draft, args.max_context, serving.map(|(_, c)| c),
                 host_config.as_ref().map_or(0, |config| config.bytes), cuteafd_core::spark_reply::requested());
+            cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+                "memory_reconciliation_provenance": {
+                    "schema_version": 1, "family": "glm5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                    "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                    "native_sha256": native_hash, "programs_sha256": programs_hash,
+                    "layout": layout, "devices": inventory.gpus,
+                    "spark_world": spark_ranks, "onboard_layers": admitted.solved.decisions.onboard_layers,
+                    "prefill": admitted.solved.decisions.prefill,
+                    "graph_basis": "remote HQA SM120 nodes; uncalibrated local/TP2 byte fallback"
+                }
+            }));
             if let Some(recommendation) = admitted.census_recommendation(cuteafd_loader::placement::inventory::FigureIdentity {
                 declared_graphs: "", programs_sha256: &programs_hash, native_sha256: &native_hash,
                 toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN"), gpu_class: &gpu_classes, driver: &drivers, layout: &layout,
