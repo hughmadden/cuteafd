@@ -9,7 +9,8 @@ port a family (MiniMax Flash is next) or change shared code. Why the engine is
 built this way: [PLAN "One engine, shared structure"](../../PLAN.md#one-engine-shared-structure-tj-2026-10-25).
 Working rules: [AGENTS.md](../../AGENTS.md).
 
-Pointers are `file:line` at dev `5cd3295a1` (2026-10-29). `dev` is the
+Line-numbered pointers are at dev `5cd3295a1` (2026-10-29); the graph-cache
+section uses file/symbol pointers without fixed line numbers. `dev` is the
 integration branch; `main` moves only at tagged releases. Lines drift, so each
 one also names a symbol you can grep for. Short prefixes used below:
 
@@ -474,8 +475,9 @@ the coordinator to fit an endpoint
     cuBLAS, loaded code, graphs, runtime growth, the Spark runtime residual)
     plus the family's `FAMILY_RESERVE` constant (default 0; constants and the
     shared breakdown/log helpers live in [loader/placement/reserve.rs](../../rust/crates/cuteafd-loader/src/placement/reserve.rs)). `GPU_RESERVE` /
-    `SPARK_RESERVE` set the whole reserve and zero every built-in component.
-    No family keeps a private headroom, occupancy percentage or graph-budget key.
+    `SPARK_RESERVE` override the generic reserve, not the separate graph owner
+    ([Graph cache](#8-graph-cache)). No family keeps private headroom,
+    an occupancy percentage or a graph-budget key.
   - Startup and `cuteafd plan` print one line per device: cap, weights,
     workspaces, every reserve component, and the KV target, min, max and pool.
 - **Pool first.** `PoolPolicy` ([loader/placement/pool.rs:11](../../rust/crates/cuteafd-loader/src/placement/pool.rs#L11))
@@ -554,6 +556,9 @@ These are the gates; the tiers and bars are in
    ([daemon/shared/launch_grid.rs:18](../../rust/crates/cuteafd-daemon/src/shared/launch_grid.rs#L18)).
    The SM188/170 export comparison is the CPU-side check that a build doesn't
    depend on one card.
+8. **Graphs.** Run the [graph-cache checklist and qualification](#8-graph-cache):
+   controller lifetime/cancellation tests, per-layout traces, joined memory
+   reconciliation and trace-free adaptive speed evidence.
 
 ## 7. Porting a new family: checklist
 
@@ -582,7 +587,8 @@ These are the gates; the tiers and bars are in
      `LaneSet::run_one(decode_round)` from your scheduler;
    - end every round with `lanes::commit` on a `LaneCommit`;
    - use `Backoff` for all waits;
-   - signal readiness after all fallible init.
+   - signal readiness after all fallible init;
+   - integrate graph owners and prewarm through the [graph-cache checklist](#porting-a-family).
 7. Spark experts: use the shared exchange (`SparkLink::new_waves`). Owners come
    from `admit_family`, and route staging uses the shared packed path.
 8. Add source gates (only `run_one` and `lanes::commit` in the round; readiness
@@ -591,3 +597,113 @@ These are the gates; the tiers and bars are in
    one wip-cards pair, and, for kernels, SM188/170 plus row curves.
 10. Delete what the shared path replaced. If something cannot fit the shared
     structure, write the reason on #744 rather than forking.
+
+## 8. Graph cache
+
+### Model
+
+One ARC controller per physical device owns capture admission and eviction
+([daemon/shared/decode_graph/device.rs](../../rust/crates/cuteafd-daemon/src/shared/decode_graph/device.rs));
+typed banks retain executables and their resources
+([bank.rs](../../rust/crates/cuteafd-daemon/src/shared/decode_graph/bank.rs)).
+Prewarm is best effort, with trace-qualified hot geometries pinned. A miss
+captures within budget or runs eagerly; it never refuses a request. Estimates
+choose capture and victims, while completed-boundary measurements decide charge.
+An underestimate logs overshoot and blocks further growth, not serving.
+
+Admission charges one canonical `graph reserve` per device before KV sizing.
+The default total is the trace-derived working-set base plus its 2 MiB tail,
+plus shared runtime headroom: 500 MB capped at 100% of that base by default.
+`GPU_GRAPH_RESERVE` replaces the total (zero means eager); a scalar applies to
+each device independently, and `gpuN` selectors override ranks.
+`GPU_GRAPH_RESERVE_EXTRA` and `GPU_GRAPH_RESERVE_EXTRA_CAP` configure headroom;
+an explicit extra without an explicit cap is uncapped. Neither may accompany
+an explicit total for the same rank. `GPU_RESERVE` cannot erase graph ownership
+([loader/placement/graph_reserve.rs](../../rust/crates/cuteafd-loader/src/placement/graph_reserve.rs),
+[launch keys](../options.md)). Measured warmup never shrinks admission's reserve.
+
+Driver graph storage is a monotone measured high-water: destruction can release
+ARC live capacity without freeing visible physical bytes. Cancelled captures
+still require observation, since failed instantiation can grow driver storage.
+Qualified single-device chains reuse node/executable pools; fan-out and explicit
+peer-spanning captures do not receive chain discounts. Native width and span
+matter, not just node count (#1626). Currently reconciliation substitutes this
+high-water for the admitted reserve; it is not a current-residency measurement.
+Current-level reconciliation, while retaining high-water for admission, is
+pending [#1702](https://github.com/tpurtell/cuteafd/pull/1702).
+
+### Porting a family
+
+Paths below use the prefixes defined at the top of this page; checklist items
+name the implementing code or regression-test location.
+
+1. Attach every bank before capture through `CacheAttached` or `attach_device`, even with empty prewarm, with stable site names, cycle, preference, bootstrap bytes and explicit peer span (`daemon/shared/decode_graph.rs`, `decode_graph/native.rs`, `decode_graph/binding.rs`, `daemon/families/kimi_k3/engine.rs`).
+2. Use the same reserve and basis on each device: calibrated node rates only on their measured family/architecture/route, otherwise device-wide bytes with a warning; unknown node counts stay eager (`daemon/shared/decode_graph/device.rs`).
+3. Retain a strong controller per device across temporary startup banks until persistent banks attach; the registry is Weak and seeds the observer only on creation (`daemon/families/kimi_k3/startup.rs`, `daemon/shared/decode_graph/device.rs`).
+4. Key captures by exact typed geometry and retained resource owners; take a cancellable ticket before capture, report native nodes/width/span before insertion, and never use legacy `insert` after attachment (`daemon/shared/decode_graph/bank.rs`, `decode_graph/native.rs`).
+5. Set `cache_cycle` at decode/verify/prefill/wave entry, attribute startup to Other, and first-touch eagerly before measuring capture growth (`daemon/families/glm5/engine.rs`, `daemon/shared/decode_graph/bank.rs`).
+6. Queue all ranks before any sync; call `observe_completed` once at the outer completed-step boundary, measure each device once, and drain all consumers before dropping executables/resources, including errors (`daemon/shared/decode_graph/device.rs`, `decode_graph/bank.rs`).
+7. Remove sealing, declared-key refusals, per-bank lazy budgets, census replacement of admission and family graph margins; charge exactly one `graph reserve` per device (`loader/placement/graph_reserve.rs`, `daemon/shared/memory_report/reconcile.rs` tests).
+8. Version prewarm/reserves by resolved capture layout, including RTX count, peer rank and Spark/onboarding state; never borrow a different layout's trace, and bootstrap missing layouts unpinned with a warning (`loader/serving_capacity/qwen_graphs.rs`, `glmf_graphs.rs`).
+9. Extend the trace generator for the family's real site/key schema; select whole reachable geometries with at least one replay, charge zero-hit siblings within selected geometries, and leave wholly zero-replay geometries lazy (`scripts/dev/graph-prewarm-from-trace.py`, `scripts/tests/test_graph_prewarm_from_trace.py`).
+10. Prewarm the sustained decode/verify working set, not just startup rows; pin sustained rolling heat/churn only, sort pinned-first then lifetime replay hits descending, and test exact base/tail regeneration and no untraced pins (`scripts/tests/test_graph_prewarm_from_trace.py`, `loader/serving_capacity/kimi_prewarm.rs`).
+11. Delete or fold single-node graphs into adjacent sections between real host/exchange joins; inspect every <=2-node key and test that no new key commits fewer than two native nodes (`daemon/families/kimi_k3/graphs.rs`, `capture_worthwhile`).
+12. Preserve existing pinned full-chunk prefill coverage, with tails eager; adding prefill graphing is separate work, not permission to capture peer joins incoherently (`daemon/families/deepseek_v41/graph_policy.rs`, `daemon/families/deepseek_v4/engine/prefill.rs`, #1638).
+13. Publish final post-pool-adoption provenance through `fault::set_inputs`; Once-guard `first_request` after request retirement and the joined `observe_completed`, never inside a live lane (`daemon/shared/memory_report/reconcile.rs`, `daemon/families/deepseek_v41/v41_native_serve/scheduler/independent.rs`).
+14. Keep graph/mapped-table/reconciliation diagnostics on the central request-time stats hook, never per-round `graph_capture_stats`; test provenance, canonical owner readback and diagnostic keys (`daemon/shared/probe.rs`, `daemon/shared/memory_report/reconcile.rs`).
+15. Gate controller/bank ownership, cancellation, basis/cycle/span, startup lifetime and signed/null reconciliation; run workspace check, default CPU gate, native build if changed, golden/cache/speculation checks and the family's card (`daemon/shared/decode_graph/{device,bank,native}.rs`, `scripts/tests/test_graph_prewarm_from_trace.py`).
+
+### Measuring
+
+- Trace working sets, churn and memory only: use `GRAPH_TRACE` with an absolute
+  host path and existing parent; preserve per-device schema-2 snapshots beside
+  results. Trace each supported capture layout with the adaptive standard card,
+  C1/2/4/8/16 and a 32K point. Keep KV target 2M / max 100M to retain onboarding.
+- Generate proposals with `scripts/dev/graph-prewarm-from-trace.py --family FAMILY
+  --trace /absolute/trace.device-0.json --output /absolute/proposal.json`; review
+  whole-geometry cost/heat, update the checked-in list and relaunch. Hits are
+  cycle/boundary-attributed, not launch-exact; forgotten ARC ghosts lose history.
+  Per-key capture shares/model costs are attribution, not additional device charges.
+- Speed requires both `GRAPH_TRACE` and `SPECULATION_TRACE` unset, even after
+  trace I/O offload (#1696). Use same-day, matched-pool, balanced-order warmed
+  pairs; fixed draft length is a step-parity control, not default-selection evidence.
+- Judge graphs on/off on the adaptive standard mixed-content card and C1-C16
+  sweep, with per-arm verify-width distributions; wins or ties stay on by default.
+  Report TTFT and emitted tok/s, plus per-round wall minus full-step time to expose
+  host costs. Verify exact 8,192-token prefill with the serving tokenizer and report
+  prompt tokens/unit geometry (#1672, #1703); different shapes are not comparable.
+- Read thermal/power-cap seconds, busy clocks, temperature and T.Limit headroom;
+  qualify no refusals/OOMs, eager/eviction/recapture counters, arena versus reserve
+  and explicit headroom, and report KV/onboarding changes owner by owner, not an
+  inferred payoff from a smaller reserve (see [engineering rules](../../AGENTS.md#engineering-rules)).
+
+Reconciliation ([daemon/shared/memory_report/reconcile.rs](../../rust/crates/cuteafd-daemon/src/shared/memory_report/reconcile.rs))
+compares observer-excluded CUDA use with admitted Growth owners, excluding
+release padding. `delta_vs_measured = delta_vs_admitted + graph_reserve_slack`;
+slack is reserve minus graph high-water. At Ready and joined first_request,
+require nonnegative slack and RTX `abs(delta_vs_measured) <= padding_bytes / 2`.
+Unused admitted Growth capacity can make Ready negative; explain it, do not hide
+it. Exclude the measured observer context once; missing provenance, physical
+samples or nonzero-owner arena telemetry is unavailable/null, never a pass.
+Spark Ready uses launch-relative allocatable consumption and the reconciled UMA
+owner ledger without alias double charges or future endpoint rings. Its deltas
+remain diagnostic, not drift-flagged (#1568); coordinator post-request Spark
+physical telemetry is unavailable (#1631). The live native worker has no graph
+sites today: `SPARK_GRAPH_RESERVE` forwarding is not active ownership; add worker
+admission and controller attachment together when enabling capture
+(`daemon/shared/experts/service/backend.rs`).
+
+### Pitfalls
+
+- Warmup must first-touch eagerly and upload synthetic tables before launch; all-masked rows must still satisfy MoE guards, and empty prewarm must still attach the lazy controller (#1663, #1645).
+- Family-named or duplicate graph owners break reconciliation even when bytes were charged: use exactly `graph reserve` (#1663, #1645).
+- Single-node executable overhead can dominate an arena: fold or delete it, never treat it as a graph win (#1673); legacy Qwen/V4.1 sites remain follow-up work (#1658, #1644).
+- Zero-replay prewarm wastes startup and storage; select whole replayed geometries, account siblings, and order by heat so reduced reserves keep the hot prefix (#1663, #1666).
+- Untraced TP2/onboarding layouts cannot inherit pins or another layout's reserve/list (#1658, #1645).
+- A lane-local first-request sample races its peer; missing provenance or noncanonical owners also fabricates apparent accounting coverage (#1644, #1663).
+- Weak registry expiry during startup resamples against already captured storage: retain a controller until persistent lane attachment (#1644, #1663).
+- Per-round `graph_capture_stats` scans/serializes model-sized inventories: leave it to request-time diagnostics (#1697).
+- Trace-enabled speed includes observer overhead even with bounded background writers; use traces only for inventory and trace-free adaptive cards for decisions (#1694, #1696, #1660).
+- Boundary observation still samples CUDA, walks the allocation ledger and visits banks: do not multiply per-step observer calls; optimization is pending #1706.
+- A graphs-on speed loss with equal GPU step time is host bookkeeping (stats snapshot, observer), not replay: measure per-round wall minus step before blaming graphs (#1697, #1706).
+- High-water can retain transient capture peaks, and untracked driver memory (e.g. pinned host mapping page tables) can land in the graph residual: do not label it current resident graph memory (pending #1702).
