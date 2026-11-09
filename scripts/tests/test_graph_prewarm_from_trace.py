@@ -1696,4 +1696,12 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     assert "spans_devices: false" in graph
     assert graph.count("device::observe_completed(") == 1
     assert "cache_ticket" in graph and "cache_commit" in graph
+    assert "GraphOwner" in graph and "struct Executable" not in graph
+    assert "golden_decode_graphs" in graph
+    assert "off_digest == on_digest" in graph
+    assert "after > before" in graph
+    verify = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/verify.rs").read_text()
+    assert "if self.graphs.enabled && plan.stride > 0" in verify
+    admission = (root / "rust/crates/cuteafd-loader/src/placement/families/qwen3_5/admission.rs").read_text()
+    assert 'id: "rtx0".into()' in admission
     assert "graph_capture_stats" not in graph
