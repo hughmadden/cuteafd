@@ -521,6 +521,23 @@ mod verify_tests {
     }
 }
 
+fn first_request(requests: u64, once: &std::sync::Once, capture: impl FnOnce()) {
+    if requests > 0 { once.call_once(capture); }
+}
+
+#[cfg(test)]
+#[test]
+fn first_request_reconciliation_captures_once_per_launch() {
+    for _launch in 0..2 {
+        let once = std::sync::Once::new();
+        let captures = std::cell::Cell::new(0);
+        for requests in [0, 0, 1, 1, 2, 100] {
+            first_request(requests, &once, || captures.set(captures.get() + 1));
+            assert_eq!(captures.get(), usize::from(requests > 0));
+        }
+    }
+}
+
 /// Serving statistics for `/v1/stats`.
 #[allow(clippy::too_many_arguments)]
 fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
