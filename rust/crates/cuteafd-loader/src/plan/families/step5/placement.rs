@@ -183,7 +183,11 @@ pub(super) fn layout(
         spark_ranks,
         peer_access: coordinators == 2,
     };
-    let inputs = RuntimeInputs { decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
+    let inputs = RuntimeInputs { graph_layout: match (format, coordinators, spark_ranks) {
+            ("fp8", 2, 6) => Some(crate::serving_capacity::step5_graphs::Step5GraphLayout::Fp8Max),
+            ("nvfp4", 1, 4) => Some(crate::serving_capacity::step5_graphs::Step5GraphLayout::Nvfp4Min),
+            _ => None,
+        }, decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, &model.cfg, coordinators,
             crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_format: opts.resolved_spark_reply_format(false),
                 kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
         inventory,

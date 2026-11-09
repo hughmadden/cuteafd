@@ -914,14 +914,34 @@ impl Drop for GraphEnableRestore<'_> {
 }
 
 impl<'e, 'a> Execution<'e, 'a> {
-    pub(super) fn configure_graphs(&mut self, enabled: bool) -> Result<()> {
+    pub(super) fn configure_graphs(&mut self, enabled: bool,
+        layout: Option<cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout>) -> Result<()> {
         if enabled {
             for rank in 0..self.main.graphs.len() {
                 let device = self.main.device(rank)?;
-                self.main.graphs[rank].attach(device.library, device.id, rank)?;
+                self.main.graphs[rank].attach(device.library, device.id, rank, layout, self.main.rows)?;
             }
         }
         self.main.graph_enabled.set(enabled);
+        Ok(())
+    }
+
+    pub(super) fn warming_graphs<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        struct Restore<'s, 'a>(&'s [super::graphs::Graphs<'a>]);
+        impl Drop for Restore<'_, '_> {
+            fn drop(&mut self) { for bank in self.0 { bank.warming(false); } }
+        }
+        for bank in &self.main.graphs { bank.warming(true); }
+        let _restore = Restore(&self.main.graphs);
+        work()
+    }
+
+    pub(super) fn observe_graph_startup(&self) -> Result<()> {
+        collect_lane_results(self.main.stages.iter().map(|stage| stage.stream.drain()))?;
+        for rank in 0..self.main.graphs.len() {
+            let device = self.main.device(rank)?;
+            crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
+        }
         Ok(())
     }
 
@@ -951,7 +971,9 @@ impl<'e, 'a> Execution<'e, 'a> {
         // SAFETY: graph owners hold no allocations; native, cache and staging storage
         // stays live in this execution and its borrowed owners until terminal drainage.
         unsafe { crate::shared::decode_graph::device::observe_completed(self.main.device(0)?.library,
-            |visit| { for bank in &self.main.graphs { bank.visit(visit)?; } Ok(()) }) }
+            |visit| { for bank in &self.main.graphs { bank.visit(visit)?; } Ok(()) }) }?;
+        for bank in &self.main.graphs { bank.observed(); }
+        Ok(())
     }
 
     pub(super) fn validate_caches(&self, caches: &[&RefCell<CacheRank<'a>>], rows: usize) -> Result<()> {

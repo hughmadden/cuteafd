@@ -176,6 +176,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// absolute additional peaks above that same sample, not steady-state deltas.
 #[derive(Clone)]
 pub struct RuntimeInputs {
+    pub graph_layout: Option<crate::serving_capacity::step5_graphs::Step5GraphLayout>,
     pub decode_graphs: bool,
     pub host: HostInputs,
     pub bf16_target_head: crate::placement::planner::serving::BlasHead,
@@ -592,7 +593,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
@@ -674,13 +675,16 @@ mod tests {
                 let owners = graphs.solved.facts.allowances.iter().filter(|owner|
                     owner.location == crate::placement::planner::Location::coordinator(rank as u8)
                         && crate::placement::graph_reserve::is_source(&owner.source)).collect::<Vec<_>>();
-                assert_eq!(owners.len(), 1);
-                assert_eq!(owners[0].bytes, expected);
-                assert_eq!(owners[0].source, crate::placement::graph_reserve::source(&format!("step5.graphs.{rank}")));
-                assert!(!owners[0].assumed);
+                // The shared physical ledger omits zero-byte allowances.
+                assert_eq!(owners.len(), usize::from(expected != 0));
+                if let Some(owner) = owners.first() {
+                    assert_eq!(owner.bytes, expected);
+                    assert_eq!(owner.source, crate::placement::graph_reserve::source(&format!("step5.graphs.{rank}")));
+                    assert!(!owner.assumed);
+                }
                 for phase in [crate::placement::planner::Phase::Ready, crate::placement::planner::Phase::Growth] {
                     let total = |admission: &Admission| admission.solved.facts.allowances.iter()
-                        .filter(|owner| owner.location == owners[0].location
+                        .filter(|owner| owner.location == crate::placement::planner::Location::coordinator(rank as u8)
                             && owner.lifetime.contains(phase, admission.solved.facts.phase_order))
                         .map(|owner| owner.bytes).sum::<u64>();
                     assert_eq!(total(&graphs), total(&eager) + expected);

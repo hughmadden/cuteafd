@@ -324,7 +324,9 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let reserve = cuteafd_loader::placement::reserve::gpu("step5");
-    let mut inputs = RuntimeInputs { decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+    let graph_layout = cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+        &catalog, ids.len(), args.peers.len());
+    let mut inputs = RuntimeInputs { graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
@@ -543,7 +545,7 @@ fn with_backend<T>(args: &ServeArgs,
     library.cuda_set_device(args.device)?;
     let mut execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         transport, 92, 1)?;
-    execution.configure_graphs(args.decode_graphs)?;
+    execution.configure_graphs(args.decode_graphs, graph_layout)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_served_context(usize::try_from(admission.solved.served_context())?)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
@@ -552,6 +554,7 @@ fn with_backend<T>(args: &ServeArgs,
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
+    if args.decode_graphs { backend.warm_decode_graphs(graph_layout)?; }
     library.cuda_set_device(args.device)?;
     tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native binding complete");
@@ -579,7 +582,7 @@ fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
             "spark_world": args.peers.len(), "onboard_layers": solved.decisions.onboard_layers,
             "prefill": solved.decisions.prefill, "context": solved.served_context(),
             "kv_cache": format!("{:?}", args.kv_cache), "decode_graphs": args.decode_graphs,
-            "graph_basis": "per-device bounded byte basis; untraced layout has no pins or measured base"
+            "graph_basis": "per-device bounded byte basis; layout-specific traced rows, or zero untraced base without pins"
         }
     }));
     Ok(())
@@ -672,6 +675,25 @@ mod tests {
         assert!(execution.contains("collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))"));
         assert!(execution.contains("self.graph_completed()"));
         assert!(!serve.contains("graph_capture_stats"));
+    }
+
+    #[test]
+    fn graph_prewarm_uses_disposable_state_and_the_joined_execution_path() {
+        let backend = include_str!("backend.rs");
+        let start = backend.find("pub(super) fn warm_decode_graphs(").unwrap();
+        let end = start + backend[start..].find("/// Score retained packed").unwrap();
+        let warm = &backend[start..end];
+        assert!(warm.contains("RefPagePool::new(page_count, 64)"));
+        assert!(warm.contains("reset_sequence(0)?"));
+        assert!(warm.contains("self.execute_inner("));
+        assert!(warm.contains("drop(step)"));
+        assert!(warm.contains("pool.release(&placement.pages)"));
+        assert!(warm.contains("observe_graph_startup()?"));
+        assert!(!warm.contains("publish_wave"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("bank.warming(true)"));
+        assert!(execution.contains("bank.warming(false)"));
+        assert!(include_str!("graphs.rs").contains("Cycle::Other } else { cycle"));
     }
 
     #[test]
@@ -837,7 +859,7 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+        let mut inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,

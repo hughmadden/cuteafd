@@ -1744,7 +1744,7 @@ def generate_step5(traces, layout):
             latest[device] = (sampled, trace)
     if len(latest) != STEP5_LAYOUTS[layout]:
         raise ValueError(f"{layout} requires {STEP5_LAYOUTS[layout]} device traces")
-    ranks = []
+    rank_identities = []
     for rank, device in enumerate(sorted(latest)):
         _, trace = latest[device]
         identities = {}
@@ -1758,8 +1758,6 @@ def generate_step5(traces, layout):
             key = (int(layer), int(rows), section)
             if key[0] >= 92 or key[1] <= 0:
                 raise ValueError(f"unsupported Step-5 geometry {key}")
-            if qwen_replay(graph) < 1:
-                continue
             if int(graph.get("nodes") or 0) < 2 or graph.get("spans_devices", False):
                 raise ValueError(f"invalid local Step-5 section topology {key}")
             capture = graph.get("capture_bytes")
@@ -1768,8 +1766,21 @@ def generate_step5(traces, layout):
             if key in identities:
                 raise ValueError(f"duplicate Step-5 exact geometry {key} on device {device}")
             identities[key] = graph
-        if not identities:
-            raise ValueError(f"Step-5 rank {rank} has no replayed sections")
+        rank_identities.append(identities)
+    all_graphs = [(key, graph) for identities in rank_identities for key, graph in identities.items()]
+    rows = {key[1] for key, graph in all_graphs if qwen_replay(graph) >= 1}
+    if not rows:
+        raise ValueError("Step-5 layout has no replayed row geometries")
+    heat = {row: sum(qwen_replay(graph) for key, graph in all_graphs if key[1] == row) for row in rows}
+    hot = {row: any(sustained(graph) or (int(graph.get("evictions", 0)) >= 2
+                    and int(graph.get("recaptures", 0)) >= 2)
+                    for key, graph in all_graphs if key[1] == row and qwen_replay(graph) >= 1) for row in rows}
+    ordered_rows = sorted(rows, key=lambda row: (not hot[row], -heat[row], row))
+    ranks = []
+    for rank, inventory in enumerate(rank_identities):
+        identities = {key: graph for key, graph in inventory.items() if key[1] in rows}
+        if {key[1] for key in identities} != rows:
+            raise ValueError(f"Step-5 rank {rank} lacks a selected row geometry")
         positive = [int(g["capture_bytes"]) for g in identities.values() if int(g["capture_bytes"]) > 0]
         if not positive:
             raise ValueError(f"Step-5 rank {rank} has no positive measured capture shares")
@@ -1777,14 +1788,18 @@ def generate_step5(traces, layout):
         # Zero growth can be allocator reuse, not a free executable. Use this
         # device's measured mean rather than undercounting its selected set.
         costs = {key: int(graph["capture_bytes"]) or mean for key, graph in identities.items()}
-        pins = {key: sustained(graph) or (int(graph.get("evictions", 0)) >= 2
-                and int(graph.get("recaptures", 0)) >= 2) for key, graph in identities.items()}
-        ordered = sorted(identities, key=lambda key: (not pins[key], -qwen_replay(identities[key]), key))
-        entries = [{"layer": layer, "rows": rows, "section": section,
-                    "pin": pins[key], "capture_bytes": costs[key]}
-                   for key in ordered for layer, rows, section in [key]]
+        entries = [{"rows": row, "pin": hot[row], "replay_hits": heat[row],
+                    "capture_bytes": sum(cost for key, cost in costs.items() if key[1] == row),
+                    "sections": [{"layer": key[0], "section": key[2],
+                                  "capture_bytes": costs[key], "replay_hits": qwen_replay(identities[key])}
+                                 for key in sorted(identities) if key[1] == row]}
+                   for row in ordered_rows]
         ranks.append({"rank": rank, "reserve_base_bytes": packed(sum(costs.values())),
-                      "reserve_extra_bytes": CHUNK, "entries": entries})
+                      "reserve_extra_bytes": CHUNK, "entries": entries,
+                      "zero_replay_sibling_bytes": sum(costs[key] for key, graph in identities.items()
+                                                       if qwen_replay(graph) == 0),
+                      "lazy_zero_replay_bytes": sum(int(graph["capture_bytes"]) for key, graph in inventory.items()
+                                                    if key[1] not in rows)})
     return {"schema_version": 1, "family": "step5", "layout": layout, "ranks": ranks}
 
 

@@ -2,7 +2,8 @@
 use crate::shared::{decode_graph::{device::{self, Basis, Cycle, Preference, Site}, GraphBank,
     GraphOwner, GraphPolicy}, memory::device::Stream};
 use anyhow::Result;
-use std::{cell::RefCell, collections::HashSet};
+use std::{cell::{Cell, RefCell}, collections::HashSet};
+use cuteafd_loader::serving_capacity::step5_graphs::{self, Step5GraphLayout};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Section { Projection, Attention, Dense, Frontend, Shared, Finish }
@@ -16,33 +17,46 @@ pub(super) struct Graphs<'a> {
     eager: RefCell<HashSet<Key>>,
     touched: RefCell<HashSet<Key>>,
     device: i32,
+    pins: HashSet<usize>,
+    warming: Cell<bool>,
+    first_touch_pending: Cell<bool>,
 }
 
 impl<'a> Graphs<'a> {
     pub(super) fn new() -> Self {
         Self { bank: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "step5")),
-            eager: RefCell::new(HashSet::new()), touched: RefCell::new(HashSet::new()), device: -1 }
+            eager: RefCell::new(HashSet::new()), touched: RefCell::new(HashSet::new()), device: -1,
+            pins: HashSet::new(), warming: Cell::new(false), first_touch_pending: Cell::new(false) }
     }
 
     pub(super) fn attach(&mut self, library: &'a cuteafd_ffi::NativeLibrary, device: i32,
-        rank: usize) -> Result<()> {
-        // Step-5 was fully eager: no measured startup arena or traced pins exist.
-        // A trace run supplies GPU_GRAPH_RESERVE; untraced defaults charge zero.
-        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, 0, 0)?;
+        rank: usize, layout: Option<Step5GraphLayout>, max_rows: usize) -> Result<()> {
+        let (base, tail) = step5_graphs::reserve(layout, rank);
+        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+        self.pins = step5_graphs::selected_rows(layout, max_rows)?.into_iter()
+            .filter_map(|(rows, pin)| pin.then_some(rows)).collect();
         self.bank.get_mut().attach_device(library, device, policy.bytes, Site {
             name: "step5.section", cycle: Cycle::Other, preference: Preference::Adaptive,
             bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,
         })?;
         device::set_reserve_policy(device, policy)?;
         self.device = device;
-        tracing::warn!(rank, reserve = policy.bytes,
-            "Step-5 untraced graph layout: no pins or measured base; using byte bootstrap estimate");
+        if step5_graphs::prewarm(layout).is_none() {
+            tracing::warn!(?layout, rank, reserve = policy.bytes,
+                "Step-5 untraced graph layout: no pins or measured base; using byte bootstrap estimate");
+        }
         Ok(())
     }
 
-    pub(super) fn cycle(&self, cycle: Cycle) { self.bank.borrow_mut().cache_cycle(cycle); }
+    pub(super) fn warming(&self, enabled: bool) { self.warming.set(enabled); }
+    pub(super) fn cycle(&self, cycle: Cycle) {
+        self.bank.borrow_mut().cache_cycle(if self.warming.get() { Cycle::Other } else { cycle });
+    }
     pub(super) fn clear_drained(&self) { self.bank.borrow_mut().cache_clear_drained(); }
-    pub(super) fn needs_boundary(&self) -> bool { self.bank.borrow().cache_needs_boundary() }
+    pub(super) fn needs_boundary(&self) -> bool {
+        self.first_touch_pending.get() || self.bank.borrow().cache_needs_boundary()
+    }
+    pub(super) fn observed(&self) { self.first_touch_pending.set(false); }
     pub(super) fn tick(&self) { self.bank.borrow_mut().cache_tick(); }
     pub(super) fn visit(&self, visit: &mut device::GraphVisitor<'_>) -> Result<()> {
         visit(self.device, "step5.section", false, &mut *self.bank.borrow_mut())
@@ -52,7 +66,10 @@ impl<'a> Graphs<'a> {
         if self.eager.borrow().contains(&key) { return work(); }
         // First use initializes modules/workspaces eagerly; the outer step drains
         // before a later use can reserve capture growth for this geometry.
-        if self.touched.borrow_mut().insert(key) { return work(); }
+        if self.touched.borrow_mut().insert(key) {
+            self.first_touch_pending.set(true);
+            return work();
+        }
         if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
             return stream.device.run(|| {
                 // SAFETY: containing execution and staging owners retain every captured buffer;
@@ -60,7 +77,7 @@ impl<'a> Graphs<'a> {
                 unsafe { stream.device.library.cuda_graph_launch(raw, stream.raw) }
             });
         }
-        let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, false, None) else { return work() };
+        let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.contains(&key.rows), None) else { return work() };
         stream.device.run(|| {
             let library = stream.device.library;
             // SAFETY: sections contain only ordered launches on this stream, with persistent storage.

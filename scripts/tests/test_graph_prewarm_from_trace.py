@@ -56,7 +56,7 @@ def test_step5_selects_every_replayed_section_and_heat_orders_each_rank():
     result = MODULE.generate_step5([step5_trace(1), step5_trace(0)], "fp8-2rtx-6spark")
     assert [rank["rank"] for rank in result["ranks"]] == [0, 1]
     for rank in result["ranks"]:
-        assert [entry["section"] for entry in rank["entries"]] == ["Attention", "Projection", "Finish"]
+        assert [entry["rows"] for entry in rank["entries"]] == [4, 1, 16]
         assert [entry["pin"] for entry in rank["entries"]] == [True, False, False]
         assert rank["entries"][-1]["capture_bytes"] == 1500
         assert rank["reserve_base_bytes"] == 2 << 20
@@ -75,6 +75,19 @@ def test_step5_rejects_unmeasured_or_unsafe_section_inventory(change):
     change(data)
     with pytest.raises(ValueError):
         MODULE.generate_step5([data], "nvfp4-1rtx-4spark")
+
+
+def test_step5_row_selection_prices_zero_replay_siblings_on_every_rank():
+    data = step5_trace()
+    sibling = copy.deepcopy(data["graphs"][0])
+    sibling.update(shape="Key { layer: 1, rows: 1, section: Attention }", hits=0, capture_bytes=3000)
+    data["graphs"].append(sibling)
+    result = MODULE.generate_step5([data], "nvfp4-1rtx-4spark")["ranks"][0]
+    row = next(entry for entry in result["entries"] if entry["rows"] == 1)
+    assert row["capture_bytes"] == 4000
+    assert len(row["sections"]) == 2
+    assert result["zero_replay_sibling_bytes"] == 3000
+    assert result["lazy_zero_replay_bytes"] == 999999
 
 
 def test_step5_never_borrows_another_layout_or_selects_capture_only():
