@@ -177,6 +177,24 @@ impl GlmDflashPhysicalLayout {
             .bytes.try_into().context("GQA draft owner extent exceeds usize")
     }
 
+    /// Every device allocation this layout makes outside the packed weight arena,
+    /// split into the resident owner row (rings, taps, the context update and the
+    /// drafter's workspace buffers) and the linear/attention scratch row. Each is
+    /// one cudaMalloc request of its own extent, so each carries its own driver
+    /// granularity; the returned bytes are the engine's real request lists.
+    pub fn device_requests(&self) -> (Vec<u64>, Vec<u64>) {
+        let mut resident = Vec::new();
+        let mut scratch = Vec::new();
+        for owner in &self.owners {
+            if owner.location != Location::coordinator(0) || self.weight_owners.contains(&owner.id) { continue; }
+            match owner.id.as_str() {
+                "fp8_workspace" | "workspace.attention.scratch" => scratch.push(owner.bytes),
+                _ => resident.push(owner.bytes),
+            }
+        }
+        (resident, scratch)
+    }
+
     pub fn allocations(&self, prefix: &str, coordinator: Location) -> Vec<Allocation> {
         self.owners.iter().cloned().map(|mut owner| {
             owner.id = format!("{prefix}.{}", owner.id);
@@ -184,4 +202,22 @@ impl GlmDflashPhysicalLayout {
             owner
         }).collect()
     }
+}
+
+/// The DFlash2 drafter's per-candidate-GPU device request lists (resident owners,
+/// then linear/attention scratch), from the same checkpoint config the runtime
+/// layout reads. `None` for a dSpark drafter, whose owners are not this layout.
+pub fn draft_device_requests(config: &serde_json::Value, slots: usize, sequences: usize,
+    sms: &[u64], representation: GlmDraftRepresentation, fp8_mode: u8, kv_cache: Qwen4KvCache)
+    -> Result<Option<(Vec<Vec<u64>>, Vec<Vec<u64>>)>> {
+    if crate::families::glm5::draft_representation::is_dspark(config) { return Ok(None); }
+    let cfg = GlmDflashConfig::from_value(config)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, cfg.block)?;
+    let mut rows = Vec::with_capacity(sms.len());
+    for &sm in sms {
+        let layout = GlmDflashPhysicalLayout::new(&cfg, representation, capacity,
+            usize::try_from(sm).context("DFlash SM count")?, fp8_mode, kv_cache)?;
+        rows.push(layout.device_requests());
+    }
+    Ok(Some(rows.into_iter().unzip()))
 }

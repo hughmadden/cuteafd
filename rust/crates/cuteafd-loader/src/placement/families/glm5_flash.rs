@@ -211,11 +211,35 @@ pub struct GlmfInputs<'a> {
     pub drafter_weights: ResidentWeights,
     /// Linear and attention scratch on each candidate GPU, sized by physical SM count.
     pub drafter_scratch: Vec<u64>,
+    /// The DFlash2 drafter's real device request lists on each candidate GPU (the
+    /// resident owners, then the linear/attention scratch), when its checkpoint
+    /// layout is known; `None` charges each row as one request of its extent.
+    pub drafter_requests: Option<(Vec<Vec<u64>>, Vec<Vec<u64>>)>,
     /// Present only when the GPU1 DFlash2 executor is requested. dSpark stays local.
     pub drafter_bridge: Option<MovableDemands>,
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub full_prefill_logits: u64,
+}
+
+/// One drafter's exact device request lists on each candidate GPU: the resident
+/// owners (rings, taps, context update, workspace) and the linear/attention scratch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DrafterRequests {
+    pub resident: Vec<Vec<u64>>,
+    pub scratch: Vec<Vec<u64>>,
+}
+
+impl DrafterRequests {
+    pub fn from_rows((resident, scratch): (Vec<Vec<u64>>, Vec<Vec<u64>>)) -> Self {
+        Self { resident, scratch }
+    }
+
+    /// The resident owner row's requests on `gpu` (none without a layout).
+    pub fn resident(&self, gpu: usize) -> &[u64] { self.resident.get(gpu).map_or(&[], Vec::as_slice) }
+
+    /// The linear/attention scratch row's requests on `gpu` (none without a layout).
+    pub fn scratch(&self, gpu: usize) -> &[u64] { self.scratch.get(gpu).map_or(&[], Vec::as_slice) }
 }
 
 pub fn default_onboard() -> Onboard { Onboard::Auto }
@@ -319,15 +343,33 @@ pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, prefill_rows: u
         let bytes = |shape| cache::glmf_step_workspaces(cfg, lanes, prefill_rows, decode_rows,
             &shape, decode, prefill).device_bytes();
         let always = bytes(base);
-        [GlmfBufferDemand::new(GlmfComponent::Always, rank as u8, Category::Workspace, "steps", always, Basis::Formula),
+        let pairs = cache::glmf_step_request_pairs(cfg, lanes, prefill_rows, decode_rows,
+            &base, &full, decode, prefill);
+        debug_assert!(pairs.iter().all(|&(at_base, at_full)| at_full >= at_base));
+        // Every step buffer is its own device request. A request the base shape allocates
+        // belongs to the always row at its base size; the bytes local expert ownership adds
+        // to that same request, and every request only the local-expert shape allocates,
+        // belong to the local-expert row. The request lists therefore sum to their rows'
+        // extents exactly.
+        let always_requests: Vec<u64> = pairs.iter().map(|&(at_base, _)| at_base)
+            .filter(|&at_base| at_base > 0).collect();
+        let grown_requests: Vec<u64> = pairs.iter().filter(|&&(at_base, at_full)| at_full > at_base)
+            .map(|&(at_base, at_full)| at_full - at_base).collect();
+        debug_assert_eq!(always_requests.iter().sum::<u64>(), always);
+        debug_assert_eq!(grown_requests.iter().sum::<u64>(), bytes(full) - always);
+        [GlmfBufferDemand::new(GlmfComponent::Always, rank as u8, Category::Workspace, "steps", always, Basis::Formula)
+            .with_requests(always_requests),
             GlmfBufferDemand::new(GlmfComponent::RtxExperts, rank as u8, Category::Workspace, "steps",
-                bytes(full) - always, Basis::Formula)]
+                bytes(full) - always, Basis::Formula)
+            .with_requests(grown_requests)]
     }).collect()
 }
 
 /// Checkpoint and executor facts, before selection of an expert working set.
 pub struct GlmfFacts {
     pub geometry: cache::FamilyCacheGeometry,
+    /// Resident MLA layers on each rank, the backing count of every pool piece.
+    pub mla_layers: Vec<u64>,
     pub layers: Vec<LayerDemand>,
     /// Component-tagged owners before working-set filtering.
     pub fixed: Vec<GlmfBufferDemand>,
@@ -335,6 +377,8 @@ pub struct GlmfFacts {
     pub pool_bounded: Vec<BoundedDemand>,
     pub routed: usize,
     pub expert_gpus: usize,
+    /// The drafter's per-GPU device request lists, carried into admission's rows.
+    pub drafter_requests: Option<DrafterRequests>,
 }
 
 pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
@@ -346,6 +390,10 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
         || ![2, 4].contains(&i.partial_bytes) || i.attention.first_owner as usize >= ranks {
         return Err(PlacementError::Inventory("GLM Flash rank/layer inventory"));
     }
+    if i.drafter_requests.as_ref().is_some_and(|(resident, scratch)|
+        resident.len() != ranks || scratch.len() != ranks) {
+        return Err(PlacementError::Inventory("GLM Flash drafter request inventory"));
+    }
     let prefill_lanes = admitted_prefill_waves(i.attention.mode, i.prefill_lanes)?;
     let geometry = cache::glm_flash_placed_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
         i.kda_state_bytes, i.decode_rows, i.attention.mode, i.attention.first_owner as usize)
@@ -356,6 +404,7 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
     }
     let mul = |a: u64, b: u64| a.checked_mul(b).ok_or(PlacementError::Overflow("GLM Flash fixed demand"));
     let mut fixed = Vec::new();
+    let mut mla_layers = Vec::with_capacity(ranks);
     let mut expert = i.experts.iter();
     let mut layers = Vec::new();
     for layer in 0..i.layers {
@@ -376,6 +425,7 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
         let local_mla = if i.attention.mode == AttentionPlacement::Layers {
             mla / 2 + u64::from(rank == i.attention.first_owner as usize) * (mla % 2)
         } else { mla };
+        mla_layers.push(local_mla);
         let tails = if i.index == cache::GlmfIndexCache::Compact { local_mla * cache::GLMF_INDEX_TAIL_BYTES } else { 0 };
         let index_replay = if tails > 0 { local_mla * i.decode_rows * 512 } else { 0 };
         let gpu = rank as u8;
@@ -385,8 +435,17 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "target weights", i.resident[rank].weights, Basis::Exact)
             .with_resident_weights(ResidentWeights(i.resident[rank].weights)));
         let replay = if i.shared_replay { 0 } else { g.speculative_replay_bytes - index_replay };
+        // The recurrent state, the short-conv state and (when not shared) the replay records
+        // are separate cache allocations; each carries its own driver granularity.
+        let (recurrent, conv) = cache::glm_flash_kda_state_pieces(i.cfg, ranks, i.kda_state_bytes)
+            .map_err(|_| PlacementError::Inventory("GLM Flash KDA state geometry"))?;
+        let kda_layers = i.layers as u64 - mla;
+        let mut kda_requests = vec![mul(mul(kda_layers, i.state_slots)?, recurrent)?,
+            mul(mul(kda_layers, i.state_slots)?, conv)?];
+        if replay > 0 { kda_requests.push(replay); }
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "KDA state and replay",
-            mul(g.active_state_per_sequence_bytes - tails, i.state_slots)? + replay, Basis::Formula));
+            mul(g.active_state_per_sequence_bytes - tails, i.state_slots)? + replay, Basis::Formula)
+            .with_requests(kda_requests));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "DSA index tails and replay",
             mul(tails, i.state_slots)? + index_replay, Basis::Formula));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "commit tables", g.fixed_state_bytes, Basis::Formula));
@@ -401,6 +460,7 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
             component: GlmfComponent::Always,
             demand: Demand::new(gpu, item.category, item.group, item.bytes, item.basis)
                 .with_lifetime(item.lifetime),
+            requests: Vec::new(),
         }));
         if ranks == 2 {
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Transport, "peer exchange",
@@ -423,10 +483,14 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
                     cache::glmf_selector_bytes(i.decode_rows, i.cfg.vocab_size as u64)
                         - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
             }
+            // One device reserve per Spark rank's returned rows.
             fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
                 cache::prefill_return_bytes_with_format(prefill_lanes, i.prefill_rows,
                     i.spark_ranks as u64, i.cfg.hidden as u64, i.spark_reply_format)
-                    .map_err(|_| PlacementError::Inventory("GLM Flash Spark reply width or allocation overflow"))?, Basis::Formula));
+                    .map_err(|_| PlacementError::Inventory("GLM Flash Spark reply width or allocation overflow"))?, Basis::Formula)
+                .with_requests(cache::prefill_return_requests_with_format(prefill_lanes, i.prefill_rows,
+                    i.spark_ranks as u64, i.cfg.hidden as u64, i.spark_reply_format)
+                    .map_err(|_| PlacementError::Inventory("GLM Flash Spark reply width or allocation overflow"))?));
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "probe prefill logits", i.full_prefill_logits, Basis::Formula));
         }
     }
@@ -439,7 +503,8 @@ pub fn facts(i: &GlmfInputs<'_>) -> Result<GlmfFacts, PlacementError> {
             offset_units: 0, cap_units: u64::MAX, basis: Basis::Formula })
     }).collect();
     let expert_gpus = usize::from(ranks == 1 || i.experts.iter().all(|cost| cost.tp2));
-    Ok(GlmfFacts { geometry, layers, fixed, pool_overhead, pool_bounded, routed, expert_gpus })
+    Ok(GlmfFacts { geometry, mla_layers, layers, fixed, pool_overhead, pool_bounded, routed, expert_gpus,
+        drafter_requests: i.drafter_requests.as_ref().map(|rows| DrafterRequests::from_rows(rows.clone())) })
 }
 
 /// Exact header-only layer residency: the shared RTX onboarding costs.
@@ -634,7 +699,7 @@ pub(crate) mod tests {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, whole_supported: true, spark_ok: true }).collect(),
             expert_workspace: 128 << 20, tp2_workspace: [128 << 20; 2], drafter_bytes: 3 << 30, drafter_weights: ResidentWeights(2 << 30),
-            drafter_scratch: vec![0; ranks], drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
+            drafter_scratch: vec![0; ranks], drafter_requests: None, drafter_bridge: None, requested_pool: None, onboard: default_onboard(), full_prefill_logits: 0,
         }
     }
 
@@ -895,18 +960,33 @@ pub(crate) mod tests {
             input.context = crate::placement::planner::Context::automatic(input.max_context);
             let owner = (1 - first) as usize;
             let marked = contract(&input).unwrap();
-            let pool = marked.solved.facts.allocations.iter()
-                .find(|allocation| allocation.id == format!("glmf.pool.{owner}")).unwrap();
+            let glmf = facts(&input).unwrap();
+            let rank = &glmf.geometry.ranks[owner];
+            let layers = glmf.mla_layers[owner];
+            // Every pool piece is its own request list rounded per resident MLA layer;
+            // the shared unit-index map is one linear allocation.
+            let pool_cost = |units: u64| {
+                let pieces = cache::glm_flash_mla_unit_pieces(input.index, input.attention.mode).iter()
+                    .map(|&(_, per_layer)| per_layer * layers).filter(|&piece| piece > 0)
+                    .map(|piece| crate::placement::planner::ByteCurve::paged(piece, piece,
+                        crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES, layers, u64::MAX)
+                        .at(units).unwrap()).sum::<u64>();
+                pieces + (rank.pool_metadata_unit_bytes + rank.glmf_pool_mark_backing_unit_bytes(input.pool_marks)) * units
+            };
+            let pool: u64 = marked.solved.facts.allocations.iter()
+                .filter(|allocation| allocation.id.starts_with(&format!("glmf.pool.{owner}."))
+                    && allocation.group == "KV pool")
+                .map(|allocation| allocation.bytes).sum();
             let units = marked.solved.pool_tokens / 256;
-            let per_unit = pool.bytes / units;
+            assert_eq!(pool, pool_cost(units));
             let phase = marked.solved.phases.iter().find(|phase| phase.phase == planner::Phase::Growth
                 && phase.budget == format!("rtx{owner}")).unwrap();
             let used = phase.owned + phase.opaque;
             let runtime = marked.solved.facts.allocations.iter()
                 .find(|allocation| allocation.id == format!("glmf.runtime.{owner}")).unwrap().bytes;
-            let fixed = used - pool.bytes - runtime;
+            let fixed = used - pool - runtime;
             input.gpus[owner].1 = Baseline::Measured {
-                free_bytes: fixed + 64 * per_unit + input.headroom_bytes };
+                free_bytes: fixed + pool_cost(64) + input.headroom_bytes };
             let bounded = cuteafd_core::memory_policy::MemoryPolicy { kv_min: Some(256), ..Default::default() }
                 .scoped(|| contract(&input)).unwrap();
             assert_eq!(bounded.placement.pool_tokens, 64 * 256);
@@ -1330,6 +1410,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn draft_device_requests_cover_each_drafter_row_exactly() {
+        use crate::families::glm5::draft_representation::GlmDraftRepresentation;
+        use crate::families::qwen4::Qwen4KvCache;
+        // The runtime's checkpoint reader validates the fields the plan's loose
+        // fixture omits; fill in the shipping drafter's own values.
+        let mut config = draft_config();
+        let map = config.as_object_mut().unwrap();
+        map.insert("sliding_window".into(), serde_json::json!(2048));
+        map.insert("rms_norm_eps".into(), serde_json::json!(1e-6));
+        map.insert("rope_theta".into(), serde_json::json!(10000.0));
+        let dflash = map["dflash_config"].as_object_mut().unwrap();
+        dflash.insert("conv_kernel_size".into(), serde_json::json!(2));
+        dflash.insert("selector_top_k".into(), serde_json::json!(16));
+        dflash.insert("mask_token_id".into(), serde_json::json!(0));
+        let sms = [188u64, 170];
+        for mode in 0..=2 {
+            for representation in [GlmDraftRepresentation::Fp8Only, GlmDraftRepresentation::Bf16Only] {
+                let (owned, scratch) = drafter_inventory(&config, 8, 8, &sms,
+                    representation, mode, Qwen4KvCache::Bf16).unwrap();
+                let (resident, linear) = crate::families::glm5::draft_physical::draft_device_requests(
+                    &config, 8, 8, &sms, representation, mode, Qwen4KvCache::Bf16)
+                    .unwrap().expect("DFlash has an exact request inventory");
+                for rank in 0..2 {
+                    assert_eq!(resident[rank].iter().sum::<u64>(),
+                        owned.memory.resident - owned.resident_weights.0);
+                    assert_eq!(linear[rank].iter().sum::<u64>(), scratch[rank]);
+                    assert!(resident[rank].iter().all(|&bytes| bytes > 0));
+                    assert!(linear[rank].iter().all(|&bytes| bytes > 0));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn draft_inventory_rejects_bad_devices_and_orphan_or_overflow_scratch() {
         use crate::families::glm5::draft_representation::GlmDraftRepresentation;
         for sms in [vec![], vec![188, 170, 188], vec![0], vec![4097], vec![188, 0]] {
@@ -1701,12 +1815,23 @@ pub(crate) mod tests {
                     assert_eq!(mla, (0..11).map(|i| LayerMode::Whole { gpu: (i % 2) as u8,
                         ffn: FfnMode::Split }).collect::<Vec<_>>());
                 }
-                let geometry = facts(&input).unwrap().geometry;
+                let facts = facts(&input).unwrap();
+                let geometry = &facts.geometry;
+                let units = (2 << 20) / 256;
+                let cost = |units: u64| facts.mla_layers.iter().enumerate().map(|(gpu, &layers)| {
+                    let rank = &geometry.ranks[gpu];
+                    let pieces = cache::glm_flash_mla_unit_pieces(input.index, input.attention.mode).iter()
+                        .map(|&(_, per_layer)| per_layer * layers).filter(|&piece| piece > 0)
+                        .map(|piece| crate::placement::planner::ByteCurve::paged(piece, piece,
+                            crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES, layers, u64::MAX)
+                            .at(units).unwrap()).sum::<u64>();
+                    pieces + (rank.pool_metadata_unit_bytes + rank.glmf_pool_mark_backing_unit_bytes(input.pool_marks)) * units
+                }).sum::<u64>();
                 let pool_bytes: u64 = placed.items.iter().flatten().filter(|item| item.group == "KV pool")
                     .map(|item| item.bytes).sum();
-                assert_eq!(pool_bytes, geometry.ranks.iter().map(|rank|
-                    (rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes) * ((2 << 20) / 256))
-                    .sum::<u64>());
+                // One device request per pool piece and resident MLA layer, each rounded to
+                // its own driver granule; the unit-index metadata is one linear allocation.
+                assert_eq!(pool_bytes, cost(units));
                 let runtime = contract(&sampled(&input)).unwrap().placement;
                 assert_eq!(placed.items, runtime.items);
                 assert_eq!(placed.layers, runtime.layers);

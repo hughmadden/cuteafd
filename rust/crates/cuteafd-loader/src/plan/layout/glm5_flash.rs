@@ -251,9 +251,10 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
         let mut draft_rows = None;
         let mut draft_tp2 = Vec::new();
-        let (draft, drafter_weights, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, placement::ResidentWeights::default(), vec![0; ranks], None) }
+        let (draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge) =
+            if options.glmf_drafter_disabled { (0, placement::ResidentWeights::default(), vec![0; ranks], None, None) }
             else if options.drafter_bytes > 0 && options.glmf_drafter_snapshot.is_none() {
-                (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None)
+                (options.drafter_bytes, placement::ResidentWeights(options.drafter_bytes), vec![0; ranks], None, None)
             } else {
             let (config, capacity, _) = draft_config.as_ref().context("resolved Flash drafter config")?;
             let (slots, batch) = (capacity.context_slots, capacity.max_batch_sequences);
@@ -263,16 +264,19 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 draft_tp2 = glmf::drafter_tp2_inventory(path, *capacity, &draft_sms,
                     options.glmf_draft_representation,
                     options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
-                (0, placement::ResidentWeights::default(), vec![0; ranks], None)
+                (0, placement::ResidentWeights::default(), vec![0; ranks], None, None)
             } else {
             let (bytes, scratch) = glmf::drafter_inventory(config, slots, batch,
                 &draft_sms, options.glmf_draft_representation, options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
+            let requests = crate::families::glm5::draft_physical::draft_device_requests(config,
+                slots, batch, &draft_sms, options.glmf_draft_representation,
+                options.glmf_draft_fp8_mode, options.draft_kv_cache)?;
             // GPU1-whole remains unqualified; only GPU0-whole competes with TP2.
             let bridge = None;
             anyhow::ensure!(options.drafter_bytes == 0 || options.drafter_bytes == bytes.resident_weights.0,
                 "drafter weight override {} differs from checkpoint-resident weights {}",
                 options.drafter_bytes, bytes.resident_weights.0);
-            (bytes.memory.resident, bytes.resident_weights, scratch, bridge)
+            (bytes.memory.resident, bytes.resident_weights, scratch, requests, bridge)
             }
         };
         let core_charge = if native && exlr8.is_none() {
@@ -290,11 +294,13 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 manifest.ok_or_else(|| anyhow::anyhow!("Flash K6 requires PROGRAMS.json with native exports"))?)?)
         } else { None };
         if let Some(charge) = &core_charge {
-            let bytes = charge.bytes(cfg.hidden)?;
+            let bytes = charge.owned_bytes(cfg.hidden)?;
+            let requests = charge.requests().map(<[u64]>::to_vec).collect::<Vec<_>>();
             for profile in [&mut workspace, &mut local_workspace] {
-                for (rank, &bytes) in bytes.iter().enumerate() {
+                for (rank, (&bytes, requests)) in bytes.iter().zip(&requests).enumerate() {
                     profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
-                        Category::Workspace, "native K6 core", bytes, Basis::Exact));
+                        Category::Workspace, "native K6 core", bytes, Basis::Exact)
+                        .with_requests(requests.clone()));
                 }
             }
             notes.push("native K6 body and head; exact compressed owners and projection scratch".into());
@@ -355,7 +361,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
-            drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
+            drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
             full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let host = options.host_memory.map(Ok)
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;

@@ -444,13 +444,26 @@ pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 pub struct ComponentDemand {
     pub component: WorkingSetComponent,
     pub demand: Demand,
+    /// The engine's exact device request list behind `demand.bytes` when the
+    /// owner is more than one allocation. Empty means the owner is a single
+    /// request of its whole extent (or not a device owner).
+    pub requests: Vec<u64>,
 }
 
 impl ComponentDemand {
     pub fn new(component: WorkingSetComponent, gpu: u8,
         category: cuteafd_core::memory_layout::Category, group: &str, bytes: u64,
         basis: cuteafd_core::memory_layout::Basis) -> Self {
-        Self { component, demand: Demand::new(gpu, category, group, bytes, basis) }
+        Self { component, demand: Demand::new(gpu, category, group, bytes, basis), requests: Vec::new() }
+    }
+
+    /// The exact per-allocation requests this owner makes at runtime. Their sum
+    /// is `demand.bytes`, except where part of the owner is a view into storage
+    /// charged by another owner (GLM Flash's K6 receive suffix inside the peer
+    /// exchange slot); the tail charge covers only the listed requests either way.
+    pub fn with_requests(mut self, requests: Vec<u64>) -> Self {
+        self.requests = requests;
+        self
     }
 
     pub fn with_resident_weights(mut self, weights: super::ResidentWeights) -> Self {
@@ -517,8 +530,8 @@ impl SparkWorkingSet {
         0..if self.includes(WorkingSetComponent::SparkExperts) { self.spark_ranks } else { 0 }
     }
 
-    pub fn demands<'a>(&'a self, rows: &'a [ComponentDemand]) -> impl Iterator<Item = &'a Demand> + 'a {
-        rows.iter().filter(|row| self.includes(row.component)).map(|row| &row.demand)
+    pub fn demands<'a>(&'a self, rows: &'a [ComponentDemand]) -> impl Iterator<Item = &'a ComponentDemand> + 'a {
+        rows.iter().filter(|row| self.includes(row.component))
     }
 
     /// Coordinator staging is shared across ranks, but not across prefill lanes.
@@ -1426,10 +1439,10 @@ mod tests {
         let rows: Vec<_> = [WorkingSetComponent::Always, WorkingSetComponent::RtxExperts,
             WorkingSetComponent::SparkExperts].into_iter().map(|component|
             ComponentDemand { component, demand: Demand::new(0, Category::Workspace,
-                "selected rows", 100, Basis::Formula) }).collect();
-        assert_eq!(empty.demands(&rows).map(|d| d.bytes).sum::<u64>(), 100);
+                "selected rows", 100, Basis::Formula), requests: Vec::new() }).collect();
+        assert_eq!(empty.demands(&rows).map(|d| d.demand.bytes).sum::<u64>(), 100);
         let local = SparkWorkingSet { rtx_layers: vec![3], ..empty };
-        assert_eq!(local.demands(&rows).map(|d| d.bytes).sum::<u64>(), 200);
+        assert_eq!(local.demands(&rows).map(|d| d.demand.bytes).sum::<u64>(), 200);
     }
 
     #[test]

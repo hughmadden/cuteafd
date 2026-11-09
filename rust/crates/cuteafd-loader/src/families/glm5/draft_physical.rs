@@ -439,7 +439,7 @@ pub fn absorb_geometry(heads: usize, nope: usize, value: usize, latent: usize) -
     Ok((rows, source, uk, uv))
 }
 
-pub use super::draft_physical_layout::GlmDflashPhysicalLayout;
+pub use super::draft_physical_layout::{draft_device_requests, GlmDflashPhysicalLayout};
 
 #[cfg(test)]
 mod arena_tests {

@@ -67,7 +67,7 @@ pub mod glm_graph_nodes;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_step_scratch, glmf_core_step_scratch, GlmfCoreScratch,
+    glmf_step_scratch, glmf_core_step_scratch, glmf_step_request_pairs, GlmfCoreScratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
@@ -540,6 +540,40 @@ pub fn glm_flash_rank_cache_geometry_rows(
 /// Storage for a candidate attention placement, not an executor capability.
 /// KDA always partitions heads. Context owns alternate 256-token units, while
 /// layers owns alternate MLA layers; compact tails/replay follow those owners.
+/// One KDA layer's recurrent state per sequence on one rank: `channels` (its share of
+/// the heads x head dim) x head dim x `state_bytes`. The caches allocate it separately
+/// from the short-conv state (`glmf/kda-state`, `glmf/kda-conv`).
+fn gmf_kda_recurrent(cfg: &GlmNextConfig, channels: u64, state_bytes: u64) -> Result<u64, CacheGeometryError> {
+    product("KDA recurrent state", &[channels, cfg.kda_head_dim as u64, state_bytes])
+}
+
+/// One KDA layer's BF16 short-conv state per sequence on one rank: three taps of
+/// `3 x channels` BF16 values.
+fn gmf_kda_conv(channels: u64) -> Result<u64, CacheGeometryError> {
+    product("KDA short-conv state", &[3, 3, channels, 2])
+}
+
+/// One KDA layer's recurrent and short-conv state per sequence on one rank, which the
+/// caches allocate as two independent device requests.
+pub fn glm_flash_kda_state_pieces(cfg: &GlmNextConfig, ranks: usize, state_bytes: u64)
+    -> Result<(u64, u64), CacheGeometryError> {
+    let channels = product("KDA channels", &[(cfg.kda_heads / ranks) as u64, cfg.kda_head_dim as u64])?;
+    Ok((gmf_kda_recurrent(cfg, channels, state_bytes)?, gmf_kda_conv(channels)?))
+}
+
+/// One unit's pool storage in one resident MLA layer, split by the physical
+/// allocation that owns it: the 256 latent records (528 B each), the full index
+/// cache's 256 key | gate rows (512 B each, absent when the cache is compact) and
+/// the 64-entry pool-key page (132 B each). The engine allocates one request per
+/// piece and MLA layer, so each piece carries its own driver granularity.
+pub fn glm_flash_mla_unit_pieces(index: GlmfIndexCache,
+    attention: crate::placement::AttentionPlacement) -> [(&'static str, u64); 3] {
+    let half = if attention == crate::placement::AttentionPlacement::Context { 2 } else { 1 };
+    [("records", 256 * 528 / half),
+        ("pool-keys", 64 * 132 / half),
+        ("index-keys", if index == GlmfIndexCache::Keys { 256 * 512 / half } else { 0 })]
+}
+
 pub fn glm_flash_placed_cache_geometry_rows(
     cfg: &GlmNextConfig,
     layers: usize,
@@ -591,13 +625,7 @@ pub fn glm_flash_placed_cache_geometry_rows(
     )?;
     let state = sum(
         "KDA state",
-        &[
-            product(
-                "KDA recurrent state",
-                &[channels, cfg.kda_head_dim as u64, state_bytes],
-            )?,
-            product("KDA short-conv state", &[3, 3, channels, 2])?,
-        ],
+        &[gmf_kda_recurrent(cfg, channels, state_bytes)?, gmf_kda_conv(channels)?],
     )?;
     let replay = sum(
         "KDA replay",
@@ -617,13 +645,10 @@ pub fn glm_flash_placed_cache_geometry_rows(
             what: "compact index cache under a head split",
         });
     }
-    // Per unit and MLA layer: 256 latent records, the per-token index keys unless compact,
-    // and one pool-key page (64 pools).
-    let per_layer_unit = if compact {
-        sum("GLM Flash MLA unit", &[256 * 528, 64 * 132])?
-    } else {
-        sum("GLM Flash MLA unit", &[256 * (528 + 512), 64 * 132])?
-    };
+    // Per unit and MLA layer: the latent records, the pool-key page and, unless compact,
+    // the per-token index keys; see [`glm_flash_mla_unit_pieces`].
+    let per_layer_unit: u64 = glm_flash_mla_unit_pieces(index, attention).iter()
+        .map(|&(_, bytes)| bytes).sum();
     let kda_state = product("GLM Flash active KDA", &[kda, state])?;
     let ranks = (0..ranks).map(|rank| {
         let resident_mla = if attention == AttentionPlacement::Layers {
@@ -632,8 +657,7 @@ pub fn glm_flash_placed_cache_geometry_rows(
         let tails = if compact { product("GLM Flash index tails", &[resident_mla, GLMF_INDEX_TAIL_BYTES])? } else { 0 };
         let index_replay = if compact { product("GLM Flash index replay", &[resident_mla, decode_rows, 512])? } else { 0 };
         Ok(RankCacheGeometry {
-            persistent_unit_bytes: product("GLM Flash MLA pools", &[resident_mla, per_layer_unit])?
-                / if attention == AttentionPlacement::Context { 2 } else { 1 },
+            persistent_unit_bytes: product("GLM Flash MLA pools", &[resident_mla, per_layer_unit])?,
             pool_metadata_unit_bytes: 4,
             active_state_per_sequence_bytes: sum("GLM Flash active state", &[kda_state, tails])?,
             retained_mark_bytes: sum("GLM Flash mark", &[kda_state, tails])?,

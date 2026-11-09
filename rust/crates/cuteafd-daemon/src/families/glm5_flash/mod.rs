@@ -2014,11 +2014,13 @@ impl Opened {
         let mut workspace = workspaces(spark_ranks > 0, lanes);
         let mut local_workspace = workspaces(false, lanes);
         if let Some(core) = &core_charge {
+            let bytes = core.owned_bytes(self.cfg.hidden)?;
+            let requests = core.requests().map(<[u64]>::to_vec).collect::<Vec<_>>();
             for profile in [&mut workspace, &mut local_workspace] {
-                for (rank, bytes) in core.bytes(self.cfg.hidden)?.into_iter().enumerate() {
+                for (rank, (&bytes, requests)) in bytes.iter().zip(&requests).enumerate() {
                     profile.push(admission::GlmfBufferDemand::new(admission::GlmfComponent::Always, rank as u8,
                         cuteafd_core::memory_layout::Category::Workspace, "native K6 core", bytes,
-                        cuteafd_core::memory_layout::Basis::Exact));
+                        cuteafd_core::memory_layout::Basis::Exact).with_requests(requests.clone()));
                 }
             }
         }
@@ -2062,7 +2064,7 @@ impl Opened {
         let sms = inventory.gpus[0].sms as usize;
         let draft_sms: Vec<_> = inventory.gpus.iter().map(|gpu| gpu.sms as u64).collect();
         let mut draft_tp2 = Vec::new();
-        let (drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
+        let (drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge) = args.draft.as_ref().map(|path| -> Result<_> {
             let config = serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?;
             let capacity = cuteafd_loader::families::glm5::draft_representation::flash_draft_capacity(&config,
                 args.draft_context_slots, args.draft_sequences)?;
@@ -2071,15 +2073,18 @@ impl Opened {
                 draft_tp2 = admission::drafter_tp2_inventory(path, capacity, &draft_sms,
                     cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
                     args.draft_linear.code() as u8, args.draft_kv_cache)?;
-                return Ok((0, placement::ResidentWeights::default(), vec![0; devices.len()], None));
+                return Ok((0, placement::ResidentWeights::default(), vec![0; devices.len()], None, None));
             }
+            let representation = cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8);
             let (bytes, scratch) = admission::drafter_inventory(&config, slots, batch, &draft_sms,
-                cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation::from_fp8_option(args.draft_fp8),
+                representation, args.draft_linear.code() as u8, args.draft_kv_cache)?;
+            let requests = cuteafd_loader::families::glm5::draft_physical::draft_device_requests(
+                &config, slots, batch, &draft_sms, representation,
                 args.draft_linear.code() as u8, args.draft_kv_cache)?;
             let bridge = if remote_draft { admission::drafter_bridge_inventory(&config, slots, batch)? }
                 else { None };
-            Ok((bytes.memory.resident, bytes.resident_weights, scratch, bridge))
-        }).transpose()?.unwrap_or_else(|| (0, placement::ResidentWeights::default(), vec![0; devices.len()], None));
+            Ok((bytes.memory.resident, bytes.resident_weights, scratch, requests, bridge))
+        }).transpose()?.unwrap_or_else(|| (0, placement::ResidentWeights::default(), vec![0; devices.len()], None, None));
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
@@ -2101,7 +2106,7 @@ impl Opened {
             blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none()
                 && representation.head == head::GlmfHeadFormat::Bf16),
             representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
-            drafter_bytes, drafter_weights, drafter_scratch, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
+            drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: if shape.full_prefill_logits {
                 cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,
                     self.cfg.vocab_size as u64)
@@ -2872,6 +2877,7 @@ impl Opened {
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.decode_rows, records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
+        probe("engine")?;
         engine.admitted_host = admitted_host;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
         engine.attention_plan = attention_plan;
@@ -2895,6 +2901,7 @@ impl Opened {
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
+        probe("head-split")?;
         if let Some(native) = &native_admission {
             let shared = native_shared.take().context("native shared owners missing after load")?;
             let manifest = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
@@ -2902,6 +2909,7 @@ impl Opened {
         } else {
             engine.bind_core(self.core_admission(args, layers, 1 + usize::from(split_device.is_some()), attention)?)?;
         }
+        probe("core-bind")?;
         engine.validate_attention_homes(&execution)?;
         if attention.mode == cuteafd_loader::placement::AttentionPlacement::Layers {
             engine.bind_layer_execution(execution)?;
@@ -2910,6 +2918,7 @@ impl Opened {
             // The solver charged selected partial scratch and full-extent staging.
             engine.attach_context(args.max_context, manifest)?;
         }
+        probe("context-attach")?;
         probe("peer-exchanges")?;
         engine.set_graph_budget(None);
         engine.full_prefill_logits = args.full_prefill_logits;
@@ -2965,6 +2974,7 @@ impl Opened {
                 if args.tp2_dflash { Some(engine.draft_exchange()?) } else { None },
                 crate::shared::speculation::dflash::TargetProjection::from_bf16(engine.weights.head.bf16().is_some()))?;
             engine.bind_draft_core_head()?;
+            probe("draft-core")?;
             engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(dspark::Drafter::drafts))?;
             cuteafd_bench::context::set_resolved("attention-plan-rows", &engine.attention_plan.rows().to_string());
             tracing::info!(plan_rows = engine.attention_plan.rows(), active_drafts = ?engine.attention_plan.active_drafts(),
@@ -2980,9 +2990,13 @@ impl Opened {
                     engine.attach_peer_l2(budget)?;
                 }
             }
+            probe("l2")?;
             if let Some(workspaces) = early_workspaces { engine.install_workspaces(workspaces)?; }
+            probe("install-workspaces")?;
             if args.serving_graph_policy.is_some() { engine.prepare_serving_workspaces()?; }
+            probe("serving-workspaces")?;
             if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+            probe("scoring-prefill")?;
             probe("workspaces")
         }, |engine| {
             engine.prime_tp2()?;
@@ -2992,9 +3006,11 @@ impl Opened {
             probe("expert-prime")
         })?;
         engine.configure_packing(args.prefill_packing.unwrap_or_default())?;
+        probe("packing")?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
                 if let Some(capture) = engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)? {
+                    probe("graphs-instantiated")?;
                     use cuteafd_loader::placement::inventory::{GraphCensus, GraphCensusIdentity};
                     let measured = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
                         &mut admitted_plan, "glmf.graphs", &admitted_graphs, &declared_graphs, &capture.ranks)?;
@@ -3038,6 +3054,7 @@ impl Opened {
                 engine.check_admitted_graphs(&admitted_graphs)?;
                 engine.check_tp2_routes()
             }, || body(&engine));
+        probe("post-checks")?;
         drop(engine);
         // SAFETY: the engine that used the streams is gone.
         unsafe { self.library.cuda_stream_destroy(stream)? };
