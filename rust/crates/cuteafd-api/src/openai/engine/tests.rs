@@ -184,6 +184,43 @@ async fn every_protocol_renders_the_chat_prompt_for_every_family() {
 }
 
 #[tokio::test]
+async fn benchmark_messages_count_matches_chat_template_nonce_and_thinking() {
+    for family in families() {
+        for enabled in [false, true] {
+            for system in [None, Some("You are terse.")] {
+                let (app, worker) = serve(family.profile.clone(), family.snapshot.clone(), vec![], false);
+                let text = "[bench-0000000017] Reply with the single word OK.\n\nfn main() { println!(\"hello\"); }";
+                let thinking = json!({"type": if enabled { "enabled" } else { "disabled" }});
+                let user = json!({"role":"user","content":text});
+                let mut messages = vec![];
+                if let Some(system) = system { messages.push(json!({"role":"system","content":system})); }
+                messages.push(user.clone());
+                let chat = json!({"model":family.profile.id,"messages":messages,"max_tokens":1,
+                    "temperature":0,"thinking":thinking,"stream":true});
+                let mut count = json!({"model":family.profile.id,"messages":[user],"max_tokens":1,"thinking":thinking});
+                if let Some(system) = system { count["system"] = json!(system); }
+                let (status, reply) = post(&app, "/v1/messages/count_tokens", count.clone()).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let counted = serde_json::from_str::<Value>(&reply).unwrap()["input_tokens"].as_u64().unwrap();
+                let (status, reply) = post(&app, "/v1/chat/completions", chat).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let (status, reply) = post(&app, "/v1/messages", count).await;
+                assert_eq!(status, StatusCode::OK, "{}: {reply}", family.name);
+                let prompts = worker.prompts.lock().unwrap();
+                assert_eq!(prompts[0], prompts[1], "{} thinking={enabled} system={system:?}", family.name);
+                assert!(prompts[0].contains("bench-0000000017"));
+                if let Some(snapshot) = &family.snapshot {
+                    let ids = cuteafd_loader::encode_tokenizer_text(snapshot, &prompts[0], false).unwrap().token_ids;
+                    assert_eq!(counted, ids.len() as u64, "{} thinking={enabled} system={system:?}", family.name);
+                    eprintln!("exact benchmark count parity: {} thinking={enabled} system={} tokens={counted}",
+                        family.name, system.is_some());
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn count_tokens_is_exact_through_the_tokenizer() {
     for family in families().into_iter().filter(|f| f.snapshot.is_some()) {
         let snapshot = family.snapshot.clone().unwrap();

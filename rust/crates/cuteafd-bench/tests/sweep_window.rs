@@ -76,6 +76,9 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
     fake_engine(forward);
     let router = router_with_console(queue, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
         Duration::from_secs(5), ConsoleHub::disabled());
+    let router = common::with_fake_token_count(router).route("/v1/bench/status", axum::routing::get(|| async {
+        axum::Json(serde_json::json!({"settings":[{"name":"prefill-units", "value":"2752", "source":"resolved"}]}))
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move {

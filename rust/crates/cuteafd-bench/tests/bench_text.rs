@@ -34,7 +34,7 @@ async fn runs_allow_console_text_and_clear_it_on_finish_and_cancel() {
     let bench = cuteafd_bench::Bench::new(Store::open(dir.path()).unwrap());
     bench.set_console(hub.clone());
     bench.set_api_key(ApiKey::new("integration-test-key").unwrap());
-    let app = cuteafd_bench::http::mount(router, bench.clone());
+    let app = common::with_fake_token_count(cuteafd_bench::http::mount(router, bench.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     cuteafd_bench::ready(&listener);
     let base = format!("http://{}", listener.local_addr().unwrap());

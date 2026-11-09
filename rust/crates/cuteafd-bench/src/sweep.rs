@@ -64,6 +64,10 @@ pub struct Point {
 pub struct PrefillPoint {
     /// Requested prompt tokens.
     pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<crate::report::PrefillShape>,
     pub prompt_tokens: u64,
     pub tok_s: f64,
     pub ttft_s: f64,
@@ -252,7 +256,8 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
 }
 
 /// Cold prefill at each length: fit tokens per reference token from two short
-/// requests, then per length one untimed warm request and one measured request
+/// requests as an initial estimate, then size exactly through the served tokenizer.
+/// Per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens). With `options.repeat`
 /// the measured request re-sends the warm-up's corpus behind a fresh nonce;
 /// with `options.purge` the purge runs before the warm-up and again before the
@@ -269,19 +274,28 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
     let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
     let purge = || options.purge.map_or(Ok(()), |purge| purge());
     let mut points = Vec::new();
-    for &length in lengths {
-        let target = length.min(max_context.saturating_sub(64)) as f64;
-        let words = ((target - intercept) / slope).max(64.0) as usize;
+    let unit = client.prefill_unit_rows()?;
+    let tail = crate::prefill::tail_tokens(unit)?;
+    let mut requested = lengths.to_vec();
+    if requested.contains(&crate::prefill::CARD_TOKENS) && !requested.contains(&tail) { requested.push(tail); }
+    for length in requested {
+        anyhow::ensure!(length <= max_context.saturating_sub(64),
+            "exact {length}-token prefill exceeds max context {max_context} with output headroom");
+        let words = ((length as f64 - intercept) / slope).max(64.0) as usize;
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
+        let warm_text = crate::prefill::prompt(client, warm_seed, words, length, "Summarize in one word.")?;
+        let timed_text = crate::prefill::prompt(client, timed_seed, words, length, "Summarize in one word.")?;
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
-        ask(words, warm_seed).with_context(|| format!("{length}-token prefill warm-up"))?;
+        let warm = client.chat(plain(client, &warm_text, 1), None)
+            .with_context(|| format!("{length}-token prefill warm-up"))?;
+        crate::prefill::validate(length, warm.timing.prompt_tokens)?;
         if !idle.is_zero() { std::thread::sleep(idle); }
         timed(on_timed)?;
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
         let counters = phase_counters(client);
-        let chat = ask(words, timed_seed).with_context(|| format!("{length}-token prefill"))?;
+        let chat = client.chat(plain(client, &timed_text, 1), None).with_context(|| format!("{length}-token prefill"))?;
         let after = phase_counters(client);
         let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
         let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
@@ -289,7 +303,9 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
-        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
+        crate::prefill::validate(length, t.prompt_tokens)?;
+        points.push(PrefillPoint { length, label: (length == tail).then(|| "8K w/tail".into()),
+            shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
             idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
     }
     Ok(points)
@@ -472,6 +488,76 @@ mod tests {
         let (warm, timed) = prefill_seeds(8192, false);
         assert_ne!(corpus(warm, 512), corpus(timed, 512));
         assert_ne!(prefill_seeds(8192, true), prefill_seeds(65536, true));
+    }
+
+    #[test]
+    fn exact_prefill_rejects_streamed_warm_and_timed_usage_mismatches() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use serde_json::json;
+        use std::sync::atomic::Ordering;
+
+        for mismatch_at in [3, 4] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let done = Arc::new(AtomicBool::new(false));
+            let stop = done.clone();
+            let server = std::thread::spawn(move || {
+                let mut chats = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let (mut socket, _) = match listener.accept() {
+                        Ok(connection) => connection,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(1)); continue;
+                        }
+                        Err(e) => panic!("{e}"),
+                    };
+                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut reader = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_string();
+                    let mut length = 0;
+                    loop {
+                        line.clear(); reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" { break; }
+                        if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+                    let body: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
+                    let count = || 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
+                    let (kind, reply) = match path.as_str() {
+                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count()}).to_string()),
+                        "/v1/bench/status" => ("application/json", json!({"settings":[{
+                            "name":"prefill-units", "value":"2752", "source":"resolved"
+                        }]}).to_string()),
+                        "/v1/chat/completions" => {
+                            chats += 1;
+                            assert_eq!(body["stream"], true);
+                            let actual = count();
+                            if chats >= 3 { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
+                            let reported = if chats == mismatch_at { 8310 } else { actual };
+                            let event = json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}],
+                                "usage":{"prompt_tokens":reported, "completion_tokens":1}});
+                            ("text/event-stream", format!("data: {event}\n\ndata: [DONE]\n\n"))
+                        }
+                        "/v1/stats" | "/v1/thermal" => ("application/json", "{}".into()),
+                        _ => panic!("unexpected request {path}"),
+                    };
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                }
+                chats
+            });
+            let client = Client::new(&format!("http://{address}"), None, Default::default());
+            let mut hook: OnTimed = None;
+            let result = prefill(&client, &[crate::prefill::CARD_TOKENS], 32768, &PrefillOptions::default(), &mut hook);
+            done.store(true, Ordering::Relaxed);
+            assert_eq!(server.join().unwrap(), mismatch_at);
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("requested 8192 prompt tokens but server reported 8310"), "{error}");
+        }
     }
 
     #[test]

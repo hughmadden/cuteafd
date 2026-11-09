@@ -144,3 +144,12 @@ and arms for cleanup. Source worktrees are retained for inspection.
   `--set`/`--arm-set` overrides, no serving topology (export TP and families
   come from every card's scopes), and dev images tagged with the revision's
   toolchain identity.
+
+Prefill sizing uses the served tokenizer, including the chat template, to
+reach the exact requested total prompt-token count. Warm-ups have the same
+length; a timed usage mismatch fails the run, never silently clamps it.
+`--prefill-lengths 8192` also records **8K w/tail** (`3 * served unit rows + 40`,
+8,296 at 2,752 rows/unit) in `sweep.json` and the development summary. The basic
+profile records both in `report.json`, but only exactly 8,192 appears on card
+images and README tables. Points record their execution-unit shape beside
+actual prompt tokens. Earlier approximate-8K results are not directly comparable.

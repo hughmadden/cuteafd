@@ -263,6 +263,7 @@ impl Panel for Prefill {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let lengths = Self::lengths(ctx.max_context);
+        let unit = crate::prefill::unit_rows(&ctx.info.configuration.settings)?;
         let mut points = Vec::new();
         for (i, &target) in lengths.iter().enumerate() {
             ctx.progress.step(i as f64 / lengths.len() as f64, format!("{}K", target / 1024));
@@ -276,6 +277,7 @@ impl Panel for Prefill {
             let cold = ctx.client.chat(plain(ctx.client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
             let ids = cold.probe.as_ref().filter(|r| r.engine.is_some()).map(|r| r.prompt_ids.clone());
             let mut point = json!({"target": target, "prompt_tokens": cold.timing.prompt_tokens,
+                "shape": crate::prefill::shape(cold.timing.prompt_tokens, unit),
                 "cold_ttft_s": cold.timing.ttft_s, "cold_tok_s": cold.timing.prefill_tok_s(),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("prefill/{target}/cold"), true)});
             if let Some(ids) = ids.filter(|ids| ids.len() > 512) {

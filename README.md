@@ -32,6 +32,11 @@ DGX Sparks serves the routed experts over RoCE.
 Prefill reports without `prompt_content: "realistic-v1"` used synthetic filler.
 New prefill benchmarks use fixed real code, agent/tool transcripts and technical
 prose; their prefill numbers are not directly comparable to the older content.
+The basic card now sizes 8K to exactly 8,192 total prompt tokens through the
+served tokenizer (chat template included), with exact-length warm-ups. Earlier
+approximate-8K results are not directly comparable. Development reports also
+record **8K w/tail**: three served prefill units plus 40 tokens (8,296 at
+2,752 rows/unit), omitted from card images and README tables.
 Decode and agentic-session workloads are unchanged.
 
 ## What's new in v4.1.0
@@ -190,7 +195,7 @@ concurrency point is that limit.
 </tr>
 </table>
 
-Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).
+Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).
 
 ### Retired
 
@@ -238,7 +243,7 @@ Last Release-smoke cards for retired configurations; no new measurements. Versio
 
 ### Methodology
 
-Cards measure text C1, warmed C8 aggregate code throughput, cold ~8K prefill,
+Cards measure text C1, warmed C8 aggregate code throughput, cold exactly-8,192-token prefill,
 quick fidelity against the family golden reference and exact prefix-cache
 restore. They are single launches: compare releases only with matched-prompt
 runs. Simulated 5090 cells cap memory only; SM count, L2, clocks and power are

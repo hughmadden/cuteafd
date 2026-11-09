@@ -7,7 +7,7 @@ natural minimum (1× RTX + the fewest Sparks it fits) and the maximum
 (2× RTX + 4 or 6 Sparks). A third column covers a 32 GB card (RTX 5090).
 
 Release smoke measures text C1 decode, warmed C8 aggregate code throughput,
-cold ~8K prefill, quick fidelity against the family golden reference, exact
+cold exactly-8,192-token prefill (served tokenizer and chat template), quick fidelity against the family golden reference, exact
 prefix-cache restore and lossless speculation. It is not a full multimodal,
 full-context or C16 qualification. Cards are single launches, not A/B
 measurements: compare cells across releases only with matched-prompt runs
@@ -54,3 +54,9 @@ V4 Flash 8K prefill −2.6%.
 MiMo V2.6 Flash MOPD replaced the legacy Flash rows; its
 [text-only bring-up qualification](models/mimo_v2.md#flash-mopd-qualification-2026-10-05)
 keeps its original conditions.
+
+Prefill warm-ups use the same exact token length as their timed request.
+Earlier approximate-8K results are not directly comparable. Reports include
+a development-only **8K w/tail** point: `3 * served unit rows + 40` tokens
+(8,296 for 2,752-row units), with requested/actual counts and unit/tail shape.
+It is not drawn on card images or published in README tables.
