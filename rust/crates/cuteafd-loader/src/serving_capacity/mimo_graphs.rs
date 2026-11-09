@@ -111,6 +111,26 @@ mod tests {
     }
 
     #[test]
+    fn untraced_flash_tp2_layout_bootstraps_without_pins() {
+        let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_flash_mopd_config()).unwrap();
+        cfg.layers = 48;
+        let variant = mimo_graph_variant(&cfg);
+        for sparks in [false, true] {
+            assert!(!mimo_prewarm_list().layouts.iter().any(|layout|
+                layout.variant == variant && layout.ranks == 2 && layout.sparks == sparks));
+            let layout = mimo_prewarm_layout(&cfg, 2, sparks);
+            assert_eq!(layout.variant, variant);
+            assert_eq!(layout.ranks, 2);
+            assert_eq!(layout.sparks, sparks);
+            assert_eq!(layout.entries.iter().map(|entry| entry.rows).collect::<Vec<_>>(), (1..=64).collect::<Vec<_>>());
+            assert!(layout.entries.iter().all(|entry| !entry.pin));
+            let resolved = crate::families::mimo_v2::decode_graph::graph_layout(&cfg, 2, sparks, true).unwrap();
+            assert!(resolved.pinned.is_empty());
+            assert_eq!(resolved.rows, (1..=64).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
     fn untraced_variant_bootstraps_instead_of_borrowing() {
         let mut cfg = MimoV2Config::from_hf(&crate::plan::testing::mimo_flash_mopd_config()).unwrap();
         cfg.layers = 47;
