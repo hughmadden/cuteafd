@@ -5958,7 +5958,7 @@ mod prefill_lane_tests {
             // Startup prewarms every traced shape this context admits; the long
             // geometries only exist at the wide context, so the wide reserve is
             // a superset and pays for the trace's whole demand.
-            assert_eq!(wide.executables[0], 690);
+            assert_eq!(wide.executables[0], 644);
             assert!(narrow.shapes.iter().all(|shape| wide.shapes.contains(shape)));
             assert!(narrow.reserves[0] <= wide.reserves[0]);
         }

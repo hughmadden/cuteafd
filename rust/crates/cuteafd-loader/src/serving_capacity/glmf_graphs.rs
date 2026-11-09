@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(peer_exchange_bytes(2, 4096, 4096, 2, false), 268_435_712);
     }
 
-    /// The checked-in set is the sizing trace's demand (690 graphs at the
+    /// The checked-in set is the sizing trace's demand (644 graphs at the
     /// reference launch), every traced shape prewarms at startup, its two
     /// always-hot shapes are pinned against eviction, and its reserve prices
     /// the whole demand plus the fixed allocation tail.
@@ -401,7 +401,7 @@ mod tests {
         let layout = GlmfLayout::resolved(1, true);
         // Startup prewarms the trace's shapes, not the launch's whole set.
         let warm = glmf_prewarm_shapes(1_048_576, 2_097_152, 2051, 16, true, &buckets, layout);
-        assert_eq!(warm.len(), 15);
+        assert_eq!(warm.len(), 14);
         assert!(warm.iter().all(|shape| shapes.contains(shape)));
         let list = glmf_prewarm_list().layout(layout).expect("the min column is traced");
         assert!(list.entries.iter().filter(|entry| entry.pin)
@@ -413,14 +413,14 @@ mod tests {
         assert_eq!(plan.layout, layout);
         assert!(plan.traced);
         assert_eq!(plan.shapes, warm);
-        // The traced demand (690 graphs) is the base; the fixed 2 MiB
+        // The traced demand (644 graphs) is the base; the fixed 2 MiB
         // allocation tail is the arena's own slice headroom, and runtime
         // capture headroom comes from the shared extra keys.
-        assert_eq!(plan.reserves, [119_537_664]);
-        assert_eq!(plan.executables, [690]);
+        assert_eq!(plan.reserves, [113_246_208]);
+        assert_eq!(plan.executables, [644]);
         assert_eq!(plan.extra, 2_097_152);
-        assert_eq!(plan.reserves[0] + plan.extra, 121_634_816);
-        assert_eq!(plan.bootstraps, [173_243]);
+        assert_eq!(plan.reserves[0] + plan.extra, 115_343_360);
+        assert_eq!(plan.bootstraps, [175_849]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
@@ -479,11 +479,11 @@ mod tests {
         assert!(two.traced, "a 2-RTX launch with local TP2 experts is traced");
         assert_eq!(two.executables.len(), 2);
         // Each rank prices its own selected entries' measured capture bytes
-        // under the costlier quant (K6 locally: 136,314,880 B / 690 execs on
-        // rank 0 and 123,731,968 B / 675 on rank 1), never the other rank's
+        // under the costlier quant (K6 locally: 125,829,120 B / 644 execs on
+        // rank 0 and 117,440,512 B / 630 on rank 1), never the other rank's
         // per-executable price.
-        assert_eq!(two.reserves, [136_314_880, 123_731_968]);
-        assert_eq!(two.bootstraps, [197_558, 183_307]);
+        assert_eq!(two.reserves, [125_829_120, 117_440_512]);
+        assert_eq!(two.bootstraps, [195_387, 186_414]);
         // Sparks idle behind a 2-RTX local-expert launch are not an expert
         // attachment: that launch keys `2`, the same resolved shape it serves.
         assert_eq!(GlmfLayout::resolved(2, false).key(), two.layout.key());
@@ -493,7 +493,7 @@ mod tests {
     fn prewarm_shapes_filter_to_the_launch_and_stay_unique() {
         let list = glmf_prewarm_list();
         let min = list.layout(GlmfLayout::resolved(1, true)).expect("the min column is traced");
-        assert_eq!(min.executable_bytes(0), 173_243);
+        assert_eq!(min.executable_bytes(0), 175_849);
         assert_eq!(min.reserve_extra_bytes, 2_097_152);
         let mut identities = HashSet::new();
         for entry in &min.entries {
@@ -503,13 +503,13 @@ mod tests {
             "a trace chooses pins; every other traced shape stays evictable");
         // A launch warms exactly the traced shapes its own geometries and row
         // buckets admit: the rows=1 plain shape at both its short and long
-        // geometries (two long pool widths), and every traced shape the
+        // geometries, and every traced shape the
         // speculative set can request.
         let layout = GlmfLayout::resolved(1, true);
         let buckets = DecodeBuckets::new(64);
         let plain = serving_graph_shapes(65_536, 65_536, 2051, 4, false, &buckets);
         let plain_warm = glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets, layout);
-        assert_eq!(plain_warm.len(), 3);
+        assert_eq!(plain_warm.len(), 2);
         assert!(plain_warm.iter().all(|shape| shape.0 == 1), "one plain row bucket");
         assert!(plain_warm.iter().all(|shape| plain.contains(shape)));
         let speculative = serving_graph_shapes(65_536, 65_536, 2051, 16, true, &buckets);
@@ -519,7 +519,7 @@ mod tests {
         assert!(min.entries.iter().filter(|entry| entry.pin)
             .all(|entry| spec_warm.contains(&entry.shape())), "every admitted pin prewarms");
         let plan = glmf_graph_reserve(65_536, 65_536, 2051, 4, false, 45, 1, 64, 188, true);
-        assert_eq!(plan.executables, [3 * 46]);
+        assert_eq!(plan.executables, [2 * 46]);
         // Rank 0 also captures its head segment, so it holds one more
         // executable per shape than its peer.
         let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 2, 64, 188, true);

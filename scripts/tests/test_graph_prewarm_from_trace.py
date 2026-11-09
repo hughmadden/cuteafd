@@ -46,6 +46,17 @@ def test_frequency_and_low_parameter_pin_candidate():
     assert result["reserve_extra_bytes"] == 2 << 20
 
 
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
+@pytest.mark.parametrize("missing", ["all", "one"])
+def test_glm_legacy_trace_without_replay_hits_names_the_required_upgrade(family, missing):
+    data = trace()
+    for graph in data["graphs"] if missing == "all" else data["graphs"][:1]:
+        del graph["hits"]
+    kwargs = {"layout": 1} if family == "mistral_large4" else {}
+    with pytest.raises(ValueError, match="legacy trace has no replay hits; regenerate with schema 2"):
+        MODULE.generate([data], family, **kwargs)
+
+
 def test_devices_are_not_added_and_repeated_snapshots_do_not_duplicate_shapes():
     result = MODULE.generate([trace(), trace(), trace(1, 12 << 20)], "glm5")
     assert len(result["entries"]) == 3

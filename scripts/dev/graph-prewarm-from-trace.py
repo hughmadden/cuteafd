@@ -686,6 +686,8 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
         for graph in trace["graphs"]:
             if not graph["site"].startswith(prefix):
                 continue
+            if version == 1 and "hits" not in graph:
+                raise ValueError("legacy trace has no replay hits; regenerate with schema 2")
             match = GEOMETRY.search(graph["shape"])
             if match is None:
                 raise ValueError(f"cannot parse {family} geometry: {graph['shape']!r}")
