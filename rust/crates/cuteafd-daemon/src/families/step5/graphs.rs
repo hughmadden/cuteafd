@@ -14,13 +14,14 @@ pub(super) struct Graphs<'a> {
     bank: RefCell<GraphBank<Key, GraphOwner<'a, ()>>>,
     // A section found to contain fewer than two nodes always stays eager.
     eager: RefCell<HashSet<Key>>,
+    touched: RefCell<HashSet<Key>>,
     device: i32,
 }
 
 impl<'a> Graphs<'a> {
     pub(super) fn new() -> Self {
         Self { bank: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "step5")),
-            eager: RefCell::new(HashSet::new()), device: -1 }
+            eager: RefCell::new(HashSet::new()), touched: RefCell::new(HashSet::new()), device: -1 }
     }
 
     pub(super) fn attach(&mut self, library: &'a cuteafd_ffi::NativeLibrary, device: i32,
@@ -49,6 +50,9 @@ impl<'a> Graphs<'a> {
 
     pub(super) fn run(&self, key: Key, stream: &Stream<'a>, work: impl Fn() -> Result<()>) -> Result<()> {
         if self.eager.borrow().contains(&key) { return work(); }
+        // First use initializes modules/workspaces eagerly; the outer step drains
+        // before a later use can reserve capture growth for this geometry.
+        if self.touched.borrow_mut().insert(key) { return work(); }
         if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
             return stream.device.run(|| {
                 // SAFETY: containing execution and staging owners retain every captured buffer;
