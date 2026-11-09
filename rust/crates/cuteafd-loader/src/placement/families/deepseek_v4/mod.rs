@@ -474,6 +474,34 @@ mod default_tests {
         prepared.admit(request).map(|admitted| admitted.placement)
     }
 
+    /// The graph arena is exactly one canonical `graph reserve` owner per
+    /// coordinator GPU. `/v1/stats` reconciliation sums only owners named
+    /// exactly that (shared/memory_report/reconcile.rs), so a family-named row
+    /// would report a zero reserve and no measured-arena slack.
+    #[test]
+    fn graph_reserve_is_one_canonical_owner_per_coordinator_gpu() {
+        use crate::placement::planner::{Location, Phase};
+        let mut input = plan_inputs(&context_cfg());
+        input.attention = Some(AttentionPlacement::Heads);
+        let admitted = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
+        assert_eq!(admitted.graph_reserves.len(), 2);
+        for (rank, &reserve) in admitted.graph_reserves.iter().enumerate() {
+            assert!(reserve > 0, "rtx{rank} admits a graph arena");
+            let items = admitted.solved.items_at(Location::coordinator(rank as u8), Phase::Growth).unwrap();
+            let owners = cuteafd_core::memory_policy::MemoryPolicy::default().scoped(||
+                crate::placement::reserve::breakdown(format!("rtx{rank}"),
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, &items));
+            let graph: Vec<_> = owners.reserve.iter().filter(|owner| owner.name == "graph reserve").collect();
+            assert_eq!(graph.len(), 1, "one graph reserve owner on rtx{rank}: {:?}",
+                owners.reserve.iter().map(|owner| owner.name.as_str()).collect::<Vec<_>>());
+            assert_eq!(graph[0].bytes, reserve, "the owner charges the admitted arena once");
+            assert!(owners.reserve.iter().all(|owner|
+                    owner.name == "graph reserve" || !owner.name.contains("graph")),
+                "no other graph owner row: {:?}",
+                owners.reserve.iter().map(|owner| owner.name.as_str()).collect::<Vec<_>>());
+        }
+    }
+
     /// The pre-weight base and the code still to load are named Runtime owners
     /// on every coordinator GPU, lead and peer alike: the planned allowance
     /// offline, the measured sample's occupancy in serve (#1614).
