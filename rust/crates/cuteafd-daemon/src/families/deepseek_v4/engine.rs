@@ -2415,6 +2415,21 @@ mod coverage_tests {
     }
 
     #[test]
+    fn an_empty_pin_list_pins_no_startup_row() {
+        // Only a trace-derived entry pins: an untraced layout's boot policy
+        // supplies no geometry, so even a width-0 startup capture stays an
+        // ordinary ARC entry.
+        let key = |attention, rows, table_width| super::GraphKey { layer: 3, rows, chunked: false,
+            attention, table_width, table_stride: table_width, previous: 0, tp2_broadcast: false,
+            exchange_f32: false };
+        for attention in ["local-experts", "tail", "c4"] {
+            for table_width in [0, 128] {
+                assert!(!super::pinned_geometry(&[], &key(attention, 16, table_width)));
+            }
+        }
+    }
+
+    #[test]
     fn legacy_coverage_matches_attention_expert_and_tail_composition() {
         let base = super::GraphKey { layer: 3, rows: 33, chunked: true, attention: "c4",
             table_width: 8, table_stride: 8, previous: 4, tp2_broadcast: false, exchange_f32: false };

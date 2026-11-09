@@ -178,7 +178,10 @@ pub fn v4_prewarm(gpus: usize, sparks: bool) -> Result<Vec<V4PrewarmEntry>, Stri
 /// The pinned geometries this shape keeps resident, as `(rows, table_width)`:
 /// a graph the trace shows as always hot is captured pinned, so churn elsewhere
 /// cannot evict it. V4's startup set is the width-0 row classes; a verify
-/// geometry is pinned only where its own trace showed sustained heat.
+/// geometry is pinned only where its own trace showed sustained heat. Only
+/// trace-derived entries may pin: a shape without a trace has no entries, so
+/// it warms nothing and pins nothing, and every graph it captures lives in the
+/// shared ARC like any other family's.
 pub fn v4_pinned(gpus: usize, sparks: bool) -> Result<Vec<(usize, usize)>, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).entries.into_iter()
         .filter(|entry| entry.pin)
@@ -230,6 +233,23 @@ mod tests {
         assert!(v4_reserves(3, true).is_err());
         assert!(v4_bootstraps(0, true).is_err());
         assert!(v4_pinned(3, false).is_err());
+    }
+
+    #[test]
+    fn an_untraced_shape_pins_nothing() {
+        // Only trace-derived entries may pin (TJ, 2026-11-09). A shape without
+        // a trace has no entry list, so its startup bootstrap is a charge
+        // estimate, not residency: the engine warms no set for it and the boot
+        // policy hands the cache an empty pin list.
+        for (gpus, sparks) in [(1, true), (1, false), (2, true), (2, false)] {
+            if v4_traced(gpus, sparks).unwrap() { continue }
+            assert_eq!((gpus, sparks), (1, false), "a new traced layout needs its own card");
+            assert!(v4_prewarm(gpus, sparks).unwrap().is_empty());
+            assert!(v4_pinned(gpus, sparks).unwrap().is_empty());
+            // The bootstrap estimate stays a per-rank charge for a device with
+            // no measured capture; it is never a pin.
+            assert_eq!(v4_bootstraps(gpus, sparks).unwrap(), vec![8 << 20; gpus]);
+        }
     }
 
     #[test]
