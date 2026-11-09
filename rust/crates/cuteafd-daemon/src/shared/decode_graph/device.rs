@@ -125,6 +125,7 @@ struct Record {
     node_rate: u64,
     graph_rate: u64,
     parallel_width: usize,
+    spans_devices: bool,
     stats: Box<KeyStats>,
 }
 
@@ -560,13 +561,14 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, stats: KeyStats::new(now) });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
             record.bytes = estimate; record.pinned = pinned; record.pending_capture = true;
             record.nodes = nodes; record.node_rate = metadata.node_rate;
             record.graph_rate = metadata.graph_rate; record.parallel_width = metadata.parallel_width;
+            record.spans_devices |= site.spans_devices;
             self.pending_growth = self.pending_growth.max(projected);
             self.unmeasured = true;
             self.pools.live_nodes = next_nodes;
@@ -604,7 +606,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, stats: KeyStats::new(now) });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -633,6 +635,9 @@ impl DeviceCache {
 
     pub fn captured_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
         let Some(record) = self.records.get_mut(&id) else { return };
+        // Peer pointers in kernel arguments are invisible to native inspection.
+        let spans_devices = spans_devices || record.spans_devices;
+        record.spans_devices = spans_devices;
         if width != 1 || spans_devices {
             // Previously reserved chain discounts are no longer justified,
             // including pending captures elsewhere on this device.
@@ -981,6 +986,24 @@ mod tests {
         assert_eq!(cache.snapshot().top_churn.len(), 16);
         cache.remove_bank(1);
         assert_eq!(cache.snapshot().telemetry_bytes, 0);
+    }
+
+    #[test]
+    fn declared_peer_span_survives_single_device_native_inspection() {
+        let mut cache = DeviceCache::new(-8803, 100);
+        let mut peer_site = site(Preference::Capture);
+        peer_site.spans_devices = true;
+        let Miss::Capture(id) = cache.miss(key(1), peer_site, None, false) else { panic!("capture expected") };
+        assert!(!cache.chain_only); // Admission already excludes peer reuse.
+        // Isolate topology's independent protection against hidden peer pointers.
+        cache.chain_only = true;
+        cache.captured_topology(id, 1, 1, false);
+        assert!(!cache.chain_only);
+        assert!(cache.records[&id].spans_devices);
+        assert!(cache.pending_growth >= cache.pending_bytes);
+        cache.measured_capture(10);
+        cache.captured_topology(id, 1, 1, false);
+        assert!(!cache.chain_only);
     }
 
     #[test]
