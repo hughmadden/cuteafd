@@ -62,6 +62,30 @@ to an absolute host path whose parent exists. The launcher writes one
 the card results. It contains schema_version, cache charge/reserve/basis/pools,
 site measurement classes, and identities with count, per-cycle counts,
 first-seen time, native maximum ready-frontier width and device-span flag.
+Schema 2 adds hits, misses, captures, evictions, recaptures (successful captures
+after eviction), ghost_hits (misses found in ARC history), last_hit_ms and a
+rolling hit_histogram: at most 60 intervals of 10 seconds, oldest first, with
+start_ms and interval_ms. The final interval is partial. Lifetime counters are
+not windowed; telemetry lives only as long as its resident/ghost ARC record.
+Forgotten ghosts lose their history. `/v1/stats` graph_cache includes top_hits
+and top_churn (evictions + recaptures), up to 16 identities each per device,
+with the same fields even without tracing. telemetry_bytes reports the owned
+per-key statistics payload, including histogram rings, not allocator overhead.
+Pinned replay is lock-free: per-key counts flush at cycle/boundary with that
+boundary's time. ARC hits use the clock sampled at cycle entry or boundary,
+not a clock read per launch. Timestamps/windows are cycle/boundary-attributed,
+not launch-exact; sampled_at_ms identifies the device snapshot time.
+Miss identities expose bank-local key_id and are interned by exact typed-key equality; hash collisions and
+identical display strings cannot merge keys. Display strings are built once
+per interned key, not per miss. Interned keys are pruned with forgotten ARC
+records at boundaries and cleared at teardown.
+
+Each row includes capture_bytes (the latest proportional share of measured
+step-boundary arena growth, null before capture and possibly zero on reuse),
+nodes (native count when inspected, otherwise node-model count or null),
+executables, basis, and permanent_bytes (the
+unpacked node/exec model estimate or byte-based ARC size). These are not extra
+physical charges: shared 2 MiB driver pools remain charged once per device.
 
 Generate a proposal with:
 
@@ -72,8 +96,22 @@ python3 scripts/dev/graph-prewarm-from-trace.py --family glm5 \
 
 The generator aggregates segment identities into geometry frequency, excludes
 startup Other counts when per-cycle counts exist, takes the maximum across
-overlapping snapshots/devices, selects requested frequency coverage, and pins
-a hot minimum-parameter geometry. The base is the maximum measured physical
+overlapping snapshots/devices, and selects requested frequency coverage.
+Schema 2 proposes pins when at least 60% of at least three complete observed
+intervals have hits, or when a key has at least two evictions and two recaptures;
+churning candidates survive the frequency cutoff. Inspect rolling heat and
+request-cycle counts together: startup or an early burst alone is not evidence
+of sustained request demand. Schema 1 retains its legacy hot minimum-parameter
+heuristic because it has no interval/churn data. Each proposed pin prints a
+per-device observed permanent-cost lower bound, observed reserve-fraction lower
+bound, measured capture share and model basis to stdout (unknown for legacy
+traces). A geometry pin covers every layer/residual/head variant, while bounded
+traces may omit those variants: the full permanent_bytes and reserve_fraction
+are explicitly unknown, never presented as the observed subset's sum.
+Heat and costs use only the latest complete snapshot's identity set per device;
+forgotten identities cannot keep old heat alive. The output list keeps its
+consumer schema.
+The base is the maximum measured physical
 graph high-water, rounded to 2 MiB; extra is one largest measured capture,
 separately rounded. Review the proposal, update the family's checked-in list,
 and relaunch before accepting it. Extend the parser/consumer for each new

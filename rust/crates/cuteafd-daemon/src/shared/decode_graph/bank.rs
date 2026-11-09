@@ -77,6 +77,7 @@ struct Entry<E> {
     exec: E,
     launched: u64,
     cached: Option<(u64, bool)>,
+    pinned_slot: Option<usize>,
 }
 
 struct DeviceBinding {
@@ -84,13 +85,27 @@ struct DeviceBinding {
     bank: u64,
     site: super::device::Site,
     pinned_hits: u64,
-    trace: bool,
+    pinned_counts: Vec<(u64, u64)>,
+}
+
+impl DeviceBinding {
+    fn flush(&mut self, cache: &mut super::device::DeviceCache) {
+        if std::mem::take(&mut self.pinned_hits) == 0 { return }
+        cache.sample_clock();
+        for (id, count) in &mut self.pinned_counts {
+            cache.pinned_hits(*id, self.site.cycle, std::mem::take(count));
+        }
+    }
 }
 
 /// E owns the capture's GraphOwner (including its resource pins). The bank is
 /// independent of the native executable type, allowing CPU-only policy tests.
 pub(crate) struct GraphBank<K, E> {
     entries: HashMap<K, Entry<E>>,
+    cache_keys: HashMap<K, super::device::Identity>,
+    next_cache_key: u64,
+    cache_key_generation: u64,
+    cache_keys_dirty: bool,
     seen: HashSet<K>,
     policy: GraphPolicy,
     family: &'static str,
@@ -117,7 +132,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// Names the owning family in startup-miss warnings and /v1/stats, so a
     /// shared bank's miss is attributable without looking up its construction.
     pub fn with_family(policy: GraphPolicy, family: &'static str) -> Self {
-        Self { entries: HashMap::new(), seen: HashSet::new(), policy, family, startup: None, startup_sealed: false,
+        Self { entries: HashMap::new(), cache_keys: HashMap::new(), next_cache_key: 0, cache_key_generation: 0, cache_keys_dirty: false, seen: HashSet::new(), policy, family, startup: None, startup_sealed: false,
             clock: 0, stats: GraphStats::default(), measured_bytes: 0, measured: 0,
             frozen: None, retired: Vec::new(), device: None }
     }
@@ -126,8 +141,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
         let cache = super::device::device_cache(device, reserve, site.basis)?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
-        let trace = cache.lock().unwrap_or_else(|p| p.into_inner()).tracing();
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, trace });
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
         Ok(())
     }
 
@@ -135,19 +149,22 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// fast path and flushing its previous cycle before switching.
     pub fn cache_cycle(&mut self, cycle: super::device::Cycle) {
         if let Some(binding) = &mut self.device {
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            cache.sample_clock();
             if binding.site.cycle != cycle {
-                binding.cache.lock().unwrap_or_else(|p| p.into_inner())
-                    .pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+                binding.flush(&mut cache);
                 binding.site.cycle = cycle;
             }
         }
     }
 
     pub fn cached_launch(&mut self, key: &K) -> Option<&E> {
-        let entry = self.entries.get(key)?;
+        let entry = self.entries.get_mut(key)?;
         if let (Some(binding), Some((id, pinned))) = (&mut self.device, entry.cached) {
-            if pinned && !binding.trace {
+            if pinned {
                 binding.pinned_hits += 1;
+                binding.pinned_counts[entry.pinned_slot.expect("pinned cache slot")].1 += 1;
             } else {
                 binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_cycle(id, binding.site.cycle);
             }
@@ -157,12 +174,26 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn cache_miss(&mut self, key: &K, pinned: bool, node_estimate: Option<super::device::Estimate>) -> super::device::Miss {
         let Some(binding) = &self.device else { return super::device::Miss::Eager };
-        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(super::device::Identity {
-            bank: binding.bank, site: binding.site.name, shape: format!("{key:?}") }, binding.site, node_estimate, pinned)
+        let identity = if let Some(identity) = self.cache_keys.get(key) { identity.clone() } else {
+            self.next_cache_key = self.next_cache_key.checked_add(1).expect("graph key identity exhausted");
+            let identity = super::device::Identity { bank: binding.bank, site: binding.site.name,
+                key: self.next_cache_key, shape: format!("{key:?}").into() };
+            self.cache_keys.insert(key.clone(), identity.clone());
+            self.cache_keys_dirty = true;
+            identity
+        };
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(identity, binding.site, node_estimate, pinned)
     }
 
     pub fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
-        self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)) });
+        let pinned_slot = if pinned {
+            self.device.as_mut().map(|binding| {
+                let slot = binding.pinned_counts.len();
+                binding.pinned_counts.push((id, 0));
+                slot
+            })
+        } else { None };
+        self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)), pinned_slot });
     }
 
     pub fn cache_cancel(&mut self, id: u64) {
@@ -178,16 +209,25 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// Explicit teardown only, after the caller drains all consumers.
     pub fn cache_clear_drained(&mut self) {
         self.entries.clear();
+        self.cache_keys.clear();
         self.retired.clear();
-        if let Some(binding) = &self.device {
+        if let Some(binding) = &mut self.device {
+            binding.pinned_hits = 0;
+            binding.pinned_counts.clear();
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
         }
     }
 
     pub fn cache_tick(&mut self) {
         if let Some(binding) = &mut self.device {
-            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            binding.flush(&mut cache);
+            if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
+                self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
+                self.cache_keys_dirty = false;
+                self.cache_key_generation = cache.identity_generation();
+            }
             cache.boundary();
         }
     }
@@ -198,8 +238,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn cache_measured(&mut self, bytes: u64) {
         if let Some(binding) = &mut self.device {
-            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            binding.flush(&mut cache);
             cache.measured_capture(bytes);
         }
     }
@@ -210,8 +251,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         measure: impl FnOnce() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
         let Some(binding) = &mut self.device else { return Ok(()) };
         let victims: Vec<_> = {
-            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
-            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            let shared = binding.cache.clone();
+            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+            binding.flush(&mut cache);
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
@@ -224,7 +266,13 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
                 &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>(), measurement);
         }
-        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).boundary();
+        let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if self.cache_keys_dirty || self.cache_key_generation != cache.identity_generation() {
+            self.cache_keys.retain(|_, identity| cache.retains_identity(identity));
+            self.cache_keys_dirty = false;
+            self.cache_key_generation = cache.identity_generation();
+        }
+        cache.boundary();
         Ok(())
     }
 
@@ -351,7 +399,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.measured_bytes += bytes;
             self.measured += 1;
         }
-        if let Some(old) = self.entries.insert(key.clone(), Entry { exec, launched: self.clock, cached: None }) {
+        if let Some(old) = self.entries.insert(key.clone(), Entry { exec, launched: self.clock, cached: None, pinned_slot: None }) {
             self.freeze();
             self.retired.push(old.exec);
         }
@@ -418,7 +466,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
 impl<K, E> Drop for GraphBank<K, E> {
     fn drop(&mut self) {
-        if let Some(binding) = &self.device {
+        if let Some(binding) = &mut self.device {
+            binding.pinned_hits = 0;
+            binding.pinned_counts.clear();
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
         }
         if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
@@ -713,7 +763,7 @@ mod device_tests {
         // Same proven kind in another bank needs this graph's slot.
         let cache = bank.device.as_ref().unwrap().cache.clone();
         let Miss::Eager = cache.lock().unwrap().miss(super::super::device::Identity {
-            bank: 99, site: "bank-test", shape: "1".into() }, site(), None, false) else { panic!() };
+            bank: 99, site: "bank-test", key: 1, shape: "1".into() }, site(), None, false) else { panic!() };
         assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
         assert_eq!(drops.get(), 0);
         bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
@@ -737,6 +787,59 @@ mod device_tests {
         let cache = bank.device.as_ref().unwrap().cache.clone();
         assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Verify), 2);
         assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Decode), 0);
+        bank.cached_launch(&1);
+        bank.cache_tick();
+        let rows = super::super::device::snapshots();
+        let snapshot = rows.iter().find(|row| row.device == -303).unwrap();
+        let json = serde_json::to_value(snapshot).unwrap();
+        let pinned = json["top_hits"].as_array().unwrap().iter().find(|row| row["pinned"] == true).unwrap();
+        assert_eq!(pinned["hits"], 2);
+        assert_eq!(pinned["cycles"]["verify"], 1);
+        assert_eq!(pinned["cycles"]["decode"], 2); // Initial capture miss plus replay.
+        assert!(pinned["last_hit_ms"].is_u64());
+        assert_eq!(pinned["hit_histogram"]["counts"].as_array().unwrap().iter().map(|n| n.as_u64().unwrap()).sum::<u64>(), 2);
+    }
+
+    #[test]
+    fn miss_keys_use_typed_equality_and_do_not_reformat_repeated_misses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static FORMATS: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Clone, PartialEq, Eq)]
+        struct Key(u32);
+        impl std::hash::Hash for Key {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) { 0u32.hash(state); }
+        }
+        impl std::fmt::Debug for Key {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                FORMATS.fetch_add(1, Ordering::Relaxed);
+                f.write_str("identical display")
+            }
+        }
+        let mut bank: GraphBank<Key, u32> = GraphBank::new(None);
+        bank.attach_device(-304, 100, Site { preference: Preference::Eager, ..site() }).unwrap();
+        assert!(matches!(bank.cache_miss(&Key(1), false, None), Miss::Eager));
+        assert!(matches!(bank.cache_miss(&Key(2), false, None), Miss::Eager));
+        let first = bank.cache_keys[&Key(1)].clone();
+        let second = bank.cache_keys[&Key(2)].clone();
+        assert_ne!(first, second, "hash collisions and identical Debug text must not alias");
+        assert!(matches!(bank.cache_miss(&Key(1), false, None), Miss::Eager));
+        assert_eq!(first, bank.cache_keys[&Key(1)]);
+        bank.cache_tick();
+        assert_eq!(bank.cache_keys.len(), 2, "retained ghosts keep exact typed identities");
+        assert_eq!(FORMATS.load(Ordering::Relaxed), 2);
+        assert_eq!(bank.cache_keys.len(), 2);
+        bank.cache_clear_drained();
+        assert!(bank.cache_keys.is_empty());
+    }
+
+    #[test]
+    fn transient_interned_keys_are_pruned_at_boundary() {
+        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        bank.attach_device(-305, 1, site()).unwrap();
+        assert!(matches!(bank.cache_miss(&1, false, None), Miss::Eager));
+        assert_eq!(bank.cache_keys.len(), 1);
+        bank.cache_tick();
+        assert!(bank.cache_keys.is_empty());
     }
 
     #[test]
@@ -750,6 +853,9 @@ mod device_tests {
             bank.cache_insert(key, key, id, key == 1); bank.cache_measured(10);
         }
         let iterations = 1_000_000;
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(bank.get(black_box(&1))); }
+        println!("plain: {:.1} ns/replay", started.elapsed().as_nanos() as f64 / iterations as f64);
         for (label, key) in [("pinned", 1), ("arc", 2), ("miss", 3)] {
             let started = Instant::now();
             for _ in 0..iterations {

@@ -43,11 +43,32 @@ pub(crate) struct Site {
     pub spans_devices: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Identity {
     pub bank: u64,
     pub site: &'static str,
-    pub shape: String,
+    #[serde(rename = "key_id")]
+    pub key: u64,
+    #[serde(serialize_with = "serialize_shape")]
+    pub shape: Arc<str>,
+}
+
+fn serialize_shape<S: serde::Serializer>(shape: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(shape)
+}
+
+// The bank interns typed keys with exact equality. Display text is diagnostic,
+// never an identity: distinct keys may deliberately have identical Debug output.
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        (self.bank, self.site, self.key) == (other.bank, other.site, other.key)
+    }
+}
+impl Eq for Identity {}
+impl std::hash::Hash for Identity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&(self.bank, self.site, self.key), state);
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug, serde::Serialize)]
@@ -69,6 +90,10 @@ pub(crate) struct Snapshot {
     pub cycles: HashMap<Cycle, Counters>,
     pub pools: Pools,
     pub basis: Basis,
+    pub sampled_at_ms: u64,
+    pub telemetry_bytes: usize,
+    pub top_hits: Vec<TraceRow>,
+    pub top_churn: Vec<TraceRow>,
 }
 
 /// Release observations are deliberately independent of cudaMemGetInfo. An
@@ -98,6 +123,66 @@ struct Record {
     node_rate: u64,
     graph_rate: u64,
     parallel_width: usize,
+    stats: Box<KeyStats>,
+}
+
+const HIT_INTERVAL_MS: u64 = 10_000;
+const HIT_INTERVALS: usize = 60;
+
+/// Owned by a resident or bounded ARC ghost; forgetting the key frees its history.
+struct KeyStats {
+    count: u64,
+    hits: u64,
+    misses: u64,
+    captures: u64,
+    evictions: u64,
+    recaptures: u64,
+    ghost_hits: u64,
+    cycles: [u64; 5],
+    first_seen_ms: u64,
+    last_hit_ms: Option<u64>,
+    hit_intervals: [u64; HIT_INTERVALS],
+    interval: u64,
+    capture_bytes: Option<u64>,
+    native_nodes: Option<u64>,
+    declared_capture_streams: usize,
+    max_parallel_width: usize,
+    spans_devices: bool,
+    evicted_since_capture: bool,
+}
+
+impl KeyStats {
+    fn new(now: u64) -> Box<Self> {
+        Box::new(Self { count: 0, hits: 0, misses: 0, captures: 0, evictions: 0,
+            recaptures: 0, ghost_hits: 0, cycles: [0; 5], first_seen_ms: now,
+            last_hit_ms: None, hit_intervals: [0; HIT_INTERVALS], interval: now / HIT_INTERVAL_MS,
+            capture_bytes: None, native_nodes: None, declared_capture_streams: 1, max_parallel_width: 0,
+            spans_devices: false, evicted_since_capture: false })
+    }
+
+    fn event(&mut self, cycle: Cycle, count: u64) {
+        self.count += count;
+        self.cycles[cycle as usize] += count;
+    }
+
+    fn hit(&mut self, cycle: Cycle, count: u64, now: u64) {
+        if count == 0 { return }
+        self.event(cycle, count);
+        self.hits += count;
+        self.last_hit_ms = Some(now);
+        // Startup Other hits must not look like sustained request demand.
+        if !matches!(cycle, Cycle::Decode | Cycle::Verify) { return }
+        let interval = now / HIT_INTERVAL_MS;
+        if interval.saturating_sub(self.interval) >= HIT_INTERVALS as u64 {
+            self.hit_intervals.fill(0);
+        } else {
+            for elapsed in self.interval + 1..=interval {
+                self.hit_intervals[elapsed as usize % HIT_INTERVALS] = 0;
+            }
+        }
+        self.interval = interval;
+        self.hit_intervals[interval as usize % HIT_INTERVALS] += count;
+    }
 }
 
 #[derive(Default)]
@@ -130,7 +215,7 @@ fn may_capture(preference: Preference, estimate: u64, headroom: u64, reserve: u6
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
-struct TraceRow {
+pub(crate) struct TraceRow {
     device: i32,
     #[serde(flatten)]
     identity: Identity,
@@ -138,9 +223,31 @@ struct TraceRow {
     count: u64,
     cycles: HashMap<Cycle, u64>,
     first_seen_ms: u64,
+    hits: u64,
+    misses: u64,
+    captures: u64,
+    evictions: u64,
+    recaptures: u64,
+    ghost_hits: u64,
+    last_hit_ms: Option<u64>,
+    hit_histogram: HitHistogram,
+    capture_bytes: Option<u64>,
+    nodes: Option<u64>,
+    executables: u64,
+    basis: Basis,
+    permanent_bytes: u64,
+    pinned: bool,
     declared_capture_streams: usize,
     max_parallel_width: usize,
     spans_devices: bool,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct HitHistogram {
+    rolling: bool,
+    interval_ms: u64,
+    start_ms: u64,
+    counts: Vec<u64>,
 }
 
 pub(crate) enum Miss { Capture(u64), Eager }
@@ -178,6 +285,7 @@ pub(crate) struct DeviceCache {
     pending_bytes: u64,
     next_id: u64,
     next_bank: u64,
+    identity_generation: u64,
     recent_target: u64,
     records: HashMap<u64, Record>,
     identities: HashMap<Identity, u64>,
@@ -191,32 +299,33 @@ pub(crate) struct DeviceCache {
     pending_destroy: usize,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
+    clock_ms: u64,
     last_report: Instant,
     interval_evictions: u64,
     trace: Option<std::path::PathBuf>,
     last_trace: Instant,
-    trace_rows: HashMap<Identity, TraceRow>,
 }
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0,
+        Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
-            counters: HashMap::new(), started: Instant::now(), last_report: Instant::now(),
+            counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
-            last_trace: Instant::now() - Duration::from_secs(1), trace_rows: HashMap::new() }
+            last_trace: Instant::now() - Duration::from_secs(1) }
     }
 
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
     pub fn reserve(&self) -> u64 { self.reserve }
+    pub fn identity_generation(&self) -> u64 { self.identity_generation }
+    pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
     pub fn needs_boundary(&self) -> bool {
         self.unmeasured || self.pending_destroy > 0
     }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
-    pub fn tracing(&self) -> bool { self.trace.is_some() }
 
     fn unlink(&mut self, id: u64) {
         let record = &self.records[&id];
@@ -248,7 +357,7 @@ impl DeviceCache {
 
     fn forget(&mut self, id: u64) {
         self.unlink(id);
-        if let Some(record) = self.records.remove(&id) { self.identities.remove(&record.identity); }
+        if let Some(record) = self.records.remove(&id) { self.identities.remove(&record.identity); self.identity_generation += 1; }
     }
 
     fn trim_ghosts(&mut self) {
@@ -261,32 +370,29 @@ impl DeviceCache {
         }
     }
 
-    fn trace(&mut self, identity: &Identity, cycle: Cycle) {
-        if self.trace.is_none() { return }
-        let row = self.trace_rows.entry(identity.clone()).or_insert_with(|| TraceRow {
-            device: self.device, identity: identity.clone(), cycle, count: 0, cycles: HashMap::new(),
-            first_seen_ms: self.started.elapsed().as_millis() as u64, declared_capture_streams: 1,
-            max_parallel_width: 0, spans_devices: false });
-        row.count += 1;
-        *row.cycles.entry(cycle).or_default() += 1;
-    }
-
     #[cfg(test)]
     pub fn hit(&mut self, id: u64) {
         let Some(record) = self.records.get(&id) else { return };
         self.hit_cycle(id, record.cycle);
     }
 
+    /// One timestamp per cycle/boundary, not per executable replay.
+    pub fn sample_clock(&mut self) { self.clock_ms = self.started.elapsed().as_millis() as u64; }
+
     pub fn hit_cycle(&mut self, id: u64, cycle: Cycle) {
-        let Some(record) = self.records.get(&id) else { return };
+        let now = self.clock_ms;
+        let Some(record) = self.records.get_mut(&id) else { return };
         let (pinned, pending) = (record.pinned, record.pending_destroy);
-        if self.trace.is_some() { let identity = record.identity.clone(); self.trace(&identity, cycle); }
+        record.stats.hit(cycle, 1, now);
         self.counters.entry(cycle).or_default().hits += 1;
         if !pinned && !pending { self.push(id, List::Frequent); }
     }
 
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
-    pub fn pinned_hits(&mut self, cycle: Cycle, count: u64) {
+    pub fn pinned_hits(&mut self, id: u64, cycle: Cycle, count: u64) {
+        if count == 0 { return }
+        let now = self.clock_ms;
+        if let Some(record) = self.records.get_mut(&id) { record.stats.hit(cycle, count, now); }
         self.counters.entry(cycle).or_default().hits += count;
     }
 
@@ -330,7 +436,7 @@ impl DeviceCache {
     }
 
     pub fn miss(&mut self, identity: Identity, site: Site, node_estimate: Option<Estimate>, pinned: bool) -> Miss {
-        self.trace(&identity, site.cycle);
+        let now = self.started.elapsed().as_millis() as u64;
         self.counters.entry(site.cycle).or_default().misses += 1;
         let compatible = site.basis == self.basis && match (self.basis, &node_estimate) {
             (Basis::Bytes, None | Some(Estimate { nodes: None, .. })) => true,
@@ -385,7 +491,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -396,10 +502,12 @@ impl DeviceCache {
             self.unmeasured = true;
             self.pools.live_nodes = next_nodes;
             self.pools.live_execs = next_execs;
-            if let Some(row) = self.trace_rows.get_mut(&self.records[&id].identity) {
-                row.declared_capture_streams = metadata.parallel_width;
-                row.spans_devices |= site.spans_devices;
-            }
+            let stats = &mut record.stats;
+            stats.event(site.cycle, 1);
+            stats.misses += 1;
+            stats.ghost_hits += u64::from(ghost.is_some());
+            stats.declared_capture_streams = metadata.parallel_width;
+            stats.spans_devices |= site.spans_devices;
             if metadata.parallel_width > 1 {
                 tracing::warn!(site = site.name, width = metadata.parallel_width,
                     "parallel graph capture; chain node model does not apply");
@@ -426,10 +534,16 @@ impl DeviceCache {
             self.next_id += 1;
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
-            self.records.insert(id, Record { identity, cycle: site.cycle, bytes: estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width });
+            self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
+        }
+        if let Some(id) = self.identities.get(&identity) {
+            let stats = &mut self.records.get_mut(id).unwrap().stats;
+            stats.event(site.cycle, 1);
+            stats.misses += 1;
+            stats.ghost_hits += u64::from(ghost.is_some());
         }
         self.counters.entry(site.cycle).or_default().eager_runs += 1;
         Miss::Eager
@@ -464,10 +578,9 @@ impl DeviceCache {
             record.nodes = nodes;
         }
         record.parallel_width = width;
-        if let Some(row) = self.trace_rows.get_mut(&record.identity) {
-            row.max_parallel_width = width;
-            row.spans_devices |= spans_devices;
-        }
+        if nodes != 0 || width != 0 { record.stats.native_nodes = Some(nodes); }
+        record.stats.max_parallel_width = width;
+        record.stats.spans_devices |= spans_devices;
     }
 
     /// Called once per device after the complete multi-rank step has drained.
@@ -488,6 +601,10 @@ impl DeviceCache {
             self.unlink(id);
             let record = self.records.get_mut(&id).unwrap();
             record.pending_capture = false;
+            record.stats.capture_bytes = Some(share);
+            record.stats.captures += 1;
+            if record.stats.evicted_since_capture { record.stats.recaptures += 1; }
+            record.stats.evicted_since_capture = false;
             // Zero physical growth can mean allocator reuse, not a zero-size
             // graph. Keep its estimate for victim ordering, never for charge.
             record.bytes = if share > 0 { share } else { estimated };
@@ -523,6 +640,8 @@ impl DeviceCache {
             self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
             self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
             if evicted {
+                record.stats.evictions += 1;
+                record.stats.evicted_since_capture = true;
                 self.counters.entry(record.cycle).or_default().evictions += 1;
                 self.interval_evictions += 1;
             }
@@ -556,6 +675,7 @@ impl DeviceCache {
     }
 
     pub fn boundary(&mut self) {
+        self.sample_clock();
         self.report_due(self.last_report.elapsed());
         if let Some(path) = &self.trace {
             // Trace mode counts every hit, but serializing thousands of keys
@@ -564,10 +684,11 @@ impl DeviceCache {
             self.last_trace = Instant::now();
             // Each device has its own snapshot file, avoiding concurrent writers.
             let path = path.with_extension(format!("device-{}.json", self.device));
-            let mut rows: Vec<_> = self.trace_rows.values().collect();
+            let now = self.started.elapsed().as_millis() as u64;
+            let mut rows: Vec<_> = self.records.values().map(|record| self.row(record, now)).collect();
             rows.sort_by(|a, b| (a.identity.site, a.identity.bank, &a.identity.shape)
                 .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)));
-            let document = serde_json::json!({"schema_version": 1, "cache": self.snapshot(), "graphs": rows,
+            let document = serde_json::json!({"schema_version": 2, "cache": self.snapshot(), "graphs": rows,
                 "sites": self.classes.iter().map(|(name, class)| (*name, serde_json::json!({
                     "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
                 }))).collect::<HashMap<_, _>>()});
@@ -578,9 +699,47 @@ impl DeviceCache {
     }
 
     fn snapshot(&self) -> Snapshot {
+        let now = self.started.elapsed().as_millis() as u64;
+        let ranked = |churn: bool| {
+            let mut records: Vec<_> = self.records.values().filter(|r| if churn {
+                r.stats.evictions + r.stats.recaptures > 0
+            } else { r.stats.hits > 0 }).collect();
+            records.sort_unstable_by(|a, b| {
+                let score = |r: &Record| if churn { r.stats.evictions + r.stats.recaptures } else { r.stats.hits };
+                score(b).cmp(&score(a)).then_with(|| (a.identity.site, a.identity.bank, &a.identity.shape)
+                    .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)))
+            });
+            records.into_iter().take(16).map(|record| self.row(record, now)).collect()
+        };
         Snapshot { device: self.device, reserve: self.reserve, charged: self.charged,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
-            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis }
+            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: ranked(false), top_churn: ranked(true) }
+    }
+
+    fn row(&self, record: &Record, now: u64) -> TraceRow {
+        let stats = &record.stats;
+        let end = now / HIT_INTERVAL_MS;
+        let start = end.saturating_sub(HIT_INTERVALS as u64 - 1);
+        let counts = (start..=end).map(|interval| {
+            if interval <= stats.interval && stats.interval - interval < HIT_INTERVALS as u64 {
+                stats.hit_intervals[interval as usize % HIT_INTERVALS]
+            } else { 0 }
+        }).collect();
+        TraceRow { device: self.device, identity: record.identity.clone(), cycle: record.cycle,
+            count: stats.count, cycles: [Cycle::Decode, Cycle::Verify, Cycle::Prefill, Cycle::Wave, Cycle::Other]
+                .into_iter().map(|cycle| (cycle, stats.cycles[cycle as usize])).collect(),
+            first_seen_ms: stats.first_seen_ms, hits: stats.hits, misses: stats.misses, captures: stats.captures,
+            evictions: stats.evictions, recaptures: stats.recaptures, ghost_hits: stats.ghost_hits,
+            last_hit_ms: stats.last_hit_ms, hit_histogram: HitHistogram {
+                rolling: true, interval_ms: HIT_INTERVAL_MS, start_ms: start * HIT_INTERVAL_MS, counts },
+            capture_bytes: stats.capture_bytes, nodes: stats.native_nodes.or_else(|| matches!(self.basis, Basis::Nodes { .. }).then_some(record.nodes)),
+            executables: 1, basis: self.basis,
+            permanent_bytes: match self.basis {
+                Basis::Bytes => record.bytes,
+                Basis::Nodes { node_rate, graph_rate } => record.nodes.saturating_mul(node_rate).saturating_add(graph_rate),
+            }, pinned: record.pinned, declared_capture_streams: stats.declared_capture_streams,
+            max_parallel_width: stats.max_parallel_width, spans_devices: stats.spans_devices }
     }
 }
 
@@ -588,12 +747,146 @@ impl DeviceCache {
 mod tests {
     use super::*;
     fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes, spans_devices: false } }
-    fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", shape: n.to_string() } }
+    fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", key: n, shape: n.to_string().into() } }
     fn capture(cache: &mut DeviceCache, n: u64, pinned: bool) -> u64 {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn per_key_churn_cost_and_forget_lifetime() {
+        let mut cache = DeviceCache::new(-213, 100);
+        let a = capture(&mut cache, 1, false);
+        cache.captured_topology(a, 0, 1, false);
+        cache.hit_cycle(a, Cycle::Verify);
+        assert_eq!(cache.mark_victim(false), Some(a));
+        cache.destroyed(&[a], ReleaseMeasurement { released: 0 });
+        assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(id) if id == a));
+        cache.measured_capture(0);
+        let row = cache.row(&cache.records[&a], 0);
+        assert_eq!((row.hits, row.misses, row.captures), (1, 2, 2));
+        assert_eq!((row.evictions, row.recaptures, row.ghost_hits), (1, 1, 1));
+        assert_eq!(row.capture_bytes, Some(0));
+        assert_eq!(row.permanent_bytes, 10, "reuse must not imply free permanent graph");
+        assert_eq!(row.executables, 1);
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.top_churn.len(), 1);
+        assert_eq!(snapshot.top_hits.len(), 1);
+        assert_eq!(snapshot.telemetry_bytes, std::mem::size_of::<KeyStats>());
+        cache.forget(a);
+        assert_eq!(cache.snapshot().telemetry_bytes, 0);
+        assert!(cache.snapshot().top_churn.is_empty());
+    }
+
+    #[test]
+    fn boundary_cost_shares_sum_to_physical_growth_with_node_basis() {
+        let mut cache = DeviceCache::new(-217, 64 << 20);
+        cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
+        let mut node_site = site(Preference::Capture);
+        node_site.basis = cache.basis;
+        let mut ids = Vec::new();
+        for n in [1, 2] {
+            let estimate = Some(Estimate { bytes: n * 2560 + 65536, nodes: Some(n),
+                node_rate: 2560, graph_rate: 65536, parallel_width: 1 });
+            let Miss::Capture(id) = cache.miss(key(n), node_site, estimate, false) else { panic!() };
+            ids.push(id);
+        }
+        cache.measured_capture(4 << 20);
+        assert_eq!(ids.iter().map(|id| cache.records[id].stats.capture_bytes.unwrap()).sum::<u64>(), 4 << 20);
+        let row = cache.row(&cache.records[&ids[1]], 0);
+        assert_eq!(row.nodes, Some(2));
+        assert_eq!(row.permanent_bytes, 2 * 2560 + 65536);
+        assert_eq!(row.basis, cache.basis);
+    }
+
+    #[test]
+    fn canceled_capture_and_cold_ghost_are_not_recaptures() {
+        let mut cache = DeviceCache::new(-214, 20);
+        capture(&mut cache, 1, true);
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+        let id = cache.identities[&key(2)];
+        assert_eq!(cache.records[&id].stats.ghost_hits, 1);
+        assert_eq!(cache.records[&id].stats.recaptures, 0);
+        cache.remove_bank(1);
+        let Miss::Capture(id) = cache.miss(key(3), site(Preference::Capture), None, false) else { panic!() };
+        cache.cancel_capture(id);
+        assert!(cache.snapshot().top_churn.is_empty());
+        assert_eq!(cache.snapshot().telemetry_bytes, 0);
+    }
+
+    #[test]
+    fn histogram_wraps_ages_idle_and_preserves_lifetime_hits() {
+        let mut cache = DeviceCache::new(-215, 100);
+        let id = capture(&mut cache, 1, false);
+        let stats = &mut cache.records.get_mut(&id).unwrap().stats;
+        stats.hit(Cycle::Decode, 3, 0);
+        stats.hit(Cycle::Verify, 5, 20_000);
+        let row = cache.row(&cache.records[&id], 30_000);
+        assert_eq!(row.hit_histogram.counts, vec![3, 0, 5, 0]);
+        let row = cache.row(&cache.records[&id], 620_000);
+        assert_eq!(row.hit_histogram.counts, vec![0; HIT_INTERVALS]);
+        assert!(row.hit_histogram.rolling);
+        let stats = &mut cache.records.get_mut(&id).unwrap().stats;
+        stats.hit(Cycle::Decode, 7, 630_000);
+        let row = cache.row(&cache.records[&id], 630_000);
+        assert_eq!(row.hit_histogram.counts.iter().sum::<u64>(), 7);
+        assert_eq!(row.hits, 15);
+        assert_eq!(row.last_hit_ms, Some(630_000));
+        assert_eq!(row.hit_histogram.start_ms, 40_000);
+    }
+
+    #[test]
+    fn arc_hits_use_cycle_clock_without_per_replay_sampling() {
+        let mut cache = DeviceCache::new(-218, 100);
+        let id = capture(&mut cache, 1, false);
+        cache.clock_ms = 25_000;
+        cache.hit_cycle(id, Cycle::Verify);
+        cache.hit_cycle(id, Cycle::Verify);
+        let row = cache.row(&cache.records[&id], 30_000);
+        assert_eq!(row.last_hit_ms, Some(25_000));
+        assert_eq!(row.hit_histogram.counts, vec![0, 0, 2, 0]);
+        assert_eq!(row.cycles[&Cycle::Verify], 2);
+    }
+
+    #[test]
+    #[ignore = "CPU telemetry attribution microbenchmark; run explicitly with --nocapture"]
+    fn telemetry_nanoseconds() {
+        use std::hint::black_box;
+        let iterations = 1_000_000;
+        let origin = Instant::now();
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(origin.elapsed().as_millis() as u64); }
+        println!("timestamp: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
+        let mut stats = KeyStats::new(0);
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(&mut stats).event(Cycle::Verify, black_box(1)); }
+        println!("boxed_counters: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(&mut stats).hit(Cycle::Verify, black_box(1), black_box(25_000)); }
+        println!("boxed_counters_and_ring: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
+    }
+
+    #[test]
+    fn stats_top_lists_are_bounded_sorted_and_available_without_trace() {
+        let mut cache = DeviceCache::new(-216, 1000);
+        assert!(cache.trace.is_none());
+        for n in 0..30 {
+            let id = capture(&mut cache, n, false);
+            cache.pinned_hits(id, Cycle::Decode, n + 1);
+        }
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.top_hits.len(), 16);
+        assert_eq!(snapshot.top_hits[0].hits, 30);
+        assert_eq!(snapshot.top_hits[15].hits, 15);
+        while let Some(id) = cache.mark_victim(false) {
+            cache.destroyed(&[id], ReleaseMeasurement { released: 0 });
+        }
+        assert_eq!(cache.snapshot().top_churn.len(), 16);
+        cache.remove_bank(1);
+        assert_eq!(cache.snapshot().telemetry_bytes, 0);
+    }
+
     #[test]
     fn cold_step_is_capped_and_unknown_site_bootstraps() {
         let mut cache = DeviceCache::new(-200, 100);
@@ -772,12 +1065,11 @@ mod tests {
         assert!(!cache.report_due(Duration::from_secs(1)));
         assert!(cache.report_due(Duration::from_secs(30)));
         assert!(!cache.report_due(Duration::from_secs(30)));
-        cache.trace = Some("unused".into());
-        cache.trace(&key(1), Cycle::Decode);
-        cache.trace(&key(1), Cycle::Verify);
-        let row = serde_json::to_value(&cache.trace_rows[&key(1)]).unwrap();
-        assert_eq!(row["site"], "test"); assert_eq!(row["count"], 2);
-        assert_eq!(row["cycles"]["decode"], 1);
+        cache.hit_cycle(a, Cycle::Decode);
+        cache.hit_cycle(a, Cycle::Verify);
+        let row = serde_json::to_value(cache.row(&cache.records[&a], 0)).unwrap();
+        assert_eq!(row["site"], "test"); assert_eq!(row["count"], 3);
+        assert_eq!(row["cycles"]["decode"], 2);
         assert_eq!(row["cycles"]["verify"], 1);
         assert!(row["first_seen_ms"].is_u64());
     }
