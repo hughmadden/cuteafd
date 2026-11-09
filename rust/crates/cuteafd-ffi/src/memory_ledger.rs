@@ -284,6 +284,23 @@ pub fn tensor(name: &str) {
     });
 }
 
+/// Names the work itself when it is not a checkpoint tensor (a decode graph's
+/// shape key, a scratch region): a failure or live row on this thread reports
+/// it as `tensor` without a `tensor_stem`, so it never joins the weights table.
+#[must_use = "the subject ends when the guard drops"]
+pub struct Subject(Option<&'static str>);
+
+pub fn subject(label: &str) -> Subject {
+    let label = intern(label);
+    CONTEXT.with(|context| Subject(context.borrow_mut().name.replace(label)))
+}
+
+impl Drop for Subject {
+    fn drop(&mut self) {
+        CONTEXT.with(|context| context.borrow_mut().name = self.0);
+    }
+}
+
 /// Format guard: allocations on this thread are tagged with this resident
 /// format (`bf16`, `fp8`, `fp8-scale`, ...) until it drops.
 #[must_use = "the format tag ends when the guard drops"]
@@ -944,6 +961,23 @@ mod tests {
         }
         assert_eq!(snapshot().total(Space::Device, 9), 0);
         assert_eq!(snapshot().peak[&(Space::Device, 9)], 3015);
+    }
+
+    /// Graph capture and instantiate allocate driver storage this ledger never
+    /// sees: a subject names that work in a failure dump without pretending it
+    /// is a checkpoint tensor (no stem, so it never joins the weights table).
+    #[test]
+    fn subject_names_non_tensor_work_without_a_weights_stem() {
+        let _ledger = test_guard();
+        {
+            let _scope = scope("test/graph");
+            let _subject = subject("decode graph rank=0 segment=1 rows=64");
+            let (key, name) = current_key(Space::Device, 12, TEST);
+            assert_eq!(name, Some("decode graph rank=0 segment=1 rows=64"));
+            assert_eq!(key.tensor, None);
+            assert_eq!(key.scope, "test/graph");
+        }
+        assert_eq!(CONTEXT.with(|context| context.borrow().name), None);
     }
 
     /// A category scope nested inside an owner relabels the category but keeps
