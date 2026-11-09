@@ -263,7 +263,6 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
             super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
     });
-    crate::shared::probe::graph_capture_stats(&mut stats);
     stats
 }
 

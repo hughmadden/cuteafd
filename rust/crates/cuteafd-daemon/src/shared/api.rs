@@ -120,6 +120,7 @@ impl ApiPolicy {
         cuteafd_bench::context::set_thinking_off(profile.encoding.supports_thinking_off());
         let profile = if snapshot.join("tokenizer.json").is_file() { profile.with_tokenizer(snapshot)? } else { profile };
         let mut profile = profile_with_health(profile);
+        profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats);
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };

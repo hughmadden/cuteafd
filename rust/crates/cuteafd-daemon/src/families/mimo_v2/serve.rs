@@ -1390,8 +1390,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
+            "prefilling": prefilling, "prefix_cache": cache.serving_stats(), "kv_reserve": reserve.snapshot(stalled),
+            "media": media.stats(cache.serving_stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }
 

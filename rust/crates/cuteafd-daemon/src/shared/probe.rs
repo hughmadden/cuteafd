@@ -90,7 +90,8 @@ pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: 
     Ok(spans)
 }
 
-/// Adds cumulative capture counts and site deltas since the last stats publication.
+/// Request-time diagnostics, called by the HTTP blocking worker, never a scheduler.
+/// Adds cumulative capture counts and site deltas since the last stats fetch.
 /// Gate clients subtract the cumulative fields across their own warmed interval.
 /// Startup-miss variants are cumulative too: each distinct shape a sealed graph
 /// set lacked with its eager run count, so a client sees which one to add.

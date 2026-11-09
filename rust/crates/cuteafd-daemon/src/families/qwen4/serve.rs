@@ -225,12 +225,6 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             let tokens: Vec<_> = bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
             engine.check_decode_padding(&tokens)?;
         }
-        // Startup captures must be visible in the first API statistics snapshot.
-        {
-            let mut stats = stats.lock().map_err(|_| anyhow::anyhow!("Qwen serving stats lock poisoned"))?;
-            *stats = serde_json::json!({});
-            probe::graph_capture_stats(&mut stats);
-        }
         scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences, draft, length, eos,
             decode_share, &prefix, loop_abort, args.token_io.token_select, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {

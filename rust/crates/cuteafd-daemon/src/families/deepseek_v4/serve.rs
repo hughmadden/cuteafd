@@ -647,7 +647,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "draft_policy": resource::snapshot(),
+            "prefilling": prefilling, "prefix_cache": cache.serving_stats(), "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
     }
 }

@@ -634,9 +634,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
+            "prefilling": prefilling, "prefix_cache": cache.serving_stats(), "kv_reserve": reserve.snapshot(stalled),
             "draft_policy": crate::shared::draft::resource::snapshot()});
-        crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
 

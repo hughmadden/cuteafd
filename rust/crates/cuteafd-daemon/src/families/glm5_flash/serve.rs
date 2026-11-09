@@ -911,11 +911,10 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.serving_stats(),
             "kv_reserve": reserve.snapshot(stalled),
             "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
-        crate::shared::probe::graph_capture_stats(&mut stats);
+            "media": media.stats(cache.serving_stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
         if active == 0 && prefilling == 0 {
             use cuteafd_ffi::memory_ledger::{snapshot, Space};

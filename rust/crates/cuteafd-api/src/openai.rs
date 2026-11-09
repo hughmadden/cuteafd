@@ -116,6 +116,8 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    /// Process diagnostics collected only by `/v1/stats` on a blocking worker.
+    pub stats_diagnostics: Option<fn(&mut Value)>,
     pub expert_usage: cuteafd_core::expert_usage::Reader,
     pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
@@ -163,7 +165,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -470,8 +472,14 @@ pub fn publish_host_heap(value: Value) {
 }
 
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
+    // Model-sized diagnostics never run on the serving thread or async reactor.
+    tokio::task::spawn_blocking(move || collect_stats(&state)).await.expect("stats worker panicked")
+}
+
+fn collect_stats(state: &NativeState) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
+    if let Some(collect) = state.profile.stats_diagnostics { collect(&mut value); }
     refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
