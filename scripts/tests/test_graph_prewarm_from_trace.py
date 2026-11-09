@@ -517,11 +517,48 @@ def test_mistral_large4_selects_its_site_prefix_and_layout():
     assert two["reserve_base_bytes"] == one["reserve_base_bytes"]
 
 
-def test_layout_is_required_for_mistral_large4_and_reserved_for_it():
+def test_layout_is_required_for_mistral_large4_and_optional_for_glm5():
     with pytest.raises(ValueError):
         MODULE.generate([trace()], "mistral_large4")
-    with pytest.raises(ValueError):
-        MODULE.generate([trace()], "glm5", layout=1)
+    assert MODULE.generate([trace()], "glm5", layout=1)["layout"] == 1
+    two = MODULE.generate([context_trace()], "glm5", coverage=0.99, layout=2)
+    assert two["layout"] == 2
+    assert [(entry["rows"], entry["table_width"]) for entry in two["entries"]] == [(1, 16), (16, 32)]
+
+
+def test_glm_two_rank_cli_keeps_built_widths(tmp_path):
+    import subprocess
+    import sys
+
+    paths = []
+    for device in (0, 1):
+        path = tmp_path / f"trace.device-{device}.json"
+        path.write_text(json.dumps(context_trace(device)))
+        paths.extend(["--trace", str(path)])
+    output = tmp_path / "glm_prewarm_2.json"
+    subprocess.run([sys.executable, str(SCRIPT), "--family", "glm5", "--layout", "2",
+                    *paths, "--output", str(output)], check=True, capture_output=True, text=True)
+    expected = MODULE.generate([context_trace(0), context_trace(1)], "glm5", layout=2)
+    assert output.read_text() == json.dumps(expected, indent=2) + "\n"
+
+
+def test_glm_two_rank_trace_reproduces_checked_in_bytes():
+    import gzip
+
+    fixture = Path(__file__).parent / "fixtures/glm-prewarm-two-rank-trace.json.gz"
+    traces = json.loads(gzip.decompress(fixture.read_bytes()))
+    assert {trace["cache"]["device"] for trace in traces} == {0, 1}
+    generated = MODULE.generate(traces, "glm5", layout=2)
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/glm_prewarm_2.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    assert generated["layout"] == 2
+    assert generated["reserve_extra_bytes"] == MODULE.CHUNK
+    replayed = {MODULE.geometry("glm5", graph["shape"])
+                for trace in traces for graph in trace["graphs"]
+                if MODULE.glm_request_replays(graph) > 0}
+    assert all((entry["rows"], entry["table_width"] // 2) in replayed
+               for entry in generated["entries"])
+    assert fixture.stat().st_size < 1_000_000
 
 
 def test_odd_half_table_width_is_refused():
@@ -562,7 +599,7 @@ def test_every_consumer_uses_fixed_allocation_tail_not_largest_graph(family):
     assert result["reserve_extra_bytes"] == 2 << 20
 
 
-@pytest.mark.parametrize("filename", ["glm_prewarm.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
+@pytest.mark.parametrize("filename", ["glm_prewarm_1.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
 def test_regeneration_reproduces_checked_in_base_and_tail(filename):
     import json
     root = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity"

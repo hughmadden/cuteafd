@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "family": "glm5",
+  "layout": 1,
   "reserve_base_bytes": 335544320,
   "reserve_extra_bytes": 2097152,
   "entries": [

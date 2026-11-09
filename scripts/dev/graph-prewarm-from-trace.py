@@ -645,11 +645,9 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
         raise ValueError(f"no checked-in shape-list consumer for {family}; qwen4 is keyed by --shape")
-    if family == "mistral_large4":
+    if family == "mistral_large4" or layout is not None:
         if layout not in (1, 2):
-            raise ValueError("mistral_large4 keys its list by layout: pass --layout 1 or 2")
-    elif layout is not None:
-        raise ValueError("--layout applies to mistral_large4 only")
+            raise ValueError(f"{family} keys its list by layout: pass --layout 1 or 2")
     # A two-rank trace is recorded on the context placement, whose per-rank key
     # carries the half table; a checked-in entry holds the width a step is
     # built with, which is what the engine warms.
@@ -1667,7 +1665,7 @@ def main():
     parser.add_argument("--family", required=True,
                         choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5")))
     parser.add_argument("--layout",
-                        help="coordinator layout the trace was recorded on (mistral_large4), "
+                        help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
     parser.add_argument("--list", type=Path,
                         help="deepseek_v4 only: checked-in prewarm list the layout is replaced in")
@@ -1703,12 +1701,12 @@ def main():
     if args.family != "deepseek_v4" and args.list is not None:
         parser.error("--list applies only to deepseek_v4")
     layout = args.layout
-    if args.family in ("mistral_large4", "deepseek_v41"):
+    if args.family in ("mistral_large4", "deepseek_v41") or (args.family == "glm5" and layout is not None):
         if layout not in ("1", "2"):
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:

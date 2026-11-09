@@ -8,7 +8,7 @@ use crate::placement::inventory::DeclaredGraphSet;
 /// Both are served by the same engine, but they do not capture the same graphs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlmPrewarmFamily {
-    /// GLM 5.x: one list covers every layout it ships.
+    /// GLM 5.x: each coordinator rank count owns its traced pins.
     Glm5,
     /// Mistral Large 4: one and two coordinator ranks resolve different
     /// attention placements (heads, then page-partitioned context), so each
@@ -23,11 +23,6 @@ impl GlmPrewarmFamily {
     /// The list's `family` identity.
     pub fn name(self) -> &'static str {
         match self { Self::Glm5 => "glm5", Self::MistralLarge4 => "mistral_large4" }
-    }
-    /// The coordinator layout this checkpoint's list is keyed by, if any.
-    /// GLM shares one list; Mistral Large 4 keys it by rank count.
-    fn layout(self, ranks: usize) -> Option<usize> {
-        match self { Self::Glm5 => None, Self::MistralLarge4 => Some(ranks.clamp(1, 2)) }
     }
 }
 
@@ -198,11 +193,25 @@ fn checked_in(source: &str, family: GlmPrewarmFamily, layout: Option<usize>) -> 
     list
 }
 
-/// GLM 5.3's list, measured on its 1-RTX/4-Spark EXL3 baseline plus the
-/// C1/2/4/8/16 sweep (docs/architecture/shared-engine.md, Graph cache).
-pub fn glm_prewarm_list() -> &'static GlmPrewarmList {
-    static LIST: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
-    LIST.get_or_init(|| checked_in(include_str!("glm_prewarm.json"), GlmPrewarmFamily::Glm5, None))
+/// GLM 5.3's rank-specific lists: 1 RTX + 4 Sparks, or the native K6-core
+/// 2 RTX + 6 Sparks card, with C1/2/4/8/16 and 32K working-set coverage.
+pub fn glm_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
+    static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    static UNTRACED: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    let one = ONE.get_or_init(|| checked_in(include_str!("glm_prewarm_1.json"), GlmPrewarmFamily::Glm5, Some(1)));
+    if ranks == 1 { return one; }
+    if ranks == 2 {
+        return TWO.get_or_init(|| checked_in(include_str!("glm_prewarm_2.json"), GlmPrewarmFamily::Glm5, Some(2)));
+    }
+    // Until this rank count has its own trace, keep bootstrap work and sizing
+    // but never claim another layout's pins.
+    UNTRACED.get_or_init(|| {
+        let mut list = one.clone();
+        list.layout = None;
+        for entry in &mut list.entries { entry.pin = false; }
+        list
+    })
 }
 
 /// Mistral Large 4's list for the resolved coordinator layout. One rank runs
@@ -215,7 +224,7 @@ pub fn glm_prewarm_list() -> &'static GlmPrewarmList {
 /// high-water (the larger device under the context placement); `reserve_extra`
 /// is its largest measured boundary capture, one 2 MiB chunk. Neither trace
 /// evicted or recaptured a graph, so the only pin is the C1 decode geometry
-/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm.json`.
+/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm_1.json`.
 pub fn ml4_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
     static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
@@ -230,7 +239,7 @@ pub fn ml4_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
 /// The checked-in list a resolved glm5-engine layout uses.
 pub fn glm_prewarm(family: GlmPrewarmFamily, ranks: usize) -> &'static GlmPrewarmList {
     match family {
-        GlmPrewarmFamily::Glm5 => glm_prewarm_list(),
+        GlmPrewarmFamily::Glm5 => glm_prewarm_list(ranks),
         GlmPrewarmFamily::MistralLarge4 => ml4_prewarm_list(ranks),
     }
 }
@@ -240,7 +249,12 @@ pub fn glm_prewarm(family: GlmPrewarmFamily, ranks: usize) -> &'static GlmPrewar
 pub fn glm_prewarm_shapes(family: GlmPrewarmFamily, ranks: usize, context: usize,
     pool_pages: usize) -> Vec<GlmPrewarmEntry> {
     let allowed = glm_graph_shapes(context, pool_pages);
-    glm_prewarm(family, ranks).entries.iter().filter(|entry| allowed.contains(&entry.shape)).cloned().collect()
+    let list = glm_prewarm(family, ranks);
+    if list.layout.is_none() {
+        tracing::warn!(family = family.name(), ranks,
+            "GLM layout has no graph trace; warming bootstrap entries without pins");
+    }
+    list.entries.iter().filter(|entry| allowed.contains(&entry.shape)).cloned().collect()
 }
 
 #[cfg(test)]
@@ -250,7 +264,7 @@ mod tests {
 
     #[test]
     fn checked_in_prewarm_list_roundtrips_and_filters_to_supported_shapes() {
-        let list = glm_prewarm_list();
+        let list = glm_prewarm_list(1);
         assert!(!list.entries.is_empty());
         let mut identities = HashSet::new();
         for entry in &list.entries {
@@ -274,9 +288,33 @@ mod tests {
     fn every_family_layout_selects_its_own_checked_in_list() {
         let glm = glm_prewarm(GlmPrewarmFamily::Glm5, 1);
         assert_eq!(glm.family, "glm5");
-        assert_eq!(glm.layout, None);
-        // GLM shares one list across its layouts.
-        assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::Glm5, 2), glm));
+        assert_eq!(glm.layout, Some(1));
+        for ranks in [0, 3, 4] {
+            let untraced = glm_prewarm(GlmPrewarmFamily::Glm5, ranks);
+            assert_eq!(untraced.layout, None);
+            assert_eq!(untraced.reserve_base_bytes, glm.reserve_base_bytes);
+            assert_eq!(untraced.reserve_extra_bytes, glm.reserve_extra_bytes);
+            assert_eq!(untraced.entries.len(), glm.entries.len());
+            assert!(untraced.entries.iter().all(|entry| !entry.pin));
+            for (entry, bootstrap) in untraced.entries.iter().zip(&glm.entries) {
+                assert_eq!(entry.shape, bootstrap.shape);
+            }
+        }
+        for layout in [1usize, 2] {
+            let list = glm_prewarm(GlmPrewarmFamily::Glm5, layout);
+            assert_eq!(list.family, "glm5");
+            assert_eq!(list.layout, Some(layout));
+            assert!(!list.entries.is_empty());
+            assert!(list.reserve_base_bytes > 0 && list.reserve_extra_bytes > 0);
+            assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::Glm5, layout), list));
+            let mut identities = HashSet::new();
+            let allowed = glm_graph_shapes(1 << 20, 16384);
+            for entry in &list.entries {
+                assert!(identities.insert((entry.shape.rows, entry.shape.table_width)));
+                assert!(allowed.contains(&entry.shape));
+            }
+        }
+        assert!(!std::ptr::eq(glm_prewarm_list(1), glm_prewarm_list(2)));
         for layout in [1usize, 2] {
             let list = glm_prewarm(GlmPrewarmFamily::MistralLarge4, layout);
             assert_eq!(list.family, GlmPrewarmFamily::MistralLarge4.name());
