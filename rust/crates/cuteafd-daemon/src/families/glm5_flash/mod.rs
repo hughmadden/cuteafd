@@ -348,14 +348,6 @@ pub(crate) fn wide_decode_programs(args: &EngineArgs, cfg: &GlmNextConfig) -> Ve
     names
 }
 
-/// The token selector and GPU sampler of `decode_rows`-row steps beyond the 64-row ones (none at 64):
-/// what `--decode-rows 128` adds where the serving loop makes the selector after the pool.
-fn wide_selector_bytes(decode_rows: usize, vocab: usize) -> u64 {
-    use cuteafd_loader::serving_capacity::glmf_selector_bytes;
-    glmf_selector_bytes(decode_rows as u64, vocab as u64)
-        .saturating_sub(glmf_selector_bytes(engine::DECODE_ROWS as u64, vocab as u64))
-}
-
 /// Finish every loader before releasing its reusable staging; priming must not retain it.
 fn finish_loading<S, T>(library: &NativeLibrary, state: &mut S,
     load: impl FnOnce(&mut S) -> Result<()>, prime: impl FnOnce(&mut S) -> Result<T>) -> Result<T> {
@@ -457,43 +449,35 @@ mod draft_cli_tests {
     }
 
     #[test]
-    fn serving_startup_seals_once_for_tp2_and_spark_layouts() {
+    fn serving_startup_prewarm_runs_once_before_tp2_checks_and_the_body() {
         use std::cell::{Cell, RefCell};
-        use crate::shared::decode_graph::{GraphBank, GraphPolicy};
-        use cuteafd_loader::serving_capacity::glmf_graphs::{startup_set, DecodeBuckets};
 
-        for (name, tp2, spark_ranks) in [("tp2-zero-spark", true, 0),
-            ("tp2-spark-suffix", true, 4), ("spark-only", false, 4)] {
-            let startup = startup_set(262144, 262144, 2048, 8, true, 45, true, &DecodeBuckets::new(64));
-            let banks = RefCell::new([GraphBank::with_policy(GraphPolicy::FixedStartup),
-                GraphBank::with_policy(GraphPolicy::FixedStartup)]);
-            let seals = Cell::new([0; 2]);
+        for (name, tp2) in [("tp2-zero-spark", true), ("tp2-spark-suffix", true), ("spark-only", false)] {
+            let warmups = Cell::new(0);
             let events = RefCell::new(Vec::new());
-            // The production with_engine sequence, with CPU executable stand-ins.
+            // The production with_engine sequence: one prewarm, then TP2 diagnostics, then the body.
             with_startup_graphs(tp2, Some((8, true)), (16, false), |sequences, speculation| {
-                assert_eq!((sequences, speculation), (8, true));
-                events.borrow_mut().push("warm");
-                for (rank, bank) in banks.borrow_mut().iter_mut().enumerate() {
-                    let keys: Vec<_> = startup.keys.iter().enumerate().flat_map(|(shape, _)|
-                        (0..if rank == 0 { 46 } else { 45 }).map(move |segment| (shape, segment))).collect();
-                    for key in &keys { bank.insert(*key, (), None); }
-                    bank.seal_startup(&keys)?;
-                    let mut counts = seals.get(); counts[rank] += 1; seals.set(counts);
-                }
+                assert_eq!((sequences, speculation), (8, true), "{name}");
+                warmups.set(warmups.get() + 1);
+                events.borrow_mut().push("prewarm");
                 Ok(())
             }, || {
-                assert_eq!(seals.get(), [1, 1]);
+                assert_eq!(warmups.get(), 1, "{name}");
                 events.borrow_mut().push("tp2-check");
                 Ok(())
             }, || {
-                assert_eq!(seals.get(), [1, 1], "{name}, {spark_ranks} Sparks");
-                events.borrow_mut().push("serve");
+                assert_eq!(warmups.get(), 1, "{name}: serving must not own a second warm-up");
+                events.borrow_mut().push("body");
                 Ok(())
             }).unwrap();
-            assert_eq!(seals.get(), [1, 1]);
-            assert_eq!(*events.borrow(), if tp2 { vec!["warm", "tp2-check", "serve"] }
-                else { vec!["warm", "serve"] });
+            assert_eq!(warmups.get(), 1, "{name}");
+            assert_eq!(*events.borrow(), if tp2 { vec!["prewarm", "tp2-check", "body"] }
+                else { vec!["prewarm", "body"] });
         }
+        // Golden-only runs (no serving policy, no TP2) prewarm nothing.
+        with_startup_graphs(false, None, (16, true),
+            |_, _| unreachable!("golden without TP2 prewarms nothing"),
+            || unreachable!("no TP2 diagnostics"), || Ok(())).unwrap();
         let serve = include_str!("serve.rs");
         assert!(!serve.contains("engine.warm_decode_graphs("), "serving must not own a second warm-up");
     }
@@ -1020,8 +1004,8 @@ mod draft_cli_tests {
             assert_eq!(cuteafd_loader::serving_capacity::glmf_selector_bytes(rows as u64, 154_880),
                 (rows * 12 + TargetSamplingWave::device_bytes(rows.min(128), 154_880)) as u64);
         }
-        assert_eq!(wide_selector_bytes(engine::DECODE_ROWS, 154_880), 0);
-        assert_eq!(wide_selector_bytes(engine::WIDE_DECODE_ROWS, 154_880), 3_209_984);
+        let over = |rows: usize| cuteafd_loader::serving_capacity::glmf_selector_bytes(rows as u64, 154_880);
+        assert_eq!(over(engine::WIDE_DECODE_ROWS) - over(engine::DECODE_ROWS), 3_209_984);
     }
 
     /// `--prefill-rows 64 --decode-rows 128`: a 16-stream verify wave of long drafts fills the GPU's
@@ -1576,6 +1560,71 @@ mod replay_cli_tests {
     }
 }
 
+/// The `memory_reconciliation_provenance` input the shared Ready and
+/// first-request captures attach to every device row. Admission publishes it
+/// once the placement is resolved; both captures early-return without it.
+fn reconciliation_provenance(manifest: &std::path::Path, native_lib: &std::path::Path, layout: String,
+    devices: &[cuteafd_loader::placement::RuntimeSample], spark_world: usize,
+    onboard_layers: &[Vec<usize>], prefill: &cuteafd_loader::placement::planner::PrefillShape)
+    -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("memory reconciliation provenance input {}", path.display()))?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    Ok(serde_json::json!({
+        "schema_version": 1, "family": "glm5_flash", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+        "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+        "native_sha256": hash(native_lib)?, "programs_sha256": hash(manifest)?,
+        "layout": layout, "devices": devices, "spark_world": spark_world,
+        "onboard_layers": onboard_layers, "prefill": prefill,
+        "graph_basis": "trace-derived prewarm document keyed by resolved layout; uncalibrated byte fallback elsewhere"
+    }))
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::reconciliation_provenance;
+    use anyhow::Context as _;
+
+    fn sample(device: i32) -> cuteafd_loader::placement::RuntimeSample {
+        cuteafd_loader::placement::RuntimeSample { device, total_bytes: 96 << 30, free_bytes: 90 << 30,
+            context_bytes: 577 << 20, module_bytes: 12 << 20, sms: 188, arch: "sm_120".into(), driver: "test".into() }
+    }
+
+    #[test]
+    fn admission_publishes_memory_reconciliation_provenance() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manifest = dir.path().join("PROGRAMS.json");
+        let native = dir.path().join("libcuteafd.so");
+        std::fs::write(&manifest, b"{\"families\":{}}")?;
+        std::fs::write(&native, b"native")?;
+        let prefill = cuteafd_loader::placement::planner::PrefillShape { rows: 4096, waves: 1 };
+        let value = reconciliation_provenance(&manifest, &native, "layout/test".into(),
+            &[sample(0), sample(1)], 2, &[vec![0, 1], vec![2, 3]], &prefill)?;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": value }));
+        let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
+        let published = inputs.get("memory_reconciliation_provenance").context("provenance input")?;
+        assert_eq!(published["schema_version"], 1);
+        assert_eq!(published["family"], "glm5_flash");
+        assert_eq!(published["spark_world"], 2);
+        assert_eq!(published["onboard_layers"], serde_json::json!([[0, 1], [2, 3]]));
+        assert_eq!(published["prefill"], serde_json::to_value(&prefill)?);
+        assert_eq!(published["devices"].as_array().map(Vec::len), Some(2));
+        assert_eq!(published["devices"][1]["device"], 1);
+        for key in ["native_sha256", "programs_sha256"] {
+            let hash = published[key].as_str().context("hash string")?;
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        Ok(())
+    }
+}
+
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
     let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
@@ -1615,21 +1664,11 @@ fn check_options(args: &EngineArgs) -> Result<()> {
     Ok(())
 }
 
-/// Internal lazy decode-graph allowance per GPU when startup capture is off
-/// (formerly `--graph-budget-mib`'s default). A graph component of the auto reserve.
-const LAZY_GRAPH_ALLOWANCE_BYTES: u64 = 1536 << 20;
-
 impl EngineArgs {
     /// The target head's mode: explicit `--target-head`, else the shared setting (tensor by
     /// default). The FP8 head's own program ignores it.
     pub fn resolved_target_head(&self) -> head::TargetHead {
         head::resolve(self.target_head)
-    }
-
-    /// Whether serving captures every decode graph at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless
-    /// 0). Off, admission keeps the internal lazy-graph allowance instead.
-    pub(crate) fn startup_graphs(&self) -> bool {
-        engine::startup_graphs_enabled()
     }
 
     /// The rows every routed-expert resource holds (the dense NVFP4 package, local FP8 or EXL3
@@ -1925,13 +1964,14 @@ impl Opened {
         remote_draft: bool, attention: engine::GlmfAttention,
         native_admission: Option<&native::Admission>,
         inventory: &crate::shared::inventory::RuntimeInventory)
-        -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::GraphSet,
+        -> Result<(cuteafd_loader::placement::Placement,
+            cuteafd_loader::placement::families::glm5_flash::admission::GlmfGraphs,
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet,
             Option<cuteafd_hostcache::config::Config>,
             Option<cuteafd_loader::placement::families::glm5_flash::admission::NativeLoad>,
             Option<cuteafd_loader::push_load::PushHostEnvelope>,
             Option<cuteafd_loader::shared::dense_read::MountLoad>,
-            cuteafd_loader::placement::planner::ResolvedPlan, Vec<String>)> {
+            cuteafd_loader::placement::planner::ResolvedPlan)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
         use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
@@ -2067,11 +2107,6 @@ impl Opened {
             Ok((bytes.memory.resident, bytes.resident_weights, scratch, requests, bridge))
         }).transpose()?.unwrap_or_else(|| (0, placement::ResidentWeights::default(), vec![0; devices.len()], None, None));
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
-        let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
-        let graphs = if args.startup_graphs() {
-            admission::startup_graph_bound(&self.cfg, layers, args.max_context, pool,
-                sequences, speculation, devices.len(), args.decode_rows, sms)
-        } else { placement::GraphSet::budget(&vec![cuteafd_loader::placement::reserve::gpu_component(LAZY_GRAPH_ALLOWANCE_BYTES); devices.len()]) };
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
         let onboard = runtime_onboard(args, self.native, routed, experts.len());
         let inputs = admission::GlmfInputs {
@@ -2086,7 +2121,7 @@ impl Opened {
             kda_state_bytes: args.kda_state.bytes() as u64, shared_replay: args.replay_records == engine::ReplayRecords::Shared,
             blas_head: args.resolved_target_head().blas_head(!self.native && core.get_weight("lm_head").is_none()
                 && representation.head == head::GlmfHeadFormat::Bf16),
-            representation, resident, workspace, local_workspace, graphs, experts, expert_workspace, tp2_workspace,
+            representation, resident, workspace, local_workspace, experts, expert_workspace, tp2_workspace,
             drafter_bytes, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64), onboard,
             full_prefill_logits: if shape.full_prefill_logits {
                 cuteafd_loader::plan::layout::full_prefill_logits_bytes("glm5_flash", args.prefill_rows as u64,
@@ -2140,15 +2175,15 @@ impl Opened {
         // Under TP2_DFLASH auto both drafter candidates are admitted; each logs its breakdown.
         tracing::info!(target: "cuteafd::memory_policy", tp2_dflash = args.tp2_dflash, "GLM Flash admission candidate");
         cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5_flash");
-        tracing::info!(graph_slack = ?admitted.graph_slack, phases = ?admitted.solved.phases,
-            "GLM Flash admitted exact physical owners");
+        tracing::info!(graph_reserve = ?admitted.graphs.charged, prewarm_shapes = admitted.graphs.shapes,
+            phases = ?admitted.solved.phases, "GLM Flash admitted exact physical owners");
         let (placement, graphs, working) = (admitted.placement, admitted.graphs, admitted.working);
         ensure!(placement.movables.iter().all(|(id, gpu)| *gpu == 0 || *id == placement::MovableId::Drafter),
             "GLM Flash placement has no matching movable executor");
         placement::draft::require_home(&placement, "GLM Flash",
             if remote_draft { &[0, 1] } else { &[0] })?;
         Ok((placement, graphs, working, host_config, admitted.native_load, admitted.push_host,
-            admitted.mount_load, admitted.solved, admitted.declared_graphs))
+            admitted.mount_load, admitted.solved))
     }
 
     /// Builds the engine and hands it to `body`. Either KV admission keeps the prefix marks of
@@ -2391,8 +2426,18 @@ impl Opened {
         let remote_draft = false;
         cuteafd_bench::context::set_resolved("tp2-dflash", if args.tp2_dflash { "on" } else { "off" });
         let (placement, admitted_graphs, working, admitted_host, admitted_native_load,
-            admitted_push_host, admitted_mount_load, mut admitted_plan, declared_graphs) = admitted;
+            admitted_push_host, admitted_mount_load, admitted_plan) = admitted;
         if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
+        // The shared Ready and first-request reconciliation captures read this
+        // input; without it both stages early-return as unavailable.
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": reconciliation_provenance(&args.manifest, &args.native_lib,
+                format!("snapshot/{}; draft/{:?}; context/{}; attention/{:?}; sparks/{}; prefill/{:?}",
+                    self.checkpoint.snapshot.display(), args.draft, args.max_context, attention.mode,
+                    working.spark_ranks, admitted_plan.decisions.prefill),
+                &inventory.gpus, working.spark_ranks, &admitted_plan.decisions.onboard_layers,
+                &admitted_plan.decisions.prefill)?
+        }));
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {
@@ -2414,7 +2459,7 @@ impl Opened {
         tracing::info!(target: "cuteafd::placement", plan = %serde_json::json!({
             "memory_layout": {"devices": devices, "pool_tokens": placement.pool_tokens},
             "graph_shapes": admitted_graphs.shapes,
-            "graphs": admitted_graphs.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(),
+            "graphs": admitted_graphs.executables,
             "speculation": speculation, "sequences": sequences,
             "attention_first_owner": attention.first_owner,
             "layer_modes": placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>(),
@@ -2455,9 +2500,8 @@ impl Opened {
         }
         let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
-        let startup_graphs = admitted_graphs.lifetime == cuteafd_loader::placement::Lifetime::Startup;
-        ensure!(tp2_layers.is_empty() || startup_graphs, "GLM Flash TP2 experts require startup graphs; \
-            set CUTEAFD_GLMF_STARTUP_GRAPHS=1 (post-ready captures are not admitted)");
+        ensure!(tp2_layers.is_empty() || engine::GlmfEngine::graphs_enabled(),
+            "GLM Flash TP2 experts require the decode graph cache; unset CUTEAFD_GLMF_GRAPHS=0 to enable it");
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             let peer = peer_stream.context("TP2 placement without peer device")?;
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -2838,10 +2882,6 @@ impl Opened {
         let reserved_units = if args.prefix_marks == prefix::PrefixMarks::Pool {
             cuteafd_loader::serving_capacity::GLMF_POOL_MARK_RESERVED_UNITS } else { 0 };
         let pool_tokens = usize::try_from(placement.pool_tokens)?;
-        if !startup_graphs {
-            tracing::info!(allowance_bytes = LAZY_GRAPH_ALLOWANCE_BYTES,
-                "GLM Flash decode graphs captured lazily within the graph allowance, not at startup");
-        }
         let max_context = crate::shared::context::pool_context("glm5_flash", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let step_experts = admitted_step_experts(&self.cfg, &placement, args.skip_experts, self.fp8().is_some())?;
         let early_workspaces = if args.replay_records == engine::ReplayRecords::Shared {
@@ -2864,9 +2904,6 @@ impl Opened {
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
 
-        if !startup_graphs {
-            engine.capture_graphs_lazily();
-        }
         tracing::info!(index_cache = ?engine.index_cache, pool_tokens, reserved_units, "GLM 5.3 Flash DSA index cache");
         engine.kda_fp32_partials = args.kda_fp32_partials;
         engine.kda_output_shard = args.kda_output_shard;
@@ -2901,7 +2938,6 @@ impl Opened {
         }
         probe("context-attach")?;
         probe("peer-exchanges")?;
-        engine.set_graph_budget(None);
         engine.full_prefill_logits = args.full_prefill_logits;
         let group = |g: Fp8PrefillGroup| args.fp8_prefill.iter().any(|&x| x == g || x == Fp8PrefillGroup::All);
         // `all`: every group with FP8 weights (BF16 KDA has none to run W8A8 over).
@@ -2990,51 +3026,23 @@ impl Opened {
         probe("packing")?;
         let result = with_startup_graphs(engine.has_tp2(), args.serving_graph_policy,
             (16, engine.drafter.is_some()), |sequences, speculation| {
-                if let Some(capture) = engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)? {
+                engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves,
+                    &admitted_graphs.bootstraps, admitted_graphs.extra)?;
+                let prewarm = admitted_graphs.prewarm_bytes();
+                for (rank, &charge) in admitted_graphs.charged.iter().enumerate() {
+                    let resolved = cuteafd_loader::placement::graph_reserve::current(rank, false,
+                        admitted_graphs.reserves[rank], admitted_graphs.extra).map_err(anyhow::Error::msg)?;
+                    tracing::info!(rank, reserve = charge, default = resolved.bytes, source = %resolved.source,
+                        prewarm_bytes = prewarm[rank], capture_headroom = resolved.effective_extra_bytes,
+                        extra_source = %resolved.extra_source, cap_source = %resolved.cap_source,
+                        executables = admitted_graphs.executables[rank], prewarm_shapes = admitted_graphs.shapes,
+                        bootstrap = admitted_graphs.bootstraps[rank], "GLM Flash graph reserve");
+                }
+                if engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)? {
                     probe("graphs-instantiated")?;
-                    use cuteafd_loader::placement::inventory::{GraphCensus, GraphCensusIdentity};
-                    let measured = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
-                        &mut admitted_plan, "glmf.graphs", &admitted_graphs, &declared_graphs, &capture.ranks)?;
-                    cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "glm5_flash captured");
-                    use sha2::{Digest, Sha256};
-                    let hash = |path: &std::path::Path| -> Result<String> {
-                        let mut file = std::fs::File::open(path)?;
-                        let mut digest = Sha256::new();
-                        std::io::copy(&mut file, &mut digest)?;
-                        Ok(format!("{:x}", digest.finalize()))
-                    };
-                    let programs_sha256 = hash(&args.manifest)?;
-                    let native_sha256 = hash(self.library.loaded_path())?;
-                    let layout = serde_json::to_string(&serde_json::json!({
-                        "family": "glm5_flash", "context": max_context, "pool": pool_tokens,
-                        "sequences": sequences.min(args.decode_rows), "speculation": speculation,
-                        "args": format!("{args:?}"), "decisions": admitted_plan.decisions,
-                        "spark_ranks": working.spark_ranks,
-                    }))?;
-                    for (rank, (graph, gpu)) in measured.ranks.iter().zip(&inventory.gpus).enumerate() {
-                        let identity = GraphCensusIdentity {
-                            declared_graphs: declared_graphs[rank].clone(),
-                            programs_sha256: programs_sha256.clone(), native_sha256: native_sha256.clone(),
-                            toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN").into(),
-                            gpu_class: format!("{}/{}/{}", gpu.arch, gpu.sms, gpu.total_bytes),
-                            driver: gpu.driver.clone(), layout: layout.clone(),
-                        };
-                        identity.validate().map_err(anyhow::Error::msg)?;
-                        let census = GraphCensus { identity, executables: graph.executables, bytes: graph.bytes,
-                            evidence: "GLM Flash synchronized startup capture after exact masked-segment prewarm; tracked device growth excluded".into(),
-                            producing_commit: env!("CUTEAFD_BUILD_COMMIT").into() };
-                        tracing::info!(target: "cuteafd::placement", rank, census = %serde_json::to_string(&census)?,
-                            "startup graph residency census");
-                    }
-                } else {
-                    ensure!(admitted_graphs.lifetime != cuteafd_loader::placement::Lifetime::Startup,
-                        "startup graphs were admitted but the executor did not capture them");
                 }
                 probe("graph-capture")
-            }, || {
-                engine.check_admitted_graphs(&admitted_graphs)?;
-                engine.check_tp2_routes()
-            }, || body(&engine));
+            }, || engine.check_tp2_routes(), || body(&engine));
         probe("post-checks")?;
         drop(engine);
         // SAFETY: the engine that used the streams is gone.

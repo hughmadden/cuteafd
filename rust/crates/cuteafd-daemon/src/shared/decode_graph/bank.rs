@@ -1,5 +1,5 @@
-//! Exact-key graph storage. Retirement never destroys an executable until its
-//! caller proves every stream using the captured storage has drained.
+//! Exact-key graph storage. Persistent-buffer executables may be evicted without
+//! draining; owners of per-graph storage require explicit drained retirement.
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use cuteafd_loader::placement::inventory::DeclaredGraphSet;
@@ -94,6 +94,21 @@ impl DeviceBinding {
         cache.sample_clock();
         for (id, count) in &mut self.pinned_counts {
             cache.pinned_hits(*id, self.site.cycle, std::mem::take(count));
+        }
+    }
+}
+
+pub(crate) struct CaptureTicket {
+    cache: super::device::SharedCache,
+    id: u64,
+    pinned: bool,
+    committed: bool,
+}
+
+impl Drop for CaptureTicket {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(self.id);
         }
     }
 }
@@ -196,6 +211,22 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)), pinned_slot });
     }
 
+    pub fn cache_attached(&self) -> bool { self.device.is_some() }
+
+    /// A capture reservation independent of the bank borrow. Dropping it on any
+    /// failed path cancels the ticket, without synchronizing a peer segment.
+    pub fn cache_ticket(&mut self, key: &K, pinned: bool, estimate: Option<super::device::Estimate>) -> Option<CaptureTicket> {
+        let super::device::Miss::Capture(id) = self.cache_miss(key, pinned, estimate) else { return None };
+        Some(CaptureTicket { cache: self.device.as_ref()?.cache.clone(), id, pinned, committed: false })
+    }
+
+    pub fn cache_commit(&mut self, key: K, exec: E, mut ticket: CaptureTicket,
+        nodes: u64, width: usize, spans_devices: bool) {
+        self.cache_topology(ticket.id, nodes, width, spans_devices);
+        self.cache_insert(key, exec, ticket.id, ticket.pinned);
+        ticket.committed = true;
+    }
+
     pub fn cache_cancel(&mut self, id: u64) {
         if let Some(binding) = &self.device { binding.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(id); }
     }
@@ -215,6 +246,16 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             binding.pinned_hits = 0;
             binding.pinned_counts.clear();
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
+        }
+    }
+
+    /// Selective explicit invalidation after all consumers have drained.
+    pub fn cache_remove_drained(&mut self, matches: impl Fn(&K) -> bool) {
+        let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
+        let ids: Vec<_> = keys.iter().filter_map(|key| self.entries.get(key)?.cached.map(|(id, _)| id)).collect();
+        for key in keys { self.entries.remove(&key); }
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_drained(&ids);
         }
     }
 
@@ -242,6 +283,26 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
             binding.flush(&mut cache);
             cache.measured_capture(bytes);
+        }
+    }
+
+    /// Destroy victims without waiting for an idle lane. cudaGraphExecDestroy
+    /// itself is asynchronous-safe; only captured allocation lifetime matters.
+    /// # Safety
+    /// Dropping E must not release captured allocations. Their persistent backing
+    /// storage remains owned by the pipeline, which already orders buffer reuse.
+    pub unsafe fn cache_evict_persistent(&mut self) {
+        let Some(binding) = &mut self.device else { return };
+        let victims: Vec<_> = {
+            let cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            self.entries.iter().filter_map(|(key, entry)| entry.cached
+                .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
+        };
+        for (key, _) in &victims { self.entries.remove(key); }
+        if !victims.is_empty() {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
+                &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>(),
+                super::device::ReleaseMeasurement { released: 0 });
         }
     }
 
@@ -772,6 +833,29 @@ mod device_tests {
     }
 
     #[test]
+    fn persistent_victims_release_capacity_without_a_drain_or_idle_lane() {
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = Rc::new(Cell::new(0));
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-318, 20, site()).unwrap();
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
+        bank.cache_measured(10);
+        for key in 2..20 {
+            assert!(bank.cache_ticket(&key, false, None).is_none());
+            // SAFETY: fixture executables own no captured buffers or native work.
+            unsafe { bank.cache_evict_persistent(); }
+            assert_eq!(drops.get(), key - 1);
+            let ticket = bank.cache_ticket(&key, false, None).expect("victim capacity reusable without idle");
+            bank.cache_commit(key, Exec(drops.clone()), ticket, 1, 1, false);
+            bank.cache_measured(0);
+        }
+        assert_eq!(super::super::device::snapshots().into_iter().find(|row| row.device == -318).unwrap().charged, 10);
+    }
+
+    #[test]
     fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
         let mut bank = GraphBank::new(None);
         bank.attach_device(-303, 100, site()).unwrap();
@@ -864,5 +948,23 @@ mod device_tests {
             }
             println!("{label}: {:.1} ns/replay", started.elapsed().as_nanos() as f64 / iterations as f64);
         }
+    }
+}
+
+impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBank<K, E> {
+    fn attach(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+        self.attach_device(device, reserve, site)
+    }
+    fn cycle(&mut self, cycle: super::device::Cycle) { self.cache_cycle(cycle); }
+    fn needs_boundary(&self) -> bool { self.cache_needs_boundary() }
+    fn measured(&mut self, bytes: u64) { self.cache_measured(bytes); }
+    fn tick(&mut self) { self.cache_tick(); }
+    unsafe fn evict_persistent(&mut self) {
+        // SAFETY: forwarded persistent-storage contract from the visitor.
+        unsafe { self.cache_evict_persistent(); }
+    }
+    fn drain(&mut self, drain: &mut dyn FnMut() -> anyhow::Result<()>,
+        measure: &mut dyn FnMut() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
+        self.cache_drain(drain, measure)
     }
 }

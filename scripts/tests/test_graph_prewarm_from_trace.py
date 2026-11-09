@@ -1,5 +1,6 @@
 """Trace-derived startup lists preserve hot shapes and per-device ownership."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,170 @@ def test_invalid_trace_fails(change):
     with pytest.raises(ValueError):
         MODULE.generate([data], "glm5")
 
+
+def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0,
+                site="glm5_flash.decode", capture_bytes=1 << 20):
+    return {"device": 0, "site": site, "bank": 1,
+            "shape": f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {spec}, long: {long}, "
+                     f"pool_width: {width}, page_stride: {stride}, pool_stride: {pool_stride} }}",
+            "count": count, "capture_bytes": capture_bytes, "executables": 1}
+
+
+def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20, device=0):
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
+            "sites": {"glm5_flash.decode": {"largest_bytes": 3 << 20}},
+            "graphs": graphs if graphs is not None else
+            [flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0,
+                         capture_bytes=capture_bytes),
+             flash_graph(4, "false", "false", 0, 64, 0, 90, segment=3,
+                         capture_bytes=capture_bytes),
+             flash_graph(16, "true", "false", 0, 128, 0, 30, segment=0,
+                         capture_bytes=capture_bytes),
+             flash_graph(1, "true", "true", 2048, 64, 16, 1, segment=2,
+                         capture_bytes=capture_bytes)]}
+
+
+def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
+    result = MODULE.generate([flash_trace()], "glm5_flash", coverage=0.99)
+    assert result["family"] == "glm5_flash"
+    # The base is the selected entries' measured capture bytes (three rows of
+    # 1 MiB on device 0), not the 16 MiB whole-session arena the trace held.
+    assert result["measured_bytes"] == [4 << 20]
+    assert result["measured_executables"] == [3]
+    # Startup prewarms every traced shape, so the reserve base holds the whole
+    # request demand; the tail is the fixed 2 MiB allocation headroom.
+    assert result["reserve_extra_bytes"] == 2 << 20
+    # 99% coverage keeps the two hot shapes (190 and 30 hits); only the peak is pinned.
+    assert result["entries"] == [
+        {"rows": 4, "spec": False, "long": False, "pool_width": 0,
+         "page_stride": 64, "pool_stride": 0, "pin": True},
+        {"rows": 16, "spec": True, "long": False, "pool_width": 0,
+         "page_stride": 128, "pool_stride": 0, "pin": False},
+    ]
+
+
+def test_flash_short_steps_collapse_the_unkeyed_pool_geometry():
+    graphs = [flash_graph(4, "false", "false", 1, 64, 16, 10),
+              flash_graph(4, "false", "false", 4, 64, 32, 5)]
+    result = MODULE.generate([flash_trace(graphs)], "glm5_flash")
+    assert result["entries"] == [{"rows": 4, "spec": False, "long": False, "pool_width": 0,
+                                  "page_stride": 64, "pool_stride": 0, "pin": True}]
+
+
+def test_flash_startup_prewarm_is_not_request_demand():
+    graphs = flash_trace()["graphs"]
+    for graph in graphs:
+        graph["cycles"] = {"other": 1000}
+    graphs[0]["cycles"] = {"other": 1000, "verify": 5}
+    result = MODULE.generate([flash_trace(graphs)], "glm5_flash")
+    assert [(entry["rows"], entry["pin"]) for entry in result["entries"]] == [(4, True)]
+
+
+def test_flash_each_device_keeps_its_own_measured_base():
+    first = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10)],
+                        charged=8 << 20)
+    second = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10,
+                                      capture_bytes=3 << 20)],
+                         charged=24 << 20, device=1)
+    result = MODULE.generate([first, second], "glm5_flash")
+    # One selected shape per device, 1 MiB and 3 MiB; each packs once to its
+    # own 2 MiB / 4 MiB base, never scaled from the other rank's price.
+    assert (result["measured_bytes"], result["measured_executables"]) == ([2 << 20, 4 << 20], [1, 1])
+
+
+def test_flash_a_selected_shape_without_a_measured_share_fails():
+    missing = flash_trace()
+    missing["graphs"][0]["capture_bytes"] = None
+    with pytest.raises(ValueError, match="no measured capture bytes"):
+        MODULE.generate([missing], "glm5_flash")
+    # A device trace that never captured one of the layout's selected shapes
+    # cannot price that shape; the base would be short by an unknown share.
+    incomplete = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100)])
+    with pytest.raises(ValueError, match="lacks selected shapes"):
+        MODULE.generate([flash_trace(), incomplete], "glm5_flash")
+
+
+@pytest.mark.parametrize("change", [
+    lambda t: t["graphs"][0].update(shape="GlmGraphKey { rows: 1 }"),
+    lambda t: t["graphs"][0].update(capture_bytes=None),
+    lambda t: t["cache"].update(device=1),
+    lambda t: t.update(graphs=[flash_graph(0, "false", "false", 0, 64, 0, 5)]),
+    lambda t: t.update(graphs=[flash_graph(4, "false", "true", 1, 64, 0, 5)]),
+])
+def test_flash_invalid_trace_fails(change):
+    data = flash_trace()
+    change(data)
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "glm5_flash")
+
+
+def flash_trace_path(tmp_path, name, capture_bytes):
+    path = tmp_path / name
+    path.write_text(json.dumps(flash_trace(capture_bytes=capture_bytes)))
+    return path
+
+
+def test_flash_shapes_are_priced_separately_by_resolved_shape(tmp_path):
+    one = flash_trace_path(tmp_path, "one.json", 1 << 20)
+    two = flash_trace_path(tmp_path, "two.json", 3 << 20)
+    groups = MODULE.layout_groups([f"1-sparks={one}", f"2={two}"], "glm5_flash")
+    result = MODULE.generate_layouts(groups, "glm5_flash")
+    assert result["schema_version"] == 3
+    assert result["family"] == "glm5_flash"
+    assert set(result["layouts"]) == {"1-sparks", "2"}
+    # Each layout prices its own selected entries: the same four rows of
+    # captures, 4 MiB at the 1 MiB row price and 12 MiB at the 3 MiB row price.
+    assert result["layouts"]["1-sparks"]["measured_bytes"] == [4 << 20]
+    assert result["layouts"]["2"]["measured_bytes"] == [12 << 20]
+    # A shape entry carries only its own trace's prices, never the document's
+    # schema or another shape's arena.
+    assert "schema_version" not in result["layouts"]["1-sparks"]
+    assert result["layouts"]["1-sparks"]["entries"] == result["layouts"]["2"]["entries"]
+
+
+def test_flash_prices_a_layout_from_the_costlier_quant(tmp_path):
+    # One layout traced twice, as an EXL3 and an FP8 checkpoint would be. The
+    # entries are the same request shapes either way; the price is the costlier
+    # quant's selected-entry sum, taken as that trace's own (bytes, executables)
+    # pair, never a mix of the two.
+    cheap = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0),
+                         flash_graph(4, "false", "false", 0, 64, 0, 90, segment=1)], charged=16 << 20)
+    dear = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0,
+                                    capture_bytes=3 << 20),
+                        flash_graph(4, "false", "false", 0, 64, 0, 90, segment=1,
+                                    capture_bytes=3 << 20)], charged=20 << 20)
+    dear["sites"]["glm5_flash.decode"]["largest_bytes"] = 5 << 20
+    paths = []
+    for name, data in (("exl3.json", cheap), ("fp8.json", dear)):
+        path = tmp_path / name
+        path.write_text(json.dumps(data))
+        paths.append(path)
+    groups = MODULE.layout_groups([f"1-sparks={path}" for path in paths], "glm5_flash")
+    layout = MODULE.generate_layouts(groups, "glm5_flash")["layouts"]["1-sparks"]
+    assert (layout["measured_bytes"], layout["measured_executables"]) == ([6 << 20], [2])
+    assert layout["reserve_extra_bytes"] == 2 << 20
+    assert [(entry["rows"], entry["spec"]) for entry in layout["entries"]] == [(4, False)]
+
+
+def test_flash_accepts_a_subset_of_traced_shapes_and_no_unknown_keys(tmp_path):
+    path = flash_trace_path(tmp_path, "trace.json", 16 << 20)
+    # An untraced shape falls back to the engine's bootstrap set, so a partial
+    # document is valid; an unknown key is still refused.
+    groups = MODULE.layout_groups([f"2-sparks={path}"], "glm5_flash")
+    assert set(MODULE.generate_layouts(groups, "glm5_flash")["layouts"]) == {"2-sparks"}
+    with pytest.raises(ValueError, match="unknown GLM Flash layout"):
+        MODULE.layout_groups([f"min={path}"], "glm5_flash")
+    with pytest.raises(ValueError, match="unknown GLM Flash layout"):
+        MODULE.layout_groups([f"1-sparks={path}", f"mid={path}"], "glm5_flash")
+
+
+def test_single_layout_families_keep_the_flat_document(tmp_path):
+    data = trace()
+    path = tmp_path / "glm5.json"
+    path.write_text(json.dumps(data))
+    result = MODULE.generate_layouts(MODULE.layout_groups([str(path)], "glm5"), "glm5")
+    assert "layouts" not in result
+    assert result["family"] == "glm5"
 
 def modern_trace():
     data = trace()
@@ -242,11 +407,15 @@ def test_generator_prefix_matches_shared_engine_graph_site(family):
     assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
 
 
-@pytest.mark.parametrize("family", ["glm5_flash", "deepseek_v41"])
+@pytest.mark.parametrize("family", ["deepseek_v41"])
 def test_native_family_schemas_are_not_advertised_as_glm_consumers(family):
     assert family not in MODULE.SITE_PREFIX
     with pytest.raises(ValueError, match="no checked-in shape-list consumer"):
         MODULE.generate([trace()], family)
+
+
+def test_flash_is_not_advertised_as_a_glm_prefix_consumer():
+    assert "glm5_flash" not in MODULE.SITE_PREFIX
 
 
 @pytest.mark.parametrize("family", ["glm5", "mistral_large4"])

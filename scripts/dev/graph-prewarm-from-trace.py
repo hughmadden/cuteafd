@@ -4,6 +4,28 @@
 Request frequency selects coverage. Schema 2 pins sustained rolling-window
 heat or repeated eviction/recapture, and reports permanent pin cost separately
 from measured step-boundary allocator growth. Review and qualify before use.
+
+Examples:
+  python3 scripts/dev/graph-prewarm-from-trace.py --family glm5 \
+    --trace trace.device-0.json --output prewarm.json
+  python3 scripts/dev/graph-prewarm-from-trace.py --family glm5_flash \
+    --trace 1-sparks=trace-1-sparks.json --trace 2=trace-2.json \
+    --trace 2-sparks=trace-2-sparks.json --output prewarm.json
+
+Input is the versioned GRAPH_TRACE JSON snapshot, not arbitrary log text.
+Frequencies are aggregated by geometry, not bank id or layer. Pin candidates
+must have both dominant frequency and the lowest row/table parameter rank.
+Reserve suggestions use the maximum per-device arena, never a sum of ranks.
+GLM Flash prices the base from the selected entries' measured capture bytes per
+device (the maximum across devices and quants), not the trace's whole-session
+arena: shapes outside the coverage set never prewarm and never charge.
+GLM Flash keys its list by resolved card shape, `<devices>[-sparks]`: onboarding
+and TP2 each add captured segments, so each shape's own capture demand prices
+its own reserve and a launch reads only its own entry. A shape's entries are
+the same for every quant of the checkpoint (a shape is a pure function of the
+launch geometry); when a shape is traced on more than one quant, the costlier
+quant's measured arena and largest capture price it. A shape with no trace
+warms the engine's bootstrap set, never another shape's list.
 """
 import argparse
 import json
@@ -11,9 +33,13 @@ import re
 from pathlib import Path
 
 CHUNK = 2 << 20
+GLM5_FLASH_LAYOUTS = {"1", "1-sparks", "2", "2-sparks"}
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
 SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
+GLMF_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
+    r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 
 
 def packed(value):
@@ -32,6 +58,10 @@ def sustained(graph):
 
 
 def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
+    if family == "glm5_flash":
+        if layout is not None:
+            raise ValueError("--layout applies to mistral_large4 only")
+        return generate_glm5_flash(traces, coverage, pin_frequency)
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
         raise ValueError(f"no checked-in shape-list consumer for {family}")
@@ -160,27 +190,177 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
     return result
 
 
+def glmf_identity(shape):
+    """A GLM Flash graph identity as its stable key tuple.
+
+    Short steps key neither the pool top-k's width nor the pool table stride
+    (`GraphGeometry::keyed`), so those identities collapse to one shape.
+    """
+    match = GLMF_GEOMETRY.fullmatch(shape.strip())
+    if match is None:
+        raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
+    rows, spec, long, width, page_stride, pool_stride = match.groups()
+    rows, width, page_stride, pool_stride = (int(value) for value in (rows, width, page_stride, pool_stride))
+    if rows <= 0 or page_stride <= 0:
+        raise ValueError("unsupported prewarm geometry")
+    if long == "false":
+        width = pool_stride = 0
+    elif pool_stride <= 0:
+        raise ValueError("unsupported prewarm geometry")
+    return (rows, spec == "true", long == "true", width, page_stride, pool_stride)
+
+
+def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
+    """A GLM Flash startup list: every selected shape prewarms at startup, the
+    always-hot ones are pinned, and the reserve base is what those selected
+    shapes measured, device by device, plus the fixed 2 MiB allocation tail.
+    Startup prewarm itself runs as Other, never as request demand. The
+    whole-session arena in `cache.charged` also holds captures outside the
+    coverage set (startup warmups and one-off shapes this launch never
+    prewarms), so it is not the base. Runtime capture headroom comes from the
+    shared extra keys, not the trace."""
+    if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
+        raise ValueError("coverage and pin frequency must be in (0, 1]")
+    counts = {}
+    for trace in traces:
+        if trace.get("schema_version") != 2:
+            raise ValueError("expected GRAPH_TRACE schema_version=2")
+        matching = [graph for graph in trace["graphs"] if graph["site"].startswith("glm5_flash.")]
+        device_counts = {}
+        for graph in matching:
+            key = glmf_identity(graph["shape"])
+            cycles = graph.get("cycles")
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
+                if cycles is not None else int(graph["count"])
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
+        for key, count in device_counts.items():
+            counts[key] = max(counts.get(key, 0), count)
+    if not counts:
+        raise ValueError("trace contains no matching graph identities")
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
+    total = sum(counts.values())
+    covered = 0
+    selected = []
+    for key in ranked:
+        selected.append(key)
+        covered += counts[key]
+        if covered >= total * coverage:
+            break
+    peak = max(counts.values())
+    pinned = {key for key in selected if counts[key] >= peak * pin_frequency}
+    entries = [{"rows": key[0], "spec": key[1], "long": key[2], "pool_width": key[3],
+                "page_stride": key[4], "pool_stride": key[5], "pin": key in pinned}
+               for key in sorted(selected)]
+    # Price exactly the entries this list prewarms: sum each selected shape's
+    # measured capture bytes on one device, take the costliest quant traced for
+    # that device, and keep one base per coordinator device. A selected shape
+    # with no measured share means the trace cannot price this list; it is
+    # missing data, never a zero.
+    wanted = set(selected)
+    shares = {}
+    for trace in traces:
+        device = int(trace["cache"].get("device", 0))
+        seen = set()
+        captured = 0
+        executables = 0
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("glm5_flash."):
+                continue
+            key = glmf_identity(graph["shape"])
+            if key not in wanted:
+                continue
+            capture = graph.get("capture_bytes")
+            if capture is None:
+                raise ValueError(f"GLM Flash selected shape {key} has no measured capture bytes "
+                                 f"on device {device}")
+            seen.add(key)
+            captured += int(capture)
+            executables += int(graph.get("executables", 1) or 0)
+        if seen != wanted:
+            raise ValueError(f"GLM Flash trace for device {device} lacks selected shapes "
+                             f"{sorted(wanted - seen)}; its measured base is unknown")
+        if captured > 0 and executables > 0:
+            previous = shares.get(device)
+            if previous is None or (packed(captured), executables) > previous:
+                shares[device] = (packed(captured), executables)
+    if not shares:
+        raise ValueError("trace has no measured GLM Flash arena")
+    devices = sorted(shares)
+    if devices != list(range(len(devices))):
+        raise ValueError(f"GLM Flash traces must cover devices 0..n-1; saw {devices}")
+    measured_bytes = [shares[device][0] for device in devices]
+    measured_executables = [shares[device][1] for device in devices]
+    # Startup prewarms every selected shape, so the reserve base already holds
+    # the whole request demand. The fixed allocation tail is the arena's own
+    # headroom for its single physical allocation; runtime capture headroom is
+    # the shared extra keys' (never a trace-derived largest capture).
+    extra = CHUNK
+    return {"schema_version": 1, "family": "glm5_flash",
+            "measured_bytes": measured_bytes, "measured_executables": measured_executables,
+            "reserve_extra_bytes": extra, "entries": entries}
+
+
+def layout_groups(specs, family):
+    """Group `--trace` arguments by layout: `LAYOUT=PATH` for GLM Flash, a bare
+    path (the one layout) for GLM. A GLM Flash key names a resolved card shape,
+    `<devices>[-sparks]`; a shape left out warms the engine's bootstrap set, so
+    a trace is required only for the shapes this run measured."""
+    groups = {}
+    for spec in specs:
+        layout, path = spec.split("=", 1) if "=" in spec else ("min", spec)
+        if family != "glm5_flash" and layout != "min":
+            raise ValueError(f"{family} has one layout, not {layout!r}")
+        if family == "glm5_flash" and layout not in GLM5_FLASH_LAYOUTS:
+            raise ValueError(f"unknown GLM Flash layout {layout!r}; expected one of {sorted(GLM5_FLASH_LAYOUTS)}")
+        groups.setdefault(layout, []).append(Path(path))
+    return groups
+
+
+def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
+    """The checked-in document: one entry per traced shape, each priced from its
+    own traces. A shape's pins and arena describe that shape's traffic; absent
+    keys fall back to the engine's bootstrap set."""
+    layouts = {name: generate([json.loads(path.read_text()) for path in paths],
+                              family, coverage, pin_frequency, pin_report, layout)
+               for name, paths in sorted(groups.items())}
+    if family != "glm5_flash":
+        return layouts.pop("min")
+    for values in layouts.values():
+        for key in ("schema_version", "family"):
+            values.pop(key)
+    return {"schema_version": 3, "family": family, "layouts": layouts}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--family", required=True, choices=sorted(SITE_PREFIX))
+    parser.add_argument("--family", required=True, choices=sorted((*SITE_PREFIX, "glm5_flash")))
     parser.add_argument("--layout", type=int, choices=(1, 2),
                         help="coordinator layout the trace was recorded on (mistral_large4)")
-    parser.add_argument("--trace", action="append", required=True, type=Path)
+    parser.add_argument("--trace", action="append", required=True,
+                        help="PATH, or LAYOUT=PATH for GLM Flash (repeatable)")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
     args = parser.parse_args()
     report = []
     try:
-        result = generate([json.loads(path.read_text()) for path in args.trace],
-                          args.family, args.coverage, args.pin_frequency, report, args.layout)
+        result = generate_layouts(layout_groups(args.trace, args.family),
+                                  args.family, args.coverage, args.pin_frequency, report, args.layout)
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    layout = f" layout={result['layout']};" if "layout" in result else ""
-    print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
-          f"extra={result['reserve_extra_bytes']} bytes; "
-          f"pinned={sum(entry['pin'] for entry in result['entries'])}")
+    values = result["layouts"].values() if "layouts" in result else [result]
+    for values in values:
+        pinned = sum(entry["pin"] for entry in values["entries"])
+        if "measured_bytes" in values:
+            print(f"{len(values['entries'])} shapes; measured={values['measured_bytes']} bytes "
+                  f"for {values['measured_executables']} executables; "
+                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
+        else:
+            layout = f" layout={values['layout']};" if "layout" in values else ""
+            print(f"{len(values['entries'])} shapes;{layout} base={values['reserve_base_bytes']} "
+                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
     for pin in report:
         print("pin " + json.dumps(pin, sort_keys=True))
 

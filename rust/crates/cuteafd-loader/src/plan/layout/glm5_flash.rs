@@ -344,10 +344,6 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             baselines.push((total, Baseline::Planned { context_bytes: context, loaded_bytes: 0 }));
         }
         let speculation = draft > 0 || !draft_tp2.is_empty();
-        let automatic_target = placement::PoolPolicy::resolve(&options.rtx_bytes[..ranks], context, None, 256).target;
-        let target = options.pool_tokens.filter(|&n| n > 0).unwrap_or(automatic_target);
-        let graphs = glmf::startup_graph_bound(&cfg, cfg.layers, context as usize, target as usize,
-                sequences as usize, speculation, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize);
         let inputs = glmf::GlmfInputs {
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code,
             headroom_bytes: crate::placement::reserve::gpu("glm5_flash"), spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
@@ -358,7 +354,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
                 || representation.head != resident::GlmfHeadFormat::Bf16 {
                 placement::planner::serving::BlasHead::Native
             } else { options.bf16_target_head },
-            resident, workspace, local_workspace, graphs, experts,
+            resident, workspace, local_workspace, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_weights, drafter_scratch, drafter_requests, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
@@ -457,7 +453,8 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&selected.solved));
         report.host_budget_bytes = quota;
-        notes.push(format!("unused graph bound by GPU: {:?} bytes", selected.graph_slack));
+        notes.push(format!("graph reserve by GPU: {:?} bytes ({} prewarm shapes)",
+            selected.graphs.charged, selected.graphs.shapes));
         let (placed, working) = (selected.placement, selected.working);
         let replicas = glmf::replicated_mla_bytes(&cfg, inputs.index, &placed)?;
         if replicas > 0 {

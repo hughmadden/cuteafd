@@ -902,6 +902,12 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     ring_misses: u64, cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
     memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>, reserve: &Reserve, stalled: usize) {
+    // The second reconciliation stage: the Ready row is resident only, so this one
+    // records what the first served request added (lazy graphs, wider workspaces).
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
@@ -1343,7 +1349,6 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 active = active.len(), steps = steps_seen, all_steps = lane.steps, dflash, dflash_ok, draft_calls,
                 draft_s = lane.draft_s, verify_s = lane.verify_s, emit_s = lane.emit_s, gpu_wait_s = phases[0], experts_s = phases[1], head_s = phases[2],
-                graph_captures = graphs.stats.captures, graph_recaptures = graphs.stats.recaptures,
                 graph_held = graphs.held, graph_shapes = graphs.shapes, graph_bytes = graphs.bytes,
                 draft_ring_misses = ring_misses, "request complete");
             (lane.steps, lane.draft_s, lane.verify_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);

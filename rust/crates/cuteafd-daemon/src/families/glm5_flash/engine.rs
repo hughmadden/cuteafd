@@ -41,7 +41,7 @@
 //! homes. The LM head stays on rank 0; the drafter follows its admitted movable placement.
 //! Explicit per-layer placement keeps KDA/FFNs split and assigns each MLA layer
 //! (complete operands, KV and index state) to one owner with BF16 residual handoff.
-use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy, GraphStats};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, GraphPolicy};
 use super::packing;
 use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
@@ -1474,18 +1474,15 @@ pub(crate) struct GlmfEngine<'a> {
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
-    /// Executables evicted from either rank's cache (rank, executable): destroyed at the next
-    /// decode step, once every rank's stream has drained.
     use_graphs: bool,
-    /// Every serving decode graph captured at startup (`CUTEAFD_GLMF_STARTUP_GRAPHS`, on unless 0);
-    /// an engine graph budget captures lazily within it instead.
-    pub(crate) startup_graphs: bool,
-    /// Admission's bytes per executable for each rank's startup set. A capture
-    /// failure names it beside the shape: cudaGraphInstantiate reports no size.
-    graph_estimate: [std::cell::Cell<u64>; 2],
+    /// Either prewarm pass runs: the masked bucket owns the FFN boundary, so no real
+    /// rows are routed.
     warming_graphs: std::cell::Cell<bool>,
-    /// Run the exact masked capture segments eagerly before sampling residency.
+    /// The prewarm's eager pass: every decode segment runs eagerly with the masked
+    /// boundary a capture would bake in, before any graph is created.
     prewarming_graphs: std::cell::Cell<bool>,
+    /// The prewarm finished. Before it every decode segment runs eagerly.
+    graphs_warmed: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
     /// The shared draft policy's per-step signals (layer events, routes), armed by
@@ -1524,9 +1521,9 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, serving_graph_shapes, serving_graph_reserve};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_pinned, glmf_prewarm_shapes};
 #[allow(unused_imports)]
-use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, graph_reserve_bytes, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
+use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
 // projection has none below its capacity (`FP8_DECODE_ROWS`), where the row-invariant GEMV
 // hands over to the W8A16 GEMM. Full/half-head shapes share these thresholds; MoE
@@ -1565,30 +1562,6 @@ fn check_decode_thresholds(buckets: &DecodeBuckets, sequences: usize, speculatio
     if speculation { check_bucket_thresholds(&buckets.spec, &thresholds)?; }
     Ok(())
 }
-fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {
-    graphs != Some("0") && startup != Some("0")
-}
-pub(crate) fn startup_graphs_enabled() -> bool {
-    startup_graph_policy(std::env::var("CUTEAFD_GLMF_GRAPHS").ok().as_deref(),
-        std::env::var("CUTEAFD_GLMF_STARTUP_GRAPHS").ok().as_deref())
-}
-
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::StartupGraphReserve;
-
-/// Admission policy lives in the loader; CUDA error classification stays at the edge.
-pub(crate) fn admit_beside_decode_graphs(startup: Option<StartupGraphReserve>,
-    admit: impl FnMut(Option<u64>) -> Result<usize>) -> Result<(usize, bool)> {
-    let result = cuteafd_loader::serving_capacity::glmf_graphs::admit_beside_decode_graphs(
-        startup, admit, crate::shared::memory_report::kv_shortfall,
-        |retry, refused| retry.context(format!("admitting the GLM Flash KV pool with lazily captured \
-            decode graphs, after the startup set's admission was refused ({refused:#})")));
-    if let (Some(graphs), Ok((tokens, false))) = (startup, &result) {
-        tracing::warn!(startup_graph_bytes = graphs.reserve, graph_allowance_bytes = graphs.allowance,
-            lazy_pool_tokens = tokens, "GLM Flash startup decode graphs refused: capturing lazily within the graph allowance");
-    }
-    result
-}
-
 /// A startup capture's tables: `rows` masked rows over `geometry`.
 fn startup_tables(rows: usize, spec: bool, geometry: GraphGeometry) -> StepTables {
     let mut tables = StepTables { decode: true, spec, long: geometry.long, pool_width: geometry.pool_width,
@@ -1647,7 +1620,6 @@ impl GraphKey {
 /// What the decode graph caches did and hold.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GraphCounts {
-    pub stats: GraphStats,
     /// Executables held, the step shapes they belong to (segment 0's), and their charged bytes.
     pub held: usize,
     pub shapes: usize,
@@ -1803,10 +1775,9 @@ impl<'a> GlmfEngine<'a> {
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
-            use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: startup_graphs_enabled(),
-            graph_estimate: [std::cell::Cell::new(0), std::cell::Cell::new(0)],
-            warming_graphs: std::cell::Cell::new(false), prewarming_graphs: std::cell::Cell::new(false),
+            use_graphs: Self::graphs_enabled(),
+            warming_graphs: std::cell::Cell::new(false),
+            prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             spark_bf16: false, full_prefill_logits: false,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
@@ -1815,12 +1786,6 @@ impl<'a> GlmfEngine<'a> {
             kda_output_shard: false, mark_slots: 0,
             kda_prefill_expanded: false, kda_state, l2: None, target_head: TargetHeadRoute::Tensor, embedding,
             selector: RefCell::new(None), admitted_host: None })
-    }
-
-    /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
-    /// (the KV admission found no room for it: `admit_beside_decode_graphs`).
-    pub(crate) fn capture_graphs_lazily(&mut self) {
-        self.startup_graphs = false;
     }
 
     /// Own every ordinary text/media workspace before readiness: both ranks' decode workspaces and
@@ -1836,135 +1801,161 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    /// Capture the complete serving key set on masked rows, without expert traffic. The bucket sets
-    /// pass the projection thresholds before readiness in every graph mode.
-    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool)
-        -> Result<Option<cuteafd_loader::serving_capacity::glmf_graphs::StartupCapture>> {
-        use cuteafd_loader::placement::inventory::{CapturedGraphRank, DeclaredGraphSet, GraphMemorySample};
-        if !self.use_graphs { return Ok(None); }
-        check_decode_thresholds(&self.buckets, sequences, speculation)?;
-        tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
-            verify_rows = self.verify_rows, startup = self.startup_graphs,
-            "GLM Flash decode buckets pass the projection thresholds");
-        if !self.startup_graphs { return Ok(None); }
-        let startup = cuteafd_loader::serving_capacity::glmf_graphs::startup_set(
-            self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(), sequences,
-            speculation, self.weights.layers.len(), self.peer.is_some(), &self.buckets);
-        ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
-            "startup graph peer layer inventory differs from planner");
-        for (rank, estimate) in startup.inventory.ranks.iter().enumerate() {
-            self.graph_estimate[rank.min(1)].set(estimate.bytes / estimate.executables.max(1));
-        }
-        let shapes = startup.keys;
-        let segments = self.weights.layers.len() + 1;
-        let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>();
-        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?self.buckets.plain,
-            spec_rows = ?self.buckets.spec, "GLM Flash startup decode graph admission");
-        // Allocate fixed workspaces before measuring the graph executables' physical memory.
-        for rank in 0..self.ranks() {
-            drop(self.decode_workspace_of(rank)?);
-        }
-        ensure!((0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().len() == 0),
-            "startup graph banks must be empty before capture");
-        // Same segment closures and masked FFN semantics, without creating a
-        // graph: module/BLAS first use belongs outside executable residency.
-        self.warming_graphs.set(true);
-        self.prewarming_graphs.set(true);
-        let prewarmed = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
-            }
-            self.synchronize()
-        })();
-        self.prewarming_graphs.set(false);
-        self.warming_graphs.set(false);
-        prewarmed?;
-        let sample = || -> Result<Vec<GraphMemorySample>> {
-            self.synchronize()?;
-            let ledger = cuteafd_ffi::memory_ledger::snapshot();
-            use cuteafd_ffi::memory_ledger::Space;
-            (0..self.ranks()).map(|rank| self.on(rank, || {
-                let device = self.library.cuda_get_device()?;
-                let (free, total) = self.library.cuda_physical_memory_info()?;
-                Ok(GraphMemorySample { free: free as u64, total: total as u64,
-                    tracked_device: ledger.total(Space::Device, device) as u64,
-                    tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
-                        .map(|row| row.bytes as u64).sum(),
-                    tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
-                        .map(|row| row.bytes as u64).sum() })
-            })).collect()
-        };
-        for rank in 0..self.ranks() {
-            let end = if rank == 0 { segments } else { segments - 1 };
-            let keys: Vec<_> = shapes.iter().flat_map(|&(rows, spec, geometry)| {
-                let tables = startup_tables(rows, spec, geometry);
-                (0..end).map(move |segment| GraphKey::new(segment, rows, &tables))
-            }).collect();
-            self.graphs_of(rank).borrow_mut().declare_startup(&keys)?;
-        }
-        let before = sample()?;
-        let started = std::time::Instant::now();
-        self.warming_graphs.set(true);
-        let captured = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
-            }
-            self.synchronize()
-        })();
-        self.warming_graphs.set(false);
-        captured?;
-        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
-        for rank in 0..self.ranks() {
-            self.graphs_of(rank).borrow_mut().finish_startup()?;
-        }
-        for &(rows, spec, geometry) in &shapes {
-            let tables = startup_tables(rows, spec, geometry);
-            for rank in 0..self.ranks() {
-                let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
-                let end = if rank == 0 { segments } else { segments - 1 };
-                for segment in 0..end {
-                    ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
-                        "startup graph coverage missing");
-                }
-            }
-        }
-        let after = sample()?;
-        let ranks = (0..self.ranks()).map(|rank| {
-            let declared = cuteafd_loader::serving_capacity::glmf_graphs::executable_keys(
-                &shapes, self.weights.layers.len(), rank);
-            let declared = DeclaredGraphSet::new(&declared).map_err(anyhow::Error::msg)?;
-            let actual = self.graphs_of(rank).borrow().keys().into_iter().map(|key|
-                cuteafd_loader::serving_capacity::glmf_graphs::GraphKey {
-                    segment: key.segment, rows: key.rows, spec: key.spec, long: key.long,
-                    pool_width: key.pool_width, page_stride: key.page_stride, pool_stride: key.pool_stride,
-                }).collect::<Vec<_>>();
-            CapturedGraphRank::measure(rank as u8, &declared, &actual, before[rank], after[rank])
-                .map_err(anyhow::Error::msg)
-        }).collect::<Result<Vec<_>>>()?;
-        let bytes = ranks.iter().map(|rank| rank.bytes).collect::<Vec<_>>();
-        tracing::info!(graphs, shapes = shapes.len(), ?bytes, elapsed_ms = started.elapsed().as_millis() as u64,
-            "GLM Flash decode graphs captured at startup");
-        Ok(Some(cuteafd_loader::serving_capacity::glmf_graphs::StartupCapture { ranks }))
+    /// Best-effort prewarm of the launch's checked-in shape list, on masked rows without
+    /// expert traffic: an eager pass first (module, workspace and BLAS first touch outside
+    /// executable residency), then a capture pass. Never sealed: an unlisted or uncaptured
+    /// request shape captures or runs eagerly inside the same measured reserve.
+    /// Returns the resident keys and each rank's before/after sample.
+    /// Whether this process captures decode segments (`CUTEAFD_GLMF_GRAPHS=0` runs decode eagerly).
+    pub(crate) fn graphs_enabled() -> bool {
+        std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0")
     }
 
-    pub(crate) fn check_admitted_graphs(&self, admitted: &cuteafd_loader::placement::GraphSet) -> Result<()> {
-        ensure!(admitted.lifetime == cuteafd_loader::placement::Lifetime::Startup
-            && admitted.ranks.len() == self.ranks(), "startup graph admission does not match executor ranks");
-        for (rank, expected) in admitted.ranks.iter().enumerate() {
-            let actual = if rank == 0 { self.graphs.borrow().len() } else { self.peer()?.graphs.borrow().len() };
-            ensure!(actual as u64 == expected.executables,
-                "GLM Flash rank {rank} captured {actual} graphs, admission reserved {}", expected.executables);
+    /// Returns whether the prewarm ran.
+    pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<bool> {
+        if !self.use_graphs { return Ok(false); }
+        check_decode_thresholds(&self.buckets, sequences, speculation)?;
+        tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
+            verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
+        let layout = self.graph_layout();
+        let shapes = glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
+            sequences.min(self.decode_rows), speculation, &self.buckets, layout);
+        ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
+            "prewarm peer layer inventory differs from planner");
+        ensure!(!self.graphs_warmed.get() && (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().len() == 0),
+            "GLM Flash graph prewarm already ran");
+        let started = std::time::Instant::now();
+        use crate::shared::decode_graph::device::Cycle;
+        for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_cycle(Cycle::Other); }
+        // Allocate fixed workspaces before measuring the graph executables' physical memory.
+        for rank in 0..self.ranks() { drop(self.decode_workspace_of(rank)?); }
+        let run = |eager: bool| -> Result<()> {
+            // Both passes keep the masked bucket boundary; only the second creates graphs.
+            self.warming_graphs.set(true);
+            self.prewarming_graphs.set(eager);
+            let result = (|| -> Result<()> {
+                for &(rows, spec, geometry) in &shapes {
+                    self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
+                }
+                self.synchronize()
+            })();
+            self.prewarming_graphs.set(false);
+            self.warming_graphs.set(false);
+            result
+        };
+        // Same segment closures and masked FFN semantics, without creating a graph.
+        run(true)?;
+        let before = self.graph_memory_samples()?;
+        let captured = run(false);
+        captured?;
+        self.graphs_warmed.set(true);
+        let after = self.graph_memory_samples()?;
+        let held: usize = (0..self.ranks()).map(|rank| self.graphs_of(rank).borrow().len()).sum();
+        tracing::info!(graphs = held, layout = %layout,
+            free = ?(0..self.ranks()).map(|rank| (before[rank].free, after[rank].free)).collect::<Vec<_>>(),
+            shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+            "GLM Flash decode graphs warmed at startup");
+        Ok(true)
+    }
+
+    /// Bind each rank's banks at its admitted charge, then record the shared
+    /// reserve policy that charge came from: the traced base plus the fixed
+    /// allocation tail, with runtime capture headroom from the shared extra.
+    pub fn configure_graph_cache(&self, charged: &[u64], bases: &[u64], bootstraps: &[u64], tail: u64) -> Result<()> {
+        use crate::shared::decode_graph::device::{Cycle, Preference, Site};
+        let basis = self.graph_basis();
+        if basis == crate::shared::decode_graph::device::Basis::Bytes {
+            tracing::warn!("GLM Flash graph cache uses a per-site byte estimate: no node-rate calibration for this route");
+        }
+        for rank in 0..self.ranks() {
+            let device = if rank == 0 { self.device } else { self.peer()?.device };
+            self.graphs_of(rank).borrow_mut().attach_device(device, charged[rank], Site {
+                name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: bootstraps[rank], basis,
+                spans_devices: self.ranks() > 1 || self.peer.is_some(),
+            })?;
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, bases[rank], tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
+    }
+
+    /// #1612 calibrated no GLM Flash route, so every device estimates in bytes: the site's
+    /// bootstrap until its own measured capture replaces it.
+    fn graph_basis(&self) -> crate::shared::decode_graph::device::Basis {
+        crate::shared::decode_graph::device::Basis::Bytes
+    }
+
+    /// The resolved graph layout this launch serves under: its coordinator
+    /// device count, and whether Spark ranks serve its routed experts. The
+    /// second coordinator GPU under a head split is not a Spark attachment:
+    /// a 2-RTX launch with local TP2 experts (Sparks idle) and one with Spark
+    /// experts are different layouts, and a 1-RTX launch with Sparks is not
+    /// `1`.
+    fn graph_layout(&self) -> GlmfLayout {
+        GlmfLayout::resolved(self.ranks(), matches!(self.experts, Some(Experts::Spark { .. })))
+    }
+
+    /// Whether this launch's layout's checked-in prewarm list pins this shape:
+    /// only what that layout's trace shows is always hot. A layout with no
+    /// trace prewarms its bootstrap set unpinned and lets ARC decide.
+    fn graph_pinned(&self, key: &GraphKey) -> bool {
+        let shape = (key.rows, key.spec, GraphGeometry { pool_width: key.pool_width,
+            page_stride: key.page_stride, pool_stride: key.pool_stride, long: key.long });
+        glmf_pinned(self.graph_layout(), &shape)
+    }
+
+    /// Every rank's launches for the completed step are queued: observe the
+    /// device once per physical GPU, tick each site's cycle and retire the
+    /// victims without draining a lane. GLM Flash every graph owner pins `()`
+    /// and captures only persistent engine buffers, so destroying a victim
+    /// executable never releases storage an in-flight launch reads.
+    fn observe_graphs_completed(&self) -> Result<()> {
+        let spans = self.ranks() > 1 || self.peer.is_some();
+        // SAFETY: every GLM Flash graph owner pins `()` (see `GraphOwner::new`
+        // in `replay_on`) and its captured pointers are persistent engine
+        // buffers, never per-graph allocations.
+        unsafe {
+            crate::shared::decode_graph::device::observe_completed(&self.library, |visit| {
+                for rank in 0..self.ranks() {
+                    let device = if rank == 1 { self.peer()?.device } else { self.device };
+                    visit(device, "glm5_flash.decode", spans,
+                        &mut *self.graphs_of(rank).borrow_mut())?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// Physical free/total and the ledger's tracked bytes on both ranks, with
+    /// the streams drained so no queued work lands inside the window.
+    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
+        // SAFETY: both ranks' streams are live; nothing else is queued.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        if self.peer.is_some() {
+            let stream = self.stream_of(1);
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        use cuteafd_ffi::memory_ledger::Space;
+        (0..self.ranks()).map(|rank| self.on(rank, || {
+            let device = self.library.cuda_get_device()?;
+            let (free, total) = self.library.cuda_physical_memory_info()?;
+            Ok(GraphMemorySample { free: free as u64, total: total as u64,
+                tracked_device: ledger.total(Space::Device, device) as u64,
+                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
+                    .map(|row| row.bytes as u64).sum(),
+                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
+                    .map(|row| row.bytes as u64).sum() })
+        })).collect()
     }
 
     /// All-owner real-row byte gate; plain steps restore the complete persistent state. With the wide
     /// programs the speculative steps also pad 65 rows and the verify budget less one into the
     /// budget's bucket (65 -> 127 and 126 -> 127 on an RTX 5090).
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(self.use_graphs && self.startup_graphs,
-            "padding check needs graphs and CUTEAFD_GLMF_STARTUP_GRAPHS=1");
+        ensure!(self.use_graphs, "padding check needs decode graphs (CUTEAFD_GLMF_GRAPHS=1)");
         let mut spec_rows = vec![3, 9, 17, 33];
         if self.verify_rows > DECODE_ROWS {
             spec_rows.extend([DECODE_ROWS + 1, self.verify_rows - 1]);
@@ -3780,11 +3771,12 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.startup_graphs }
+    /// Production replay is ready once the prewarm finished: before it every segment is eager.
+    pub(crate) fn production_replay_ready(&self) -> bool { self.use_graphs && self.graphs_warmed.get() }
 
-    /// Physical row count of an ordinary serving verify (lazy graphs use exact rows).
+    /// Physical row count of an ordinary serving verify (an eager step keeps its exact rows).
     pub(crate) fn serving_decode_rows(&self, rows: usize, spec: bool) -> usize {
-        if self.use_graphs && self.startup_graphs { self.buckets.bucket(rows, spec) } else { rows }
+        if self.use_graphs { self.buckets.bucket(rows, spec) } else { rows }
     }
 
     /// [`Self::verify`] (`spec`: [`Self::verify_spec`]) leaving every row's
@@ -3837,6 +3829,11 @@ impl<'a> GlmfEngine<'a> {
         if spec {
             // The commit that follows reads this step's records.
             self.records.recorded();
+        }
+        {
+            use crate::shared::decode_graph::device::Cycle;
+            let cycle = if spec { Cycle::Verify } else { Cycle::Decode };
+            for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_cycle(cycle); }
         }
         let graphed = self.use_graphs && !tables.eager && on_layer.is_none() && trace.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
@@ -4081,7 +4078,7 @@ impl<'a> GlmfEngine<'a> {
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
         let out = self.peer_ffn_out(index, w1, layer)?;
         // Startup bucket graphs exclude both ranks' real-row shared FFNs and their peer publication.
-        if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }
+        if !layer.dense && self.capturing.get() { return Ok(()); }
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
         match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, false) => {}
@@ -4119,7 +4116,7 @@ impl<'a> GlmfEngine<'a> {
             self.peer_attention(index, 0, w1, t, decode_cap(t), tables)
         })?;
         let layer = &self.peer()?.layers[index];
-        if self.startup_graphs && !layer.dense && !self.tp2_layer(index) {
+        if !layer.dense && !self.tp2_layer(index) {
             let out = self.peer_ffn_out(index, w1, layer)?;
             if self.warming_graphs.get() {
                 self.on(1, || unsafe {
@@ -4151,7 +4148,13 @@ impl<'a> GlmfEngine<'a> {
         trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            |scope| self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media))
+            |scope| {
+                let result = self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media)?;
+                // Every rank's launches are queued now: this completed step is the
+                // measurement boundary for a capture queued inside it.
+                self.observe_graphs_completed()?;
+                Ok(result)
+            })
     }
 
     fn decode_primitive_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
@@ -4334,7 +4337,6 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn decode_graphed(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, tables1: &StepTables,
         t: usize, rows: Scalar, logit_rows: usize) -> Result<Option<DeviceLogits>> {
-        self.release_retired_graphs()?;
         let layers = &self.weights.layers;
         // Every layer resident: the last segment ends in the head and the greedy selection.
         let head = layers.len() == self.cfg.layers && logit_rows == t;
@@ -4386,11 +4388,9 @@ impl<'a> GlmfEngine<'a> {
                 self.post_pre_on(0, w, attended, 0, layer, "ffn", "post_norm", rows, cap)?;
                 if layer.dense {
                     self.ffn(w, layer, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
-                } else if self.startup_graphs {
+                } else {
                     // Real width is runtime data, not part of a bucket graph key.
                     Ok(())
-                } else {
-                    self.moe_front(w, index, layer, t, rows, cap, &[Span { first: 0, rows: t }])
                 }
             })?;
             // Outside capture: every replay queues its matching peer landing.
@@ -4423,7 +4423,7 @@ impl<'a> GlmfEngine<'a> {
                             self.library.cuda_zero_bytes_async(buffer, t * self.cfg.hidden * 2, self.stream_of(1))
                         })?;
                     }
-                } else if self.startup_graphs {
+                } else {
                     // A padded step's real rows run the router, the expert wire and the shared expert
                     // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
                     // padding tail of the decode workspace's `delta` is cleared after the expert work.
@@ -4451,10 +4451,6 @@ impl<'a> GlmfEngine<'a> {
                             Ok(())
                         }
                     })?;
-                } else {
-                    // The router ran inside this layer's segment: its ids are still in place.
-                    self.probe_ring(index, w, t)?;
-                    self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?;
                 }
             }
             if self.tp2_layer(index) {
@@ -4553,102 +4549,83 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Launches `segment` through a graph captured the first time `key` is seen.
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
 
-    /// [`Self::replay`] on rank `rank`'s stream (its own graphs). A capture measures its
-    /// executable's device bytes (free memory before the capture and after its instantiation);
-    /// executables evicted past the graph budget retire until the next decode step.
-    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs): a hit launches the captured
+    /// segment, a miss captures it (or runs it eagerly where capture is unavailable), and every
+    /// failed capture cancels its ticket. A capture's cost is measured at the completed step
+    /// boundary (`observe_graphs_completed`), never by a sync inside a segment.
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
-        // Only a startup-set miss builds this context, describing which rank
-        // and warm-up phase needed a shape its declared inventory lacked.
-        let prewarming = self.prewarming_graphs.get();
-        let calibrating = graphs.borrow().calibrating();
-        let (decision, cached) = {
-            let mut graphs = graphs.borrow_mut();
-            let (decision, graph) = graphs.enqueue_with_context(&key, || format!(
-                "rank={rank} prewarming={prewarming} calibrating={calibrating}"));
-            (decision, graph.map(|graph| graph.raw))
-        };
-        if let Some(exec) = cached {
+        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) });
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) });
         }
-        if self.prewarming_graphs.get() || decision == crate::shared::decode_graph::GraphDecision::Eager {
-            // Preserve the captured segment's masked/shared-FFN boundary while
-            // running it eagerly; a startup-bank miss never captures a request.
-            self.capturing.set(true);
-            let result = segment();
-            self.capturing.set(false);
-            return result;
+        // Before the prewarm, and through its eager pass, every segment runs eagerly.
+        if self.prewarming_graphs.get()
+            || (!self.graphs_warmed.get() && !self.warming_graphs.get()) {
+            return self.eager_segment(segment);
         }
-        ensure!(graphs.borrow().capture_allowed(&key),
-            "GLM Flash startup graph key is outside its declared inventory: rank {rank}, {key:?}");
-        let calibrating = graphs.borrow().calibrating();
-        let free = || self.on(rank, || self.library.cuda_memory_info().map(|(free, _)| free));
-        let before = if calibrating { Some(free()?) } else { None };
-        // Capture and instantiate are CUDA-owned allocations the ledger cannot
-        // see, and cudaGraphInstantiate reports no requested size; name the plan
-        // owner, the scope, this exact shape and admission's bytes per executable
-        // so an OOM dump names them instead of `owner=null, scope=other`.
-        let device = if rank == 1 { self.peer()?.device } else { self.device };
-        let _scope = cuteafd_ffi::memory_ledger::scope("glm5_flash.decode-graph");
-        let _owner = cuteafd_ffi::memory_ledger::owner(&format!("glmf.graphs.{device}"));
-        let _subject = cuteafd_ffi::memory_ledger::subject(&format!(
-            "decode graph rank={rank} segment={} rows={} spec={} long={} pool_width={} page_stride={} pool_stride={} planner_bytes_per_exec={}",
-            key.segment, key.rows, key.spec, key.long, key.pool_width, key.page_stride, key.pool_stride,
-            self.graph_estimate[rank.min(1)].get()));
-        // SAFETY: capture records this stream's launches; nothing in a segment
-        // synchronizes the host or allocates.
-        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
-        self.capturing.set(true);
+        let pinned = self.graph_pinned(&key);
+        let crate::shared::decode_graph::device::Miss::Capture(ticket) =
+            graphs.borrow_mut().cache_miss(&key, pinned, None) else {
+            return self.eager_segment(segment);
+        };
+        // No synchronization here: peer segments may not yet have been queued.
+        // SAFETY: capture records launches on this rank's persistent stream.
+        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
+            graphs.borrow_mut().cache_cancel(ticket);
+            tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            return self.eager_segment(segment);
+        }
         let captured = segment();
-        self.capturing.set(false);
-        // SAFETY: ends the capture begun above on the same stream.
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
-        captured?;
-        // An instantiate that runs out of device memory is the launch's
-        // allocation failure: name the owner, the exact shape and the levers
-        // that free memory, instead of a bare CUDA status.
-        let exec = exec.with_context(|| format!(
-            "cudaGraphInstantiate failed for GLM Flash startup decode graph rank={rank} {key:?} under \
-             its owner glmf.graphs.{device} ({} B planned per executable); lower GPU_MEMORY_CAP or \
-             KV_TARGET_TOKENS, or reserve device memory with GPU_RESERVE, so the startup graph set fits",
-            self.graph_estimate[rank.min(1)].get()))?;
-        // SAFETY: persistent engine storage is drained before bank destruction.
-        let exec = unsafe { GraphOwner::new(self.library, device, exec, ())? };
-        graphs.borrow().census_capture_key("decode", rank as i32, Some(0), &key, exec.raw);
-        let measured = match before {
-            Some(before) => Some(before.saturating_sub(free()?) as u64),
-            None => None,
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        if let Err(error) = captured {
+            graphs.borrow_mut().cache_cancel(ticket);
+            if let Ok((raw, _, _, _, _)) = exec {
+                // SAFETY: the capture failed; this executable owns no live launch.
+                let _ = self.on(rank, || unsafe { self.library.cuda_graph_exec_destroy(raw) });
+            }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                graphs.borrow_mut().cache_cancel(ticket);
+                tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                return self.eager_segment(segment);
+            }
         };
-        // SAFETY: the new graph reads and writes persistent engine buffers.
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.raw, stream) })?;
-        let (recaptured, evicted, held, stats) = {
-            let mut graphs = graphs.borrow_mut();
-            let recaptured = graphs.seen(&key);
-            let retired = graphs.retired_len();
-            graphs.insert(key, exec, measured);
-            (recaptured, graphs.retired_len() - retired, graphs.bytes(), graphs.stats())
-        };
-        if recaptured {
-            tracing::debug!(rank, ?key, recaptures = stats.recaptures, "decode graph recaptured");
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "glm5_flash.decode", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
         }
-        if calibrating && !graphs.borrow().calibrating() {
-            tracing::info!(rank, executables = stats.captures, each_bytes = graphs.borrow().each(),
-                budget = ?graphs.borrow().budget(), "decode graph size calibrated at the first eviction");
-        }
-        if evicted > 0 {
-            tracing::info!(rank, evicted, held = graphs.borrow().len(), held_bytes = held,
-                budget = ?graphs.borrow().budget(),
-                captures = stats.captures, recaptures = stats.recaptures, evictions = stats.evictions,
-                "decode graphs past the budget retire");
-        }
+        let device = if rank == 1 { self.peer()?.device } else { self.device };
+        // SAFETY: persistent engine storage outlives the executable, which teardown drains first.
+        let graph = unsafe { GraphOwner::new(self.library, device, raw, ())? };
+        crate::shared::decode_graph::census::capture_key("glm5_flash", "decode",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.raw);
+        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
+        // Own the executable and ticket before launch: a launch error is drained by the
+        // submission guard before either its pointers or owner can retire.
+        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        let bank = graphs.borrow();
+        let graph = bank.get(&key).context("inserted graph")?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) })?;
         Ok(())
+    }
+
+    /// `segment` eagerly, with the masked/shared-FFN boundary a capture would bake in.
+    fn eager_segment(&self, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.capturing.set(true);
+        let result = segment();
+        self.capturing.set(false);
+        result
     }
 
     fn graphs_of(&self, rank: usize) -> &RefCell<GraphBank<GraphKey, GraphExec<'a>>> {
@@ -4658,42 +4635,13 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Destroys retired decode graphs once every rank's stream has drained (none of them can be
-    /// in flight). Called between decode steps: a sync inside one could wait on a peer push the
-    /// host has not queued yet.
-    fn release_retired_graphs(&self) -> Result<()> {
-        if (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().retired_len() == 0) {
-            return Ok(());
-        }
-        self.synchronize()?;
-        for rank in 0..self.ranks() {
-            let retired = self.graphs_of(rank).borrow_mut().drain_retired(|| Ok(()))?;
-            self.on(rank, || { drop(retired); Ok(()) })?;
-        }
-        Ok(())
-    }
-
-    /// The decode graph budget of every rank (None: unbounded).
-    pub(crate) fn set_graph_budget(&self, budget: Option<u64>) {
-        for rank in 0..self.ranks() {
-            self.graphs_of(rank).borrow_mut().set_budget(budget);
-        }
-    }
-
-    /// Decode graph captures, recaptures and evictions, and the measured bytes held (every rank).
+    /// Decode graph cache occupancy: executables held, their step shapes and charged bytes.
     pub(crate) fn graph_stats(&self) -> GraphCounts {
         (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
             let graphs = self.graphs_of(rank).borrow();
-            let stats = graphs.stats();
-            GraphCounts {
-                stats: GraphStats { captures: total.stats.captures + stats.captures,
-                    recaptures: total.stats.recaptures + stats.recaptures,
-                    evictions: total.stats.evictions + stats.evictions,
-                    eager_runs: total.stats.eager_runs + stats.eager_runs },
-                held: total.held + graphs.len(),
+            GraphCounts { held: total.held + graphs.len(),
                 shapes: total.shapes + graphs.count(|key| key.segment == 0),
-                bytes: total.bytes + graphs.bytes(),
-            }
+                bytes: total.bytes + graphs.bytes() }
         })
     }
 
@@ -5923,112 +5871,6 @@ mod prefill_lane_tests {
 
     }
 
-    /// The startup set's fallback, against an admission modelled on a 5090 at 131,072 tokens and 16
-    /// sequences: 49,408 tokens of 11,804 B fit beside the planner's 1.5 GiB graph allowance, and the
-    /// startup set needs 3,388,063,576 B more (28,060 graphs).
-    #[test]
-    fn startup_graphs_fall_back_to_lazy_capture_only_on_a_real_shortfall() {
-        use super::{admit_beside_decode_graphs, StartupGraphReserve};
-        use crate::shared::memory_report::NoKvRoom;
-        let allowance = 1_610_612_736;
-        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
-        // Whole 256-token units of 11,804 B in the room past the fixed costs and `extra`.
-        let modelled = |room: u64| move |extra: u64| -> anyhow::Result<usize> {
-            let tokens = room.saturating_sub(extra) / 11_804 / 256 * 256;
-            anyhow::ensure!(tokens >= 256, NoKvRoom { free_after_reserve: vec![room as i64 - extra as i64] });
-            Ok(tokens as usize)
-        };
-        let calls = std::cell::RefCell::new(Vec::new());
-        // A planned admission: the startup set's bytes above the allowance, nothing for lazy capture.
-        let counted = |room: u64| { let admit = modelled(room); let calls = &calls;
-            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs);
-                admit(graphs.map_or(0, |bytes| bytes.saturating_sub(allowance))) } };
-        let set = Some(allowance + 3_388_063_576);
-        // Fits: startup capture, one admission keeping the startup set.
-        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(8_000_000_000)).unwrap();
-        assert!(at_startup && tokens == 390_656);
-        assert_eq!(calls.take(), [set]);
-        // A real shortfall: no room beside the startup set, 49,408 tokens with lazily captured graphs.
-        let (tokens, at_startup) = admit_beside_decode_graphs(startup, counted(49_408 * 11_804)).unwrap();
-        assert!(!at_startup && tokens == 49_408);
-        assert_eq!(calls.take(), [set, None]);
-        // No room either way: the startup admission's refusal stands.
-        let error = admit_beside_decode_graphs(startup, counted(1_000)).unwrap_err();
-        assert!(error.to_string().contains(&format!("{}", 1_000 - 3_388_063_576_i64)), "{error}");
-        assert_eq!(calls.take(), [set, None]);
-        // Any other refusal is not a shortfall: no retry.
-        let failing = |_: Option<u64>| -> anyhow::Result<usize> { anyhow::bail!("CUDA error 2") };
-        assert!(admit_beside_decode_graphs(startup, failing).unwrap_err().to_string().contains("CUDA error"));
-        // A startup set within the allowance adds nothing to retry without; startup capture off runs lazily.
-        let within = Some(StartupGraphReserve { reserve: allowance, allowance });
-        assert!(admit_beside_decode_graphs(within, counted(1_000)).is_err());
-        assert_eq!(calls.take(), [Some(allowance)]);
-        assert_eq!(admit_beside_decode_graphs(None, counted(49_408 * 11_804)).unwrap(), (49_408, false));
-        assert_eq!(calls.take(), [None]);
-    }
-
-    /// The lazy retry after each refusal for want of memory: a pool falls back to lazy capture; a retry
-    /// short of memory too (either kind) keeps the startup refusal; a retry that fails for another
-    /// reason returns its own error, with the startup refusal as context. Same startup set as above.
-    #[test]
-    fn the_lazy_retry_keeps_the_startup_refusal_only_when_it_is_short_too() {
-        use super::{admit_beside_decode_graphs, StartupGraphReserve};
-        use crate::shared::memory_report::{kv_shortfall, NoKvRoom};
-        use cuteafd_core::serving_capacity::CapacityError;
-        // The modelled launch above (49,408 tokens of 11,804 B fit beside the allowance alone).
-        fn no_room() -> anyhow::Error {
-            NoKvRoom { free_after_reserve: vec![583_212_032 - 3_388_063_576] }.into()
-        }
-        // An automatic pool's one-unit check (`GpuMemoryBudget::admit`), as a 5090 refused it at 131,072
-        // tokens and 16 sequences with host embedding; the retry then admitted 91,904 tokens.
-        fn over_budget() -> anyhow::Error {
-            CapacityError::GpuBudgetExceeded { device: 0, required: 36_016_220_192, budget: 33_711_521_792,
-                shortfall: 2_304_698_400 }.into()
-        }
-        // The retry's refreshed memory sample or checkpoint read failing: none is a shortfall.
-        let others: [fn() -> anyhow::Error; 4] = [
-            || CapacityError::Invalid("invalid GPU budget or physical memory sample").into(),
-            || CapacityError::Overflow("GPU allocation budget").into(),
-            || anyhow::anyhow!("cuteafd_cuda_memory_info returned status 1: unspecified launch failure"),
-            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::NotFound)).context("opening config.json"),
-        ];
-        let allowance = 1_610_612_736;
-        let startup = Some(StartupGraphReserve { reserve: allowance + 3_388_063_576, allowance });
-        let calls = std::cell::RefCell::new(Vec::new());
-        // The admission keeping the startup set is refused with `first`; the retry answers `retry`.
-        let scripted = |first: anyhow::Error, retry: anyhow::Result<usize>| {
-            let mut answers = vec![retry, Err(first)];
-            let calls = &calls;
-            move |graphs: Option<u64>| { calls.borrow_mut().push(graphs); answers.pop().expect("at most two admissions") }
-        };
-        let both = [Some(allowance + 3_388_063_576), None];
-        let chain = |error: &anyhow::Error| error.chain().map(|cause| cause.to_string()).collect::<Vec<_>>();
-        let refusals: [(fn() -> anyhow::Error, usize); 2] = [(no_room, 49_408), (over_budget, 91_904)];
-        for (refusal, pool) in refusals {
-            // A pool with lazily captured graphs: lazy capture.
-            let admitted = admit_beside_decode_graphs(startup, scripted(refusal(), Ok(pool))).unwrap();
-            assert_eq!(admitted, (pool, false));
-            assert_eq!(calls.take(), both);
-            // Short either way: the startup refusal, unchanged.
-            for (short, _) in refusals {
-                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(short()))).unwrap_err();
-                assert!(kv_shortfall(&error));
-                assert_eq!(chain(&error), chain(&refusal()));
-                assert_eq!(calls.take(), both);
-            }
-            // Another failure: the retry's own error, whole, beneath the startup refusal as context.
-            for other in others {
-                let error = admit_beside_decode_graphs(startup, scripted(refusal(), Err(other()))).unwrap_err();
-                assert!(!kv_shortfall(&error), "{error:#}");
-                assert_eq!(&chain(&error)[1..], chain(&other()).as_slice());
-                assert!(error.to_string().contains(&format!("({:#})", refusal())), "{error:#}");
-                assert_eq!(calls.take(), both);
-            }
-        }
-    }
-
-
-
     #[test]
     fn step_workspaces_reproduce_the_frozen_accounting_and_share_the_lanes_temporaries() {
         use cuteafd_loader::families::glm5_flash::{GlmNextConfig, GlmNextAttention};
@@ -6089,6 +5931,7 @@ mod prefill_lane_tests {
     #[test]
     fn million_token_graphs_add_only_three_long_geometries() {
         use super::*;
+        use cuteafd_loader::serving_capacity::glmf_graphs::{glmf_graph_reserve, serving_graph_shapes};
         let pages = 2_097_152 / PAGE_ROWS;
         for (verify, expected) in [(64, 300), (128, 330)] {
             let buckets = DecodeBuckets::new(verify);
@@ -6110,16 +5953,22 @@ mod prefill_lane_tests {
                     }
                 }
             }
-            let reserves = serving_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            let old = serving_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, true, &buckets);
-            assert!(reserves.iter().zip(old).all(|(new, old)| new - old < (512 << 20)));
+            let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
+            let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
+            // Startup prewarms every traced shape this context admits; the long
+            // geometries only exist at the wide context, so the wide reserve is
+            // a superset and pays for the trace's whole demand.
+            assert_eq!(wide.executables[0], 690);
+            assert!(narrow.shapes.iter().all(|shape| wide.shapes.contains(shape)));
+            assert!(narrow.reserves[0] <= wide.reserves[0]);
         }
     }
 
     #[test]
     fn startup_graph_shapes_cover_all_admitted_capacities_and_positions() {
-        use super::{decode_bucket, glmf_table_pages, serving_graph_shapes, DecodeBuckets, GraphGeometry, GraphKey,
+        use super::{decode_bucket, glmf_table_pages, DecodeBuckets, GraphGeometry, GraphKey,
             StepTables, DECODE_ROWS, MIN_PAGE_STRIDE, UNIT_PAGES, UNIT_ROWS};
+        use cuteafd_loader::serving_capacity::glmf_graphs::serving_graph_shapes;
         let buckets = DecodeBuckets::new(DECODE_ROWS);
         for (context, pages, dense) in [(32768usize, 4096usize, 2051usize), (777, 28, 99), (3000, 36, 2051)] {
             let shapes = serving_graph_shapes(context, pages, dense, 16, true, &buckets);
@@ -6175,16 +6024,24 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(9, false), 16);
         assert_eq!(super::decode_bucket(17, false), 32);
         let buckets = super::DecodeBuckets::new(super::DECODE_ROWS);
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, glmf_prewarm_list, glmf_prewarm_shapes, serving_graph_shapes};
+        let layout = GlmfLayout::resolved(1, true);
         for sequences in [8, 16] {
-            let shapes = super::serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
+            let shapes = serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            let reserve = super::serving_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, true, &buckets);
-            use cuteafd_loader::serving_capacity::glmf_graphs::estimated_graph_rank;
-            assert_eq!(reserve, [estimated_graph_rank(6440, 1).bytes, estimated_graph_rank(6300, 2).bytes]);
-            assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
+            // Startup reserves the traced shapes this launch admits; rank 0
+            // carries the head segment on top of the 45 layer segments.
+            let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 1, 64, 188, true);
+            let warm = glmf_prewarm_shapes(32768, 2_097_152, 2051, sequences, true, &buckets, layout);
+            assert_eq!(plan.executables, [warm.len() as u64 * 46]);
+            let list = glmf_prewarm_list().layout(layout).expect("the min column is traced");
+            let packed = |count: u64| list.arena_bytes(0, count).div_ceil(2 << 20) * (2 << 20);
+            assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46)]);
+            assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
+            assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
-        assert_eq!(super::serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
+        assert_eq!(serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
+        assert_eq!(serving_graph_shapes(32768, 32768, 2051, 64, true, &buckets).len() * 46, 7728);
     }
 
     #[test]
@@ -6402,34 +6259,14 @@ mod wide_decode_tests {
         }
     }
 
-    #[test]
-    fn runtime_startup_key_fingerprints_match_the_selected_shared_inventory() {
-        use super::{serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
-        use cuteafd_loader::placement::inventory::DeclaredGraphSet;
-        use cuteafd_loader::serving_capacity::glmf_graphs::{declared_fingerprints, DecodeBuckets};
-        for (context, pool, verify) in [(8192, 32768, 64), (32768, 2_097_152, 127), (131_072, 2_097_152, 128)] {
-            let shapes = serving_graph_shapes(context, pool / PAGE_ROWS, 2051, 16, true, &DecodeBuckets::new(verify));
-            for ranks in [1, 2] {
-                let fingerprints = declared_fingerprints(&shapes, 45, ranks).unwrap();
-                for (rank, fingerprint) in fingerprints.iter().enumerate() {
-                    let keys = shapes.iter().flat_map(|&(rows, spec, geometry)| {
-                        let tables = startup_tables(rows, spec, geometry);
-                        (0..45 + usize::from(rank == 0)).map(move |segment| GraphKey::new(segment, rows, &tables))
-                    }).collect::<Vec<_>>();
-                    assert_eq!(DeclaredGraphSet::new(&keys).unwrap().fingerprint(rank as u8).unwrap(), *fingerprint);
-                }
-            }
-        }
-    }
-
     /// The startup set grows by one speculative bucket per geometry: at 16 sequences and the 2,097,152-
     /// token pool target, 50 -> 55 shapes at 8,192 tokens, 140 -> 154 at 32,768 and 270 -> 297 at
-    /// 131,072 (the geometries of the graph keys); at 8,192 tokens its estimate grows by 230 graphs
-    /// (32,435,951 B). Each added shape is the budget's bucket, keyed as its own shape by its capture's
-    /// padded tables.
+    /// 131,072 (the geometries of the graph keys); each added shape is 46 executables. The added shape
+    /// is the budget's bucket, keyed as its own shape by its capture's padded tables.
     #[test]
     fn the_startup_set_grows_by_one_speculative_bucket_per_geometry() {
-        use super::{graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables, GraphKey, PAGE_ROWS};
+        use super::{startup_tables, GraphKey, PAGE_ROWS};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, serving_graph_shapes};
         let pages = 2_097_152usize.div_ceil(PAGE_ROWS);
         let (narrow, wide) = (DecodeBuckets::new(DECODE_ROWS), DecodeBuckets::new(127));
         for (context, before, after) in [(8_192usize, 50usize, 55usize), (32_768, 140, 154), (131_072, 270, 297)] {
@@ -6448,11 +6285,17 @@ mod wide_decode_tests {
             assert_eq!(serving_graph_shapes(context, pages, 2051, 16, false, &wide),
                 serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
         }
-        let reserve = |buckets: &DecodeBuckets| serving_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, false,
-            buckets)[0];
-        assert_eq!(reserve(&narrow), graph_reserve_bytes(50 * 46));
-        assert_eq!(reserve(&narrow), 324_359_510);
-        assert_eq!(reserve(&wide) - reserve(&narrow), 32_435_951);
+        // A wider verify budget adds shapes the prewarm does not reserve, so the
+        // prewarm and its reserve stay the traced shapes this context admits.
+        let reserve = |decode_rows: usize| glmf_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, 1,
+            decode_rows, 188, true);
+        let short = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
+            8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS),
+            GlmfLayout::resolved(1, true));
+        let admitted = serving_graph_shapes(8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS));
+        assert!(short.iter().all(|shape| admitted.contains(shape)), "a prewarm never leaves its launch's set");
+        assert_eq!(reserve(DECODE_ROWS).executables[0], short.len() as u64 * 46);
+        assert_eq!(reserve(DECODE_ROWS), reserve(127));
     }
 
     /// A padded wide step (65, 100 or 126 -> 127 rows) keeps its real tables, masks the rest, runs the
@@ -6486,9 +6329,10 @@ mod wide_decode_tests {
 #[cfg(test)]
 mod graph_key_tests {
     use super::{check_bucket_thresholds, check_decode_thresholds, decode_bucket, decode_strides, glmf_table_pages,
-        graph_geometries, graph_reserve_bytes, serving_graph_reserve, serving_graph_shapes, startup_tables,
-        DecodeBuckets, GraphGeometry, GraphKey, StepTables, DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE,
-        PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS, UNIT_PAGES, UNIT_ROWS};
+        graph_geometries, startup_tables, DecodeBuckets, GraphGeometry, GraphKey, StepTables,
+        DECODE_PROJECTION_THRESHOLDS, DECODE_ROWS, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS,
+        UNIT_PAGES, UNIT_ROWS};
+    use cuteafd_loader::serving_capacity::glmf_graphs::serving_graph_shapes;
     use std::collections::HashSet;
 
     fn tables(long: bool, pool_width: usize, page_stride: usize, pool_stride: usize) -> StepTables {
@@ -6610,12 +6454,6 @@ mod graph_key_tests {
                         pool_stride: geometry.pool_stride });
                 }
             }
-        }
-        // Single-GPU historical whole-capture ratio, without a percentage or minimum margin.
-        for (context, before, after) in [(8192, 1_492_053_743, 324_359_510), (32768, 2_594_876_075, 908_206_627),
-            (131_072, 3_957_186_014u64, 1_751_541_351u64)] {
-            assert_eq!(graph_reserve_bytes(full_keys(context, 32768, dense).len() * 10 * 46), before);
-            assert_eq!(serving_graph_reserve(context, 2_097_152, dense, 16, true, 45, false, &buckets), [after]);
         }
     }
 

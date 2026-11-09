@@ -234,7 +234,12 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert inventory < opening.index("self.admit_candidate(")
     assert all(inventory < start < allocation for start in (
         match.start() for match in re.finditer(r"self\.admit_candidate\(", opening)))
-    assert "admitted_graphs.lifetime" in opening
+    # The charged per-device reserve configures the shared cache and the startup set warms it;
+    # each rank carries its own traced base and the fixed allocation tail behind its charge.
+    flat = " ".join(opening.split())
+    assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
+            "&admitted_graphs.bootstraps, admitted_graphs.extra)?") in flat
+    assert "engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?" in opening
     assert 'full_prefill_logits_bytes(' not in opening
     startup = opening.index("let result = with_startup_graphs(")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
