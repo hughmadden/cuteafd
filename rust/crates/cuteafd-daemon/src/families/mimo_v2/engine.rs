@@ -3425,7 +3425,7 @@ mod tests {
         // consume the capture's original allocation baseline on reattachment.
         let before_free = engine.graph_before.borrow().as_ref().unwrap()[0].free;
         for _ in 0..2 {
-            let mut temporary = GraphBank::<GraphKey, ()>::new(None);
+            let mut temporary = crate::shared::decode_graph::GraphBank::<GraphKey, ()>::new(None);
             temporary.attach_device(&library, 7, engine.graph_layout.as_ref().unwrap().reserves[0],
                 crate::shared::decode_graph::device::Site {
                     name: "mimo_v2.segment", cycle: crate::shared::decode_graph::device::Cycle::Decode,

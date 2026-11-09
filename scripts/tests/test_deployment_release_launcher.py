@@ -31,13 +31,18 @@ def release_entry(entry: dict) -> dict:
     return entry
 
 
-@pytest.mark.parametrize("entry,swa_kv", [
-    pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
+@pytest.mark.parametrize("entry,swa_kv,decode_graphs", [
+    pytest.param(entry, swa_kv, decode_graphs,
+                 id=entry["name"] + (f"-{swa_kv}" if swa_kv else "")
+                 + ("-graphs-off" if decode_graphs == "off" else ""))
     for entry in ENTRIES
     for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+    for decode_graphs in ([None, "off"] if entry["family"] == "mimo_v2" else [None])
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
+def test_deployment_preserves_release_container_commands(
+    entry: dict, swa_kv: str | None, draft_kv: str, decode_graphs: str | None,
+) -> None:
     golden_name = BASELINE_CAPTURES.get(entry['name'], entry['name'])
     golden_text = (FIXTURES / f"{golden_name}.json").read_text()
     if entry['name'].startswith('glm53-exl3-k6core-'):
@@ -71,6 +76,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         selected["set"]["DRAFT_KV_CACHE"] = draft_kv
     if swa_kv is not None:
         selected["set"]["SWA_KV_CACHE"] = swa_kv
+    if decode_graphs is not None:
+        selected["set"]["DECODE_GRAPHS"] = decode_graphs
     current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
@@ -117,7 +124,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
-                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8",
+                                                        "--decode-graphs", "false" if decode_graphs == "off" else "true"]
                 for flag, value in [("--prefill-rows", "2752"), ("--prefill-waves", "3")]:
                     before["command"][before["command"].index(flag) + 1] = value
                 position = before["command"].index("--prefill-waves") + 2
