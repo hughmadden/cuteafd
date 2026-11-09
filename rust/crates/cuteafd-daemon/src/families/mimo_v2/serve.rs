@@ -280,8 +280,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
-        // the server is ready: serving replays them without capturing.
+        // Best-effort prewarm of the selected checkpoint/layout row shapes.
+        // Serving misses capture within the same reserve or run eagerly.
         let started = std::time::Instant::now();
         let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
         if graphs > 0 {
