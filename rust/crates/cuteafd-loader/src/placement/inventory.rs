@@ -519,11 +519,13 @@ pub struct GraphRank {
     pub margin: u64,
     #[serde(default = "estimated_graph_basis")]
     pub basis: Basis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_charge: Option<super::graph_nodes::GraphNodeCharge>,
 }
 
 impl GraphRank {
     pub fn estimated(executables: u64, bytes: u64) -> Self {
-        Self { executables, bytes, margin: 0, basis: Basis::Estimated }
+        Self { executables, bytes, margin: 0, basis: Basis::Estimated, node_charge: None }
     }
 
     /// Historical whole-capture arithmetic is only a fallback estimate. It
@@ -584,6 +586,8 @@ impl<K: std::hash::Hash + Eq + Clone + std::fmt::Debug> DeclaredGraphSet<K> {
         if declared.len() != keys.len() { return Err("duplicate startup graph key".into()); }
         Ok(Self { keys: declared })
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = &K> { self.keys.iter() }
 
     pub fn contains(&self, key: &K) -> bool { self.keys.contains(key) }
     pub fn len(&self) -> usize { self.keys.len() }
@@ -650,7 +654,7 @@ impl GraphSet {
                 return Err("startup graph capture keys differ from admission".into());
             }
             Ok(GraphRank { executables: actual.executables, bytes: actual.bytes,
-                margin: 0, basis: Basis::Calibrated })
+                margin: 0, basis: Basis::Calibrated, node_charge: rank.node_charge })
         }).collect::<Result<_, String>>()?;
         Ok(Self { ranks, lifetime: Lifetime::Startup, shapes: self.shapes })
     }
@@ -696,14 +700,14 @@ impl GraphSet {
         let ranks = executables.iter().map(|&count| {
             let measured = count.saturating_mul(per_executable);
             let margin = measured.saturating_mul(margin_percent).div_ceil(100).max(minimum_margin);
-            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin, basis: Basis::Estimated }
+            GraphRank { executables: count, bytes: measured.saturating_add(margin), margin, basis: Basis::Estimated, node_charge: None }
         }).collect();
         Self { ranks, lifetime, shapes }
     }
 
     /// A lazily captured set bounded by a byte budget per rank.
     pub fn budget(per_rank: &[u64]) -> Self {
-        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes, basis: Basis::Exact }).collect(),
+        Self { ranks: per_rank.iter().map(|&bytes| GraphRank { executables: 0, bytes, margin: bytes, basis: Basis::Exact, node_charge: None }).collect(),
             lifetime: Lifetime::Growth, shapes: 0 }
     }
 
@@ -871,7 +875,7 @@ mod tests {
         let estimated = GraphSet { ranks: vec![GraphRank::estimated(2, 10)], shapes: 1, lifetime: Lifetime::Startup };
         let fingerprints = [declared.fingerprint(0).unwrap()];
         let measured = estimated.captured(&fingerprints, &[captured.clone()]).unwrap();
-        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated });
+        assert_eq!(measured.ranks[0], GraphRank { executables: 2, bytes: 100, margin: 0, basis: Basis::Calibrated, node_charge: None });
         assert!(estimated.captured(&["other keys".into()], &[captured.clone()]).is_err());
         assert!(estimated.captured(&fingerprints, &[]).is_err());
         assert!(GraphSet::budget(&[10]).captured(&fingerprints, &[captured]).is_err());

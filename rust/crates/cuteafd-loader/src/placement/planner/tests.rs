@@ -513,6 +513,12 @@ fn startup_graph_capture_replaces_opaque_estimate_without_reselection() {
         assert!(serving::reconcile_startup_graphs(&mut plan, "test", &graphs, &declared, &[bad]).is_err());
         assert_eq!(plan, good);
     }
+    let mut over = good.clone();
+    serving::reconcile_startup_graphs(&mut over, "test", &graphs, &declared,
+        &[CapturedGraphRank { bytes: 1000, ..capture.clone() }]).unwrap();
+    assert_eq!(over.facts.allowances[0].bytes, 1000);
+    assert!(over.phases.iter().any(|p| p.owned + p.opaque > p.available));
+    assert_eq!(over.remaining(&over.budgets[0].id, Phase::Ready), Some(0));
     let mut duplicate = good.clone();
     duplicate.facts.allowances.push(duplicate.facts.allowances[0].clone());
     let unchanged = duplicate.clone();
@@ -3465,6 +3471,28 @@ fn gpu_reserve_override_replaces_every_builtin_reserve_component() {
     let spark = MemoryPolicy { spark_reserve: Some(200), ..Default::default() }
         .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract.clone()))).unwrap();
     assert_eq!((spark.pool_tokens, spark.budgets[0].headroom), (auto.pool_tokens, 0));
+}
+
+#[test]
+fn graph_node_owner_and_padding_survive_reserve_override_once() {
+    use crate::placement::graph_nodes::{GraphNodeCharge, GraphNodeCounts, charge};
+    use crate::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES;
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let nodes = GraphNodeCounts { nodes: 10, executables: 2 };
+    let charged: GraphNodeCharge = charge("glm5", "sm_120", &nodes, &GLM_SM120_NODE_RATES,
+        MemoryPolicy::default().graph_node_padding).unwrap();
+    let graph = serving::startup_graph_component("test.0", Location::coordinator(0), charged.rank(), 1).unwrap();
+    let mut contract = with_reserve_components(1);
+    contract.components.push(graph);
+    let mut budgets = vec![budget(1 << 30)];
+    MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+        super::search::apply_reserve_override(&mut contract, &mut budgets);
+    });
+    let graphs: Vec<_> = contract.components.iter().filter_map(|component| match &component.kind {
+        ComponentKind::Allowance(owner) => Some(owner), _ => None }).collect();
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].bytes, charged.packed_bytes);
+    assert!(graphs[0].source.contains("GRAPH_NODE_PADDING=5854 bytes"));
 }
 
 #[test]

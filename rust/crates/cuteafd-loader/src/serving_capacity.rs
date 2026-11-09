@@ -63,6 +63,7 @@ mod exl3_workspace;
 pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
 pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
+pub mod glm_graph_nodes;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
