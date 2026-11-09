@@ -144,6 +144,8 @@ impl LaneL2<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
+    /// Successful window selection on an otherwise unused idle lane.
+    WindowSelectedIdle,
     Prepared,
     Query,
     Ffn,
@@ -152,6 +154,13 @@ enum Phase {
     SharedReady,
     Complete,
     Invalid,
+}
+
+fn rearm_startup_prefill(phase: &mut Phase) -> Result<()> {
+    ensure!(matches!(*phase, Phase::Idle | Phase::WindowSelectedIdle),
+        "startup prefill requires an idle lane or its successful window selection");
+    *phase = Phase::Idle;
+    Ok(())
 }
 
 // The containing lane's pending owner drains all consumer work before drop.
@@ -812,6 +821,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// Warm only nonwindowed prompt/replay primitive shapes. Sparse prefill
     /// geometry depends on live request history and is captured lazily instead.
     pub(crate) fn capture_startup_prefill(&mut self, local: &[bool; 40]) -> Result<()> {
+        // Only a successful window selection on an idle lane may be rearmed.
+        // Invalid also represents failed execution and must never be revived.
+        rearm_startup_prefill(&mut self.phase)?;
         self.capture_startup_kind(&[], &[], false, false, local)
     }
     pub(crate) fn startup_prefill_rows(&self) -> Vec<usize> {
@@ -952,6 +964,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// layer, the query/output readiness) are dropped as `invalidate` does;
     /// the next use restarts the lane. Pending work still refuses.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        let was_idle = matches!(self.phase, Phase::Idle | Phase::WindowSelectedIdle);
         self.invalidate();
         self.query.discard_ready();
         self.projection.discard_ready();
@@ -964,6 +977,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(projection) = &mut self.tp2_query { projection.select_window(window.clone())?; }
         if let Some(projection) = &mut self.tp2_output { projection.select_window(window.clone())?; }
         self.window = window;
+        if was_idle { self.phase = Phase::WindowSelectedIdle; }
         Ok(())
     }
     #[cfg(test)]
@@ -1535,6 +1549,28 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::read_official_v41_catalog;
+
+    #[test]
+    fn startup_prefill_rearms_only_successfully_selected_idle_lanes() -> Result<()> {
+        for initial in [Phase::Idle, Phase::WindowSelectedIdle] {
+            let mut phase = initial;
+            rearm_startup_prefill(&mut phase)?;
+            assert_eq!(phase, Phase::Idle);
+        }
+        for initial in [Phase::Invalid, Phase::Prepared, Phase::Query, Phase::Ffn,
+            Phase::UnitPending, Phase::SharedReady, Phase::Complete] {
+            let mut phase = initial;
+            assert!(rearm_startup_prefill(&mut phase).is_err());
+            assert_eq!(phase, initial);
+        }
+        let source = include_str!("v41_backbone_lane.rs");
+        let select = source.split("pub(crate) fn select_window(").nth(1).unwrap()
+            .split("#[cfg(test)]").next().unwrap();
+        assert!(select.contains("if was_idle { self.phase = Phase::WindowSelectedIdle; }"));
+        assert!(select.find("self.window = window;").unwrap()
+            < select.find("self.phase = Phase::WindowSelectedIdle").unwrap());
+        Ok(())
+    }
 
     #[test]
     fn replay_capture_never_drains_layer_events_without_profiling() -> Result<()> {

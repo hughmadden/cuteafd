@@ -867,7 +867,7 @@ impl WindowWave<'_, '_> {
         self.output(state)
     }
     /// # Safety
-    /// Same inputs as execute. Warmup is drained and unpublished after capture.
+    /// Same inputs as execute. The drained eager result stays published after capture.
     pub unsafe fn capture(
         &mut self,
         state: &WindowState<'_>,
@@ -878,9 +878,14 @@ impl WindowWave<'_, '_> {
         unsafe {
             self.execute(state, chunks)?;
         }
-        let p = self.prepare(state, chunks)?;
+        // Recording does not execute: retain the exact completed proposal,
+        // including when admission selects eager fallback.
+        let p = self.ready.take().context("window capture eager output missing")?;
         let Some(ticket) = self.graphs.cache_ticket(&(p.rows, state.owner),
-            super::graph_policy::pinned_shape(p.rows as u32), None) else { return Ok(()) };
+            super::graph_policy::pinned_shape(p.rows as u32), None) else {
+                self.ready = Some(p);
+                return Ok(());
+            };
         unsafe {
             self.stream()
                 .library
@@ -898,6 +903,7 @@ impl WindowWave<'_, '_> {
             }
             (Err(e), Err(_)) | (Ok(()), Err(e)) => return Err(e),
         }
+        self.ready = Some(p);
         Ok(())
     }
     /// # Safety
@@ -1107,5 +1113,76 @@ impl WindowWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
         f(format!("{prefix}packed_scale"), self.scales.buffer);
+    }
+}
+
+#[cfg(test)]
+mod cold_capture_tests {
+    use super::*;
+    use crate::shared::decode_graph::CacheAttached;
+    use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    #[test]
+    #[ignore = "requires V4.1 checkpoint, AOT native library and CUDA GPU"]
+    fn first_query_publishes_eager_result_with_admitted_or_denied_capture() -> Result<()> {
+        // SAFETY: checkpoint, library, inputs and request state outlive every wave.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let query_weights = AttentionQueryWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let weights = WindowWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let mut query = query_weights.wave(2, usize::MAX)?;
+        let input: Vec<_> = (0..2 * 5120).flat_map(|i| {
+            let value = ((i * 37 % 61) as f32 - 30.) / 32.;
+            ((value.to_bits() >> 16) as u16).to_ne_bytes()
+        }).collect();
+        for admitted in [true, false] {
+            let mut state = WindowState::new(&library, 2, 1, usize::MAX)?;
+            let lease = state.begin_request(0, 1)?;
+            let chunks = [WindowChunk { lease, position: 0, tokens: 2 }];
+            let mut wave = weights.wave(2, usize::MAX)?;
+            wave.graphs.attach(0, 256 << 20, Site {
+                name: if admitted { "Window.cold.admitted" } else { "Window.cold.denied" },
+                cycle: Cycle::Prefill, preference: Preference::Capture,
+                bootstrap: if admitted { 2 << 20 } else { 1 << 30 },
+                basis: Basis::Bytes, spans_devices: false,
+            })?;
+            // Startup recording must not publish or consume a request proposal.
+            wave.capture_startup(&state, &[1])?;
+            assert!(wave.ready.is_none());
+            // SAFETY: preparation stages finite matching hidden rows and positions.
+            let produced = unsafe { query.execute_tokens_prepared(&[0, 1], |stream, buffer| {
+                library.copy_h2d(buffer, &input)?;
+                unsafe { library.cuda_stream_synchronize(stream) }
+            })? };
+            // Obtain an eager reference from the identical normalized query input.
+            library.copy_d2d(wave.input(), produced.hidden, produced.hidden.bytes)?;
+            let expected = unsafe {
+                let output = wave.execute(&state, &chunks)?;
+                let mut bytes = vec![0; output.values.bytes];
+                library.copy_d2h(&mut bytes, output.values)?;
+                bytes
+            };
+            let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
+            // First real query misses the startup row-1 key. Capture records,
+            // but must return the completed eager row-2 proposal without replay.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let prepared = wave.ready.as_ref().context("first query output unpublished")?;
+            assert_eq!(prepared.snapshot, eager_snapshot + 2, "cold capture prepared more than its query and eager execution");
+            assert_eq!(prepared.rows, 2);
+            assert_eq!(wave.current_graph().is_some(), admitted);
+            let output = wave.output(&state)?;
+            let mut actual = vec![0; output.values.bytes];
+            library.copy_d2h(&mut actual, output.values)?;
+            assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
+            // A subsequent real query exercises replay or repeated eager denial.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let output = wave.output(&state)?;
+            library.copy_d2h(&mut actual, output.values)?;
+            assert_eq!(actual, expected, "next query differs, admitted={admitted}");
+        }
+        Ok(())
     }
 }
