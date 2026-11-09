@@ -291,6 +291,43 @@ mod tests {
     }
 
     #[test]
+    fn mimo_admission_publishes_one_canonical_graph_owner_per_device() {
+        use cuteafd_core::memory_layout::{Basis, Item};
+        use cuteafd_core::memory_policy::{DeviceBreakdown, DeviceKind};
+        use cuteafd_loader::families::mimo_v2::{decode_graph::graph_layout, MimoV2Config};
+        use cuteafd_loader::placement::{families::mimo_v2, reserve};
+        let admission = include_str!("../../families/mimo_v2/admission.rs");
+        assert_eq!(admission.matches("additional.extend(graph_layout.reservations(rank)?)").count(), 1);
+        for config in [cuteafd_loader::plan::testing::mimo_flash_config(),
+            cuteafd_loader::plan::testing::mimo_pro_config()] {
+            let cfg = MimoV2Config::from_hf(&config).unwrap();
+            for ranks in [1, 2] {
+                let layout = graph_layout(&cfg, ranks, true, true).unwrap();
+                for rank in 0..ranks {
+                    let reservations = layout.reservations(rank).unwrap();
+                    assert_eq!(reservations.len(), 1);
+                    assert_eq!(reservations[0].name, "graph reserve");
+                    let items: Vec<_> = reservations.iter().map(|owner| Item::new(
+                        mimo_v2::reservation_category(&owner.name), mimo_v2::reservation_group(&owner.name),
+                        "", owner.bytes, Basis::Formula)).collect();
+                    let device = format!("rtx{rank}");
+                    let owners = reserve::breakdown(&device, DeviceKind::Gpu, 96 << 30, 0, &items);
+                    // log_plan publishes this serialized breakdown; capture reads the same schema.
+                    let published = json!({format!("device.{device}"): owners});
+                    let owners: DeviceBreakdown = serde_json::from_value(published[format!("device.{device}")].clone()).unwrap();
+                    assert_eq!(owners.reserve.iter().filter(|owner| owner.name == "graph reserve").count(), 1);
+                    assert!(!owners.reserve.iter().any(|owner| owner.name != "graph reserve"
+                        && owner.name.to_ascii_lowercase().contains("graph")));
+                    let sample = row(&device, None, &owners, Some(0), json!({}), None);
+                    assert_eq!(sample["graph_reserve_bytes"], layout.reserves[rank]);
+                    assert!(sample["graph_reserve_bytes"].as_u64().unwrap() > 0);
+                }
+            }
+        }
+    }
+
+
+    #[test]
     fn v41_admission_owner_reaches_canonical_reconciliation_once_per_rank() {
         use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
         use cuteafd_core::memory_policy::DeviceKind;
