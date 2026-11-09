@@ -52,10 +52,16 @@ pub(crate) struct GoldenArgs {
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
     manifest: PathBuf,
     /// Pinned official reference export containing meta.json and windows/ID/layerNN.bin.
-    #[arg(long)]
-    golden: PathBuf,
-    #[arg(long)]
-    window: String,
+    #[arg(long, required_unless_present = "graph_oracle")]
+    golden: Option<PathBuf>,
+    #[arg(long, required_unless_present = "graph_oracle")]
+    window: Option<String>,
+    /// Compare every target logit bit with eager, capture and replay from one restored prompt.
+    #[arg(long, requires = "split_device", conflicts_with_all = ["golden", "window", "nll",
+        "prefix_state", "fp8_diagnostic_reference", "compare_layers", "compare_final_norm",
+        "save_logits", "dump_residuals", "dump_layers", "dump_layer0", "poison_scratch",
+        "prefill", "prefill_units", "prefill_waves"])]
+    graph_oracle: bool,
     #[arg(long, value_delimiter = ',')]
     peers: Vec<SocketAddr>,
     /// Last target layer, inclusive; logits require the complete target through layer 91.
@@ -118,7 +124,7 @@ fn diagnostic_selection(args: &GoldenArgs) -> Result<()> {
         && args.save_logits.is_none() && args.dump_residuals.is_none() && !args.compare_final_norm),
         "layer-zero dump requires --last-layer 0, no peers, scoring, or full-target diagnostics");
     ensure!(args.last_layer != 0 || args.dump_layer0.is_some(), "layer zero requires --dump-layer0");
-    ensure!(args.split_device.is_none() || args.dump_layer0.is_some() || (args.nll && args.last_layer == 91),
+    ensure!(args.split_device.is_none() || args.dump_layer0.is_some() || ((args.nll || args.graph_oracle) && args.last_layer == 91),
         "shared execution requires full NLL or layer-zero diagnostic");
     let writes = args.save_logits.is_some() || args.dump_residuals.is_some();
     ensure!(!writes || (args.nll && args.last_layer == 91 && !args.prefix_state),
@@ -322,15 +328,15 @@ fn hidden_metrics(actual: &[f32], expected: &[f32]) -> Result<(f64, f64)> {
 }
 
 fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
+    let golden = args.golden.as_ref().context("--golden required outside graph oracle")?;
+    let window = args.window.as_deref().context("--window required outside graph oracle")?;
     ensure!(
-        !args.window.is_empty()
-            && args
-                .window
-                .bytes()
+        !window.is_empty()
+            && window.bytes()
                 .all(|c| c.is_ascii_alphanumeric() || b"-_".contains(&c)),
         "invalid golden window id"
     );
-    let meta: Value = serde_json::from_slice(&std::fs::read(args.golden.join("meta.json"))?)?;
+    let meta: Value = serde_json::from_slice(&std::fs::read(golden.join("meta.json"))?)?;
     reference_identity(&meta, args.fp8_diagnostic_reference)?;
     let tokenizer = format!(
         "{:x}",
@@ -340,9 +346,9 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
         meta["snapshot_identity"]["tokenizer_sha256"] == tokenizer,
         "reference tokenizer differs from target"
     );
-    let folder = args.golden.join("windows").join(&args.window);
+    let folder = golden.join("windows").join(&window);
     let entry = meta["windows"].as_array().context("golden windows")?
-        .iter().find(|w| w["id"] == args.window && w["path"] == format!("windows/{}", args.window))
+        .iter().find(|w| w["id"] == window && w["path"] == format!("windows/{}", window))
         .context("window missing from reference inventory")?;
     let bytes = std::fs::read(folder.join("tokens.bin"))?;
     ensure!(
@@ -375,8 +381,8 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
     let final_norm = args.compare_final_norm.then(||
         hidden_file(folder.join("final_norm.bin"), tokens.len(), rows)).transpose()?;
     if args.fp8_diagnostic_reference && (args.compare_final_norm || args.compare_layers.iter().any(|l| (88..=90).contains(l))) {
-        let tail: Value = serde_json::from_slice(&std::fs::read(args.golden.join("tail-diagnostic.json"))?)?;
-        let source_sha = format!("{:x}", Sha256::digest(std::fs::read(args.golden.join("meta.json"))?));
+        let tail: Value = serde_json::from_slice(&std::fs::read(golden.join("tail-diagnostic.json"))?)?;
+        let source_sha = format!("{:x}", Sha256::digest(std::fs::read(golden.join("meta.json"))?));
         ensure!(tail["schema"] == "cuteafd.step5.tail-diagnostic/1" && tail["diagnostic_only"] == true
             && tail["source_meta_sha256"] == source_sha && tail["original_layer91_byte_exact"] == true,
             "tail continuation provenance missing or mismatched");
@@ -385,7 +391,7 @@ fn reference(args: &GoldenArgs, vocab: usize) -> Result<Reference> {
             .chain(args.compare_final_norm.then_some("final_norm.bin".into()));
         for file in files {
             let sha = format!("{:x}", Sha256::digest(std::fs::read(folder.join(&file))?));
-            ensure!(tail["files"][format!("windows/{}/{file}", args.window)] == sha,
+            ensure!(tail["files"][format!("windows/{}/{file}", window)] == sha,
                 "tail diagnostic payload digest differs: {file}");
         }
     }
@@ -823,7 +829,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     use std::sync::Arc;
     let peer_device = args.split_device.context("Step-5 split device")?;
     ensure!(args.device >= 0 && peer_device >= 0 && args.device != peer_device
-        && args.nll && args.last_layer == 91 && !args.prefix_state,
+        && (args.nll || args.graph_oracle) && args.last_layer == 91 && !args.prefix_state,
         "Step-5 shared golden requires distinct devices and complete cold target");
     let rows = reference.tokens.len();
     // Prefill units: units of `unit` rows, `waves` in flight; else one whole step.
@@ -844,7 +850,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         && reference.hidden.is_empty()),
         "Step-5 golden prefill units compare logits, not retained per-layer hidden states");
     let ownership = split_ownership_lanes(cfg, unit, waves as u64)?;
-    let layout = Step5CacheLayout::for_execution(cfg, &ownership, rows as u64, 0, rows as u64, rows as u64, args.kv_cache)?;
+    // Full summary stride exercises the production batched CSA attention graph ABI.
+    let context = if args.graph_oracle { cfg.max_context } else { rows as u64 };
+    let slots = u64::from(args.graph_oracle);
+    let layout = Step5CacheLayout::for_execution(cfg, &ownership, context, 0, rows as u64, rows as u64, args.kv_cache)?;
     if args.check_headers { println!("Step-5 shared headers/reference validated: rows={rows} ranks=2; no CUDA or numerical qualification"); return Ok(()); }
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 golden requires an isolated process"))?;
@@ -875,10 +884,12 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
             }).map(|(free, _)| free as u64)?;
         let admission = Execution::serving_admission(&programs, checkpoint, &ownership, rank, unit, rows, rows)?;
         chain_bytes[rank] = admission.check( u64::MAX, &[])?;
-        cache_bytes[rank] = Some(layout.ranks[rank].bytes)
-            .and_then(|active| layout.geometry.ranks[rank].persistent_unit_bytes.checked_mul(pages)
-                .and_then(|pages| active.checked_add(pages)))
-            .context("Step-5 shared cache overflow")?;
+        cache_bytes[rank] = super::cache::Reservation::new(&layout, rank, 1, slots, pages, usize::MAX)?.total as u64;
+        let graph_reserve = if args.graph_oracle {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, 0, 0)?.bytes;
+            ensure!(reserve > 0, "Step-5 graph oracle requires explicit nonzero graph reserve on rank {rank}");
+            reserve
+        } else { 0 };
         staging_bytes[rank] = Staging::bytes(&layout, rank)? as u64;
         let pending = crate::shared::inventory::pending_code(&library, devices[rank].id, rank, true, "step5", &format.package_name(), &selected)?;
         let hops = cuteafd_loader::placement::hop_buffer_bytes(ownership.execution().hops(), &ownership.execution().spec(), 2)
@@ -888,7 +899,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         let peer = ((8 * unit * H * 4) as u64 + (2 << 20))
             .checked_add(hops[rank]).context("Step-5 private peer/hop overflow")?;
         let input = if rank == 0 { (rows * H * 6) as u64 } else { 0 };
-        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending,
+        reservations[rank] = [cache_bytes[rank], staging_bytes[rank], peer, input, pending, graph_reserve,
             2u64 << 30, 2u64 << 30].into_iter().try_fold(0u64, |n, bytes| n.checked_add(bytes))
             .context("Step-5 shared reservation overflow")?;
         let total = chain_bytes[rank].checked_add(reservations[rank]).context("Step-5 shared admission overflow")?;
@@ -897,8 +908,8 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
             staging_bytes=staging_bytes[rank], peer, pending, total, available=available[rank], "Step-5 shared golden admission");
     }
     let started = std::time::Instant::now();
-    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, 0, pages, cache_bytes[0] as usize)?),
-        RefCell::new(CacheRank::new(devices[1], layout, 1, 1, 0, pages, cache_bytes[1] as usize)?)];
+    let caches = [RefCell::new(CacheRank::new(devices[0], layout.clone(), 0, 1, slots, pages, cache_bytes[0] as usize)?),
+        RefCell::new(CacheRank::new(devices[1], layout, 1, 1, slots, pages, cache_bytes[1] as usize)?)];
     let stages = [Staging::new_for_units(devices[0], &programs, &caches[0].borrow(), staging_bytes[0] as usize, 1, unit)?,
         Staging::new_for_units(devices[1], &programs, &caches[1].borrow(), staging_bytes[1] as usize, 1, unit)?];
     let (world, config, format) = expert_admission(args,
@@ -915,7 +926,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 1 }, None)?);
     let mut placement = pool.borrow_mut().admit_cold(&family, 1, 1,
         |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
-    let execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
+    let mut execution = Execution::load_units(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         vec![&stages[0], &stages[1]], unit, rows, available.to_vec(), reservations.to_vec(), Some(transport), 17)?;
     if args.poison_scratch { execution.poison_scratch_between_layers(); }
     let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
@@ -925,6 +936,13 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let input = Allocation::new(devices[0], rows * H * 4, Tag::workspace("step5/golden-input"))?;
     devices[0].run(|| library.copy_h2d(input.buffer, &embeddings))?;
     tracing::info!(seconds=started.elapsed().as_secs_f64(), "Step-5 shared readiness");
+    if args.graph_oracle {
+        execution.configure_graphs(true, None)?;
+        graph_oracle(&execution, &caches, &stages, &pool, &mut placement, &input,
+            checkpoint, cfg, &reference.tokens)?;
+        pool.borrow_mut().release(&family, &placement.pages)?;
+        return Ok(());
+    }
     let mut step = Step::begin(vec![&caches[0], &caches[1]], vec![&stages[0], &stages[1]], &pool, &mut placement, rows)?;
     if args.prefill_units.is_some() {
         let units = crate::shared::prefill_pipeline::prefill_units(rows, unit, waves, 64)?.into_iter().enumerate()
@@ -972,6 +990,91 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
+fn same_logit_bits(left: &[f32], right: &[f32]) -> bool {
+    left.len() == right.len() && left.iter().zip(right).all(|(a, b)|
+        a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits())
+}
+
+/// Every arm restores one committed page-aligned prompt into the same sequence
+/// and mark slot. Continuations are never published, including capture first-touch.
+#[allow(clippy::too_many_arguments)]
+fn graph_oracle<'e, 'a>(execution: &super::execution::Execution<'e, 'a>,
+    caches: &[RefCell<CacheRank<'a>>; 2], stages: &[Staging<'a>; 2],
+    pool: &RefCell<PrefixCache<StubCopyEngine, Frontier>>, placement: &mut Placement,
+    input: &Allocation<'a>, checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32]) -> Result<()> {
+    use crate::shared::decode_graph::device::{self, Cycle};
+    const PROMPT: usize = 64;
+    const MAX_ROWS: usize = 64;
+    ensure!(tokens.len() >= PROMPT + MAX_ROWS, "Step-5 graph oracle token extent");
+    let device = stages[0].stream.device;
+    let upload = |tokens: &[u32]| -> Result<()> {
+        let embeddings = embedding_rows(checkpoint, tokens, cfg.vocab)?;
+        device.run(|| device.library.copy_h2d(input.buffer, &embeddings))
+    };
+    upload(&tokens[..PROMPT])?;
+    let mut prompt = Step::begin(caches.iter().collect(), stages.iter().collect(), pool, placement, PROMPT)?;
+    execution.without_graphs(|| execution.enqueue(&mut prompt, input, ExpertV2SourceKind::Prefill))?;
+    prompt.publish(PROMPT)?;
+    ensure!(placement.committed == PROMPT, "Step-5 graph oracle prompt publication");
+    for cache in caches { cache.borrow_mut().capture(0, 0, PROMPT as u64)?; }
+    let head_rank = execution.ownership().execution().spec().head_gpu as usize;
+    let counters = |id, cycle| -> Result<device::Counters> {
+        let snapshot = device::snapshots().into_iter().find(|snapshot| snapshot.device == id)
+            .context("Step-5 graph oracle missing rank controller")?;
+        ensure!(snapshot.reserve > 0 && snapshot.charged <= snapshot.reserve,
+            "Step-5 graph oracle rank {id} exceeded its admitted reserve");
+        Ok(snapshot.cycles.get(&cycle).copied().unwrap_or_default())
+    };
+    for (rows, kind, cycle) in [(1, ExpertV2SourceKind::Decode, Cycle::Decode),
+        (2, ExpertV2SourceKind::MtpVerify, Cycle::Verify),
+        (4, ExpertV2SourceKind::MtpVerify, Cycle::Verify),
+        (MAX_ROWS, ExpertV2SourceKind::MtpVerify, Cycle::Verify)] {
+        let mut outputs: Vec<Vec<f32>> = Vec::new();
+        let mut captured = Vec::new();
+        // First-touch eagerly initializes modules/workspaces before the capture
+        // arm. It is compared too, but never counted as evidence of graph replay.
+        for arm in ["eager", "first_touch", "capture", "replay"] {
+            for cache in caches { cache.borrow_mut().restore(0, 0, PROMPT as u64)?; }
+            upload(&tokens[PROMPT..PROMPT + rows])?;
+            let before = execution.retained_graph_rows(rows)?.into_iter()
+                .map(|(id, retained)| Ok((id, retained, counters(id, cycle)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut step = Step::begin(caches.iter().collect(), stages.iter().collect(), pool, placement, rows)?;
+            if arm == "eager" {
+                execution.without_graphs(|| execution.enqueue(&mut step, input, kind))?;
+            } else { execution.enqueue(&mut step, input, kind)?; }
+            let (_, output) = execution.terminal_output()?;
+            let logits = execution.head()?.device_logits_on(output, rows, &stages[head_rank].stream)?
+                .to_host(device.library)?;
+            ensure!(logits.len() == rows * cfg.vocab && logits.iter().all(|v| v.is_finite()),
+                "Step-5 graph oracle invalid logits: {arm}, rows={rows}");
+            drop(step);
+            ensure!(placement.committed == PROMPT, "Step-5 graph oracle continuation published state");
+            if let Some(eager) = outputs.first() {
+                ensure!(same_logit_bits(eager, &logits),
+                    "Step-5 graph oracle every-row logits differ: {arm}, rows={rows}");
+            }
+            outputs.push(logits);
+            let after = execution.retained_graph_rows(rows)?;
+            for ((id, retained), (old_id, old_retained, old)) in after.iter().zip(before) {
+                ensure!(*id == old_id, "Step-5 graph oracle rank order changed");
+                let now = counters(*id, cycle)?;
+                if arm == "capture" {
+                    ensure!(*retained > 0 && *retained > old_retained && now.captures > old.captures,
+                        "Step-5 graph oracle did not retain native graphs on rank {id}, rows={rows}");
+                    captured.push((*id, *retained));
+                } else if arm == "replay" {
+                    ensure!(*retained == old_retained && now.captures == old.captures
+                        && now.hits.saturating_sub(old.hits) >= *retained as u64,
+                        "Step-5 graph oracle did not replay every retained section on rank {id}, rows={rows}");
+                }
+            }
+        }
+        println!("Step-5 graph oracle: rows={rows} cycle={cycle:?} ranks={captured:?}; eager/first-touch/capture/replay every logit float-bit identical");
+    }
+    Ok(())
+}
+
 fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExperts,
     fp8_diagnostic: bool) -> Result<()> {
     use super::experts::StepExperts;
@@ -1015,7 +1118,11 @@ fn run(args: GoldenArgs) -> Result<()> {
         args.fp8_diagnostic_reference)?;
     let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
-    let reference = reference(&args, cfg.vocab)?;
+    let reference = if args.graph_oracle {
+        ensure!(cfg.vocab > 0, "Step-5 graph oracle empty vocabulary");
+        Reference { tokens: (0..128).map(|n| ((n * 7919 + 17) % cfg.vocab) as u32).collect(),
+            expected: vec![], positions: vec![], hidden: vec![], final_norm: None }
+    } else { reference(&args, cfg.vocab)? };
     if args.dump_layer0.is_some() { return layer0_run(&args, &checkpoint, &cfg, reference); }
     if args.split_device.is_some() { return split_run(&args, &checkpoint, &cfg, reference, &layers, &format); }
     let Reference { tokens, expected, positions, hidden, final_norm } = reference;
@@ -1221,6 +1328,36 @@ mod tests {
         ].into_iter().chain(flags.iter().copied()))?;
         let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
         Ok(args)
+    }
+
+    #[test]
+    fn graph_oracle_cli_needs_no_ignored_reference_arguments() -> Result<()> {
+        use clap::Parser;
+        let base = ["cuteafd", "step5-golden", "--snapshot", "/snapshot", "--last-layer", "91"];
+        for flags in [vec![], vec!["--golden", "/reference"], vec!["--window", "code-1"]] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(flags)).is_err());
+        }
+        let oracle = ["--graph-oracle", "--split-device", "1"];
+        let cli = crate::cli::Cli::try_parse_from(base.into_iter().chain(oracle))?;
+        let crate::cli::Commands::Step5Golden(args) = cli.command else { unreachable!() };
+        assert!(args.graph_oracle && args.golden.is_none() && args.window.is_none());
+        diagnostic_selection(&args)?;
+        for ignored in [vec!["--golden", "/reference"], vec!["--window", "code-1"],
+            vec!["--nll"], vec!["--prefill", "128"], vec!["--poison-scratch"]] {
+            assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(oracle).chain(ignored)).is_err());
+        }
+        assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(["--graph-oracle"])).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn graph_oracle_compares_float_bits_and_rejects_nonfinite_rows() {
+        assert!(same_logit_bits(&[0., -0., 3.], &[0., -0., 3.]));
+        assert!(!same_logit_bits(&[0.], &[-0.]));
+        assert!(!same_logit_bits(&[1.], &[f32::from_bits(1f32.to_bits() + 1)]));
+        assert!(!same_logit_bits(&[f32::NAN], &[f32::NAN]));
+        assert!(!same_logit_bits(&[f32::INFINITY], &[f32::INFINITY]));
+        assert!(!same_logit_bits(&[1.], &[1., 2.]));
     }
 
     #[test]
@@ -1567,8 +1704,9 @@ mod tests {
             snapshot: root.path().into(),
             native_lib: None,
             manifest: PathBuf::new(),
-            golden,
-            window: "code-1".into(),
+            golden: Some(golden),
+            window: Some("code-1".into()),
+            graph_oracle: false,
             peers: vec![],
             last_layer: 87,
             prefill: Some(1),
@@ -1594,9 +1732,9 @@ mod tests {
         args.prefill = Some(3);
         assert!(reference(&args, 3).is_err());
         args.prefill = Some(1);
-        args.window = "../code-1".into();
+        args.window = Some("../code-1".into());
         assert!(reference(&args, 3).is_err());
-        args.window = "code-1".into();
+        args.window = Some("code-1".into());
         std::fs::write(folder.join("layer87.bin"), &bytes[..bytes.len() - 4])?;
         assert!(reference(&args, 3).is_err());
         let mut nonfinite = bytes.clone();
@@ -1630,7 +1768,7 @@ mod tests {
         let mut args = GoldenArgs {
             attention: Default::default(),
             kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, snapshot: root.path().into(), native_lib: None,
-            manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
+            manifest: PathBuf::new(), golden: Some(golden.clone()), window: Some("code-1".into()), graph_oracle: false,
             peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None,  poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
             save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None,

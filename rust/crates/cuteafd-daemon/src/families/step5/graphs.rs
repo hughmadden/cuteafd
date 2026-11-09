@@ -53,6 +53,9 @@ impl<'a> Graphs<'a> {
         self.bank.borrow_mut().cache_cycle(if self.warming.get() { Cycle::Other } else { cycle });
     }
     pub(super) fn clear_drained(&self) { self.bank.borrow_mut().cache_clear_drained(); }
+    pub(super) fn retained_rows(&self, rows: usize) -> usize {
+        self.bank.borrow().count(|key| key.rows == rows)
+    }
     pub(super) fn needs_boundary(&self) -> bool {
         self.first_touch_pending.get() || self.bank.borrow().cache_needs_boundary()
     }

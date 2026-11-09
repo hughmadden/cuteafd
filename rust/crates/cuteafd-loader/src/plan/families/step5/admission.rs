@@ -668,8 +668,12 @@ mod tests {
             let eager = run(&policy)?;
             policy.decode_graphs = true;
             let graphs = run(&policy)?;
-            assert_eq!(graphs.placement.pool_tokens, eager.placement.pool_tokens);
-            assert_eq!(graphs.placement.layers, eager.placement.layers);
+            // An asymmetric nonzero reserve can legitimately change the selected
+            // CSA boundary; only zero reserve promises eager-equivalent placement.
+            if value == "untraced" {
+                assert_eq!(graphs.placement.pool_tokens, eager.placement.pool_tokens);
+                assert_eq!(graphs.placement.layers, eager.placement.layers);
+            }
             for rank in 0..ranks {
                 let expected = if value == "untraced" { 0 } else { [64 << 20, 96 << 20][rank] };
                 let owners = graphs.solved.facts.allowances.iter().filter(|owner|

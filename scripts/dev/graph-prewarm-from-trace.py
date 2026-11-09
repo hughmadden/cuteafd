@@ -1725,13 +1725,14 @@ def generate_qwen35(traces, variant, summary=None):
                      "pin": (rows, stride, spec) in pins} for rows, stride, spec in keys]}]}
 
 
-STEP5_LAYOUTS = {"fp8-2rtx-6spark": 2, "nvfp4-1rtx-4spark": 1}
+STEP5_LAYOUTS = {"fp8-2rtx-6spark": 2, "nvfp4-1rtx-4spark": 1,
+                 "exl3-k4-core-k6-1rtx-3spark": 1, "exl3-k4-core-k6-2rtx-6spark": 2}
 STEP5_GEOMETRY = re.compile(r"Key \{ layer: (\d+), rows: (\d+), section: "
                             r"(Projection|Attention|Dense|Frontend|Shared|Finish) \}")
 
 
 def generate_step5(traces, layout):
-    """Every replayed exact section, per rank; never borrow another layout."""
+    """Whole replayed row geometries, per rank; never borrow another layout."""
     if layout not in STEP5_LAYOUTS:
         raise ValueError(f"unknown Step-5 layout {layout!r}")
     latest = {}

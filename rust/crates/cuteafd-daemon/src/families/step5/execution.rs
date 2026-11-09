@@ -926,6 +926,12 @@ impl<'e, 'a> Execution<'e, 'a> {
         Ok(())
     }
 
+    /// Diagnostic-only inventory, inspected after all rank streams have completed.
+    pub(super) fn retained_graph_rows(&self, rows: usize) -> Result<Vec<(i32, usize)>> {
+        self.main.graphs.iter().enumerate().map(|(rank, bank)|
+            Ok((self.main.device(rank)?.id, bank.retained_rows(rows)))).collect()
+    }
+
     pub(super) fn warming_graphs<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
         struct Restore<'s, 'a>(&'s [super::graphs::Graphs<'a>]);
         impl Drop for Restore<'_, '_> {

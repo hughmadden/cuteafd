@@ -52,8 +52,9 @@ def step5_trace(device=0):
                        graph(2, 64, "Shared", 0, 999999)]}
 
 
-def test_step5_selects_every_replayed_section_and_heat_orders_each_rank():
-    result = MODULE.generate_step5([step5_trace(1), step5_trace(0)], "fp8-2rtx-6spark")
+@pytest.mark.parametrize("layout", ["fp8-2rtx-6spark", "exl3-k4-core-k6-2rtx-6spark"])
+def test_step5_selects_every_replayed_section_and_heat_orders_each_rank(layout):
+    result = MODULE.generate_step5([step5_trace(1), step5_trace(0)], layout)
     assert [rank["rank"] for rank in result["ranks"]] == [0, 1]
     for rank in result["ranks"]:
         assert [entry["rows"] for entry in rank["entries"]] == [4, 1, 16]
@@ -62,7 +63,16 @@ def test_step5_selects_every_replayed_section_and_heat_orders_each_rank():
         assert rank["reserve_base_bytes"] == 2 << 20
         assert rank["reserve_extra_bytes"] == 2 << 20
     assert result == MODULE.generate_step5([step5_trace(0), step5_trace(1), step5_trace(0)],
-                                           "fp8-2rtx-6spark")
+                                           layout)
+
+
+def test_step5_exl3_min_and_max_have_independent_rank_identities():
+    layout = "exl3-k4-core-k6-1rtx-3spark"
+    result = MODULE.generate_step5([step5_trace()], layout)
+    assert result["layout"] == layout
+    assert len(result["ranks"]) == 1
+    with pytest.raises(ValueError, match="requires 2 device traces"):
+        MODULE.generate_step5([step5_trace()], "exl3-k4-core-k6-2rtx-6spark")
 
 
 @pytest.mark.parametrize("change", [lambda t: t["graphs"][0].update(nodes=1),
