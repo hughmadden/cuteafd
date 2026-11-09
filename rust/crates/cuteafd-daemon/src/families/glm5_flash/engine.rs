@@ -1475,9 +1475,13 @@ pub(crate) struct GlmfEngine<'a> {
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
-    /// Capture pass of the prewarm: a decode segment captures instead of running eagerly.
+    /// Either prewarm pass runs: the masked bucket owns the FFN boundary, so no real
+    /// rows are routed.
     warming_graphs: std::cell::Cell<bool>,
-    /// The prewarm pass finished. Before it every decode segment runs eagerly.
+    /// The prewarm's eager pass: every decode segment runs eagerly with the masked
+    /// boundary a capture would bake in, before any graph is created.
+    prewarming_graphs: std::cell::Cell<bool>,
+    /// The prewarm finished. Before it every decode segment runs eagerly.
     graphs_warmed: std::cell::Cell<bool>,
     /// Free bytes per rank sampled before the step that captures, for its measured cost.
     graph_before: RefCell<Option<Vec<u64>>>,
@@ -1774,7 +1778,8 @@ impl<'a> GlmfEngine<'a> {
             prefill_slots: RefCell::new(Vec::new()),
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "glm5_flash")),
             use_graphs: Self::graphs_enabled(),
-            warming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
+            warming_graphs: std::cell::Cell::new(false),
+            prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
             graph_before: RefCell::new(None),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             spark_bf16: false, full_prefill_logits: false,
@@ -1826,21 +1831,24 @@ impl<'a> GlmfEngine<'a> {
         for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_cycle(Cycle::Other); }
         // Allocate fixed workspaces before measuring the graph executables' physical memory.
         for rank in 0..self.ranks() { drop(self.decode_workspace_of(rank)?); }
-        let run = |warming: bool| -> Result<()> {
-            self.warming_graphs.set(warming);
+        let run = |eager: bool| -> Result<()> {
+            // Both passes keep the masked bucket boundary; only the second creates graphs.
+            self.warming_graphs.set(true);
+            self.prewarming_graphs.set(eager);
             let result = (|| -> Result<()> {
                 for &(rows, spec, geometry) in &shapes {
                     self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
                 }
                 self.synchronize()
             })();
+            self.prewarming_graphs.set(false);
             self.warming_graphs.set(false);
             result
         };
         // Same segment closures and masked FFN semantics, without creating a graph.
-        run(false)?;
+        run(true)?;
         let before = self.graph_memory_samples()?;
-        let captured = run(true);
+        let captured = run(false);
         captured?;
         self.graphs_warmed.set(true);
         let after = self.graph_memory_samples()?;
@@ -4552,8 +4560,11 @@ impl<'a> GlmfEngine<'a> {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.raw, stream) });
         }
-        // Before the prewarm and during its eager pass every segment runs eagerly.
-        if !self.graphs_warmed.get() && !self.warming_graphs.get() { return self.eager_segment(segment); }
+        // Before the prewarm, and through its eager pass, every segment runs eagerly.
+        if self.prewarming_graphs.get()
+            || (!self.graphs_warmed.get() && !self.warming_graphs.get()) {
+            return self.eager_segment(segment);
+        }
         let pinned = self.graph_pinned(&key);
         let crate::shared::decode_graph::device::Miss::Capture(ticket) =
             graphs.borrow_mut().cache_miss(&key, pinned, None) else {
