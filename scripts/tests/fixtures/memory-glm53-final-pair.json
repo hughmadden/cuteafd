@@ -1,0 +1,728 @@
+{
+  "source": "graph-cache/final-pair/glm53-exl3-min-candidate-r1/policy-stats.jsonl final stats; provenance paths omitted",
+  "stats": {
+    "prefix_cache": {
+      "lookups": 108,
+      "media_key_collisions": 0,
+      "hits": 6,
+      "exact_hits": 5,
+      "partial_hits": 0,
+      "hit_tokens": 36221,
+      "promotions": 0,
+      "device_hits": 6,
+      "host_hits": 0,
+      "mark_promotions": 0,
+      "capture_stalls": 0,
+      "capture_stall_ns": 0,
+      "restore_failures": 0,
+      "fork_no_room": 0,
+      "captures_prompt": 47,
+      "captures_turn": 102,
+      "parked": 0,
+      "capture_skips": 0,
+      "evictions": 109,
+      "cow_copies": 5,
+      "host_store_skips": 135,
+      "host_evict_waits": 0,
+      "host_evict_uncached": 0,
+      "captures_queued": 0,
+      "captures_aborted": 0,
+      "quarantined": 0,
+      "eviction_skips": 0,
+      "entries_prompt": 20,
+      "entries_turn": 20,
+      "pages": 16384,
+      "pages_free": 16281,
+      "pages_used_by_gpu": null,
+      "pages_shared": 17,
+      "pages_retained": 103,
+      "mark_slots": 0,
+      "marks_in_use": 0,
+      "mark_pages": 0,
+      "host": {
+        "stores_issued": 14,
+        "stores_completed": 14,
+        "stores_replaced": 2,
+        "stores_failed": 0,
+        "store_drain_timeouts": 0,
+        "store_latency_sum_ns": 5376371249,
+        "store_latency_buckets": [
+          5,
+          2,
+          1,
+          2,
+          1,
+          1,
+          0,
+          2
+        ],
+        "stores_skipped": 135,
+        "store_bytes": 2965405454,
+        "pages_copied": 859,
+        "pages_shared": 866,
+        "lookups": 102,
+        "host_hits": 0,
+        "restores": 0,
+        "restore_bytes": 0,
+        "restore_timeouts": 0,
+        "restore_failures": 0,
+        "restore_latency_buckets": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "restore_latency_sum_ns": 0,
+        "evict_waits": 0,
+        "evict_wait_ns": 0,
+        "evict_drops_uncached": 0,
+        "prefill_holds": 0,
+        "prefill_hold_ns_sum": 0,
+        "prefill_hold_timeouts": 0,
+        "device_evictions": 109,
+        "host_evictions": 0,
+        "host_eviction_ns": 0,
+        "host_evicted_bytes": 0,
+        "copy_submissions": 14,
+        "resident_snapshots": 12,
+        "bytes_used": 2958501132,
+        "quota_bytes": 34359738368
+      }
+    },
+    "kv_reserve": {
+      "top_ups": 0,
+      "top_up_pages": 0,
+      "stalls": 0,
+      "early_terminations": 0,
+      "deadlock_breaks": 0,
+      "refused_grants": 0,
+      "admission_waits": 0,
+      "stalled": 0,
+      "config": {
+        "chunk": 16384,
+        "drain_buffer": null,
+        "termination": null
+      }
+    },
+    "graph_cache": [
+      {
+        "device": 0,
+        "reserve": 1191182336,
+        "charged": 335544320,
+        "pinned": 8388608,
+        "pending_capture": 0,
+        "cycles": {
+          "verify": {
+            "hits": 94721,
+            "misses": 0,
+            "captures": 0,
+            "eager_runs": 0,
+            "evictions": 0
+          },
+          "other": {
+            "hits": 0,
+            "misses": 2212,
+            "captures": 2212,
+            "eager_runs": 0,
+            "evictions": 0
+          },
+          "decode": {
+            "hits": 24490,
+            "misses": 0,
+            "captures": 0,
+            "eager_runs": 0,
+            "evictions": 0
+          }
+        },
+        "pools": {
+          "live_nodes": 330108926,
+          "node_high_water": 330108926,
+          "live_execs": 2212,
+          "exec_high_water": 2212
+        },
+        "basis": {
+          "kind": "bytes"
+        }
+      }
+    ],
+    "memory_reconciliation": {
+      "schema_version": 1,
+      "ready": {
+        "stage": "ready",
+        "devices": [
+          {
+            "device": "rtx0",
+            "measured_bytes": 93944610816,
+            "charged_bytes": 97727602552,
+            "padding_bytes": 104857600,
+            "delta_vs_admitted": -3782991736,
+            "delta_vs_measured": -2927353720,
+            "graph_reserve_slack": 855638016,
+            "graph_reserve_bytes": 1191182336,
+            "graph_arena_high_water_bytes": 335544320,
+            "beyond_half_padding": true,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "active-context CUDA physical total minus free, excluding independently measured observer context",
+            "charge_basis": "admitted named owners excluding release padding",
+            "owners": {
+              "device": "rtx0",
+              "cap_bytes": 101393629184,
+              "weights_bytes": 35422055228,
+              "workspace_bytes": 3469570816,
+              "reserve": [
+                {
+                  "name": "BLAS device initialization",
+                  "bytes": 2097152
+                },
+                {
+                  "name": "GLM context and selected modules",
+                  "bytes": 592707584
+                },
+                {
+                  "name": "GLM first ready-step CUDA module touch",
+                  "bytes": 69045248
+                },
+                {
+                  "name": "GLM startup prewarm module first touch",
+                  "bytes": 72615168
+                },
+                {
+                  "name": "allocation granularity",
+                  "bytes": 204165888
+                },
+                {
+                  "name": "cuBLAS handles",
+                  "bytes": 67108864
+                },
+                {
+                  "name": "driver page tables",
+                  "bytes": 67121212
+                },
+                {
+                  "name": "glm/driver-stream-slabs/gpu0",
+                  "bytes": 6291456
+                },
+                {
+                  "name": "graph reserve",
+                  "bytes": 1191182336
+                },
+                {
+                  "name": "family reserve",
+                  "bytes": 0
+                },
+                {
+                  "name": "release padding",
+                  "bytes": 104857600
+                }
+              ],
+              "reserve_overridden": false,
+              "kv_bytes": 56563641600,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": {
+                "device": 0,
+                "total_bytes": 101393629184,
+                "free_bytes": 100703076352,
+                "context_bytes": 690552832,
+                "module_bytes": 90177536,
+                "sms": 188,
+                "arch": "sm_120",
+                "driver": "13.2"
+              }
+            },
+            "raw_used_bytes": 94521327616,
+            "observer_bytes": 576716800,
+            "observer_provenance": {
+              "source": "CUTEAFD_OBSERVER_CONTEXT_FILE; measured sampler context per logical CUDA device",
+              "method": "same observer_context::exclude helper as cuda_allocatable_memory_info; excluded exactly once",
+              "present": true
+            }
+          },
+          {
+            "device": "spark0",
+            "measured_bytes": 92034871296,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": 1837710616,
+            "delta_vs_measured": 1837710616,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": true,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark0",
+              "cap_bytes": 130594160640,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": 101761773568,
+            "baseline_allocatable_free_bytes": 120867258368,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": 109917011968,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594160640,
+              "free_bytes": 28832387072,
+              "context_bytes": 11599153176,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 0
+          },
+          {
+            "device": "spark1",
+            "measured_bytes": 92176715776,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": 1979555096,
+            "delta_vs_measured": 1979555096,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": true,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark1",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": 102749532160,
+            "baseline_allocatable_free_bytes": 120021340160,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": 108099571712,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 27844624384,
+              "context_bytes": 12586911768,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 1
+          },
+          {
+            "device": "spark2",
+            "measured_bytes": 94066728960,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": 3869568280,
+            "delta_vs_measured": 3869568280,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": true,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark2",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": 104950575104,
+            "baseline_allocatable_free_bytes": 119710310400,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": 109060706304,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 25643581440,
+              "context_bytes": 14787954712,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 2
+          },
+          {
+            "device": "spark3",
+            "measured_bytes": 92637712384,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": 2440551704,
+            "delta_vs_measured": 2440551704,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": true,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark3",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": 102618898432,
+            "baseline_allocatable_free_bytes": 120612970496,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": 107887296512,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 27975258112,
+              "context_bytes": 12456278040,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 3
+          }
+        ]
+      },
+      "first_request": {
+        "stage": "first_request",
+        "devices": [
+          {
+            "device": "rtx0",
+            "measured_bytes": 96882720768,
+            "charged_bytes": 97727602552,
+            "padding_bytes": 104857600,
+            "delta_vs_admitted": -844881784,
+            "delta_vs_measured": 10756232,
+            "graph_reserve_slack": 855638016,
+            "graph_reserve_bytes": 1191182336,
+            "graph_arena_high_water_bytes": 335544320,
+            "beyond_half_padding": false,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "active-context CUDA physical total minus free, excluding independently measured observer context",
+            "charge_basis": "admitted named owners excluding release padding",
+            "owners": {
+              "device": "rtx0",
+              "cap_bytes": 101393629184,
+              "weights_bytes": 35422055228,
+              "workspace_bytes": 3469570816,
+              "reserve": [
+                {
+                  "name": "BLAS device initialization",
+                  "bytes": 2097152
+                },
+                {
+                  "name": "GLM context and selected modules",
+                  "bytes": 592707584
+                },
+                {
+                  "name": "GLM first ready-step CUDA module touch",
+                  "bytes": 69045248
+                },
+                {
+                  "name": "GLM startup prewarm module first touch",
+                  "bytes": 72615168
+                },
+                {
+                  "name": "allocation granularity",
+                  "bytes": 204165888
+                },
+                {
+                  "name": "cuBLAS handles",
+                  "bytes": 67108864
+                },
+                {
+                  "name": "driver page tables",
+                  "bytes": 67121212
+                },
+                {
+                  "name": "glm/driver-stream-slabs/gpu0",
+                  "bytes": 6291456
+                },
+                {
+                  "name": "graph reserve",
+                  "bytes": 1191182336
+                },
+                {
+                  "name": "family reserve",
+                  "bytes": 0
+                },
+                {
+                  "name": "release padding",
+                  "bytes": 104857600
+                }
+              ],
+              "reserve_overridden": false,
+              "kv_bytes": 56563641600,
+              "other_bytes": 0
+            },
+            "unavailable_reason": null,
+            "provenance": {
+              "device_sample": {
+                "device": 0,
+                "total_bytes": 101393629184,
+                "free_bytes": 100703076352,
+                "context_bytes": 690552832,
+                "module_bytes": 90177536,
+                "sms": 188,
+                "arch": "sm_120",
+                "driver": "13.2"
+              }
+            },
+            "raw_used_bytes": 97459437568,
+            "observer_bytes": 576716800,
+            "observer_provenance": {
+              "source": "CUTEAFD_OBSERVER_CONTEXT_FILE; measured sampler context per logical CUDA device",
+              "method": "same observer_context::exclude helper as cuda_allocatable_memory_info; excluded exactly once",
+              "present": true
+            }
+          },
+          {
+            "device": "spark0",
+            "measured_bytes": null,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": null,
+            "delta_vs_measured": null,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": null,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark0",
+              "cap_bytes": 130594160640,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": null,
+            "baseline_allocatable_free_bytes": 120867258368,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": null,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594160640,
+              "free_bytes": 28832387072,
+              "context_bytes": 11599153176,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 0
+          },
+          {
+            "device": "spark1",
+            "measured_bytes": null,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": null,
+            "delta_vs_measured": null,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": null,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark1",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": null,
+            "baseline_allocatable_free_bytes": 120021340160,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": null,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 27844624384,
+              "context_bytes": 12586911768,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 1
+          },
+          {
+            "device": "spark2",
+            "measured_bytes": null,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": null,
+            "delta_vs_measured": null,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": null,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark2",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": null,
+            "baseline_allocatable_free_bytes": 119710310400,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": null,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 25643581440,
+              "context_bytes": 14787954712,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 2
+          },
+          {
+            "device": "spark3",
+            "measured_bytes": null,
+            "charged_bytes": 90197160680,
+            "padding_bytes": 0,
+            "delta_vs_admitted": null,
+            "delta_vs_measured": null,
+            "graph_reserve_slack": 0,
+            "graph_reserve_bytes": 0,
+            "graph_arena_high_water_bytes": 0,
+            "beyond_half_padding": null,
+            "graph_measurement_unavailable_reason": null,
+            "measurement_method": "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded",
+            "charge_basis": "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings",
+            "owners": {
+              "device": "spark3",
+              "cap_bytes": 130594156544,
+              "weights_bytes": 89711968256,
+              "workspace_bytes": 485192424,
+              "reserve": [],
+              "reserve_overridden": false,
+              "kv_bytes": 0,
+              "other_bytes": 0
+            },
+            "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
+            "provenance": {
+              "device_sample": null
+            },
+            "absolute_allocatable_used_bytes": null,
+            "baseline_allocatable_free_bytes": 120612970496,
+            "admitted_future_ring_bytes": 547356672,
+            "raw_used_bytes": null,
+            "raw_measurement_method": "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568",
+            "drift_measurement_basis": "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic",
+            "admission_sample": {
+              "device": 0,
+              "total_bytes": 130594156544,
+              "free_bytes": 27975258112,
+              "context_bytes": 12456278040,
+              "module_bytes": 0,
+              "sms": 48,
+              "arch": "sm_121",
+              "driver": "13.0"
+            },
+            "rank": 3
+          }
+        ]
+      }
+    },
+    "host_heap": {
+      "allocator": "glibc",
+      "scope": "all_arenas",
+      "rss_bytes": 40855592960,
+      "live_bytes": 2409304240,
+      "active_bytes": 2305523712,
+      "mapped_bytes": 3939913728,
+      "resident_bytes": 0,
+      "retained_bytes": 0,
+      "metadata_bytes": 0,
+      "fragmentation_bytes": 1530609488,
+      "hblkhd_bytes": 1634390016,
+      "arenas": 0
+    }
+  }
+}

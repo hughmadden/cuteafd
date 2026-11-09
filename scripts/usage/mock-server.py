@@ -377,7 +377,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(b"", 304, "application/octet-stream", headers)
             snapshot = expert_snapshot(tick, getattr(self.server, "expert_geometry", None))
             return self.send(expert_binary(snapshot, window, phase), mime="application/octet-stream", headers=headers)
-        assets = {"/experts": "rust/crates/cuteafd-api/assets/experts.html",
+        if path == "/console/memory":
+            if not unlocked:
+                return self.send({"error": {"type": "console_locked"}}, 401)
+            fixture = ROOT / "scripts/tests/fixtures/memory-glm53-final-pair.json"
+            return self.send(json.loads(fixture.read_text()))
+        assets = {"/memory": "rust/crates/cuteafd-api/assets/memory.html",
+                  "/assets/memory.js": "rust/crates/cuteafd-api/assets/memory.js",
+                  "/experts": "rust/crates/cuteafd-api/assets/experts.html",
                   "/usage": "rust/crates/cuteafd-usage/assets/usage.html",
                   "/": "rust/crates/cuteafd-api/assets/console.html",
                   "/bench": "rust/crates/cuteafd-bench/assets/bench.html",
