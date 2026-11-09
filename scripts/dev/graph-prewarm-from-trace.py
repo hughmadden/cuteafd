@@ -1089,12 +1089,12 @@ def main():
     if args.family != "deepseek_v4" and args.list is not None:
         parser.error("--list applies only to deepseek_v4")
     layout = args.layout
-    if args.family == "mistral_large4":
+    if args.family in ("mistral_large4", "deepseek_v41"):
         if layout not in ("1", "2"):
-            parser.error("mistral_large4 keys its list by layout: pass --layout 1 or 2")
+            parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
     elif layout is not None and args.family != "deepseek_v4":
-        parser.error("--layout applies to mistral_large4 and deepseek_v4 only")
+        parser.error("--layout applies to mistral_large4, deepseek_v4 and deepseek_v41 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
