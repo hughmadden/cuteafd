@@ -16,7 +16,9 @@
 //! shape's lead/peer ranks, exactly `GRAPH_BYTES[role]`, all of it
 //! `reserve_extra_bytes` because no measured prewarm arena exists to separate a
 //! base from headroom, plus a one-graph bootstrap estimate. Today that is only
-//! `rtx1-local`; startup names the missing trace.
+//! `rtx1-local`; startup names the missing trace. The shared capture-headroom
+//! policy then charges that provisional base like any other family base: with
+//! no user key it adds `min(500 MB, 100% of the base)`.
 //!
 //! A traced shape carries its own cards' measurements: every geometry the trace
 //! observed is an entry, so `reserve_base_bytes` is the startup warm's whole
@@ -148,7 +150,7 @@ pub fn v4_reserve_policies(gpus: usize, sparks: bool)
         return Err(format!("V4 prewarm list {} ranks disagree", layout.key()));
     }
     (0..layout.ranks()).map(|rank| crate::placement::graph_reserve::current(
-        rank, false, base[rank], extra[rank])).collect()
+        rank, false, base[rank], extra[rank]).map_err(|error| error.to_string())).collect()
 }
 
 /// Per-rank bootstrap estimate, for a device with no measured capture yet.
@@ -210,7 +212,8 @@ mod tests {
 
     #[test]
     fn the_untraced_shape_keeps_the_replaced_growth_charge() {
-        // The numbers retired from `families::deepseek_v4::GRAPH_BYTES`.
+        // The numbers retired from `families::deepseek_v4::GRAPH_BYTES`; the
+        // shared headroom policy charges this provisional base like any other.
         let entry = &v4_prewarm_list().layouts["rtx1-local"];
         assert!(!entry.traced);
         assert_eq!(entry.reserve_base_bytes, [0]);

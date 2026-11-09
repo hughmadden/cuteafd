@@ -817,7 +817,10 @@ pub(crate) fn with_engine<T>(
         for (rank, policy) in cuteafd_loader::serving_capacity::v4_graphs::v4_reserve_policies(
                 graphs.reserves.len(), !peers.is_empty()).map_err(anyhow::Error::msg)?.iter().enumerate() {
             tracing::info!(rank, reserve = policy.bytes, source = policy.source,
-                "V4 GPU_GRAPH_RESERVE startup policy");
+                base = policy.base_bytes, base_source = policy.base_source,
+                extra = policy.extra_bytes, extra_source = policy.extra_source,
+                cap = ?policy.cap_bytes, cap_source = policy.cap_source,
+                charged = policy.bytes, "V4 GPU_GRAPH_RESERVE startup policy");
         }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;

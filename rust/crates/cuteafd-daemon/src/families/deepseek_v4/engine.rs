@@ -2188,9 +2188,10 @@ impl<'a> Engine<'a> {
         // Lead-rank expert graphs plus the peer half each TP2 layer also captures.
         let wanted = rows.len() * (self.local_layers()
             + (0..self.local_layers()).filter(|&layer| self.tp2_layer(layer)).count());
-        let before = self.graph_captures.get();
+        let before_captures = self.graph_captures.get();
         let eager_before = self.graph_eager.get();
         self.cache_cycle(crate::shared::decode_graph::device::Cycle::Other);
+        let before = self.graph_memory_samples()?;
         self.capture_only.set(true);
         let result = (|| -> Result<()> {
             let work = self.decode_workspace.borrow();
@@ -2211,7 +2212,8 @@ impl<'a> Engine<'a> {
         // The capture pass launched nothing, so this is already a completed
         // boundary: measure the prewarm arena before any request can grow it.
         self.graph_completed()?;
-        let captured = self.graph_captures.get().saturating_sub(before);
+        let after = self.graph_memory_samples()?;
+        let captured = self.graph_captures.get().saturating_sub(before_captures);
         // A second pass over an already-warm set legitimately captures nothing,
         // so only a reserve refusal is a truncation signal.
         let eager = self.graph_eager.get().saturating_sub(eager_before);
@@ -2221,6 +2223,8 @@ impl<'a> Engine<'a> {
         }
         let (graphs0, graphs1, captures) = self.graph_inventory();
         tracing::info!(graphs0, graphs1, captures, wanted, captured, eager, elapsed_ms = started.elapsed().as_millis() as u64,
+            arena = ?before.iter().zip(&after).map(|(b, a)| a.retained_since(*b)).collect::<Result<Vec<_>, _>>(),
+            free = ?before.iter().zip(&after).map(|(b, a)| (b.free, a.free)).collect::<Vec<_>>(),
             "V4 local expert graphs warmed");
         Ok(())
     }
