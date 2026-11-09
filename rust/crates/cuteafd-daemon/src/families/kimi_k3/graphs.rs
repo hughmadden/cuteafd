@@ -440,7 +440,7 @@ mod tests {
         assert!(!capture_worthwhile(0));
         assert!(!capture_worthwhile(1));
         assert!(capture_worthwhile(2));
-        let source = include_str!("graphs.rs").split("#[cfg(test)]").next().unwrap();
+        let source = include_str!("graphs.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
         assert!(source.find("if !capture_worthwhile(nodes)").unwrap()
             < source.find("self.bank.cache_commit").unwrap());
         assert!(!source.contains("Residual("));
