@@ -2007,7 +2007,7 @@ impl<'a> Engine<'a> {
                 _ => &self.graphs,
             };
             let device = self.on(rank, || self.library.cuda_get_device())?;
-            graphs.borrow_mut().attach_device(device, reserves[rank], Site {
+            graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
                 name: "deepseek_v4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis: Basis::Bytes,
                 spans_devices: self.ranks() > 1,
