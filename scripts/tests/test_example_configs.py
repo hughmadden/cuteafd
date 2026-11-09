@@ -500,6 +500,11 @@ def test_v5_smoke_matches_pending_matrix_and_attention_comparison() -> None:
             assert values["GPU_MEMORY_CAP"] == "31.8GiB"
             assert values["BENCH_HARDWARE_CLASS"] == values["BENCH_SIMULATED"] == "5090"
             assert len(entry["sparks"]) == 4
+            assert entry["precheck"] == {
+                "argv": ["sh", "-c", "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"],
+                "timeout_s": 30,
+                "required": True,
+            }
     expected = {(row["family"], row["checkpoint"], column) for row in matrix["cells"]
                 for column in ("5090", "1rtx", "2rtx") if row[column]["status"] != "na"}
     assert cards == expected

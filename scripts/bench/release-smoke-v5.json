@@ -181,6 +181,15 @@
         "GPU_MEMORY_CAP": "31.8GiB",
         "BENCH_HARDWARE_CLASS": "5090",
         "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
       }
     },
     {
@@ -778,6 +787,15 @@
         "BENCH_HARDWARE_CLASS": "5090",
         "BENCH_SIMULATED": "5090",
         "ATTENTION_MODE": "hqa"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
       }
     },
     {
@@ -922,6 +940,15 @@
         "GPU_MEMORY_CAP": "31.8GiB",
         "BENCH_HARDWARE_CLASS": "5090",
         "BENCH_SIMULATED": "5090"
+      },
+      "precheck": {
+        "argv": [
+          "sh",
+          "-c",
+          "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"
+        ],
+        "timeout_s": 30,
+        "required": true
       }
     },
     {
