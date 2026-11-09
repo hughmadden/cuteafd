@@ -3406,6 +3406,14 @@ mod tests {
             64, 64, 16384, 1, 1, embedding, MimoKvFormats::default(), MimoPrefillOutput::AllRows)?;
         engine.decode_graphs = true;
         engine.configure_graph_cache(&layout.reserves, &layout.bootstraps, &layout.policies)?;
+        let mut stats = serde_json::json!({"requests": 1});
+        crate::shared::probe::graph_capture_stats(&mut stats);
+        let cache = stats["graph_cache"].as_array().unwrap().iter()
+            .find(|cache| cache["device"] == 7).expect("MiMo physical graph cache is published");
+        assert_eq!(cache["reserve_policy"], serde_json::to_value(&layout.policies[0])?);
+        assert!(cache["reserve_policy"]["charged_bytes"].as_u64().unwrap() > 0);
+        assert!(stats["memory_reconciliation"].is_object());
+        assert!(stats["memory_reconciliation"].get("first_request").is_some());
         engine.graph_layout = Some(layout);
         assert_eq!(engine.capture_decode_graphs(DECODE_ROWS)?, 0);
         assert!(engine.graphs_warmed.get());

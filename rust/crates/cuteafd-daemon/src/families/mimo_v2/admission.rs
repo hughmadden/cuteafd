@@ -558,6 +558,30 @@ fn preflight_shape(
     tracing::info!(phases = %serde_json::to_string(&admitted.solved.phases)?,
         "MiMo admitted phase ledger before allocations");
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "mimo_v2");
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &std::path::Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{}; host-prefix/{}; replies/{:?}",
+            args.snapshot.display(), args.draft, args.max_context, concurrency, host_bytes,
+            cuteafd_core::spark_reply::requested());
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "mimo_v2", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
+                "layout": layout, "devices": memory, "spark_world": working.spark_ranks,
+                "onboard_layers": admitted.solved.decisions.onboard_layers,
+                "prefill": admitted.solved.decisions.prefill,
+                "graph_basis": { "rows": graph_layout.rows, "pinned": graph_layout.pinned,
+                    "reserve_policy": graph_layout.policies }
+            }
+        }));
+    }
     tracing::info!(placement = %placement.summary(), "MiMo shared admission solve");
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
