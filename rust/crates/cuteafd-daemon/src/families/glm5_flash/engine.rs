@@ -1483,8 +1483,6 @@ pub(crate) struct GlmfEngine<'a> {
     prewarming_graphs: std::cell::Cell<bool>,
     /// The prewarm finished. Before it every decode segment runs eagerly.
     graphs_warmed: std::cell::Cell<bool>,
-    /// Free bytes per rank sampled before the step that captures, for its measured cost.
-    graph_before: RefCell<Option<Vec<u64>>>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
     /// The shared draft policy's per-step signals (layer events, routes), armed by
@@ -1780,7 +1778,6 @@ impl<'a> GlmfEngine<'a> {
             use_graphs: Self::graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false),
             prewarming_graphs: std::cell::Cell::new(false), graphs_warmed: std::cell::Cell::new(false),
-            graph_before: RefCell::new(None),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             spark_bf16: false, full_prefill_logits: false,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
@@ -1893,27 +1890,26 @@ impl<'a> GlmfEngine<'a> {
             && entry.pool_stride == key.pool_stride)
     }
 
-    fn graph_free_samples(&self) -> Result<Vec<u64>> {
-        (0..self.ranks()).map(|rank| self.on(rank, || self.library.cuda_physical_memory_info()
-            .map(|(free, _)| free as u64))).collect()
-    }
-
-    fn graph_boundary(&self, before: &[u64]) -> Result<()> {
-        let needs = (0..self.ranks()).any(|rank| self.graphs_of(rank).borrow().cache_needs_boundary());
-        if !needs { return Ok(()) }
-        // Every rank's submissions are queued now. A per-segment sync deadlocks
-        // cross-rank waits; this completed step is the measurement boundary.
-        let after = self.graph_memory_samples()?;
-        for rank in 0..self.ranks() {
-            let graphs = self.graphs_of(rank);
-            graphs.borrow_mut().cache_measured(before[rank].saturating_sub(after[rank].free));
-            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
-                let (free, _) = self.library.cuda_physical_memory_info()?;
-                Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
-                    released: (free as u64).saturating_sub(after[rank].free) })
-            }))?;
+    /// Every rank's launches for the completed step are queued: observe the
+    /// device once per physical GPU, tick each site's cycle and retire the
+    /// victims without draining a lane. GLM Flash every graph owner pins `()`
+    /// and captures only persistent engine buffers, so destroying a victim
+    /// executable never releases storage an in-flight launch reads.
+    fn observe_graphs_completed(&self) -> Result<()> {
+        let spans = self.ranks() > 1 || self.peer.is_some();
+        // SAFETY: every GLM Flash graph owner pins `()` (see `GraphOwner::new`
+        // in `replay_on`) and its captured pointers are persistent engine
+        // buffers, never per-graph allocations.
+        unsafe {
+            crate::shared::decode_graph::device::observe_completed(&self.library, |visit| {
+                for rank in 0..self.ranks() {
+                    let device = if rank == 1 { self.peer()?.device } else { self.device };
+                    visit(device, "glm5_flash.decode", spans,
+                        &mut *self.graphs_of(rank).borrow_mut())?;
+                }
+                Ok(())
+            })
         }
-        Ok(())
     }
 
     /// Physical free/total and the ledger's tracked bytes on both ranks, with
@@ -4139,14 +4135,9 @@ impl<'a> GlmfEngine<'a> {
             || self.require_live(), || self.shutdown_submission(),
             |scope| {
                 let result = self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media)?;
-                // Every rank's launches are queued now: this completed step is the measurement
-                // boundary for a capture queued inside it.
-                let before = self.graph_before.borrow_mut().take();
-                if let Some(before) = before { self.graph_boundary(&before)?; }
-                else if (0..self.ranks()).any(|rank| self.graphs_of(rank).borrow().cache_needs_boundary()) {
-                    self.graph_boundary(&self.graph_free_samples()?)?;
-                }
-                for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_tick(); }
+                // Every rank's launches are queued now: this completed step is the
+                // measurement boundary for a capture queued inside it.
+                self.observe_graphs_completed()?;
                 Ok(result)
             })
     }
@@ -4550,7 +4541,7 @@ impl<'a> GlmfEngine<'a> {
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs): a hit launches the captured
     /// segment, a miss captures it (or runs it eagerly where capture is unavailable), and every
     /// failed capture cancels its ticket. A capture's cost is measured at the completed step
-    /// boundary (`graph_boundary`), never by a sync inside a segment.
+    /// boundary (`observe_graphs_completed`), never by a sync inside a segment.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let graphs = self.graphs_of(rank);
@@ -4569,12 +4560,6 @@ impl<'a> GlmfEngine<'a> {
             graphs.borrow_mut().cache_miss(&key, pinned, None) else {
             return self.eager_segment(segment);
         };
-        if self.graph_before.borrow().is_none() {
-            match self.graph_free_samples() {
-                Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
-                Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
-            }
-        }
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
