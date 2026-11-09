@@ -1436,6 +1436,29 @@ fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>
 #[cfg(test)]
 mod lane_tests {
     #[test]
+    fn admission_and_completed_request_publish_reconciliation() {
+        let admission = include_str!("admission.rs");
+        let registered = admission.split_once("reserve::log_plan(&admitted.solved, \"mimo_v2\")").unwrap().1
+            .split_once("MiMo shared admission solve").unwrap().0;
+        assert!(registered.contains("memory_ledger::fault::set_inputs"));
+        for field in ["memory_reconciliation_provenance", "family", "source_commit", "native_sha256",
+            "programs_sha256", "layout", "devices", "spark_world", "onboard_layers", "prefill"] {
+            assert!(registered.contains(&format!("\"{field}\"")), "missing provenance {field}");
+        }
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\nfn eligible_draft_rooms").unwrap().0;
+        let completed = publish.find("if requests > 0").unwrap();
+        let once = publish.find("static FIRST: std::sync::Once").unwrap();
+        let capture = publish.find("FIRST.call_once(|| crate::shared::memory_report::reconcile::capture(\"first_request\"))").unwrap();
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        assert!(completed < once && once < capture && capture < replace);
+        assert!(!publish.contains("graph_capture_stats"), "diagnostics belong to HTTP stats fetches");
+        assert!(publish.contains("cache.serving_stats()"));
+        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+    }
+
+    #[test]
     fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
         let source = include_str!("serve.rs");
         let schedule = source.split_once("\nfn schedule_inner(").unwrap().1
