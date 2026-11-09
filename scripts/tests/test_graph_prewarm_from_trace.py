@@ -517,11 +517,13 @@ def test_mistral_large4_selects_its_site_prefix_and_layout():
     assert two["reserve_base_bytes"] == one["reserve_base_bytes"]
 
 
-def test_layout_is_required_for_mistral_large4_and_reserved_for_it():
+def test_layout_is_required_for_mistral_large4_and_optional_for_glm5():
     with pytest.raises(ValueError):
         MODULE.generate([trace()], "mistral_large4")
-    with pytest.raises(ValueError):
-        MODULE.generate([trace()], "glm5", layout=1)
+    assert MODULE.generate([trace()], "glm5", layout=1)["layout"] == 1
+    two = MODULE.generate([context_trace()], "glm5", coverage=0.99, layout=2)
+    assert two["layout"] == 2
+    assert [(entry["rows"], entry["table_width"]) for entry in two["entries"]] == [(1, 16), (16, 32)]
 
 
 def test_odd_half_table_width_is_refused():
@@ -562,7 +564,7 @@ def test_every_consumer_uses_fixed_allocation_tail_not_largest_graph(family):
     assert result["reserve_extra_bytes"] == 2 << 20
 
 
-@pytest.mark.parametrize("filename", ["glm_prewarm.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
+@pytest.mark.parametrize("filename", ["glm_prewarm_1.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
 def test_regeneration_reproduces_checked_in_base_and_tail(filename):
     import json
     root = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity"

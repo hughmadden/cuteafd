@@ -645,11 +645,9 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
         raise ValueError(f"no checked-in shape-list consumer for {family}; qwen4 is keyed by --shape")
-    if family == "mistral_large4":
+    if family == "mistral_large4" or layout is not None:
         if layout not in (1, 2):
-            raise ValueError("mistral_large4 keys its list by layout: pass --layout 1 or 2")
-    elif layout is not None:
-        raise ValueError("--layout applies to mistral_large4 only")
+            raise ValueError(f"{family} keys its list by layout: pass --layout 1 or 2")
     # A two-rank trace is recorded on the context placement, whose per-rank key
     # carries the half table; a checked-in entry holds the width a step is
     # built with, which is what the engine warms.
@@ -1703,7 +1701,7 @@ def main():
     if args.family != "deepseek_v4" and args.list is not None:
         parser.error("--list applies only to deepseek_v4")
     layout = args.layout
-    if args.family in ("mistral_large4", "deepseek_v41"):
+    if args.family in ("mistral_large4", "deepseek_v41") or (args.family == "glm5" and layout is not None):
         if layout not in ("1", "2"):
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
