@@ -160,13 +160,15 @@ ATTENTION = parse_attention()
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
-    bounded = {"glm5", "glm5_flash", "qwen4"}
+    bounded = {"glm5", "glm5_flash", "qwen4", "deepseek_v4"}
     for family in FAMILIES.values():
         keys = family_keys(family)
         assert "GRAPH_RESERVE" not in keys
         for key in ("GPU_GRAPH_RESERVE", "GPU_GRAPH_RESERVE_EXTRA", "GPU_GRAPH_RESERVE_EXTRA_CAP",
-                    "SPARK_GRAPH_RESERVE", "GRAPH_TRACE"):
+                    "GRAPH_TRACE"):
             assert (key in keys) == (family in bounded), (family, key)
+        # Only a family with a capturing Spark worker accepts the worker reserve.
+        assert ("SPARK_GRAPH_RESERVE" in keys) == (family in {"glm5", "glm5_flash", "qwen4"}), family
     assert "GRAPH_RESERVE" not in MATRIX
 
 

@@ -38,6 +38,30 @@ identities' measured capture bytes (startup-only siblings included,
 deduplicated by identity, rounded once to 2 MiB); selection ranks by replayed
 hits only, so a zero-hit startup shape is never selected and a
 captured-but-never-replayed identity stays lazy.
+
+DeepSeek V4 keys a shape by the resolved coordinator GPU count and Spark
+attachment (`rtx1-spark`, `rtx1-local`, `rtx2-spark`, `rtx2-local`), and
+captures different graphs per rank, so `--layout` plus `--list` replaces that
+one shape's per-rank arrays in the checked-in `v4_prewarm.json` and marks it
+traced: devices map to ranks in ascending device order, `reserve_base_bytes` is
+the emitted prewarm set's own measured captures (the trace's whole charged
+arena also holds lazy captures, which the shared reserve-extra policy covers),
+`reserve_extra_bytes` is the arena's 2 MiB allocation tail (the shared capture
+headroom is separate), and `bootstrap_bytes` is the largest measured capture
+unless the trace has none.
+Every verify geometry the trace observed becomes an entry unless it is rare -
+used once, or only inside one sampling interval, such as one panel or the 32K
+context pass - which stays lazy under the shared capture headroom. A width-0
+startup row follows a stricter test: it is warmed only when the trace replayed
+it, so a row captured once and never looked up again stays lazy. Pins follow
+sustained heat, plus two keys that cost every step: plain C1 (rows 1, width 0)
+and the layout's dominant verify geometry pin whatever their heat class. A row
+hot in one sampling interval, or merely recurring, is otherwise prewarmed but
+stays evictable for ARC. Entries follow the fan-out order - pinned first, then
+lifetime replay hits descending - so a reduced reserve warms the hottest rows
+first. A sustained geometry is pinned, a regular one prewarmed unpinned, and
+the heat report prints each class's keys and arena bytes. The engine warms the
+entries its pool can express and skips the rest.
 """
 import argparse
 import json
@@ -48,8 +72,14 @@ CHUNK = 2 << 20
 GLM5_FLASH_LAYOUTS = {"1", "1-sparks", "2", "2-sparks"}
 EXTRA_BYTES = 2 << 20
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
+# The prewarm arena's allocation tail; capture headroom is a shared policy key.
+V4_TAIL = 2 << 20
+# GraphKey's display shape; width 0 is the local-expert startup set or the tail.
+V4_GEOMETRY = re.compile(r'rows: (\d+), chunked: \w+, attention: "([^"]+)", '
+                         r"table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
-SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
+SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
+               "deepseek_v4": "deepseek_v4."}
 GLMF_GEOMETRY = re.compile(
     r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
@@ -75,7 +105,256 @@ def sustained(graph):
     return len(complete) >= 3 and sum(int(count) > 0 for count in complete) >= len(complete) * 0.6
 
 
-def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
+# Hottest class wins when ranks disagree, because one prewarm set is shared.
+HEAT_ORDER = {"rare": 0, "regular": 1, "sustained": 2, "startup": 3}
+
+
+def heat(graph):
+    """The startup class of one traced geometry.
+
+    `rare` is a key the trace used once - a capture with no later hit - or only
+    inside a single sampling interval, which is one point or panel such as the
+    32K context pass; it stays lazy under the shared capture headroom.
+    `sustained` is the rolling-window heat a pin is earned by, and `regular` is
+    everything between: worth prewarming, not worth permanent residency.
+    """
+    histogram = graph.get("hit_histogram", {})
+    counts = histogram.get("counts", [])
+    intervals = sum(int(count) > 0 for count in counts) if counts else int(int(graph.get("count", 0)) > 0)
+    if int(graph.get("hits", 0)) == 0 or intervals <= 1:
+        return "rare"
+    return "sustained" if sustained(graph) else "regular"
+
+
+def geometry(family, shape):
+    """`(rows, table_width)` of a captured segment's display shape."""
+    if family != "deepseek_v4":
+        match = GEOMETRY.search(shape)
+        if match is None:
+            raise ValueError(f"cannot parse {family} geometry: {shape!r}")
+        rows, width, stride = map(int, match.groups())
+        if rows <= 0 or width <= 0 or stride != width:
+            raise ValueError("unsupported prewarm geometry")
+        return rows, width
+    match = V4_GEOMETRY.search(shape)
+    if match is None:
+        raise ValueError(f"cannot parse deepseek_v4 geometry: {shape!r}")
+    rows, width, stride = int(match[1]), int(match[3]), int(match[4])
+    if rows <= 0 or width < 0 or stride != width:
+        raise ValueError("unsupported prewarm geometry")
+    return rows, width
+
+
+def prewarmable(family, shape):
+    """Whether a captured key can stand as a prewarm entry.
+
+    V4 keeps tails eager (#1638), so a width-0 tail capture must not become a
+    startup entry; every other width-0 key is the local-expert/TP2 startup set
+    (a 1-RTX shape captures `local-experts`, a 2-RTX one `tp2-broadcast` and
+    `tp2-replicated`), and their geometry is the same `(rows, 0)` key.
+    """
+    if family != "deepseek_v4":
+        return True
+    match = V4_GEOMETRY.search(shape)
+    return match is None or int(match[3]) > 0 or match[2] != "tail"
+
+
+def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency=0.9,
+                         pin_report=None, heat_report=None):
+    """Replace one deepseek_v4 layout in the checked-in per-rank prewarm list."""
+    if layout is None or existing is None:
+        raise ValueError("deepseek_v4 needs --layout and --list")
+    if existing.get("family") != "deepseek_v4":
+        raise ValueError(f"list is for {existing.get('family')}, not deepseek_v4")
+    prior = existing.get("layouts", {}).get(layout)
+    if prior is None:
+        raise ValueError(f"list has no layout {layout!r}")
+    ranks = len(prior["reserve_base_bytes"])
+    if len(prior["bootstrap_bytes"]) != ranks:
+        raise ValueError(f"layout {layout} has inconsistent rank arrays")
+    if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
+        raise ValueError("coverage and pin frequency must be in (0, 1]")
+    prefix = SITE_PREFIX["deepseek_v4"]
+    counts = {}
+    reserves = {}
+    captures = {}
+    # Per device and geometry, the largest capture total any one snapshot saw.
+    spreads = {}
+    matched = set()
+    reasons = {}
+    # The startup class of every observed geometry, hottest rank wins.
+    classes = {}
+    # Costs/heat use only the latest complete inventory per device.
+    identities = {}
+    legacy = set()
+    latest = {}
+    for trace in traces:
+        version = trace.get("schema_version")
+        if version not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        cache = trace["cache"]
+        device = int(cache["device"])
+        reserves[device] = max(reserves.get(device, 0), int(cache.get("reserve", 0)))
+        # Snapshots enumerate the entire bounded cache. Missing identities in a
+        # newer snapshot have been forgotten; old heat/cost must not survive.
+        inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
+                            len(graph.get("hit_histogram", {}).get("counts", [])) *
+                            int(graph.get("hit_histogram", {}).get("interval_ms", 0))
+                            for graph in trace["graphs"]), default=0)
+        snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
+        if device not in latest or snapshot_time >= latest[device][0]:
+            latest[device] = (snapshot_time, trace)
+
+        device_counts = {}
+        device_bytes = {}
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith(prefix):
+                continue
+            matched.add(device)
+            if not prewarmable("deepseek_v4", graph["shape"]):
+                continue
+            captures[device] = max(captures.get(device, 0), int(graph.get("capture_bytes") or 0))
+            key = geometry("deepseek_v4", graph["shape"])
+            device_bytes[key] = device_bytes.get(key, 0) + int(graph.get("capture_bytes") or 0)
+            cycles = graph.get("cycles")
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) if cycles is not None else int(graph["count"])
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
+                if version == 1:
+                    legacy.add(key)
+        for key, value in device_bytes.items():
+            spreads[(device, key)] = max(spreads.get((device, key), 0), value)
+        for key, count in device_counts.items():
+            counts[key] = max(counts.get(key, 0), count)
+    if not counts:
+        raise ValueError("trace contains no matching graph identities")
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if graph["site"].startswith(prefix) and prewarmable("deepseek_v4", graph["shape"]):
+                key = geometry("deepseek_v4", graph["shape"])
+                identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                identities[identity] = (key, graph)
+    for identity, (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
+            continue
+        # A width-0 row is a startup row once the trace proves a replay; a
+        # capture with no later hit stays an ordinary lazy graph. Interval
+        # concentration is a verify-geometry test: a short panel still proves a
+        # decode row is reachable at that layout. The hottest rank decides a
+        # shared entry's class.
+        observed = heat(graph)
+        if key[1] == 0:
+            observed = "startup" if int(graph.get("hits", 0)) > 0 else "rare"
+        if key not in classes or HEAT_ORDER[observed] > HEAT_ORDER[classes[key]]:
+            classes[key] = observed
+        why = reasons.setdefault(key, set())
+        histogram = graph.get("hit_histogram", {})
+        histogram_end = int(histogram.get("start_ms", 0)) + len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+        if histogram_end >= latest[identity[0]][0] and sustained(graph):
+            why.add("sustained_heat")
+        if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
+            why.add("repeated_recapture")
+    # Startup residency is for heat the trace proves. A sustained verify
+    # geometry is pinned, a regular one is prewarmed unpinned, and a rare
+    # one - captured once, or used only inside one sampling interval such
+    # as the 32K context pass - stays lazy under the shared capture
+    # headroom. A width-0 startup row is kept when the trace replayed it,
+    # but it earns a pin only on sustained heat: a row hot in one interval,
+    # or merely recurring, lives in the prewarmed set and stays evictable
+    # so ARC can reclaim it if serving never revisits it. One captured once
+    # and never replayed is neither warmed nor pinned. A thrashing key is
+    # kept even when rare, because the trace shows the churn rather than a
+    # single use. Two keys are the cost of every step, so they pin whatever
+    # their heat class: plain C1 (rows 1, width 0) and the layout's
+    # dominant verify geometry, the width>0 key with the most lifetime hits
+    # in the latest device snapshots. Entries keep the fan-out order -
+    # pinned first, then lifetime replay hits descending - so a reduced
+    # reserve warms the hottest rows before the list ends. Order never
+    # changes selection, base or pin flags.
+    selected = {key for key in counts
+                if classes.get(key, "rare") != "rare" or reasons.get(key)}
+    if (1, 0) in counts:
+        selected.add((1, 0))
+        reasons.setdefault((1, 0), set()).add("c1_decode")
+    lifetime_hits = {}
+    for key, graph in identities.values():
+        lifetime_hits[key] = lifetime_hits.get(key, 0) + int(graph.get("hits", 0))
+    verify_hits = {key: hits for key, hits in lifetime_hits.items() if key[1] > 0}
+    if verify_hits:
+        dominant = max(verify_hits, key=lambda key: (verify_hits[key], key))
+        selected.add(dominant)
+        reasons.setdefault(dominant, set()).add("dominant_verify")
+    peak = max(counts.values())
+    minimum = min(counts, key=lambda key: (key[0] * key[1], key))
+    if minimum in legacy and counts[minimum] >= peak * pin_frequency:
+        reasons.setdefault(minimum, set()).add("legacy_frequency")
+    # Fan-out order: the pinned set first, then lifetime replay hits
+    # descending, so a shrunken reserve keeps what serving replays most.
+    order = sorted(selected, key=lambda key: (not reasons.get(key),
+                                              -lifetime_hits.get(key, 0), key[1], key[0]))
+    entries = [{"rows": rows, "table_width": width, "pin": bool(reasons.get((rows, width)))}
+               for rows, width in order]
+    if pin_report is not None:
+        for key in sorted(selected):
+            if not reasons.get(key):
+                continue
+            for device in sorted(reserves):
+                graphs = [graph for identity, (shape, graph) in identities.items()
+                          if identity[0] == device and shape == key]
+                if not graphs:
+                    continue
+                known = all("permanent_bytes" in graph for graph in graphs)
+                cost = sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None
+                pin_report.append({"device": device, "rows": key[0], "table_width": key[1],
+                                   "reasons": sorted(reasons[key]), "permanent_bytes": None,
+                                   "observed_permanent_lower_bound_bytes": cost,
+                                   "reserve_bytes": reserves[device], "reserve_fraction": None,
+                                   "observed_reserve_fraction_lower_bound": cost / reserves[device] if cost is not None and reserves[device] else None,
+                                   "capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
+                                   "nodes": sum(int(graph.get("nodes") or 0) for graph in graphs),
+                                   "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
+                                   "basis": graphs[0].get("basis"),
+                                   "cost_basis": "observed_inventory_lower_bound_unknown_total" if known else "unknown_legacy_trace"})
+    devices = sorted(matched)
+    if len(devices) != ranks:
+        raise ValueError(f"layout {layout} traces {len(devices)} matching devices, needs {ranks}")
+    if heat_report is not None:
+        for device in devices:
+            totals = {}
+            for key, observed in classes.items():
+                bucket = totals.setdefault(observed, [0, 0, False])
+                bucket[0] += 1
+                bucket[1] += spreads.get((device, key), 0)
+                bucket[2] = bucket[2] or key in selected
+            for observed in ("startup", "sustained", "regular", "rare"):
+                if observed in totals:
+                    observed_keys, arena, kept = totals[observed]
+                    heat_report.append({"device": device, "heat": observed,
+                                        "keys": observed_keys, "arena_bytes": arena,
+                                        "packed_bytes": packed(arena), "selected": kept})
+    base = [packed(sum(spreads.get((device, key), 0) for key in selected))
+            for device in devices]
+    # The prewarm arena's tail only; runtime capture headroom is charged by
+    # the shared GPU_GRAPH_RESERVE_EXTRA/_CAP policy, never hand-picked here.
+    extra = [V4_TAIL] * ranks
+    # One measured capture estimates the next; a trace without capture
+    # shares keeps the checked-in number.
+    bootstrap = [min(packed(captures.get(device, 0)) or prior["bootstrap_bytes"][rank], base[rank] + extra[rank])
+                 for rank, device in enumerate(devices)]
+    layouts = dict(existing["layouts"])
+    layouts[layout] = {"traced": True,
+                       "reserve_base_bytes": base, "reserve_extra_bytes": extra,
+                       "bootstrap_bytes": bootstrap, "entries": entries}
+    return {"schema_version": existing.get("schema_version", 1), "family": "deepseek_v4",
+            "layouts": layouts}
+
+
+def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None,
+             existing=None, heat_report=None):
+    if family == "deepseek_v4":
+        return generate_deepseek_v4(traces, layout, existing, coverage, pin_frequency, pin_report,
+                                    heat_report)
     if family == "glm5_flash":
         if layout is not None:
             raise ValueError("--layout applies to mistral_large4 only")
@@ -589,8 +868,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
                         choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4")))
-    parser.add_argument("--layout", type=int, choices=(1, 2),
-                        help="coordinator layout the trace was recorded on (mistral_large4)")
+    parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
+                        help="coordinator layout the trace was recorded on (mistral_large4), "
+                             "or the deepseek_v4 layout key to replace in --list")
+    parser.add_argument("--list", type=Path,
+                        help="deepseek_v4 only: checked-in prewarm list the layout is replaced in")
     parser.add_argument("--shape", choices=QWEN_SHAPES,
                         help="qwen4 resolved capture shape (owner count, Sparks attached)")
     parser.add_argument("--trace", action="append", required=True,
@@ -603,6 +885,7 @@ def main():
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
     args = parser.parse_args()
     report = []
+    heat_rows = []
     summary = {}
     if args.family == "qwen4" and args.shape is None:
         parser.error("--shape is required for qwen4")
@@ -610,15 +893,32 @@ def main():
         parser.error("--shape applies only to qwen4")
     if args.family != "qwen4" and args.merge is not None:
         parser.error("--merge applies only to qwen4")
+    if (args.family == "deepseek_v4") != (args.list is not None):
+        parser.error("--list applies only to deepseek_v4")
+    if args.family == "deepseek_v4" and args.layout is None:
+        parser.error("--layout is required for deepseek_v4")
+    if args.family != "deepseek_v4" and args.list is not None:
+        parser.error("--list applies only to deepseek_v4")
+    layout = args.layout
+    if args.family == "mistral_large4":
+        if layout not in ("1", "2"):
+            parser.error("mistral_large4 keys its list by layout: pass --layout 1 or 2")
+        layout = int(layout)
+    elif layout is not None and args.family != "deepseek_v4":
+        parser.error("--layout applies to mistral_large4 and deepseek_v4 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
         if args.family == "qwen4":
             traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
+        elif args.family == "deepseek_v4":
+            result = generate_deepseek_v4([json.loads(Path(spec).read_text()) for spec in args.trace],
+                                          layout, json.loads(args.list.read_text()),
+                                          args.coverage, args.pin_frequency, report, heat_rows)
         else:
             result = generate_layouts(layout_groups(args.trace, args.family),
-                                      args.family, args.coverage, args.pin_frequency, report, args.layout)
+                                      args.family, args.coverage, args.pin_frequency, report, layout)
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
     if args.merge is not None:
@@ -626,6 +926,19 @@ def main():
         args.merge.write_text(json.dumps(document, indent=2) + "\n")
     else:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
+    if args.family == "deepseek_v4":
+        entry = result["layouts"][layout]
+        verify = sum(1 for row in entry["entries"] if row["table_width"] > 0)
+        print(f"{len(entry['entries'])} shapes ({verify} verify geometries, "
+              f"{len(entry['entries']) - verify} width-0 startup rows); "
+              f"base={entry['reserve_base_bytes']} "
+              f"extra={entry['reserve_extra_bytes']} bootstrap={entry['bootstrap_bytes']} bytes; "
+              f"pinned={sum(entry['pin'] for entry in entry['entries'])}")
+        for row in heat_rows:
+            print("heat " + json.dumps(row, sort_keys=True))
+        for pin in report:
+            print("pin " + json.dumps(pin, sort_keys=True))
+        return
     if args.family == "qwen4":
         print(f"{result['shape']}: {len(result['trace']['entries'])} shapes; "
               f"base={result['reserve_base_bytes']} extra={result['reserve_extra_bytes']} bytes; "

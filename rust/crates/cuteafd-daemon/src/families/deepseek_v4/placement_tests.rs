@@ -165,7 +165,7 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
-    let (placement, _, _) = admission::admit(&facts)?;
+    let placement = admission::admit(&facts)?.placement;
     crate::shared::context::pool_context("deepseek_v4", facts.serving_context, usize::try_from(placement.pool_tokens)?)?;
     assert_eq!(placement.residual.last(), Some(&cuteafd_loader::placement::ResidualHome::Owned(0)),
         "V4 final residual must live on the rank0 head, not on both ranks");
@@ -951,7 +951,7 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
             &catalog, Some(case.manifest), max_rows).ok().map(|b| [b; 2]) } else { None },
         exchange_f32: case.exchange_f32, physical: Vec::new(), host_memory: (128 << 30, 128 << 30) };
     let facts = admission::inputs(&cli.engine, &inputs)?;
-    Ok(admission::admit(&facts)?.0)
+    Ok(admission::admit(&facts)?.placement)
 }
 
 /// P2's two-RTX fixture predates TP2 and its deleted GPU0-only routed layout.

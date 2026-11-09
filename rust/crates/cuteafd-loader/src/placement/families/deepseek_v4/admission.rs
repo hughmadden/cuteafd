@@ -11,11 +11,11 @@ use super::{context_buffers, fixed_demands, steps_requests, V4Inputs};
 use crate::placement::planner::*;
 use crate::placement::{
     hop_buffer_bytes, plan_hops, residual_homes, AttentionClass, AttentionPlacement, ExpertHome,
-    ExpertRange, FfnMode, HopSpec, HopStorage, LayerAssignment, LayerMode, MovableId, Onboard,
-    Placement, PoolLimits, ResidentWeights, TerminalHome, Tp2Range,
+    ExpertRange, FfnMode, GraphRank, HopSpec, HopStorage, LayerAssignment, LayerMode, MovableId,
+    Onboard, Placement, PoolLimits, ResidentWeights, TerminalHome, Tp2Range,
 };
 use crate::serving_capacity::V4ExpertCost;
-use cuteafd_core::memory_layout::Category;
+use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::BTreeSet;
 
@@ -114,6 +114,10 @@ pub struct PreparedV4<'a> {
     tp2: bool,
     /// The retained host prefix, resolved before admission.
     prefix: super::HostPrefix,
+    /// Per-rank graph reserve (`GPU_GRAPH_RESERVE` resolved) and the estimate a
+    /// device uses until its first measured capture.
+    graph_reserves: Vec<u64>,
+    graph_bootstraps: Vec<u64>,
     prepare_time: std::time::Duration,
 }
 
@@ -122,6 +126,9 @@ pub struct AdmittedV4 {
     pub solved: ResolvedPlan,
     pub placement: Placement,
     pub reserves: Vec<u64>,
+    /// The graph arena per rank, charged once before KV sizing.
+    pub graph_reserves: Vec<u64>,
+    pub graph_bootstraps: Vec<u64>,
     /// Prepare plus solve/execution work, excluding checkpoint inventory and
     /// any caller delay between preparing and admitting the request.
     pub solve_us: u64,
@@ -312,6 +319,13 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         // V4 admits every local prefix, including all routed layers.
         (0..=routed.len()).collect()
     };
+    // The graph arena is charged once, before KV sizing; the cache captures
+    // lazily inside it and runs eagerly when it is full.
+    let sparks = inputs.spark_ranks > 0;
+    let graph_reserves = crate::serving_capacity::v4_graphs::v4_reserves(inputs.gpus.len(), sparks)
+        .map_err(invalid)?;
+    let graph_bootstraps = crate::serving_capacity::v4_graphs::v4_bootstraps(inputs.gpus.len(), sparks)
+        .map_err(invalid)?;
     let context = context_floor(inputs);
     let page_rows = if attention == AttentionPlacement::Context {
         2 * V4_PAGE_ROWS
@@ -355,6 +369,8 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
         counts,
         tp2,
         prefix,
+        graph_reserves,
+        graph_bootstraps,
         prepare_time: started.elapsed(),
     })
 }
@@ -857,9 +873,11 @@ impl<'a> PreparedV4<'a> {
         let solved = solve(request, self.budgets.clone(), &self)?;
         let placement = self.execution(&solved)?;
         let reserves = self.reserves.clone();
+        let graph_reserves = self.graph_reserves.clone();
+        let graph_bootstraps = self.graph_bootstraps.clone();
         let solve_us = self.prepare_time.saturating_add(started.elapsed()).as_micros()
             .try_into().unwrap_or(u64::MAX);
-        Ok(AdmittedV4 { solved, placement, reserves, solve_us })
+        Ok(AdmittedV4 { solved, placement, reserves, graph_reserves, graph_bootstraps, solve_us })
     }
 }
 
@@ -940,13 +958,21 @@ impl Recipe for PreparedV4<'_> {
             Ok(if context && gpu_fixed { total / 2 + 1 } else { total })
         };
         for gpu in 0..gpus {
-            for (layer, &mode) in self.modes.iter().enumerate() {
+            // One window ring per cached layer plus one per dSpark stage, and the
+            // engine allocates the stages' rings on the lead GPU.
+            for layer in 0..layers(gpu) as usize {
                 let ratio = inputs.cfg.compress_ratios.get(layer).copied().unwrap_or(0);
-                let _ = mode;
                 // Window rings: whole on every GPU, one request per layer.
                 owners.physical(format!("v4.cache.{gpu}.{layer}.main"), gpu as u8,
                     vec![window.checked_mul(sequences).ok_or(Refusal::Overflow("V4 window ring"))?],
                     Category::Kv, "window rings", Activation::always())?;
+                // Records are pool-affine: a layer's units grow with the pool.
+                // Each is its own allocation (`Engine::pool_layer_for` takes one
+                // per layer for the C4 records and one for the index units, one
+                // for C128 records), so each carries its own curve and its own
+                // 2 MiB SM120 rounding. One pooled owner cannot express this:
+                // `paged` with 21 backings would have to split the per-page bytes
+                // exactly, which 37,440 and 336,960 don't.
                 if ratio == 4 {
                     let first = c4_unit(1, true)?;
                     let slope = c4_unit(2, true)?.checked_sub(first)
@@ -954,10 +980,11 @@ impl Recipe for PreparedV4<'_> {
                     for (name, unit) in [("records", 37_440u64), ("index", 8_448u64)] {
                         owners.paged(format!("v4.cache.{gpu}.{layer}.{name}"), gpu as u8,
                             unit.checked_mul(slope).ok_or(Refusal::Overflow("V4 C4 slope"))?,
-                            unit.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C4 fixed"))?)
+                            unit.checked_mul(first.checked_sub(slope)
+                                .ok_or(Refusal::Overflow("V4 C4 fixed"))?)
                                 .ok_or(Refusal::Overflow("V4 C4 fixed"))?,
-                            SM120_ALLOCATION_GRANULARITY_BYTES,
-                            Category::Kv, "records", Activation::always())?;
+                            SM120_ALLOCATION_GRANULARITY_BYTES, Category::Kv, "records",
+                            Activation::always())?;
                     }
                     for (index, bytes) in [16 * 1024 * 4u64, 16 * 1024 * 4, 16 * 256 * 4, 16 * 256 * 4]
                         .into_iter().enumerate() {
@@ -971,10 +998,11 @@ impl Recipe for PreparedV4<'_> {
                         .ok_or(Refusal::Overflow("V4 C128 units"))?;
                     owners.paged(format!("v4.cache.{gpu}.{layer}.records"), gpu as u8,
                         1_728u64.checked_mul(slope).ok_or(Refusal::Overflow("V4 C128 slope"))?,
-                        1_728u64.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C128 fixed"))?)
+                        1_728u64.checked_mul(first.checked_sub(slope)
+                            .ok_or(Refusal::Overflow("V4 C128 fixed"))?)
                             .ok_or(Refusal::Overflow("V4 C128 fixed"))?,
-                        SM120_ALLOCATION_GRANULARITY_BYTES,
-                        Category::Kv, "records", Activation::always())?;
+                        SM120_ALLOCATION_GRANULARITY_BYTES, Category::Kv, "records",
+                        Activation::always())?;
                     for index in 0..2u64 {
                         owners.physical(format!("v4.cache.{gpu}.{layer}.carry{index}"), gpu as u8,
                             vec![256u64.checked_mul(512).and_then(|n| n.checked_mul(4))
@@ -1077,6 +1105,23 @@ impl Recipe for PreparedV4<'_> {
                     source: format!("v4/driver-stream-slabs/gpu{gpu} ({peak} peak live streams, SM120 driver/runtime13020 LAZY, #1511 2026-11-08)"),
                 }),
             });
+        }
+        // The graph arena, one owner per coordinator rank: executable residency
+        // plus the disposable graph pool. It is charged once here, before the
+        // pool sizes KV, and the bounded cache captures inside it. The source
+        // survives GPU_RESERVE (its bytes are admitted, not a policy margin).
+        for (rank, &reserve) in self.graph_reserves.iter().enumerate() {
+            let id = format!("v4.graphs.{rank}");
+            let mut component = crate::placement::planner::serving::startup_graph_component(
+                &id, Location::coordinator(rank as u8),
+                GraphRank { executables: 0, bytes: reserve, margin: 0, basis: Basis::Exact, node_charge: None },
+                self.maximum_pages)?;
+            if let ComponentKind::Allowance(owner) = &mut component.kind {
+                owner.source = crate::placement::graph_reserve::source(&id);
+                // This owner is the configured budget, not a per-capture estimate.
+                owner.assumed = false;
+            }
+            owners.components.push(component);
         }
         // Context staging, exchange and workspace exist only under a split.
         if self.attention == AttentionPlacement::Context {

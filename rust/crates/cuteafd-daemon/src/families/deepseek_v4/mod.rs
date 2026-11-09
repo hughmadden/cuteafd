@@ -547,8 +547,30 @@ pub(crate) fn with_engine<T>(
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
         let facts = admission::inputs(args, &inputs)?;
         // One solve over every device and host owner, before the first allocation.
-        let (placement, host_prefix, expert_usage) = admission::admit(&facts)
+        let admitted = admission::admit(&facts)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
+        {
+            use sha2::{Digest, Sha256};
+            let hash = |path: &std::path::Path| -> Result<String> {
+                let mut file = std::fs::File::open(path)?;
+                let mut digest = Sha256::new();
+                std::io::copy(&mut file, &mut digest)?;
+                Ok(format!("{:x}", digest.finalize()))
+            };
+            let layout = format!("snapshot/{}; dspark/{}/tp2={}; attention/{}; context/{}; sequences/{}; \
+                pool/{}; onboard/{:?}; device/{}{}; host-prefix/{}; replies/{:?}; graph-sparks/{}",
+                loaded.snapshot.display(), args.dspark, args.tp2_dspark_experts, args.attention_placement,
+                max_context, args.max_sequences, args.pool_tokens, args.rtx_expert_layers, args.device,
+                split_device.map(|device| format!("/{device}")).unwrap_or_default(),
+                admitted.host_prefix.quota_bytes, cuteafd_core::spark_reply::requested(), peers.len());
+            admission::Provenance { layout, native_sha256: hash(&args.native_lib)?,
+                programs_sha256: hash(&args.manifest)?, gpus: inventory.gpus.clone(), spark_world: peers.len(),
+                onboard_layers: admitted.decisions.onboard_layers.clone(), prefill: admitted.decisions.prefill,
+                graph_reserves: admitted.graphs.reserves.clone(),
+                graph_bootstraps: admitted.graphs.bootstraps.clone() }.register();
+        }
+        let (placement, host_prefix, expert_usage, graphs) = (admitted.placement, admitted.host_prefix,
+            admitted.expert_usage, admitted.graphs);
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
             use cuteafd_loader::placement::{ExpertHome, SparkWorkingSet};
@@ -642,9 +664,9 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
-        (placement, host_prefix, expert_usage, embedding, model, shares)
+        (placement, host_prefix, expert_usage, graphs, embedding, model, shares)
     };
-    let (placement, host_prefix, expert_usage, embedding, model, mut shares) = placement;
+    let (placement, host_prefix, expert_usage, graphs, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
@@ -808,8 +830,25 @@ pub(crate) fn with_engine<T>(
         if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        // One graph arena per rank, charged before KV sizing and captured lazily
+        // inside it. A capture the reserve cannot hold runs eagerly.
+        // The prewarm shape is the resolved layout (coordinator GPUs x Sparks
+        // attached), the same key admission selected, not whether experts are
+        // remote: onboarding captures graphs either way.
+        engine.configure_graph_cache(&graphs.reserves, &graphs.bootstraps, !peers.is_empty())?;
+        for (rank, policy) in cuteafd_loader::serving_capacity::v4_graphs::v4_reserve_policies(
+                graphs.reserves.len(), !peers.is_empty()).map_err(anyhow::Error::msg)?.iter().enumerate() {
+            tracing::info!(rank, reserve = policy.bytes, source = policy.source,
+                base = policy.base_bytes, base_source = policy.base_source,
+                extra = policy.extra_bytes, extra_source = policy.extra_source,
+                cap = ?policy.cap_bytes, cap_source = policy.cap_source,
+                charged = policy.bytes, "V4 GPU_GRAPH_RESERVE startup policy");
+        }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        // The traced verify geometries, after the route check settles the
+        // exchange policy its keys bake in and before the first request.
+        engine.warm_verify_graphs(&mut transports, &runtime)?;
         let (graphs0, graphs1, captures) = engine.graph_inventory();
         tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
             classes = metadata::c4_width_classes(engine.shape.units).len(), "V4 decode graph inventory");

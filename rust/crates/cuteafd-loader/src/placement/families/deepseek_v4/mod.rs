@@ -13,18 +13,11 @@ pub use host::{pool_units, HostPrefix, PinnedTables, V4Host};
 
 use crate::families::deepseek_v4::DeepseekV4Config;
 use crate::placement::*;
-use crate::placement::inventory::GraphSet;
 use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cost, deepseek_v4_expert_exchange_bytes,
     deepseek_v4_layer_unit_bytes, deepseek_v4_peer_exchange_bytes, V4ExpertCost,
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
-/// segment graphs by the exact compressed-table width, so the set grows with
-/// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
-/// smoke run). Reserved as growth beside the pool, never part of the ready
-/// ledger (`inventory::GraphSet::budget`).
-pub const GRAPH_BYTES: [u64; 3] = [gib(35), gib(40), gib(25)];
 /// Step workspace allowance per role at 4096 prefill rows, used only when no
 /// program manifest gives the exact geometry.
 pub const WORKSPACE_BYTES: [u64; 3] = [gib(480), gib(414), gib(355)];
@@ -250,9 +243,9 @@ pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>
 }
 
 /// Fixed V4 demands plus each GPU's reserve, the ones both sides previously
-/// computed apart. Every pool-owned term (per-layer records, lane page tables)
-/// is a separate exact owner in `Recipe::prepare`, so nothing here scales with
-/// the pool.
+/// computed apart. Every pool-owned term (window rings, the per-layer cache
+/// records, lane page tables) is a separate exact owner in `Recipe::prepare`,
+/// so nothing here scales with the pool.
 pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
     let geometry = deepseek_v4_cache_geometry(&inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
@@ -268,9 +261,9 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        // Window rings, compressor carry and the per-sequence records unit are
-        // named per-layer physical owners in `Recipe::prepare`; this keeps the
-        // pool-independent replay and lane-table state.
+        // Window rings and the per-layer cache records are exact owners in
+        // `Recipe::prepare`; this keeps the pool-independent replay and
+        // lane-table state.
         let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
             + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
@@ -306,7 +299,6 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
-        demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
                 deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32, inputs.prefill_waves)
@@ -480,6 +472,70 @@ mod default_tests {
         let prepared = prepare(input)?;
         let request = production_request(input);
         prepared.admit(request).map(|admitted| admitted.placement)
+    }
+
+    /// The graph arena is exactly one canonical `graph reserve` owner per
+    /// coordinator GPU. `/v1/stats` reconciliation sums only owners named
+    /// exactly that (shared/memory_report/reconcile.rs), so a family-named row
+    /// would report a zero reserve and no measured-arena slack.
+    #[test]
+    fn graph_reserve_is_one_canonical_owner_per_coordinator_gpu() {
+        use crate::placement::planner::{Location, Phase};
+        let mut input = plan_inputs(&context_cfg());
+        input.attention = Some(AttentionPlacement::Heads);
+        let admitted = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
+        assert_eq!(admitted.graph_reserves.len(), 2);
+        for (rank, &reserve) in admitted.graph_reserves.iter().enumerate() {
+            assert!(reserve > 0, "rtx{rank} admits a graph arena");
+            let items = admitted.solved.items_at(Location::coordinator(rank as u8), Phase::Growth).unwrap();
+            let owners = cuteafd_core::memory_policy::MemoryPolicy::default().scoped(||
+                crate::placement::reserve::breakdown(format!("rtx{rank}"),
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, &items));
+            let graph: Vec<_> = owners.reserve.iter().filter(|owner| owner.name == "graph reserve").collect();
+            assert_eq!(graph.len(), 1, "one graph reserve owner on rtx{rank}: {:?}",
+                owners.reserve.iter().map(|owner| owner.name.as_str()).collect::<Vec<_>>());
+            assert_eq!(graph[0].bytes, reserve, "the owner charges the admitted arena once");
+            assert!(owners.reserve.iter().all(|owner|
+                    owner.name == "graph reserve" || !owner.name.contains("graph")),
+                "no other graph owner row: {:?}",
+                owners.reserve.iter().map(|owner| owner.name.as_str()).collect::<Vec<_>>());
+        }
+    }
+
+    /// The engine allocates one window ring per cached layer plus one per
+    /// dSpark stage, and the lead GPU holds every stage's ring. Each layer's
+    /// cache records are their own allocations (C4 records and index units,
+    /// C128 records), so each is charged its own curve and 2 MiB rounding.
+    #[test]
+    fn cache_stages_ring_on_the_lead_gpu_and_records_charge_per_layer() {
+        use crate::placement::planner::Location;
+        let mut cfg = context_cfg();
+        cfg.n_mtp_layers = 3;
+        let mut input = plan_inputs(&cfg);
+        input.cache_stages = 3;
+        input.attention = Some(AttentionPlacement::Heads);
+        let solved = prepare(&input).unwrap().admit(production_request(&input)).unwrap().solved;
+        let owners = |gpu: u8, group: &str| -> Vec<String> { solved.facts.allocations.iter()
+            .filter(|allocation| allocation.group == group
+                && allocation.location == Location::coordinator(gpu))
+            .map(|allocation| allocation.id.clone()).collect() };
+        for gpu in 0..2u8 {
+            let stages = if gpu == 0 { 3 } else { 0 };
+            assert_eq!(owners(gpu, "window rings").len(), 43 + stages,
+                "rtx{gpu} charges 43 cached layers plus its {stages} dSpark stages");
+            let records = owners(gpu, "records");
+            assert_eq!(records.len(), 21 + 21 + 20,
+                "rtx{gpu} charges 21 C4 records, 21 C4 index units and 20 C128 records apart");
+            assert_eq!(records.iter().filter(|id| id.ends_with(".index")).count(), 21);
+            assert_eq!(records.iter().filter(|id| id.ends_with(".records")).count(), 41);
+        }
+        // A stage ring is the same request as a layer's, so the lead GPU's
+        // three extra owners are exactly the draft stages the engine puts there.
+        let record_bytes = |gpu: u8| solved.facts.allocations.iter()
+            .filter(|allocation| allocation.id.starts_with(&format!("v4.cache.{gpu}."))
+                && allocation.id.ends_with(".records"))
+            .map(|allocation| allocation.bytes).sum::<u64>();
+        assert!(record_bytes(0) > 0 && record_bytes(1) > 0);
     }
 
     /// The pre-weight base and the code still to load are named Runtime owners

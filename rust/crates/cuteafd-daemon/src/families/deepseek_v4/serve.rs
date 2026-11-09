@@ -647,10 +647,15 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
     let prefix_stats = cache.serving_stats();
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
+        crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
 
@@ -1281,6 +1286,21 @@ mod tests {
         assert_eq!(round_censor(true, true, 2, &rows, None, 99), Some(Censor::Cancelled));
         assert_eq!(round_censor(true, true, 2, &rows, Some(99), 99), None);
         assert_eq!(round_censor(true, true, 4, &rows, Some(99), 99), Some(Censor::Cancelled));
+    }
+
+    #[test]
+    fn publish_includes_shared_graph_cache_and_reconciliation_stats() {
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\n/// Message starts").unwrap().0;
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        let graph = publish.find("crate::shared::probe::graph_capture_stats(&mut stats)").unwrap();
+        assert!(replace < graph, "publish the shared graph fields after replacing per-request stats");
+        let guard = publish.find("if requests > 0 {").unwrap();
+        let once = publish.find("static FIRST: std::sync::Once").unwrap();
+        let first = publish.find("reconcile::capture(\"first_request\")").unwrap();
+        assert!(guard < once && once < first && first < replace,
+            "the once-guarded first request capture precedes the stats replacement");
     }
 
     #[test]

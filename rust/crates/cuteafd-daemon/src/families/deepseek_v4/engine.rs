@@ -34,6 +34,8 @@ mod prefill;
 mod packing;
 #[cfg(test)]
 mod packed_check;
+#[cfg(test)]
+mod warm_exchange_tests;
 pub(crate) use tp2::ExchangePolicy;
 use tp2::Tp2State;
 pub(crate) use dspark::DraftRequest;
@@ -106,7 +108,12 @@ pub(crate) struct Engine<'a> {
     packed_programs: crate::shared::prefill_packing::ProgramInventory,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     pub profile: RefCell<Profile>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    /// Decode segments on this rank, owned by the device-wide bounded cache.
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
+    /// The checked-in prewarm set's pinned geometries for this layout.
+    graph_pinned: RefCell<Vec<(usize, usize)>>,
+    /// Whether this serve attaches Sparks, which selects the prewarm list.
+    graph_sparks: Cell<bool>,
     /// Expert layers resident on this GPU (they skip the Spark exchange).
     pub local: RefCell<Option<super::local::LocalExperts<'a>>>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -132,8 +139,13 @@ pub(crate) struct Engine<'a> {
     /// Per lane and rank: this step's context tables (gather and commit counts).
     context_units: RefCell<Vec<[context::ContextUnit; 2]>>,
     capture_only: std::cell::Cell<bool>,
+    /// The startup warm's eager pass: run each prewarmed step once with no
+    /// capture, outside executable residency, and without the Spark exchange.
+    graph_warming: std::cell::Cell<bool>,
     graph_captures: std::cell::Cell<usize>,
     expert_graph_captures: std::cell::Cell<usize>,
+    /// Captures the reserve could not hold, so they ran eagerly.
+    graph_eager: std::cell::Cell<usize>,
     pub(super) graph_coverage: crate::shared::decode_graph::census::LaunchCoverage,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
     expert_usage: Option<cuteafd_ffi::expert_usage::ExpertUsage<'a>>,
@@ -153,7 +165,7 @@ pub(crate) struct V4Peer<'a> {
     rope_compressed: Dev<'a>,
     prefill_workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
 }
 
 /// Exchange slot of layer `layer`, lane `lane`: its attention partials (`ffn`
@@ -492,7 +504,7 @@ impl<'a> Engine<'a> {
                 self.context_mode.is_some())).collect::<Result<Vec<_>>>()?;
             Ok(V4Peer { device, stream, layers, pools, rope_window: table(false)?, rope_compressed: table(true)?,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-                graphs: RefCell::new(std::collections::HashMap::new()) })
+                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -594,8 +606,10 @@ impl<'a> Engine<'a> {
             context_units: RefCell::new(Vec::new()),
             exchange_policy: ExchangePolicy::from_env()?,
             capture_only: std::cell::Cell::new(false),
+            graph_warming: std::cell::Cell::new(false),
             graph_captures: std::cell::Cell::new(0),
             expert_graph_captures: std::cell::Cell::new(0),
+            graph_eager: std::cell::Cell::new(0),
             graph_coverage: crate::shared::decode_graph::census::LaunchCoverage::new(),
             draft_probe: RefCell::new(None),
             rope_window: table(false)?,
@@ -623,7 +637,9 @@ impl<'a> Engine<'a> {
             packed_programs: Default::default(),
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
-            graphs: RefCell::new(std::collections::HashMap::new()),
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)),
+            graph_pinned: RefCell::new(Vec::new()),
+            graph_sparks: Cell::new(false),
             local: RefCell::new(None),
             embedding: parts.embedding,
             skip_routed: parts.skip_routed,
@@ -916,6 +932,7 @@ impl<'a> Engine<'a> {
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
             "prefill span of {t} tokens at {start} exceeds the span or context capacity");
         let _ = runtime; // Prefill waves run on the link's transport worker.
+        self.cache_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
         let logits = self.prefill_units(placement, tokens, transports, logit_rows, on_layer, download)?;
         placement.len += t;
         Ok(logits)
@@ -956,6 +973,7 @@ impl<'a> Engine<'a> {
             Some(transport) => std::slice::from_mut(transport),
             None => &mut [],
         };
+        self.cache_cycle(crate::shared::decode_graph::device::Cycle::Decode);
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, _) in rows.iter_mut() {
             placement.len += 1;
@@ -998,6 +1016,7 @@ impl<'a> Engine<'a> {
         tables.pad_c4_geometry(self.shape.units)?;
         let tables = &tables;
         let step = RowStep { tables, tokens: &tokens };
+        self.cache_cycle(crate::shared::decode_graph::device::Cycle::Verify);
         let logits = self.step(&[step], transports, runtime, tokens.len(), None, false)?;
         for (placement, tokens) in sequences.iter_mut() {
             placement.len += tokens.len();
@@ -1018,9 +1037,15 @@ impl<'a> Engine<'a> {
         download: bool,
     ) -> Result<Logits> {
         let transports = RefCell::new(transports);
+        // The boundary lives inside the guarded body: the submission guard
+        // retires queued owners only on failure.
         crate::shared::experts::rtx::pair::submit(
             || self.require_live(), || self.shutdown_submission(&mut transports.borrow_mut()),
-            || self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download))
+            || {
+                let logits = self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download)?;
+                self.graph_completed()?;
+                Ok(logits)
+            })
     }
 
     fn step_inner(
@@ -1032,7 +1057,13 @@ impl<'a> Engine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         download: bool,
     ) -> Result<Logits> {
-        self.begin_route_step();
+        // The startup warm runs a synthetic step: no route diagnostic and no
+        // Spark request belongs to it, and its captures are the point.
+        let mode = StepMode::of(self.graph_warming.get(), self.capture_only.get());
+        let warming = mode != StepMode::Serve;
+        if !warming {
+            self.begin_route_step();
+        }
         let h = self.cfg.dim;
         ensure!(lanes.len() == 1 && lanes[0].tables.decode
             && lanes[0].tokens.len() == lanes[0].tables.rows && logit_rows <= lanes[0].tables.rows,
@@ -1052,7 +1083,9 @@ impl<'a> Engine<'a> {
         if !gather {
             self.upload(lane.stream_a.buffer, &self.embedding.host_rows_repeated(step.tokens, 4)?)?;
         }
-        self.prepare_route_checks(&[step.tables.rows])?;
+        if !warming {
+            self.prepare_route_checks(&[step.tables.rows])?;
+        }
         let cap = self.decode_rows;
         let rows_of = |_: usize| Scalar::I32(step.tables.rows as i32);
         let peer_workspace = match &self.peer {
@@ -1145,7 +1178,9 @@ impl<'a> Engine<'a> {
                 }
                 // Preserve owner routes outside capture before another router reuses them.
                 // Every routed layer rings its ids on the device (read after the step's sync).
-                self.probe_ring(layer, w, t, false)?;
+                if !warming {
+                    self.probe_ring(layer, w, t, false)?;
+                }
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
                     // host waits in this layer's exchange.
@@ -1159,26 +1194,40 @@ impl<'a> Engine<'a> {
                 }
                 let _ = runtime;
                 ranks = self.decode_experts(layer, t, w, lane, cap, decode_link.as_deref_mut())?;
-                unread = layer >= local_layers && !self.skip_routed;
-                self.probe_mark(layer)?;
+                unread = !warming && layer >= local_layers && !self.skip_routed;
+                if !warming {
+                    self.probe_mark(layer)?;
+                }
                 crate::shared::console::layer_mark(layer);
             }
             // The tail: the last post, its taps and the drafter's KV, then the head.
             let last = self.weights.layers.len() - 1;
             let key = GraphKey { layer: TAIL_SEGMENT, rows: t, chunked: false, attention: "tail", table_width: 0,
                 table_stride: 0, previous: ranks, tp2_broadcast: false, exchange_f32: false };
-            self.replay(key, || -> Result<()> {
+            let tail = || -> Result<()> {
                 if ranks > 0 {
                     self.post_layer(w, lane, 0, ranks, decode_reduction.clone(), rows, last)?;
                     self.tap(w, lane, last, t)?;
                 }
                 self.write_draft_kv(w, lane, t, cap)?;
                 self.head_launch(&lane.stream_a, t, t, 0, w)
-            })?;
+            };
+            // The tail is never part of the startup prewarm set, so the eager
+            // pass runs it for first touch and leaves its capture to the first
+            // request. A capture pass cannot: it records graph bodies and runs
+            // none of them, so the tail's TP2 close would wait for the peer
+            // push that only a segment body issues.
+            if warming {
+                if mode.tail_runs() { tail()?; }
+            } else {
+                self.replay(key, tail)?;
+            }
             if unread {
                 decode_link.as_deref_mut().context("decode transport")?.exchange()?.consumed(0, self.stream)?;
             }
-            self.finish_route_step()?;
+            if !warming {
+                self.finish_route_step()?;
+            }
             Ok(Logits::Device(Some(self.device_logits(w, t))))
         }
     }
@@ -1230,17 +1279,23 @@ impl<'a> Engine<'a> {
 
     /// Launches `segment` through a captured graph for `key`, capturing it the
     /// first time.
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.replay_on(0, key, segment)
     }
 
     /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
-    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let mut key = key;
         if let Some(tp2) = &self.tp2 {
             key.tp2_broadcast = tp2.broadcast();
             key.exchange_f32 = self.exchange_policy.is_f32(key.rows, self.decode_rows);
+        }
+        // The warm's eager pass: load modules and allocate graph-free
+        // workspaces once before any capture, outside executable residency. It
+        // never touches the cache, so it consumes no capture budget.
+        if self.graph_warming.get() {
+            return segment();
         }
         // Diagnostic copies must never become permanent graph nodes.
         if self.tp2.as_ref().is_some_and(|t| t.checking.get()) && !self.capture_only.get() {
@@ -1252,29 +1307,69 @@ impl<'a> Engine<'a> {
             _ => &self.graphs,
         };
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow().get(&key) {
+        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             if self.capture_only.get() { return Ok(()); }
             self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
-        // SAFETY: capture records launches on that rank's stream; nothing in the
-        // segment synchronizes the host.
-        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
-        let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
-        captured?;
-        let exec = exec?;
-        if !self.capture_only.get() {
-            self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
-            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec, stream) })?;
+        let pinned = self.graph_pinned(&key);
+        let ticket = match graphs.borrow_mut().cache_miss(&key, pinned, None) {
+            crate::shared::decode_graph::device::Miss::Capture(id) => id,
+            crate::shared::decode_graph::device::Miss::Eager => {
+                self.graph_eager.set(self.graph_eager.get() + 1);
+                // Warming captures only: running the body here would execute
+                // uninitialized routes or wait for peer work nobody queued.
+                if self.capture_only.get() { return Ok(()); }
+                self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Eager, "no-room");
+                return segment();
+            }
+        };
+        // No synchronization here: peer segments may not yet have been queued.
+        // SAFETY: capture records launches on this rank's persistent stream.
+        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
+            graphs.borrow_mut().cache_cancel(ticket);
+            tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            if self.capture_only.get() { return Ok(()); }
+            return segment();
         }
+        let captured = segment();
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        if let Err(error) = captured {
+            graphs.borrow_mut().cache_cancel(ticket);
+            if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                graphs.borrow_mut().cache_cancel(ticket);
+                tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                if self.capture_only.get() { return Ok(()); }
+                return segment();
+            }
+        };
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "deepseek_v4.decode", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
+        }
+        let graph = GraphExec(raw, self.library);
+        crate::shared::decode_graph::census::capture_key("deepseek_v4", "decode",
+            graphs.as_ptr() as usize, rank as i32, None, &key, graph.0);
+        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
+        // Own the executable and ticket before launch: a launch error is drained
+        // by the submission guard before either its pointers or owner can retire.
+        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
         self.graph_captures.set(self.graph_captures.get() + 1);
         if key.attention.starts_with("tp2-") {
             self.expert_graph_captures.set(self.expert_graph_captures.get() + 1);
         }
-        graphs.borrow_mut().insert(key, GraphExec(exec, self.library));
-        Ok(())
+        if self.capture_only.get() { return Ok(()); }
+        self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
+        let bank = graphs.borrow();
+        let graph = bank.get(&key).context("inserted graph")?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })
     }
 
     /// Rank 1's decode segment of `layer`: the previous layer's FFN close, then this
@@ -1885,17 +1980,235 @@ impl<'a> Engine<'a> {
             self.graph_captures.get())
     }
 
+    /// Attaches each rank's decode-segment bank to the device-wide cache with
+    /// the checked-in prewarm geometry, reserve and bootstrap. Runs once,
+    /// before any capture; a capture the reserve cannot hold runs eagerly.
+    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64], sparks: bool) -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        ensure!(reserves.len() == self.ranks() && bootstraps.len() == self.ranks(),
+            "V4 graph cache needs one reserve and bootstrap per rank");
+        self.graph_sparks.set(sparks);
+        let layout = cuteafd_loader::serving_capacity::v4_graphs::v4_layout(self.ranks(), sparks)
+            .map_err(anyhow::Error::msg)?;
+        if !cuteafd_loader::serving_capacity::v4_graphs::v4_traced(self.ranks(), sparks)
+            .map_err(anyhow::Error::msg)? {
+            tracing::warn!(layout = layout.key(),
+                "V4 graph cache shape has no trace card: prewarm and reserve are provisional");
+        }
+        *self.graph_pinned.borrow_mut() =
+            cuteafd_loader::serving_capacity::v4_graphs::v4_pinned(self.ranks(), sparks)
+                .map_err(anyhow::Error::msg)?;
+        // #1612 calibrated no V4 route: one byte basis for the whole device, so
+        // a miss carries no node estimate and the site bootstrap seeds its class.
+        tracing::warn!("V4 graph cache uses per-site byte estimates: no calibrated node rates for this family");
+        for rank in 0..self.ranks() {
+            let graphs = match (rank, &self.peer) {
+                (1, Some(peer)) => &peer.graphs,
+                _ => &self.graphs,
+            };
+            let device = self.on(rank, || self.library.cuda_get_device())?;
+            graphs.borrow_mut().attach_device(device, reserves[rank], Site {
+                name: "deepseek_v4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: bootstraps[rank], basis: Basis::Bytes,
+                spans_devices: self.ranks() > 1,
+            })?;
+            // Seed the growth observer before the first capture, so the startup
+            // arena is measured as growth rather than absorbed into a baseline
+            // that already contains it.
+            crate::shared::decode_graph::device::observe_device(self.library, device)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the layout's checked-in prewarm list pins this capture: only a
+    /// shape the trace shows is always hot.
+    fn graph_pinned(&self, key: &GraphKey) -> bool {
+        pinned_geometry(&self.graph_pinned.borrow(), key)
+    }
+
+    /// Attribute work before it is queued: pinned hits flush on the boundary.
+    fn cache_cycle(&self, cycle: crate::shared::decode_graph::device::Cycle) {
+        self.graphs.borrow_mut().cache_cycle(cycle);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(cycle); }
+    }
+
+    /// Every rank's launches for the completed step are queued: observe each
+    /// physical device once, tick its site and retire victims without draining
+    /// a lane. V4 every graph owner pins `()` and captures only persistent
+    /// engine buffers (weights, workspaces, KV pools, exchange planes), so
+    /// destroying a victim executable never releases storage an in-flight
+    /// launch reads.
+    fn graph_completed(&self) -> Result<()> {
+        let needs = self.graphs.borrow().cache_needs_boundary()
+            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary());
+        if !needs {
+            self.graphs.borrow_mut().cache_tick();
+            if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+            return Ok(());
+        }
+        // A sample is only a completed-step boundary once every rank's queued
+        // work landed; this runs only while a capture or retirement is due.
+        self.drain_state()?;
+        let spans = self.ranks() > 1;
+        // SAFETY: see above; every V4 owner pins `()` and only borrowed
+        // persistent storage, never a per-capture allocation.
+        unsafe {
+            crate::shared::decode_graph::device::observe_completed(self.library, |visit| {
+                visit(self.device, "deepseek_v4.segment", spans, &mut *self.graphs.borrow_mut())?;
+                if let Some(peer) = &self.peer {
+                    visit(peer.device, "deepseek_v4.segment", spans, &mut *peer.graphs.borrow_mut())?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// Captures the traced verify geometries at startup: every prewarm entry
+    /// with a C4 width class, at that class's last position, on a synthetic
+    /// placement. Only geometries this pool can express are warmed; the rest
+    /// stay lazy. One eager pass first, so module, workspace and BLAS first
+    /// touches land outside executable residency, then the capture pass. Runs
+    /// after the route check: the exchange policy it settles is baked into keys.
+    pub fn warm_verify_graphs(&self, transports: &mut [SparkLink<'_>], runtime: &tokio::runtime::Runtime) -> Result<()> {
+        use crate::shared::decode_graph::device::{observe_device, Cycle};
+        use cuteafd_loader::serving_capacity::v4_graphs::v4_prewarm;
+        let entries = v4_prewarm(self.ranks(), self.graph_sparks.get()).map_err(anyhow::Error::msg)?;
+        let units = self.shape.units;
+        let (mut skipped, mut steps) = (0usize, Vec::new());
+        for entry in entries.iter().filter(|entry| entry.table_width > 0) {
+            let (rows, width) = (entry.rows, entry.table_width);
+            // A geometry this pool cannot express, or one whose positions run
+            // past the checkpoint's context, is not warmed and stays lazy.
+            if rows > self.decode_rows || metadata::c4_width_class(width, units) != width
+                || metadata::prewarm_last_position(width) >= self.max_context {
+                skipped += 1;
+                continue;
+            }
+            steps.push((rows, width, metadata::prewarm_last_position(width)));
+            // Class 1 also runs the window path: no C128 group completes, so a
+            // compressed layer sees `win`. A trace showed both at that class.
+            if width == 1 && rows <= metadata::WINDOW {
+                steps.push((rows, width, metadata::prewarm_window_position()));
+            }
+        }
+        if steps.is_empty() { return Ok(()); }
+        self.prepare_workspaces()?;
+        // First touch lands in the eager pass; re-seed the growth baseline here
+        // so the measured arena is the captures alone.
+        for rank in 0..self.ranks() {
+            let device = self.on(rank, || self.library.cuda_get_device())?;
+            observe_device(self.library, device)?;
+        }
+        self.cache_cycle(Cycle::Other);
+        let started = Instant::now();
+        let runs_before = self.graph_captures.get();
+        let eager_before = self.graph_eager.get();
+        let mut run = |capture: bool| -> Result<()> {
+            self.graph_warming.set(!capture);
+            self.capture_only.set(capture);
+            let result = (|| -> Result<()> {
+                for &(rows, width, end) in &steps {
+                    let tables = metadata::prewarm_step(&self.shape, rows, width, end,
+                        self.cfg.index_topk, self.c128_width)?;
+                    let tokens = vec![0u32; rows];
+                    self.step(&[RowStep { tables: &tables, tokens: &tokens }], transports, runtime,
+                        rows, None, false)?;
+                }
+                Ok(())
+            })();
+            self.graph_warming.set(false);
+            self.capture_only.set(false);
+            result
+        };
+        run(false)?;
+        let before = self.graph_memory_samples()?;
+        let captured = run(true);
+        captured?;
+        // The capture pass launched nothing, so this is already a completed
+        // boundary: credit its pending captures to the arena before anything
+        // samples Ready, or the growth is only observed at the first request
+        // (the arena would read 935 MB at Ready and 1,005 MB at first request
+        // while the CUDA sample is unchanged). `warm_local_graphs` does the same.
+        self.graph_completed()?;
+        let after = self.graph_memory_samples()?;
+        let captured = self.graph_captures.get().saturating_sub(runs_before);
+        let eager = self.graph_eager.get().saturating_sub(eager_before);
+        if eager > 0 {
+            tracing::warn!(eager, wanted = steps.len(),
+                "V4 verify prewarm hit the graph reserve; those geometries stay lazy");
+        }
+        let (graphs0, graphs1, captures) = self.graph_inventory();
+        // `captured` is the measured number of verify keys this pass added.
+        tracing::info!(graphs0, graphs1, captures, captured, eager, skipped,
+            prewarm_steps = steps.len(),
+            arena = ?before.iter().zip(&after).map(|(b, a)| a.retained_since(*b)).collect::<Result<Vec<_>, _>>(),
+            free = ?before.iter().zip(&after).map(|(b, a)| (b.free, a.free)).collect::<Vec<_>>(),
+            elapsed_ms = started.elapsed().as_millis() as u64, "V4 verify graphs warmed");
+        Ok(())
+    }
+
+    /// Both ranks' device memory at a completed boundary: physical free/total
+    /// plus the ledger's tracked device, pinned and managed bytes, so a graph
+    /// arena can be separated from everything admission already charged.
+    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
+        // SAFETY: both ranks' streams are live; nothing else is queued.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        if self.peer.is_some() {
+            let stream = self.stream_of(1);
+            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        use cuteafd_ffi::memory_ledger::Space;
+        (0..self.ranks()).map(|rank| self.on(rank, || {
+            let device = self.library.cuda_get_device()?;
+            let (free, total) = self.library.cuda_physical_memory_info()?;
+            Ok(GraphMemorySample { free: free as u64, total: total as u64,
+                tracked_device: ledger.total(Space::Device, device) as u64,
+                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
+                    .map(|row| row.bytes as u64).sum(),
+                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
+                    .map(|row| row.bytes as u64).sum() })
+        })).collect()
+    }
+
+    /// The startup prewarm set's width-0 row classes: the local-expert and TP2
+    /// router graphs every request replays. Best effort within the reserve.
     /// Every local-expert row shape is captured at startup, without executing
     /// uninitialized routes or unmatched peer waits. Pointer ownership is fixed.
     pub fn warm_local_graphs(&self) -> Result<()> {
         self.prepare_workspaces()?;
         if self.local_layers() == 0 { return Ok(()); }
         self.warm_tp2_routers()?;
+        // The checked-in list's width-0 rows are the local-expert startup set.
+        let rows: Vec<usize> = cuteafd_loader::serving_capacity::v4_graphs::v4_prewarm(
+                self.ranks(), self.graph_sparks.get())
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .filter(|entry| entry.table_width == 0 && entry.rows <= self.decode_rows)
+            .map(|entry| entry.rows)
+            .collect();
+        if rows.is_empty() { return Ok(()); }
+        // First touch happens eagerly above (workspaces and both router
+        // branches); re-seed the growth baseline here so the measured arena is
+        // the captures alone, not kernel/driver first-use allocation.
+        for rank in 0..self.ranks() {
+            let device = self.on(rank, || self.library.cuda_get_device())?;
+            crate::shared::decode_graph::device::observe_device(self.library, device)?;
+        }
+        let started = Instant::now();
+        // Lead-rank expert graphs plus the peer half each TP2 layer also captures.
+        let wanted = rows.len() * (self.local_layers()
+            + (0..self.local_layers()).filter(|&layer| self.tp2_layer(layer)).count());
+        let before_captures = self.graph_captures.get();
+        let eager_before = self.graph_eager.get();
+        self.cache_cycle(crate::shared::decode_graph::device::Cycle::Other);
+        let before = self.graph_memory_samples()?;
         self.capture_only.set(true);
-        let result = (|| {
+        let result = (|| -> Result<()> {
             let work = self.decode_workspace.borrow();
             let w = work.as_ref().context("decode workspace")?;
-            for t in 1..=self.decode_rows {
+            for &t in &rows {
                 for layer in 0..self.local_layers() {
                     self.local_experts(layer, t, w, &w.slots[0], self.decode_rows, 0)?;
                     if self.tp2_layer(layer) {
@@ -1907,7 +2220,25 @@ impl<'a> Engine<'a> {
             Ok(())
         })();
         self.capture_only.set(false);
-        result
+        result?;
+        // The capture pass launched nothing, so this is already a completed
+        // boundary: measure the prewarm arena before any request can grow it.
+        self.graph_completed()?;
+        let after = self.graph_memory_samples()?;
+        let captured = self.graph_captures.get().saturating_sub(before_captures);
+        // A second pass over an already-warm set legitimately captures nothing,
+        // so only a reserve refusal is a truncation signal.
+        let eager = self.graph_eager.get().saturating_sub(eager_before);
+        if eager > 0 {
+            tracing::warn!(eager, wanted,
+                "V4 startup prewarm hit the graph reserve; those shapes capture lazily or run eagerly");
+        }
+        let (graphs0, graphs1, captures) = self.graph_inventory();
+        tracing::info!(graphs0, graphs1, captures, wanted, captured, eager, elapsed_ms = started.elapsed().as_millis() as u64,
+            arena = ?before.iter().zip(&after).map(|(b, a)| a.retained_since(*b)).collect::<Result<Vec<_>, _>>(),
+            free = ?before.iter().zip(&after).map(|(b, a)| (b.free, a.free)).collect::<Vec<_>>(),
+            "V4 local expert graphs warmed");
+        Ok(())
     }
 
     /// A prefill unit's wave on the link's transport worker: routes and wire
@@ -1974,6 +2305,22 @@ impl<'a> Engine<'a> {
         cap: usize,
         transport: Option<&mut SparkLink<'_>>,
     ) -> Result<usize> {
+        // A warmed step owns no Spark request, so it posts none; every GPU-to-GPU
+        // exchange still runs exactly as serving does, because the peer rank's
+        // own segment matches each of its waits. The rank count is what serving
+        // returns, since the segment keys and the tail body bake it in.
+        if self.graph_warming.get() || self.capture_only.get() {
+            if self.skip_routed {
+                return Ok(SKIPPED_EXPERTS);
+            }
+            if layer < self.local_layers() {
+                self.local_experts(layer, t, w, lane, cap, 0)?;
+                return Ok(LOCAL_EXPERTS);
+            }
+            // The shared expert is an eager launch outside every capture, and
+            // `check_routes` already exercised it where one runs.
+            return Ok(transport.context("no transport")?.exchange()?.ranks());
+        }
         if self.skip_routed {
             self.coverage_launch("shared", 0, lane.index, t,
                 crate::shared::decode_graph::census::Launch::Eager, "skip-routed");
@@ -2024,6 +2371,38 @@ impl<'a> Engine<'a> {
     }
 }
 
+/// What a step executes. A serving step and a warm's first-touch eager pass
+/// run every graph body; the warm's capture pass records bodies without
+/// running any. Eager, unwrapped work that is coupled across ranks (the tail's
+/// TP2 close) must therefore run exactly where the bodies do: its peer push or
+/// wait is inside the other rank's segment body.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StepMode {
+    Serve,
+    EagerWarm,
+    CaptureWarm,
+}
+
+impl StepMode {
+    fn of(graph_warming: bool, capture_only: bool) -> Self {
+        match (graph_warming, capture_only) {
+            (false, false) => Self::Serve,
+            (true, false) => Self::EagerWarm,
+            (false, true) => Self::CaptureWarm,
+            (true, true) => unreachable!("the eager pass and the capture pass are exclusive"),
+        }
+    }
+
+    /// Graph-wrapped segment bodies run in this mode, and with them each
+    /// rank's peer pushes and waits inside those bodies.
+    fn segments_run(self) -> bool { self != Self::CaptureWarm }
+
+    /// The eager tail runs only where segment bodies run. Its post is a peer
+    /// push/wait, and the peer's match is inside a segment body this mode
+    /// either runs everywhere or nowhere.
+    fn tail_runs(self) -> bool { self.segments_run() }
+}
+
 /// One Spark request for `rows` wire rows (FP8, UE8M0 scales per 32) with
 /// `topk` routes each; the response is compact BF16 partials.
 fn spark_request(dim: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
@@ -2039,6 +2418,15 @@ fn spark_request(dim: usize, topk: usize, layer: usize, rows: usize, routes: Vec
     )?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
+}
+
+/// Whether a pinned prewarm geometry covers this capture. Width 0 is either
+/// the local-expert startup set or a tail capture; only the startup set is
+/// prewarmed and pinned, so tails stay ordinary ARC entries (#1638 keeps them
+/// out of the prewarm list).
+fn pinned_geometry(pinned: &[(usize, usize)], key: &GraphKey) -> bool {
+    let eligible = key.table_width > 0 || key.attention == "local-experts";
+    eligible && pinned.contains(&(key.rows, key.table_width))
 }
 
 /// A step's logits: downloaded, or left on the device.
@@ -2058,6 +2446,58 @@ impl Logits {
 
 #[cfg(test)]
 mod coverage_tests {
+    use super::StepMode;
+
+    #[test]
+    fn a_capture_pass_runs_no_coupled_eager_work() {
+        // Serving and the eager warm pass run every graph body, and with them
+        // each rank's peer pushes and waits. The capture pass records bodies
+        // and runs none. The eager tail is the step's only rank-coupled work
+        // outside a body, so its TP2 close may run only where bodies do: on
+        // both ranks or on neither. An asymmetric graph reserve across ranks
+        // changes which rank captures or eagers (every outcome runs the body
+        // once), never whether a rank's body runs, so it cannot desynchronize
+        // the two ranks' peer sequences.
+        for (graph_warming, capture_only, mode) in [
+            (false, false, StepMode::Serve),
+            (true, false, StepMode::EagerWarm),
+            (false, true, StepMode::CaptureWarm),
+        ] {
+            assert_eq!(StepMode::of(graph_warming, capture_only), mode);
+            assert_eq!(mode.tail_runs(), mode.segments_run(), "{mode:?} runs the tail iff bodies run");
+        }
+        assert!(StepMode::Serve.segments_run() && StepMode::Serve.tail_runs());
+        assert!(StepMode::EagerWarm.segments_run() && StepMode::EagerWarm.tail_runs());
+        assert!(!StepMode::CaptureWarm.segments_run() && !StepMode::CaptureWarm.tail_runs());
+    }
+
+    #[test]
+    fn pinned_geometry_spares_tails_of_startup_rows() {
+        let key = |attention, rows, table_width| super::GraphKey { layer: 3, rows, chunked: false,
+            attention, table_width, table_stride: table_width, previous: 0, tp2_broadcast: false,
+            exchange_f32: false };
+        let pinned = [(1, 0), (16, 0), (16, 512)];
+        assert!(super::pinned_geometry(&pinned, &key("local-experts", 16, 0)));
+        assert!(!super::pinned_geometry(&pinned, &key("tail", 16, 0)));
+        assert!(super::pinned_geometry(&pinned, &key("c4", 16, 512)));
+        assert!(!super::pinned_geometry(&pinned, &key("c4", 4, 512)));
+    }
+
+    #[test]
+    fn an_empty_pin_list_pins_no_startup_row() {
+        // Only a trace-derived entry pins: an untraced layout's boot policy
+        // supplies no geometry, so even a width-0 startup capture stays an
+        // ordinary ARC entry.
+        let key = |attention, rows, table_width| super::GraphKey { layer: 3, rows, chunked: false,
+            attention, table_width, table_stride: table_width, previous: 0, tp2_broadcast: false,
+            exchange_f32: false };
+        for attention in ["local-experts", "tail", "c4"] {
+            for table_width in [0, 128] {
+                assert!(!super::pinned_geometry(&[], &key(attention, 16, table_width)));
+            }
+        }
+    }
+
     #[test]
     fn legacy_coverage_matches_attention_expert_and_tail_composition() {
         let base = super::GraphKey { layer: 3, rows: 33, chunked: true, attention: "c4",

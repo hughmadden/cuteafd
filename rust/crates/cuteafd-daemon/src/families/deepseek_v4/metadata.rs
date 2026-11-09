@@ -333,6 +333,43 @@ pub(crate) fn decode_step(
     Ok(tables)
 }
 
+/// Last position of the step that captures C4 width class `width`: `width`
+/// completed C4 groups is exactly the class, and every ratio-128 layer sees
+/// the same `2 * width - 1` completed groups, so the step is never mixed and
+/// runs the compressed (`c4`/`c128`) path on every layer.
+pub(crate) fn prewarm_last_position(width: usize) -> usize {
+    width * SOURCE_PAGE_TOKENS - 2
+}
+
+/// Last position of the window variant of class 1: no C128 group completes, so
+/// a compressed layer runs its `win` path. A trace shows both kinds at class 1.
+pub(crate) fn prewarm_window_position() -> usize {
+    WINDOW - 2
+}
+
+/// Tables for one prewarmed verify geometry: `rows` consecutive rows ending at
+/// `end`, from a scratch placement that owns the first `width` C4 pages. The
+/// warm only needs the launch shape such a step produces; nothing reads the
+/// page contents, and the placement's page ids satisfy the per-rank shard's
+/// ownership parity (`page % 2`).
+pub(crate) fn prewarm_step(
+    shape: &super::pool::PoolShape,
+    rows: usize,
+    width: usize,
+    end: usize,
+    index_topk: usize,
+    c128_width: usize,
+) -> anyhow::Result<StepTables> {
+    anyhow::ensure!(width > 0 && rows > 0 && end >= rows - 1 && end < width * SOURCE_PAGE_TOKENS,
+        "prewarm geometry {rows} rows of class {width} ending at {end}");
+    let placement = super::pool::Placement::new(0, (0..u32::try_from(width)?).collect());
+    let mut tables = verify_step(&[(&placement, end + 1 - rows, rows)], shape, index_topk, c128_width)?;
+    tables.pad_c4_geometry(shape.units)?;
+    anyhow::ensure!(tables.c4_table_width == width && tables.c4_table_stride == width,
+        "prewarm geometry {rows} rows ending at {end} is class {} not {width}", tables.c4_table_width);
+    Ok(tables)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::pool::{PoolAllocator, PoolShape};
@@ -567,6 +604,39 @@ mod tests {
         assert_eq!(dec.c4_tables[1].1, vec![seq.state as i32]);
         assert_eq!(compressed_page_bytes(4), 37_440);
         assert_eq!(compressed_page_bytes(128), 1_728);
+        Ok(())
+    }
+
+    #[test]
+    fn prewarm_steps_reproduce_every_traced_verify_class() -> anyhow::Result<()> {
+        // Every width a trace showed, and the pool the traces ran on.
+        let shape = PoolShape::new(2, 4096, 512);
+        for width in [1usize, 2, 4, 8, 32, 64, 128, 256] {
+            for rows in [1usize, 64] {
+                let tables = prewarm_step(&shape, rows, width, prewarm_last_position(width), 2048, 1024)?;
+                assert_eq!((tables.rows, tables.chunked), (rows, true));
+                assert_eq!((tables.c4_table_width, tables.c4_table_stride), (width, width));
+                assert_eq!(tables.c4_groups, width * 64 - 1);
+                // One row's last position fixes every row's C128 length: all rows
+                // sit in one 128-block, so no row reports a different length.
+                assert_eq!(tables.c128_groups, width * 2 - 1);
+                assert!(tables.c128_lengths.iter().all(|&length| length == (width * 2 - 1) as i32));
+                // Each rank's shard accepts the synthetic placement's page ids.
+                for rank in 0..2 {
+                    let shard = c4_context_tables(&tables, rank, shape.units)?;
+                    assert_eq!(shard.c4_table_stride, width.div_ceil(2));
+                }
+                if width == 1 {
+                    // The window variant of class 1: no C128 group completes.
+                    let low = prewarm_step(&shape, rows, 1, prewarm_window_position(), 2048, 1024)?;
+                    assert_eq!((low.c4_table_width, low.c4_table_stride), (1, 1));
+                    assert_eq!((low.c4_groups, low.c128_groups), (31, 0));
+                    assert!(low.c128_lengths.iter().all(|&length| length == 0));
+                }
+            }
+        }
+        // A width the pool cannot express is refused rather than silently padded.
+        assert!(prewarm_step(&shape, 4, 3, prewarm_last_position(3), 2048, 1024).is_err());
         Ok(())
     }
 
