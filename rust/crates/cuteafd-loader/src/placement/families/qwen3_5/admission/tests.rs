@@ -377,8 +377,9 @@ fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
     assert!(ready.iter().any(|item| item.basis == cuteafd_core::memory_layout::Basis::Estimated));
     let calibrated = plan.facts.allowances.iter().filter(|allowance| !allowance.assumed).collect::<Vec<_>>();
     assert!(!calibrated.is_empty());
-    assert!(calibrated.iter().all(|allowance| allowance.source.starts_with("BLAS device initialization")));
-    // Exact items are physical owners; calibrated BLAS residency is an allowance.
+    assert!(calibrated.iter().all(|allowance| allowance.source.starts_with("BLAS device initialization")
+        || crate::placement::graph_reserve::is_source(&allowance.source)));
+    // Exact items are physical owners; BLAS residency and graph capacity are allowances.
     let exact: u64 = ready.iter().filter(|item| item.basis == cuteafd_core::memory_layout::Basis::Exact)
         .map(|item| item.bytes).sum();
     let declared: u64 = plan.facts.allocations.iter()
