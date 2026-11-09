@@ -1892,3 +1892,48 @@ def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
     assert "(true, scheduler::UngraphedKind::Decode)" in serve
     assert "(false, scheduler::UngraphedKind::Scoring)" in serve
     assert "check_diagnostic_graph_bypass(&tokens)?" in golden
+
+
+
+def muse_trace(device=0):
+    def graph(rows, layer, hits, cost):
+        return {"site": "muse_spark.segment", "bank": 1, "key_id": f"{rows}-{layer}",
+                "shape": f"Key {{ layer: {layer}, rows: {rows}, stride: 2048, section: Attention }}",
+                "hits": hits, "count": hits + 1, "misses": 1, "capture_bytes": cost}
+    return {"schema_version": 2, "cache": {"device": device, "sampled_at_ms": 10},
+            "graphs": [graph(1, 0, 20, 100), graph(1, 1, 0, 50),
+                       graph(4, 0, 10, 200), graph(8, 0, 0, 300)]}
+
+
+def test_muse_prices_capture_only_siblings_but_not_zero_replay_geometries():
+    result = MODULE.generate_muse([muse_trace()], 1, True)
+    assert result["reserve_base_bytes"] == [2 << 20]
+    assert result["reserve_extra_bytes"] == [2 << 20]
+    assert result["entries"] == [
+        {"rows": 1, "pin": False, "capture_bytes": [150]},
+        {"rows": 4, "pin": False, "capture_bytes": [200]}]
+    assert "1 zero-replay siblings included" in result["provenance"]
+    assert "1 zero-replay identities stay lazy" in result["provenance"]
+    assert result == MODULE.generate_muse([muse_trace(), muse_trace()], 1, True)
+
+
+def test_muse_latest_snapshot_and_physical_rank_costs_are_not_borrowed():
+    old = muse_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    old["graphs"][0]["capture_bytes"] = 9999999
+    other = muse_trace(1)
+    other["graphs"][0]["capture_bytes"] = 300
+    result = MODULE.generate_muse([old, muse_trace(), other], 2, True)
+    assert result["entries"][0]["capture_bytes"] == [150, 350]
+    assert result == MODULE.generate_muse([other, muse_trace(), old], 2, True)
+    with pytest.raises(ValueError, match="needs 2 device traces"):
+        MODULE.generate_muse([muse_trace()], 2, True)
+    missing = muse_trace()
+    missing["graphs"][1].pop("capture_bytes")
+    with pytest.raises(ValueError, match="lacks measured capture share"):
+        MODULE.generate_muse([missing], 1, True)
+
+
+def test_muse_synthetic_trace_regeneration_is_byte_stable():
+    expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, True), indent=2) + "\n"
+    assert json.dumps(MODULE.generate_muse([muse_trace()], 1, True), indent=2) + "\n" == expected

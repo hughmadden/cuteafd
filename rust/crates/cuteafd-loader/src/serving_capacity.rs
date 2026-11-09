@@ -65,6 +65,7 @@ pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilog
 pub mod glm_graphs;
 pub mod v41_graphs;
 pub mod mimo_graphs;
+pub mod muse_graphs;
 pub mod glm_graph_nodes;
 pub mod glmf_graphs;
 pub mod kimi_prewarm;

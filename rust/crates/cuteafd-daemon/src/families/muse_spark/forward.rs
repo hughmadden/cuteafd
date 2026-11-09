@@ -76,13 +76,14 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
 /// One step: metadata, embedding, every layer, then the head over `head_rows`.
 /// `experts` is rank 0's Spark path; `peers[r]` rank r's exchange end on a pair.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: &[*mut c_void],
+pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], streams: &[*mut c_void],
     table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
     meta: &StepMetadata, prefill: bool,
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
     local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
-    mut probe: Option<&mut crate::shared::draft::probe::RoundProbe<'_>>, head_rows: std::ops::Range<usize>)
+    mut probe: Option<&mut crate::shared::draft::probe::RoundProbe<'_>>, head_rows: std::ops::Range<usize>,
+    graphs: &[super::graphs::Graphs<'a>])
     -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
         && (local.is_empty() || local.len() == ranks.len()), "Muse step geometry");
@@ -97,13 +98,15 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
     let mut experts = Some(experts);
     for layer in 0..cfg.layers {
         for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
+            let mut device = rank.device(cfg, stream);
+            device.graphs = graphs.get(index).filter(|_| !prefill && planes[index].trace.is_none());
             let peer = peers.get_mut(index).map(|end| &mut **end as &mut dyn PeerExchange);
             if let Some(onboarded) = local.get_mut(index).filter(|onboarded| onboarded.holds(layer)) {
-                rank.device.run(|| rank.device(cfg, stream).layer_local(layer, &planes[index], onboarded, peer))?;
+                rank.device.run(|| device.layer_local(layer, &planes[index], onboarded, peer))?;
                 continue;
             }
             let path = if index == 0 { experts.as_deref_mut() } else { None };
-            rank.device.run(|| rank.device(cfg, stream).layer(layer, &planes[index], path, peer))?;
+            rank.device.run(|| device.layer(layer, &planes[index], path, peer))?;
         }
         // The drafter taps the head rank's hidden rows after the layer, on that rank's stream.
         let last = ranks.len() - 1;
@@ -122,7 +125,20 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
         }
     }
     let last = ranks.len() - 1;
-    ranks[last].device.run(|| head(cfg, &ranks[last], &ranks[last].lane.views, head_rows, streams[last]))
+    let mut logits = None;
+    ranks[last].device.run(|| {
+        let launch = || {
+            logits = Some(head(cfg, &ranks[last], &ranks[last].lane.views, head_rows.clone(), streams[last])?);
+            Ok(())
+        };
+        if let Some(graphs) = graphs.get(last).filter(|_| !prefill && planes[last].trace.is_none()) {
+            graphs.run(super::graphs::Key { layer: cfg.layers, rows: head_rows.len(), stride: head_rows.start,
+                section: super::graphs::Section::Head }, streams[last], launch)?;
+        } else { let mut launch = launch; launch()?; }
+        // Replay does not execute the closure: head's persistent stored plane is the output.
+        let (stored, _) = ranks[last].head.as_ref().context("Muse head planes absent")?;
+        Ok(logits.unwrap_or(Buffer { bytes: head_rows.len() * cfg.vocab_size * 4, ..stored.buffer }))
+    })
 }
 
 #[cfg(test)]
@@ -138,6 +154,18 @@ mod tests {
             placement: cuteafd_loader::plan::ExpertPlacement::from_spark_ranks(6),
             layout: Some(cuteafd_loader::plan::layout::LayoutOptions { host_memory: Some((256 << 30, 256 << 30)),
                 rtx_bytes: vec![total; 2], head_split: true, ..Default::default() }), ..Default::default() })?;
+        for rank in 0..2 {
+            let items = &report.solver_placement.as_ref().unwrap().items[rank];
+            let owners = cuteafd_loader::placement::reserve::breakdown(format!("gpu{rank}"),
+                cuteafd_core::memory_policy::DeviceKind::Gpu, total, 0, items);
+            let graph = owners.reserve.iter().filter(|row| row.name == "graph reserve").collect::<Vec<_>>();
+            // The untraced bootstrap is empty; an explicit policy may charge a
+            // nonzero reserve, but never a second family-named owner or tail.
+            let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, true, rank)?;
+            assert_eq!(graph.iter().map(|row| row.bytes).sum::<u64>(), policy.bytes);
+            assert!(graph.len() <= 1);
+            assert!(!owners.reserve.iter().any(|row| row.name != "graph reserve" && row.name.contains("graph")));
+        }
         let placement = report.solver_placement.as_ref().unwrap();
         let charged = placement.items[1].iter().find(|item| item.group == "Muse head logits").unwrap().bytes;
         let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(202112, 202048)?;

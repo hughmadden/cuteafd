@@ -23,6 +23,9 @@ pub(crate) struct ServeArgs {
     /// pair (attention heads halve), as every family's launcher passes them.
     #[arg(long, default_value_t = 0)] pub device: i32,
     #[arg(long)] pub split_device: Option<i32>,
+    /// Bounded decode/verify graph replay; prefill and diagnostics stay eager.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Spark expert ranks: every expert's intermediate is sliced across them (TP),
     /// each replying per-expert partials the coordinator combines.
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
@@ -252,6 +255,31 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(solve_us = built.solve_us, "Muse shared admission solve");
     let placement = &built.placement;
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &std::path::Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let policies = (0..gpus).map(|rank|
+            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, args.peers.len() > 0, rank)).collect::<Result<Vec<_>, _>>()?;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "muse_spark",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+                "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
+                "layout": format!("snapshot/{}; draft/{:?}; ranks/{}; sparks/{}; C{}; pool/{}",
+                    args.snapshot.display(), args.draft, gpus, args.peers.len(), args.max_sequences, placement.pool_tokens),
+                "devices": device_ids, "spark_world": args.peers.len(),
+                "onboard_layers": built.solved.decisions.onboard_layers,
+                "prefill": built.solved.decisions.prefill,
+                "graph_basis": { "basis": "bytes", "enabled": args.decode_graphs, "reserve_policy": policies }
+            }
+        }));
+    }
     cuteafd_bench::context::ResolvedSettings::placement(placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &cuteafd_loader::placement::planner::Context::resolve(cfg.max_position as u64, args.max_context).served(placement.pool_tokens).to_string());
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
@@ -389,9 +417,10 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             cuteafd_loader::placement::planner::CoordinatorDevices::new(&device_ids)?, "muse.drafter"))
             .transpose()?.unwrap_or_default()
     } else { Vec::new() };
-    let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
+    let mut backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
+    backend.configure_graphs(args.decode_graphs, args.peers.len() > 0)?;
     let weight_census = if crate::shared::inventory::startup_probe_enabled() {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
         use crate::shared::memory::receipts::{Census, Inventory};
@@ -738,6 +767,8 @@ mod tests {
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
+        assert!(!defaults.decode_graphs);
+        assert!(args(&["--peers", PEERS, "--decode-graphs", "true"])?.decode_graphs);
         assert_eq!(defaults.vision, cuteafd_loader::plan::MediaMode::Auto);
         assert_eq!(defaults.audio, cuteafd_loader::plan::MediaMode::Auto);
         assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());

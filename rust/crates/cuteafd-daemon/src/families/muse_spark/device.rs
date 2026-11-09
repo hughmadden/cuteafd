@@ -92,6 +92,7 @@ impl<'a> RankPrograms<'a> {
 }
 
 /// One rank's device state for the layer chain.
+#[derive(Clone, Copy)]
 pub(crate) struct RankDevice<'a, 'w> {
     pub library: &'a cuteafd_ffi::NativeLibrary,
     pub cfg: &'w MuseSparkConfig,
@@ -109,6 +110,7 @@ pub(crate) struct RankDevice<'a, 'w> {
     /// The wire quantizer's device-sized grid (cached at startup).
     pub wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
     pub stream: *mut c_void,
+    pub graphs: Option<&'w super::graphs::Graphs<'a>>,
 }
 
 /// One step's device metadata planes (copied from [`StepMetadata`] before the layers).
@@ -145,6 +147,15 @@ impl StepPlanes {
 fn rows_i32(rows: usize) -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(rows)?)) }
 
 impl RankDevice<'_, '_> {
+    fn segment(&self, layer: usize, step: &StepPlanes, section: super::graphs::Section,
+        mut launch: impl FnMut() -> Result<()>) -> Result<()> {
+        match self.graphs.filter(|_| !step.prefill && step.trace.is_none()) {
+            Some(graphs) => graphs.run(super::graphs::Key { layer, rows: step.rows,
+                stride: if section == super::graphs::Section::Attention { step.table_stride } else { 0 }, section }, self.stream, launch),
+            None => launch(),
+        }
+    }
+
     /// Diagnostic readback at the producer, before another unit can reuse scratch.
     fn trace(&self, step: &StepPlanes, layer: usize, components: &[(&str, usize)]) -> Result<()> {
         let Some(trace) = &step.trace else { return Ok(()) };
@@ -198,9 +209,35 @@ impl RankDevice<'_, '_> {
     /// attention route, the output gate and o_proj into `attended`.
     pub(crate) fn attention(&self, layer: usize, step: &StepPlanes, peer: Option<&mut (dyn PeerExchange + '_)>)
         -> Result<()> {
+        if self.ranks == 1 {
+            return self.segment(layer, step, super::graphs::Section::Attention, || {
+                self.attention_prefix(layer, step)?;
+                self.project(layer, "attn.o", step.rows, self.lane.rows("gated", step.rows)?,
+                    self.lane.rows("attended", step.rows)?)
+            });
+        }
+        self.segment(layer, step, super::graphs::Section::Attention, || self.attention_prefix(layer, step))?;
+        let rows = step.rows;
+        let gated = self.lane.rows("gated", rows)?;
+        let attended = self.lane.rows("attended", rows)?;
+        let weights = self.weights(layer)?;
+        match (self.ranks, weights.core("attn.o")) {
+            (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
+            (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended,
+                peer.context("Muse TP2 o_proj needs the peer exchange")?),
+            (1, None) => self.project(layer, "attn.o", rows, gated, attended),
+            (2, None) => self.native_k_split(rows, gated,
+                weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended,
+                peer.context("Muse native TP2 o_proj needs the peer exchange")?),
+            _ => anyhow::bail!("Muse attention needs one or two coordinator ranks"),
+        }
+    }
+
+    fn attention_prefix(&self, layer: usize, step: &StepPlanes) -> Result<()> {
         let rows = step.rows;
         let lane = self.lane;
         let normed = lane.rows("normed", rows)?;
+        self.norm(layer, "input_norm", Some("norm.input"), rows, lane.rows("hidden", rows)?, normed)?;
         // v lands in the `attention` plane ([rows, H_q, 64] >= [rows, H_kv, 64]): qk_norm copies it
         // into the record before the attention overwrites the plane with its output (same stream).
         for (name, plane) in [("attn.q", "q_raw"), ("attn.k", "k_raw"), ("attn.v", "attention"), ("attn.gate", "gate")] {
@@ -262,19 +299,7 @@ impl RankDevice<'_, '_> {
             self.programs.launch("attention_output", &[out, lane.rows("gate", rows)?, lane.rows("gated", rows)?],
                 &[rows_i32(rows)?], self.stream)?;
         }
-        let gated = lane.rows("gated", rows)?;
-        let attended = lane.rows("attended", rows)?;
-        let weights = self.weights(layer)?;
-        match (self.ranks, weights.core("attn.o")) {
-            (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
-            (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended,
-                peer.context("Muse TP2 o_proj needs the peer exchange")?),
-            (1, None) => self.project(layer, "attn.o", rows, gated, attended),
-            (2, None) => self.native_k_split(rows, gated,
-                weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended,
-                peer.context("Muse native TP2 o_proj needs the peer exchange")?),
-            _ => anyhow::bail!("Muse attention needs one or two coordinator ranks"),
-        }
+        Ok(())
     }
 
     /// `out = bf16(alpha * residual + beta * x)` with the layer's site gate.
@@ -334,6 +359,15 @@ impl RankDevice<'_, '_> {
             self.stream) }
     }
 
+    fn attention_residual(&self, layer: usize, rows: usize) -> Result<()> {
+        let lane = self.lane;
+        let normed = lane.rows("normed", rows)?;
+        self.norm(layer, "post_attn_norm", None, rows, lane.rows("attended", rows)?, normed)?;
+        self.residual_gate(layer, "attention", rows, lane.rows("hidden", rows)?, normed,
+            lane.rows("residual", rows)?)?;
+        self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, lane.rows("residual", rows)?, normed)
+    }
+
     /// The MoE frontend: FP32 router + selection on the pre-feedforward-normed
     /// rows, and pre_expert_proj + its centered norm into `expert_input`.
     pub(crate) fn moe_frontend(&self, layer: usize, rows: usize) -> Result<()> {
@@ -367,18 +401,25 @@ impl RankDevice<'_, '_> {
     /// GPUs, so the halves are swapped and both assemble the full expert input.
     fn moe_frontend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
         let lane = self.lane;
-        let weights = self.weights(layer)?;
-        let normed = lane.rows("normed", rows)?;
-        let logits = lane.rows("router_logits", rows)?;
-        // SAFETY: as `project`.
-        unsafe {
-            self.programs.launch("router", &[normed, weights.buffer("moe.router")?, logits], &[rows_i32(rows)?], self.stream)?;
-            self.programs.launch("route_select", &[logits, weights.buffer("moe.bias")?, lane.rows("route_ids", rows)?,
-                lane.rows("route_weights", rows)?], &[rows_i32(rows)?], self.stream)?;
-        }
-        let half_bytes = self.cfg.expert_hidden; // E/2 BF16 values
         let half = lane.rows("expert_half", rows)?;
-        self.project(layer, "moe.pre_expert", rows, normed, half)?;
+        let half_bytes = self.cfg.expert_hidden;
+        let launch = || -> Result<()> {
+            if self.graphs.is_some() { self.attention_residual(layer, rows)?; }
+            let weights = self.weights(layer)?;
+            let normed = lane.rows("normed", rows)?;
+            let logits = lane.rows("router_logits", rows)?;
+            // SAFETY: resident weights and lane operands are retained by the rank.
+            unsafe {
+                self.programs.launch("router", &[normed, weights.buffer("moe.router")?, logits], &[rows_i32(rows)?], self.stream)?;
+                self.programs.launch("route_select", &[logits, weights.buffer("moe.bias")?, lane.rows("route_ids", rows)?,
+                    lane.rows("route_weights", rows)?], &[rows_i32(rows)?], self.stream)?;
+            }
+            self.project(layer, "moe.pre_expert", rows, normed, half)
+        };
+        if let Some(graphs) = self.graphs {
+            graphs.run(super::graphs::Key { layer, rows, stride: 0, section: super::graphs::Section::Frontend },
+                self.stream, launch)?;
+        } else { launch()?; }
         let received = if both { peer.swap(Channel::ExpertInput, half)? } else {
             if self.rank == 1 { return peer.send(Channel::ExpertInput, half, rows, half_bytes, half_bytes); }
             peer.receive(Channel::ExpertInput, rows * half_bytes)?
@@ -491,20 +532,28 @@ impl RankDevice<'_, '_> {
     /// the wire) or written by the land: other units' hooks may run between.
     pub(crate) fn layer_front(&self, layer: usize, step: &StepPlanes, experts: Option<&mut (dyn SparkExperts + '_)>,
         mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<Option<super::experts::Wave>> {
-        let (rows, lane) = (step.rows, self.lane);
-        let (hidden, normed, residual) = (lane.rows("hidden", rows)?, lane.rows("normed", rows)?, lane.rows("residual", rows)?);
-        self.norm(layer, "input_norm", Some("norm.input"), rows, hidden, normed)?;
+        if self.ranks == 1 && self.graphs.is_some() {
+            let eager = Self { graphs: None, ..*self };
+            self.segment(layer, step, super::graphs::Section::Attention, || {
+                eager.attention(layer, step, None)?;
+                eager.attention_residual(layer, step.rows)?;
+                eager.moe_frontend(layer, step.rows)?;
+                eager.expert_wire(step.rows)
+            })?;
+            return Ok(Some(experts.context("Muse single rank needs Spark experts")?
+                .send(layer, &step.wave, self.wave_sources(step.rows)?)?));
+        }
+        let rows = step.rows;
         self.attention(layer, step, peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
-        let attended = lane.rows("attended", rows)?;
-        self.norm(layer, "post_attn_norm", None, rows, attended, normed)?;
-        self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
+        if self.ranks == 1 || self.graphs.is_none() { self.attention_residual(layer, rows)?; }
         self.trace(step, layer, &[("residual", self.cfg.hidden * 2)])?;
-        self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
         match (self.ranks, self.rank, experts) {
             (1, 0, Some(experts)) => {
-                self.moe_frontend(layer, rows)?;
+                self.segment(layer, step, super::graphs::Section::Frontend, || {
+                    self.moe_frontend(layer, rows)?;
+                    self.expert_wire(rows)
+                })?;
                 self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
-                self.expert_wire(rows)?;
                 Ok(Some(experts.send(layer, &step.wave, self.wave_sources(rows)?)?))
             }
             (2, rank, experts) if (rank == 0) == experts.is_some() => {
@@ -529,16 +578,19 @@ impl RankDevice<'_, '_> {
     /// order) or 1, then the back half.
     pub(crate) fn layer_local(&self, layer: usize, step: &StepPlanes, onboarded: &mut super::onboard::OnboardedExperts<'_>,
         mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
+        if self.ranks == 1 && self.graphs.is_some() {
+            let eager = Self { graphs: None, ..*self };
+            let own = onboarded.own_rows(self.cfg, step.rows);
+            onboarded.tables_for(self.library, &[own.ptr as u64], self.stream)?;
+            return self.segment(layer, step, super::graphs::Section::Attention,
+                || eager.layer_local(layer, step, onboarded, None));
+        }
         let (rows, lane) = (step.rows, self.lane);
         ensure!(onboarded.holds(layer), "Muse layer {layer} is not onboarded on rank {}", self.rank);
         let (hidden, normed, residual) = (lane.rows("hidden", rows)?, lane.rows("normed", rows)?, lane.rows("residual", rows)?);
-        self.norm(layer, "input_norm", Some("norm.input"), rows, hidden, normed)?;
         self.attention(layer, step, peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
-        let attended = lane.rows("attended", rows)?;
-        self.norm(layer, "post_attn_norm", None, rows, attended, normed)?;
-        self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
+        if self.ranks == 1 || self.graphs.is_none() { self.attention_residual(layer, rows)?; }
         self.trace(step, layer, &[("residual", self.cfg.hidden * 2)])?;
-        self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
         match peer.as_mut() {
             Some(peer) => self.moe_frontend_halves(layer, rows, &mut **peer, true)?,
             None => self.moe_frontend(layer, rows)?,
@@ -546,19 +598,22 @@ impl RankDevice<'_, '_> {
         self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
         self.expert_wire(rows)?;
         let [ids, weights, wire] = self.wave_sources(rows)?;
-        // All rows BF16: the epilogue's BF16 row map is the identity prefix 0..rows, so its
-        // per-launch rewrite of the pinned map staging writes the bytes an in-flight copy
-        // already reads (no drain between layers is needed), and the combine's cached
-        // full-capacity tables (`tables_for`) serve every wave.
+        // Identity epilogue maps are initialized once, outside graph capture.
         let plan = cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4, regions: vec![0; rows] };
         let own = onboarded.own_rows(self.cfg, rows);
-        // SAFETY: the wire, routes and own plane are this GPU's, written on this stream before;
-        // the executor's sources are read by its epilogue on the same stream.
-        unsafe {
-            onboarded.executor.enqueue_partials(layer, rows, wire.ptr,
-                crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr },
-                &mut onboarded.epilogue, &plan, own, self.stream)?;
-        }
+        let mut launch = || -> Result<()> {
+            // SAFETY: resident executor scratch, immutable maps and lane inputs
+            // remain live until the backend's joined terminal drain.
+            unsafe {
+                onboarded.executor.enqueue_partials(layer, rows, wire.ptr,
+                    crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr },
+                    &mut onboarded.epilogue, &plan, own, self.stream)
+            }
+        };
+        if let Some(graphs) = self.graphs {
+            graphs.run(super::graphs::Key { layer, rows, stride: 0, section: super::graphs::Section::LocalExperts },
+                self.stream, launch)?;
+        } else { launch()?; }
         let planes: Vec<u64> = match peer.as_mut() {
             Some(peer) => {
                 let received = peer.swap(Channel::Partials, own)?;
@@ -577,8 +632,10 @@ impl RankDevice<'_, '_> {
             None => self.moe_backend(layer, rows)?,
         }
         let moe = lane.rows("moe", rows)?;
-        self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
-        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)?;
+        self.segment(layer, step, super::graphs::Section::Residual, || {
+            self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
+            self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+        })?;
         self.trace(step, layer, &[("hidden", self.cfg.hidden * 2)])
     }
 
@@ -602,12 +659,14 @@ impl RankDevice<'_, '_> {
             ensure!(self.rank == 1 && wave.is_none(), "Muse rank {} lands without its wave", self.rank);
         }
         self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
-        if self.ranks == 1 { self.moe_backend(layer, rows)?; }
-        else { self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?; }
+        if self.ranks == 2 { self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?; }
         let (moe, normed) = (lane.rows("moe", rows)?, lane.rows("normed", rows)?);
         let (residual, hidden) = (lane.rows("residual", rows)?, lane.rows("hidden", rows)?);
-        self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
-        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)?;
+        self.segment(layer, step, super::graphs::Section::Residual, || {
+            if self.ranks == 1 { self.moe_backend(layer, rows)?; }
+            self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
+            self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+        })?;
         self.trace(step, layer, &[("hidden", self.cfg.hidden * 2)])
     }
 }
