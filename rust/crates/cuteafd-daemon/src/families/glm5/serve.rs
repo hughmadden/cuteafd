@@ -634,8 +634,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
-            "draft_policy": crate::shared::draft::resource::snapshot(),
-            "memory_reconciliation": crate::shared::memory_report::reconcile::snapshot()});
+            "draft_policy": crate::shared::draft::resource::snapshot()});
+        crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
 
@@ -1452,6 +1452,19 @@ mod media_tests {
 
 #[cfg(test)]
 mod lane_tests {
+    #[test]
+    fn publish_includes_shared_graph_cache_and_reconciliation_stats() {
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\n/// Weak GLM").unwrap().0;
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        let graph = publish.find("crate::shared::probe::graph_capture_stats(&mut stats)").unwrap();
+        assert!(replace < graph, "publish the shared graph fields after replacing per-request stats");
+        let shared = include_str!("../../shared/probe.rs");
+        assert!(shared.contains("stats[\"graph_cache\"]"));
+        assert!(shared.contains("stats[\"memory_reconciliation\"]"));
+    }
+
     #[test]
     fn final_chunk_cancellation_parks_before_error_or_missing_head() {
         let source = include_str!("serve.rs");

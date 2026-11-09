@@ -561,7 +561,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
             for launcher in ['scripts/launch/run-family.sh']:
                 source = (ROOT / launcher).read_text()
                 suffix = source.split('shared_graph_census_args() {\n', 1)[1]
-                block = suffix.split('\n}\n', 1)[0] + '\n'
+                block = 'shared_graph_census_args() {\n' + suffix.split('\n}\n', 1)[0] + '\n}\nshared_graph_census_args\n'
                 self.assertIn('"${graph_census_args[@]}"', source)
                 for value, wip, path, valid in [
                     (None, '', str(control), True), ('0', '', str(control), True),
