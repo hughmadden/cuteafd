@@ -243,9 +243,9 @@ pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>
 }
 
 /// Fixed V4 demands plus each GPU's reserve, the ones both sides previously
-/// computed apart. Every pool-owned term (per-layer records, lane page tables)
-/// is a separate exact owner in `Recipe::prepare`, so nothing here scales with
-/// the pool.
+/// computed apart. Every pool-owned term (the packed per-device records backing,
+/// lane page tables) is a separate exact owner in `Recipe::prepare`, so nothing
+/// here scales with the pool.
 pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
     let geometry = deepseek_v4_cache_geometry(&inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
@@ -261,8 +261,8 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        // Window rings, compressor carry and the per-sequence records unit are
-        // named per-layer physical owners in `Recipe::prepare`; this keeps the
+        // Window rings, compressor carry and the per-device packed records
+        // backing are exact owners in `Recipe::prepare`; this keeps the
         // pool-independent replay and lane-table state.
         let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
             + mul(table_bytes, inputs.sequences, "V4 tables")?;
@@ -500,6 +500,37 @@ mod default_tests {
                 "no other graph owner row: {:?}",
                 owners.reserve.iter().map(|owner| owner.name.as_str()).collect::<Vec<_>>());
         }
+    }
+
+    /// The engine allocates one window ring per cached layer plus one per
+    /// dSpark stage, and the lead GPU holds every stage's ring. The compressed
+    /// records are one packed backing per device, so their 2 MiB SM120
+    /// granularity is charged once instead of once per layer.
+    #[test]
+    fn cache_stages_ring_on_the_lead_gpu_and_records_pack_per_device() {
+        use crate::placement::planner::Location;
+        let mut cfg = context_cfg();
+        cfg.n_mtp_layers = 3;
+        let mut input = plan_inputs(&cfg);
+        input.cache_stages = 3;
+        input.attention = Some(AttentionPlacement::Heads);
+        let solved = prepare(&input).unwrap().admit(production_request(&input)).unwrap().solved;
+        let owners = |gpu: u8, group: &str| -> Vec<String> { solved.facts.allocations.iter()
+            .filter(|allocation| allocation.group == group
+                && allocation.location == Location::coordinator(gpu))
+            .map(|allocation| allocation.id.clone()).collect() };
+        for gpu in 0..2u8 {
+            let stages = if gpu == 0 { 3 } else { 0 };
+            assert_eq!(owners(gpu, "window rings").len(), 43 + stages,
+                "rtx{gpu} charges 43 cached layers plus its {stages} dSpark stages");
+            assert_eq!(owners(gpu, "records"), vec![format!("v4.cache.{gpu}.records")],
+                "rtx{gpu} prices the packed records as one backing");
+        }
+        // A stage ring is the same request as a layer's, so the lead GPU's
+        // three extra owners are exactly the draft stages the engine puts there.
+        let records = |gpu: u8| solved.facts.allocations.iter().find(|allocation|
+            allocation.id == format!("v4.cache.{gpu}.records")).unwrap().bytes;
+        assert!(records(0) > 0 && records(1) > 0);
     }
 
     /// The pre-weight base and the code still to load are named Runtime owners

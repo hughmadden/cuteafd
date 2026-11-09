@@ -2124,6 +2124,12 @@ impl<'a> Engine<'a> {
         let before = self.graph_memory_samples()?;
         let captured = run(true);
         captured?;
+        // The capture pass launched nothing, so this is already a completed
+        // boundary: credit its pending captures to the arena before anything
+        // samples Ready, or the growth is only observed at the first request
+        // (the arena would read 935 MB at Ready and 1,005 MB at first request
+        // while the CUDA sample is unchanged). `warm_local_graphs` does the same.
+        self.graph_completed()?;
         let after = self.graph_memory_samples()?;
         let captured = self.graph_captures.get().saturating_sub(runs_before);
         let eager = self.graph_eager.get().saturating_sub(eager_before);

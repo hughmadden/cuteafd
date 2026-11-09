@@ -958,9 +958,15 @@ impl Recipe for PreparedV4<'_> {
             Ok(if context && gpu_fixed { total / 2 + 1 } else { total })
         };
         for gpu in 0..gpus {
-            for (layer, &mode) in self.modes.iter().enumerate() {
+            // The compressed cache records are one packed backing per device: the
+            // pool allocates every layer's records and index units out of it, so
+            // its 2 MiB SM120 granularity is charged once, not once per layer.
+            let mut records_slope = 0u64;
+            let mut records_fixed = 0u64;
+            // One window ring per cached layer plus one per dSpark stage, and the
+            // engine allocates the stages' rings on the lead GPU.
+            for layer in 0..layers(gpu) as usize {
                 let ratio = inputs.cfg.compress_ratios.get(layer).copied().unwrap_or(0);
-                let _ = mode;
                 // Window rings: whole on every GPU, one request per layer.
                 owners.physical(format!("v4.cache.{gpu}.{layer}.main"), gpu as u8,
                     vec![window.checked_mul(sequences).ok_or(Refusal::Overflow("V4 window ring"))?],
@@ -969,13 +975,14 @@ impl Recipe for PreparedV4<'_> {
                     let first = c4_unit(1, true)?;
                     let slope = c4_unit(2, true)?.checked_sub(first)
                         .ok_or(Refusal::Overflow("V4 C4 units"))?;
-                    for (name, unit) in [("records", 37_440u64), ("index", 8_448u64)] {
-                        owners.paged(format!("v4.cache.{gpu}.{layer}.{name}"), gpu as u8,
-                            unit.checked_mul(slope).ok_or(Refusal::Overflow("V4 C4 slope"))?,
-                            unit.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C4 fixed"))?)
-                                .ok_or(Refusal::Overflow("V4 C4 fixed"))?,
-                            SM120_ALLOCATION_GRANULARITY_BYTES,
-                            Category::Kv, "records", Activation::always())?;
+                    for unit in [37_440u64, 8_448u64] {
+                        records_slope = unit.checked_mul(slope)
+                            .and_then(|bytes| records_slope.checked_add(bytes))
+                            .ok_or(Refusal::Overflow("V4 C4 slope"))?;
+                        records_fixed = unit.checked_mul(first.checked_sub(slope)
+                            .ok_or(Refusal::Overflow("V4 C4 fixed"))?)
+                            .and_then(|bytes| records_fixed.checked_add(bytes))
+                            .ok_or(Refusal::Overflow("V4 C4 fixed"))?;
                     }
                     for (index, bytes) in [16 * 1024 * 4u64, 16 * 1024 * 4, 16 * 256 * 4, 16 * 256 * 4]
                         .into_iter().enumerate() {
@@ -987,12 +994,13 @@ impl Recipe for PreparedV4<'_> {
                     let first = c4_unit(1, false)?;
                     let slope = c4_unit(2, false)?.checked_sub(first)
                         .ok_or(Refusal::Overflow("V4 C128 units"))?;
-                    owners.paged(format!("v4.cache.{gpu}.{layer}.records"), gpu as u8,
-                        1_728u64.checked_mul(slope).ok_or(Refusal::Overflow("V4 C128 slope"))?,
-                        1_728u64.checked_mul(first.checked_sub(slope).ok_or(Refusal::Overflow("V4 C128 fixed"))?)
-                            .ok_or(Refusal::Overflow("V4 C128 fixed"))?,
-                        SM120_ALLOCATION_GRANULARITY_BYTES,
-                        Category::Kv, "records", Activation::always())?;
+                    records_slope = 1_728u64.checked_mul(slope)
+                        .and_then(|bytes| records_slope.checked_add(bytes))
+                        .ok_or(Refusal::Overflow("V4 C128 slope"))?;
+                    records_fixed = 1_728u64.checked_mul(first.checked_sub(slope)
+                        .ok_or(Refusal::Overflow("V4 C128 fixed"))?)
+                        .and_then(|bytes| records_fixed.checked_add(bytes))
+                        .ok_or(Refusal::Overflow("V4 C128 fixed"))?;
                     for index in 0..2u64 {
                         owners.physical(format!("v4.cache.{gpu}.{layer}.carry{index}"), gpu as u8,
                             vec![256u64.checked_mul(512).and_then(|n| n.checked_mul(4))
@@ -1001,6 +1009,11 @@ impl Recipe for PreparedV4<'_> {
                             Category::Kv, "compressor carry", Activation::always())?;
                     }
                 }
+            }
+            if records_slope > 0 {
+                owners.paged(format!("v4.cache.{gpu}.records"), gpu as u8,
+                    records_slope, records_fixed, SM120_ALLOCATION_GRANULARITY_BYTES,
+                    Category::Kv, "records", Activation::always())?;
             }
             // Beside the records, not inside them: every admitted lane keeps
             // its own C4 page table as a pool-sized cudaMalloc. Prefill lanes
