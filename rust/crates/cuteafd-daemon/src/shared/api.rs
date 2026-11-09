@@ -1,7 +1,7 @@
 //! Common API policy for every serving family.
 use cuteafd_api::openai::{auth::{ApiKey, Auth}, health::HealthWitness, ModelProfile};
 use anyhow::Context;
-use std::{path::PathBuf, sync::Arc};
+use std::{future::IntoFuture, path::PathBuf, sync::Arc};
 
 /// Admission errors terminate only this request, never the scheduler's receive loop.
 pub(crate) fn admission_result<T>(events: &tokio::sync::mpsc::UnboundedSender<
@@ -231,6 +231,46 @@ pub(crate) async fn watch_scheduler(worker: &mut Option<tokio::task::JoinHandle<
     // Stay pending so select keeps polling the HTTP server after worker death.
     std::future::pending::<()>().await;
 }
+/// Stop monitoring streams immediately, while letting in-flight completions finish.
+pub(crate) async fn serve_http(listener: tokio::net::TcpListener, router: axum::Router,
+    family: &str,
+) -> std::io::Result<()> {
+    serve_http_until(listener, router, family, cuteafd_bench::shutdown_signal(),
+        std::time::Duration::from_secs(10)).await
+}
+
+async fn serve_http_until(listener: tokio::net::TcpListener, router: axum::Router,
+    family: &str, shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    grace: std::time::Duration,
+) -> std::io::Result<()> {
+    let drain = cuteafd_api::shutdown::Drain::default();
+    let signal_drain = drain.clone();
+    let (stopping, stopped) = tokio::sync::oneshot::channel();
+    let signal = async move {
+        shutdown.await;
+        signal_drain.stop_monitors();
+        let _ = stopping.send(());
+    };
+    let server = axum::serve(listener, drain.layer(router)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(signal).into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        _ = stopped => match tokio::time::timeout(grace, &mut server).await {
+            Ok(result) => result,
+            Err(_) => {
+                drain.stop_requests();
+                // Dropping Axum's listener future does not cancel spawned connection tasks.
+                // The body middleware cancels those tasks' work before producer shutdown.
+                let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut server).await;
+                tracing::warn!(family, ?grace, "HTTP completion grace elapsed; cancelled remaining requests");
+                result.unwrap_or(Ok(()))
+            }
+        }
+    }
+}
+
 /// Only called after the listener stops: a broken peer must not prevent trace drain.
 pub(crate) async fn finish_scheduler(worker: &mut Option<tokio::task::JoinHandle<anyhow::Result<()>>>, family: &str) -> anyhow::Result<()> {
     let Some(worker) = worker.take() else { return Ok(()) };
@@ -251,6 +291,82 @@ fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sigterm_closes_monitor_but_preserves_completion_grace() {
+        const CHILD: &str = "CUTEAFD_HTTP_DRAIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let (queue, _requests) = tokio::sync::mpsc::channel(1);
+                let router = cuteafd_api::openai::router(queue).route("/completion-fixture", axum::routing::get(|| async {
+                    let stream = async_stream::stream! {
+                        yield Ok::<_, std::convert::Infallible>("data: started\n\n");
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        yield Ok("data: [DONE]\n\n");
+                    };
+                    axum::body::Body::from_stream(stream)
+                }));
+                let clients = tokio::spawn(async move {
+                    let client = reqwest::Client::new();
+                    let monitor = client.get(format!("http://{address}/v1/console/events")).send().await.unwrap();
+                    let mut completion = client.get(format!("http://{address}/completion-fixture")).send().await.unwrap();
+                    assert!(completion.chunk().await.unwrap().is_some());
+                    println!("TRACE_SERVER_READY {}", std::process::id());
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                    let start = std::time::Instant::now();
+                    let text = monitor.text().await.unwrap();
+                    assert!(text.contains("data:"));
+                    assert!(start.elapsed() < std::time::Duration::from_millis(1000), "monitor did not stop promptly");
+                    assert!(completion.text().await.unwrap().contains("[DONE]"), "completion cut off during grace");
+                });
+                crate::shared::api::serve_http(listener, router, "trace fixture").await.unwrap();
+                clients.await.unwrap();
+            });
+            return;
+        }
+        let mut child = std::process::Command::new("/usr/bin/timeout")
+            .args(["--signal=KILL", "20"]).arg(std::env::current_exe().unwrap())
+            .args(["--exact", "shared::api::tests::sigterm_closes_monitor_but_preserves_completion_grace", "--nocapture"])
+            .env(CHILD, "1").stdout(std::process::Stdio::piped()).spawn().unwrap();
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut signalled = false;
+        for line in reader.lines() {
+            let line = line.unwrap();
+            if let Some((_, pid)) = line.split_once("TRACE_SERVER_READY ") {
+                assert!(std::process::Command::new("/bin/kill").args(["-TERM", pid.trim()]).status().unwrap().success());
+                signalled = true;
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        assert!(signalled);
+    }
+
+    #[tokio::test]
+    async fn stalled_completion_is_cancelled_after_its_grace() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (signal, shutdown) = tokio::sync::oneshot::channel();
+        let router = axum::Router::new().route("/stalled", axum::routing::get(|| async {
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::convert::Infallible>("started");
+                std::future::pending::<()>().await;
+            };
+            axum::body::Body::from_stream(stream)
+        }));
+        let server = tokio::spawn(serve_http_until(listener, router, "stalled fixture",
+            async { let _ = shutdown.await; }, std::time::Duration::from_millis(30)));
+        let mut response = reqwest::get(format!("http://{address}/stalled")).await.unwrap();
+        assert!(response.chunk().await.unwrap().is_some());
+        let start = std::time::Instant::now();
+        signal.send(()).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), response.text()).await.unwrap().unwrap().is_empty());
+        assert!(start.elapsed() >= std::time::Duration::from_millis(25));
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await.unwrap().unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn scheduler_join_is_only_after_http_ends_and_is_bounded() {
         let (finish, wait) = tokio::sync::oneshot::channel();

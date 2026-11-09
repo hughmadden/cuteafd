@@ -9,6 +9,15 @@ use std::time::{Duration, Instant};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Cycle { Decode, Verify, Prefill, Wave, Other }
 
+fn serialize_cycles<S: serde::Serializer, T: serde::Serialize>(cycles: &HashMap<Cycle, T>, serializer: S) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(cycles.len()))?;
+    for cycle in [Cycle::Decode, Cycle::Verify, Cycle::Prefill, Cycle::Wave, Cycle::Other] {
+        if let Some(value) = cycles.get(&cycle) { map.serialize_entry(&cycle, value)?; }
+    }
+    map.end()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Preference { Adaptive, Capture, Eager }
 
@@ -89,6 +98,7 @@ pub(crate) struct Snapshot {
     pub charged: u64,
     pub pinned: u64,
     pub pending_capture: u64,
+    #[serde(serialize_with = "serialize_cycles")]
     pub cycles: HashMap<Cycle, Counters>,
     pub pools: Pools,
     pub basis: Basis,
@@ -225,6 +235,7 @@ pub(crate) struct TraceRow {
     identity: Identity,
     cycle: Cycle,
     count: u64,
+    #[serde(serialize_with = "serialize_cycles")]
     cycles: HashMap<Cycle, u64>,
     first_seen_ms: u64,
     hits: u64,
@@ -911,7 +922,7 @@ impl TraceSnapshot {
         let document = serde_json::json!({"schema_version": 2, "cache": self.cache, "graphs": rows,
             "sites": self.classes.iter().map(|(name, class)| (*name, serde_json::json!({
                 "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
-            }))).collect::<HashMap<_, _>>()});
+            }))).collect::<std::collections::BTreeMap<_, _>>()});
         serde_json::to_vec(&document).map_err(std::io::Error::other)
     }
 }
@@ -1105,7 +1116,7 @@ mod tests {
             let document = serde_json::json!({"schema_version": 2, "cache": cache.snapshot(), "graphs": rows,
                 "sites": cache.classes.iter().map(|(name, class)| (*name, serde_json::json!({
                     "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
-                }))).collect::<HashMap<_, _>>()});
+                }))).collect::<std::collections::BTreeMap<_, _>>()});
             black_box(serde_json::to_vec(&document).unwrap());
         }
         println!("graph trace 5000 records: legacy {:.1} us -> raw copy {:.1} us (no filesystem, {} iterations)",

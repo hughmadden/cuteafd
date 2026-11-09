@@ -613,9 +613,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     crate::shared::memory_report::log("ready");
     let mut handle = Some(handle);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(cuteafd_bench::shutdown_signal()) => served?,
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "step5") => served?,
         _ = crate::shared::api::watch_scheduler(&mut handle) => unreachable!(),
     }
     crate::shared::api::finish_scheduler(&mut handle, "step5").await?;

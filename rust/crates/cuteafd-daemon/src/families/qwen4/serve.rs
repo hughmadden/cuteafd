@@ -132,9 +132,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
     let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .with_graceful_shutdown(cuteafd_bench::shutdown_signal()) => served?,
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "qwen4") => served?,
         _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
     crate::shared::api::finish_scheduler(&mut worker, "qwen4").await?;
