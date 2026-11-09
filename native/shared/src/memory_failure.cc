@@ -3,6 +3,21 @@
 #include <cstring>
 #include <string>
 
+std::string cuteafd_format_allocation_failure(const char* action, size_t bytes,
+    const char* owner, const std::string& error, const cuteafd_allocation_diagnostics& diagnostics) {
+  std::string message = std::string(action) + ": " + error +
+      "; requested_bytes=" + std::to_string(bytes) + "; owner=" +
+      (owner && owner[0] ? owner : "unavailable");
+  message += diagnostics.device_error.empty()
+      ? "; device=" + std::to_string(diagnostics.device)
+      : "; device unavailable: " + diagnostics.device_error;
+  message += diagnostics.memory_error.empty()
+      ? "; free_bytes=" + std::to_string(diagnostics.free_bytes) +
+          "; total_bytes=" + std::to_string(diagnostics.total_bytes)
+      : "; free/total unavailable: " + diagnostics.memory_error;
+  return message;
+}
+
 namespace {
 // The most recent tag this thread attempted, retained (owner copied) so a
 // failure report raised after the allocator returns can name what was asked for.

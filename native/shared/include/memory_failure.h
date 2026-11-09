@@ -39,6 +39,20 @@ int32_t cuteafd_last_allocation_tag(uint32_t* kind, char* owner, size_t owner_by
 #ifdef __cplusplus
 }
 
+#include <string>
+
+struct cuteafd_allocation_diagnostics {
+  int device = -1;
+  size_t free_bytes = 0;
+  size_t total_bytes = 0;
+  std::string device_error;
+  std::string memory_error;
+};
+
+// Pure formatting: CUDA queries stay at the failing allocation boundary.
+std::string cuteafd_format_allocation_failure(const char* action, size_t bytes,
+    const char* owner, const std::string& error, const cuteafd_allocation_diagnostics& diagnostics);
+
 // Evaluate the raw call once and retain its API-domain status before cleanup.
 template <typename Status>
 inline Status cuteafd_checked_memory_call(const char* api, const char* domain,

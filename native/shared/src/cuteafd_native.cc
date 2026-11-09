@@ -537,6 +537,21 @@ cuteafd_status_t fail_cuda(cuteafd_status_t status, const char* action, cudaErro
   return fail(status, std::string(action) + ": " + cudaGetErrorString(err));
 }
 
+std::string cuda_allocation_failure(const char* action, size_t bytes, const char* owner,
+                                    cudaError_t err) {
+  const auto describe = [](cudaError_t code) {
+    return std::string(cudaGetErrorName(code)) + " (" + cudaGetErrorString(code) + ")";
+  };
+  // Retain the allocation error before diagnostic calls can fail themselves.
+  const std::string original_error = describe(err);
+  cuteafd_allocation_diagnostics diagnostics;
+  const cudaError_t device_error = cudaGetDevice(&diagnostics.device);
+  if (device_error != cudaSuccess) diagnostics.device_error = describe(device_error);
+  const cudaError_t memory_error = cudaMemGetInfo(&diagnostics.free_bytes, &diagnostics.total_bytes);
+  if (memory_error != cudaSuccess) diagnostics.memory_error = describe(memory_error);
+  return cuteafd_format_allocation_failure(action, bytes, owner, original_error, diagnostics);
+}
+
 void set_version_string(char* dst, size_t dst_len, int version) {
   char buffer[64] = {};
   std::snprintf(buffer, sizeof(buffer), "%d.%d", version / 1000, (version % 1000) / 10);
@@ -1054,7 +1069,8 @@ extern "C" cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_de
   void* ptr = nullptr;
   cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMalloc", "cuda", cudaMalloc(&ptr, bytes), bytes, 1, nullptr);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMalloc failed", err);
+    return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
+                cuda_allocation_failure("cudaMalloc failed", bytes, owner, err));
   }
 #else
   void* ptr = CUTEAFD_MALLOC(bytes);
@@ -1092,7 +1108,8 @@ extern "C" cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes,
   void* ptr = nullptr;
   cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaMallocManaged", "cuda", cudaMallocManaged(&ptr, bytes, cudaMemAttachGlobal), bytes, 1, nullptr);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaMallocManaged failed", err);
+    return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
+                cuda_allocation_failure("cudaMallocManaged failed", bytes, owner, err));
   }
   out->ptr = ptr;
   out->bytes = bytes;
@@ -1141,7 +1158,8 @@ extern "C" cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t byte
 #if CUTEAFD_NATIVE_ENABLE_CUDA
   cudaError_t err = CUTEAFD_CHECK_MEMORY("cudaHostRegister", "cuda", cudaHostRegister(ptr, bytes, cudaHostRegisterPortable), bytes, 1, nullptr);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostRegister failed", err);
+    return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
+                cuda_allocation_failure("cudaHostRegister failed", bytes, owner, err));
   }
   return ok();
 #else
@@ -1177,7 +1195,8 @@ extern "C" cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host
   cudaError_t err =
       CUTEAFD_CHECK_MEMORY("cudaHostAlloc", "cuda", cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable | cudaHostAllocMapped), bytes, 1, nullptr);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED, "cudaHostAlloc failed", err);
+    return fail(CUTEAFD_STATUS_ALLOCATION_FAILED,
+                cuda_allocation_failure("cudaHostAlloc failed", bytes, owner, err));
   }
   out->ptr = ptr;
   out->bytes = bytes;
@@ -3621,9 +3640,11 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
         send_registered_span_bytes, 1, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings",
         cudaHostAlloc(&send_buffer, send_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
     if (cuda_status != cudaSuccess) {
+      const std::string message = cuda_allocation_failure(
+          "cudaHostAlloc RDMA RC endpoint send buffer failed", send_registered_span_bytes,
+          "transport/rdma-rings", cuda_status);
       destroy_rdma_rc_endpoint(endpoint);
-      return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
-                       "cudaHostAlloc RDMA RC endpoint send buffer failed", cuda_status);
+      return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, message);
     }
     endpoint->send_buffer = static_cast<unsigned char*>(send_buffer);
     void* recv_buffer = nullptr;
@@ -3631,9 +3652,11 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
         recv_registered_span_bytes, 1, CUTEAFD_MEMORY_KIND_TRANSPORT, "transport/rdma-rings",
         cudaHostAlloc(&recv_buffer, recv_registered_span_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
     if (cuda_status != cudaSuccess) {
+      const std::string message = cuda_allocation_failure(
+          "cudaHostAlloc RDMA RC endpoint recv buffer failed", recv_registered_span_bytes,
+          "transport/rdma-rings", cuda_status);
       destroy_rdma_rc_endpoint(endpoint);
-      return fail_cuda(CUTEAFD_STATUS_ALLOCATION_FAILED,
-                       "cudaHostAlloc RDMA RC endpoint recv buffer failed", cuda_status);
+      return fail(CUTEAFD_STATUS_ALLOCATION_FAILED, message);
     }
     endpoint->recv_buffer = static_cast<unsigned char*>(recv_buffer);
 #endif
@@ -4205,13 +4228,25 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
       (cq = ibv_create_cq(context, 16, nullptr, nullptr, 0)) == nullptr) {
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RDMA device setup failed for the landing probe");
   }
-  if (CUTEAFD_TRACK_ALLOC("cudaMalloc", &gpu, bytes, 0, CUTEAFD_MEMORY_KIND_TRANSPORT,
-          "native/rdma-landing-probe", cudaMalloc(&gpu, bytes)) != cudaSuccess ||
-      CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &send, frame, 1, CUTEAFD_MEMORY_KIND_STAGING,
-          "native/rdma-landing-probe-send", cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable)) != cudaSuccess ||
-      CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &recv, frame, 1, CUTEAFD_MEMORY_KIND_STAGING,
-          "native/rdma-landing-probe-recv", cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable)) != cudaSuccess) {
-    return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, "GPU landing probe allocation failed");
+  cudaError_t allocation_error = CUTEAFD_TRACK_ALLOC("cudaMalloc", &gpu, bytes, 0,
+      CUTEAFD_MEMORY_KIND_TRANSPORT, "native/rdma-landing-probe", cudaMalloc(&gpu, bytes));
+  if (allocation_error != cudaSuccess) {
+    return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, cuda_allocation_failure(
+        "cudaMalloc GPU landing probe failed", bytes, "native/rdma-landing-probe", allocation_error));
+  }
+  allocation_error = CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &send, frame, 1,
+      CUTEAFD_MEMORY_KIND_STAGING, "native/rdma-landing-probe-send",
+      cudaHostAlloc(reinterpret_cast<void**>(&send), frame, cudaHostAllocPortable));
+  if (allocation_error != cudaSuccess) {
+    return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, cuda_allocation_failure(
+        "cudaHostAlloc GPU landing probe send failed", frame, "native/rdma-landing-probe-send", allocation_error));
+  }
+  allocation_error = CUTEAFD_TRACK_ALLOC("cudaHostAlloc", &recv, frame, 1,
+      CUTEAFD_MEMORY_KIND_STAGING, "native/rdma-landing-probe-recv",
+      cudaHostAlloc(reinterpret_cast<void**>(&recv), frame, cudaHostAllocPortable));
+  if (allocation_error != cudaSuccess) {
+    return bail(CUTEAFD_STATUS_ALLOCATION_FAILED, cuda_allocation_failure(
+        "cudaHostAlloc GPU landing probe recv failed", frame, "native/rdma-landing-probe-recv", allocation_error));
   }
   const cuteafd_status_t registered = register_device_dmabuf(pd, gpu, bytes, &gpu_mr);
   if (registered != CUTEAFD_STATUS_OK) {
