@@ -422,7 +422,7 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 shared_graph_census_args() {
 graph_census_args=()
 if [[ "$family" == qwen3_5 ]]; then
-  case "$(get DECODE_GRAPHS off)" in
+  case "$(get DECODE_GRAPHS on)" in
     on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
     off) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
     *) release_die "DECODE_GRAPHS must be on or off" ;;
@@ -2517,7 +2517,7 @@ audio_encoder_hash=""
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
   if [[ "$family" == qwen3_5 ]]; then
-    case "$(get DECODE_GRAPHS off)" in
+    case "$(get DECODE_GRAPHS on)" in
       on) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
       off) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
       *) release_die "DECODE_GRAPHS must be on or off" ;;

@@ -1690,6 +1690,15 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
         MODULE.generate_qwen35([data], layout["variant"])
 
 
+def test_dense_qwen_launcher_defaults_graphs_on_for_plan_and_serve():
+    launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
+    for section in ("shared_graph_census_args()", "plan_profile_env=()"):
+        dense = launcher.split(section, 1)[1].split('if [[ "$family" == qwen3_5 ]]; then', 1)[1].split("esac", 1)[0]
+        assert 'case "$(get DECODE_GRAPHS on)" in' in dense
+        assert "CUTEAFD_QWEN35_GRAPHS=1" in dense
+        assert "CUTEAFD_QWEN35_GRAPHS=0" in dense
+
+
 def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     root = SCRIPT.parents[2]
     engine = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/engine.rs").read_text()

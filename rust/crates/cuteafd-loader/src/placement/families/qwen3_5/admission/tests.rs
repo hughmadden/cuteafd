@@ -50,14 +50,14 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
             for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
                 let items = plan.items_at(Location::coordinator(0), phase).unwrap();
                 let owners = items.iter().filter(|item|
-                    item.group.starts_with("Dense Qwen context and selected modules:")).collect::<Vec<_>>();
+                    crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
                 assert_eq!(owners.len(), usize::from(sampled > 0));
                 assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), sampled);
                 let breakdown = crate::placement::reserve::breakdown("rtx0",
                     cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30,
                     plan.budgets[0].headroom, &items);
                 assert_eq!(breakdown.reserve.iter().filter(|owner|
-                    owner.name == "Dense Qwen context and selected modules")
+                    owner.name == "sampled baseline")
                     .map(|owner| owner.bytes).sum::<u64>(), sampled);
                 let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
                 let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
@@ -68,9 +68,37 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
     }
     let offline = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
     assert!(!offline.facts.allowances.iter().any(|owner|
-        owner.source.starts_with("Dense Qwen context and selected modules:")));
+        crate::placement::sampled_baseline::is_source(&owner.source)));
     assert!(sampled_budgets((96 << 30) + 1, 96 << 30, None,
         (128 << 30, 128 << 30)).is_err());
+}
+
+#[test]
+fn sampled_preweight_owner_survives_gpu_reserve_override_without_changing_capacity() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let (cfg, weights, buffers, arena) = fixture();
+    let occupied = 682_885_120;
+    for reserve in [0, 200 << 20] {
+        MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+            let live = sampled_budgets((96 << 30) - occupied, 96 << 30, Some(80 << 30),
+                (128 << 30, 128 << 30)).unwrap();
+            let previous = solve(request(), live.clone(), &facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let plan = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            assert_eq!(plan.pool_tokens, previous.pool_tokens);
+            assert_eq!(plan.decisions, previous.decisions);
+            assert_eq!(plan.budgets[0].headroom, reserve);
+            let owners = plan.facts.allowances.iter().filter(|owner|
+                crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, occupied);
+            for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                assert_eq!(now.available - now.owned - now.opaque,
+                    before.available - before.owned - before.opaque);
+            }
+        });
+    }
 }
 
 #[test]

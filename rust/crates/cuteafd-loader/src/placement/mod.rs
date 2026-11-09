@@ -28,6 +28,7 @@ pub mod runtime_memory;
 mod pool;
 pub mod reserve;
 pub mod graph_reserve;
+pub mod sampled_baseline;
 pub mod attention;
 mod residual;
 mod solve;

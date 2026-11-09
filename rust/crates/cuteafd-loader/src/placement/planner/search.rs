@@ -808,10 +808,9 @@ impl Search<'_> {
 }
 
 /// `GPU_RESERVE` / `SPARK_RESERVE` replace a device kind's whole reserve:
-/// every built-in reserve component (runtime, graph and reserved charges,
-/// opaque allowances) on those devices is dropped and the budget keeps the
-/// override free instead. Sampled occupancy stays in the baseline: those
-/// bytes are already held, not a component.
+/// anonymous runtime/reserved allocations and opaque allowances are dropped,
+/// and the budget keeps the override free instead. Physical driver costs,
+/// graph owners and named sampled occupancy survive: they are not reserves.
 pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Budget]) {
     use cuteafd_core::memory_policy::{DeviceKind, MemoryPolicy};
     let policy = MemoryPolicy::current();
@@ -824,7 +823,8 @@ pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Bud
         .is_some_and(|kind| policy.reserve_override(kind).is_some());
     contract.components.retain(|component| {
         let reserve = match &component.kind {
-            ComponentKind::Allowance(allowance) if crate::placement::graph_reserve::is_source(&allowance.source) => None,
+            ComponentKind::Allowance(allowance) if crate::placement::graph_reserve::is_source(&allowance.source)
+                || crate::placement::sampled_baseline::is_source(&allowance.source) => None,
             ComponentKind::Allowance(allowance) => Some(allowance.location),
             // Explicit reserve replaces anonymous reserve owners, not physical driver costs.
             ComponentKind::DriverPageTables { .. } => None,

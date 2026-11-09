@@ -121,8 +121,9 @@ pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
                 bytes: ByteCurve::fixed(occupied, contract.maximum_pages),
                 kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
                     bytes: occupied, lifetime: Lifetime::RESIDENT, assumed: false,
-                    source: format!("Dense Qwen context and selected modules: {occupied} B occupied at the \
-                        {free} B free sample of {} B; {source}", budget.physical_bytes) }) });
+                    source: crate::placement::sampled_baseline::source(&format!(
+                        "Dense Qwen context and selected modules; {occupied} B occupied at the \
+                        {free} B free sample of {} B; {source}", budget.physical_bytes)) }) });
         }
         // Move the same sampled bytes into a named owner, never charge both.
         budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
