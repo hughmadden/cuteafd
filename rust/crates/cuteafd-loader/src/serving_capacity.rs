@@ -263,7 +263,7 @@ pub enum CacheGeometryError {
         what: &'static str,
     },
     #[error("graph reserve: {0}")]
-    GraphReserve(String),
+    GraphReserve(#[source] crate::placement::graph_reserve::Error),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
