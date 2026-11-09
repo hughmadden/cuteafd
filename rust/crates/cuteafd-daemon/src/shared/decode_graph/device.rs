@@ -652,8 +652,7 @@ impl DeviceCache {
     pub fn captured_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
         let Some(record) = self.records.get_mut(&id) else { return };
         // Peer pointers in kernel arguments are invisible to native inspection.
-        let spans_devices = spans_devices || record.spans_devices;
-        record.spans_devices = spans_devices;
+        let spans_devices = spans_devices || record.stats.spans_devices;
         if width != 1 || spans_devices {
             // Previously reserved chain discounts are no longer justified,
             // including pending captures elsewhere on this device.
@@ -1485,6 +1484,22 @@ mod tests {
             assert_eq!(cache.pending_growth, 30);
             assert!(matches!(cache.miss(key(4), declared, None, false), Miss::Eager));
         }
+    }
+
+    #[test]
+    fn declared_peer_span_survives_single_device_native_inspection() {
+        let mut cache = DeviceCache::new(-8803, 100);
+        let mut peer_site = site(Preference::Capture);
+        peer_site.spans_devices = true;
+        let Miss::Capture(id) = cache.miss(key(1), peer_site, None, false) else { panic!("capture expected") };
+        assert!(cache.chain_only);
+        cache.captured_topology(id, 1, 1, false);
+        assert!(!cache.chain_only);
+        assert!(cache.records[&id].stats.spans_devices);
+        assert!(cache.pending_growth >= cache.pending_bytes);
+        cache.measured_capture(10);
+        cache.captured_topology(id, 1, 1, false);
+        assert!(!cache.chain_only);
     }
 
     #[test]
