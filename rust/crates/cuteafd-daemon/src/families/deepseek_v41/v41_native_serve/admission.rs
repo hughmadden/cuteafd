@@ -256,10 +256,17 @@ fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
+/// `modules` is each coordinator GPU's measured module-image extent: the
+/// free-memory drop across the pre-weight preload window
+/// (`RuntimeInventory::measure`, `InventoryPhase::PreWeight`). That measurement
+/// is the predicted runtime base's module half, in place of the offline
+/// layout's generic program-count estimate. Empty means no predicted base is
+/// charged and the sampled pre-weight availability stays the budget baseline.
 pub(super) fn admit_startup(
     lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
+    modules: &[u64],
 ) -> Result<Admitted> {
     use super::*;
     validate_owner_modes(args)?;
@@ -348,7 +355,7 @@ pub(super) fn admit_startup(
     }
     lib.cuda_set_device(0)?;
     let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
-        &fixed_demands, &weight_arenas, &startup, draft.as_ref())
+        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), modules)
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
     tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
         host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");
@@ -475,6 +482,15 @@ pub(super) struct Admitted {
     pub placement: Placement,
     pub host: families::deepseek_v41::admission::HostFacts,
     pub host_ledger: cuteafd_core::memory_layout::HostLayout,
+    /// The admitted plan, kept so the Ready boundary can verify its predicted
+    /// runtime-base owners against the device without re-solving.
+    pub solved: cuteafd_loader::placement::planner::ResolvedPlan,
+    /// The checkpoint header the plan was admitted from, kept for the pre-pool
+    /// measurement's pool re-fit (never re-read from disk).
+    pub config: serde_json::Value,
+    /// The pool policy's ceiling, exactly the value `prepare` bounded the
+    /// solve with.
+    pub maximum_pool_tokens: u64,
 }
 
 pub(super) fn local_workspace(
@@ -506,11 +522,14 @@ pub(super) fn resolve(
     minimum: usize,
     draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
-    resolve_with_owners(args, memory, experts, workspace, deferred, minimum, &[], &[], &[], draft)
+    resolve_with_owners(args, memory, experts, workspace, deferred, minimum, &[], &[], &[], draft, &[])
 }
 
 /// `startup` contains full sequential peaks above `memory`, never staging-only
 /// deltas. Draft owners supplied separately must not also appear in `owners`.
+/// `modules` is the predicted module-image extent of each coordinator GPU's
+/// selected native program set; empty keeps the measured pre-weight sample as
+/// the budget's baseline instead of charging a predicted runtime base.
 ///
 /// One typed request over the sampled owners: the same component contract the
 /// offline planner admits decides the pool and the local expert prefix, and
@@ -526,6 +545,7 @@ pub(super) fn resolve_with_owners(
     weight_arenas: &[cuteafd_loader::serving_capacity::WeightArenaLayout],
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
+    modules: &[u64],
 ) -> Result<Admitted> {
     use families::deepseek_v41::admission::{
         self, live_budgets, production_request, Owner, ProductionInput,
@@ -535,9 +555,14 @@ pub(super) fn resolve_with_owners(
     cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     let ranks = memory.len();
     ensure!(
-        matches!(ranks, 1 | 2) && deferred.len() == ranks && minimum <= experts.len(),
+        matches!(ranks, 1 | 2) && deferred.len() == ranks && minimum <= experts.len()
+            && (modules.is_empty() || modules.len() == ranks),
         "invalid V4.1 admission inventory"
     );
+    // A whole-GPU reserve drops the family's Runtime owners in the planner's
+    // override, so the predicted runtime base and the whole-cap baseline go
+    // together: with a reserve the measured sample stays the baseline.
+    let charged = !modules.is_empty() && !admission::whole_gpu_reserve();
     ensure!(
         (0..=1_048_576).contains(&args.max_context_tokens),
         "invalid V4.1 context limit"
@@ -606,6 +631,16 @@ pub(super) fn resolve_with_owners(
         allowances.extend(admission::growth_allowances(sample.1 as u64, ranks, gpu as u8));
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
+    if charged {
+        // The runtime base the pre-weight sample holds, named component by
+        // component: the calibrated CUDA context and the selected native
+        // program images. Both are already inside the sample (marked
+        // `pre_sample`), so the sequential load peaks do not price them again.
+        for (gpu, &bytes) in modules.iter().enumerate() {
+            let arch = cuteafd_loader::placement::ArchContext::coordinator(totals[gpu], None);
+            retained.extend(admission::runtime_base(gpu as u8, &arch, bytes));
+        }
+    }
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
         retained.push(Owner::charged(
             gpu as u8,
@@ -657,7 +692,11 @@ pub(super) fn resolve_with_owners(
     }
     retained.extend(host.owners.clone());
     allowances.extend(host.estimates.clone());
-    let mut budgets = live_budgets(&cards, &sparks)?;
+    let mut budgets = if charged {
+        admission::live_budgets_charged(&cards, &sparks)?
+    } else {
+        live_budgets(&cards, &sparks)?
+    };
     budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
         0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
     let mut blas = families::deepseek_v41::owners::blas_owners(ranks,
@@ -743,6 +782,9 @@ pub(super) fn resolve_with_owners(
         global_bytes: groups * (5 * 256 * 356),
         reservation_bytes: ceilings,
         placement,
+        solved: admitted.solved,
+        maximum_pool_tokens: pool.maximum_tokens(),
+        config,
     })
 }
 
@@ -783,6 +825,122 @@ pub(super) fn expert_demands(
             Ok(cost)
         })
         .collect()
+}
+
+/// The residual bar the memory campaign holds a plan to: a named-owner ledger
+/// within this of the device at Ready needs no further attribution.
+const RUNTIME_BASE_RESIDUAL_BAR: u64 = 50 << 20;
+
+/// Report the predicted runtime base against the device at Ready, component by
+/// component: the calibrated CUDA context and the measured module-image extent,
+/// read back from the owners admission charged. Verification only: the pool
+/// already exists, so a residual never changes placement; it reports the part
+/// of the device's runtime base the two predicted owners do not name.
+pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admitted) -> Result<()> {
+    use families::deepseek_v41::admission::{runtime_base_check, runtime_base_components, whole_gpu_reserve};
+    // With a whole-GPU reserve the sample is the budget's baseline and no
+    // predicted owner exists to verify.
+    if whole_gpu_reserve() { return Ok(()); }
+    let ranks = admitted.placement.items.len();
+    let current = lib.cuda_get_device()?;
+    for gpu in 0..ranks {
+        lib.cuda_set_device(gpu as i32)?;
+        let (free, total) = lib.cuda_memory_info()?;
+        let used = (total as u64).saturating_sub(free as u64);
+        let components = runtime_base_components(&admitted.solved.facts, gpu as u8);
+        let (predicted, measured) = runtime_base_check(&admitted.solved.facts, gpu as u8, used)
+            .with_context(|| format!("V4.1 runtime base verification on GPU {gpu}"))?;
+        ensure!(components.total() == predicted,
+            "V4.1 runtime base on GPU {gpu} reports {} charged bytes against a prediction of {predicted}",
+            components.total());
+        let residual = i128::from(measured) - i128::from(predicted);
+        if residual.unsigned_abs() > u128::from(RUNTIME_BASE_RESIDUAL_BAR) {
+            tracing::warn!(gpu, context_bytes = components.context_bytes,
+                module_bytes = components.module_bytes, predicted_bytes = predicted,
+                measured_bytes = measured, residual_bytes = %residual,
+                bar_bytes = RUNTIME_BASE_RESIDUAL_BAR,
+                "V4.1 predicted runtime base leaves a residual (device state beyond the CUDA context and module images)");
+        } else {
+            tracing::info!(gpu, context_bytes = components.context_bytes,
+                module_bytes = components.module_bytes, predicted_bytes = predicted,
+                measured_bytes = measured, residual_bytes = %residual, "V4.1 predicted runtime base");
+        }
+    }
+    lib.cuda_set_device(current)?;
+    Ok(())
+}
+
+/// Adopt the pre-pool device measurement into the admitted plan (#1634).
+///
+/// Called once, after the last loading owner and before the KV pool exists:
+/// the device's occupancy at that point is exactly the plan's owners plus
+/// what the plan cannot name — the driver's 2 MiB backing beyond each live
+/// request, and any remaining device state. The measurement is charged as
+/// named occupancy and the pool is re-fitted to what the budgets still hold,
+/// so a budget-bound boot loses KV instead of discovering the bytes at Ready.
+pub(super) fn adopt_measured_pool(
+    lib: &cuteafd_ffi::NativeLibrary,
+    args: &crate::cli::NativeServeArgs,
+    admitted: &mut Admitted,
+) -> Result<u32> {
+    use cuteafd_ffi::memory_ledger::{Space, snapshot};
+    use families::deepseek_v41::admission::{MeasuredOccupancy, adopt_measured, untracked_ready_owners, whole_gpu_reserve};
+    // A whole-GPU reserve replaces the named runtime owners with the budget's
+    // sampled baseline, so there is no prediction to reconcile.
+    if whole_gpu_reserve() { return Ok(admitted.served_context); }
+    let gpus = admitted.placement.items.len();
+    let current = lib.cuda_get_device()?;
+    let mut measured = Vec::with_capacity(gpus);
+    for gpu in 0..gpus {
+        lib.cuda_set_device(gpu as i32)?;
+        let (free, total) = lib.cuda_memory_info()?;
+        let used = (total as u64).saturating_sub(free as u64);
+        let device = lib.cuda_get_device()?;
+        let ledger = snapshot();
+        let tracked = ledger.total(Space::Device, device) as u64;
+        let rounding = ledger.granularity.get(&(Space::Device, device)).copied().unwrap_or_default();
+        let backing = rounding.tail as u64;
+        let named = untracked_ready_owners(&admitted.solved.facts, gpu as u8)?;
+        let unattributed = used
+            .saturating_sub(tracked)
+            .saturating_sub(named)
+            .saturating_sub(backing);
+        tracing::info!(gpu, used_bytes = used, tracked_bytes = tracked,
+            named_bytes = named, backing_bytes = backing,
+            large_requests = rounding.large_requests, small_bytes = rounding.small_bytes,
+            unattributed_bytes = unattributed,
+            "V4.1 pre-pool device measurement");
+        measured.push(MeasuredOccupancy { gpu: gpu as u8, backing, unattributed });
+    }
+    lib.cuda_set_device(current)?;
+    let ranks = gpus;
+    let slots = args.concurrency as u64;
+    let retained = args.resolved_prefix_entries() as u64;
+    let adopted = adopt_measured(&admitted.config, ranks, slots, retained,
+        args.tp2_attention, admitted.maximum_pool_tokens, &mut admitted.solved, &measured)
+        .context("V4.1 pre-pool measurement adoption")?;
+    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
+        &admitted.config, ranks, slots, adopted.groups, args.tp2_attention)?;
+    ensure!(exact == adopted.bytes, "adopted V4.1 cache owners differ from allocator");
+    let groups = usize::try_from(adopted.groups)?;
+    // The runtime geometry follows the adopted plan exactly: the same page
+    // array, per-GPU cache bytes and global extent the solve would have built.
+    admitted.pages = [groups, groups, groups, 2 * groups];
+    admitted.cache_bytes = exact.into_iter()
+        .map(usize::try_from)
+        .collect::<std::result::Result<_, _>>()?;
+    admitted.global_bytes = groups * (5 * 256 * 356);
+    admitted.placement.pool_tokens = admitted.solved.pool_tokens;
+    admitted.placement.items = (0..ranks)
+        .map(|rank| admitted.solved.items(
+            cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
+        .collect::<std::result::Result<_, _>>()?;
+    admitted.served_context = u32::try_from(admitted.solved.served_context())?;
+    tracing::info!(pages = adopted.pages, groups = adopted.groups,
+        pool_tokens = admitted.placement.pool_tokens, cache_bytes = ?admitted.cache_bytes,
+        served_context = admitted.served_context,
+        "V4.1 pool re-fitted to the measured pre-pool device state");
+    Ok(admitted.served_context)
 }
 
 /// Charge all occupancy arriving after the context/module inventory, including
@@ -972,7 +1130,7 @@ mod admission_tests {
                         super::super::attention_plan(&args)?;
                         embedding_placement(args.embedding_placement, memory[0].1);
                         resolve_with_owners(&args, &memory, experts.clone(), workspace,
-                            &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], &[], None)
+                            &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], &[], None, &[])
                     })?;
                     assert!(admitted.placement.pool_tokens >= 262_144);
                     if let Some(pool) = pool_tokens.filter(|&n| n > 0) {
@@ -1002,12 +1160,12 @@ mod admission_tests {
                     let over = [Demand::new(0, Category::Staging, "synthetic load overflow",
                         (80 << 30) + 1, Basis::Exact)];
                     assert!(resolve_with_owners(&args, &memory, experts.clone(), workspace,
-                        &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], &over, None).is_err());
+                        &vec![0; ranks], usize::from(ranks == 2), &fixed, &[], &over, None, &[]).is_err());
                     let mut missing_owner = fixed.clone();
                     missing_owner.push(Demand::new(0, Category::Workspace,
                         "synthetic owner overflow", 80 << 30, Basis::Exact));
                     assert!(resolve_with_owners(&args, &memory, experts.clone(), workspace,
-                        &vec![0; ranks], usize::from(ranks == 2), &missing_owner, &[], &[], None).is_err());
+                        &vec![0; ranks], usize::from(ranks == 2), &missing_owner, &[], &[], None, &[]).is_err());
                 }
             }
         }
@@ -1105,7 +1263,7 @@ mod admission_tests {
             // borrows the serving pool's Markov GEMM backend.
             let loaded_draft = DraftInventory::default();
             let original = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
-                &fixed, &[], &[], Some(&loaded_draft))?;
+                &fixed, &[], &[], Some(&loaded_draft), &[])?;
             assert_eq!(moved.cache_bytes, original.cache_bytes);
             for gpu in 0..ranks {
                 let total = |items: &[cuteafd_core::memory_layout::Item]| items.iter().map(|i| i.bytes).sum::<u64>();
@@ -1120,7 +1278,43 @@ mod admission_tests {
             let peak = [Demand::new(home, Category::Staging, "full draft load phase",
                 81 << 30, Basis::Exact)];
             assert!(resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; ranks], 0,
-                &[], &[], &peak, Some(&draft)).is_err());
+                &[], &[], &peak, Some(&draft), &[]).is_err());
+        }
+        Ok(())
+    }
+
+    /// The predicted runtime base is the calibrated context plus the selected
+    /// module images, charged once per coordinator GPU, and only when the
+    /// caller names the extent it loaded after the pre-weight sample.
+    #[test]
+    fn predicted_module_images_charge_the_runtime_base_once() -> Result<()> {
+        use cuteafd_core::memory_layout::Category;
+        use cuteafd_loader::placement::ArchContext;
+        use families::deepseek_v41::admission::{CONTEXT_OWNER, MODULE_OWNER};
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../cuteafd-loader/src/families/deepseek_v41/official-v41-config.json"
+        )))?;
+        let mut args = args(dir.path());
+        args.rtx_gpus = 2;
+        args.rtx_expert_layers = LocalLayers::Count(0);
+        let memory = vec![(80usize << 30, 96usize << 30); 2];
+        let modules = [40u64 << 20, 56 << 20];
+        let sample = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; 2], 0,
+            &[], &[], &[], None, &[])?;
+        assert!(sample.placement.items.iter().flatten()
+            .all(|item| item.group != CONTEXT_OWNER && item.group != MODULE_OWNER));
+        let charged = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; 2], 0,
+            &[], &[], &[], None, &modules)?;
+        for gpu in 0..2usize {
+            let arch = ArchContext::coordinator(96u64 << 30, None);
+            let named = |group: &str| charged.placement.items[gpu].iter()
+                .filter(|item| item.group == group)
+                .map(|item| (item.bytes, item.category))
+                .collect::<Vec<_>>();
+            assert_eq!(named(CONTEXT_OWNER), [(arch.context_bytes, Category::Runtime)]);
+            assert_eq!(named(MODULE_OWNER), [(modules[gpu], Category::Runtime)]);
         }
         Ok(())
     }

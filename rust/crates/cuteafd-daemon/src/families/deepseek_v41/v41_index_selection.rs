@@ -1,5 +1,6 @@
 //! Bounded, captured index selection and snapshot-checked candidate sharing.
 use crate::families::deepseek_v41::v41_attention_binding::QueryBinding;
+use crate::shared::decode_graph::GraphPolicy;
 use crate::families::deepseek_v41::v41_compressor::{IndexBinding, IndexProposal, IndexScoreGeometry};
 use crate::families::deepseek_v41::v41_index_query::{IndexQueryOutput, IndexQueryGeometry};
 use crate::shared::memory::Tag;
@@ -284,7 +285,7 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(Self {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
             staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40, "v41/index-metadata")?, capacity,
-            graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
+            graph: None, graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
             ready: None, pending: None, in_flight: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
@@ -442,7 +443,12 @@ impl<'a> IndexSelectionWave<'a> {
             self.storage.stream.require_complete()?;
             self.ready = None;
             self.graph = self.graphs.launch(&key).map(|owner| (owner.raw, key.clone()));
-            return Ok(cached.is_some() || self.graphs.capture_allowed(&key));
+            let graphable = cached.is_some() || self.graphs.capture_allowed(&key);
+            if !graphable && super::graph_policy::captures_shape(fingerprint[1] as u32) {
+                super::graph_policy::note_miss(format!("index_selection rows={}", fingerprint[1]),
+                    || format!("key={fingerprint:?} retained={}", self.graphs.len()));
+            }
+            return Ok(graphable);
         }
         if let Some(limit) = fixed_limit {
             ensure!(!self.in_flight, "index selection pending");

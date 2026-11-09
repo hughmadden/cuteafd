@@ -1,7 +1,7 @@
 //! Backbone FP8 window KV production, private proposals and accepted ring writes.
 use crate::shared::memory::{DeviceAllocation, HostAllocation, LoadStream};
 use crate::shared::memory::row_window::RowWindow;
-use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner};
+use crate::shared::decode_graph::{fatal_drain, GraphBank, GraphOwner, GraphPolicy};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps, V41Fp8Plan, V41Kv};
@@ -343,7 +343,7 @@ impl<'a> WindowWeights<'a> {
             commit_staging: HostAllocation::new(self.library, commit::staging_bytes(unit), Tag::staging("v41/window-proposal"))?,
             capacity: unit,
             graph: None,
-            graphs: GraphBank::new(None),
+            graphs: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
             ready: None,
             pending_query: None,
             pending_commit: None,
@@ -736,6 +736,12 @@ impl WindowWave<'_, '_> {
             || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
             || (!self.graphs.contains(&(prepared.rows, state.owner))
                 && !self.graphs.capture_allowed(&(prepared.rows, state.owner)));
+        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+            && !self.graphs.contains(&(prepared.rows, state.owner))
+            && !self.graphs.capture_allowed(&(prepared.rows, state.owner)) {
+            super::graph_policy::note_miss(format!("window_query rows={} layer={}", prepared.rows, self.weights.layer),
+                || format!("windowed={} forced={forced_eager}", self.window.is_windowed()));
+        }
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -831,6 +837,12 @@ impl WindowWave<'_, '_> {
                 // row-0 plane pointers): run it once eagerly, never capture it.
                 // Launch and return: the chain orders consumers (outside a
                 // chain scope `finish` drains on the host as before).
+                if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
+                    && !self.graphs.contains(&(prepared.rows, state.owner))
+                    && !self.graphs.capture_allowed(&(prepared.rows, state.owner)) {
+                    super::graph_policy::note_miss(format!("window_execute rows={} layer={}", prepared.rows, self.weights.layer),
+                        || format!("windowed={}", self.window.is_windowed()));
+                }
                 let launched = self.upload(&prepared).and_then(|()| unsafe { self.enqueue(prepared.rows) });
                 launched.and(unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) })?;
                 self.ready = Some(prepared);

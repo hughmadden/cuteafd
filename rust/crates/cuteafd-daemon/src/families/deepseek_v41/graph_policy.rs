@@ -52,6 +52,14 @@ pub(super) fn captures_shape(rows: u32) -> bool {
         && FIXED_SHAPES.get().is_none_or(|shapes| shapes.contains(&rows))
 }
 
+/// Records one eager run of a shape the policy would graph but this owner's
+/// bank cannot capture. Every site that chooses eager for that reason reports
+/// through here, so `/v1/stats["graph_missing_variants"]` holds one entry per
+/// variant and the first execution logs one structured warning.
+pub(super) fn note_miss(shape: String, context: impl FnOnce() -> String) {
+    crate::shared::decode_graph::note_eager("deepseek_v41", &shape, context);
+}
+
 fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
     rows <= MAX_DECODE_ROWS || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
         || prefill.is_none_or(|chunk| rows == chunk)

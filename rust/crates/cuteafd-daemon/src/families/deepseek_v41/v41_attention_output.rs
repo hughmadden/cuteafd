@@ -282,6 +282,12 @@ impl AttentionOutputWave<'_, '_> {
     fn graphed(&self, rows: u32) -> bool {
         #[cfg(test)]
         if IGNORE_WINDOW.with(|ignore| ignore.get()) { return super::graph_policy::captures_shape(rows); }
+        let retained = self.graphs.get_shape(self.weights.layer, self.weights, rows).is_some();
+        if !retained && !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
+            && !self.graphs.capture_allowed(self.weights.layer, rows) {
+            super::graph_policy::note_miss(format!("attention_output rows={rows} layer={}", self.weights.layer),
+                || format!("windowed={} layer={}", self.window.is_windowed(), self.weights.layer));
+        }
         !self.window.is_windowed() && super::graph_policy::captures_shape(rows)
     }
     /// `execute_attention`'s graph decision over inputs already in `input()`
