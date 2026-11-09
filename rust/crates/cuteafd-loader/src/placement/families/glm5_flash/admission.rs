@@ -418,7 +418,7 @@ fn invalid(error: impl std::fmt::Display) -> p::Refusal {
 
 /// The launch's graph reserve, one fixed owner per coordinator device. The
 /// measured prewarm arena and the list's capture headroom come from a device
-/// graph trace of the traffic (`glmf_prewarm.json`, 172,230 B/graph measured);
+/// graph trace of the traffic (`glmf_prewarm.json`, 173,243 B/graph measured);
 /// a new trace replaces the list, never the accounting: admission charges the
 /// whole reserve once, before KV sizing, and a warm-up never shrinks it.
 #[derive(Debug, Clone, PartialEq, Eq)]

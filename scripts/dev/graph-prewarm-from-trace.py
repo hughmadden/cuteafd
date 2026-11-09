@@ -16,6 +16,9 @@ Input is the versioned GRAPH_TRACE JSON snapshot, not arbitrary log text.
 Frequencies are aggregated by geometry, not bank id or layer. Pin candidates
 must have both dominant frequency and the lowest row/table parameter rank.
 Reserve suggestions use the maximum per-device arena, never a sum of ranks.
+GLM Flash prices the base from the selected entries' measured capture bytes per
+device (the maximum across devices and quants), not the trace's whole-session
+arena: shapes outside the coverage set never prewarm and never charge.
 GLM Flash keys its list by resolved card shape, `<devices>[-sparks]`: onboarding
 and TP2 each add captured segments, so each shape's own capture demand prices
 its own reserve and a launch reads only its own entry. A shape's entries are
@@ -208,24 +211,21 @@ def glmf_identity(shape):
 
 
 def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
-    """A GLM Flash startup list: every traced shape prewarms at startup, the
-    always-hot ones are pinned, and the reserve is the measured arena of one
-    device with the executables it held plus one largest capture of headroom
-    for a shape the trace did not cover. Startup prewarm itself runs as Other,
-    never as request demand."""
+    """A GLM Flash startup list: every selected shape prewarms at startup, the
+    always-hot ones are pinned, and the reserve base is what those selected
+    shapes measured, device by device, plus one largest capture of headroom for
+    a shape the trace did not cover. Startup prewarm itself runs as Other, never
+    as request demand. The whole-session arena in `cache.charged` also holds
+    captures outside the coverage set (startup warmups and one-off shapes this
+    launch never prewarms), so it is not the base."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
     counts = {}
-    arenas = []
     largest = 0
     for trace in traces:
-        if trace.get("schema_version") != 1:
-            raise ValueError("expected GRAPH_TRACE schema_version=1")
+        if trace.get("schema_version") != 2:
+            raise ValueError("expected GRAPH_TRACE schema_version=2")
         matching = [graph for graph in trace["graphs"] if graph["site"].startswith("glm5_flash.")]
-        # The arena held `live_execs` executables; trace rows also include keys
-        # whose capture was refused (they ran eagerly), which the arena never held.
-        held = int(trace["cache"].get("pools", {}).get("live_execs") or 0)
-        arenas.append((int(trace["cache"]["charged"]), held or len(matching)))
         for site, values in trace.get("sites", {}).items():
             if site.startswith("glm5_flash."):
                 largest = max(largest, int(values["largest_bytes"]))
@@ -255,16 +255,46 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     entries = [{"rows": key[0], "spec": key[1], "long": key[2], "pool_width": key[3],
                 "page_stride": key[4], "pool_stride": key[5], "pin": key in pinned}
                for key in sorted(selected)]
-    charged, executables = max(arenas)
-    if charged <= 0 or executables <= 0:
+    # Price exactly the entries this list prewarms: sum each selected shape's
+    # measured capture bytes on one device, and let the costliest device across
+    # the layout's traces (and quants) set the base. A selected shape with no
+    # measured share means the trace cannot price this list; it is missing data,
+    # never a zero.
+    wanted = set(selected)
+    shares = []
+    for trace in traces:
+        device = trace["cache"].get("device")
+        seen = set()
+        captured = 0
+        executables = 0
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("glm5_flash."):
+                continue
+            key = glmf_identity(graph["shape"])
+            if key not in wanted:
+                continue
+            capture = graph.get("capture_bytes")
+            if capture is None:
+                raise ValueError(f"GLM Flash selected shape {key} has no measured capture bytes "
+                                 f"on device {device}")
+            seen.add(key)
+            captured += int(capture)
+            executables += int(graph.get("executables", 1) or 0)
+        if seen != wanted:
+            raise ValueError(f"GLM Flash trace for device {device} lacks selected shapes "
+                             f"{sorted(wanted - seen)}; its measured base is unknown")
+        if captured > 0 and executables > 0:
+            shares.append((captured, executables))
+    if not shares:
         raise ValueError("trace has no measured GLM Flash arena")
-    # Startup prewarms every traced shape, so the reserve base already holds
+    charged, executables = max(shares)
+    # Startup prewarms every selected shape, so the reserve base already holds
     # the whole request demand; only a shape outside the trace (a new context
     # width or row bucket) needs room, and one largest capture keeps it free
     # so that first capture never has to evict a pinned shape.
     extra = packed(largest)
     return {"schema_version": 1, "family": "glm5_flash",
-            "measured_bytes": charged, "measured_executables": executables,
+            "measured_bytes": packed(charged), "measured_executables": executables,
             "reserve_extra_bytes": extra, "entries": entries}
 
 

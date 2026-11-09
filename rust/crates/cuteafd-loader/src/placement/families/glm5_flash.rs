@@ -735,7 +735,7 @@ pub(crate) mod tests {
 
     /// Every coordinator device charges the launch's whole graph reserve as
     /// one fixed opaque owner, before KV sizing, with the launch's own
-    /// prewarm price behind it (`glmf_prewarm.json`'s measured 172,230 B/graph).
+    /// prewarm price behind it (`glmf_prewarm.json`'s measured 173,243 B/graph).
     #[test]
     fn contract_graph_reserve_is_one_fixed_opaque_owner_per_device() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();

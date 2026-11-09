@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(plan.executables, [690]);
         assert_eq!(plan.extra, 2_097_152);
         assert_eq!(plan.reserves[0] + plan.extra, 121_634_816);
-        assert_eq!(plan.bootstraps, [172_230]);
+        assert_eq!(plan.bootstraps, [173_243]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
@@ -442,6 +442,11 @@ mod tests {
         assert_eq!(two.layout, GlmfLayout::resolved(2, false));
         assert!(two.traced, "a 2-RTX launch with local TP2 experts is traced");
         assert_eq!(two.executables.len(), 2);
+        // The `2` base is its selected entries' measured capture bytes on the
+        // costlier device (K6 locally: 136,314,880 B for 690 executables), and
+        // its head segment prices the second device's 675 executables.
+        assert_eq!(two.reserves, [136_314_880, 134_217_728]);
+        assert_eq!(two.bootstraps, [197_558, 197_558]);
         // Sparks idle behind a 2-RTX local-expert launch are not an expert
         // attachment: that launch keys `2`, the same resolved shape it serves.
         assert_eq!(GlmfLayout::resolved(2, false).key(), two.layout.key());
@@ -451,7 +456,7 @@ mod tests {
     fn prewarm_shapes_filter_to_the_launch_and_stay_unique() {
         let list = glmf_prewarm_list();
         let min = list.layout(GlmfLayout::resolved(1, true)).expect("the min column is traced");
-        assert_eq!(min.executable_bytes(), 172_230);
+        assert_eq!(min.executable_bytes(), 173_243);
         assert_eq!(min.reserve_extra_bytes, 2_097_152);
         let mut identities = HashSet::new();
         for entry in &min.entries {

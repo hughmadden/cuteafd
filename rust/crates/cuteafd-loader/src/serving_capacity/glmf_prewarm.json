@@ -3,8 +3,8 @@
   "family": "glm5_flash",
   "layouts": {
     "1-sparks": {
-      "measured_bytes": 285212672,
-      "measured_executables": 1656,
+      "measured_bytes": 119537664,
+      "measured_executables": 690,
       "reserve_extra_bytes": 2097152,
       "entries": [
         {
@@ -145,8 +145,8 @@
       ]
     },
     "2": {
-      "measured_bytes": 312475648,
-      "measured_executables": 1610,
+      "measured_bytes": 136314880,
+      "measured_executables": 690,
       "reserve_extra_bytes": 2097152,
       "entries": [
         {
