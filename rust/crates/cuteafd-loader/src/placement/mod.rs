@@ -27,6 +27,7 @@ pub mod planner;
 pub mod runtime_memory;
 mod pool;
 pub mod reserve;
+pub mod graph_reserve;
 pub mod attention;
 mod residual;
 mod solve;

@@ -1771,12 +1771,24 @@ impl StartupGraphs {
         GraphSet { ranks: self.ranks.clone(), lifetime: crate::placement::Lifetime::Startup, shapes: self.shapes }
     }
 
+    pub fn reserves(&self) -> Result<Vec<u64>, Refusal> {
+        self.ranks.iter().map(|graph| crate::placement::graph_reserve::current(
+            "sm120", "coordinator", graph.bytes, crate::placement::graph_reserve::GLM_EXTRA)
+            .map_err(Refusal::InvalidFact)).collect()
+    }
+
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero graph pool extent")); }
-        self.ranks.iter().enumerate().map(|(rank, graph)|
-            crate::placement::planner::serving::startup_graph_component(
-                &format!("glm.graphs.{rank}"), Location::coordinator(rank as u8), *graph, maximum_pages)
-        ).collect()
+        let reserves = self.reserves()?;
+        self.ranks.iter().enumerate().map(|(rank, graph)| {
+            let mut component = crate::placement::planner::serving::startup_graph_component(
+                &format!("glm.graphs.{rank}"), Location::coordinator(rank as u8),
+                GraphRank { bytes: reserves[rank], ..*graph }, maximum_pages)?;
+            if let ComponentKind::Allowance(owner) = &mut component.kind {
+                owner.source = crate::placement::graph_reserve::source(&format!("glm.graphs.{rank}"));
+            }
+            Ok(component)
+        }).collect()
     }
 
     /// The measured rows beside the live capture, so a build whose captured

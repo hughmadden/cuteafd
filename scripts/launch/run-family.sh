@@ -421,6 +421,16 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
+if [[ "$family" == glm5 ]]; then
+  local graph_reserve graph_trace
+  graph_reserve="$(get GRAPH_RESERVE)"
+  graph_trace="$(get GRAPH_TRACE)"
+  [[ -z "$graph_reserve" ]] || graph_census_args+=(-e "CUTEAFD_GRAPH_RESERVE=$graph_reserve")
+  if [[ -n "$graph_trace" ]]; then
+    [[ "$graph_trace" == /* && -d "$(dirname "$graph_trace")" ]] || { printf '%s\n' 'GRAPH_TRACE needs an absolute path in an existing directory' >&2; exit 2; }
+    graph_census_args+=(-v "$(dirname "$graph_trace"):/run/cuteafd-graph-trace" -e "CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/$(basename "$graph_trace")")
+  fi
+fi
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph census requires a WIP build' >&2; exit 2; }
   graph_census_args+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug')

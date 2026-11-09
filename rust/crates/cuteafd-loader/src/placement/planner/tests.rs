@@ -3637,3 +3637,19 @@ fn zero_padding_is_identical_to_a_plan_with_no_padding_component() {
         assert_eq!(actual, expected, "{family}: all decisions, owners and phases must match");
     }
 }
+
+#[test]
+fn graph_cache_reserve_survives_gpu_reserve_override() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let mut contract = with_reserve_components(1 << 15);
+    let source = crate::placement::graph_reserve::source("test.graphs.0");
+    contract.components.push(Component { activation: Activation::always(),
+        bytes: ByteCurve::fixed(500, 1 << 15),
+        kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+            bytes: 500, lifetime: Lifetime::RESIDENT, source: source.clone(), assumed: false }) });
+    let overridden = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }
+        .scoped(|| solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract))).unwrap();
+    assert_eq!(overridden.facts.allowances.len(), 1);
+    assert_eq!(overridden.facts.allowances[0].source, source);
+    assert_eq!(overridden.facts.allowances[0].bytes, 500);
+}

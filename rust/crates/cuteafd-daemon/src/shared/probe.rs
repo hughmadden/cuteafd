@@ -99,6 +99,7 @@ pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
     let mut previous = PREVIOUS.lock().unwrap_or_else(|p| p.into_inner());
     let tables = cuteafd_loader::mapped_table_stats_with_intervals();
     if !tables.is_empty() { stats["mapped_tables"] = serde_json::json!(tables); }
+    stats["graph_cache"] = serde_json::json!(crate::shared::decode_graph::device::snapshots());
     let sites = cuteafd_ffi::graph_capture_sites();
     record_graph_captures(stats, cuteafd_ffi::graph_captures(), sites, &mut previous);
     stats["graph_missing_variants"] = serde_json::json!(crate::shared::decode_graph::missing_variants()
