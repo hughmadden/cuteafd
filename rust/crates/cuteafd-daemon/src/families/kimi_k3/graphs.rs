@@ -61,17 +61,16 @@ pub(crate) use cuteafd_loader::families::kimi_k3::allocation::{GRAPH_RESERVE as 
     graph_demand as demand};
 use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_rows};
 
-fn geometry(op: Op) -> (KimiPrewarmOp, Option<usize>) {
+fn geometry(op: Op) -> KimiPrewarmOp {
     match op {
-        Op::Ffn(_) => (KimiPrewarmOp::Ffn, None),
-        Op::Attention { .. } => (KimiPrewarmOp::Attention, Some(1)),
-        Op::Context { .. } => (KimiPrewarmOp::Context, None),
+        Op::Ffn(_) => KimiPrewarmOp::Ffn,
+        Op::Attention { .. } => KimiPrewarmOp::Attention,
+        Op::Context { .. } => KimiPrewarmOp::Context,
     }
 }
 
 pub(crate) fn prewarm_selected(layout: &KimiPrewarmLayout, key: Key, pinned: bool) -> bool {
-    let (op, sequences) = geometry(key.op);
-    kimi_selected(layout, key.rows, key.op.speculative(), op, sequences, pinned)
+    kimi_selected(layout, key.rows, key.op.speculative(), geometry(key.op), pinned)
 }
 
 pub(crate) fn pinned(ranks: usize, key: Key) -> bool {
@@ -79,8 +78,7 @@ pub(crate) fn pinned(ranks: usize, key: Key) -> bool {
 }
 
 /// Project observed trace geometries onto the placement's actual sites. No new
-/// prefill/window keys are invented. Sequence layout lives in device metadata;
-/// the retained prewarm schema uses the single canonical sequence marker.
+/// prefill/window keys are invented. Sequence layout lives in device metadata.
 pub(crate) fn prewarm_keys(_cfg: &KimiK3Config, inventory: &[Key], layout: &KimiPrewarmLayout,
     _slots: usize, capacity: usize) -> Vec<Key> {
     let mut keys = std::collections::HashSet::new();
@@ -96,7 +94,6 @@ pub(crate) fn prewarm_keys(_cfg: &KimiK3Config, inventory: &[Key], layout: &Kimi
                 (KimiPrewarmOp::Context, Op::Context { layer, .. }) =>
                     Op::Context { layer, speculative: entry.speculative },
                 (KimiPrewarmOp::Attention, Op::Attention { layer, .. }) => {
-                    if entry.sequences != Some(1) { continue }
                     Op::Attention { layer, speculative: entry.speculative }
                 }
                 _ => continue,
@@ -460,9 +457,9 @@ mod tests {
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![
                 KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
-                    op: Some(KimiPrewarmOp::Attention), sequences: Some(1), capture_bytes: vec![] },
+                    op: Some(KimiPrewarmOp::Attention), capture_bytes: vec![] },
                 KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
-                    op: Some(KimiPrewarmOp::Ffn), sequences: None, capture_bytes: vec![] },
+                    op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] },
             ] };
         let inventory = inventory_for_ranks(&cfg, 1, 4096, 16, 8, 1, |_, _| true)?;
         let keys = prewarm_keys(&cfg, &inventory.keys, &layout, 16, 4096);
@@ -470,7 +467,7 @@ mod tests {
         for entry in &layout.entries {
             assert!(keys.iter().any(|key| key.rows == entry.rows
                 && key.op.speculative() == entry.speculative
-                && geometry(key.op) == (entry.op.unwrap(), entry.sequences)));
+                && geometry(key.op) == entry.op.unwrap()));
         }
         for key in keys {
             assert!(prewarm_selected(&layout, key, false));
@@ -495,10 +492,10 @@ mod tests {
             let layout = KimiPrewarmLayout { ranks: 2, layout: "trace".into(),
                 reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
-                    op: Some(kind), sequences: None, capture_bytes: vec![] }] };
+                    op: Some(kind), capture_bytes: vec![] }] };
             let keys = prewarm_keys(&cfg, &templates, &layout, 16, 4096);
             assert_eq!(keys.len(), 1, "only the observed operation class expands");
-            assert_eq!(geometry(keys[0].op), (kind, None));
+            assert_eq!(geometry(keys[0].op), kind);
             assert_eq!(keys[0].rows, 4);
             assert!(replay_allowed(keys[0].op, true, false)?);
         }
@@ -512,7 +509,7 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "base-test".into(),
             reserve_base_bytes: vec![20], reserve_extra_bytes: 2 << 20,
             entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
-                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None, capture_bytes: vec![] }).into() };
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] }).into() };
         assert!(fit_prewarm(keys.to_vec(), &layout, &[9], &[10]).is_empty());
         assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[10], &[10]), keys[..1]);
         assert_eq!(fit_prewarm(keys.to_vec(), &layout, &[20], &[10]), keys[..2]);
@@ -528,7 +525,7 @@ mod tests {
         let mut layout = KimiPrewarmLayout { ranks: 2, layout: "measured".into(),
             reserve_base_bytes: vec![5, 9], reserve_extra_bytes: 2 << 20,
             entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
-                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), sequences: None,
+                pin: rows == 1, op: Some(KimiPrewarmOp::Ffn),
                 capture_bytes: match rows {
                     1 => vec![Some(2), Some(7)],
                     2 => vec![Some(0), Some(1)],
@@ -550,7 +547,7 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "bootstrap".into(),
             reserve_base_bytes: vec![10], reserve_extra_bytes: 2 << 20,
             entries: [false, true].map(|speculative| KimiPrewarmEntry { rows: 4,
-                speculative, pin: false, op: None, sequences: None, capture_bytes: vec![] }).into() };
+                speculative, pin: false, op: None, capture_bytes: vec![] }).into() };
         assert_eq!(fit_prewarm(keys.clone(), &layout, &[10], &[10]), keys);
     }
 

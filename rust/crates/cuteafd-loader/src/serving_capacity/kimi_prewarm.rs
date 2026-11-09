@@ -12,15 +12,15 @@
 //! adaptive min/max GRAPH_TRACE run; regenerate with
 //! `scripts/dev/graph-prewarm-from-trace.py --family kimi_k3`.
 //!
-//! Listed rows preserve observed operation, verify variant and attention
-//! sequence count within the native 64-row replay band. Prefill runs eagerly
-//! inside a row window: its keys never replay and are not prewarmed (#1646).
+//! Listed rows preserve observed operation and verify variant within the
+//! native 64-row replay band. Sequence layout stays in device metadata. Prefill
+//! runs eagerly inside a row window: its keys never replay and are not prewarmed (#1646).
 
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum KimiPrewarmOp { Residual, Ffn, Attention, Context }
+pub enum KimiPrewarmOp { Ffn, Attention, Context }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KimiPrewarmEntry {
@@ -31,8 +31,6 @@ pub struct KimiPrewarmEntry {
     /// Absent only in the provisional startup bootstrap set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op: Option<KimiPrewarmOp>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sequences: Option<usize>,
     /// Sum of measured capture shares per logical rank. Zero is allocator reuse;
     /// an absent rank falls back to the provisional per-executable census.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -89,9 +87,9 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
         reserve_base_bytes: vec![],
         reserve_extra_bytes: 2 << 20,
         entries: [1, 4, 16, 64].into_iter().map(|rows|
-            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, sequences: None, capture_bytes: vec![] })
+            KimiPrewarmEntry { rows, speculative: false, pin: false, op: None, capture_bytes: vec![] })
             .chain((2..=64).map(|rows|
-                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, sequences: None, capture_bytes: vec![] })).collect(),
+                KimiPrewarmEntry { rows, speculative: true, pin: false, op: None, capture_bytes: vec![] })).collect(),
     })
 }
 
@@ -111,11 +109,11 @@ pub fn kimi_reserve(ranks: usize, rank: usize) -> (u64, u64) {
 /// no operation and retain the original startup inventory; flagless sites can
 /// share a row across decode and verify but attention variants cannot.
 pub fn kimi_selected(layout: &KimiPrewarmLayout, rows: usize, speculative: bool,
-    op: KimiPrewarmOp, sequences: Option<usize>, pinned: bool) -> bool {
+    op: KimiPrewarmOp, pinned: bool) -> bool {
     (1..=64).contains(&rows) && layout.entries.iter().any(|entry| {
         (!pinned || entry.pin) && entry.rows == rows && match entry.op {
-            Some(kind) => kind == op && entry.speculative == speculative && entry.sequences == sequences,
-            None => matches!(op, KimiPrewarmOp::Residual | KimiPrewarmOp::Ffn)
+            Some(kind) => kind == op && entry.speculative == speculative,
+            None => op == KimiPrewarmOp::Ffn
                 || entry.speculative == speculative,
         }
     })
@@ -164,7 +162,7 @@ mod tests {
             assert!((1..=64).contains(&entry.rows));
         }
         for rows in [0, 65, 1024, 3072, 4096] {
-            assert!(!kimi_selected(layout, rows, false, KimiPrewarmOp::Ffn, None, false));
+            assert!(!kimi_selected(layout, rows, false, KimiPrewarmOp::Ffn, false));
         }
     }
 
@@ -175,27 +173,25 @@ mod tests {
         assert!(!layout.entries.is_empty());
         assert!(layout.entries.iter().all(|entry| !entry.pin));
         for entry in &layout.entries {
-            for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn,
+            for op in [KimiPrewarmOp::Ffn,
                 KimiPrewarmOp::Attention, KimiPrewarmOp::Context] {
-                let sequences = (op == KimiPrewarmOp::Attention).then_some(1);
-                assert!(kimi_selected(layout, entry.rows, entry.speculative, op, sequences, false));
-                assert!(!kimi_selected(layout, entry.rows, entry.speculative, op, sequences, true));
+                assert!(kimi_selected(layout, entry.rows, entry.speculative, op, false));
+                assert!(!kimi_selected(layout, entry.rows, entry.speculative, op, true));
             }
         }
     }
 
     #[test]
-    fn selection_stays_within_the_layout_operation_and_sequence_variant() {
+    fn selection_stays_within_the_layout_operation_and_verify_variant() {
         let layout = KimiPrewarmLayout { ranks: 1, layout: "test".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
-                op: Some(KimiPrewarmOp::Attention), sequences: Some(4), capture_bytes: vec![] }] };
-        let select = |rows, spec, op, seq| kimi_selected(&layout, rows, spec, op, seq, false);
-        assert!(select(20, true, KimiPrewarmOp::Attention, Some(4)));
-        assert!(!select(20, true, KimiPrewarmOp::Attention, Some(1)));
-        assert!(!select(20, false, KimiPrewarmOp::Attention, Some(4)));
-        assert!(!select(20, true, KimiPrewarmOp::Context, None));
-        assert!(!select(4, true, KimiPrewarmOp::Attention, Some(4)));
+                op: Some(KimiPrewarmOp::Attention), capture_bytes: vec![] }] };
+        let select = |rows, spec, op| kimi_selected(&layout, rows, spec, op, false);
+        assert!(select(20, true, KimiPrewarmOp::Attention));
+        assert!(!select(20, false, KimiPrewarmOp::Attention));
+        assert!(!select(20, true, KimiPrewarmOp::Context));
+        assert!(!select(4, true, KimiPrewarmOp::Attention));
     }
 
     #[test]
@@ -203,28 +199,25 @@ mod tests {
         let layout = KimiPrewarmLayout { ranks: 2, layout: "context".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 16, speculative: false, pin: true,
-                op: Some(KimiPrewarmOp::Context), sequences: None, capture_bytes: vec![] }] };
-        assert!(kimi_selected(&layout, 16, false, KimiPrewarmOp::Context, None, false));
-        assert!(!kimi_selected(&layout, 16, true, KimiPrewarmOp::Context, None, false));
-        for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn, KimiPrewarmOp::Attention] {
-            assert!(!kimi_selected(&layout, 16, false, op, None, false));
+                op: Some(KimiPrewarmOp::Context), capture_bytes: vec![] }] };
+        assert!(kimi_selected(&layout, 16, false, KimiPrewarmOp::Context, false));
+        assert!(!kimi_selected(&layout, 16, true, KimiPrewarmOp::Context, false));
+        for op in [KimiPrewarmOp::Ffn, KimiPrewarmOp::Attention] {
+            assert!(!kimi_selected(&layout, 16, false, op, false));
         }
     }
 
     #[test]
-    fn generic_entries_select_only_their_own_operation_class() {
-        for kind in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn] {
-            let layout = KimiPrewarmLayout { ranks: 1, layout: "generic".into(),
-                reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
-                entries: vec![KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
-                    op: Some(kind), sequences: None, capture_bytes: vec![] }] };
-            for op in [KimiPrewarmOp::Residual, KimiPrewarmOp::Ffn,
-                KimiPrewarmOp::Attention, KimiPrewarmOp::Context] {
-                assert_eq!(kimi_selected(&layout, 20, false, op, None, false), op == kind);
-            }
-            assert!(!kimi_selected(&layout, 20, false, kind, None, true));
-            assert!(!kimi_selected(&layout, 16, false, kind, None, false));
+    fn ffn_entries_select_only_their_own_operation_class() {
+        let layout = KimiPrewarmLayout { ranks: 1, layout: "ffn".into(),
+            reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
+            entries: vec![KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
+                op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] }] };
+        for op in [KimiPrewarmOp::Ffn, KimiPrewarmOp::Attention, KimiPrewarmOp::Context] {
+            assert_eq!(kimi_selected(&layout, 20, false, op, false), op == KimiPrewarmOp::Ffn);
         }
+        assert!(!kimi_selected(&layout, 20, false, KimiPrewarmOp::Ffn, true));
+        assert!(!kimi_selected(&layout, 16, false, KimiPrewarmOp::Ffn, false));
     }
 
     #[test]

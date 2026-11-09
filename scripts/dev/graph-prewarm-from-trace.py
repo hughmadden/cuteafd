@@ -94,7 +94,6 @@ KIMI_ROWS = re.compile(r"rows=(\d+)")
 KIMI_RANK = re.compile(r"rank=(\d+)")
 KIMI_OP = re.compile(r"op=(\w+)")
 KIMI_SPEC = re.compile(r"spec=(\d)")
-KIMI_SEQUENCES = re.compile(r"seq=(\d+)")
 
 
 V41_DECODE_ROWS = 64
@@ -135,13 +134,9 @@ def kimi_geometry(shape):
         raise ValueError("unsupported prewarm geometry")
     spec = KIMI_SPEC.search(shape)
     kind = op.group(1)
-    if kind not in ("residual", "ffn", "attention", "context"):
+    if kind not in ("ffn", "attention", "context"):
         raise ValueError(f"unknown Kimi operation: {kind}")
-    sequences = KIMI_SEQUENCES.search(shape)
-    if kind == "attention" and sequences is not None and not 0 < int(sequences.group(1)) <= int(rows.group(1)):
-        raise ValueError("Kimi attention requires 0 < sequences <= rows")
-    return (int(rows.group(1)), kind not in ("residual", "ffn") and spec is not None and spec.group(1) == "1",
-            kind, (int(sequences.group(1)) if sequences is not None else 1) if kind == "attention" else None)
+    return (int(rows.group(1)), kind != "ffn" and spec is not None and spec.group(1) == "1", kind)
 
 
 def kimi_lifetime_pins(identities):
@@ -163,8 +158,8 @@ def kimi_lifetime_pins(identities):
         if hits > 0:
             classes.setdefault((device, key[2]), []).append((hits, key))
         if key[1] and key[2] in ("attention", "context"):
-            geometry = (key[0], key[3])
-            verify[(device, geometry)] = verify.get((device, geometry), 0) + int(cycles.get("verify", 0))
+            geometry = (device, key[2], key[0])
+            verify[geometry] = verify.get(geometry, 0) + int(cycles.get("verify", 0))
     for rows in classes.values():
         rows.sort(key=lambda row: -row[0])
         total = sum(hits for hits, _ in rows)
@@ -177,23 +172,21 @@ def kimi_lifetime_pins(identities):
             covered += hits
             if covered * 2 >= total and cutoff is None:
                 cutoff = hits
-    # Attention has the exact row/sequence identity; Context carries no sequence
-    # count. Pick one dominant attention geometry per device (or Context when
-    # there is no attention), then include its flagless and Context siblings.
+    # Pick a dominant verify width per device, preferring attention over Context,
+    # then pin its flagless FFN and peer Context siblings.
     for device in {owner[0] for owner in verify}:
-        candidates = [(count, geometry) for (owner, geometry), count in verify.items()
-                      if owner == device and geometry[1] is not None and count > 0]
+        candidates = [(count, rows) for (owner, op, rows), count in verify.items()
+                      if owner == device and op == "attention" and count > 0]
         if not candidates:
-            candidates = [(count, geometry) for (owner, geometry), count in verify.items()
+            candidates = [(count, rows) for (owner, _, rows), count in verify.items()
                           if owner == device and count > 0]
         if not candidates:
             continue
-        _, (rows, sequences) = min(candidates, key=lambda row: (-row[0], row[1][0], row[1][1] or 0))
+        _, rows = min(candidates, key=lambda row: (-row[0], row[1]))
         for (owner, *_), (key, graph) in identities.items():
             if owner != device or key[0] != rows or not graph.get("cycles", {}).get("verify", 0):
                 continue
-            if key[2] in ("residual", "ffn") or key[1] and (
-                    key[2] == "context" or key[2] == "attention" and key[3] == sequences):
+            if key[2] == "ffn" or key[1]:
                 reasons.setdefault(key, set()).add("dominant_verify")
     return reasons
 
@@ -258,7 +251,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     lifetime_reasons = kimi_lifetime_pins(replayed)
     for key, why in lifetime_reasons.items():
         reasons.setdefault(key, set()).update(why)
-    ranked = sorted(counts, key=lambda key: (-counts[key], key[0], key[1]))
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
     total = sum(counts.values())
     covered = 0
     selected = set()
@@ -271,9 +264,8 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     heat = {key: max(rows.get(key, 0) for rows in lifetime_hits.values()) for key in selected}
     ordered = sorted(selected, key=lambda key: (not bool(reasons.get(key)), -heat[key], key))
     entries = [{"rows": rows, "speculative": speculative, "op": op,
-                **({"sequences": sequences} if sequences is not None else {}),
-                "pin": bool(reasons.get((rows, speculative, op, sequences)))}
-               for rows, speculative, op, sequences in ordered]
+                "pin": bool(reasons.get((rows, speculative, op)))}
+               for rows, speculative, op in ordered]
     # Charge only emitted geometry, including startup-only siblings. The
     # completed-step shares are physical growth; zero is valid allocator reuse.
     bases = [None] * ranks
@@ -310,7 +302,7 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                     continue
                 known = all("permanent_bytes" in graph for graph in graphs)
                 pin_report.append({"device": device, "rows": key[0], "speculative": key[1],
-                                   "op": key[2], "sequences": key[3],
+                                   "op": key[2],
                                    "pin": bool(reasons.get(key)), "reasons": sorted(reasons.get(key, [])),
                                    "rolling_pin": "sustained_heat" in reasons.get(key, set()),
                                    "lifetime_pin": key in lifetime_reasons,
