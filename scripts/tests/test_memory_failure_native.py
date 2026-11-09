@@ -156,7 +156,11 @@ static int last_error = 0, sticky_error = 0, injected = 0, point = 0, live_graph
 static bool active = false, partial_exec = false, census = false;
 static std::string message;
 int cudaGetLastError() { int status = sticky_error ? sticky_error : last_error; last_error = 0; return status; }
-int outcome(int at) { return last_error = sticky_error ? sticky_error : (point == at ? injected : 0); }
+int outcome(int at) {
+  const int status = sticky_error ? sticky_error : (point == at ? injected : 0);
+  if (status) last_error = status; // Successful CUDA calls do not consume a previous error.
+  return status;
+}
 int cudaStreamBeginCapture(void*, int) { int status = outcome(1); if (!status) active = true; return status; }
 int cudaStreamEndCapture(void*, void** graph) {
   assert(active); active = false;
@@ -205,7 +209,7 @@ int main() {
         const auto status = cuteafd_cuda_graph_end_capture_topology(stream, &exec, &nodes, &width, &spans);
         assert(!active && live_graphs == 0);
         if (status != CUTEAFD_STATUS_OK) {
-          assert(message == "cudaGraphInstantiate failed: 2" && exec == nullptr);
+          assert(message == "cudaGraphInstantiate failed; lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom: 2" && exec == nullptr);
           ++cancelled[rank]; ++eager[rank];
         } else {
           assert(nodes == 2 && width == 1 && spans == 1);

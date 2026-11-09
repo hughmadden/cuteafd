@@ -1847,7 +1847,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     // A cache miss retries eagerly on the same host thread. OOM is not sticky,
     // but leaving its last-error slot set makes the next valid peer-wait launch
     // report the old OOM and permanently retire an otherwise healthy TP2 engine.
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate failed",
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate failed; lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom",
                      cuteafd::diagnostic_cuda(err));
   }
   if (graph_exec == nullptr) {
