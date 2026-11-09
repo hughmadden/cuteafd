@@ -547,7 +547,7 @@ pub(crate) fn with_engine<T>(
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
         let facts = admission::inputs(args, &inputs)?;
         // One solve over every device and host owner, before the first allocation.
-        let (placement, host_prefix, expert_usage) = admission::admit(&facts)
+        let (placement, host_prefix, expert_usage, graphs) = admission::admit(&facts)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
@@ -642,9 +642,9 @@ pub(crate) fn with_engine<T>(
         cuteafd_bench::context::set_resolved("pool-tokens", &placement.pool_tokens.to_string());
         cuteafd_bench::context::set_resolved("attention-placement", &placement.attention_summary());
         cuteafd_bench::context::set_resolved("attention-by-kind", &serde_json::to_string(&placement.attention_by_kind)?);
-        (placement, host_prefix, expert_usage, embedding, model, shares)
+        (placement, host_prefix, expert_usage, graphs, embedding, model, shares)
     };
-    let (placement, host_prefix, expert_usage, embedding, model, mut shares) = placement;
+    let (placement, host_prefix, expert_usage, graphs, embedding, model, mut shares) = placement;
     let context_mode = if check_modes(&placement, split_device.is_some(), &loaded.cfg)? {
         Some(cuteafd_loader::placement::families::deepseek_v4::manifest_context(&loaded.manifest, loaded.family,
             loaded.cfg.n_heads, caps["decode_rows"].as_u64().context("decode_rows")?)
@@ -808,6 +808,17 @@ pub(crate) fn with_engine<T>(
         if remote_experts { tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm"); }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        // One graph arena per rank, charged before KV sizing and captured lazily
+        // inside it. A capture the reserve cannot hold runs eagerly.
+        // The prewarm shape is the resolved layout (coordinator GPUs x Sparks
+        // attached), the same key admission selected, not whether experts are
+        // remote: onboarding captures graphs either way.
+        engine.configure_graph_cache(&graphs.reserves, &graphs.bootstraps, !peers.is_empty())?;
+        for (rank, policy) in cuteafd_loader::serving_capacity::v4_graphs::v4_reserve_policies(
+                graphs.reserves.len(), !peers.is_empty()).map_err(anyhow::Error::msg)?.iter().enumerate() {
+            tracing::info!(rank, reserve = policy.bytes, source = policy.source,
+                "V4 GPU_GRAPH_RESERVE startup policy");
+        }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
         let (graphs0, graphs1, captures) = engine.graph_inventory();

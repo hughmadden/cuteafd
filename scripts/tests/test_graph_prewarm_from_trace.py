@@ -628,3 +628,98 @@ def test_qwen_unparseable_identity_fails():
 def test_qwen_family_requires_shape_argument():
     with pytest.raises(ValueError):
         MODULE.generate([qwen_trace()], "qwen4")
+
+
+def v4_shape(rows, width, attention="c4"):
+    return (f'GraphKey {{ layer: 3, rows: {rows}, chunked: false, attention: "{attention}", '
+            f'table_width: {width}, table_stride: {width}, previous: 0, '
+            'tp2_broadcast: false, exchange_f32: false }')
+
+
+def v4_list():
+    shapes = {"rtx1-spark": 1, "rtx1-local": 1, "rtx2-spark": 2, "rtx2-local": 2}
+    return {"schema_version": 1, "family": "deepseek_v4", "layouts": {
+        key: {"traced": False, "reserve_base_bytes": [0] * ranks,
+              "reserve_extra_bytes": [0] * ranks,
+              "bootstrap_bytes": [1 << 20] * ranks, "entries": []}
+        for key, ranks in shapes.items()}}
+
+
+def v4_trace(device, charged, capture=2 << 20):
+    def graph(rows, width, count, attention="c4"):
+        return {"device": device, "site": "deepseek_v4.segment", "bank": 1,
+                "shape": v4_shape(rows, width, attention), "count": count, "key_id": (rows, width),
+                "cycles": {"decode": count}, "capture_bytes": capture}
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
+            "sites": {"deepseek_v4.segment": {"largest_bytes": 3 << 20}},
+            "graphs": [graph(16, 512, 100), graph(4, 0, 90, "local-experts"), graph(1, 16, 1)]}
+
+
+def test_v4_geometry_allows_the_width_zero_startup_set():
+    assert MODULE.geometry("deepseek_v4", v4_shape(4, 0, "local-experts")) == (4, 0)
+    assert MODULE.geometry("deepseek_v4", v4_shape(16, 512)) == (16, 512)
+    with pytest.raises(ValueError):
+        MODULE.geometry("deepseek_v4", "GraphKey { rows: 1 }")
+
+
+def test_v4_eager_tails_never_become_prewarm_entries():
+    assert MODULE.prewarmable("deepseek_v4", v4_shape(4, 0, "local-experts"))
+    # A 2-RTX shape's startup set is the TP2 router pair at width 0.
+    assert MODULE.prewarmable("deepseek_v4", v4_shape(4, 0, "tp2-broadcast"))
+    assert MODULE.prewarmable("deepseek_v4", v4_shape(4, 0, "tp2-replicated"))
+    assert MODULE.prewarmable("deepseek_v4", v4_shape(16, 512))
+    assert not MODULE.prewarmable("deepseek_v4", v4_shape(5, 0, "tail"))
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+                            "shape": v4_shape(5, 0, "tail"), "count": 4, "key_id": (5, 0),
+                            "cycles": {"decode": 4}, "capture_bytes": 2 << 20})
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list())
+    assert (5, 0) not in {(row["rows"], row["table_width"])
+                          for row in entry["layouts"]["rtx1-local"]["entries"]}
+
+
+def test_v4_replaces_one_shape_with_per_rank_arrays():
+    result = MODULE.generate([v4_trace(0, 5 << 20, 6 << 20), v4_trace(1, 7 << 20, 4 << 20)],
+                             "deepseek_v4", layout="rtx2-spark", existing=v4_list())
+    assert result["layouts"]["rtx1-spark"] == v4_list()["layouts"]["rtx1-spark"]
+    assert result["layouts"]["rtx2-local"] == v4_list()["layouts"]["rtx2-local"]
+    entry = result["layouts"]["rtx2-spark"]
+    assert entry["traced"] is True
+    # The prewarm set is the whole traced working set, and its base is that
+    # set's own captures: three geometries of 6 MiB on device 0, 4 MiB on 1.
+    assert {(row["rows"], row["table_width"]) for row in entry["entries"]} == \
+        {(1, 16), (4, 0), (16, 512)}
+    assert entry["reserve_base_bytes"] == [18 << 20, 12 << 20]
+    # The arena tail only: capture headroom is a shared launcher policy.
+    assert entry["reserve_extra_bytes"] == [2 << 20, 2 << 20]
+    assert entry["bootstrap_bytes"] == [6 << 20, 4 << 20]
+
+
+def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+                            "shape": v4_shape(64, 0, "local-experts"), "count": 90,
+                            "key_id": (64, 0), "cycles": {"decode": 90},
+                            "capture_bytes": 2 << 20})
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list())
+    entries = {(row["rows"], row["table_width"]): row["pin"]
+               for row in entry["layouts"]["rtx1-local"]["entries"]}
+    # Every observed width-0 row class is a startup row, at every row count.
+    assert entries[(4, 0)] is True
+    assert entries[(64, 0)] is True
+    # A verify geometry the trace did not show as sustained heat stays lazy.
+    assert entries[(16, 512)] is False
+    assert entries[(1, 16)] is False
+
+
+def test_v4_shape_needs_one_trace_per_rank():
+    with pytest.raises(ValueError):
+        MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx2-spark", existing=v4_list())
+    single = MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx1-local", existing=v4_list())
+    # The 5 MiB charge is mostly lazy captures; only the prewarm set is the base.
+    assert single["layouts"]["rtx1-local"]["reserve_base_bytes"] == [6 << 20]
+
+
+def test_v4_unknown_layout_fails():
+    with pytest.raises(ValueError):
+        MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx4", existing=v4_list())

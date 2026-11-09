@@ -112,11 +112,18 @@ pub(crate) fn host_config(prefix: Option<&crate::shared::prefix::PrefixArgs>,
     Ok(config)
 }
 
+/// The graph arena admission charged on each coordinator rank, and the
+/// estimate a device uses until its first measured capture.
+pub(crate) struct GraphCache {
+    pub reserves: Vec<u64>,
+    pub bootstraps: Vec<u64>,
+}
+
 /// Admit one placement from these inputs: one solve over every device and
 /// host owner, before any allocation.
 pub(crate) fn admit(inputs: &v4::V4Inputs)
     -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners,
-        Option<cuteafd_core::expert_usage::Geometry>)> {
+        Option<cuteafd_core::expert_usage::Geometry>, GraphCache)> {
     let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
     let prefix = prepared.prefix().owners;
     let expert_usage = prepared.expert_usage().cloned();
@@ -127,7 +134,8 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    Ok((admitted.placement, prefix, expert_usage))
+    Ok((admitted.placement, prefix, expert_usage,
+        GraphCache { reserves: admitted.graph_reserves, bootstraps: admitted.graph_bootstraps }))
 }
 
 /// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.

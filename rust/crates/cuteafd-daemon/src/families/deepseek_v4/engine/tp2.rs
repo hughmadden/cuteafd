@@ -278,9 +278,11 @@ impl<'a> Engine<'a> {
             graphs: || {
                 for link in transports.borrow_mut().iter_mut() { link.terminal_release()?; }
                 for rank in 0..(1 + usize::from(self.peer.is_some())) {
+                    // Every queued launch drained above, so dropping the
+                    // bank's entries releases only retired executables.
                     self.on(rank, || {
-                        if rank == 0 { self.graphs.borrow_mut().clear(); }
-                        else { self.peer()?.graphs.borrow_mut().clear(); }
+                        if rank == 0 { self.graphs.borrow_mut().cache_clear_drained(); }
+                        else { self.peer()?.graphs.borrow_mut().cache_clear_drained(); }
                         Ok(())
                     })?;
                 }
@@ -475,8 +477,10 @@ impl<'a> Engine<'a> {
     }
 
     pub(super) fn finish_route_step(&self) -> Result<()> {
-        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        // Live graph counters reach the bench record on every layout, including
+        // TP1, where there is no TP2 route source to publish.
         self.publish_route_source();
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
         if !tp2.checking.replace(false) { return Ok(()); }
         for rank in 0..2 {
             self.on(rank, || {
@@ -514,6 +518,7 @@ impl<'a> Engine<'a> {
     fn publish_route_source(&self) {
         cuteafd_bench::context::set_resolved("v4-graph-captures", &self.graph_captures.get().to_string());
         cuteafd_bench::context::set_resolved("tp2-expert-graph-captures", &self.expert_graph_captures.get().to_string());
+        cuteafd_bench::context::set_resolved("v4-graph-eager", &self.graph_eager.get().to_string());
         if let Some(tp2) = &self.tp2 {
             cuteafd_bench::context::set_resolved("route-source",
                 if tp2.source.get() == RouteSource::Replicated { "replicated" } else { "broadcast" });

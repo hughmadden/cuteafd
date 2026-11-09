@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "family": "deepseek_v4",
+  "layouts": {
+    "rtx1-spark": {
+      "traced": false,
+      "reserve_base_bytes": [0],
+      "reserve_extra_bytes": [375809638],
+      "bootstrap_bytes": [8388608],
+      "entries": []
+    },
+    "rtx1-local": {
+      "traced": false,
+      "reserve_base_bytes": [0],
+      "reserve_extra_bytes": [375809638],
+      "bootstrap_bytes": [8388608],
+      "entries": []
+    },
+    "rtx2-spark": {
+      "traced": false,
+      "reserve_base_bytes": [0, 0],
+      "reserve_extra_bytes": [429496729, 268435456],
+      "bootstrap_bytes": [8388608, 8388608],
+      "entries": [
+        {"rows": 1, "table_width": 0, "pin": true},
+        {"rows": 2, "table_width": 0, "pin": true},
+        {"rows": 3, "table_width": 0, "pin": true},
+        {"rows": 4, "table_width": 0, "pin": true},
+        {"rows": 5, "table_width": 0, "pin": true},
+        {"rows": 6, "table_width": 0, "pin": true},
+        {"rows": 7, "table_width": 0, "pin": true},
+        {"rows": 8, "table_width": 0, "pin": true},
+        {"rows": 9, "table_width": 0, "pin": true},
+        {"rows": 10, "table_width": 0, "pin": true},
+        {"rows": 11, "table_width": 0, "pin": true},
+        {"rows": 12, "table_width": 0, "pin": true},
+        {"rows": 13, "table_width": 0, "pin": true},
+        {"rows": 14, "table_width": 0, "pin": true},
+        {"rows": 15, "table_width": 0, "pin": true},
+        {"rows": 16, "table_width": 0, "pin": true}
+      ]
+    },
+    "rtx2-local": {
+      "traced": false,
+      "reserve_base_bytes": [0, 0],
+      "reserve_extra_bytes": [429496729, 268435456],
+      "bootstrap_bytes": [8388608, 8388608],
+      "entries": [
+        {"rows": 1, "table_width": 0, "pin": true},
+        {"rows": 2, "table_width": 0, "pin": true},
+        {"rows": 3, "table_width": 0, "pin": true},
+        {"rows": 4, "table_width": 0, "pin": true},
+        {"rows": 5, "table_width": 0, "pin": true},
+        {"rows": 6, "table_width": 0, "pin": true},
+        {"rows": 7, "table_width": 0, "pin": true},
+        {"rows": 8, "table_width": 0, "pin": true},
+        {"rows": 9, "table_width": 0, "pin": true},
+        {"rows": 10, "table_width": 0, "pin": true},
+        {"rows": 11, "table_width": 0, "pin": true},
+        {"rows": 12, "table_width": 0, "pin": true},
+        {"rows": 13, "table_width": 0, "pin": true},
+        {"rows": 14, "table_width": 0, "pin": true},
+        {"rows": 15, "table_width": 0, "pin": true},
+        {"rows": 16, "table_width": 0, "pin": true}
+      ]
+    }
+  }
+}
