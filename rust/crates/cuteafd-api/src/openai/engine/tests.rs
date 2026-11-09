@@ -212,6 +212,8 @@ async fn benchmark_messages_count_matches_chat_template_nonce_and_thinking() {
                 if let Some(snapshot) = &family.snapshot {
                     let ids = cuteafd_loader::encode_tokenizer_text(snapshot, &prompts[0], false).unwrap().token_ids;
                     assert_eq!(counted, ids.len() as u64, "{} thinking={enabled} system={system:?}", family.name);
+                    eprintln!("exact benchmark count parity: {} thinking={enabled} system={} tokens={counted}",
+                        family.name, system.is_some());
                 }
             }
         }

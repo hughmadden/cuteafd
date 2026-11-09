@@ -20,7 +20,7 @@ async fn share_run_completes_and_locks_out_other_clients() {
     let dir = tempfile::tempdir().unwrap();
     let bench = cuteafd_bench::Bench::new(Store::open(dir.path()).unwrap());
     bench.set_api_key(ApiKey::new("integration-test-key").unwrap());
-    let app = cuteafd_bench::http::mount(router, bench.clone());
+    let app = common::with_fake_token_count(cuteafd_bench::http::mount(router, bench.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     cuteafd_bench::ready(&listener);
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -73,7 +73,15 @@ async fn share_run_completes_and_locks_out_other_clients() {
     assert!((c1.aggregate_tok_s - code.tok_s).abs() < 1e-9);
     assert_eq!(c1.runs[0].timing, code.runs[0]);
     assert_eq!(c1.per_stream_median_tok_s, code.tok_s);
-    assert!(baseline.card.prefill.as_ref().is_some_and(|p| p.prompt_tokens > 1000));
+    let prefill = baseline.card.prefill.as_ref().unwrap();
+    assert_eq!(prefill.requested_tokens, 8192);
+    assert_eq!(prefill.prompt_tokens, 8192);
+    let tail = baseline.card.prefill_tail.as_ref().unwrap();
+    assert_eq!(tail.requested_tokens, 8296);
+    assert_eq!(tail.prompt_tokens, 8296);
+    assert_eq!(tail.shape.as_ref().unwrap(), &cuteafd_bench::report::PrefillShape {
+        unit_rows: 2752, full_units: 3, tail_rows: 40,
+    });
     assert_eq!(baseline.quality.checks.len(), 5, "{:?}", baseline.quality.checks);
     // Exports of the stored run, and the lock lifted.
     let base3 = base.clone();
