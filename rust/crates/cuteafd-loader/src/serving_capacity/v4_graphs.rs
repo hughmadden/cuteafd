@@ -20,14 +20,17 @@
 //! policy then charges that provisional base like any other family base: with
 //! no user key it adds `min(500 MB, 100% of the base)`.
 //!
-//! A traced shape carries its own cards' measurements: every geometry the trace
-//! observed is an entry, so `reserve_base_bytes` is the startup warm's whole
-//! arena per rank — the width-0 row classes plus one capture per layer segment
-//! at each verify geometry (the trace's remaining charged arena is lazy
-//! captures, mainly the never-prewarmed tail), `reserve_extra_bytes` is that
-//! arena's 2 MiB allocation tail, and `bootstrap_bytes` is its largest measured
-//! capture. `scripts/dev/graph-prewarm-from-trace.py` replaces one shape at a
-//! time; the consumer schema does not change.
+//! A traced shape carries its own cards' measurements: every recurring geometry
+//! the trace observed is an entry, so `reserve_base_bytes` is the startup warm's
+//! whole arena per rank — the width-0 row classes plus one capture per layer
+//! segment at each recurring verify geometry. A geometry the trace shows as rare
+//! (used once, or only inside one sampling interval such as a single panel or
+//! the 32K context pass) is not an entry: it captures lazily inside the shared
+//! capture headroom. `reserve_extra_bytes` is the arena's 2 MiB allocation tail,
+//! and `bootstrap_bytes` is its largest measured capture.
+//! `scripts/dev/graph-prewarm-from-trace.py` replaces one shape at a time and
+//! prints each heat class's keys and arena bytes; the consumer schema does not
+//! change.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -165,8 +168,9 @@ pub fn v4_bootstraps(gpus: usize, sparks: bool) -> Result<Vec<u64>, String> {
 
 /// The startup prewarm set for this shape: entries whose `table_width` is 0
 /// are the local-expert row classes the engine captures before serving, best
-/// effort within the reserve. A width above 0 is a verify geometry the startup
-/// warm captures on a synthetic placement at that C4 class.
+/// effort within the reserve. A width above 0 is a recurring verify geometry the
+/// startup warm captures on a synthetic placement at that C4 class; a rare one
+/// the trace saw once, or inside a single panel, is left lazy.
 pub fn v4_prewarm(gpus: usize, sparks: bool) -> Result<Vec<V4PrewarmEntry>, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).entries)
 }
@@ -233,17 +237,17 @@ mod tests {
         let list = v4_prewarm_list();
         let one = &list.layouts["rtx1-spark"];
         assert!(one.traced);
-        // The startup warm's whole arena on the min card: 112 verify geometries
-        // and 51 width-0 row classes, its arena tail, one measured capture.
-        assert_eq!(one.reserve_base_bytes, [1_172_307_968]);
+        // The warmed set's own arena on the min card: 53 verify geometries and
+        // 51 width-0 row classes, plus its allocation tail.
+        assert_eq!(one.reserve_base_bytes, [671_088_640]);
         assert_eq!(one.reserve_extra_bytes, [2 << 20]);
         assert_eq!(one.bootstrap_bytes, [2 << 20]);
         let spark = &list.layouts["rtx2-spark"];
         assert!(spark.traced);
-        assert_eq!(spark.reserve_base_bytes, [1_509_949_440, 1_524_629_504]);
+        assert_eq!(spark.reserve_base_bytes, [966_787_072, 968_884_224]);
         let local = &list.layouts["rtx2-local"];
         assert!(local.traced);
-        assert_eq!(local.reserve_base_bytes, [1_530_920_960, 1_547_698_176]);
+        assert_eq!(local.reserve_base_bytes, [912_261_120, 922_746_880]);
         for entry in [one, spark, local] {
             assert_eq!(entry.reserve_extra_bytes, vec![2 << 20; entry.reserve_base_bytes.len()]);
             assert_eq!(entry.bootstrap_bytes, vec![2 << 20; entry.reserve_base_bytes.len()]);
@@ -270,13 +274,11 @@ mod tests {
 
     #[test]
     fn verify_geometries_are_prewarmed_unpinned_except_sustained_heat() {
-        // The full width ladder the traces observed, at every row count.
+        // The verify geometries the traces show as recurring heat.
         for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
             let verify: Vec<_> = v4_prewarm(gpus, sparks).unwrap().into_iter()
                 .filter(|entry| entry.table_width > 0).collect();
-            assert!(verify.len() > 100, "{gpus}x{sparks}: {} verify geometries", verify.len());
-            assert_eq!(verify.iter().map(|entry| entry.table_width).collect::<std::collections::BTreeSet<_>>(),
-                [1usize, 2, 4, 8, 32, 64, 128, 256].into_iter().collect());
+            assert!(verify.len() >= 35, "{gpus}x{sparks}: {} verify geometries", verify.len());
             // A pin is permanent residency, so only trace-proven heat earns one.
             let pinned: Vec<_> = verify.iter().filter(|entry| entry.pin)
                 .map(|entry| (entry.rows, entry.table_width)).collect();

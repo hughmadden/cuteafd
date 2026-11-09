@@ -646,13 +646,21 @@ def v4_list():
 
 
 def v4_trace(device, charged, capture=2 << 20):
-    def graph(rows, width, count, attention="c4"):
+    """One rank's snapshot: a regular verify geometry, a startup row and a rare
+    verify geometry used once inside one sampling interval."""
+    def graph(rows, width, count, attention="c4", heat="regular"):
+        counts = {"rare": [count, 0, 0, 0, 0, 0],
+                  "regular": [1, 0, 0, count - 2, 0, 0],
+                  "sustained": [count // 6] * 6}[heat]
+        hits = 0 if heat == "rare" else count - 1
         return {"device": device, "site": "deepseek_v4.segment", "bank": 1,
                 "shape": v4_shape(rows, width, attention), "count": count, "key_id": (rows, width),
-                "cycles": {"decode": count}, "capture_bytes": capture}
+                "hits": hits, "cycles": {"decode": count}, "capture_bytes": capture,
+                "hit_histogram": {"interval_ms": 10_000, "start_ms": 0, "counts": counts}}
     return {"schema_version": 2, "cache": {"device": device, "charged": charged},
             "sites": {"deepseek_v4.segment": {"largest_bytes": 3 << 20}},
-            "graphs": [graph(16, 512, 100), graph(4, 0, 90, "local-experts"), graph(1, 16, 1)]}
+            "graphs": [graph(16, 512, 100), graph(4, 0, 90, "local-experts"),
+                       graph(1, 16, 1, heat="rare")]}
 
 
 def test_v4_geometry_allows_the_width_zero_startup_set():
@@ -685,14 +693,40 @@ def test_v4_replaces_one_shape_with_per_rank_arrays():
     assert result["layouts"]["rtx2-local"] == v4_list()["layouts"]["rtx2-local"]
     entry = result["layouts"]["rtx2-spark"]
     assert entry["traced"] is True
-    # The prewarm set is the whole traced working set, and its base is that
-    # set's own captures: three geometries of 6 MiB on device 0, 4 MiB on 1.
-    assert {(row["rows"], row["table_width"]) for row in entry["entries"]} == \
-        {(1, 16), (4, 0), (16, 512)}
-    assert entry["reserve_base_bytes"] == [18 << 20, 12 << 20]
+    # The one-use geometry is rare and stays lazy; the base is the warmed set's
+    # own captures: two geometries of 6 MiB on device 0, 4 MiB on 1.
+    assert {(row["rows"], row["table_width"]) for row in entry["entries"]} == {(4, 0), (16, 512)}
+    assert entry["reserve_base_bytes"] == [12 << 20, 8 << 20]
     # The arena tail only: capture headroom is a shared launcher policy.
     assert entry["reserve_extra_bytes"] == [2 << 20, 2 << 20]
     assert entry["bootstrap_bytes"] == [6 << 20, 4 << 20]
+
+
+def test_v4_heat_split_pins_sustained_prewarms_regular_and_leaves_rare_lazy():
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].append({
+        "device": 0, "site": "deepseek_v4.segment", "bank": 1,
+        "shape": v4_shape(8, 64), "count": 60, "key_id": (8, 64), "hits": 59,
+        "cycles": {"verify": 60}, "capture_bytes": 3 << 20,
+        "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                          "counts": [10, 10, 10, 10, 10, 10]}})
+    heat = []
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list(),
+                            heat_report=heat)["layouts"]["rtx1-local"]
+    entries = {(row["rows"], row["table_width"]): row["pin"] for row in entry["entries"]}
+    assert entries[(8, 64)] is True, "sustained heat is pinned"
+    assert entries[(16, 512)] is False, "regular heat is prewarmed unpinned"
+    assert entries[(4, 0)] is True, "the startup set is pinned"
+    assert (1, 16) not in entries, "a one-use geometry stays lazy"
+    classes = {(row["device"], row["heat"]): (row["keys"], row["arena_bytes"], row["selected"])
+               for row in heat}
+    assert classes[(0, "startup")] == (1, 2 << 20, True)
+    assert classes[(0, "sustained")] == (1, 3 << 20, True)
+    assert classes[(0, "regular")] == (1, 2 << 20, True)
+    assert classes[(0, "rare")] == (1, 2 << 20, False)
+    # The rare geometry's bytes are not charged in the base: 2 + 2 + 3 MiB of
+    # warmed captures, rounded up to whole 2 MiB chunks.
+    assert entry["reserve_base_bytes"] == [8 << 20]
 
 
 def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
@@ -707,17 +741,17 @@ def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
     # Every observed width-0 row class is a startup row, at every row count.
     assert entries[(4, 0)] is True
     assert entries[(64, 0)] is True
-    # A verify geometry the trace did not show as sustained heat stays lazy.
+    # A regular verify geometry is prewarmed unpinned; a rare one stays lazy.
     assert entries[(16, 512)] is False
-    assert entries[(1, 16)] is False
+    assert (1, 16) not in entries
 
 
 def test_v4_shape_needs_one_trace_per_rank():
     with pytest.raises(ValueError):
         MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx2-spark", existing=v4_list())
     single = MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx1-local", existing=v4_list())
-    # The 5 MiB charge is mostly lazy captures; only the prewarm set is the base.
-    assert single["layouts"]["rtx1-local"]["reserve_base_bytes"] == [6 << 20]
+    # The 5 MiB charge is mostly lazy captures; only the warmed set is the base.
+    assert single["layouts"]["rtx1-local"]["reserve_base_bytes"] == [4 << 20]
 
 
 def test_v4_unknown_layout_fails():
