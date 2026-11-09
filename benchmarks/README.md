@@ -12,6 +12,10 @@ workloads are unchanged.
 
 The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) schedules the
 regular max cards in `hqa` mode and 11 additional max-only attention variants.
+All six families' cards explicitly pin their `-HQA` repository revision,
+which bundles both HQA and compact views; original Core-K6 repositories do
+not supply that comparison. The example configs remain unchanged here;
+the v5 matrix overrides their checkpoint IDs and revisions.
 These experiments are separate from the main three-column release table.
 Results are pending; no new speed or quality measurement is claimed here.
 

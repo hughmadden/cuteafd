@@ -480,6 +480,10 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
         assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
         if values.get("ATTENTION_MODE"):
             assert entry["family"] in variants
+            assert values["MODEL_ID"].endswith("-HQA"), "Attention modes require the dual-view HQA checkpoint"
+        if values["MODEL_ID"].endswith("-HQA"):
+            assert values.get("ATTENTION_MODE", "hqa") in ("hqa", "compact", "fp8-compact")
+        if values.get("ATTENTION_MODE"):
             if len(entry["gpus"]) == 2:
                 comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
         assert entry.get("baseline", True), "All cards retain baseline quick quality"
