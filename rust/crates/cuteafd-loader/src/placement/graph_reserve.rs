@@ -177,6 +177,15 @@ mod tests {
         assert_eq!(resolve(None, 0, false, base, tail).unwrap().bytes, 675_282_944);
     }
     #[test]
+    fn ml4_layout_bases_get_shared_headroom() {
+        for (ranks, expected_base) in [(1, 715_128_832), (2, 914_358_272)] {
+            let (base, tail) = glm_default(GlmPrewarmFamily::MistralLarge4, ranks);
+            let policy = resolve(None, 0, false, base, tail).unwrap();
+            assert_eq!(policy.base_bytes, expected_base);
+            assert_eq!(policy.bytes, expected_base + 500_000_000);
+        }
+    }
+    #[test]
     fn explicit_size_or_percentage_has_no_implicit_cap() {
         for (extra, bytes) in [("500MB", 600_000_000), ("250%", 350_000_000), ("12.5%", 112_500_000)] {
             let policy = resolve_with_extra(None, Some(extra), None, 0, false, 100_000_000, 0).unwrap();

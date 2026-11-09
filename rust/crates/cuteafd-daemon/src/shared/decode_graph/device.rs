@@ -779,6 +779,7 @@ mod tests {
         assert_eq!(policy["extra_bytes"], 50_000_000);
         assert_eq!(policy["cap_bytes"], 20_000_000);
         assert_eq!(policy["charged_bytes"], 120_000_000);
+        assert_eq!(snapshot["reserve"], policy["charged_bytes"]);
         assert_eq!(policy["charged_source"], "family default with extra");
         assert_eq!(policy["extra_source"], "user override");
     }

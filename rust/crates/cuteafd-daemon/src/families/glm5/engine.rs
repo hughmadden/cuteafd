@@ -1587,6 +1587,7 @@ impl<'a> GlmEngine<'a> {
                 skipped_bytes = ?full.iter().zip(&kept).map(|(full, kept)| full.saturating_sub(*kept)).collect::<Vec<_>>(),
                 base_bytes = ?bases, "GLM prewarm exceeds base; skipped entries remain runtime misses (pinned set is indivisible)");
         }
+        let estimated_arena_bytes = costs(&selected);
         let shapes: Vec<_> = selected.into_iter().map(|index| all_shapes[index].clone()).collect();
         use crate::shared::decode_graph::device::Cycle;
         self.graphs.borrow_mut().cache_cycle(Cycle::Other);
@@ -1622,6 +1623,8 @@ impl<'a> GlmEngine<'a> {
         tracing::info!(graphs = captures.iter().map(|capture| capture.keys.len()).sum::<usize>(),
             free = ?captures.iter().map(|capture| (capture.before.free, capture.after.free)).collect::<Vec<_>>(),
             prewarm_shapes = shapes.len(),
+            estimated_arena_bytes = ?estimated_arena_bytes,
+            measured_arena_bytes = ?before.iter().zip(&after).map(|(before, after)| before.free.saturating_sub(after.free)).collect::<Vec<_>>(),
             prewarm_geometries = ?shapes.iter().map(|entry| entry.shape).collect::<Vec<_>>(),
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
         Ok(captures)
