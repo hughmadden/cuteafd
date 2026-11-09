@@ -295,8 +295,7 @@ mod owner_graph_tests {
             assert_eq!((entry.shape.rows, entry.shape.spec, entry.shape.geometry()), *shape);
             assert!(!entry.pin, "the bootstrap prewarm pins nothing");
         }
-        for key in [QwenGraphShapeKey::Single0Spark, QwenGraphShapeKey::SingleSparks,
-            QwenGraphShapeKey::Dual0Spark, QwenGraphShapeKey::DualSparks] {
+        for key in [QwenGraphShapeKey::SingleSparks, QwenGraphShapeKey::DualSparks] {
             // Untraced: every shape falls back to the bootstrap set, never another shape's list.
             assert!(qwen_shape_prewarm(key).trace.is_none(), "{key:?}");
             assert_eq!(qwen_prewarm_shapes(key, 262_144, 8192, 2051, 16, true).len(), 682, "{key:?}");
@@ -304,14 +303,25 @@ mod owner_graph_tests {
             assert!(qwen_prewarm_shapes(key, 8192, 8192, 2051, 1, false).len() < 253, "{key:?}");
             assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
         }
+        // Traced shapes install their own measured list; every entry must stay
+        // reachable at the card it was traced on (the trace cards' pool pages),
+        // so prewarm never silently drops a measured shape.
+        for (key, pages) in [(QwenGraphShapeKey::Single0Spark, 10_744),
+            (QwenGraphShapeKey::Dual0Spark, 32_768)] {
+            let prewarm = qwen_shape_prewarm(key);
+            let trace = prewarm.trace.as_ref().expect("traced shape");
+            assert_eq!(qwen_prewarm_shapes(key, 262_144, pages, 2051, 16, true).len(),
+                trace.entries.len(), "{key:?} traced entries are all reachable");
+            assert!(qwen_prewarm_pinned(key).is_empty(), "{key:?}");
+        }
         assert_eq!(QwenGraphShapeKey::resolve(1, false), QwenGraphShapeKey::Single0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(1, true), QwenGraphShapeKey::SingleSparks);
         assert_eq!(QwenGraphShapeKey::resolve(2, false), QwenGraphShapeKey::Dual0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(2, true), QwenGraphShapeKey::DualSparks);
         for (key, rank0, rank1) in [
-            (QwenGraphShapeKey::Single0Spark, (5_102_370_816, 2_097_152), None),
+            (QwenGraphShapeKey::Single0Spark, (109_051_904, 2_097_152), None),
             (QwenGraphShapeKey::SingleSparks, (5_102_370_816, 2_097_152), None),
-            (QwenGraphShapeKey::Dual0Spark, (2_707_423_232, 2_097_152), Some((2_604_662_784, 2_097_152))),
+            (QwenGraphShapeKey::Dual0Spark, (67_108_864, 2_097_152), Some((73_400_320, 2_097_152))),
             (QwenGraphShapeKey::DualSparks, (2_707_423_232, 2_097_152), Some((2_604_662_784, 2_097_152))),
         ] {
             assert_eq!(qwen_reserve(key, 0), Some(rank0), "{key:?}");

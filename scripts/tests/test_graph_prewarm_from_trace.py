@@ -520,8 +520,31 @@ def test_qwen_zero_hit_bootstrap_shapes_are_never_selected():
     assert result["reserve_base_bytes"] == [2 << 20]
     # Captured once, never replayed: never selected, and reported rather than
     # hidden (11 cold identities, 1 MiB each).
-    assert summary == {"zero_replay_identities": len(cold), "zero_replay_bytes": len(cold) << 20}
+    assert summary == {"zero_replay_identities": len(cold), "zero_replay_bytes": len(cold) << 20,
+                       "zero_share_identities": 0, "zero_share_bytes": 0}
     assert f"{len(cold)} zero-replay identities" in result["trace"]["provenance"]
+
+
+def test_qwen_zero_share_identity_is_charged_the_device_mean():
+    # A capture boundary with no new physical growth is allocator reuse, not a
+    # free graph. The shared cache keeps such a record's estimate; the base
+    # must not treat the zero as a measured zero, or a selected shape's share
+    # vanishes from the reserve.
+    data = qwen_trace()
+    data["graphs"][0]["capture_bytes"] = 0
+    data["graphs"][2]["capture_bytes"] = 1 << 20
+    summary = {}
+    result = MODULE.generate_qwen([data], "single_0spark", coverage=0.99, summary=summary)
+    # Device mean over three captures: (0 + 2 + 1) MiB / 3 = 1 MiB; the zero
+    # selected identity is charged it, so 1 + 2 = 3 MiB -> one 2 MiB chunk.
+    assert result["reserve_base_bytes"] == [4 << 20]
+    assert summary["zero_share_identities"] == 1
+    assert summary["zero_share_bytes"] == 1 << 20
+    assert "1 zero-share selected identities" in result["trace"]["provenance"]
+    # A measured zero outside the selected set is not filled.
+    data = qwen_trace()
+    data["graphs"][2]["capture_bytes"] = 0
+    assert MODULE.generate_qwen([data], "single_0spark", coverage=0.99)["reserve_base_bytes"] == [4 << 20]
 
 
 def test_qwen_selected_identity_without_a_measured_share_fails():

@@ -411,6 +411,20 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     if summary is not None:
         summary["zero_replay_identities"] = len(zero_replay)
         summary["zero_replay_bytes"] = zero_replay_bytes
+    # A completed capture boundary with no new physical growth is allocator
+    # reuse, not a free graph: the shared cache keeps such a record's estimate
+    # for exactly this case. Charge a selected identity whose measured share is
+    # zero the launch's measured mean capture on its device, so the traced
+    # working set's base is never undercounted by the proportional split.
+    measured = {}
+    for (device, _, _, _), (_, graph) in identities.items():
+        share = graph.get("capture_bytes")
+        if share is None:
+            continue
+        captures, total = measured.get(device, (0, 0))
+        measured[device] = (captures + max(int(graph.get("captures") or 0), 1),
+                            total + int(share))
+    mean = {device: total / captures for device, (captures, total) in measured.items()}
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
@@ -464,6 +478,7 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                                    "basis": graphs[0].get("basis"),
                                    "cost_basis": "observed_inventory_lower_bound_unknown_total" if cost is not None else "unknown_legacy_trace"})
     base = []
+    zero_share = []
     for device in devices:
         total = 0
         for selected_key in sorted(selected):
@@ -475,12 +490,22 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                     raise ValueError(
                         f"{shape} device {device} selects {qwen_shape_text(selected_key)} "
                         f"without a measured capture share: {graph['shape']!r}")
-                total += int(share)
+                share = int(share)
+                if share == 0:
+                    share = round(mean.get(device, 0.0))
+                    zero_share.append(identity)
+                total += share
         base.append(packed(total))
+    zero_share_bytes = sum(round(mean.get(identity[0], 0.0)) for identity in zero_share)
+    if summary is not None:
+        summary["zero_share_identities"] = len(zero_share)
+        summary["zero_share_bytes"] = zero_share_bytes
     extra = [EXTRA_BYTES for _ in devices]
     provenance = (f"GRAPH_TRACE {len(traces)} snapshots at {shape}; devices {devices}; "
                   f"{len(selected)} selected shapes; capture base {base} + {EXTRA_BYTES} extra bytes; "
-                  f"{len(zero_replay)} zero-replay identities ({zero_replay_bytes} bytes) stay lazy")
+                  f"{len(zero_replay)} zero-replay identities ({zero_replay_bytes} bytes) stay lazy; "
+                  f"{len(zero_share)} zero-share selected identities ({zero_share_bytes} bytes) "
+                  f"charged at the device's measured mean capture")
     return {"shape": shape, "reserve_base_bytes": base,
             "reserve_extra_bytes": extra,
             "trace": {"provenance": provenance, "entries": entries}}
@@ -606,7 +631,9 @@ def main():
               f"base={result['reserve_base_bytes']} extra={result['reserve_extra_bytes']} bytes; "
               f"pinned={sum(entry['pin'] for entry in result['trace']['entries'])}; "
               f"zero_replay={summary.get('zero_replay_identities', 0)} "
-              f"({summary.get('zero_replay_bytes', 0)} bytes)")
+              f"({summary.get('zero_replay_bytes', 0)} bytes); "
+              f"zero_share={summary.get('zero_share_identities', 0)} "
+              f"({summary.get('zero_share_bytes', 0)} bytes filled)")
     else:
         layout = f" layout={result['layout']};" if "layout" in result else ""
         print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
