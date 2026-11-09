@@ -124,8 +124,7 @@ def test_deployment_preserves_release_container_commands(
                 before["command"][position:position] = ["--tp2-dflash", tp2_dflash]
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
-                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8",
-                                                        "--decode-graphs", "false" if decode_graphs == "off" else "true"]
+                before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
                 for flag, value in [("--prefill-rows", "2752"), ("--prefill-waves", "3")]:
                     before["command"][before["command"].index(flag) + 1] = value
                 position = before["command"].index("--prefill-waves") + 2
@@ -184,6 +183,12 @@ def test_deployment_preserves_release_container_commands(
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
+            if entry["family"] == "mimo_v2":
+                # Preserve the effective default-on command and explicit opt-out.
+                position = before["command"].index("--swa-kv-cache") + 2
+                before["command"][position:position] = [
+                    "--decode-graphs", "false" if decode_graphs == "off" else "true",
+                ]
         # Other families have no resolved-config fingerprint today; adding a
         # fabricated one is a failure. V4.1's fingerprint now also covers the
         # shared executor's prefill waves, which reach serve-native.
