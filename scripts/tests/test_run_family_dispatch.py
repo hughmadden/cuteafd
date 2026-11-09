@@ -1710,6 +1710,28 @@ release_validate_deployment "$plan" glm5_flash
     assert result.returncode == 0, result.stderr
 
 
+def _coordinator_launches(stderr: str) -> list[list[str]]:
+    launches = []
+    for line in stderr.splitlines():
+        if not line.startswith("docker run -d "):
+            continue
+        tokens = shlex.split(line)
+        if any(command == "cuteafd" and re.fullmatch(r"serve-[a-z0-9-]+", argument)
+               for command, argument in zip(tokens, tokens[1:])):
+            launches.append(tokens)
+    return launches
+
+
+@pytest.mark.parametrize("path", ["/builds/graph-reserve-extra", "/builds/serve-fixture with spaces"])
+def test_coordinator_launch_matching_ignores_serve_in_worker_paths(path):
+    worker = (f'ssh worker-0 docker run -d -e HF_HOME={shlex.quote(path)} '
+              'image cuteafd expertd-native --rank 0')
+    local_worker = f'docker run -d -e HF_HOME={shlex.quote(path)} image cuteafd expertd-native'
+    coordinator = f'docker run -d -v {shlex.quote(path + ":/hf")} image cuteafd serve-dsv4 --listen 127.0.0.1:1'
+    assert _coordinator_launches("\n".join([worker, local_worker, coordinator])) == [shlex.split(coordinator)]
+    assert not _coordinator_launches(worker + "\n" + local_worker)
+
+
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
     """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
     deployment = json.loads(deployment_path.read_text())
@@ -1734,8 +1756,7 @@ def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, tempor
         extra_env={"STUB_REAL_DEPLOYMENT": str(deployment_path),
                    "STUB_SPARK_ROLES": "tp2;tp3;tp6;tp8", "CUTEAFD_CDI_CHECK": "off"})
     assert result.returncode == 0, result.stderr
-    lines = [shlex.split(line) for line in result.stderr.splitlines()
-             if "serve-" in line and "docker run -d" in line]
+    lines = _coordinator_launches(result.stderr)
     assert len(lines) == 1, result.stderr
     tokens = lines[0]
     argv = tokens[tokens.index("cuteafd"):]
