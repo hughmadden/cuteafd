@@ -1,4 +1,4 @@
-//! Console-authenticated memory view. HTTP only reads published snapshots.
+//! Console-authenticated memory view with request-time process diagnostics.
 use super::{ConsoleHub, SharedStats};
 use axum::{extract::State, http::{header, HeaderMap, StatusCode}, response::{Html, IntoResponse, Response}, routing::get, Json, Router};
 use serde_json::{json, Value};
@@ -11,13 +11,13 @@ pub fn publish_memory_inventory(value: Value) {
 }
 
 #[derive(Clone)]
-struct Dashboard { console: Arc<ConsoleHub>, stats: SharedStats }
+struct Dashboard { console: Arc<ConsoleHub>, stats: SharedStats, diagnostics: Option<fn(&mut Value)> }
 
-pub(super) fn routes(console: Arc<ConsoleHub>, stats: SharedStats) -> Router {
+pub(super) fn routes(console: Arc<ConsoleHub>, stats: SharedStats, diagnostics: Option<fn(&mut Value)>) -> Router {
     Router::new().route("/memory", get(page))
         .route("/assets/memory.js", get(script))
         .route("/console/memory", get(snapshot))
-        .with_state(Dashboard { console, stats })
+        .with_state(Dashboard { console, stats, diagnostics })
 }
 async fn page() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Html(include_str!("../../assets/memory.html")))
@@ -59,14 +59,18 @@ async fn snapshot(State(state): State<Dashboard>, headers: HeaderMap) -> Respons
     if !state.console.admin_unlocked(&headers) {
         return (StatusCode::UNAUTHORIZED, cache, Json(json!({"error": {"type": "console_locked"}}))).into_response();
     }
-    let stats = state.stats.lock().unwrap_or_else(|e| e.into_inner());
-    // No arbitrary stats, checkpoint paths, prompts or provenance arguments.
-    let mut selected = serde_json::Map::new();
-    for key in ["prefix_cache", "kv_reserve", "graph_cache", "memory_reconciliation"] {
-        let value = stats.get(key).cloned().unwrap_or(Value::Null);
-        selected.insert(key.into(), if key == "memory_reconciliation" { reconciliation_view(value) } else { value });
-    }
-    drop(stats);
+    let mut selected = tokio::task::spawn_blocking(move || {
+        let mut stats = state.stats.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if !stats.is_object() { stats = json!({}); }
+        if let Some(collect) = state.diagnostics { collect(&mut stats); }
+        // No arbitrary stats, checkpoint paths, prompts or provenance arguments.
+        let mut selected = serde_json::Map::new();
+        for key in ["prefix_cache", "kv_reserve", "graph_cache", "memory_reconciliation"] {
+            let value = stats.get(key).cloned().unwrap_or(Value::Null);
+            selected.insert(key.into(), if key == "memory_reconciliation" { reconciliation_view(value) } else { value });
+        }
+        selected
+    }).await.expect("memory stats worker panicked");
     selected.insert("host_heap".into(), super::HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
     (cache, Json(json!({"schema_version": 1, "stats": selected,
         "inventory": INVENTORY.read().unwrap_or_else(|e| e.into_inner()).clone()}))).into_response()
@@ -88,7 +92,7 @@ mod tests {
         console.set_gate(gate.clone());
         console.set_bench_active(true);
         let stats = Arc::new(Mutex::new(json!({"prefix_cache": {"pages": 20}, "secret": "excluded"})));
-        let app = gate.mount(routes(console, stats));
+        let app = gate.mount(routes(console, stats, Some(|value| { value["graph_cache"] = json!([{"charged": 42}]); })));
         let locked = app.clone().oneshot(Request::get("/console/memory").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(locked.headers()[header::CACHE_CONTROL], "no-store");
@@ -102,7 +106,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1 << 20).await.unwrap()).unwrap();
         assert_eq!(value["stats"]["prefix_cache"]["pages"], 20);
         assert!(value["stats"].get("secret").is_none());
-        assert!(value["stats"]["graph_cache"].is_null());
+        assert_eq!(value["stats"]["graph_cache"][0]["charged"], 42);
     }
 
     #[test]
@@ -125,7 +129,7 @@ mod tests {
 
     #[tokio::test]
     async fn memory_without_configured_gate_stays_locked() {
-        let app = routes(ConsoleHub::disabled(), Arc::new(Mutex::new(Value::Null)));
+        let app = routes(ConsoleHub::disabled(), Arc::new(Mutex::new(Value::Null)), None);
         assert_eq!(app.oneshot(Request::get("/console/memory").body(Body::empty()).unwrap()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     }
 }

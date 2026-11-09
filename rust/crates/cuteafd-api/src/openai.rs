@@ -409,7 +409,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let expert_routes = expert_usage::routes(console.clone(), profile.expert_usage.clone());
-    let memory_routes = memory::routes(console.clone(), stats.clone());
+    let memory_routes = memory::routes(console.clone(), stats.clone(), profile.stats_diagnostics);
     let console_routes = Router::new()
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
