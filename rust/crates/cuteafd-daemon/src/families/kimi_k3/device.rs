@@ -997,11 +997,10 @@ impl<'a> LocalLane<'a> {
         self.mla_output(layer, batch)
     }
 
-    /// Capture the shared protocol as one executable, including its device flags.
-    /// This is invoked only during startup capture, never as an eager live fallback.
+    /// Enqueue the shared protocol, including its device-side exchange flags.
+    /// Startup records these same commands; a replay miss submits them eagerly.
     fn context_step(&mut self, layer: usize, rows: usize, speculative: bool) -> Result<()> {
         use crate::shared::peer_split::attention::{Candidates, ContextKernels, Partial, Query};
-        ensure!(self.graphs.is_none(), "Kimi context step may only be submitted during startup capture");
         let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
         struct Bindings<'b, 'a> { local: &'b mut LocalLane<'a>, layer: usize, rows: usize, speculative: bool }
         impl ContextKernels for Bindings<'_, '_> {
@@ -1057,9 +1056,10 @@ impl<'a> LocalLane<'a> {
         let splits = super::context::split_bucket(self.context_pages[0], bucket,
             self.context.as_ref().unwrap().1.sms)? as i32;
         context.ranks[self.rank].upload("active splits", 0, &splits.to_le_bytes(), &stream)?;
-        ensure!(self.replay(bucket, super::graphs::Op::Context { layer, speculative })?,
-            "Kimi context whole-step graph missing");
-        // Native output was captured directly into the persistent F32 lane plane.
+        if !self.replay(bucket, super::graphs::Op::Context { layer, speculative })? {
+            self.context_step(layer, bucket, speculative)?;
+        }
+        // Both replay and eager submission write the persistent F32 lane plane.
         if self.native_f32_attention(layer)? { return Ok(()); }
         let rank = self.rank;
         let output = context.ranks[rank].buffer("decode output")?;

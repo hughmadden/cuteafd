@@ -193,20 +193,25 @@ impl<'a> Graphs<'a> {
     pub(crate) fn replays(&self) -> u64 { self.replays }
 
     pub(crate) fn launch(&mut self, key: Key, stream: &Stream<'a>, context: impl FnOnce() -> String) -> Result<bool> {
+        self.launch_with(key, context, |owner| {
+            ensure!(owner.device() == stream.device.id, "Kimi graph replay device changed");
+            stream.device.run(|| {
+                // SAFETY: binding owns immutable capture pointers and this exact stream.
+                unsafe { stream.device.library.cuda_graph_launch(owner.raw, stream.raw) }
+            })
+        })
+    }
+
+    fn launch_with(&mut self, key: Key, context: impl FnOnce() -> String,
+        replay: impl FnOnce(&GraphOwner<'a, ()>) -> Result<()>) -> Result<bool> {
         let (decision, owner) = self.bank.enqueue_with_context(&key, context);
         match decision {
             GraphDecision::Replay => {
                 let owner = owner.expect("replay has executable");
-                ensure!(owner.device() == stream.device.id, "Kimi graph replay device changed");
-                stream.device.run(|| {
-                    // SAFETY: binding owns immutable capture pointers and this exact stream.
-                    unsafe { stream.device.library.cuda_graph_launch(owner.raw, stream.raw) }
-                })?;
+                replay(owner)?;
                 self.replays += 1;
                 Ok(true)
             }
-            GraphDecision::Eager if matches!(key.op, Op::Context { .. }) =>
-                anyhow::bail!("Kimi context requires a startup-captured whole-step graph"),
             GraphDecision::Eager => Ok(false),
             GraphDecision::Capture => anyhow::bail!("Kimi live submission attempted graph capture"),
         }
@@ -221,6 +226,43 @@ pub(crate) fn check_captures(startup: u64, current: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_miss_is_counted_and_requests_eager_submission_without_capture() -> Result<()> {
+        let mut bank = GraphBank::with_family(GraphPolicy::FixedStartup, "kimi_k3");
+        bank.seal_startup(&[])?;
+        let mut graphs = Graphs { bank, replays: 0 };
+        let key = Key { lane: usize::MAX, rank: 0, rows: 17,
+            op: Op::Context { layer: usize::MAX, speculative: true } };
+        let before = crate::shared::decode_graph::missing_variants().into_iter()
+            .find(|entry| entry.family == "kimi_k3" && entry.shape == format!("{key:?}"))
+            .map_or(0, |entry| entry.runs);
+        for _ in 0..2 {
+            assert!(!graphs.launch_with(key, || "context eager regression".into(),
+                |_| panic!("a missing executable cannot replay"))?);
+        }
+        let missing = crate::shared::decode_graph::missing_variants().into_iter()
+            .find(|entry| entry.family == "kimi_k3" && entry.shape == format!("{key:?}"))
+            .expect("context miss must be visible in shared stats");
+        assert_eq!(missing.runs, before + 2);
+        assert_eq!(graphs.bank.stats().eager_runs, 2);
+        assert_eq!(graphs.bank.stats().captures, 0);
+        assert_eq!(graphs.replays(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn context_decode_miss_enqueues_the_same_protocol_as_startup() {
+        let source = include_str!("device.rs");
+        let step = source.split("    fn context_step(").nth(1).unwrap()
+            .split("    pub(crate) fn context_decode(").next().unwrap();
+        assert!(!step.contains("self.graphs.is_none()"));
+        assert!(step.contains("crate::shared::peer_split::attention::context_decode("));
+        let decode = source.split("    pub(crate) fn context_decode(").nth(1).unwrap()
+            .split("    pub(crate) fn context_attention(").next().unwrap();
+        assert!(decode.contains("if !self.replay(bucket, super::graphs::Op::Context { layer, speculative })? {\n            self.context_step(layer, bucket, speculative)?;"));
+        assert!(!decode.contains("cuda_graph_begin_capture"));
+    }
 
     #[test]
     fn context_whole_steps_match_admission_and_capture_each_native_row_bucket() -> Result<()> {
