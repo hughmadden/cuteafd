@@ -186,10 +186,12 @@ pub(crate) struct EngineArgs {
     #[arg(long, action = clap::ArgAction::Set)]
     pub fp8_o_proj: Option<bool>,
     /// Decode and verify steps replay one captured CUDA graph per layer segment
-    /// between the Spark exchanges (every 1..=64-row shape captured at startup).
-    /// Off by default: with the host-driven exchange the GPU, not the launches,
-    /// bounds each segment (same C1/C4 and step times, +0.4-1.2 GiB of graphs);
-    /// the segments are what a device-driven exchange captures as one step.
+    /// between the Spark exchanges. Startup captures the checked-in prewarm
+    /// list (rows 1..=64) inside one bounded reserve per device; any other shape
+    /// captures on a miss or runs eagerly. Off by default: with the host-driven
+    /// exchange the GPU, not the launches, bounds each segment (same C1/C4 and
+    /// step times, +0.4-1.2 GiB of graphs); the segments are what a
+    /// device-driven exchange captures as one step.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set, env = "CUTEAFD_MIMO_DECODE_GRAPHS")]
     pub decode_graphs: bool,
     /// Expert input rows sent to the Spark ranks: FP8 K32 wire rows, BF16
