@@ -242,11 +242,15 @@ def test_generator_prefix_matches_shared_engine_graph_site(family):
     assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
 
 
-@pytest.mark.parametrize("family", ["glm5_flash", "deepseek_v41"])
+@pytest.mark.parametrize("family", ["deepseek_v41"])
 def test_native_family_schemas_are_not_advertised_as_glm_consumers(family):
     assert family not in MODULE.SITE_PREFIX
     with pytest.raises(ValueError, match="no checked-in shape-list consumer"):
         MODULE.generate([trace()], family)
+
+
+def test_flash_is_not_advertised_as_a_glm_prefix_consumer():
+    assert "glm5_flash" not in MODULE.SITE_PREFIX
 
 
 @pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
@@ -272,3 +276,72 @@ def test_regeneration_reproduces_checked_in_base_and_tail(filename):
                              **({"layout": checked_in["layout"]} if checked_in.get("layout") else {}))
     for key in ("reserve_base_bytes", "reserve_extra_bytes"):
         assert result[key] == checked_in[key]
+
+def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0, site="glm5_flash.decode"):
+    return {"device": 0, "site": site, "bank": 1,
+            "shape": f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {spec}, long: {long}, "
+                     f"pool_width: {width}, page_stride: {stride}, pool_stride: {pool_stride} }}",
+            "count": count}
+
+
+def flash_trace(graphs=None, charged=16 << 20):
+    return {"schema_version": 1, "cache": {"device": 0, "charged": charged},
+            "sites": {"glm5_flash.decode": {"largest_bytes": 3 << 20}},
+            "graphs": graphs if graphs is not None else
+            [flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0),
+             flash_graph(4, "false", "false", 0, 64, 0, 90, segment=3),
+             flash_graph(16, "true", "false", 0, 128, 0, 30, segment=0),
+             flash_graph(1, "true", "true", 2048, 64, 16, 1, segment=2)]}
+
+
+def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
+    result = MODULE.generate([flash_trace()], "glm5_flash", coverage=0.99)
+    assert result["family"] == "glm5_flash"
+    assert result["measured_bytes"] == 16 << 20
+    assert result["measured_executables"] == 4
+    assert result["reserve_extra_bytes"] == 4 << 20
+    # 99% coverage keeps the two hot shapes (190 and 30 hits); only the peak is pinned.
+    assert result["entries"] == [
+        {"rows": 4, "spec": False, "long": False, "pool_width": 0,
+         "page_stride": 64, "pool_stride": 0, "pin": True},
+        {"rows": 16, "spec": True, "long": False, "pool_width": 0,
+         "page_stride": 128, "pool_stride": 0, "pin": False},
+    ]
+
+
+def test_flash_short_steps_collapse_the_unkeyed_pool_geometry():
+    graphs = [flash_graph(4, "false", "false", 1, 64, 16, 10),
+              flash_graph(4, "false", "false", 4, 64, 32, 5)]
+    result = MODULE.generate([flash_trace(graphs)], "glm5_flash")
+    assert result["entries"] == [{"rows": 4, "spec": False, "long": False, "pool_width": 0,
+                                  "page_stride": 64, "pool_stride": 0, "pin": True}]
+
+
+def test_flash_startup_prewarm_is_not_request_demand():
+    graphs = flash_trace()["graphs"]
+    for graph in graphs:
+        graph["cycles"] = {"other": 1000}
+    graphs[0]["cycles"] = {"other": 1000, "verify": 5}
+    result = MODULE.generate([flash_trace(graphs)], "glm5_flash")
+    assert [(entry["rows"], entry["pin"]) for entry in result["entries"]] == [(4, True)]
+
+
+def test_flash_arena_is_the_largest_device_with_its_executables():
+    small = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10)], charged=8 << 20)
+    large = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 10),
+                         flash_graph(8, "false", "false", 0, 64, 0, 10)], charged=24 << 20)
+    result = MODULE.generate([small, large], "glm5_flash")
+    assert (result["measured_bytes"], result["measured_executables"]) == (24 << 20, 2)
+
+
+@pytest.mark.parametrize("change", [
+    lambda t: t["graphs"][0].update(shape="GlmGraphKey { rows: 1 }"),
+    lambda t: t["cache"].update(charged=0),
+    lambda t: t.update(graphs=[flash_graph(0, "false", "false", 0, 64, 0, 5)]),
+    lambda t: t.update(graphs=[flash_graph(4, "false", "true", 1, 64, 0, 5)]),
+])
+def test_flash_invalid_trace_fails(change):
+    data = flash_trace()
+    change(data)
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "glm5_flash")

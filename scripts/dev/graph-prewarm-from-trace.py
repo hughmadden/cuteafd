@@ -14,6 +14,9 @@ CHUNK = 2 << 20
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
 SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
+GLMF_GEOMETRY = re.compile(
+    r"GraphKey \{ segment: \d+, rows: (\d+), spec: (true|false), long: (true|false), "
+    r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 
 
 def packed(value):
@@ -32,6 +35,10 @@ def sustained(graph):
 
 
 def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
+    if family == "glm5_flash":
+        if layout is not None:
+            raise ValueError("--layout applies to mistral_large4 only")
+        return generate_glm5_flash(traces, coverage, pin_frequency)
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
         raise ValueError(f"no checked-in shape-list consumer for {family}")
@@ -160,9 +167,82 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
     return result
 
 
+def glmf_identity(shape):
+    """A GLM Flash graph identity as its stable key tuple.
+
+    Short steps key neither the pool top-k's width nor the pool table stride
+    (`GraphGeometry::keyed`), so those identities collapse to one shape.
+    """
+    match = GLMF_GEOMETRY.fullmatch(shape.strip())
+    if match is None:
+        raise ValueError(f"cannot parse glm5_flash graph identity: {shape!r}")
+    rows, spec, long, width, page_stride, pool_stride = match.groups()
+    rows, width, page_stride, pool_stride = (int(value) for value in (rows, width, page_stride, pool_stride))
+    if rows <= 0 or page_stride <= 0:
+        raise ValueError("unsupported prewarm geometry")
+    if long == "false":
+        width = pool_stride = 0
+    elif pool_stride <= 0:
+        raise ValueError("unsupported prewarm geometry")
+    return (rows, spec == "true", long == "true", width, page_stride, pool_stride)
+
+
+def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
+    """A GLM Flash startup list: shapes by request frequency, the measured
+    arena of one device with the executables it held, and one capture of
+    headroom. Startup prewarm itself runs as Other, never as request demand."""
+    if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
+        raise ValueError("coverage and pin frequency must be in (0, 1]")
+    counts = {}
+    arenas = []
+    largest = 0
+    for trace in traces:
+        if trace.get("schema_version") != 1:
+            raise ValueError("expected GRAPH_TRACE schema_version=1")
+        matching = [graph for graph in trace["graphs"] if graph["site"].startswith("glm5_flash.")]
+        arenas.append((int(trace["cache"]["charged"]), len(matching)))
+        for site, values in trace.get("sites", {}).items():
+            if site.startswith("glm5_flash."):
+                largest = max(largest, int(values["largest_bytes"]))
+        device_counts = {}
+        for graph in matching:
+            key = glmf_identity(graph["shape"])
+            cycles = graph.get("cycles")
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
+                if cycles is not None else int(graph["count"])
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
+        for key, count in device_counts.items():
+            counts[key] = max(counts.get(key, 0), count)
+    if not counts:
+        raise ValueError("trace contains no matching graph identities")
+    ranked = sorted(counts, key=lambda key: (-counts[key], key))
+    total = sum(counts.values())
+    covered = 0
+    selected = []
+    for key in ranked:
+        selected.append(key)
+        covered += counts[key]
+        if covered >= total * coverage:
+            break
+    peak = max(counts.values())
+    entries = [{"rows": key[0], "spec": key[1], "long": key[2], "pool_width": key[3],
+                "page_stride": key[4], "pool_stride": key[5],
+                "pin": counts[key] >= peak * pin_frequency}
+               for key in sorted(selected)]
+    charged, executables = max(arenas)
+    if charged <= 0 or executables <= 0:
+        raise ValueError("trace has no measured GLM Flash arena")
+    # One largest measured capture is the explicit capture-before-reuse
+    # headroom; the arena base already carries the prewarm set.
+    return {"schema_version": 1, "family": "glm5_flash",
+            "measured_bytes": charged, "measured_executables": executables,
+            "reserve_extra_bytes": packed(largest), "entries": entries}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--family", required=True, choices=sorted(SITE_PREFIX))
+    parser.add_argument("--family", required=True, choices=sorted((*SITE_PREFIX, "glm5_flash")))
     parser.add_argument("--layout", type=int, choices=(1, 2),
                         help="coordinator layout the trace was recorded on (mistral_large4)")
     parser.add_argument("--trace", action="append", required=True, type=Path)
@@ -177,10 +257,15 @@ def main():
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    layout = f" layout={result['layout']};" if "layout" in result else ""
-    print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
-          f"extra={result['reserve_extra_bytes']} bytes; "
-          f"pinned={sum(entry['pin'] for entry in result['entries'])}")
+    pinned = sum(entry["pin"] for entry in result["entries"])
+    if "measured_bytes" in result:
+        print(f"{len(result['entries'])} shapes; measured={result['measured_bytes']} bytes "
+              f"for {result['measured_executables']} executables; "
+              f"extra={result['reserve_extra_bytes']} bytes; pinned={pinned}")
+    else:
+        layout = f" layout={result['layout']};" if "layout" in result else ""
+        print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
+              f"extra={result['reserve_extra_bytes']} bytes; pinned={pinned}")
     for pin in report:
         print("pin " + json.dumps(pin, sort_keys=True))
 
