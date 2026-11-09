@@ -159,10 +159,7 @@ impl<'a> GlmfEngine<'a> {
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>)
         -> Result<Option<DeviceLogits>> {
         ensure!(!graphed || on_layer.is_none(), "layer callbacks must run outside capture");
-        if graphed {
-            self.release_retired_graphs()?;
-            if self.embedding.device_gather() { self.gather_streams(w, rows)?; }
-        }
+        if graphed && self.embedding.device_gather() { self.gather_streams(w, rows)?; }
         let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables: [tables, tables1],
             owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
             tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS),
@@ -375,7 +372,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let [w, w1] = self.work;
         let layer = self.layer(0, index);
         let peer = self.layer(1, index);
-        let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
+        let real = if self.tables[0].decode && e.use_graphs { self.tables[0].real_rows } else { self.rows };
         let rows = Scalar::I32((if layer.dense { self.rows } else { real }) as i32);
         let masked = self.graphed && e.warming_graphs.get() && !layer.dense;
         ensure!(masked || layer.dense || real > 0, "per-layer MoE needs positive real rows");
@@ -419,7 +416,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
         ensure!(ticket.layer == index && ticket.lane == self.lane, "per-layer FFN ticket identity");
         let e = self.engine;
-        let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
+        let real = if self.tables[0].decode && e.use_graphs { self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
             let Some(Experts::Spark { transport }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
