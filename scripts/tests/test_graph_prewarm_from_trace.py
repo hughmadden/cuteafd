@@ -16,10 +16,26 @@ def trace(device=0, charged=8 << 20):
     def graph(rows, width, count):
         return {"device": device, "site": "glm5.segment", "bank": 1,
                 "shape": f"GlmGraphKey {{ layer: 0, rows: {rows}, table_width: {width}, table_stride: {width}, previous: First, head: false }}",
-                "count": count}
+                "count": count, "hits": count}
     return {"schema_version": 1, "cache": {"device": device, "charged": charged},
             "sites": {"glm5.segment": {"largest_bytes": 3 << 20}},
             "graphs": [graph(1, 16, 100), graph(16, 32, 99), graph(64, 128, 1)]}
+
+
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v41", "qwen4", "mimo_v2", "kimi_k3"])
+def test_non_glm_generators_keep_existing_fixture_outputs(family):
+    expected = json.loads((Path(__file__).parent / "fixtures/non-glm-prewarm-expected.json").read_text())
+    if family == "deepseek_v4":
+        result = MODULE.generate([v4_trace(0, 5 << 20)], family, layout="rtx1-local", existing=v4_list())
+    elif family == "deepseek_v41":
+        result = MODULE.generate([v41_trace()], family, layout=1)
+    elif family == "qwen4":
+        result = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    elif family == "mimo_v2":
+        result = MODULE.generate([mimo_trace()], family, coverage=0.99, ranks=1, variant="mimof-48", sparks=True)
+    else:
+        result = MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min")
+    assert result == expected[family]
 
 
 def test_frequency_and_low_parameter_pin_candidate():
@@ -44,6 +60,49 @@ def test_startup_prewarm_counts_do_not_select_cold_shapes():
     result = MODULE.generate([data], "glm5")
     assert len(result["entries"]) == 2
     assert all(entry["rows"] != 64 for entry in result["entries"])
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4", "glm5_flash"])
+def test_glm_capture_only_geometry_never_enters_coverage_or_pins(family):
+    if family == "glm5_flash":
+        data = flash_trace()
+    else:
+        data = modern_trace()
+    # A huge lazy-capture count must not dilute the replay denominator. Even
+    # churn/heat cannot turn a never-replayed geometry into startup demand.
+    hot, cold = data["graphs"][0], data["graphs"][-1]
+    hot.update(hits=1000, cycles={"decode": 1001})
+    cold.update(hits=0, count=100_000, cycles={"decode": 100_000},
+                evictions=3, recaptures=3,
+                hit_histogram={"interval_ms": 10_000, "start_ms": 0, "counts": [1] * 5})
+    data["graphs"] = [hot, cold]
+    kwargs = {"layout": 1} if family == "mistral_large4" else {}
+    result = MODULE.generate([data], family, **kwargs)
+    assert len(result["entries"]) == 1
+    assert result["entries"][0]["rows"] == (4 if family == "glm5_flash" else 1)
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4", "glm5_flash"])
+def test_glm_trace_without_replays_cannot_propose_prewarm(family):
+    data = flash_trace() if family == "glm5_flash" else modern_trace()
+    for graph in data["graphs"]:
+        graph["hits"] = 0
+    kwargs = {"layout": 1} if family == "mistral_large4" else {}
+    with pytest.raises(ValueError, match="no matching graph identities"):
+        MODULE.generate([data], family, **kwargs)
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4", "glm5_flash"])
+def test_glm_startup_hits_are_capped_by_request_cycles(family):
+    data = flash_trace() if family == "glm5_flash" else modern_trace()
+    hot, startup = data["graphs"][0], data["graphs"][-1]
+    hot.update(hits=1000, cycles={"verify": 1001})
+    startup.update(hits=1_000_000, cycles={"other": 1_000_000, "decode": 1})
+    data["graphs"] = [hot, startup]
+    kwargs = {"layout": 1} if family == "mistral_large4" else {}
+    result = MODULE.generate([data], family, coverage=0.99, **kwargs)
+    assert len(result["entries"]) == 1
+    assert result["entries"][0]["rows"] == (4 if family == "glm5_flash" else 1)
 
 
 def test_cold_low_rank_shape_is_not_pinned():
@@ -107,7 +166,7 @@ def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0,
     return {"device": 0, "site": site, "bank": 1,
             "shape": f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {spec}, long: {long}, "
                      f"pool_width: {width}, page_stride: {stride}, pool_stride: {pool_stride} }}",
-            "count": count, "capture_bytes": capture_bytes, "executables": 1}
+            "count": count, "hits": count, "capture_bytes": capture_bytes, "executables": 1}
 
 
 def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20, device=0):
@@ -122,6 +181,22 @@ def flash_trace(graphs=None, charged=16 << 20, capture_bytes=1 << 20, device=0):
                          capture_bytes=capture_bytes),
              flash_graph(1, "true", "true", 2048, 64, 16, 1, segment=2,
                          capture_bytes=capture_bytes)]}
+
+
+def test_flash_checked_in_list_regenerates_byte_for_byte_from_source_traces(tmp_path):
+    import gzip
+    fixture = Path(__file__).parent / "fixtures/glmf-prewarm-traces.json.gz"
+    traces = json.loads(gzip.decompress(fixture.read_bytes()))
+    groups = {}
+    for layout, snapshots in traces.items():
+        groups[layout] = []
+        for index, snapshot in enumerate(snapshots):
+            path = tmp_path / f"{layout}-{index}.json"
+            path.write_text(json.dumps(snapshot))
+            groups[layout].append(path)
+    generated = MODULE.generate_layouts(groups, "glm5_flash")
+    checked_in = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == checked_in.read_text()
 
 
 def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
