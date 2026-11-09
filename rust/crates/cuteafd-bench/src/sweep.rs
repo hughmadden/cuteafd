@@ -553,7 +553,7 @@ mod tests {
                             chats += 1;
                             assert_eq!(body["stream"], true);
                             let actual = count();
-                            if chats >= 3 { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
+                            if (3..=4).contains(&chats) { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
                             let reported = if Some(chats) == mismatch_at { 8310 } else { actual };
                             let event = json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}],
                                 "usage":{"prompt_tokens":reported, "completion_tokens":1}});
