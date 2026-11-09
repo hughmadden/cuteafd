@@ -208,6 +208,14 @@ pub fn glm_prewarm_list() -> &'static GlmPrewarmList {
 /// Mistral Large 4's list for the resolved coordinator layout. One rank runs
 /// head-split attention and captures no peer segment; two ranks run the
 /// context placement, which adds rank-1 segments and halves each table width.
+///
+/// Each list was traced on its own card (1 rank + 5 Sparks, 2 ranks + 6
+/// Sparks) at KV target 2M / max 100M with the C1/2/4/8/16 sweep and the 32K
+/// shared-prefix point. `reserve_base_bytes` is that layout's measured arena
+/// high-water (the larger device under the context placement); `reserve_extra`
+/// is its largest measured boundary capture, one 2 MiB chunk. Neither trace
+/// evicted or recaptured a graph, so the only pin is the C1 decode geometry
+/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm.json`.
 pub fn ml4_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
     static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
@@ -281,8 +289,19 @@ mod tests {
         assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::MistralLarge4, 0),
             glm_prewarm(GlmPrewarmFamily::MistralLarge4, 1)));
         let allowed = glm_graph_shapes(1 << 20, 16384);
-        for entry in glm_prewarm_shapes(GlmPrewarmFamily::MistralLarge4, 2, 1 << 20, 16384) {
+        let warmed = glm_prewarm_shapes(GlmPrewarmFamily::MistralLarge4, 2, 1 << 20, 16384);
+        assert!(!warmed.is_empty());
+        for entry in warmed {
             assert!(allowed.contains(&entry.shape));
+        }
+        let one = glm_prewarm(GlmPrewarmFamily::MistralLarge4, 1);
+        let two = glm_prewarm(GlmPrewarmFamily::MistralLarge4, 2);
+        assert_eq!((one.reserve_base_bytes, one.reserve_extra_bytes), (713_031_680, 2_097_152));
+        assert_eq!((two.reserve_base_bytes, two.reserve_extra_bytes), (912_261_120, 2_097_152));
+        for list in [one, two] {
+            let pins: Vec<_> = list.entries.iter().filter(|entry| entry.pin).collect();
+            assert_eq!(pins.len(), 1, "{} layout {}", list.family, list.layout.unwrap());
+            assert_eq!(pins[0].shape, GlmGraphShape { rows: 1, table_width: 16 });
         }
         // Checked-in entries hold the width a step is built with; the context
         // placement's per-rank key is its half table.

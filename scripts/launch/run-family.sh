@@ -1284,8 +1284,9 @@ read -r detected model_type first_layer last_layer <<<"$described"
 family="$detected"
 # The checkpoint's own family names its deployment plan; Mistral Large 4 runs
 # the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant. Two GPUs:
-# auto resolves to whole-layer owners (plan and server) until context measures faster; heads
-# and context (its ml42 head split) are explicit requests. The bundled mtp_dspark
+# auto resolves to the ml42 page-partitioned context placement (one rank on one GPU runs the
+# head split); heads and layers are explicit requests, and a missing context program falls
+# back to whole-layer owners. The bundled mtp_dspark
 # defaults on at its checkpoint-native depth; SPECULATOR=off disables it.
 checkpoint_family="$family"
 if [[ "$family" == mistral_large4 ]]; then
