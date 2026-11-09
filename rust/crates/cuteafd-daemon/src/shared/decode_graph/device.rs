@@ -354,7 +354,6 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
         unsafe { bank.evict_persistent(); }
         Ok(())
     })
-
 }
 
 pub(crate) struct DeviceCache {
