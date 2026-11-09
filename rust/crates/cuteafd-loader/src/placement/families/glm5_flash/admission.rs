@@ -2,6 +2,20 @@
 use super::*;
 use crate::placement::planner as p;
 
+/// The coordinator context's peak live streams (#1511: SM120 retains 2 MiB per
+/// four live streams; destroyed streams reuse the slots). One serving lane
+/// (`glm5_flash/mod.rs` serving stream), the four delivery lanes
+/// (`push_load::COPY_STREAMS` in `shared/memory/push_consumer.rs`), the packed
+/// head's pack lane (`glm5_flash/head.rs`), the embedding verify lane
+/// (`shared/token_io.rs`) and the expert-usage lane
+/// (`cuteafd-ffi/src/shared/expert_usage.rs`) overlap during the weight load;
+/// a split adds the peer lane (`glm5_flash/mod.rs` peer stream). The Spark
+/// intake and prefix-cache lanes are created after the delivery lanes retire,
+/// so they refill the same slots and never raise the peak.
+pub fn startup_peak_live_streams(gpus: usize) -> u64 {
+    8 + u64::from(gpus > 1)
+}
+
 /// Caller-resolved process owners. Preparing a recipe never samples memory.
 #[derive(Debug, Clone)]
 pub struct ProcessOwners {
@@ -452,18 +466,50 @@ fn component(id: impl Into<String>, gpu: u8, category: Category, group: &str,
     Ok(owner)
 }
 
-fn add_demand(contract: &mut p::Contract, demand: &Demand, id: String,
+fn add_demand(contract: &mut p::Contract, demand: &Demand, requests: &[u64], id: String,
     activation: p::Activation) -> Result<(), p::Refusal> {
-    let lifetime = if demand.lifetime == cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve {
+    add_demand_allocated_at(contract, demand, requests, id, activation, None)
+}
+
+/// `allocated_at` names the phases the engine really allocates the owner in, when the
+/// owner's category alone would name a later one (the DFlash linear/attention scratch is
+/// a workspace allocation made while the drafter loads).
+fn add_demand_allocated_at(contract: &mut p::Contract, demand: &Demand, requests: &[u64], id: String,
+    activation: p::Activation, allocated_at: Option<p::Lifetime>) -> Result<(), p::Refusal> {
+    let lifetime = if let Some(lifetime) = allocated_at { lifetime }
+    else if demand.lifetime == cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve {
         p::Lifetime { first: p::Phase::Growth, last: p::Phase::Growth }
     } else if matches!(demand.category, Category::Weights | Category::Embedding | Category::Runtime) {
         p::Lifetime::RESIDENT
+    } else if demand.category == Category::Drafter {
+        // Drafter owners are allocated while the drafter loads, not with the target KV.
+        p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }
     } else { p::Lifetime::TARGET };
     let maximum = contract.maximum_pages;
+    // A supplied request list must sit inside the owner it describes: a view (the K6
+    // receive suffix inside the peer exchange slot) or an unlisted small field can
+    // make it smaller, never larger.
+    if !requests.is_empty() {
+        let total = requests.iter().try_fold(0u64, |sum, &bytes| sum.checked_add(bytes))
+            .ok_or(p::Refusal::Overflow("GLM Flash owner request list"))?;
+        if total > demand.bytes {
+            return Err(p::Refusal::InvalidFact(format!(
+                "GLM Flash owner {id}: its request list is {total} bytes, more than its {}-byte extent",
+                demand.bytes)));
+        }
+    }
     let mut owner = component(id.clone(), demand.gpu, demand.category, &demand.group,
         p::ByteCurve::fixed(demand.bytes, maximum), lifetime, maximum)?;
     owner.activation = activation.clone();
     contract.components.push(owner);
+    // One named SM120 backing per physical request of this owner. Every caller
+    // that knows the engine's real request list passes it; an owner that is one
+    // request of its whole extent needs none.
+    if let Some(mut tail) = p::exact_owner_tail(format!("{id}.tail"), id.clone(),
+        p::Location::coordinator(demand.gpu), lifetime, requests.to_vec(), maximum)? {
+        tail.activation = activation.clone();
+        contract.components.push(tail);
+    }
     if demand.resident_weights.0 > 0 {
         let mut weight = p::Component::resident_weight(p::ResidentWeight {
             id, location: p::Location::coordinator(demand.gpu), weights: demand.resident_weights,
@@ -715,7 +761,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             physical_bytes: total, logical_bytes: total, headroom: i.headroom_bytes, baseline });
         if occupied > 0 {
             add_demand(&mut contract, &Demand::new(gpu as u8, Category::Runtime, "context+modules", occupied,
-                Basis::Calibrated), format!("glmf.runtime.{gpu}"), p::Activation::always())?;
+                Basis::Calibrated), &[], format!("glmf.runtime.{gpu}"), p::Activation::always())?;
         }
     }
     // HOST and PINNED share one physical capacity; external occupancy is sampled
@@ -857,27 +903,47 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                 .enumerate().filter(|(_, n)| if row.component == GlmfComponent::RtxExperts { **n > 0 }
                     else { **n < routed.len() }).map(|(option, _)| vec![p::Choice { variable: onboard_variable, option }]).collect() },
         };
-        add_demand(&mut contract, &row.demand, format!("glmf.fixed.{index}"), activation)?;
+        add_demand(&mut contract, &row.demand, &row.requests, format!("glmf.fixed.{index}"), activation)?;
     }
     for gpu in 0..gpus {
         let geometry = &facts.geometry.ranks[gpu];
-        let bytes = geometry.persistent_unit_bytes.checked_add(geometry.pool_metadata_unit_bytes)
-            .and_then(|bytes| bytes.checked_add(geometry.glmf_pool_mark_backing_unit_bytes(i.pool_marks)))
+        // One device request per pool piece and resident MLA layer, each rounded to its own
+        // driver granule: charge those backings instead of the flat payload.
+        let layers = facts.mla_layers[gpu];
+        let mut unit: u64 = 0;
+        for (name, per_layer) in cache::glm_flash_mla_unit_pieces(i.index, i.attention.mode) {
+            let piece = per_layer.checked_mul(layers).ok_or(p::Refusal::Overflow("GLM Flash KV piece"))?;
+            unit = unit.checked_add(piece).ok_or(p::Refusal::Overflow("GLM Flash KV unit"))?;
+            if piece == 0 { continue; }
+            contract.components.push(component(format!("glmf.pool.{gpu}.{name}"), gpu as u8,
+                Category::Kv, "KV pool", p::ByteCurve::paged(piece, piece,
+                    p::SM120_ALLOCATION_GRANULARITY_BYTES, layers, maximum), p::Lifetime::TARGET, maximum)?);
+        }
+        if unit != geometry.persistent_unit_bytes {
+            return Err(p::Refusal::InvalidFact("GLM Flash KV unit pieces do not sum".into()));
+        }
+        // The shared unit-index map is one small allocation (4 B per unit) and the
+        // KDA-only pool's mark backing reserves its whole state per unit.
+        let metadata = geometry.pool_metadata_unit_bytes.checked_add(
+            geometry.glmf_pool_mark_backing_unit_bytes(i.pool_marks))
             .ok_or(p::Refusal::Overflow("GLM Flash KV unit"))?;
-        contract.components.push(component(format!("glmf.pool.{gpu}"), gpu as u8, Category::Kv, "KV pool",
-            p::ByteCurve::linear(bytes, bytes, maximum), p::Lifetime::TARGET, maximum)?);
+        if metadata > 0 {
+            contract.components.push(component(format!("glmf.pool.{gpu}.metadata"), gpu as u8,
+                Category::Kv, "KV pool", p::ByteCurve::linear(metadata, metadata, maximum),
+                p::Lifetime::TARGET, maximum)?);
+        }
     }
     if i.attention.mode == AttentionPlacement::Context {
         for (index, demand) in context_buffers(i.cfg, i.max_context, i.prefill_rows, i.prefill_lanes,
             i.attention).demands().map_err(invalid)?.iter().enumerate() {
-            add_demand(&mut contract, demand, format!("glmf.context.{index}"), p::Activation::always())?;
+            add_demand(&mut contract, demand, &[], format!("glmf.context.{index}"), p::Activation::always())?;
         }
     }
     let hop = hop_spec(i);
     let hops = plan_hops(&attention, &hop).map_err(invalid)?;
     for (gpu, bytes) in hop_buffer_bytes(&hops, &hop, gpus).ok_or(p::Refusal::Overflow("GLM Flash hops"))?.into_iter().enumerate() {
         add_demand(&mut contract, &Demand::new(gpu as u8, Category::Transport, "residual hops", bytes,
-            Basis::Formula), format!("glmf.hops.{gpu}"), p::Activation::always())?;
+            Basis::Formula), &[], format!("glmf.hops.{gpu}"), p::Activation::always())?;
     }
     if i.drafter_bytes > 0 {
         let nonweights = i.drafter_bytes.checked_sub(i.drafter_weights.0)
@@ -905,13 +971,20 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
             }
             add_arena(&mut contract, &draft_arenas[usize::from(gpu)], usize::from(gpu),
                 p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }, &activation, cuteafd_core::memory_layout::MemoryKind::DrafterWeights)?;
+            // One device request per drafter owner: the rings, taps, context update and
+            // workspace buffers, then the linear and attention scratch allocations.
+            let requests = facts.drafter_requests.as_ref();
+            let none: &[u64] = &[];
             add_demand(&mut contract, &Demand::new(gpu, Category::Drafter, "DFlash", nonweights,
-                Basis::Exact), format!("glmf.draft.{gpu}"), activation.clone())?;
-            add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],
-                Basis::Formula), format!("glmf.draft.scratch.{gpu}"), activation.clone())?;
+                Basis::Exact), requests.map_or(none, |rows| rows.resident(usize::from(gpu))),
+                format!("glmf.draft.{gpu}"), activation.clone())?;
+            add_demand_allocated_at(&mut contract, &Demand::new(gpu, Category::Workspace, "DFlash linear/attention scratch", i.drafter_scratch[usize::from(gpu)],
+                Basis::Formula), requests.map_or(none, |rows| rows.scratch(usize::from(gpu))),
+                format!("glmf.draft.scratch.{gpu}"), activation.clone(),
+                Some(p::Lifetime { first: p::Phase::DraftLoad, last: p::Phase::Growth }))?;
             if head.draft_scratch > 0 {
                 add_demand(&mut contract, &Demand::new(gpu, Category::Workspace, "packed head draft scratch",
-                    head.draft_scratch, Basis::Formula), format!("glmf.draft.head.{gpu}"), activation.clone())?;
+                    head.draft_scratch, Basis::Formula), &[], format!("glmf.draft.head.{gpu}"), activation.clone())?;
             }
             if gpu != 0 {
                 if i.blas_head.bf16() {
@@ -921,7 +994,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                         activation: activation.clone() });
                 }
                 for (index, demand) in i.drafter_bridge.as_ref().into_iter().flat_map(|bridge| &bridge.demands).enumerate() {
-                    add_demand(&mut contract, demand, format!("glmf.draft.bridge.{index}"), activation.clone())?;
+                    add_demand(&mut contract, demand, &[], format!("glmf.draft.bridge.{index}"), activation.clone())?;
                 }
             }
         }
@@ -951,7 +1024,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         let working = GlmfWorkingSet::candidate(i, count).map_err(invalid)?;
         let workspace = if working.spark_ranks == 0 { &i.local_workspace } else { &i.workspace };
         for (index, row) in working.demands(workspace).enumerate() {
-            add_demand(&mut contract, row, format!("glmf.steps.{option}.{index}"), activation.clone())?;
+            add_demand(&mut contract, &row.demand, &row.requests, format!("glmf.steps.{option}.{index}"), activation.clone())?;
         }
         let mut peak = vec![0; gpus];
         for gpu in 0..gpus {
@@ -968,7 +1041,7 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
                     .ok_or(p::Refusal::Overflow("GLM Flash expert load peak"))?);
             }
             add_demand(&mut contract, &Demand::new(gpu as u8, Category::Experts, "RTX expert arena", peak[gpu], Basis::Exact)
-                .with_resident_weights(ResidentWeights(weights)), format!("glmf.experts.{option}.{gpu}"), activation.clone())?;
+                .with_resident_weights(ResidentWeights(weights)), &[], format!("glmf.experts.{option}.{gpu}"), activation.clone())?;
         }
         arena.push(peak);
     }
@@ -1000,6 +1073,19 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
     contract.components.extend(p::serving::blas_components("sm_120", &rtx_blas, maximum, contract.phase_order)?);
     contract.components.extend(p::serving::blas_components("sm_121", &spark_blas, maximum, contract.phase_order)?);
     contract.add_driver_page_tables();
+    // Driver stream slots are slabs, not cudaMalloc requests: no allocation-tail
+    // charge, and the slab survives the streams that first filled it.
+    let peak = startup_peak_live_streams(gpus);
+    let slabs = p::cuda_stream_slab_bytes(peak).map_err(invalid)?;
+    for rank in 0..gpus {
+        contract.components.push(p::Component { activation: p::Activation::always(),
+            bytes: p::ByteCurve::fixed(slabs, maximum),
+            kind: p::ComponentKind::Allowance(p::Allowance {
+                location: p::Location::coordinator(rank as u8), bytes: slabs,
+                lifetime: p::Lifetime::RESIDENT, assumed: false,
+                source: format!("glmf/driver-stream-slabs/gpu{rank} ({peak} peak live streams, \
+                    SM120 driver/runtime13020 LAZY, #1511 2026-11-08)") }) });
+    }
     let request = p::Request { context: i.context,
         pool: PoolPolicy::normalize_request(i.requested_pool).map_or(p::Pin::Auto, p::Pin::Exact),
         onboard: i.onboard.layers(routed.len()).map_or(p::Pin::Auto, |n| p::Pin::Exact(n as u64)),
@@ -1106,6 +1192,35 @@ impl PreparedGlmf<'_> {
 mod tests {
     use super::*;
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
+
+    /// SM120 retains a 2 MiB driver slab per four peak live streams (#1511);
+    /// the charge is one named resident allowance per coordinator GPU.
+    #[test]
+    fn driver_stream_slabs_are_named_resident_allowances_per_gpu() {
+        assert_eq!((startup_peak_live_streams(1), startup_peak_live_streams(2)), (8, 9));
+        assert_eq!(p::cuda_stream_slab_bytes(8).unwrap(), 4 << 20);
+        assert_eq!(p::cuda_stream_slab_bytes(9).unwrap(), 4 << 20);
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for ranks in [1, 2] {
+            let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, ranks,
+                crate::placement::inventory::PRO_TOTAL_BYTES);
+            input.drafter_bytes = 0;
+            input.drafter_weights = ResidentWeights(0);
+            input.requested_pool = Some(262_144);
+            let solved = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))
+                .unwrap().admit().unwrap().solved;
+            let slabs = p::cuda_stream_slab_bytes(startup_peak_live_streams(ranks)).unwrap();
+            for rank in 0..ranks {
+                let owners = solved.facts.allowances.iter().filter(|owner|
+                    owner.location == p::Location::coordinator(rank as u8)
+                        && owner.source.starts_with(&format!("glmf/driver-stream-slabs/gpu{rank} "))
+                        && owner.lifetime.contains(p::Phase::Ready, solved.facts.phase_order)).collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1, "{ranks} GPUs, rank {rank}");
+                assert_eq!(owners[0].bytes, slabs);
+                assert!(!owners[0].assumed);
+            }
+        }
+    }
 
     #[test]
     fn selected_arenas_replace_payload_and_share_activation_with_their_single_tail() -> anyhow::Result<()> {

@@ -12,13 +12,16 @@ use cuteafd_core::memory_policy::{DeviceKind, MemoryPolicy};
 /// growth beyond the #1242 census figures. Placeholder for measurement.
 pub const GLM5: u64 = 0;
 /// GLM 5.3 Flash. Inherited: 2 GiB `--headroom-gib` / `GLM5_FLASH_HEADROOM_GIB`
-/// (`families/glm5_flash/mod.rs:155-159`, dev `3ce3fbd19`). Covered lazily
-/// loaded kernels, cuBLAS and allocator rounding the startup cannot measure.
-/// RESTORED to 2 GiB: the K4 1-Spark memory probe (2026-11-07) peaked above
-/// its own admitted Growth/Ready bound on GPU0 (+0.28-0.73 GB) and GPU1 in
-/// both drafter arms, fitting only inside this margin. Back to 0 once the
-/// missing owner is charged: #1442.
-pub const GLM5_FLASH: u64 = 2 << 30;
+/// (`families/glm5_flash/mod.rs:155-159`, dev `3ce3fbd19`). Empty: the growth
+/// the K4 1-Spark probe measured is charged to named owners — driver stream
+/// slabs per coordinator GPU (#1511), native module code inside the measured
+/// pre-weight baseline (#1554) and the pinned host page tables — while its
+/// startup decode graphs are driver-owned instantiations no allocation ledger
+/// sees; a capture that fails names its shape and owner (`glmf.graphs.<gpu>`)
+/// and the levers that free memory (#1577). #1442 follows the residual from a
+/// pool-filled Ready; #1627 replaces the lazy graph allowance with a bounded
+/// per-device graph cache.
+pub const GLM5_FLASH: u64 = 0;
 /// Kimi K3. Inherited: 2 GiB hardcoded headroom (`families/kimi_k3/startup.rs:194`,
 /// dev `3ce3fbd19`). Probably covered allocator slack and unmeasured workspaces
 /// (no warmed census yet). Placeholder for measurement.

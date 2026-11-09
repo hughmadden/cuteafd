@@ -31,6 +31,13 @@ pub enum GranularityEvidence {
     /// Large allocations round independently; small requests share driver blocks.
     /// This is not a packing guarantee (e.g. repeated 576 KiB requests fragment).
     Forecast,
+    /// One logical owner whose physical request list is exact: only its requests
+    /// above one MiB are attributed here, because sub-MiB requests share driver
+    /// blocks across owners. Same physical model as [`Forecast`], narrower
+    /// attribution.
+    ///
+    /// [`Forecast`]: Self::Forecast
+    IndependentLarge,
 }
 
 /// Qualified only for discrete SM120 direct cudaMalloc, driver/runtime 13020,
@@ -114,23 +121,44 @@ impl AllocationGranularity {
             || !matches!(self.location, Location { device: Device::Coordinator(_), domain: Domain::Device }) {
             return Err(Refusal::InvalidFact("SM120 cudaMalloc granularity requires a named coordinator owner".into()));
         }
-        allocation_granularity_forecast(&self.requests())
+        match self.evidence {
+            GranularityEvidence::Forecast => allocation_granularity_forecast(&self.requests()),
+            GranularityEvidence::IndependentLarge => independent_backing_slack(self.requests()),
+        }
     }
 
     pub fn basis(&self) -> Basis { Basis::Estimated }
 
     pub fn source(&self) -> String {
-        format!("{} (SM120 direct cudaMalloc, driver/runtime13020 LAZY, #1454 2026-11-08, sizes-only forecast)", self.id)
+        let model = match self.evidence {
+            GranularityEvidence::Forecast => "sizes-only forecast",
+            GranularityEvidence::IndependentLarge => "exact request list, large requests only",
+        };
+        format!("{} (SM120 direct cudaMalloc, driver/runtime13020 LAZY, #1454 2026-11-08, {model})", self.id)
     }
 
     pub(super) fn validate_backings(&self, facts: &Facts, seen: &mut BTreeSet<String>) -> Result<(), Refusal> {
         self.bytes()?;
         for backing in &self.backings {
             let owner = facts.allocations.iter().chain(&facts.deferred).find(|owner| owner.id == backing.backing);
-            if backing.backing.is_empty() || !seen.insert(backing.backing.clone())
+            let duplicate = !backing.backing.is_empty() && !seen.insert(backing.backing.clone());
+            if backing.backing.is_empty() || duplicate
                 || !owner.is_some_and(|owner| owner.view.is_none() && owner.location == self.location
                     && owner.lifetime == self.lifetime && sum_requests(backing.requests.iter().copied()) == Ok(owner.bytes)) {
-                return Err(Refusal::InvalidFact(format!("invalid cudaMalloc granularity backing {}", backing.backing)));
+                let listed = sum_requests(backing.requests.iter().copied()).ok();
+                return Err(Refusal::InvalidFact(match owner {
+                    _ if backing.backing.is_empty() => "cudaMalloc granularity backing has no owner id".into(),
+                    None => format!("cudaMalloc granularity backing {} names no device owner", backing.backing),
+                    Some(_) if duplicate =>
+                        format!("cudaMalloc granularity backing {} is charged twice", backing.backing),
+                    Some(owner) if owner.view.is_some() || owner.location != self.location
+                        || owner.lifetime != self.lifetime => format!(
+                        "cudaMalloc granularity backing {} names an owner with another view, location or lifetime",
+                        backing.backing),
+                    Some(owner) => format!(
+                        "cudaMalloc granularity backing {}: requests total {listed:?} bytes, owner extent {}",
+                        backing.backing, owner.bytes),
+                }));
             }
         }
         Ok(())
@@ -143,6 +171,20 @@ pub fn allocation_granularity_component(owner: AllocationGranularity, maximum: u
     let bytes = owner.bytes()?;
     Ok(Component { activation: Activation::always(), bytes: ByteCurve::fixed(bytes, maximum),
         kind: ComponentKind::AllocationGranularity(owner) })
+}
+
+/// One logical owner whose physical request list is exact. Charges the SM120
+/// rounding of its requests above one MiB and nothing for sub-MiB requests,
+/// which share driver blocks across owners. `requests` must be the engine's
+/// real list (every device allocation the owner makes), never an even split of
+/// an aggregate; `backing` is the payload owner whose bytes the list describes.
+pub fn exact_owner_tail(id: String, backing: String, location: Location, lifetime: Lifetime,
+    requests: Vec<u64>, maximum: u64) -> Result<Option<Component>, Refusal> {
+    let owner = AllocationGranularity { id, location, lifetime,
+        backings: vec![GranularityBacking { backing, requests }],
+        evidence: GranularityEvidence::IndependentLarge };
+    if owner.bytes()? == 0 { return Ok(None); }
+    allocation_granularity_component(owner, maximum).map(Some)
 }
 
 /// Append one named tail for every fixed device owner that is exactly one

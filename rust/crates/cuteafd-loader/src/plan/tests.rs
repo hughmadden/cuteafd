@@ -3698,7 +3698,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
             graphs: glmf::startup_graph_bound(&cfg, cfg.layers, 262144, 2 << 20, 8, false, 2, 64, 188),
             experts: glmf::expert_costs(&catalog, true).unwrap(),
             expert_workspace: 0, tp2_workspace: [glmf::expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(); 2],
-            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
+            drafter_bytes: 0, drafter_weights: placement::ResidentWeights::default(), drafter_scratch: vec![0; 2], drafter_requests: None, drafter_bridge: None, requested_pool: Some(2 << 20), onboard,
             full_prefill_logits: 0 };
         let mut process = glmf::admission::ProcessOwners::new((512 << 30, 512 << 30), 8 << 30);
         process.target(&checkpoint, &input, None).unwrap();
@@ -3978,15 +3978,26 @@ fn glm5_flash_index_layout_pool_matches_runtime_geometry() {
                         let unit = geometry.logical_unit_rows;
                         let mut served_pool = crate::placement::PoolPolicy::resolve(&vec![24 << 30; gpus],
                             131_072, None, 256).target;
+                        let pieces = crate::serving_capacity::glm_flash_mla_unit_pieces(served_index,
+                            AttentionPlacement::Heads);
                         for (device, rank) in memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
                             .zip(&geometry.ranks) {
-                            let records = device.items.iter().find(|i| i.category == Category::Kv && i.group == "KV pool")
-                                .unwrap().bytes;
-                            let bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes
-                                + rank.glmf_pool_mark_backing_unit_bytes(pool_marks);
-                            assert_eq!(records, memory.pool_tokens.div_ceil(unit) * bytes);
-                            let available = (device.free_bytes() + records as i64).max(0) as u64;
-                            served_pool = served_pool.min(available / bytes * unit);
+                            // One request per pool piece and resident MLA layer, each rounded to
+                            // its own driver granule; the unit-index map is one linear allocation.
+                            let layers = rank.persistent_unit_bytes / pieces.iter().map(|&(_, per_layer)| per_layer).sum::<u64>();
+                            let metadata = rank.pool_metadata_unit_bytes + rank.glmf_pool_mark_backing_unit_bytes(pool_marks);
+                            let cost = |units: u64| pieces.iter().filter(|&&(_, per_layer)| per_layer > 0)
+                                .map(|&(_, per_layer)| crate::placement::planner::ByteCurve::paged(per_layer * layers,
+                                    per_layer * layers, crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES,
+                                    layers, u64::MAX).at(units).unwrap()).sum::<u64>() + metadata * units;
+                            let pool: u64 = device.items.iter().filter(|i| i.category == Category::Kv && i.group == "KV pool")
+                                .map(|i| i.bytes).sum();
+                            let bytes = rank.persistent_unit_bytes + metadata;
+                            assert_eq!(pool, cost(memory.pool_tokens.div_ceil(unit)));
+                            let available = (device.free_bytes() + pool as i64).max(0) as u64;
+                            let mut affordable = served_pool / unit;
+                            while affordable > 0 && cost(affordable) > available { affordable -= 1; }
+                            served_pool = served_pool.min(affordable * unit);
                             let state: u64 = device.items.iter().filter(|i| i.category == Category::Kv && ["KDA state and replay", "DSA index tails and replay", "commit tables"].contains(&i.group.as_str())).map(|i| i.bytes).sum();
                             let replay = if shared && gpus == 1 {
                                 crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, 1, rows).unwrap()

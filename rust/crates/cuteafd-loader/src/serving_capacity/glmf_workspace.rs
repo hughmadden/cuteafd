@@ -252,21 +252,30 @@ pub struct GlmfLaneBytes {
 }
 
 impl GlmfLaneBytes {
+    /// Every device field with its presence: an absent optional buffer issues no request.
+    fn request_fields(&self) -> impl Iterator<Item = Option<u64>> {
+        [Some(self.streams), Some(self.streams), Some(self.post), Some(self.comb), Some(self.x),
+            Some(self.delta), Some(self.shared), Some(self.positions), Some(self.kv_slots), Some(self.kda_slots),
+            Some(self.seq_first), Some(self.pool_slots), Some(self.cache_lengths), Some(self.page_table),
+            Some(self.pool_table), Some(self.ids), Some(self.select), Some(self.router_logits),
+            Some(self.route_ids), Some(self.route_weights), Some(self.wire), self.zero, self.sum, self.routed]
+            .into_iter()
+    }
+
+    /// One request per live field, each floored as the engine allocates it.
     fn device_fields(&self) -> impl Iterator<Item = u64> {
-        [self.streams, self.streams, self.post, self.comb, self.x, self.delta, self.shared, self.positions,
-            self.kv_slots, self.kda_slots, self.seq_first, self.pool_slots, self.cache_lengths, self.page_table,
-            self.pool_table, self.ids, self.select, self.router_logits, self.route_ids, self.route_weights, self.wire]
-            .into_iter().chain([self.zero, self.sum, self.routed].into_iter().flatten())
+        self.request_fields().flatten().map(|bytes| bytes.max(FLOOR))
     }
 
     /// Separate decode allocations preserve their exact byte ledger.
     pub fn device_bytes(&self) -> u64 {
-        self.device_fields().map(|bytes| bytes.max(FLOOR)).sum()
+        self.device_fields().sum()
     }
 
     /// Packed prefill views keep every operand 256-byte aligned.
     pub fn arena_bytes(&self) -> u64 {
-        self.device_fields().map(|bytes| bytes.max(FLOOR).next_multiple_of(FLOOR)).sum()
+        self.request_fields().flatten()
+            .map(|bytes| bytes.max(FLOOR).next_multiple_of(FLOOR)).sum()
     }
 }
 
@@ -288,11 +297,16 @@ pub struct GlmfTemporaryBytes {
 }
 
 impl GlmfTemporaryBytes {
-    /// Device bytes, every allocation floored as the engine allocates it.
-    pub fn device_bytes(&self) -> u64 {
+    /// One request per field, each floored as the engine allocates it.
+    fn device_fields(&self) -> impl Iterator<Item = u64> {
         [self.query, self.q_resid, self.latent, self.q_fp8, self.head_weights, self.pools, self.indices,
             self.lengths, self.scratch, self.topk_scratch, self.logits, self.head_workspace]
-            .into_iter().map(|bytes| bytes.max(FLOOR)).sum()
+            .into_iter().map(|bytes| bytes.max(FLOOR))
+    }
+
+    /// Device bytes, every allocation floored as the engine allocates it.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_fields().sum()
     }
 }
 
@@ -376,6 +390,39 @@ impl GlmfStepWorkspaces {
     pub fn device_bytes(&self) -> u64 {
         self.decode + self.lanes * self.lane + self.prefill_temporaries
     }
+}
+
+/// One rank's step requests under the base and the full step shape, paired as the engine
+/// would issue them: the decode lane's buffers, the decode temporaries, the `lanes`-wide
+/// prefill lane arena and the shared prefill temporaries. `(0, 0)` marks a field neither
+/// shape allocates. The base side is what the always row allocates; the difference to the
+/// full side is the bytes local expert ownership adds to that same request (or, where the
+/// base side is zero, the whole request). The engine allocates every step buffer
+/// separately, so each pair is one `cudaMalloc` whose granularity the owner's charge must
+/// carry.
+pub fn glmf_step_request_pairs(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, decode_rows: u64,
+    base: &GlmfStepShape, full: &GlmfStepShape, decode_scratch: GlmfScratch, prefill_scratch: GlmfScratch)
+    -> Vec<(u64, u64)> {
+    let pair = |base: Option<u64>, full: Option<u64>| match (base, full) {
+        (Some(base), Some(full)) => (base.max(FLOOR), full.max(FLOOR)),
+        (None, Some(full)) => (0, full.max(FLOOR)),
+        (Some(base), None) => (base.max(FLOOR), 0),
+        (None, None) => (0, 0),
+    };
+    let (base_decode, full_decode) = (glmf_lane_bytes(cfg, decode_rows, true, base),
+        glmf_lane_bytes(cfg, decode_rows, true, full));
+    let mut out: Vec<(u64, u64)> = base_decode.request_fields()
+        .zip(full_decode.request_fields()).map(|(base, full)| pair(base, full)).collect();
+    let (base_decode, full_decode) = (glmf_temporary_bytes(cfg, decode_rows, true, base, decode_scratch),
+        glmf_temporary_bytes(cfg, decode_rows, true, full, decode_scratch));
+    out.extend(base_decode.device_fields().zip(full_decode.device_fields()));
+    // The prefill lanes share one arena allocation per rank, sized by the active shape.
+    let arena = |shape| glmf_lane_bytes(cfg, lane_rows, false, shape).arena_bytes() * lanes as u64;
+    out.push((arena(base), arena(full)));
+    let (base_prefill, full_prefill) = (glmf_temporary_bytes(cfg, lane_rows, false, base, prefill_scratch),
+        glmf_temporary_bytes(cfg, lane_rows, false, full, prefill_scratch));
+    out.extend(base_prefill.device_fields().zip(full_prefill.device_fields()));
+    out
 }
 
 /// The token selector of decode steps of up to `rows` rows (the daemon's `TokenSelector`): its

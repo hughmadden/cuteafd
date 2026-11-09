@@ -35,9 +35,22 @@ pub struct CoreRankLayout {
     pub target_head: Option<ProjectionScratchLayout>,
     pub draft_head: Option<ProjectionScratchLayout>,
     pub retained_rows: usize,
+    /// The rank's independent device requests behind [`Self::bytes`], in bytes: every
+    /// projection scratch owner, every stage extent and every retained slot buffer.
+    /// The receive suffix is a view inside the peer exchange slot that the transport
+    /// charges, so it is none of them (their sum is `bytes(hidden) - receive_suffix`).
+    pub allocations: Vec<u64>,
     pub receive_suffix: usize,
 }
 impl CoreRankLayout {
+    /// The rank's own device requests: [`Self::bytes`] without the receive suffix,
+    /// which is a view inside the peer exchange slot the transport charges. Exactly
+    /// the sum of [`Self::allocations`], so admission charges this rank once.
+    pub fn owned_bytes(&self, hidden: usize) -> Result<u64> {
+        self.bytes(hidden)?.checked_sub(self.receive_suffix as u64)
+            .context("Flash K6 owned extent below its receive suffix")
+    }
+
     pub fn bytes(&self, hidden: usize) -> Result<u64> {
         let mut bytes = self.receive_suffix;
         for layout in self.decode.iter().chain(&self.prefill).chain(&self.target_head).chain(&self.draft_head) {
@@ -147,17 +160,37 @@ impl CoreCharges {
         let retained_rows = decode_rows.checked_add(unit.checked_mul(slots).context("Flash K6 live rows overflow")?)
             .context("Flash K6 live rows overflow")?;
         let receive = receive_suffix_bytes(unit.max(decode_rows), cfg.hidden, slots, output_shard)?;
+        // Retained slot buffers: `[rows, rows, 2 * rows]` of `hidden * 8` bytes, one slot
+        // at the decode width and `slots` at the prefill width (`glmf/core-retained`).
+        let retained = |rows: usize| -> Result<Vec<u64>> {
+            let row = rows.checked_mul(cfg.hidden).and_then(|n| n.checked_mul(2))
+                .context("Flash K6 retained row overflow")? as u64;
+            Ok(vec![row, row, row.checked_mul(2).context("Flash K6 retained row overflow")?])
+        };
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
+            let stages = if body.is_empty() { None } else { Some([
+                CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(rank, true)?)?,
+                CoreStageLayout::new(cfg, unit, ranks, owned, scratch(rank, false)?)?]) };
+            let (decode, prefill) = (projection(&body, decode_rows)?, projection(&body, unit)?);
+            let target_head = if rank == 0 { head_scratch(decode_rows)? } else { None };
+            let draft_head = if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None };
+            let mut allocations = Vec::new();
+            for layout in decode.iter().chain(&prefill).chain(&target_head).chain(&draft_head) {
+                allocations.extend(layout.storage()?.owners.values().map(|&bytes| bytes as u64));
+            }
+            if let Some(stages) = &stages {
+                allocations.extend(stages.iter().flat_map(|stage|
+                    stage.extents.values().map(|&bytes| bytes as u64)));
+            }
+            if !body.is_empty() {
+                allocations.extend(retained(decode_rows)?);
+                for _ in 0..slots { allocations.extend(retained(unit)?); }
+            }
             layouts.push(CoreRankLayout {
-                stages: if body.is_empty() { None } else { Some([
-                    CoreStageLayout::new(cfg, decode_rows, ranks, owned, scratch(rank, true)?)?,
-                    CoreStageLayout::new(cfg, unit, ranks, owned, scratch(rank, false)?)?]) },
-                decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
-                target_head: if rank == 0 { head_scratch(decode_rows)? } else { None },
-                draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },
+                stages, decode, prefill, target_head, draft_head,
                 retained_rows: if body.is_empty() { 0 } else { retained_rows },
-                receive_suffix: if split { receive } else { 0 }, body,
+                allocations, receive_suffix: if split { receive } else { 0 }, body,
             });
         }
         let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
@@ -165,6 +198,14 @@ impl CoreCharges {
         Ok(result)
     }
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+
+    /// Each rank's independently allocated extent, exactly its [`Self::requests`] sum.
+    pub fn owned_bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.owned_bytes(hidden)).collect() }
+
+    /// Each rank's independent device requests, paired with [`Self::bytes`] per rank.
+    pub fn requests(&self) -> impl Iterator<Item = &[u64]> {
+        self.ranks.iter().map(|rank| rank.allocations.as_slice())
+    }
 }
 
 pub fn fp8_projection_name(prefix: &str, [n, k]: [usize; 2], cap: usize) -> String {
@@ -221,7 +262,7 @@ mod tests {
         let stage = CoreStageLayout::new(&cfg, 64, 2, false, 4096)?;
         let rank = CoreRankLayout { body: vec![], stages: Some([stage.clone(), stage.clone()]),
             decode: Some(p.clone()), prefill: Some(p.clone()), target_head: Some(p.clone()), draft_head: Some(p.clone()),
-            retained_rows: 64 + 3 * 4096, receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
+            retained_rows: 64 + 3 * 4096, allocations: vec![], receive_suffix: 4 * 3 * 4096 * 4096 * 2 };
         assert_eq!(rank.bytes(4096)?, (4 * p.bytes()? + 2 * stage.bytes()? + rank.receive_suffix
             + rank.retained_rows * 4096 * 8) as u64);
         let mut overflow = rank; overflow.retained_rows = usize::MAX;

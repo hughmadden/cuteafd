@@ -600,6 +600,11 @@ mod tests {
         for layers in 1..=4 {
             let owners = vec![0; layers];
             let charges = CoreCharges::from_package(&cfg,&core,layers,2,Some(&owners),4096,3,64,None,false,&manifest)?;
+            for (rank, requests) in charges.ranks.iter().zip(charges.requests()) {
+                assert_eq!(rank.owned_bytes(cfg.hidden)?, requests.iter().sum::<u64>());
+                assert_eq!(rank.owned_bytes(cfg.hidden)?, rank.allocations.iter().sum::<u64>());
+                assert_eq!(rank.bytes(cfg.hidden)? - rank.owned_bytes(cfg.hidden)?, rank.receive_suffix as u64);
+            }
             let owned = owned_mla(&cfg,layers,2,true);
             assert_eq!(owned,layers == 4);
             let expected = CoreStageLayout::new(&cfg,64,2,owned,4096)?;
@@ -613,6 +618,9 @@ mod tests {
             let expected = receive_suffix_bytes(4096,cfg.hidden,3,output_shard)?;
             assert_eq!(expected,if output_shard { 6 } else { 4 } * 3 * 4096 * cfg.hidden * 2);
             assert!(charges.ranks.iter().all(|r| r.receive_suffix == expected));
+            for (rank, requests) in charges.ranks.iter().zip(charges.requests()) {
+                assert_eq!(rank.owned_bytes(cfg.hidden)?, requests.iter().sum::<u64>());
+            }
         }
         assert!(receive_suffix_bytes(usize::MAX,4096,3,true).is_err());
         Ok(())
