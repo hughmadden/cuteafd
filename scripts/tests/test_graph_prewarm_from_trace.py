@@ -39,6 +39,33 @@ def test_non_glm_generators_keep_existing_fixture_outputs(family):
     assert result == expected[family]
 
 
+def test_step5_real_hqa_traces_reproduce_installed_inventories_byte_for_byte():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/step5-prewarm-trace.json.gz"
+    evidence = json.loads(gzip.decompress(fixture.read_bytes()))
+    assert evidence["checkpoint"] == "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA"
+    assert evidence["revision"] == "61f9275e7f604cb11a5ae9a64a07ff1c600174b7"
+    generated = {"layouts": [MODULE.generate_step5(layout["traces"], layout["layout"])
+                             for layout in evidence["layouts"]]}
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/step5_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    expected = [(58, [3_407_872_000], [46]), (59, [2_835_349_504, 2_629_828_608], [])]
+    for layout, (rows, bases, pins) in zip(generated["layouts"], expected, strict=True):
+        assert [rank["reserve_base_bytes"] for rank in layout["ranks"]] == bases
+        for rank in layout["ranks"]:
+            assert len(rank["entries"]) == rows
+            assert [entry["rows"] for entry in rank["entries"] if entry["pin"]] == pins
+            assert rank["reserve_extra_bytes"] == MODULE.CHUNK
+            assert rank["zero_replay_sibling_bytes"] == 0
+            assert rank["lazy_zero_replay_bytes"] > 0
+    for layout in evidence["layouts"]:
+        for trace in layout["traces"]:
+            assert all(graph["nodes"] > 2 and not graph["spans_devices"]
+                       and graph["recaptures"] == 0 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
+
+
 def step5_trace(device=0):
     def graph(layer, rows, section, hits, capture, pin=False):
         return {"site": "step5.section", "bank": 1,

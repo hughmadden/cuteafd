@@ -158,6 +158,29 @@ mod tests {
         assert_eq!(Exl3Max.ranks(), 2);
     }
     #[test]
+    fn shipped_hqa_inventories_retain_exact_rank_bases_and_default_rows() {
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for (layout, bases, rows, pins) in [
+                (Step5GraphLayout::Exl3Min, vec![3_407_872_000], 58, vec![46]),
+                (Step5GraphLayout::Exl3Max, vec![2_835_349_504, 2_629_828_608], 59, vec![]),
+            ] {
+                let trace = prewarm(Some(layout)).unwrap();
+                for (rank, base) in bases.into_iter().enumerate() {
+                    assert_eq!(reserve(Some(layout), rank), (base, 2 << 20));
+                    assert_eq!(trace.ranks[rank].entries.len(), rows);
+                }
+                let selected = selected_rows(Some(layout), 64).unwrap();
+                assert_eq!(selected.len(), rows);
+                assert_eq!(selected.iter().filter_map(|&(row, pin)| pin.then_some(row))
+                    .collect::<Vec<_>>(), pins);
+            }
+            for layout in [Step5GraphLayout::Fp8Max, Step5GraphLayout::Nvfp4Min] {
+                assert!(prewarm(Some(layout)).is_none());
+                assert_eq!(reserve(Some(layout), 0), (0, 0));
+            }
+        });
+    }
+    #[test]
     fn untraced_layout_has_no_pins_no_charge_and_no_borrowed_rows() {
         assert!(prewarm(None).is_none());
         assert_eq!(reserve(None, 0), (0, 0));
