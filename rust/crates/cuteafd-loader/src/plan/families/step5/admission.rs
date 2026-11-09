@@ -645,6 +645,80 @@ mod tests {
     }
 
     #[test]
+    fn sampled_preweight_occupancy_is_capacity_neutral_and_named_once_per_rank() -> Result<()> {
+        use crate::placement::{families::step5 as family, planner::*};
+        struct Prepared(Contract);
+        impl Recipe for Prepared {
+            fn prepare(&self, _: &Request) -> std::result::Result<Contract, Refusal> { Ok(self.0.clone()) }
+        }
+        for reserve in [None, Some(0), Some(200 << 20)] {
+            cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| -> Result<()> {
+        for occupied in [[0, 0], [682_885_120, 711_196_672]] {
+            let mut input = inputs(2);
+            for gpu in &mut input.inventory.gpus {
+                gpu.reserve_bytes = crate::placement::reserve::gpu("step5");
+            }
+            for (gpu, bytes) in input.inventory.gpus.iter_mut().zip(occupied) {
+                gpu.baseline = crate::placement::Baseline::Measured { free_bytes: gpu.capacity_bytes - bytes };
+            }
+            let cfg = config();
+            let recipe = family::Step5Recipe::new(&cfg, &input, 0, |ownership| Ok(vec![RankAdmission {
+                resident_weights: ResidentWeights(0), weight_arenas: vec![], immutable: 1 << 30,
+                private_requests: vec![1 << 30], drafter_requests: vec![], vocabulary_heads: vec![],
+                projection_bytes: 0, workspace: 1 << 20 }; ownership.ranks()]))?;
+            let request = recipe.request();
+            let mut contract = recipe.prepare(&request)?;
+            contract.components.retain(|component| !matches!(&component.kind,
+                ComponentKind::Allowance(owner) if crate::placement::sampled_baseline::is_source(&owner.source)));
+            let mut old_budgets = family::budgets(&input)?;
+            for (budget, bytes) in old_budgets.iter_mut().take(2).zip(occupied) {
+                budget.baseline = planner::Baseline::Sampled { free: budget.physical_bytes - bytes,
+                    phase: Phase::Load, source: "pre-weight CUDA free memory".into() };
+            }
+            let before = solve(request, old_budgets, &Prepared(contract))?;
+            let now = run(&input)?.solved;
+            assert_eq!(now.pool_tokens, before.pool_tokens);
+            assert_eq!(now.decisions, before.decisions);
+            assert_eq!(&now.budgets[2..], &before.budgets[2..], "Spark/host budgets unchanged");
+            for (rank, bytes) in occupied.into_iter().enumerate() {
+                assert!(matches!(now.budgets[rank].baseline, planner::Baseline::Forecast { occupied: 0, .. }));
+                for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                    let items = now.items_at(Location::coordinator(rank as u8), phase)?;
+                    let owners = items.iter().filter(|item| crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), usize::from(bytes > 0));
+                    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), bytes);
+                    let row = |plan: &ResolvedPlan| plan.phases.iter().find(|row|
+                        row.budget == format!("rtx{rank}") && row.phase == phase).unwrap().clone();
+                    let a = row(&now); let b = row(&before);
+                    assert_eq!(a.available - a.owned - a.opaque, b.available - b.owned - b.opaque);
+                    let breakdown = crate::placement::reserve::breakdown(format!("rtx{rank}"),
+                        cuteafd_core::memory_policy::DeviceKind::Gpu, now.budgets[rank].physical_bytes,
+                        now.budgets[rank].headroom, &items);
+                    assert_eq!(breakdown.reserve.iter().filter(|owner|
+                        owner.name == "sampled baseline").map(|owner| owner.bytes).sum::<u64>(), bytes);
+                }
+            }
+        }
+                Ok(())
+            })?;
+        }
+        let mut offline = inputs(2);
+        for gpu in &mut offline.inventory.gpus {
+            gpu.baseline = crate::placement::Baseline::Planned { context_bytes: 600 << 20, loaded_bytes: 40 << 20 };
+        }
+        let planned = run(&offline)?.solved;
+        assert!(!planned.facts.allowances.iter().any(|owner|
+            crate::placement::sampled_baseline::is_source(&owner.source)));
+        assert!(matches!(planned.budgets[0].baseline, planner::Baseline::Forecast { occupied, .. }
+            if occupied == 640 << 20));
+        let mut invalid = inputs(2);
+        invalid.inventory.gpus[1].baseline = crate::placement::Baseline::Measured {
+            free_bytes: invalid.inventory.gpus[1].capacity_bytes + 1 };
+        assert!(run(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank() -> Result<()> {
         const CHILD: &str = "CUTEAFD_TEST_STEP5_GRAPH_RESERVE";
         let Ok(value) = std::env::var(CHILD) else {

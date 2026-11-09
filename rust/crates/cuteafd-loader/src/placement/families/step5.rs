@@ -748,21 +748,38 @@ impl Recipe for Step5Recipe<'_> {
                     ByteCurve::fixed(owner.bytes, self.maximum_pages), false, self.maximum_pages));
             }
         }
+        for (rank, gpu) in self.inputs.inventory.gpus.iter().enumerate() {
+            if let Some(occupied) = sampled_occupancy(gpu)?.filter(|bytes| *bytes > 0) {
+                contract.components.push(Component { activation: Activation::always(),
+                    bytes: ByteCurve::fixed(occupied, self.maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                        bytes: occupied, lifetime: Lifetime::RESIDENT, assumed: false,
+                        source: crate::placement::sampled_baseline::source(&format!("Step-5 context and selected modules; {occupied} B occupied at the pre-weight CUDA free memory sample")) }) });
+            }
+        }
         self.expert_components(&mut contract, onboard)?;
         Ok(contract)
     }
 }
 
-/// One physical budget per coordinator and Spark rank. Offline keeps its
-/// predicted CUDA/code floor; live requires the measured pre-weight sample.
+fn sampled_occupancy(gpu: &crate::placement::GpuBudget) -> Result<Option<u64>, Refusal> {
+    match gpu.baseline {
+        crate::placement::Baseline::Measured { free_bytes } => gpu.capacity_bytes.checked_sub(free_bytes)
+            .map(Some).ok_or_else(|| Refusal::InvalidFact("Step-5 sample exceeds physical capacity".into())),
+        crate::placement::Baseline::Planned { .. } => Ok(None),
+    }
+}
+
+/// One physical budget per coordinator and Spark rank. Live pre-weight
+/// occupancy is a named resident owner in the recipe, not a second deduction.
 pub fn budgets(inputs: &RuntimeInputs) -> Result<Vec<Budget>, Refusal> {
     let mut budgets = Vec::new();
     for (rank, gpu) in inputs.inventory.gpus.iter().enumerate() {
         let baseline = match gpu.baseline {
-            crate::placement::Baseline::Measured { free_bytes } => Baseline::Sampled {
-                free: free_bytes,
-                phase: Phase::Load,
-                source: "pre-weight CUDA free memory".into(),
+            crate::placement::Baseline::Measured { .. } => {
+                sampled_occupancy(gpu)?;
+                Baseline::Forecast { occupied: 0, assumed: false,
+                    source: "physical capacity; pre-weight occupancy charged once in Step-5 recipe".into() }
             },
             crate::placement::Baseline::Planned { context_bytes, loaded_bytes } => {
                 Baseline::Forecast {

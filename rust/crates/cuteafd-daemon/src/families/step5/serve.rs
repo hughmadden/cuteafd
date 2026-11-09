@@ -379,8 +379,7 @@ fn with_backend<T>(args: &ServeArgs,
                 cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?);
         }
         let native = native.check(u64::MAX, &[])?;
-        let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved allocation overflow")?;
+        let total = future_allocation_bytes(&admission.placement.items[rank], &inputs.inventory.gpus[rank])?;
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
@@ -394,8 +393,7 @@ fn with_backend<T>(args: &ServeArgs,
     let predictor_budget = if args.mtp > 0 {
         let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_weight_charge(
             &checkpoint, &native_plan.contract, usize::from(args.mtp))?;
-        let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved predictor allocation overflow")?;
+        let total = future_allocation_bytes(&admission.placement.items[head_rank], &inputs.inventory.gpus[head_rank])?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
     } else { None };
     crate::shared::inventory::startup_probe(&library, &ids, "step5/pre-weight", Default::default())?;
@@ -564,9 +562,33 @@ fn with_backend<T>(args: &ServeArgs,
     run(&backend, inputs.sequences)
 }
 
-fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
+pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item], gpu: &GpuBudget) -> Result<u64> {
+    let total = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 solved allocation overflow")?;
+    // CUDA free already excludes this occupancy; only future owners belong in
+    // native/predictor checks against GpuBudget::available().
+    let sampled = match gpu.baseline {
+        cuteafd_loader::placement::Baseline::Measured { free_bytes } => gpu.capacity_bytes
+            .checked_sub(free_bytes).context("Step-5 sample exceeds physical capacity")?,
+        cuteafd_loader::placement::Baseline::Planned { .. } => 0,
+    };
+    let owners = items.iter().filter(|item| cuteafd_loader::placement::sampled_baseline::is_source(&item.group))
+        .collect::<Vec<_>>();
+    ensure!(owners.len() == usize::from(sampled > 0), "Step-5 sampled owner must appear exactly once");
+    let published = owners.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 sampled owner overflow")?;
+    ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
+    total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
+}
+
+fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {
+    ids.iter().map(|id| serde_json::json!({"device": id})).collect()
+}
+
+pub(super) fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
     solved: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
     use sha2::{Digest, Sha256};
+    cuteafd_loader::placement::reserve::log_plan(solved, "step5");
     let hash = |path: &std::path::Path| -> Result<String> {
         let mut file = std::fs::File::open(path)?;
         let mut digest = Sha256::new();
@@ -578,7 +600,7 @@ fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
             "schema_version": 1, "family": "step5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
             "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
             "native_sha256": hash(&args.native_lib)?, "programs_sha256": hash(&args.manifest)?,
-            "devices": ids.iter().map(|id| serde_json::json!({"device": id})).collect::<Vec<_>>(),
+            "devices": reconciliation_devices(ids),
             "spark_world": args.peers.len(), "onboard_layers": solved.decisions.onboard_layers,
             "prefill": solved.decisions.prefill, "context": solved.served_context(),
             "kv_cache": format!("{:?}", args.kv_cache), "decode_graphs": args.decode_graphs,
@@ -662,6 +684,41 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn future_allocation_excludes_only_the_exact_published_sample() -> Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        use cuteafd_loader::placement::Baseline;
+        let gpu = GpuBudget { capacity_bytes: 1000, reserve_bytes: 50,
+            baseline: Baseline::Measured { free_bytes: 800 } };
+        let owner = |bytes| Item::new(Category::Runtime,
+            cuteafd_loader::placement::sampled_baseline::source("Step-5 context and selected modules; pre-weight sample"), "", bytes, Basis::Formula);
+        let future = Item::new(Category::Workspace, "native", "", 600, Basis::Formula);
+        let available = gpu.available();
+        assert_eq!(future_allocation_bytes(&[owner(200), future.clone()], &gpu)?, 600);
+        assert_eq!(gpu.available(), available);
+        assert!(future_allocation_bytes(&[future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(201), future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(100), owner(100), future.clone()], &gpu).is_err());
+        let invalid = GpuBudget { baseline: Baseline::Measured { free_bytes: 1001 }, ..gpu };
+        assert!(future_allocation_bytes(&[future.clone()], &invalid).is_err());
+        let planned = GpuBudget { baseline: Baseline::Planned { context_bytes: 200, loaded_bytes: 0 }, ..gpu };
+        assert_eq!(future_allocation_bytes(&[future], &planned)?, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_devices_preserve_tp2_physical_ids_in_rank_order() {
+        let devices = reconciliation_devices(&[1, 3]);
+        assert_eq!(devices, vec![serde_json::json!({"device": 1}), serde_json::json!({"device": 3})]);
+        for (rank, physical) in [1, 3].into_iter().enumerate() {
+            assert_eq!(devices[rank]["device"].as_i64(), Some(physical));
+        }
+        assert_eq!(reconciliation_devices(&[1]), vec![serde_json::json!({"device": 1})]);
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("\"devices\": reconciliation_devices(ids)"));
+        assert!(source.contains("\"spark_world\": args.peers.len()"));
     }
 
     #[test]
@@ -894,7 +951,7 @@ mod tests {
                         plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?);
                 }
                 let native = native.check(u64::MAX, &[])?;
-                let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                let total = future_allocation_bytes(&admitted.placement.items[rank], &inputs.inventory.gpus[rank])?;
                 ensure!(native <= total && total <= inputs.inventory.gpus[rank].available(),
                     "native allocation exceeds solved startup budget at rank {rank}");
             }
