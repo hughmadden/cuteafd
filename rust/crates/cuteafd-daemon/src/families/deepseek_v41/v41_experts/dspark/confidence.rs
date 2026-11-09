@@ -40,7 +40,7 @@ impl<'library> DsparkWeights<'library> {
             output: DeviceAllocation::new(library, capacity * 4, Tag::drafter_workspace("v41/draft-confidence"))?,
             kernel,
             weights: self,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_confidence")?,
             capacity,
             ready_rows: None,
         })

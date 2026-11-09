@@ -9,6 +9,25 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("CUTEAFD_GRAPH_CENSUS").is_some_and(|v| v == "1"))
 }
 
+/// Capture identity is emitted only when explicitly collecting a census. A null
+/// lane means the bank has no logical lane. Instance addresses are diagnostic
+/// hints, not lifetime ids: join the nearest preceding native capture_ref for
+/// this exec in the same ordered process stderr stream, never on exec alone.
+pub(crate) fn capture_key<K: std::fmt::Debug>(family: &str, bank: &str, instance: usize,
+    rank: i32, lane: Option<usize>, key: &K, exec: *mut std::ffi::c_void) {
+    if !enabled() { return }
+    tracing::info!(target: "cuteafd::graph_capture", family, bank, instance, rank, ?lane,
+        key = ?key, exec = ?exec, "graph census capture key");
+}
+
+/// Shared adapters know a physical CUDA device, not a logical rank.
+pub(crate) fn capture_device_key<K: std::fmt::Debug>(family: &str, bank: &str, instance: usize,
+    device: i32, lane: Option<usize>, key: &K, exec: *mut std::ffi::c_void) {
+    if !enabled() { return }
+    tracing::info!(target: "cuteafd::graph_capture", family, bank, instance, device, ?lane,
+        key = ?key, exec = ?exec, "graph census capture key");
+}
+
 fn bank_id(bank: &str) -> Option<u8> {
     Some(match bank { "baseline" => 0, "sparse" => 1, "index" => 2,
         "layer_row" => 3, "head" => 4, "dspark" => 5, "window" => 6, _ => return None })
@@ -244,6 +263,28 @@ mod tests {
             .args(["--exact", "shared::decode_graph::census::tests::startup_eager_does_not_enable_census_timing"])
             .env(CHILD, "1").env("CUTEAFD_GRAPH_EAGER", "layer_row")
             .env_remove("CUTEAFD_GRAPH_CENSUS").env_remove("CUTEAFD_GRAPH_CENSUS_CONTROL")
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn disabled_capture_identity_does_not_format_its_key() {
+        const CHILD: &str = "CUTEAFD_GRAPH_IDENTITY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            struct Unformattable;
+            impl std::fmt::Debug for Unformattable {
+                fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    panic!("census-off capture identity formatted its key");
+                }
+            }
+            assert!(!super::enabled());
+            super::capture_key("test", "decode", 0, 0, None, &Unformattable, std::ptr::null_mut());
+            super::capture_device_key("test", "decode", 0, 0, None, &Unformattable, std::ptr::null_mut());
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shared::decode_graph::census::tests::disabled_capture_identity_does_not_format_its_key"])
+            .env(CHILD, "1").env_remove("CUTEAFD_GRAPH_CENSUS")
             .status().unwrap();
         assert!(status.success());
     }

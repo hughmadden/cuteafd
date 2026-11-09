@@ -46,7 +46,7 @@ impl<'library> DsparkWeights<'library> {
                 DsparkAttentionWave::device_bytes_with_width(library, requests, self.draft_width)?,
             )?,
             library,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_stage")?,
             requests,
             width: self.draft_width,
             ready: false,

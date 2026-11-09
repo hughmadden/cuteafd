@@ -45,7 +45,7 @@ impl<'library> DsparkWeights<'library> {
             embedding: DeviceAllocation::new(library, capacity * 512, Tag::drafter_workspace("v41/draft-markov"))?,
             logits: DeviceAllocation::new(library, capacity * 129280 * 4, Tag::drafter_workspace("v41/draft-markov"))?,
             weights: self,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_markov")?,
             capacity,
             ready_rows: None,
         })

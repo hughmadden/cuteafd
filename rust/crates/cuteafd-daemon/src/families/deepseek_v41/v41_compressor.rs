@@ -1356,6 +1356,8 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         // SAFETY: weights are borrowed and the containing wave retains workspace
         // and buffers; the cache owner is unchanged until a drained bank clear.
         let exec = unsafe { GraphOwner::new(library, device, graph, self.weights)? };
+        crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "compressor",
+            &self.retained_graphs as *const _ as usize, device, None, &(rows, owner), graph);
         self.retained_graphs.insert((rows, owner), exec, None);
         self.graph = Some((graph, rows, owner));
         tracing::debug!(target: "cuteafd::graph_capture", site = "compressor", rows,

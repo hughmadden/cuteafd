@@ -57,7 +57,7 @@ impl<'library> DsparkWeights<'library> {
             input: DeviceAllocation::new(library, capacity as usize * 65536, Tag::drafter_workspace("v41/draft-attention-output"))?,
             frequencies: DeviceAllocation::new(library, capacity as usize * 256, Tag::drafter_workspace("v41/draft-attention-output"))?,
             capacity,
-            graph: BindingGraphs::new(library)?,
+            graph: BindingGraphs::new(library, "dspark_attention_output")?,
             ready: None,
         })
     }

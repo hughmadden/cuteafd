@@ -4595,6 +4595,7 @@ impl<'a> GlmfEngine<'a> {
         captured?;
         // SAFETY: persistent engine storage is drained before bank destruction.
         let exec = unsafe { GraphOwner::new(self.library, if rank == 1 { self.peer()?.device } else { self.device }, exec?, ())? };
+        graphs.borrow().census_capture_key("decode", rank as i32, Some(0), &key, exec.raw);
         let measured = match before {
             Some(before) => Some(before.saturating_sub(free()?) as u64),
             None => None,

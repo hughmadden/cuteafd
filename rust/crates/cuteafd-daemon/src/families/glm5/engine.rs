@@ -2208,6 +2208,8 @@ impl<'a> GlmEngine<'a> {
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
         captured?;
         let graph = GraphExec(exec?, self.library);
+        crate::shared::decode_graph::census::capture_key("glm5", "decode",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
         self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
         graphs.borrow_mut().insert(key, graph);
         Ok(())

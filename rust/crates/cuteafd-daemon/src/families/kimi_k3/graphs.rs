@@ -174,6 +174,8 @@ impl<'a> Graphs<'a> {
             let ended = unsafe { stream.device.library.cuda_graph_end_capture(stream.raw) };
             match (submitted, ended) {
                 (Ok(()), Ok(raw)) => {
+                    crate::shared::decode_graph::census::capture_key("kimi_k3", "decode",
+                        stream.raw as usize, key.rank as i32, Some(key.lane), &key, raw);
                     // SAFETY: LocalLane retains all captured pointers and drains before drop.
                     let owner = unsafe { GraphOwner::new(stream.device.library, stream.device.id, raw, ())? };
                     Ok((owner, None))
