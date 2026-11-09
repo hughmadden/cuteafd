@@ -105,13 +105,9 @@ pub fn production_budgets(cards: &[(u64, u64)], headrooms: &[u64], baselines: Ve
     Ok(budgets)
 }
 
-/// Rank reserve kept free: the memory policy's named reserve, and on the head
-/// GPU at least the drained Spark intake startup probe (released before serving).
-/// Release padding stays additive outside that maximum; `GPU_RESERVE` replaces both.
-pub fn device_headroom(rank: usize, startup_probe_bytes: u64) -> u64 {
-    let probe = if rank == 0 { crate::placement::reserve::gpu_component(startup_probe_bytes) } else { 0 };
-    let padding = cuteafd_core::memory_policy::MemoryPolicy::current().release_padding();
-    crate::placement::reserve::gpu("mimo_v2").saturating_sub(padding).max(probe).saturating_add(padding)
+/// Serving headroom is policy only; the drained intake probe is a startup owner.
+pub fn device_headroom() -> u64 {
+    crate::placement::reserve::gpu("mimo_v2")
 }
 
 pub fn production_request(context: impl Into<crate::placement::planner::Context>, pool: Option<u64>, onboard: crate::placement::Onboard,
@@ -199,6 +195,7 @@ impl HostOwners {
 
 /// Everything both entries know about MiMo's physical owners before admission.
 pub struct ProductionInput<'a> {
+    pub startup_probe_bytes: u64,
     pub expert_usage: bool,
     pub cfg: &'a MimoV2Config,
     pub layers: usize,
@@ -255,6 +252,8 @@ impl AdmittedMimo {
 
 /// MiMo's resolved physical facts, priced by the shared planner.
 pub struct MimoRecipe<'a> {
+    pub startup_probe_bytes: u64,
+    pub context_owners: Vec<Component>,
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub cfg: &'a MimoV2Config,
     pub gpus: usize,
@@ -350,8 +349,33 @@ impl<'a> ProductionInput<'a> {
             LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }
         }).collect();
         let maximum_pages = self.maximum_pool_tokens.div_ceil(page_rows);
+        let mut context_owners = Vec::new();
+        let mut budgets = self.budgets;
+        for budget in &mut budgets {
+            if !budget.locations.iter().any(|location| matches!(location.device,
+                crate::placement::planner::Device::Coordinator(_))) { continue; }
+            // Offline forecasts already have retained, named context/media items.
+            // Live post-module samples instead need an explicit resident owner.
+            let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
+            let bytes = budget.physical_bytes.checked_sub(*free)
+                .ok_or_else(|| invalid("context sample exceeds physical capacity"))?;
+            let source = source.clone();
+            if bytes > 0 {
+                context_owners.push(Component {
+                    activation: crate::placement::planner::Activation::always(),
+                    bytes: ByteCurve::fixed(bytes, maximum_pages),
+                    kind: crate::placement::planner::ComponentKind::Allowance(crate::placement::planner::Allowance {
+                        location: budget.locations[0], bytes, lifetime: Lifetime::RESIDENT, assumed: false,
+                        source: format!("MiMo context and selected modules: {source}"),
+                    }),
+                });
+            }
+            budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
+                source: "physical capacity; context and selected modules charged once in recipe".into() };
+        }
         Ok(PreparedMimo {
             recipe: MimoRecipe {
+                startup_probe_bytes: self.startup_probe_bytes, context_owners,
                 expert_usage, cfg: self.cfg, gpus: self.gpus, layers: self.layers, routed, counts,
                 experts: self.experts, expert_workspace: self.expert_workspace,
                 tp2_workspace: self.tp2_workspace, route, spark_ranks: self.spark_ranks,
@@ -363,7 +387,7 @@ impl<'a> ProductionInput<'a> {
                 spark_reply_formats: self.spark_reply_formats,
                 blas_head: self.blas_head, draft_head: self.draft_head,
             },
-            budgets: self.budgets.into_iter().map(|mut budget| {
+            budgets: budgets.into_iter().map(|mut budget| {
                 if budget.locations.contains(&Location::HOST) { budget.headroom = self.host.headroom; }
                 budget
             }).collect(),
@@ -541,7 +565,7 @@ impl MimoRecipe<'_> {
             .collect::<std::collections::BTreeMap<_, _>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let items = (0..self.gpus).map(|rank| solved.items(Location::coordinator(rank as u8)))
+        let items = (0..self.gpus).map(|rank| solved.items_at(Location::coordinator(rank as u8), Phase::Growth))
             .collect::<Result<Vec<_>, _>>()?;
         let placement = Placement {
             pool_tokens: solved.pool_tokens,
@@ -586,6 +610,7 @@ impl Recipe for MimoRecipe<'_> {
             requires: vec![],
             components: vec![],
         };
+        contract.components.extend(self.context_owners.iter().cloned());
         if let Some(geometry) = &self.expert_usage {
             contract.components.extend(crate::placement::expert_usage::components(geometry, &[0], maximum)?);
         }
@@ -717,6 +742,17 @@ impl Recipe for MimoRecipe<'_> {
                     }
                 }
             }
+            let probe = if count < self.routed.len() {
+                self.startup_probe_bytes
+            } else { 0 };
+            if probe > 0 {
+                let owner = Allocation::buffer("mimo.startup.intake-probe", Location::coordinator(0), probe,
+                    Lifetime { first: Phase::Warmup, last: Phase::Warmup }, Category::Workspace,
+                    "MiMo startup intake probe");
+                let mut component = Component::allocation(owner, ByteCurve::fixed(probe, maximum), false, maximum);
+                component.activation = activation.clone();
+                contract.components.push(component);
+            }
             let (arena, weights) = self.arena(count)?;
             let first = self.routed.first().copied().unwrap_or(0);
             for (rank, costs) in profile.devices.iter().enumerate() {
@@ -724,7 +760,10 @@ impl Recipe for MimoRecipe<'_> {
                 for reservation in &costs.reservations {
                     if arena_names.contains(&reservation.name) { continue; }
                     let owner = Allocation::buffer(format!("rtx{rank}.{}", reservation.name),
-                        location, reservation.bytes, Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                        location, reservation.bytes, Lifetime {
+                            first: if reservation.name.starts_with("prefill.") || reservation.name == "state.prefill_kv_wide" {
+                                Phase::Growth
+                            } else { Phase::Warmup }, last: Phase::Growth },
                         super::reservation_category(&reservation.name),
                         super::reservation_group(&reservation.name));
                     let mut component = Component::allocation(owner,
@@ -916,18 +955,14 @@ mod release_padding_tests {
     use cuteafd_core::memory_policy::{MemoryPolicy, DEFAULT_MEMORY_PADDING};
 
     #[test]
-    fn padding_is_not_swallowed_by_the_drained_intake_probe() {
-        let probe = 64 << 20;
-        assert_eq!(device_headroom(0, probe), DEFAULT_MEMORY_PADDING + probe);
-        assert_eq!(device_headroom(1, probe), DEFAULT_MEMORY_PADDING);
+    fn serving_headroom_does_not_retain_the_drained_intake_probe() {
+        assert_eq!(device_headroom(), DEFAULT_MEMORY_PADDING);
         MemoryPolicy { memory_padding: Some(0), ..Default::default() }.scoped(|| {
-            assert_eq!(device_headroom(0, probe), probe);
-            assert_eq!(device_headroom(1, probe), 0);
+            assert_eq!(device_headroom(), 0);
         });
         for reserve in [0, 123] {
             MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
-                assert_eq!(device_headroom(0, probe), reserve);
-                assert_eq!(device_headroom(1, probe), reserve);
+                assert_eq!(device_headroom(), reserve);
             });
         }
     }

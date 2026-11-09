@@ -11,8 +11,7 @@ use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillO
 pub(super) struct Preflight {
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub capacity: cuteafd_core::serving_capacity::ResolvedCapacity,
-    pub graph_plan: cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan,
-    pub graph_bound_bytes: Vec<u64>,
+    pub graph_layout: cuteafd_loader::families::mimo_v2::decode_graph::MimoGraphLayout,
     pub host_config: Option<cuteafd_hostcache::config::Config>,
     pub local_expert_budget: usize,
     pub placement: cuteafd_loader::placement::Placement,
@@ -322,23 +321,16 @@ fn preflight_shape(
         args.local_experts,
         args.peers.is_some(),
     );
-    let graph_plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
-        cfg.layers,
+    // One bounded graph reserve per physical device, selected by the resolved
+    // layout and charged once, before KV sizing.
+    let graph_layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(
+        cfg,
         ranks,
-        super::engine::DECODE_ROWS,
+        backend == ExpertBackend::Spark,
         args.decode_graphs
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
     )?;
-    // Retained startup graph owners: measured whole-capture bytes per rank,
-    // charged before KV sizing. No driver margin or per-executable envelope.
-    let graph_reservations = (0..ranks)
-        .map(|rank| graph_plan.reservations(rank))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let graph_bound_bytes = graph_reservations
-        .iter()
-        .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
-        .collect::<Vec<_>>();
     let transport_lanes = resolved_prefill_shape(usize::from(args.peers.is_some()),
         args.prefill_rows, args.prefill_waves)?.waves as usize;
     let spark_ranks = match args
@@ -431,7 +423,7 @@ fn preflight_shape(
                 draft_packing[rank] = reservations.packing;
             }
         }
-        additional.extend(graph_reservations[rank].iter().cloned());
+        additional.extend(graph_layout.reservations(rank)?);
         let workspaces = workspace_options(
             cfg,
             args,
@@ -525,7 +517,7 @@ fn preflight_shape(
     let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
-        &(0..memory.len()).map(|rank| contract::device_headroom(rank, intake_probe_bytes)).collect::<Vec<_>>(),
+        &(0..memory.len()).map(|_| contract::device_headroom()).collect::<Vec<_>>(),
         memory.iter().map(|sample| Baseline::Sampled {
             free: sample.baseline_free_bytes, phase: Phase::Load,
             source: "measured post-module free memory".into() }).collect(),
@@ -536,6 +528,7 @@ fn preflight_shape(
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
+        startup_probe_bytes: intake_probe_bytes,
         expert_usage: args.expert_usage_enabled()?,
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
             opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
@@ -566,6 +559,30 @@ fn preflight_shape(
     tracing::info!(phases = %serde_json::to_string(&admitted.solved.phases)?,
         "MiMo admitted phase ledger before allocations");
     cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "mimo_v2");
+    {
+        use sha2::{Digest, Sha256};
+        let hash = |path: &std::path::Path| -> Result<String> {
+            let mut file = std::fs::File::open(path)?;
+            let mut digest = Sha256::new();
+            std::io::copy(&mut file, &mut digest)?;
+            Ok(format!("{:x}", digest.finalize()))
+        };
+        let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{}; host-prefix/{}; replies/{:?}",
+            args.snapshot.display(), args.draft, args.max_context, concurrency, host_bytes,
+            cuteafd_core::spark_reply::requested());
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "mimo_v2", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
+                "layout": layout, "devices": memory, "spark_world": working.spark_ranks,
+                "onboard_layers": admitted.solved.decisions.onboard_layers,
+                "prefill": admitted.solved.decisions.prefill,
+                "graph_basis": { "rows": graph_layout.rows, "pinned": graph_layout.pinned,
+                    "reserve_policy": graph_layout.policies }
+            }
+        }));
+    }
     tracing::info!(placement = %placement.summary(), "MiMo shared admission solve");
     let pool_tokens = capacity.allocated_gpu_kv_tokens;
     let shortfall_tokens = (args.max_context as u64).saturating_sub(pool_tokens);
@@ -585,14 +602,13 @@ fn preflight_shape(
         allocated_pool = capacity.allocated_gpu_kv_tokens, requested_default = capacity.requested_kv_floor_tokens,
         requested_state_slots = capacity.state_slots, allocated_rings = args.rings,
         host_prefix_bytes = capacity.host_prefix_bytes, mark_slots, intake_probe_bytes,
-        ?graph_plan, ?graph_bound_bytes,
+        ?graph_layout,
         reservations = %serde_json::to_string(&capacity.devices)?,
         "MiMo pre-allocation capacity against measured post-module baseline");
     Ok(Preflight {
         expert_usage: prepared.recipe.expert_usage.clone(),
         capacity,
-        graph_plan,
-        graph_bound_bytes,
+        graph_layout,
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: working,
@@ -620,8 +636,7 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom(
-            usize::try_from(costs.device).unwrap_or(usize::MAX), 0);
+        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom();
         let budget = sample.total_bytes.saturating_sub(minimum_free).saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {

@@ -66,6 +66,7 @@ entries its pool can express and skips the rest.
 import argparse
 import ast
 import json
+import math
 import re
 from pathlib import Path
 
@@ -661,7 +662,316 @@ def generate_v41(traces, coverage, pin_frequency, prefill_rows, pin_report, layo
     return {"schema_version": 2, "family": "deepseek_v41", "layout": layout, "ranks": ranks}
 
 
-def generate(traces, family, coverage=0.999, pin_frequency=0.9, prefill_rows=None, pin_report=None, layout=None, existing=None, heat_report=None):
+MIMO_GEOMETRY = re.compile(r"rows: (\d+)")
+MIMO_DECODE_ROWS = 64
+
+
+def key_of(family, shape):
+    """The family's prewarm key from a trace shape string."""
+    if family != "mimo_v2":
+        match = GEOMETRY.search(shape)
+        if match is None:
+            raise ValueError(f"cannot parse {family} geometry: {shape!r}")
+        rows, width, stride = map(int, match.groups())
+        if rows <= 0 or width <= 0 or stride != width:
+            raise ValueError("unsupported prewarm geometry")
+        return (rows, width)
+    match = MIMO_GEOMETRY.search(shape)
+    if match is None:
+        raise ValueError(f"cannot parse {family} geometry: {shape!r}")
+    (rows,) = map(int, match.groups())
+    if not 1 <= rows <= MIMO_DECODE_ROWS:
+        raise ValueError("unsupported prewarm geometry")
+    return (rows,)
+
+
+
+def entry_of(family, key):
+    if family != "mimo_v2":
+        rows, width = key
+        return {"rows": rows, "table_width": width, "pin": False}
+    (rows,) = key
+    return {"rows": rows, "pin": False}
+
+
+
+def mimo_lifetime_pins(identities):
+    """Pin indivisible rows using request replay demand, never startup heat."""
+    reasons, devices = {}, {}
+    for (device, *_), (key, graph) in identities.items():
+        cycles = graph.get("cycles")
+        requests = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+                    if cycles is not None else int(graph["count"]))
+        hits = min(int(graph.get("hits", 0)), requests)
+        if hits <= 0:
+            continue
+        rows = devices.setdefault(device, {})
+        demand = rows.setdefault(key, [0, 0])
+        demand[0] += hits
+        demand[1] += min(hits, int((cycles or {}).get("verify", 0)))
+        if key == (1,):
+            reasons.setdefault(key, set()).add("plain_c1")
+    for rows in devices.values():
+        total = sum(demand[0] for demand in rows.values())
+        covered, cutoff = 0, None
+        for key in sorted(rows, key=lambda key: (-rows[key][0], key)):
+            hits = rows[key][0]
+            if cutoff is not None and hits < cutoff:
+                break
+            reasons.setdefault(key, set()).add("lifetime_hit_tier")
+            covered += hits
+            if cutoff is None and covered * 2 >= total:
+                cutoff = hits
+        verify = [key for key in rows if rows[key][1] > 0]
+        if verify:
+            dominant = min(verify, key=lambda key: (-rows[key][1], key))
+            reasons.setdefault(dominant, set()).add("dominant_verify")
+    return reasons
+
+
+
+def generate_mimo(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, ranks=None, variant=None, sparks=None, arena_report=None, layout=None):
+    prefix = "mimo_v2." if family == "mimo_v2" else None
+    if prefix is None:
+        raise ValueError(f"no checked-in shape-list consumer for {family}")
+    if family == "mimo_v2" and ranks is None:
+        raise ValueError("mimo_v2 needs --ranks: 1x and 2x layouts capture different graphs")
+    if family == "mimo_v2" and (not variant or sparks is None):
+        raise ValueError("mimo_v2 needs --variant and --sparks for the checkpoint/layout key")
+    if family == "mistral_large4":
+        if layout not in (1, 2):
+            raise ValueError("mistral_large4 keys its list by layout: pass --layout 1 or 2")
+    elif layout is not None:
+        raise ValueError("--layout applies to mistral_large4 only")
+    # A two-rank trace is recorded on the context placement, whose per-rank key
+    # carries the half table; a checked-in entry holds the width a step is
+    # built with, which is what the engine warms.
+    scale = 2 if layout == 2 else 1
+    if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
+        raise ValueError("coverage and pin frequency must be in (0, 1]")
+    def geometry(shape):
+        key = key_of(family, shape)
+        if family != "mimo_v2":
+            rows, width = key
+            if scale != 1 and width % 2:
+                raise ValueError(f"{family} layout {layout} key width {width} is not an even half table")
+            return (rows, width * scale)
+        return key
+
+    counts = {}
+    charged = {}
+    reserves = {}
+    reasons = {}
+    # Costs/heat use only the latest complete inventory per device.
+    identities = {}
+    legacy = set()
+    latest = {}
+    for trace in traces:
+        version = trace.get("schema_version")
+        if version not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        cache = trace["cache"]
+        device = int(cache["device"])
+        charged[device] = max(charged.get(device, 0), int(cache["charged"]))
+        reserves[device] = max(reserves.get(device, 0), int(cache.get("reserve", 0)))
+        # Snapshots enumerate the entire bounded cache. Missing identities in a
+        # newer snapshot have been forgotten; old heat/cost must not survive.
+        inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
+                            len(graph.get("hit_histogram", {}).get("counts", [])) *
+                            int(graph.get("hit_histogram", {}).get("interval_ms", 0))
+                            for graph in trace["graphs"]), default=0)
+        snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
+        if device not in latest or snapshot_time >= latest[device][0]:
+            latest[device] = (snapshot_time, trace)
+
+        device_counts = {}
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith(prefix):
+                continue
+            key = geometry(graph["shape"])
+            cycles = graph.get("cycles")
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) if cycles is not None else int(graph["count"])
+            # MiMo prewarms a whole row geometry. A capture-only identity is
+            # not replay demand; replayed siblings can still select this row.
+            if family == "mimo_v2" and int(graph.get("hits", 0)) <= 0:
+                continue
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
+                if version == 1:
+                    legacy.add(key)
+        for key, count in device_counts.items():
+            counts[key] = max(counts.get(key, 0), count)
+    if not counts:
+        raise ValueError("trace contains no matching graph identities")
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if graph["site"].startswith(prefix):
+                identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                identities[identity] = (geometry(graph["shape"]), graph)
+    for identity, (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        if family == "mimo_v2" and int(graph.get("hits", 0)) <= 0:
+            continue
+        if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
+            continue
+        why = reasons.setdefault(key, set())
+        histogram = graph.get("hit_histogram", {})
+        histogram_end = int(histogram.get("start_ms", 0)) + len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+        if histogram_end >= latest[identity[0]][0] and sustained(graph):
+            why.add("sustained_heat")
+        if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
+            why.add("repeated_recapture")
+    ranked = sorted(counts, key=lambda key: (-counts[key], tuple(reversed(key))))
+    total = sum(counts.values())
+    covered = 0
+    selected = set()
+    for key in ranked:
+        selected.add(key)
+        covered += counts[key]
+        if covered >= total * coverage:
+            break
+    if family == "mimo_v2":
+        for key, why in mimo_lifetime_pins(identities).items():
+            reasons.setdefault(key, set()).update(why)
+    # A protected low-frequency key can fall outside frequency coverage.
+    selected.update(key for key, why in reasons.items() if why)
+    peak = max(counts.values())
+    minimum = min(counts, key=lambda key: (math.prod(key), key))
+    if minimum in legacy and counts[minimum] >= peak * pin_frequency:
+        reasons.setdefault(minimum, set()).add("legacy_frequency")
+    replay_hits = {}
+    if family == "mimo_v2":
+        device_hits = {}
+        for (device, *_), (key, graph) in identities.items():
+            cycles = graph.get("cycles")
+            requests = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+                        if cycles is not None else int(graph["count"]))
+            hits = min(int(graph.get("hits", 0)), requests)
+            row = (device, key)
+            device_hits[row] = device_hits.get(row, 0) + hits
+        for (_, key), hits in device_hits.items():
+            replay_hits[key] = max(replay_hits.get(key, 0), hits)
+    entries = []
+    order = (lambda key: (not bool(reasons.get(key)), -replay_hits.get(key, 0), key)) \
+        if family == "mimo_v2" else lambda key: tuple(reversed(key))
+    for key in sorted(selected, key=order):
+        entry = entry_of(family, key)
+        entry["pin"] = bool(reasons.get(key))
+        entries.append(entry)
+    if pin_report is not None:
+        for key in sorted(selected):
+            if not reasons.get(key):
+                continue
+            for device in sorted(reserves):
+                graphs = [graph for identity, (geometry, graph) in identities.items()
+                          if identity[0] == device and geometry == key]
+                if not graphs:
+                    continue
+                known = all("permanent_bytes" in graph for graph in graphs)
+                cost = sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None
+                pin_report.append({"device": device, "rows": key[0],
+                                   "table_width": key[1] if len(key) > 1 else None,
+                                   "reasons": sorted(reasons[key]), "permanent_bytes": None,
+                                   "observed_permanent_lower_bound_bytes": cost,
+                                   "reserve_bytes": reserves[device], "reserve_fraction": None,
+                                   "observed_reserve_fraction_lower_bound": cost / reserves[device] if cost is not None and reserves[device] else None,
+                                   "capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
+                                   "nodes": sum(int(graph.get("nodes") or 0) for graph in graphs),
+                                   "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
+                                   "basis": graphs[0].get("basis"),
+                                   "cost_basis": "observed_inventory_lower_bound_unknown_total" if known else "unknown_legacy_trace"})
+    if family == "mimo_v2":
+        devices = sorted(charged)
+        if len(devices) != ranks:
+            raise ValueError(f"trace has {len(devices)} device(s) for a {ranks}-rank layout")
+        # Latest complete inventories contain each owner once, including cold
+        # layer/head siblings of selected rows. Whole-cache high-water includes
+        # unselected startup shapes and is not the proposed prewarm arena.
+        for trace in traces:
+            device = int(trace["cache"]["device"])
+            for graph in trace["graphs"]:
+                if not graph["site"].startswith(family + "."):
+                    continue
+                identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                if key_of(family, graph["shape"]) in selected and identity not in identities:
+                    raise ValueError(f"selected MiMo identity forgotten from latest inventory: {identity}")
+        bases = []
+        for device in devices:
+            prewarm_bytes = lazy_bytes = lazy_unknown = 0
+            zero_replay_keys = zero_replay_bytes = zero_replay_unknown = 0
+            selected_zero_keys = selected_zero_bytes = 0
+            sibling_classes = {}
+            geometries = set()
+            for identity, (geometry, graph) in identities.items():
+                if identity[0] != device:
+                    continue
+                share = graph.get("capture_bytes")
+                known = isinstance(share, int) and not isinstance(share, bool) and share >= 0
+                replayed = int(graph.get("hits", 0)) > 0
+                if not replayed:
+                    zero_replay_keys += 1
+                    if known:
+                        zero_replay_bytes += share
+                    else:
+                        zero_replay_unknown += 1
+                if geometry in selected:
+                    # Row siblings are an indivisible physical capture unit.
+                    sibling = re.sub(r"rows: \d+", "rows: *", graph["shape"])
+                    group = sibling_classes.setdefault((graph["site"], sibling), [])
+                    group.append((geometry, replayed))
+                    if not replayed:
+                        selected_zero_keys += 1
+                        if known:
+                            selected_zero_bytes += share
+                    if not known:
+                        raise ValueError(f"selected MiMo identity lacks measured capture_bytes: {identity}")
+                    geometries.add(geometry)
+                    prewarm_bytes += share
+                elif known:
+                    lazy_bytes += share
+                else:
+                    lazy_unknown += 1
+            if selected - geometries:
+                raise ValueError(f"device {device} lacks selected MiMo geometries: {sorted(selected - geometries)}")
+            bases.append(packed(prewarm_bytes))
+            if arena_report is not None:
+                arena_report.append({"device": device, "prewarm_capture_bytes": prewarm_bytes,
+                                     "prewarm_base_bytes": bases[-1], "lazy_capture_bytes": lazy_bytes,
+                                     "lazy_unknown_identities": lazy_unknown,
+                                     "zero_replay_keys": zero_replay_keys,
+                                     "zero_replay_capture_bytes": zero_replay_bytes,
+                                     "zero_replay_unknown_identities": zero_replay_unknown,
+                                     "selected_zero_hit_siblings": selected_zero_keys,
+                                     "selected_zero_hit_sibling_bytes": selected_zero_bytes,
+                                     "always_zero_hit_sibling_classes": [
+                                         {"site": site, "shape": shape}
+                                         for (site, shape), values in sorted(sibling_classes.items())
+                                         if {geometry for geometry, _ in values} == selected
+                                         and not any(replayed for _, replayed in values)],
+                                     "device_high_water_bytes": charged[device]})
+        return {"schema_version": 2, "family": family, "layouts": [{
+            "variant": variant, "sparks": sparks, "ranks": len(devices),
+            "reserve_base_bytes": bases,
+            "reserve_extra_bytes": [CHUNK for device in devices],
+            "entry_capture_bytes": [[sum(graph["capture_bytes"]
+                for identity, (geometry, graph) in identities.items()
+                if identity[0] == device and geometry == (entry["rows"],))
+                for entry in entries] for device in devices],
+            "entries": entries}]}
+    base = packed(max(charged.values()))
+    # Runtime headroom is resolved by GPU_GRAPH_RESERVE_EXTRA, not the trace.
+    extra = CHUNK
+    result = {"schema_version": 1, "family": family}
+    if layout is not None:
+        result["layout"] = layout
+    result.update({"reserve_base_bytes": base, "reserve_extra_bytes": extra, "entries": entries})
+    return result
+
+
+
+def generate(traces, family, coverage=0.999, pin_frequency=0.9, prefill_rows=None, pin_report=None, layout=None, existing=None, heat_report=None, *, ranks=None, variant=None, sparks=None, arena_report=None):
+    if family == "mimo_v2":
+        return generate_mimo(traces, family, coverage, pin_frequency, pin_report, ranks, variant, sparks, arena_report, layout)
     if family == "deepseek_v4":
         return generate_deepseek_v4(traces, layout, existing, coverage, pin_frequency, pin_report, heat_report)
     if family == "glm5_flash":
@@ -1055,7 +1365,7 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2")))
     parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1072,10 +1382,14 @@ def main():
                         help="qwen4 only: install the generated shape into this prewarm list in place")
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
+    parser.add_argument("--ranks", type=int, help="MiMo physical coordinator ranks")
+    parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
+    parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
     report = []
     heat_rows = []
     summary = {}
+    arenas = []
     if args.family == "qwen4" and args.shape is None:
         parser.error("--shape is required for qwen4")
     if args.family != "qwen4" and args.shape is not None:
@@ -1098,7 +1412,13 @@ def main():
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
-        if args.family == "qwen4":
+        if args.family == "mimo_v2":
+            result = generate([json.loads(Path(path).read_text()) for path in args.trace],
+                              args.family, args.coverage, args.pin_frequency, pin_report=report,
+                              ranks=args.ranks, variant=args.variant,
+                              sparks=None if args.sparks is None else args.sparks == "yes",
+                              arena_report=arenas)
+        elif args.family == "qwen4":
             traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
         elif args.family == "deepseek_v4":
@@ -1139,6 +1459,16 @@ def main():
               f"({summary.get('zero_replay_bytes', 0)} bytes); "
               f"zero_share={summary.get('zero_share_identities', 0)} "
               f"({summary.get('zero_share_bytes', 0)} bytes filled)")
+        for pin in report:
+            print("pin " + json.dumps(pin, sort_keys=True))
+        return
+    if args.family == "mimo_v2":
+        for layout in result["layouts"]:
+            print(f"{len(layout['entries'])} shapes; ranks={layout['ranks']} "
+                  f"base={layout['reserve_base_bytes']} extra={layout['reserve_extra_bytes']} bytes; "
+                  f"pinned={sum(entry['pin'] for entry in layout['entries'])}")
+        for arena in arenas:
+            print("arena " + json.dumps(arena, sort_keys=True))
         for pin in report:
             print("pin " + json.dumps(pin, sort_keys=True))
         return

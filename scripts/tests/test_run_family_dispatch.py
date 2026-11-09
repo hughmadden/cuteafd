@@ -4292,8 +4292,24 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     assert f"--expert-input {ingress}" in preflight and f"--expert-input {ingress}" in launch
     assert "--rtx-expert-layers 0" in preflight and "--onboard 0" in launch
     assert "--max-context-tokens 262144" in preflight and "--max-context-tokens 262144" in launch
-    assert "--mimo-decode-graphs" in preflight and "--decode-graphs true" in launch
+    assert "--mimo-decode-graphs on" in preflight and "--decode-graphs true" in launch
     assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
+
+
+@pytest.mark.parametrize("graphs", [None, "on", "off"])
+def test_mimo_graph_default_and_overrides_match_plan_and_serve(tmp_path, graphs):
+    config = {"model_type": "mimo_v2", "hidden_size": 4096, "num_hidden_layers": 2,
+              "moe_layer_freq": [0, 1]}
+    keys = "VISION=off\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\n"
+    if graphs is not None:
+        keys += f"DECODE_GRAPHS={graphs}\n"
+    result = _family_launch_result(tmp_path, config, "test/mimo", keys)
+    assert result.returncode == 0, result.stderr
+    preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    expected = graphs or "on"
+    assert f"--mimo-decode-graphs {expected}" in preflight
+    assert f"--decode-graphs {'true' if expected == 'on' else 'false'}" in launch
 
 
 @pytest.mark.parametrize("backend", ["mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/exportbad",

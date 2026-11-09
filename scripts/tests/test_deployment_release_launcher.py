@@ -31,13 +31,18 @@ def release_entry(entry: dict) -> dict:
     return entry
 
 
-@pytest.mark.parametrize("entry,swa_kv", [
-    pytest.param(entry, swa_kv, id=entry["name"] + (f"-{swa_kv}" if swa_kv else ""))
+@pytest.mark.parametrize("entry,swa_kv,decode_graphs", [
+    pytest.param(entry, swa_kv, decode_graphs,
+                 id=entry["name"] + (f"-{swa_kv}" if swa_kv else "")
+                 + ("-graphs-off" if decode_graphs == "off" else ""))
     for entry in ENTRIES
     for swa_kv in ([None, "bf16", "int8", "fp8"] if entry["family"] == "mimo_v2" else [None])
+    for decode_graphs in ([None, "off"] if entry["family"] == "mimo_v2" else [None])
 ])
 @pytest.mark.parametrize("draft_kv", ["bf16", "fp8"])
-def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: str | None, draft_kv: str) -> None:
+def test_deployment_preserves_release_container_commands(
+    entry: dict, swa_kv: str | None, draft_kv: str, decode_graphs: str | None,
+) -> None:
     golden_name = BASELINE_CAPTURES.get(entry['name'], entry['name'])
     golden_text = (FIXTURES / f"{golden_name}.json").read_text()
     if entry['name'].startswith('glm53-exl3-k6core-'):
@@ -71,6 +76,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
         selected["set"]["DRAFT_KV_CACHE"] = draft_kv
     if swa_kv is not None:
         selected["set"]["SWA_KV_CACHE"] = swa_kv
+    if decode_graphs is not None:
+        selected["set"]["DECODE_GRAPHS"] = decode_graphs
     current = capture(ROOT, entry["name"], release_entry=selected)
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
@@ -176,6 +183,12 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
+            if entry["family"] == "mimo_v2":
+                # Preserve the effective default-on command and explicit opt-out.
+                position = before["command"].index("--swa-kv-cache") + 2
+                before["command"][position:position] = [
+                    "--decode-graphs", "false" if decode_graphs == "off" else "true",
+                ]
         # Other families have no resolved-config fingerprint today; adding a
         # fabricated one is a failure. V4.1's fingerprint now also covers the
         # shared executor's prefill waves, which reach serve-native.

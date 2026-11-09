@@ -29,6 +29,7 @@ mod tp2;
 use super::weights::{MimoLayer, MimoWeights};
 use super::head::BorrowedHead;
 use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
+use cuteafd_loader::placement::inventory::GraphMemorySample;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::experts::rtx::fp8moe::Fp8MoeTp2;
 use crate::shared::experts::rtx::{ExpertInput as RtxInput, FusedCombine,
@@ -210,6 +211,23 @@ impl Drop for GraphExec<'_> {
     }
 }
 
+/// Match the shared observer's untracked residual, excluding separately owned
+/// device allocations even when a lazy workspace grows during capture.
+fn graph_capture_growth(before: GraphMemorySample, after: GraphMemorySample) -> u64 {
+    let residual = |sample: GraphMemorySample| sample.total.saturating_sub(sample.free)
+        .saturating_sub(sample.tracked_device);
+    residual(after).saturating_sub(residual(before))
+}
+
+/// Native producers skip full-KV writes for negative slots; SWA commits skip
+/// negative ring slots. Position zero never reads prior SWA history. These
+/// tables reference no allocator or prefix-cache state.
+fn graph_prewarm_tables(rows: usize, table_stride: usize) -> StepTables {
+    StepTables { decode: true, positions: vec![0; rows], slots: vec![-1; rows],
+        ring_slots: vec![-1; rows], seq_first: (0..rows as i32).collect(),
+        page_table: vec![0; rows * table_stride], table_stride }
+}
+
 /// A sequence's full-attention pages (from the refcounted pool: full pages may be
 /// shared with retained prefix snapshots and other sequences, which never write them),
 /// its SWA ring and its length.
@@ -352,7 +370,7 @@ struct Workspace<'a> {
 /// half the dense MLP), its KV records, RoPE tables and workspaces.
 pub(crate) struct Peer<'a> {
     /// Drop graph owners before the buffers their nodes reference.
-    graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     pub device: i32,
     pub stream: *mut c_void,
     pub layers: Vec<MimoLayer<'a>>,
@@ -769,7 +787,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
 
 pub(crate) struct MimoEngine<'a> {
     /// Drop captured nodes before expert, exchange and workspace storage.
-    graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     terminal: Cell<crate::shared::peer_split::TerminalState>,
     /// Closing/draining is also normal retirement. Only a failed submission
     /// latches this bit, so a caller cannot swallow a terminal execution error.
@@ -836,11 +854,15 @@ pub(crate) struct MimoEngine<'a> {
     /// Decode and verify steps replay one captured graph per layer segment
     /// between the Spark exchanges ([`Self::decode_layers`]); false: eager launches.
     pub decode_graphs: bool,
-    /// Frozen preallocation bound for each physical rank; graph storage has
-    /// its own contract, separate from modules/libraries/constraints.
-    pub(super) graph_storage_plan: Option<cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan>,
-    pub(super) graph_storage_bound_bytes: Option<Vec<u64>>,
-    graph_storage_observed_bytes: [Cell<u64>;2],
+    /// Provisional per-layout prewarm rows, pins, reserve and bootstrap.
+    pub(super) graph_layout: Option<cuteafd_loader::families::mimo_v2::decode_graph::MimoGraphLayout>,
+    /// Startup capture in progress: a miss captures without launching.
+    graphs_warming: Cell<bool>,
+    /// The startup prewarm completed; serving misses capture-or-run-eager.
+    graphs_warmed: Cell<bool>,
+    /// Physical and tracked bytes per rank before the first capture miss.
+    graph_before: RefCell<Option<Vec<GraphMemorySample>>>,
+    graphs_first_touch: Cell<bool>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -927,8 +949,9 @@ impl<'a> MimoEngine<'a> {
             drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20, Tag::staging("mimo/mtp-staging"))?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
-            decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
-            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)) })
+            decode_graphs: false, graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)),
+            graph_layout: None, graphs_warming: Cell::new(false), graphs_warmed: Cell::new(false),
+            graph_before: RefCell::new(None), graphs_first_touch: Cell::new(false) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -1049,6 +1072,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn probe_mark(&self, index: usize) -> Result<()> {
+        if self.graphs_warming.get() { return Ok(()); }
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
             // SAFETY: the clock and stream belong to rank zero and outlive this round.
             unsafe { probe.mark(index, self.stream)? };
@@ -1057,6 +1081,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn probe_ring(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
+        if self.graphs_warming.get() { return Ok(()); }
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
             // SAFETY: called outside graph capture after the router; normal round sync precedes reading.
             unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.stream)?; }
@@ -1145,7 +1170,8 @@ impl<'a> MimoEngine<'a> {
             Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
                 prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
                     crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
-                decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                decode_workspace: RefCell::new(None),
+                graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(Rc::new(exchange));
@@ -1245,13 +1271,9 @@ impl<'a> MimoEngine<'a> {
             copies: || self.terminal_links(|link| link.terminal_drain_copies()),
             graphs: || {
                 self.terminal_links(|link| link.terminal_release())?;
-                for rank in 0..self.ranks() {
-                    self.on(rank, || {
-                        if rank == 0 { self.graphs.borrow_mut().clear(); }
-                        else { self.peer.as_ref().context("peer graphs")?.graphs.borrow_mut().clear(); }
-                        Ok(())
-                    })?;
-                }
+                // The stream drain above is the proof no captured node still runs.
+                self.graphs.borrow_mut().cache_clear_drained();
+                if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_clear_drained(); }
                 Ok(())
             },
             finish: |drained| {
@@ -1613,6 +1635,7 @@ impl<'a> MimoEngine<'a> {
     fn step_units(&self, placement: &MimoPlacement, tokens: &[u32], all_logits: bool,
         media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
+        self.graph_cycle_prefill();
         self.prepare_scoring_prefill()?;
         let waves = self.prefill_waves();
         let units = sequence_units(tokens.len(), self.prefill_rows, waves, self.weights.layers.len())?;
@@ -1637,6 +1660,7 @@ impl<'a> MimoEngine<'a> {
         self.unit_index.set(None);
         result?;
         self.finish_tp2_route_step()?;
+        self.graph_end_of_step()?;
         Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
             if all_logits { tokens.len() } else { 1 }, false)))
     }
@@ -1727,6 +1751,7 @@ impl<'a> MimoEngine<'a> {
         let segments = crate::shared::prefill_packing::plan(&sequences.iter()
             .map(|(p, tokens)| (p.len, tokens.len())).collect::<Vec<_>>(), &self.packed_limits())?;
         self.submit(|| {
+            self.graph_cycle_prefill();
             self.prepare_scoring_prefill()?;
             let owned = self.workspace.borrow();
             let base = owned.as_ref().context("prefill workspace")?;
@@ -1759,6 +1784,7 @@ impl<'a> MimoEngine<'a> {
             self.unit_index.set(None);
             result?;
             self.finish_tp2_route_step()?;
+            self.graph_end_of_step()?;
             for (placement, tokens) in sequences.iter_mut() { placement.len += tokens.len(); }
             let outcomes = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
                 self.launch_head(&work[0], segments[i].end_row(), 1, false)?;
@@ -1818,10 +1844,12 @@ impl<'a> MimoEngine<'a> {
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        self.graph_cycle(tables);
         self.submit(|| {
             self.prepare_tp2_route_step(&[tokens.len()])?;
             let result = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media)?;
             self.finish_tp2_route_step()?;
+            self.graph_end_of_step()?;
             Ok(result)
         })
     }
@@ -1875,7 +1903,7 @@ impl<'a> MimoEngine<'a> {
                 self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
             let head = logit_rows == t;
-            self.decode_layers(w, split.map(|(_, w1)| w1), tables, t, gather, head, true)?;
+            self.decode_layers(w, split.map(|(_, w1)| w1), tables, t, gather, head)?;
             if let Some(mtp) = &self.mtp {
                 self.mtp_tap(mtp, w, tables)?;
             }
@@ -2060,12 +2088,15 @@ impl<'a> MimoEngine<'a> {
     /// layer (captured on rank 1's stream); rank 1's next segment is queued before
     /// the host waits in this layer's exchange.
     ///
-    /// `launch` false only captures the segments (every shape a later step replays
-    /// without capturing; see [`Self::capture_decode_graphs`]).
+    /// Startup prewarm uses the same launches and expert exchanges as serving.
+    /// Every peer producer must be queued before the completed-step drain.
     #[allow(clippy::too_many_arguments)]
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
-        gather: bool, head: bool, launch: bool) -> Result<()> {
+        gather: bool, head: bool) -> Result<()> {
         let layers = &self.weights.layers;
+        // Classifying Spark epilogues reads the decode transport. Finish those
+        // reads before the exchange holds its mutable borrow for this step.
+        let previous_segments: Vec<_> = (0..=layers.len()).map(|index| self.previous(index)).collect();
         // The decode link has one return slot: every decode wave lands in its
         // planes, which the replayed segments bake in.
         let mut link = match &self.experts {
@@ -2084,8 +2115,7 @@ impl<'a> MimoEngine<'a> {
         // The previous layer's wave: landed (a device wait) before the segment
         // that reduces its planes, consumed after it.
         let mut pending: Option<crate::shared::spark_waves::WaveTicket> = None;
-        for index in 0..=layers.len() {
-            let previous = self.previous(index);
+        for (index, previous) in previous_segments.into_iter().enumerate() {
             let last = index == layers.len();
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
             let landed = match (pending.take(), link.as_mut()) {
@@ -2097,7 +2127,7 @@ impl<'a> MimoEngine<'a> {
                 (Some(_), None) => anyhow::bail!("MiMo decode wave without its Spark link"),
                 (None, _) => None,
             };
-            self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
+            self.graph(0, key, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
                 reduction.clone(), bf16_input))?;
             if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
@@ -2106,9 +2136,15 @@ impl<'a> MimoEngine<'a> {
             if let Some(w1) = w1 {
                 // Queue the matching peer attention before any host-driven
                 // Spark wait or routed package launch in this layer.
-                if index < layers.len() { self.peer_segment(index, w1, tables, t, launch)?; }
+                if index < layers.len() { self.peer_segment(index, w1, tables, t)?; }
             }
-            if last || !launch { continue; }
+            if last { continue; }
+            if !layers[index].dense && !self.graphs_warming.get() {
+                // SAFETY: the segment produced real routes; tally is outside
+                // the graph so startup replay cannot enter user statistics.
+                unsafe { record_mimo_routes(self.expert_usage.as_ref(), self.device, 0, index,
+                    w.route_ids.buffer.ptr, t, true, self.stream)?; }
+            }
             if layers[index].dense { self.probe_mark(index)?; continue; }
             if self.tp2_layer(index) { self.probe_ring(w, index, t)?; }
             if self.tp2_layer(index) {
@@ -2137,7 +2173,7 @@ impl<'a> MimoEngine<'a> {
                 (Some(_), _) => self.moe_run(w, index, t, true)?,
                 (None, _) => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
-            crate::shared::console::layer_mark(index);
+            if !self.graphs_warming.get() { crate::shared::console::layer_mark(index); }
             self.probe_mark(index)?;
         }
         Ok(())
@@ -2225,7 +2261,7 @@ impl<'a> MimoEngine<'a> {
             Ok(())
         } else {
             let local = self.tp2_layer(index) || self.rtx_local_layer(index);
-            self.moe_front(w, index, layer, t, tables.decode, local || bf16_input)
+            self.moe_front_on_accounted(0, index, w, layer, t, tables.decode, local || bf16_input, false)
         }
     }
 
@@ -2233,7 +2269,7 @@ impl<'a> MimoEngine<'a> {
     /// [`Self::decode_layers`]): the previous layer's FFN exchange (rank 0's dense
     /// partial or routed sum in) and this layer's input norm, its heads' attention and
     /// the attention all-reduce, then its dense partial out.
-    fn peer_segment(&self, index: usize, w1: &Workspace<'_>, tables: &StepTables, t: usize, launch: bool)
+    fn peer_segment(&self, index: usize, w1: &Workspace<'_>, tables: &StepTables, t: usize)
         -> Result<()> {
         let peer = self.peer.as_ref().context("no head-split peer")?;
         let previous = match index.checked_sub(1) {
@@ -2243,7 +2279,7 @@ impl<'a> MimoEngine<'a> {
             Some(_) => Previous::Delta,
         };
         let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: false };
-        self.graph(1, key, launch, || {
+        self.graph(1, key, || {
             let rows = Scalar::I32(t as i32);
             let bytes = t * self.cfg.hidden * 2;
             let share = &peer.layers[index];
@@ -2271,89 +2307,218 @@ impl<'a> MimoEngine<'a> {
                 self.dense_ffn(1, w1, share, rows, "m64", true)?;
                 self.push(1, slot(index, true, tables.decode), w1.delta.buffer.ptr, bytes)?;
             } else if self.tp2_layer(index) {
-                self.moe_front_on(1, index, w1, share, t, tables.decode, true)?;
+                self.moe_front_on_accounted(1, index, w1, share, t, tables.decode, true, false)?;
             }
             Ok(())
         })
     }
 
-    /// Launches `segment` on rank `rank`'s stream through the graph captured for `key`;
-    /// `launch` false only captures a startup shape. A serving miss runs the segment
-    /// eagerly through the shared miss inventory ([`Self::miss_graph`]): the
-    /// startup shape set is closed, so a request outside it allocates no graph
-    /// storage and no runtime capture ever happens.
-    fn graph(&self, rank: usize, key: GraphKey, launch: bool, segment: impl FnOnce() -> Result<()>) -> Result<()> {
-        self.require_live()?;
-        let graphs = match (rank, &self.peer) {
-            (1, Some(peer)) => &peer.graphs,
-            _ => &self.graphs,
-        };
-        let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow().get(&key) {
-            if !launch {
-                return Ok(());
-            }
-            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+    /// Classifies this step's graph hits under its kind: decode, verify, or a
+    /// prefill unit (a wave boundary). MiMo does not graph prefill.
+    fn graph_cycle(&self, tables: &StepTables) {
+        use crate::shared::decode_graph::device::Cycle;
+        let cycle = if !tables.decode { Cycle::Prefill }
+            else if tables.positions.len() > 1 { Cycle::Verify } else { Cycle::Decode };
+        self.graphs.borrow_mut().cache_cycle(cycle);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(cycle); }
+    }
+
+    /// A prefill unit or wave is its own graph boundary. MiMo graphs no prefill
+    /// chunk, so this only classifies the cycle and flushes any earlier step's
+    /// pinned-hit counts.
+    fn graph_cycle_prefill(&self) {
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Prefill);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Prefill); }
+    }
+
+    /// Attaches one bounded device cache per physical rank: the resolved
+    /// layout's reserve and one byte basis for the whole device. MiMo has no
+    /// #1612 node calibration, so every capture is priced from bytes.
+    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64],
+        policies: &[cuteafd_loader::placement::graph_reserve::Resolved]) -> Result<()> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        ensure!(reserves.len() == self.ranks() && bootstraps.len() == self.ranks() && policies.len() == self.ranks(),
+            "MiMo graph cache needs one reserve, bootstrap and policy per physical rank");
+        tracing::warn!("MiMo graph cache uses per-site byte estimates: no calibrated node rates for this family");
+        for rank in 0..self.ranks() {
+            let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
+            let device = self.on(rank, || self.library.cuda_get_device())?;
+            graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
+                name: "mimo_v2.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: bootstraps[rank], basis: Basis::Bytes, spans_devices: self.ranks() > 1,
+            })?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policies[rank])?;
         }
-        if launch {
-            self.miss_graph(rank, &key);
-            return segment();
-        }
-        // Instantiation allocates driver graph storage; name the owner and the
-        // exact shape so a failed capture reports them instead of owner=null.
-        let _scope = cuteafd_ffi::memory_ledger::scope_owned("decode graph");
-        let _owner = cuteafd_ffi::memory_ledger::owner(&format!("mimo/decode-graph/rank{rank}/{key:?}"));
-        // SAFETY: capture records launches on that rank's stream; nothing in the
-        // segment synchronizes the host or allocates.
-        self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) })?;
-        let captured = segment();
-        // SAFETY: ends the capture begun above on the same stream.
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
-        captured?;
-        let exec = GraphExec(exec?, self.library);
-        crate::shared::decode_graph::census::capture_key("mimo_v2", "decode",
-            graphs.as_ptr() as usize, rank as i32, Some(0), &key, exec.0);
-        if launch {
-            // SAFETY: as for a replay.
-            self.on(rank, || unsafe { self.library.cuda_graph_launch(exec.0, stream) })?;
-        }
-        graphs.borrow_mut().insert(key, exec);
         Ok(())
     }
 
-    /// Records one eager run of a decode segment the sealed startup set did not
-    /// contain: every occurrence joins the shared `/v1/stats`
-    /// `graph_missing_variants` inventory, and a variant warns once with its
-    /// rank and request context. The variant is the whole baked shape, so two
-    /// distinct misses never share a row.
-    fn miss_graph(&self, rank: usize, key: &GraphKey) {
-        let variant = format!("layer={} rows={} table_stride={} previous={:?} head={}",
-            key.layer, key.rows, key.table_stride, key.previous, key.head);
-        crate::shared::decode_graph::note_eager("mimo_v2", &variant, || format!(
-            "rank={rank} max_context={} pages={} rings={} prefill_rows={}",
-            self.max_context, self.pages, self.rings, self.prefill_rows));
+    fn graph_cycle_other(&self) {
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Other);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
     }
 
-    /// Captures (without running) every decode segment of steps of 1..=`max_rows` rows,
-    /// so serving replays them without capturing; returns the graphs captured.
+    /// Sample without draining: a capture miss can occur inside a peer step
+    /// whose consumers have not all been queued yet.
+    fn graph_allocation_samples(&self) -> Result<Vec<GraphMemorySample>> {
+        let ledger = cuteafd_ffi::memory_ledger::snapshot();
+        use cuteafd_ffi::memory_ledger::Space;
+        (0..self.ranks()).map(|rank| self.on(rank, || {
+            let device = self.library.cuda_get_device()?;
+            let (free, total) = self.library.cuda_physical_memory_info()?;
+            Ok(GraphMemorySample { free: free as u64, total: total as u64,
+                tracked_device: ledger.total(Space::Device, device) as u64,
+                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
+                    .map(|row| row.bytes as u64).sum(),
+                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
+                    .map(|row| row.bytes as u64).sum() })
+        })).collect()
+    }
+
+    /// Physical free/total and ledger bytes after every rank has drained.
+    fn graph_memory_samples(&self) -> Result<Vec<GraphMemorySample>> {
+        for rank in 0..self.ranks() {
+            let stream = self.stream_of(rank);
+            // SAFETY: the engine owns both streams; callers queue on them only.
+            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        self.graph_allocation_samples()
+    }
+
+    /// The completed multi-rank step is the only measurement boundary: every
+    /// rank's captures are drained together, then untracked device growth is
+    /// charged to pending captures, excluding separately owned lazy storage.
+    fn graph_boundary(&self, before: &[GraphMemorySample]) -> Result<()> {
+        if !self.graphs.borrow().cache_needs_boundary()
+            && self.peer.as_ref().is_none_or(|peer| !peer.graphs.borrow().cache_needs_boundary()) {
+            return Ok(());
+        }
+        let after = self.graph_memory_samples()?;
+        for rank in 0..self.ranks() {
+            let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
+            graphs.borrow_mut().cache_measured(graph_capture_growth(before[rank], after[rank]));
+            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
+                let (free, _) = self.library.cuda_physical_memory_info()?;
+                Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
+                    released: (free as u64).saturating_sub(after[rank].free) })
+            }))?;
+        }
+        Ok(())
+    }
+
+    /// Ends a step: the first capture miss sampled `graph_before`, so that net
+    /// growth is measured once the whole step is drained, then pinned-hit
+    /// counts flush at the boundary.
+    fn graph_end_of_step(&self) -> Result<()> {
+        let before = self.graph_before.borrow_mut().take();
+        if let Some(before) = before { self.graph_boundary(&before)?; }
+        else if self.graphs.borrow().cache_needs_boundary()
+            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
+            self.graph_boundary(&self.graph_allocation_samples()?)?;
+        }
+        self.graphs.borrow_mut().cache_tick();
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+        Ok(())
+    }
+
+    /// Whether the resolved layout's trace-derived prewarm list pins `rows`.
+    fn graph_pinned(&self, rows: usize) -> bool {
+        self.graph_layout.as_ref().is_some_and(|layout| layout.pinned.contains(&rows))
+    }
+
+    /// Launches `segment` on rank `rank`'s stream through the graph cached for
+    /// `key`, capturing it on a miss. A shape the bounded cache will not admit
+    /// runs eagerly: a miss never refuses the request.
+    fn graph(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
+        self.require_live()?;
+        if !self.decode_graphs || self.graphs_first_touch.get() { return segment(); }
+        let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
+        let stream = self.stream_of(rank);
+        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
+            // SAFETY: the graph's pointers are persistent engine buffers of that rank.
+            return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
+        }
+        // Before the startup prewarm every segment runs eagerly: the prewarm
+        // pass, and then serving misses, are the only capture paths.
+        if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
+        let pinned = self.graph_pinned(key.rows);
+        let crate::shared::decode_graph::device::Miss::Capture(ticket) =
+            graphs.borrow_mut().cache_miss(&key, pinned, None) else { return segment() };
+        if self.graph_before.borrow().is_none() {
+            match self.graph_allocation_samples() {
+                Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
+                Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
+            }
+        }
+        // No synchronization here: the other rank's segments may not be queued
+        // yet. SAFETY: capture records launches on this rank's persistent stream.
+        if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
+            graphs.borrow_mut().cache_cancel(ticket);
+            tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            return segment();
+        }
+        let captured = segment();
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
+        if let Err(error) = captured {
+            graphs.borrow_mut().cache_cancel(ticket);
+            if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                graphs.borrow_mut().cache_cancel(ticket);
+                tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                return segment();
+            }
+        };
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "mimo_v2.segment", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
+        }
+        let graph = GraphExec(raw, self.library);
+        crate::shared::decode_graph::census::capture_key("mimo_v2", "decode",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
+        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
+        // Own the executable and its ticket before launch: a launch error is
+        // drained by the submission guard before either pointers or owner retire.
+        graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        let bank = graphs.borrow();
+        let graph = bank.get(&key).context("inserted graph")?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
+        Ok(())
+    }
+
+    /// Captures the resolved layout's prewarm rows (1..=`max_rows`) at startup:
+    /// one eager first touch, then a capture pass whose net growth is measured
+    /// per completed row shape. The list is a provisional prewarm, not a sealed
+    /// inventory: other shapes capture-or-run-eager in serving through the same
+    /// bounded cache. Returns the graphs captured.
     pub fn capture_decode_graphs(&self, max_rows: usize) -> Result<usize> {
-        self.capture_decode_graphs_observed(max_rows, |_| Ok(()))
-    }
-
-    /// The startup oracle records each completed shape through this same path.
-    fn capture_decode_graphs_observed(&self, max_rows: usize,
-        mut observe: impl FnMut(&str) -> Result<()>) -> Result<usize> {
-        if !self.decode_graphs || !self.graphable() {
+        if !self.decode_graphs || !self.graphable() { return Ok(0); }
+        let started = std::time::Instant::now();
+        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
+            && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
+            "MiMo startup graph inventory already captured");
+        let layout = self.graph_layout.as_ref().context("MiMo decode graph layout was not admitted")?.clone();
+        if layout.reserves.iter().all(|&bytes| bytes == 0) {
+            tracing::info!("MiMo graph reserves are zero; decode segments run eagerly");
             return Ok(0);
         }
+        // Startup captures are not request heat: attribute them to Other so the
+        // trace never reads the provisional prewarm as decode demand.
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Other);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         let max_rows = max_rows.clamp(1, DECODE_ROWS);
-        let plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
-            self.cfg.layers, self.ranks(), max_rows, true)?;
-        let admitted = self.graph_storage_plan.as_ref().context("decode graph geometry was not pre-admitted")?;
-        let bounds = self.graph_storage_bound_bytes.as_ref().context("decode graph storage was not pre-admitted")?;
-        ensure!(bounds.len() == self.ranks() && admitted.segments_per_rank == plan.segments_per_rank
-            && admitted.row_shapes >= max_rows, "decode graph admission has different physical geometry");
+        let rows = layout.rows.iter().copied().filter(|&rows| rows <= max_rows).collect::<Vec<_>>();
+        if rows.is_empty() {
+            self.graphs_warmed.set(true);
+            tracing::warn!(max_rows, "MiMo prewarm selected no rows; runtime misses capture or run eagerly");
+            return Ok(0);
+        }
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
         }
@@ -2369,60 +2534,90 @@ impl<'a> MimoEngine<'a> {
             Some(ws) => Some(ws.as_ref().context("peer workspace")?),
             None => None,
         };
-        for (rank, workspace) in std::iter::once(w).chain(w1).enumerate() {
-            self.on(rank, || self.put_step_inputs(rank, workspace, &vec![0; DECODE_ROWS]))?;
-        }
-        let free = |rank: usize| self.on(rank, || Ok(self.library.cuda_memory_info()?.0));
-        let free_before_head = free(0)?;
-        // The cuBLAS head's first call (handle setup) runs before any capture.
-        self.launch_head(w, 1, 1, false)?;
-        // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        tracing::info!(bytes = free_before_head.saturating_sub(free(0)?),
-            "MiMo eager vocabulary head initialization outside graph storage");
-        observe("eager-vocabulary-head-initialization")?;
-        let free_before = (0..self.ranks()).map(&free).collect::<Result<Vec<_>>>()?;
-        let gather = self.embedding.device_gather();
+        let startup_step = |t, head| -> Result<()> {
+            let tables = graph_prewarm_tables(t, self.decode_stride());
+            // The no-write slots keep persistent full KV and SWA rings intact.
+            // All ranks enqueue their producers before the guarded step drains.
+            self.graph_cycle_other();
+            self.submit(|| {
+                self.prepare_tp2_route_step(&[t])?;
+                for (rank, workspace) in std::iter::once(w).chain(w1).enumerate() {
+                    self.on(rank, || {
+                        self.put_step_inputs(rank, workspace, &tables.positions)?;
+                        self.put(&workspace.slots, &tables.slots)?;
+                        self.put(&workspace.ring_slots, &tables.ring_slots)?;
+                        self.put(&workspace.seq_first, &tables.seq_first)?;
+                        self.put(&workspace.page_table, &tables.page_table)?;
+                        self.put(&workspace.ids, &vec![0u32; t])
+                    })?;
+                }
+                if !self.embedding.device_gather() {
+                    self.embedding.embed(&vec![0u32; t], w.ids.buffer, 1, w.h.buffer, self.stream)?;
+                }
+                self.decode_layers(w, w1, &tables, t, self.embedding.device_gather(), head)?;
+                self.finish_tp2_route_step()?;
+                self.graph_end_of_step()?;
+                self.graph_memory_samples()?;
+                Ok(())
+            })
+        };
+        // Every selected shape touches segment kernels, experts and the head
+        // eagerly before any capture measurement. No module/first-use bytes are
+        // attributed to the graph arena, and no peer waits on a skipped expert.
+        self.graphs_warming.set(true);
+        self.graphs_first_touch.set(true);
+        let first_touch = (|| -> Result<()> {
+            for &t in &rows {
+                for head in cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_TAIL_HEAD_VARIANTS {
+                    startup_step(t, head)?;
+                }
+            }
+            Ok(())
+        })();
+        self.graphs_first_touch.set(false);
+        if let Err(error) = first_touch { self.graphs_warming.set(false); return Err(error); }
+        let samples_before = match self.graph_memory_samples() {
+            Ok(samples) => samples,
+            Err(error) => { self.graphs_warming.set(false); return Err(error); }
+        };
         let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        let mut previous_free = free_before.clone();
-        for t in 1..=max_rows {
-            let tables = StepTables { decode: true, positions: vec![0; t], slots: Vec::new(), ring_slots: Vec::new(),
-                seq_first: Vec::new(), page_table: Vec::new(), table_stride: self.decode_stride() };
-            for head in cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_TAIL_HEAD_VARIANTS {
-                // Partial-row logit requests use a distinct headless tail key.
-                // All preceding layer/peer keys are shared and already captured.
-                self.decode_layers(w, w1, &tables, t, gather, head, false)?;
+        self.graphs_warming.set(true);
+        let captured = (|| -> Result<()> {
+            for &t in &rows {
+                for head in cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_TAIL_HEAD_VARIANTS {
+                    startup_step(t, head)?;
+                }
             }
-            observe(&format!("decode-graph-row-shape-{t}"))?;
-            for rank in 0..self.ranks() {
-                let now = free(rank)?;
-                let delta = previous_free[rank].saturating_sub(now) as u64;
-                previous_free[rank] = now;
-                let observed = self.graph_storage_observed_bytes[rank].get().checked_add(delta)
-                    .context("decode graph measured storage overflow")?;
-                self.graph_storage_observed_bytes[rank].set(observed);
-                ensure!(observed <= bounds[rank],
-                    "rank {rank} retained decode graph storage {observed} B at {t} rows exceeds the pre-admitted {} B bound",bounds[rank]);
-            }
+            Ok(())
+        })();
+        self.graphs_warming.set(false);
+        captured?;
+        // Taps are staging, not draft context. Capture retains their kernels,
+        // but no synthetic hidden rows survive into the first real request.
+        if let Some(drafter) = &self.drafter {
+            self.library.cuda_zero_bytes(drafter.taps.buffer, drafter.taps.buffer.bytes)?;
         }
-        for rank in 0..self.ranks() {
-            let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().context("peer graphs")?.graphs };
-            let actual = graphs.borrow().keys().filter(|key| key.rows <= max_rows).count();
-            ensure!(actual == plan.executables_per_rank[rank],
-                "rank {rank} captured {actual} decode graphs; admitted geometry expects {}",plan.executables_per_rank[rank]);
-            let delta = free_before[rank].saturating_sub(free(rank)?) as u64;
-            let observed = self.graph_storage_observed_bytes[rank].get();
-            tracing::info!(rank, executables=actual, delta_bytes=delta, observed_bytes=observed, bound_bytes=bounds[rank],
-                "MiMo retained decode graph storage");
-        }
+        self.graphs_warmed.set(true);
+        let samples_after = self.graph_memory_samples()?;
         let after = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
-        let mib = |a: usize, b: usize| a.saturating_sub(b) as f64 / (1u64 << 20) as f64;
-        tracing::info!(device_mib = format!("{:.1}", mib(free_before[0], free(0)?)),
-            peer_mib = format!("{:.1}", if self.peer.is_some() { mib(free_before[1], free(1)?) } else { 0.0 }),
-            "MiMo decode graph memory");
+        for rank in 0..self.ranks() {
+            let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
+            let actual = graphs.borrow().len();
+            if actual != layout.executables_per_rank[rank] {
+                tracing::warn!(rank, actual, expected = layout.executables_per_rank[rank],
+                    "MiMo prewarm captured a different executable count; those shapes run eagerly");
+            }
+            tracing::info!(rank, executables = actual, reserve_bytes = layout.reserves[rank],
+                source = layout.sources[rank], bootstrap_bytes = layout.bootstraps[rank],
+                measured_bytes = graph_capture_growth(samples_before[rank], samples_after[rank]),
+                physical_growth_bytes = samples_before[rank].free.saturating_sub(samples_after[rank].free),
+                tracked_growth_bytes = samples_after[rank].tracked_device.saturating_sub(samples_before[rank].tracked_device),
+                "MiMo decode graph reserve and measured prewarm arena");
+        }
+        tracing::info!(graphs = after - before, shapes = rows.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64, "MiMo decode graphs captured at startup");
         Ok(after - before)
     }
-
     /// Queues rank 1's share of layer `index` (the head split's second GPU),
     /// mirroring rank 0's pushes in `step` one for one: the embedded rows before
     /// layer 0 (its first wait), then per layer its attention partial out and rank
@@ -2966,6 +3161,12 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn moe_front_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize, decode: bool, bf16_input: bool) -> Result<()> {
+        self.moe_front_on_accounted(rank, index, w, layer, t, decode, bf16_input, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_front_on_accounted(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &MimoLayer<'_>, t: usize,
+        decode: bool, bf16_input: bool, account: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
         self.run_on(rank, false, "mimo_router_scores", &[("x", w.x.buffer.ptr), layer.router_operand()?,
@@ -2977,8 +3178,10 @@ impl<'a> MimoEngine<'a> {
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
         // SAFETY: selection produced exactly t real rows on this stream; peer routers are replicas.
-        unsafe { record_mimo_routes(self.expert_usage.as_ref(), self.device, rank, index,
-            w.route_ids.buffer.ptr, t, decode, self.stream_of(rank))?; }
+        if account {
+            unsafe { record_mimo_routes(self.expert_usage.as_ref(), self.device, rank, index,
+                w.route_ids.buffer.ptr, t, decode, self.stream_of(rank))?; }
+        }
         let grid = self.quantize_grid.blocks(t, h);
         if !bf16_input {
             self.run("mimo_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
@@ -3165,6 +3368,193 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn empty_prewarm_with_nonzero_reserve_captures_on_first_runtime_miss() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::memory::device::Stream;
+        use crate::shared::token_io::{EmbedPlacement, EmbedSource};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // Isolate this CPU-only cache from other tests' logical device owners.
+        fixture.configure_memory(&library, 7, 1 << 30)?;
+        library.cuda_set_device(7)?;
+        fixture.immediate_copies(&library)?;
+        let programs = library.programs()?;
+        let stream = Stream::new(Device { library: &library, id: 7 })?;
+        let mut cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_flash_config())?;
+        let mut layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(&cfg, 1, true, true)?;
+        layout.rows.clear();
+        layout.pinned.clear();
+        layout.executables_per_rank.fill(0);
+        // No model kernels execute: this fixture exercises startup and graph ownership only.
+        cfg.layers = 0;
+        cfg.attention.clear();
+        cfg.dense.clear();
+        cfg.vocab_size = 1;
+        let path = fixture.directory().join("embedding.bin");
+        std::fs::write(&path, vec![0u8; cfg.hidden * 2])?;
+        let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource {
+            path, offset: 0, vocab: 1, hidden: cfg.hidden, snapshot: None,
+            tensor_name: "test.empty-prewarm.embedding".into(),
+        }, EmbedPlacement::Host, || Ok(()))?;
+        let weights = MimoWeights { layers: vec![],
+            norm: DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?,
+            head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?),
+            output_fp8: false };
+        let mut engine = MimoEngine::new(&library, &programs, cfg, weights, stream.raw,
+            64, 64, 16384, 1, 1, embedding, MimoKvFormats::default(), MimoPrefillOutput::AllRows)?;
+        engine.decode_graphs = true;
+        engine.configure_graph_cache(&layout.reserves, &layout.bootstraps, &layout.policies)?;
+        let caches = serde_json::to_value(crate::shared::decode_graph::device::snapshots())?;
+        let cache = caches.as_array().unwrap().iter()
+            .find(|cache| cache["device"] == 7).expect("MiMo physical graph cache is published");
+        assert_eq!(cache["reserve_policy"], serde_json::to_value(&layout.policies[0])?);
+        assert!(cache["reserve_policy"]["charged_bytes"].as_u64().unwrap() > 0);
+        let reconciliation = crate::shared::memory_report::reconcile::snapshot();
+        assert!(reconciliation.is_object());
+        assert!(reconciliation.get("first_request").is_some());
+        engine.graph_layout = Some(layout);
+        assert_eq!(engine.capture_decode_graphs(DECODE_ROWS)?, 0);
+        assert!(engine.graphs_warmed.get());
+        assert_eq!(engine.graphs.borrow().len(), 0);
+        let key = GraphKey { layer: 0, rows: 1, table_stride: 1, previous: Previous::First, head: true };
+        let calls = Cell::new(0);
+        engine.graph(0, key, || { calls.set(calls.get() + 1); Ok(()) })?;
+        // A transient lane bank must not discard the engine's controller or
+        // consume the capture's original allocation baseline on reattachment.
+        let before_free = engine.graph_before.borrow().as_ref().unwrap()[0].free;
+        for _ in 0..2 {
+            let mut temporary = crate::shared::decode_graph::GraphBank::<GraphKey, ()>::new(None);
+            temporary.attach_device(&library, 7, engine.graph_layout.as_ref().unwrap().reserves[0],
+                crate::shared::decode_graph::device::Site {
+                    name: "mimo_v2.segment", cycle: crate::shared::decode_graph::device::Cycle::Decode,
+                    preference: crate::shared::decode_graph::device::Preference::Adaptive,
+                    bootstrap: 1, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                    spans_devices: false,
+                })?;
+            drop(temporary);
+            let snapshots = crate::shared::decode_graph::device::snapshots();
+            let cache = snapshots.iter().find(|cache| cache.device == 7).unwrap();
+            assert_eq!(cache.reserve_policy, Some(engine.graph_layout.as_ref().unwrap().policies[0]));
+            assert!(cache.pending_capture > 0, "engine bank retains pending growth across lane rebuilds");
+            assert_eq!(engine.graph_before.borrow().as_ref().unwrap()[0].free, before_free);
+        }
+        engine.graph_end_of_step()?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(engine.graphs.borrow().len(), 1, "first miss must capture, not remain eager");
+        engine.graph(0, key, || anyhow::bail!("captured key must replay"))?;
+        engine.graph_end_of_step()?;
+        assert_eq!(fixture.events()?.matches('G').count(), 1);
+        assert_eq!(fixture.events()?.matches('L').count(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_growth_excludes_separately_owned_device_allocations() {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
+        let sample = |free, tracked_device| GraphMemorySample {
+            total: 1024, free, tracked_device, tracked_pinned: 0, tracked_managed: 0,
+        };
+        let before = sample(800, 100);
+        for (after, expected) in [
+            (sample(700, 180), 20), // 80 workspace bytes, 20 graph bytes.
+            (sample(720, 180), 0),  // Only the workspace grew.
+            (sample(820, 60), 20),  // Tracked release must not hide graph growth.
+            (sample(820, 100), 0),  // Untracked release is not negative growth.
+            (before, 0),
+        ] {
+            assert_eq!(super::graph_capture_growth(before, after), expected);
+        }
+        // Physical ranks have independent ledgers and capture shares.
+        let peers = [(sample(800, 100), sample(700, 180)),
+            (sample(600, 200), sample(540, 210))];
+        assert_eq!(peers.map(|(before, after)| super::graph_capture_growth(before, after)), [20, 50]);
+    }
+
+    #[test]
+    fn capture_baseline_never_drains_a_partial_peer_step() {
+        let source = include_str!("engine.rs");
+        let sample = source.split_once("fn graph_allocation_samples(").unwrap().1
+            .split_once("fn graph_memory_samples(").unwrap().0;
+        assert!(sample.contains("memory_ledger::snapshot()"));
+        assert!(!sample.contains("cuda_stream_synchronize"));
+        let boundary = source.split_once("fn graph_boundary(").unwrap().1
+            .split_once("fn graph_end_of_step(").unwrap().0;
+        assert!(boundary.contains("self.graph_memory_samples()?"));
+        assert!(boundary.contains("cache_measured(graph_capture_growth(before[rank], after[rank]))"));
+    }
+
+    #[test]
+    fn startup_tables_never_write_persistent_kv_or_allocate_prefix_pages() {
+        for rows in [1, 2, 4, 8, 16, 64] {
+            let tables = super::graph_prewarm_tables(rows, 32);
+            assert_eq!(tables.positions, vec![0; rows]);
+            assert_eq!(tables.slots, vec![-1; rows]);
+            assert_eq!(tables.ring_slots, vec![-1; rows]);
+            assert_eq!(tables.seq_first, (0..rows as i32).collect::<Vec<_>>());
+            assert_eq!(tables.page_table.len(), rows * 32);
+        }
+        let source = include_str!("engine.rs");
+        let helper = source.split_once("fn graph_prewarm_tables(").unwrap().1
+            .split_once("/// A sequence's full-attention pages").unwrap().0;
+        assert!(!helper.contains("Pool") && !helper.contains("prefix"));
+        let native = include_str!("../../../../../../third_party/sparkinfer/b12x/integration/cuteafd/_mimo_kernels.py");
+        assert!(native.contains("slot = Int64(slots[token])"));
+        assert!(native.contains("if slot >= Int64(0):"));
+        assert!(native.contains("& (slot >= Int64(0))"));
+    }
+
+    #[test]
+    fn startup_runs_tp2_experts_and_eagerly_touches_before_measuring_capture() {
+        let source = include_str!("engine.rs");
+        let layers = source.split_once("fn decode_layers(").unwrap().1
+            .split_once("/// Rank 0's decode segment").unwrap().0;
+        assert!(!layers.contains("last || warming"));
+        assert!(layers.contains("self.tp2_experts(0,"));
+        assert!(layers.contains("self.tp2_experts(1,"));
+        let startup = source.split_once("pub fn capture_decode_graphs(").unwrap().1
+            .split_once("/// Queues rank 1's share").unwrap().0;
+        assert!(startup.contains("self.submit(||"));
+        let launch = startup.find("self.decode_layers(").unwrap();
+        for upload in ["self.put_step_inputs(", "self.put(&workspace.slots,",
+            "self.put(&workspace.ring_slots,", "self.put(&workspace.seq_first,",
+            "self.put(&workspace.page_table,", "self.put(&workspace.ids,"] {
+            assert!(startup.find(upload).unwrap() < launch, "{upload} must precede the first launch");
+        }
+        assert!(startup.find("for (rank, workspace)").unwrap() < launch);
+        let eager = startup.find("self.graphs_first_touch.set(true)").unwrap();
+        let measured = startup.find("let samples_before =").unwrap();
+        assert!(eager < measured);
+        assert!(startup.contains("self.graphs_first_touch.set(false)"));
+        assert!(startup.contains("self.finish_tp2_route_step()?"));
+        assert!(startup.contains("cuda_zero_bytes(drafter.taps.buffer"));
+        assert!(!startup.contains("mtp_tap("));
+        assert!(!startup.contains("prefix"));
+    }
+
+    #[test]
+    fn decode_classifies_spark_epilogues_before_borrowing_the_exchange() {
+        let source = include_str!("engine.rs");
+        let layers = source.split_once("fn decode_layers(").unwrap().1
+            .split_once("/// Rank 0's decode segment").unwrap().0;
+        let borrowed = layers.find("transport.borrow_mut()").unwrap();
+        assert!(layers.find("self.previous(index)").unwrap() < borrowed);
+        assert!(!layers[borrowed..].contains("self.previous("));
+        assert_eq!(layers.matches("transport.borrow").count(), 1);
+        assert!(layers.contains("previous_segments.into_iter().enumerate()"));
+        // Peer segments and both RTX expert halves run while that borrow is
+        // held, but own separate RefCells and must not reborrow the transport.
+        for (start, end) in [("fn decode_segment(", "/// Rank 1's decode segment"),
+            ("fn peer_segment(", "/// Classifies this step's graph hits")] {
+            let segment = source.split_once(start).unwrap().1.split_once(end).unwrap().0;
+            assert!(!segment.contains("transport.borrow"));
+            assert!(!segment.contains("self.previous("));
+        }
+        let tp2 = include_str!("engine/tp2.rs");
+        assert!(!tp2.contains("transport.borrow"));
+        assert!(!tp2.contains("self.experts"));
+    }
 
     #[test]
     fn disabled_expert_usage_never_queries_cuda_or_captures() {

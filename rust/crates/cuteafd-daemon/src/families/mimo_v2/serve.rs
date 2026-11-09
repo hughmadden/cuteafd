@@ -280,8 +280,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         anyhow::ensure!(engine.has_experts(), "serve-mimo needs --peers (or --local-experts) for the routed experts");
         let spark = args.peers.is_some() && !args.local_experts;
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
-        // the server is ready: serving replays them without capturing.
+        // Best-effort prewarm of the selected checkpoint/layout row shapes.
+        // Serving misses capture within the same reserve or run eagerly.
         let started = std::time::Instant::now();
         let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
         if graphs > 0 {
@@ -1388,6 +1388,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, reserve: &Reserve, stalled: usize) {
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
     let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
@@ -1431,6 +1435,29 @@ fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>
 
 #[cfg(test)]
 mod lane_tests {
+    #[test]
+    fn admission_and_completed_request_publish_reconciliation() {
+        let admission = include_str!("admission.rs");
+        let registered = admission.split_once("reserve::log_plan(&admitted.solved, \"mimo_v2\")").unwrap().1
+            .split_once("MiMo shared admission solve").unwrap().0;
+        assert!(registered.contains("memory_ledger::fault::set_inputs"));
+        for field in ["memory_reconciliation_provenance", "family", "source_commit", "native_sha256",
+            "programs_sha256", "layout", "devices", "spark_world", "onboard_layers", "prefill"] {
+            assert!(registered.contains(&format!("\"{field}\"")), "missing provenance {field}");
+        }
+        let source = include_str!("serve.rs");
+        let publish = source.split_once("\nfn publish(").unwrap().1
+            .split_once("\nfn eligible_draft_rooms").unwrap().0;
+        let completed = publish.find("if requests > 0").unwrap();
+        let once = publish.find("static FIRST: std::sync::Once").unwrap();
+        let capture = publish.find("FIRST.call_once(|| crate::shared::memory_report::reconcile::capture(\"first_request\"))").unwrap();
+        let replace = publish.find("*stats = serde_json::json!").unwrap();
+        assert!(completed < once && once < capture && capture < replace);
+        assert!(!publish.contains("graph_capture_stats"), "diagnostics belong to HTTP stats fetches");
+        assert!(publish.contains("cache.serving_stats()"));
+        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
+    }
+
     #[test]
     fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
         let source = include_str!("serve.rs");

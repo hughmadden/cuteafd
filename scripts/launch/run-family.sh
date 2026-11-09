@@ -421,7 +421,7 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
-if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 ]]; then
+if [[ "$family" == mimo_v2 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
     [[ -z "$(get "$key")" ]] || graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -1449,7 +1449,7 @@ if [[ "$family" == qwen4 ]]; then
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
-if [[ ( "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v41 ) && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
+if [[ ( "$family" == mimo_v2 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v41 ) && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
   spark_worker_env+=" -e $(printf '%q' "CUTEAFD_SPARK_GRAPH_RESERVE=$(get SPARK_GRAPH_RESERVE)")"
 fi
 # Options only the Spark expert workers take.
@@ -1794,10 +1794,9 @@ if [[ $family == mimo_v2 ]]; then
     bf16|int8|fp8) family_args+=(--swa-kv-cache "$mimo_swa_kv") ;;
     *) release_die "SWA_KV_CACHE must be bf16, int8 or fp8" ;;
   esac
-  # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
-  # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
-  case "$(get DECODE_GRAPHS)" in
-    "") ;;
+  # Keep serving and admission on the same explicit graph policy.
+  mimo_decode_graphs="$(get DECODE_GRAPHS on)"
+  case "$mimo_decode_graphs" in
     on) family_args+=(--decode-graphs true) ;;
     off) family_args+=(--decode-graphs false) ;;
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
@@ -2368,7 +2367,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
-    [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
+    plan_draft_args+=(--mimo-decode-graphs "$mimo_decode_graphs")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
@@ -2510,7 +2509,7 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
-  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 ]]; then
+  if [[ "$family" == mimo_v2 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
     done
