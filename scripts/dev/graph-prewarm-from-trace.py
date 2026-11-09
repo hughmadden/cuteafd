@@ -1725,10 +1725,73 @@ def generate_qwen35(traces, variant, summary=None):
                      "pin": (rows, stride, spec) in pins} for rows, stride, spec in keys]}]}
 
 
+STEP5_LAYOUTS = {"fp8-2rtx-6spark": 2, "nvfp4-1rtx-4spark": 1}
+STEP5_GEOMETRY = re.compile(r"Key \{ layer: (\d+), rows: (\d+), section: "
+                            r"(Projection|Attention|Dense|Frontend|Shared|Finish) \}")
+
+
+def generate_step5(traces, layout):
+    """Every replayed exact section, per rank; never borrow another layout."""
+    if layout not in STEP5_LAYOUTS:
+        raise ValueError(f"unknown Step-5 layout {layout!r}")
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") != 2:
+            raise ValueError("Step-5 requires GRAPH_TRACE schema_version=2")
+        device = int(trace["cache"]["device"])
+        sampled = int(trace["cache"]["sampled_at_ms"])
+        if device not in latest or sampled >= latest[device][0]:
+            latest[device] = (sampled, trace)
+    if len(latest) != STEP5_LAYOUTS[layout]:
+        raise ValueError(f"{layout} requires {STEP5_LAYOUTS[layout]} device traces")
+    ranks = []
+    for rank, device in enumerate(sorted(latest)):
+        _, trace = latest[device]
+        identities = {}
+        for graph in trace["graphs"]:
+            if graph["site"] != "step5.section":
+                continue
+            match = STEP5_GEOMETRY.fullmatch(graph["shape"])
+            if match is None:
+                raise ValueError(f"cannot parse Step-5 identity: {graph['shape']!r}")
+            layer, rows, section = match.groups()
+            key = (int(layer), int(rows), section)
+            if key[0] >= 92 or key[1] <= 0:
+                raise ValueError(f"unsupported Step-5 geometry {key}")
+            if qwen_replay(graph) < 1:
+                continue
+            if int(graph.get("nodes") or 0) < 2 or graph.get("spans_devices", False):
+                raise ValueError(f"invalid local Step-5 section topology {key}")
+            capture = graph.get("capture_bytes")
+            if capture is None or int(capture) < 0:
+                raise ValueError(f"Step-5 section {key} lacks measured capture bytes")
+            if key in identities:
+                raise ValueError(f"duplicate Step-5 exact geometry {key} on device {device}")
+            identities[key] = graph
+        if not identities:
+            raise ValueError(f"Step-5 rank {rank} has no replayed sections")
+        positive = [int(g["capture_bytes"]) for g in identities.values() if int(g["capture_bytes"]) > 0]
+        if not positive:
+            raise ValueError(f"Step-5 rank {rank} has no positive measured capture shares")
+        mean = math.ceil(sum(positive) / len(positive))
+        # Zero growth can be allocator reuse, not a free executable. Use this
+        # device's measured mean rather than undercounting its selected set.
+        costs = {key: int(graph["capture_bytes"]) or mean for key, graph in identities.items()}
+        pins = {key: sustained(graph) or (int(graph.get("evictions", 0)) >= 2
+                and int(graph.get("recaptures", 0)) >= 2) for key, graph in identities.items()}
+        ordered = sorted(identities, key=lambda key: (not pins[key], -qwen_replay(identities[key]), key))
+        entries = [{"layer": layer, "rows": rows, "section": section,
+                    "pin": pins[key], "capture_bytes": costs[key]}
+                   for key in ordered for layer, rows, section in [key]]
+        ranks.append({"rank": rank, "reserve_base_bytes": packed(sum(costs.values())),
+                      "reserve_extra_bytes": CHUNK, "entries": entries})
+    return {"schema_version": 1, "family": "step5", "layout": layout, "ranks": ranks}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark", "step5")))
     parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1771,8 +1834,11 @@ def main():
         if layout not in ("1", "2"):
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
+    elif args.family == "step5":
+        if layout not in STEP5_LAYOUTS:
+            parser.error("Step-5 requires its exact --layout")
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41 kimi_k3 and step5 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
@@ -1781,6 +1847,8 @@ def main():
         elif args.family == "muse_spark":
             result = generate_muse([json.loads(Path(path).read_text()) for path in args.trace],
                                    args.ranks, args.onboard_layers)
+        elif args.family == "step5":
+            result = generate_step5([json.loads(Path(path).read_text()) for path in args.trace], layout)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,

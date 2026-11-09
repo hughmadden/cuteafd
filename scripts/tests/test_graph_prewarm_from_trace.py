@@ -1,6 +1,7 @@
 """Trace-derived startup lists preserve hot shapes and per-device ownership."""
 import copy
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 
@@ -36,6 +37,71 @@ def test_non_glm_generators_keep_existing_fixture_outputs(family):
     else:
         result = MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min")
     assert result == expected[family]
+
+
+def step5_trace(device=0):
+    def graph(layer, rows, section, hits, capture, pin=False):
+        return {"site": "step5.section", "bank": 1,
+                "shape": f"Key {{ layer: {layer}, rows: {rows}, section: {section} }}",
+                "nodes": 4, "spans_devices": False, "hits": hits, "capture_bytes": capture,
+                "hit_histogram": {"counts": [1, 1, 1, 1] if pin else [hits], "interval_ms": 10000}}
+    return {"schema_version": 2, "cache": {"device": device, "sampled_at_ms": 40000},
+            "graphs": [graph(0, 1, "Projection", 100, 1000),
+                       graph(0, 4, "Attention", 2, 2000, True),
+                       graph(1, 16, "Finish", 1, 0),
+                       graph(2, 64, "Shared", 0, 999999)]}
+
+
+def test_step5_selects_every_replayed_section_and_heat_orders_each_rank():
+    result = MODULE.generate_step5([step5_trace(1), step5_trace(0)], "fp8-2rtx-6spark")
+    assert [rank["rank"] for rank in result["ranks"]] == [0, 1]
+    for rank in result["ranks"]:
+        assert [entry["section"] for entry in rank["entries"]] == ["Attention", "Projection", "Finish"]
+        assert [entry["pin"] for entry in rank["entries"]] == [True, False, False]
+        assert rank["entries"][-1]["capture_bytes"] == 1500
+        assert rank["reserve_base_bytes"] == 2 << 20
+        assert rank["reserve_extra_bytes"] == 2 << 20
+    assert result == MODULE.generate_step5([step5_trace(0), step5_trace(1), step5_trace(0)],
+                                           "fp8-2rtx-6spark")
+
+
+@pytest.mark.parametrize("change", [lambda t: t["graphs"][0].update(nodes=1),
+    lambda t: t["graphs"][0].update(spans_devices=True),
+    lambda t: t["graphs"][0].update(capture_bytes=None),
+    lambda t: t["graphs"][0].update(shape="Key { layer: 0, rows: 1, sequence: 2 }"),
+    lambda t: t["graphs"].append(copy.deepcopy(t["graphs"][0]))])
+def test_step5_rejects_unmeasured_or_unsafe_section_inventory(change):
+    data = step5_trace()
+    change(data)
+    with pytest.raises(ValueError):
+        MODULE.generate_step5([data], "nvfp4-1rtx-4spark")
+
+
+def test_step5_never_borrows_another_layout_or_selects_capture_only():
+    with pytest.raises(ValueError):
+        MODULE.generate_step5([step5_trace()], "fp8-2rtx-6spark")
+    data = step5_trace()
+    for graph in data["graphs"]:
+        graph["hits"] = 0
+    with pytest.raises(ValueError, match="no replayed"):
+        MODULE.generate_step5([data], "nvfp4-1rtx-4spark")
+
+
+def test_step5_extension_preserves_every_existing_family_output_byte_for_byte():
+    # Hashes from the generator at 2cdcc757a3, before Step-5 dispatch was added.
+    cases = [
+        (MODULE.generate([trace()], "glm5"), "3081a5619f1997899f40c27fc72a392f0a0a7c6219f52dc360e41671b0cb5cc8"),
+        (MODULE.generate([flash_trace()], "glm5_flash"), "135dc28da122a25b94de1cc0e525d571f006ae1ad2eee33fe55fff7984b0823a"),
+        (MODULE.generate([context_trace()], "mistral_large4", layout=2), "5b9886faf0eeea59230dc82c7f60229feae0b90479576ec9438767479206bf73"),
+        (MODULE.generate_qwen([qwen_trace()], "single_sparks"), "4c18df79e34426c11074a1f9f82785f916f2cccf73475d8d2f476bc811e45735"),
+        (MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx1-local", existing=v4_list()),
+         "fc9483c5180001c782b40e200cb5138fc3d03c7ecf71b85af34b1d77c4a71032"),
+        (MODULE.generate([v41_trace()], "deepseek_v41", layout=1), "8e9f32b829849a0f3fc4a2a01c595346c80606c7ee866e50cc5b2601982df754"),
+        (MODULE.generate([mimo_trace()], "mimo_v2", ranks=1, variant="mimof-48", sparks=True),
+         "51a36a9ea8fe52f6b62bd8a7de62c7ff5e984cae8b499e5f3c37088d72576ce2"),
+    ]
+    for result, expected in cases:
+        assert hashlib.sha256((json.dumps(result, indent=2) + "\n").encode()).hexdigest() == expected
 
 
 def test_frequency_and_low_parameter_pin_candidate():

@@ -1855,6 +1855,20 @@ mod tests {
 
     #[test]
     fn whole_model_native_context_constructs_headers_once() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_STEP5_CONSTRUCTIONS";
+        if std::env::var_os(CHILD).is_none() {
+            // Tracing's callsite interest cache is process-global; isolate this
+            // scoped subscriber from parallel tests that rebuild that cache.
+            let name = format!("{}::whole_model_native_context_constructs_headers_once",
+                module_path!().split_once("::").unwrap().1);
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", &name, "--nocapture"]).env(CHILD, "1").output()?;
+            ensure!(output.status.success(), "isolated construction test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            ensure!(String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "isolated construction test did not run");
+            return Ok(());
+        }
         use cuteafd_loader::{placement::*, plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions}};
         use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};

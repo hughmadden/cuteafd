@@ -1486,7 +1486,7 @@ pub(super) mod tests {
                 assert_eq!(retained_wave_rows(rows, sequences).unwrap(), retained);
                 let extra_raw = (retained - (rows + 7)) * 512 * 2 * 23;
                 assert_eq!(Staging::bytes_for_sequences(&layout, 0, sequences).unwrap(),
-                    single + extra_raw + table * (sequences - 1));
+                    single + extra_raw + 3 * table * (sequences - 1));
             }
         }
         for (rows, sequences) in [(0, 1), (1, 0), (usize::MAX, 1), (usize::MAX, usize::MAX)] {
@@ -1526,8 +1526,8 @@ pub(super) mod tests {
         let mut layout = super::super::cache::tests::layout_for(1024, 2, 0, 64);
         layout.ranks[1].regions.clear();
         layout.geometry.ranks[1].persistent_unit_bytes = 0;
-        // Positions, request ids and the two attention page tables only.
-        assert_eq!(Staging::bytes(&layout, 1)?, 64 * 8 + 256 + 2 * 256);
+        // Positions, eager/graph request ids and eager/graph attention page tables.
+        assert_eq!(Staging::bytes(&layout, 1)?, 64 * 8 + 2 * 256 + 4 * 256);
         assert!(Staging::bytes(&layout, 0)? > Staging::bytes(&layout, 1)?);
         Ok(())
     }
@@ -1599,7 +1599,7 @@ pub(super) mod tests {
                 let layout = super::super::cache::tests::layout_with_format(8192, 2, 0, rows, format);
                 let storage = staging_layout(&layout, 0, 4)?;
                 assert_eq!(storage.bytes, Staging::bytes_for_sequences(&layout, 0, 4)?);
-                assert_eq!(storage.regions.len(), 4 + 3 + 2 * 23 + if format == Qwen4KvCache::Fp8 { 2 } else { 0 });
+                assert_eq!(storage.regions.len(), 7 + 3 + 2 * 23 + if format == Qwen4KvCache::Fp8 { 2 } else { 0 });
                 assert!(storage.regions.windows(2).all(|r| r[0].end <= r[1].start));
                 let before = fixture.events()?.matches('D').count();
                 let arena = Arena::new(device, storage.bytes, Tag::staging("step5/test-producers"))?;
