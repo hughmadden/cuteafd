@@ -770,6 +770,10 @@ fn worker(
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     vision.connect()?;
+    // Every other Ready owner is priced by now: weights, workspaces, KV,
+    // transports, BLAS handles, page tables and arena tails. Report the two
+    // predicted runtime-base owners against what the device actually holds.
+    admission::log_runtime_base(&lib, &pool.solved, 1)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready
         .take()

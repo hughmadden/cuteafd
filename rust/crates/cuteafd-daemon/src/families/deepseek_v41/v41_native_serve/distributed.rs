@@ -567,6 +567,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
+    // Same Ready-boundary verification as the single-rank worker: both GPUs'
+    // predicted runtime bases against what their devices hold.
+    admission::log_runtime_base(&lib, &pool.solved, 2)?;
     memory_checkpoint("ready")?;
     ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
