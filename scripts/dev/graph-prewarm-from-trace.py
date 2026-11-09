@@ -12,6 +12,8 @@ from pathlib import Path
 
 CHUNK = 2 << 20
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
+# Families sharing one engine share its site names.
+SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
 
 
 def packed(value):
@@ -29,9 +31,19 @@ def sustained(graph):
     return len(complete) >= 3 and sum(int(count) > 0 for count in complete) >= len(complete) * 0.6
 
 
-def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None):
-    if family != "glm5":
-        raise ValueError("only glm5 has a checked-in shape-list consumer")
+def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
+    prefix = SITE_PREFIX.get(family)
+    if prefix is None:
+        raise ValueError(f"no checked-in shape-list consumer for {family}")
+    if family == "mistral_large4":
+        if layout not in (1, 2):
+            raise ValueError("mistral_large4 keys its list by layout: pass --layout 1 or 2")
+    elif layout is not None:
+        raise ValueError("--layout applies to mistral_large4 only")
+    # A two-rank trace is recorded on the context placement, whose per-rank key
+    # carries the half table; a checked-in entry holds the width a step is
+    # built with, which is what the engine warms.
+    scale = 2 if layout == 2 else 1
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
     counts = {}
@@ -62,11 +74,11 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
             latest[device] = (snapshot_time, trace)
 
         for site, values in trace.get("sites", {}).items():
-            if site.startswith(family + "."):
+            if site.startswith(prefix):
                 largest = max(largest, int(values["largest_bytes"]))
         device_counts = {}
         for graph in trace["graphs"]:
-            if not graph["site"].startswith(family + "."):
+            if not graph["site"].startswith(prefix):
                 continue
             match = GEOMETRY.search(graph["shape"])
             if match is None:
@@ -74,7 +86,9 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
             rows, width, stride = map(int, match.groups())
             if rows <= 0 or width <= 0 or stride != width:
                 raise ValueError("unsupported prewarm geometry")
-            key = (rows, width)
+            if scale != 1 and width % 2:
+                raise ValueError(f"{family} layout {layout} key width {width} is not an even half table")
+            key = (rows, width * scale)
             cycles = graph.get("cycles")
             count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) if cycles is not None else int(graph["count"])
             if count > 0:
@@ -87,10 +101,10 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
         raise ValueError("trace contains no matching graph identities")
     for device, (_, trace) in latest.items():
         for graph in trace["graphs"]:
-            if graph["site"].startswith(family + "."):
+            if graph["site"].startswith(prefix):
                 rows, width, _ = map(int, GEOMETRY.search(graph["shape"]).groups())
                 identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
-                identities[identity] = ((rows, width), graph)
+                identities[identity] = ((rows, width * scale), graph)
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
@@ -142,14 +156,18 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
                                    "cost_basis": "observed_inventory_lower_bound_unknown_total" if known else "unknown_legacy_trace"})
     base = packed(max(arenas))
     extra = packed(largest)
-    return {"schema_version": 1, "family": family,
-            "reserve_base_bytes": base, "reserve_extra_bytes": extra,
-            "entries": entries}
+    result = {"schema_version": 1, "family": family}
+    if layout is not None:
+        result["layout"] = layout
+    result.update({"reserve_base_bytes": base, "reserve_extra_bytes": extra, "entries": entries})
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--family", required=True, choices=["glm5"])
+    parser.add_argument("--family", required=True, choices=sorted(SITE_PREFIX))
+    parser.add_argument("--layout", type=int, choices=(1, 2),
+                        help="coordinator layout the trace was recorded on (mistral_large4)")
     parser.add_argument("--trace", action="append", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--coverage", type=float, default=0.999)
@@ -158,11 +176,12 @@ def main():
     report = []
     try:
         result = generate([json.loads(path.read_text()) for path in args.trace],
-                          args.family, args.coverage, args.pin_frequency, report)
+                          args.family, args.coverage, args.pin_frequency, report, args.layout)
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
     args.output.write_text(json.dumps(result, indent=2) + "\n")
-    print(f"{len(result['entries'])} shapes; base={result['reserve_base_bytes']} "
+    layout = f" layout={result['layout']};" if "layout" in result else ""
+    print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
           f"extra={result['reserve_extra_bytes']} bytes; "
           f"pinned={sum(entry['pin'] for entry in result['entries'])}")
     for pin in report:

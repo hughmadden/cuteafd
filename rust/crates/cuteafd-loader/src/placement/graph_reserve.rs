@@ -1,9 +1,11 @@
 //! A graph arena is a named owner, independent of GPU_RESERVE and KV policy.
+use crate::serving_capacity::glm_graphs::GlmPrewarmFamily;
 use cuteafd_core::memory_policy::Size;
 
-/// Per-device prewarm base plus extra capture headroom from the family list.
-pub fn glm_default() -> (u64, u64) {
-    let list = crate::serving_capacity::glm_graphs::glm_prewarm_list();
+/// Per-device prewarm base plus extra capture headroom from the resolved
+/// layout's checked-in list.
+pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
+    let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
     (list.reserve_base_bytes, list.reserve_extra_bytes)
 }
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }

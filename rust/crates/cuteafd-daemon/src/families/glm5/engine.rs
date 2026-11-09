@@ -1517,6 +1517,21 @@ impl<'a> GlmEngine<'a> {
         glm_decode_table_widths(self.max_context, self.pages)
     }
 
+    /// The checked-in prewarm and reserve identity of this checkpoint.
+    fn prewarm_family(&self) -> cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmFamily {
+        cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmFamily::of(&self.cfg.variant)
+    }
+
+    /// Whether the resolved layout's list pins this key's geometry. Entries
+    /// hold the width a step is built with; under the context placement each
+    /// rank's captured key is its half table.
+    fn prewarm_pins(&self, key: &GraphKey) -> bool {
+        use cuteafd_loader::serving_capacity::glm_graphs::{glm_prewarm, prewarm_key_width};
+        glm_prewarm(self.prewarm_family(), self.ranks()).entries.iter().any(|entry| entry.pin
+            && entry.shape.rows == key.rows
+            && prewarm_key_width(entry.shape.table_width, self.context_kv()) == key.table_width)
+    }
+
     /// Pads a decode step's tables to `bucket` rows: position 0 of the scratch
     /// page past the pool (its own records and index keys; no sequence reads them).
     fn pad_rows(&self, tables: &mut StepTables, bucket: usize) {
@@ -1537,8 +1552,8 @@ impl<'a> GlmEngine<'a> {
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "GLM startup graph inventory already captured");
-        let shapes = glm_prewarm_shapes(self.max_context, self.pages);
         use crate::shared::decode_graph::device::Cycle;
+        let shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
         self.graphs.borrow_mut().cache_cycle(Cycle::Other);
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         // Eager pass: each shape's first module, workspace and BLAS touch lands
@@ -2260,9 +2275,7 @@ impl<'a> GlmEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
-        static PREWARM: std::sync::OnceLock<cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmList> = std::sync::OnceLock::new();
-        let pinned = PREWARM.get_or_init(cuteafd_loader::serving_capacity::glm_graphs::glm_prewarm_list).entries.iter()
-            .any(|entry| entry.pin && entry.shape.rows == key.rows && entry.shape.table_width == key.table_width);
+        let pinned = self.prewarm_pins(&key);
         let ticket = graphs.borrow_mut().cache_miss(&key, pinned, self.graph_estimate(&key));
         let crate::shared::decode_graph::device::Miss::Capture(ticket) = ticket else { return segment() };
         if self.graph_before.borrow().is_none() {

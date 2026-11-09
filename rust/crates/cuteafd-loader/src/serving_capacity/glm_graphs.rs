@@ -1,7 +1,42 @@
 //! GLM owned-attention captures: one census for warm-up, replay and admission.
 use super::{glm_decode_row_buckets, glm_decode_table_widths};
+use crate::families::glm5::GlmVariant;
 use crate::placement::attention::AttentionPlacement;
 use crate::placement::inventory::DeclaredGraphSet;
+
+/// Which checkpoint's trace-derived startup work a glm5-engine layout uses.
+/// Both are served by the same engine, but they do not capture the same graphs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlmPrewarmFamily {
+    /// GLM 5.x: one list covers every layout it ships.
+    Glm5,
+    /// Mistral Large 4: one and two coordinator ranks resolve different
+    /// attention placements (heads, then page-partitioned context), so each
+    /// layout has its own traced list.
+    MistralLarge4,
+}
+
+impl GlmPrewarmFamily {
+    pub fn of(variant: &GlmVariant) -> Self {
+        if variant.is_glm() { Self::Glm5 } else { Self::MistralLarge4 }
+    }
+    /// The list's `family` identity.
+    pub fn name(self) -> &'static str {
+        match self { Self::Glm5 => "glm5", Self::MistralLarge4 => "mistral_large4" }
+    }
+    /// The coordinator layout this checkpoint's list is keyed by, if any.
+    /// GLM shares one list; Mistral Large 4 keys it by rank count.
+    fn layout(self, ranks: usize) -> Option<usize> {
+        match self { Self::Glm5 => None, Self::MistralLarge4 => Some(ranks.clamp(1, 2)) }
+    }
+}
+
+/// The width one rank's graph key carries for a step built with `table_width`.
+/// Checked-in entries store the width a step is built with; under the context
+/// placement each rank captures its half table (the engine's `rank_tables`).
+pub fn prewarm_key_width(table_width: usize, context: bool) -> usize {
+    if context { table_width.div_ceil(2) } else { table_width }
+}
 
 /// What precedes a captured decode segment's residual norm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
@@ -145,22 +180,67 @@ pub struct GlmPrewarmEntry {
 pub struct GlmPrewarmList {
     pub schema_version: u32,
     pub family: String,
+    /// The coordinator layout the list was traced on; absent when a family's
+    /// layouts share one list.
+    #[serde(default)]
+    pub layout: Option<usize>,
     pub reserve_base_bytes: u64,
     pub reserve_extra_bytes: u64,
     pub entries: Vec<GlmPrewarmEntry>,
 }
 
-pub fn glm_prewarm_list() -> GlmPrewarmList {
-    let list: GlmPrewarmList = serde_json::from_str(include_str!("glm_prewarm.json"))
-        .expect("checked-in GLM prewarm list");
-    assert_eq!(list.schema_version, 1);
-    assert_eq!(list.family, "glm5");
+fn checked_in(source: &str, family: GlmPrewarmFamily, layout: Option<usize>) -> GlmPrewarmList {
+    let list: GlmPrewarmList = serde_json::from_str(source)
+        .unwrap_or_else(|error| panic!("checked-in {} prewarm list: {error}", family.name()));
+    assert_eq!(list.schema_version, 1, "{} prewarm schema", family.name());
+    assert_eq!(list.family, family.name(), "prewarm family mismatch");
+    assert_eq!(list.layout, layout, "{} prewarm layout mismatch", family.name());
     list
 }
 
-pub fn glm_prewarm_shapes(context: usize, pool_pages: usize) -> Vec<GlmPrewarmEntry> {
+/// GLM 5.3's list, measured on its 1-RTX/4-Spark EXL3 baseline plus the
+/// C1/2/4/8/16 sweep (FANOUT.md).
+pub fn glm_prewarm_list() -> &'static GlmPrewarmList {
+    static LIST: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| checked_in(include_str!("glm_prewarm.json"), GlmPrewarmFamily::Glm5, None))
+}
+
+/// Mistral Large 4's list for the resolved coordinator layout. One rank runs
+/// head-split attention and captures no peer segment; two ranks run the
+/// context placement, which adds rank-1 segments and halves each table width.
+///
+/// Each list was traced on its own card (1 rank + 5 Sparks, 2 ranks + 6
+/// Sparks) at KV target 2M / max 100M with the C1/2/4/8/16 sweep and the 32K
+/// shared-prefix point. `reserve_base_bytes` is that layout's measured arena
+/// high-water (the larger device under the context placement); `reserve_extra`
+/// is its largest measured boundary capture, one 2 MiB chunk. Neither trace
+/// evicted or recaptured a graph, so the only pin is the C1 decode geometry
+/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm.json`.
+pub fn ml4_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
+    static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    let family = GlmPrewarmFamily::MistralLarge4;
+    if ranks <= 1 {
+        ONE.get_or_init(|| checked_in(include_str!("ml4_prewarm_1.json"), family, Some(1)))
+    } else {
+        TWO.get_or_init(|| checked_in(include_str!("ml4_prewarm_2.json"), family, Some(2)))
+    }
+}
+
+/// The checked-in list a resolved glm5-engine layout uses.
+pub fn glm_prewarm(family: GlmPrewarmFamily, ranks: usize) -> &'static GlmPrewarmList {
+    match family {
+        GlmPrewarmFamily::Glm5 => glm_prewarm_list(),
+        GlmPrewarmFamily::MistralLarge4 => ml4_prewarm_list(ranks),
+    }
+}
+
+/// Entries hold the width a step is built with, so they filter against the
+/// engine's table-width buckets unchanged in both placements.
+pub fn glm_prewarm_shapes(family: GlmPrewarmFamily, ranks: usize, context: usize,
+    pool_pages: usize) -> Vec<GlmPrewarmEntry> {
     let allowed = glm_graph_shapes(context, pool_pages);
-    glm_prewarm_list().entries.into_iter().filter(|entry| allowed.contains(&entry.shape)).collect()
+    glm_prewarm(family, ranks).entries.iter().filter(|entry| allowed.contains(&entry.shape)).cloned().collect()
 }
 
 #[cfg(test)]
@@ -185,7 +265,49 @@ mod tests {
         assert_eq!(list.reserve_base_bytes + list.reserve_extra_bytes, 1_191_182_336);
         let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
         let allowed = glm_graph_shapes(4096, 32);
-        for entry in glm_prewarm_shapes(4096, 32) { assert!(allowed.contains(&entry.shape)); }
+        for entry in glm_prewarm_shapes(GlmPrewarmFamily::Glm5, 1, 4096, 32) {
+            assert!(allowed.contains(&entry.shape));
+        }
+    }
+
+    #[test]
+    fn every_family_layout_selects_its_own_checked_in_list() {
+        let glm = glm_prewarm(GlmPrewarmFamily::Glm5, 1);
+        assert_eq!(glm.family, "glm5");
+        assert_eq!(glm.layout, None);
+        // GLM shares one list across its layouts.
+        assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::Glm5, 2), glm));
+        for layout in [1usize, 2] {
+            let list = glm_prewarm(GlmPrewarmFamily::MistralLarge4, layout);
+            assert_eq!(list.family, GlmPrewarmFamily::MistralLarge4.name());
+            assert_eq!(list.layout, Some(layout));
+            assert!(!list.entries.is_empty());
+            assert!(list.reserve_base_bytes > 0 && list.reserve_extra_bytes > 0);
+            // The ranks key selects by layout, not by an off-by-one count.
+            assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::MistralLarge4, layout), list));
+        }
+        assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::MistralLarge4, 0),
+            glm_prewarm(GlmPrewarmFamily::MistralLarge4, 1)));
+        let allowed = glm_graph_shapes(1 << 20, 16384);
+        let warmed = glm_prewarm_shapes(GlmPrewarmFamily::MistralLarge4, 2, 1 << 20, 16384);
+        assert!(!warmed.is_empty());
+        for entry in warmed {
+            assert!(allowed.contains(&entry.shape));
+        }
+        let one = glm_prewarm(GlmPrewarmFamily::MistralLarge4, 1);
+        let two = glm_prewarm(GlmPrewarmFamily::MistralLarge4, 2);
+        assert_eq!((one.reserve_base_bytes, one.reserve_extra_bytes), (713_031_680, 2_097_152));
+        assert_eq!((two.reserve_base_bytes, two.reserve_extra_bytes), (912_261_120, 2_097_152));
+        for list in [one, two] {
+            let pins: Vec<_> = list.entries.iter().filter(|entry| entry.pin).collect();
+            assert_eq!(pins.len(), 1, "{} layout {}", list.family, list.layout.unwrap());
+            assert_eq!(pins[0].shape, GlmGraphShape { rows: 1, table_width: 16 });
+        }
+        // Checked-in entries hold the width a step is built with; the context
+        // placement's per-rank key is its half table.
+        assert_eq!(prewarm_key_width(16, false), 16);
+        assert_eq!(prewarm_key_width(16, true), 8);
+        assert_eq!(prewarm_key_width(17, true), 9);
     }
 
     #[test]

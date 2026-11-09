@@ -1777,9 +1777,9 @@ impl Opened {
             .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
         engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
-                cuteafd_loader::placement::graph_reserve::glm_default().0,
-                cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;
+            let (base, extra) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE startup policy");
         }
         // Current startup shapes are a best-effort prewarm list. Admission keeps
@@ -1793,9 +1793,9 @@ impl Opened {
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
-                cuteafd_loader::placement::graph_reserve::glm_default().0,
-                cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;
+            let (base, extra) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE Ready summary");
         }
         engine.usage_active.set(true);

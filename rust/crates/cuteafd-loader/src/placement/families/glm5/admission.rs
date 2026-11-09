@@ -6,7 +6,8 @@ use crate::families::glm5::GlmDsaConfig;
 use crate::placement::inventory::{DeclaredGraphSet, FigureAttribution, FigureIdentity, MemoryFigure};
 use crate::placement::{AttentionPlacement, GraphRank, GraphSet, LayerMode, planner::*};
 use cuteafd_core::memory_layout::Basis;
-use crate::serving_capacity::glm_graphs::{GlmGraphKey, GlmGraphLayer, glm_declared_graphs, glm_graph_shapes};
+use crate::serving_capacity::glm_graphs::{GlmGraphKey, GlmGraphLayer, GlmPrewarmFamily,
+    glm_declared_graphs, glm_graph_shapes};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1100,7 +1101,8 @@ impl<'a> ProductionInput<'a> {
             }).collect::<Vec<_>>();
             let return_ranks = if self.skip_routed_experts { super::SKIP_RANKS as usize }
                 else if count < routed { self.spark_ranks } else { 0 };
-            recipe.graphs.push(Case { when, value: StartupGraphs::new(self.context,
+            recipe.graphs.push(Case { when, value: StartupGraphs::with_family(
+                GlmPrewarmFamily::of(&self.cfg.variant), self.context,
                 self.attention, self.gpus, &layers, return_ranks)? });
             local.insert(count, inventory);
         }
@@ -1719,6 +1721,7 @@ fn ordinary_heap_subset(component: &Component) -> bool {
 /// post-Ready reserve.
 #[derive(Debug, Clone)]
 pub struct StartupGraphs {
+    family: GlmPrewarmFamily,
     context: u64,
     shapes: u64,
     attention: AttentionPlacement,
@@ -1730,8 +1733,16 @@ pub struct StartupGraphs {
 }
 
 impl StartupGraphs {
+    /// GLM 5.3's own declared set and checked-in prewarm list.
     pub fn new(context: u64, attention: AttentionPlacement, gpus: usize,
         layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
+        Self::with_family(GlmPrewarmFamily::Glm5, context, attention, gpus, layers, return_ranks)
+    }
+
+    /// A glm5-engine family's declared set; its reserve comes from that
+    /// family's list for this layout.
+    pub fn with_family(family: GlmPrewarmFamily, context: u64, attention: AttentionPlacement,
+        gpus: usize, layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
         if context == 0 { return Err(invalid("zero graph context")); }
         let extent = usize::try_from(context).map_err(|_| Refusal::Overflow("GLM graph context"))?;
         let shapes = glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize));
@@ -1757,7 +1768,7 @@ impl StartupGraphs {
                 "GLM startup graphs are admitted on estimated rows (#1605); no census covers this declared set: {}",
                 estimated.join("; ")));
         }
-        Ok(Self { context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
+        Ok(Self { family, context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
             declared, fingerprints, ranks, figures })
     }
 
@@ -1771,8 +1782,13 @@ impl StartupGraphs {
         GraphSet { ranks: self.ranks.clone(), lifetime: crate::placement::Lifetime::Startup, shapes: self.shapes }
     }
 
+    /// This layout's checked-in reserve before user overrides.
+    pub fn default_reserve(&self) -> (u64, u64) {
+        crate::placement::graph_reserve::glm_default(self.family, self.ranks.len())
+    }
+
     pub fn reserves(&self) -> Result<Vec<u64>, Refusal> {
-        let (base, extra) = crate::placement::graph_reserve::glm_default();
+        let (base, extra) = self.default_reserve();
         self.ranks.iter().enumerate().map(|(rank, _)| crate::placement::graph_reserve::current(
             rank, false, base, extra)
             .map(|reserve| reserve.bytes).map_err(Refusal::InvalidFact)).collect()
