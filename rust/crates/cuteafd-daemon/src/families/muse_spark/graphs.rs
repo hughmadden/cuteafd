@@ -89,6 +89,10 @@ impl<'a> Graphs<'a> {
         unsafe { self.device.library.cuda_graph_launch(raw, stream) }
     }
 
+    pub(crate) fn retains_rows(&self, rows: usize) -> bool {
+        self.bank.borrow().keys().iter().any(|key| key.rows == rows)
+    }
+
     pub(crate) fn needs_boundary(&self) -> bool { self.bank.borrow().cache_needs_boundary() }
     pub(crate) fn tick(&self) { self.bank.borrow_mut().cache_tick(); }
     pub(crate) fn visit(&self, visitor: &mut decode_graph::device::GraphVisitor<'_>) -> Result<()> {

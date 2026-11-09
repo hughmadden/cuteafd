@@ -230,6 +230,17 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         }) }
     }
 
+    pub(super) fn diagnostic_graph_width(&self) -> Option<usize> {
+        self.graph_enabled.get().then(|| self.draft.as_ref().map_or(0, |draft| draft.block - 1))
+    }
+
+    pub(super) fn diagnostic_require_graph_rows(&self, rows: usize) -> Result<()> {
+        ensure!(self.graph_enabled.get() && !self.graphs.is_empty()
+            && self.graphs.iter().all(|bank| bank.retains_rows(rows)),
+            "Muse graph oracle requires retained {rows}-row graphs on every rank; increase GPU_GRAPH_RESERVE");
+        Ok(())
+    }
+
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
 
     pub(super) fn diagnostic_sync(&self) -> Result<()> {

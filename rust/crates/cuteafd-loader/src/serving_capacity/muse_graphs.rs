@@ -54,7 +54,7 @@ pub fn policy(ranks: usize, sparks: bool, rank: usize) -> Result<crate::placemen
     crate::placement::graph_reserve::current(rank, false, base, tail)
 }
 
-pub fn selected(layout: &Layout, bases: &[u64]) -> Vec<&Entry> {
+pub fn selected<'a>(layout: &'a Layout, bases: &[u64]) -> Vec<&'a Entry> {
     let pins = layout.entries.iter().map(|entry| entry.pin).collect::<Vec<_>>();
     crate::placement::graph_reserve::prewarm_selection(&pins, bases, |indices, bases| {
         bases.iter().enumerate().all(|(rank, &base)| {
