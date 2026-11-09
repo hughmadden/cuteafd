@@ -1000,9 +1000,21 @@ mod tests {
             assert_eq!(runtime.tp2.unwrap().layers, 4);
             assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));
             for rank in 0..2 {
+                // TP2 samples free memory after the resident upload: the plan's
+                // `context+modules` bytes are what the runtime sees already
+                // occupied, and it charges them as one named owner at exactly
+                // those bytes. Every other runtime item is a plan item.
+                let sampled = layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
+                    .map(|item| item.bytes).sum::<u64>();
                 let planned = layout.devices[rank].items.iter().filter(|item| item.group != "context+modules")
                     .cloned().collect::<Vec<_>>();
-                assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
+                let mut actual = runtime.items[rank].clone();
+                let index = actual.iter().position(|item| item.group.starts_with("Qwen context and selected modules"))
+                    .unwrap_or_else(|| panic!("rank {rank}: no measured-occupancy owner in {actual:?}"));
+                let owner = actual.remove(index);
+                assert_eq!(owner.bytes, sampled,
+                    "rank {rank}: the owner charges the sampled bytes, not a second estimate");
+                assert_eq!(actual, planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
             }
         }
         std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
@@ -1077,9 +1089,22 @@ mod tests {
                     "the plan charges the graph reserve");
                 assert!(!device.items.iter().any(|item| item.group == "startup graphs"),
                     "the declared startup-graph owner is gone");
+                // The single-flavor sample is taken after the resident upload,
+                // so the whole measured occupancy is one named owner at the
+                // bytes the plan names for them; host embeddings are not mapped
+                // in this fixture (`QwenHost::ample` sets none). Every other
+                // runtime item is the plan's own item.
+                let mut measured = Vec::new();
                 for item in &placement.items[0] {
-                    assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
+                    if item.group.starts_with("Qwen context and selected modules") {
+                        measured.push(item);
+                    } else {
+                        assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
+                    }
                 }
+                assert_eq!(measured.len(), 1, "the sampled occupancy is one named owner");
+                assert_eq!(measured[0].bytes, baseline,
+                    "the owner charges the sampled bytes, not a second estimate");
             }
         }
         Ok(())
