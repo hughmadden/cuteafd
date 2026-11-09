@@ -80,6 +80,53 @@ int main() {
     assert ran.returncode == 0, ran.stderr
 
 
+def test_allocation_failure_format_preserves_original_error(tmp_path):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    source = tmp_path / "allocation_failure.cc"
+    source.write_text(r'''
+#include "memory_failure.h"
+#include <cassert>
+#include <limits>
+int main() {
+  cuteafd_allocation_diagnostics diagnostics;
+  diagnostics.device = 1;
+  diagnostics.free_bytes = 4096;
+  diagnostics.total_bytes = 98304;
+  const std::string original = "cudaErrorMemoryAllocation (out of memory)";
+  const auto format = [&](const char* owner) {
+    return cuteafd_format_allocation_failure("cudaMalloc failed", 8192, owner, original, diagnostics);
+  };
+  assert(format("kv/pages") == "cudaMalloc failed: cudaErrorMemoryAllocation (out of memory); "
+      "requested_bytes=8192; owner=kv/pages; device=1; free_bytes=4096; total_bytes=98304");
+  diagnostics.memory_error = "cudaErrorUnknown (unknown error)";
+  assert(format("weights/core") == "cudaMalloc failed: cudaErrorMemoryAllocation (out of memory); "
+      "requested_bytes=8192; owner=weights/core; device=1; free/total unavailable: cudaErrorUnknown (unknown error)");
+  diagnostics.device_error = "cudaErrorNoDevice (no CUDA-capable device is detected)";
+  const auto unavailable = format(nullptr);
+  assert(unavailable == "cudaMalloc failed: cudaErrorMemoryAllocation (out of memory); "
+      "requested_bytes=8192; owner=unavailable; device unavailable: cudaErrorNoDevice (no CUDA-capable device is detected); "
+      "free/total unavailable: cudaErrorUnknown (unknown error)");
+  assert(format("") == unavailable);
+  diagnostics.memory_error.clear();
+  assert(format("host/staging").find("free_bytes=4096; total_bytes=98304") != std::string::npos);
+  const size_t large = std::numeric_limits<size_t>::max();
+  const auto wide = cuteafd_format_allocation_failure("cudaHostAlloc failed", large, "transport/rings", original, diagnostics);
+  assert(wide.find("requested_bytes=" + std::to_string(large)) != std::string::npos);
+  assert(wide.find("cudaHostAlloc failed: " + original) == 0);
+}
+''')
+    executable = tmp_path / "allocation_failure"
+    built = subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                            "-I", str(ROOT / "native/shared/include"), str(source),
+                            str(ROOT / "native/shared/src/memory_failure.cc"), "-o", str(executable)],
+                           capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    ran = subprocess.run([str(executable)], capture_output=True, text=True)
+    assert ran.returncode == 0, ran.stderr
+
+
 def test_cmake_rejects_wrapped_source_without_real_callbacks(tmp_path):
     cmake = shutil.which("cmake")
     if not cmake:
