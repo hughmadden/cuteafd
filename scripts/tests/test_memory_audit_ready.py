@@ -323,8 +323,12 @@ def test_kimi_reconciliation_uses_shared_ready_first_request_and_stats_paths():
     assert 'memory_report::log("ready")' in (root / "families/kimi_k3/serve.rs").read_text()
     assert 'if stage == "ready" { reconcile::capture(&stage); }' in (root / "shared/memory_report.rs").read_text()
     scheduler = (root / "shared/qwen/scheduler.rs").read_text()
-    assert 'first_request(requests, &FIRST,' in scheduler
-    assert 'reconcile::capture("first_request")' in scheduler
+    hook = '''    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }'''
+    assert hook in scheduler
+    assert scheduler.count('reconcile::capture("first_request")') == 1
     assert 'memory_reconciliation' in (root / "shared/probe.rs").read_text()
 
 
