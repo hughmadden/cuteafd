@@ -45,6 +45,16 @@ pub fn variant(cfg: &Qwen35Config, fp8: bool, kv: Qwen4KvCache) -> String {
         if fp8 { "fp8" } else { "bf16" }, kv)
 }
 
+pub fn enabled() -> bool {
+    std::env::var("CUTEAFD_QWEN35_GRAPHS").ok().as_deref() == Some("1")
+}
+
+pub fn configured_reserve(variant: &str, enabled: bool) -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    if enabled { reserve(variant) } else {
+        crate::placement::graph_reserve::resolve_with_extra(Some("0"), None, None, 0, false, 0, 0)
+    }
+}
+
 pub fn layout(variant: &str) -> Option<&'static Layout> {
     prewarm().layouts.iter().find(|layout| layout.variant == variant)
 }

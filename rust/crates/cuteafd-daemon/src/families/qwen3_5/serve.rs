@@ -631,6 +631,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                     crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
+            resolved_prefill_settings(backend.geometry().prefill_rows).publish();
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, engine_args.draft_length, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
@@ -667,6 +668,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolved_prefill_settings(rows: usize) -> cuteafd_bench::context::ResolvedSettings {
+    cuteafd_bench::context::ResolvedSettings::default()
+        .value("prefill-rows", rows).value("prefill-units", rows)
+}
+
 fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::console::Layout> {
     use crate::shared::console;
     let mut layout = console::Layout::new("qwen3_5", model.into(), args.snapshot.clone());
@@ -696,6 +702,16 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn prefill_configuration_reports_the_resolved_native_chunk() {
+        for rows in [TAP_ROWS, 4096] {
+            let settings = super::resolved_prefill_settings(rows);
+            settings.assert_resolved();
+            assert_eq!(settings.0, vec![("prefill-rows".into(), rows.to_string()),
+                ("prefill-units".into(), rows.to_string())]);
+        }
     }
 
     #[test]
@@ -740,7 +756,7 @@ mod tests {
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
-                DenseFacts { graph_variant: "fixture".into(), cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
+                DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None,
                     blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;
             assert_eq!(admitted.request.context, requested_context);

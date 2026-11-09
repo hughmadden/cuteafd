@@ -27,7 +27,7 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { graph_variant: "fixture".into(), cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
+    DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
@@ -428,4 +428,10 @@ fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
     assert_eq!(graphs[0].name, "graph reserve");
     assert_eq!(graphs[0].bytes, crate::serving_capacity::qwen35_graphs::reserve("fixture").unwrap().bytes);
     assert!(graphs[0].bytes > 0);
+    let mut disabled = facts(&cfg, &weights, &buffers, &arena);
+    disabled.graphs_enabled = false;
+    let off = admit(request(), budgets(), disabled).unwrap();
+    assert!(!off.facts.allowances.iter().any(|allowance|
+        crate::placement::graph_reserve::is_source(&allowance.source)));
+    assert!(off.pool_tokens >= plan.pool_tokens);
 }

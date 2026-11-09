@@ -186,7 +186,7 @@ impl<'a> DenseEngine<'a> {
         let solve_started = std::time::Instant::now();
         let graph_variant = cuteafd_loader::serving_capacity::qwen35_graphs::variant(&cfg, format.fp8(), kv_format);
         let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
-            graph_variant: graph_variant.clone(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
+            graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),

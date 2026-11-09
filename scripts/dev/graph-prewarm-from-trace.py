@@ -1611,7 +1611,9 @@ def generate_qwen35(traces, variant):
             key = (int(rows), int(stride), spec == "true")
             if not 1 <= key[0] <= 64 or key[1] < 1 or key[1] & (key[1] - 1):
                 raise ValueError(f"invalid dense Qwen geometry: {key}")
-            if int(graph.get("nodes", 0)) < 2:
+            if graph.get("nodes") is None and not graph.get("captures", 0) and not graph.get("hits", 0):
+                continue  # A denied cold miss has no executable topology or capture share.
+            if graph.get("nodes") is None or int(graph["nodes"]) < 2:
                 raise ValueError("dense Qwen must not retain singleton/unknown graphs")
             identity = (graph.get("bank", 0), graph.get("key_id", graph["shape"]))
             identities[identity] = (key, graph)

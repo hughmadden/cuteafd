@@ -180,6 +180,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let targets: Vec<_> = positions.iter().map(|&p| tokens[p]).collect();
     let nll = scored_nll(&ours, &targets, cfg.vocab)?;
     let reference_nll = scored_nll(&theirs, &targets, cfg.vocab)?;
+    if let Some((off, on)) = engine.golden_decode_graphs(&tokens, &positions, args.prefill_chunk)? {
+        let off_nll = scored_nll(&off, &targets, cfg.vocab)?;
+        let on_nll = scored_nll(&on, &targets, cfg.vocab)?;
+        ensure!(off_nll.to_bits() == on_nll.to_bits(), "dense graph-on/off NLL differs");
+        println!("dense graph NLL: off {off_nll:.8}, on {on_nll:.8}, evaluate {nll:.8}, reference {reference_nll:.8}; decode minus evaluate {:.8}", off_nll - nll);
+        ensure!((on_nll - reference_nll).abs() <= args.nll_tolerance,
+            "dense graph decode NLL differs from reference by {:.8}", on_nll - reference_nll);
+    }
     let (mean_kl, max_kl) = scored_kl(&theirs, &ours, cfg.vocab)?;
     let argmax = |row: &[f32]| row.iter().enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0))).unwrap().0;

@@ -30,6 +30,7 @@ impl ServingFacts {
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
     pub graph_variant: String,
+    pub graphs_enabled: bool,
     pub weights: &'a NativeWeights,
     pub target_arena: &'a crate::serving_capacity::WeightArenaLayout,
     pub buffers: &'a NativeBuffers,
@@ -369,7 +370,7 @@ impl DenseFacts<'_> {
         // time; every device byte is a named owner above.
         let mut allowances = vec![
             Allowance { location: gpu,
-                bytes: crate::serving_capacity::qwen35_graphs::reserve(&self.graph_variant)
+                bytes: crate::serving_capacity::qwen35_graphs::configured_reserve(&self.graph_variant, self.graphs_enabled)
                     .map_err(|error| Refusal::InvalidFact(error.to_string()))?.bytes,
                 lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
                 source: crate::placement::graph_reserve::source("qwen3_5.graphs.0"),

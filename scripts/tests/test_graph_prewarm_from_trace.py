@@ -1673,6 +1673,11 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
     # Every selected sibling is charged, including the zero-hit sibling.
     data["graphs"][1]["capture_bytes"] = 3 << 20
     assert MODULE.generate_qwen35([data], layout["variant"])["layouts"][0]["reserve_base_bytes"] == 4 << 20
+    cold = graph(0, 16, 64, True, 0)
+    cold.update(nodes=None, capture_bytes=None, captures=0)
+    data["graphs"].append(cold)
+    assert MODULE.generate_qwen35([data], layout["variant"]) == MODULE.generate_qwen35(
+        [{**data, "graphs": data["graphs"][:-1]}], layout["variant"])
     data["graphs"][0]["nodes"] = 1
     with pytest.raises(ValueError, match="singleton"):
         MODULE.generate_qwen35([data], layout["variant"])

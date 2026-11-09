@@ -368,7 +368,7 @@ impl<'a> DenseEngine<'a> {
     fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.healthy = false;
         self.graphs.cycle(speculative);
-        if plan.stride > 0 {
+        if self.graphs.enabled && plan.stride > 0 {
             let stride = plan.stride.next_power_of_two().min(self.cfg.max_context.div_ceil(64));
             if stride != plan.stride {
                 let mut pages = Vec::with_capacity(plan.tokens.len() * stride);

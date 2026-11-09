@@ -1,9 +1,9 @@
 //! Captures borrow only engine-owned weights, state and planes. Uploads and tap
 //! scatters remain ordered eager work outside each complete layer segment.
 use super::*;
-use crate::shared::decode_graph::{GraphBank, device::{self, Basis, Cycle, Preference, Site}};
+use crate::shared::decode_graph::{GraphBank, GraphOwner, device::{self, Basis, Cycle, Preference, Site}};
 use cuteafd_loader::serving_capacity::qwen35_graphs::{self, Geometry};
-use std::{cell::RefCell, ffi::c_void};
+use std::cell::RefCell;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Key {
@@ -13,25 +13,20 @@ pub(super) struct Key {
     spec: bool,
 }
 
-pub(super) struct Executable<'a>(*mut c_void, Device<'a>);
-impl Drop for Executable<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the owning engine drains before this bank or any backing drops.
-        let _ = self.1.run(|| unsafe { self.1.library.cuda_graph_exec_destroy(self.0) });
-    }
-}
+type Executable<'a> = GraphOwner<'a, ()>;
 
 pub(super) struct Graphs<'a> {
     bank: RefCell<GraphBank<Key, Executable<'a>>>,
     variant: String,
-    enabled: bool,
+    pub(super) enabled: bool,
     capture_ready: std::cell::Cell<bool>,
     warming: std::cell::Cell<bool>,
 }
 
 impl<'a> Graphs<'a> {
     pub(super) fn new(device: Device<'a>, variant: String) -> Result<Self> {
-        let reserve = qwen35_graphs::reserve(&variant)?;
+        let enabled = qwen35_graphs::enabled();
+        let reserve = qwen35_graphs::configured_reserve(&variant, enabled)?;
         let mut bank = GraphBank::new(None);
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "qwen3_5.segment", cycle: Cycle::Other, preference: Preference::Adaptive,
@@ -44,7 +39,7 @@ impl<'a> Graphs<'a> {
             tracing::warn!(%variant, "Dense Qwen layout has no trace: bootstrap is unpinned");
         }
         Ok(Self { bank: RefCell::new(bank), variant,
-            enabled: std::env::var("CUTEAFD_QWEN35_GRAPHS").ok().as_deref() == Some("1"),
+            enabled,
             capture_ready: std::cell::Cell::new(false), warming: std::cell::Cell::new(false) })
     }
 
@@ -65,7 +60,7 @@ impl DenseEngine<'_> {
         if !self.graphs.enabled || !self.graphs.capture_ready.get() { return segment(); }
         let key = Key { segment: index, rows: step.rows, table_stride: step.table_stride, spec: step.speculative };
         let library = self.stream.device.library;
-        if let Some(raw) = self.graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.0) {
+        if let Some(raw) = self.graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw) {
             // SAFETY: all captured pointers retain the same engine-owned backing.
             return unsafe { library.cuda_graph_launch(raw, self.stream.raw) };
         }
@@ -99,7 +94,8 @@ impl DenseEngine<'_> {
                 return segment();
             }
         };
-        let exec = Executable(raw, self.stream.device);
+        // SAFETY: engine field order drains the stream, then drops graphs before backing.
+        let exec = unsafe { GraphOwner::new(library, self.stream.device.id, raw, ())? };
         // Unknown topology or a singleton is not useful enough to retain.
         if inspection.is_some() || nodes < 2 {
             drop(exec);
@@ -121,6 +117,53 @@ impl DenseEngine<'_> {
         // backing, and persistent weights/state/planes outlive every executable.
         unsafe { device::observe_completed(self.stream.device.library, |visit|
             visit(self.stream.device.id, "qwen3_5.segment", false, &mut *self.graphs.bank.borrow_mut())) }
+    }
+
+    /// Qualification only: compare identical decode shapes without changing the
+    /// eager evaluate path or rebuilding the engine's captured backing.
+    pub(super) fn golden_decode_graphs(&mut self, tokens: &[u32], positions: &[usize], chunk: usize)
+        -> Result<Option<(Vec<f32>, Vec<f32>)>> {
+        use crate::shared::speculation::target::{VerifyRequest, VerifyRow};
+        use sha2::{Digest, Sha256};
+        if !self.graphs.enabled { return Ok(None); }
+        let ready = self.graphs.capture_ready.get();
+        let before = device::snapshots().iter().filter(|row| row.device == self.stream.device.id)
+            .flat_map(|row| row.cycles.values()).map(|cycle| cycle.hits).sum::<u64>();
+        let mut score = |capturing: bool| -> Result<(Vec<f32>, Vec<u8>)> {
+            self.reset_slot(0)?;
+            self.graphs.capture_ready.set(capturing);
+            let mut selected = Vec::with_capacity(positions.len() * self.cfg.vocab);
+            let mut digest = Sha256::new();
+            let mut first = 0;
+            for tokens in tokens.chunks(chunk.min(64)) {
+                let rows = tokens.iter().enumerate().map(|(offset, &token)| VerifyRow {
+                    slot: 0, position: first + offset, token: Some(token) }).collect::<Vec<_>>();
+                let logits = self.decode_device(&[0], VerifyRequest { rows: &rows, tap_layers: &[] })?
+                    .to_host(self.stream.device.library)?;
+                for value in &logits { digest.update(value.to_le_bytes()); }
+                for &position in positions.iter().filter(|&&p| p > first && p <= first + tokens.len()) {
+                    let row = position - first - 1;
+                    selected.extend_from_slice(&logits[row * self.cfg.vocab..(row + 1) * self.cfg.vocab]);
+                }
+                first += tokens.len();
+            }
+            Ok((selected, digest.finalize().to_vec()))
+        };
+        let result: Result<(Vec<f32>, Vec<f32>)> = (|| {
+            let (off, off_digest) = score(false)?;
+            let (on, on_digest) = score(true)?;
+            ensure!(off_digest == on_digest, "dense graph-on/off decode logits are not byte-identical");
+            Ok((off, on))
+        })();
+        self.graphs.capture_ready.set(ready);
+        let (off, on) = result?;
+        let after = device::snapshots().iter().filter(|row| row.device == self.stream.device.id)
+            .flat_map(|row| row.cycles.values()).map(|cycle| cycle.hits).sum::<u64>();
+        ensure!(after > before, "dense graph golden did not replay any executable");
+        println!("dense graph decode: byte-identical on/off logits over {} rows; {} replay hits",
+            tokens.len(), after - before);
+        self.reset_slot(0)?;
+        Ok(Some((off, on)))
     }
 
     pub(crate) fn warm_decode_graphs(&mut self) -> Result<()> {

@@ -2516,6 +2516,13 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
+  if [[ "$family" == qwen3_5 ]]; then
+    case "$(get DECODE_GRAPHS off)" in
+      on) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
+      off) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
+      *) release_die "DECODE_GRAPHS must be on or off" ;;
+    esac
+  fi
   if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue

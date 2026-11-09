@@ -294,7 +294,7 @@ mod tests {
                 prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
                 spark_reply_formats: Default::default() };
             let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
-                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), cfg: &cfg, weights: &weights,
+                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
                 target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 1024, drafter: Some(draft),
                 blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
                 serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
@@ -404,7 +404,7 @@ mod tests {
                 prefill: Pin::Auto, operation: Operation::Serving, resident_weight_limit: None,
                 spark_reply_formats: Default::default() };
             let plan = qwen3_5::admit(request, qwen3_5::forecast_budgets(&cuteafd_loader::placement::ARCH_CONTEXTS[1],
-                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), cfg: &cfg, weights: &weights,
+                96 << 30, 0, (128 << 30, 128 << 30))?, DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights,
                 target_arena: &target, buffers: &buffers, slots: 1, record_bytes: 4096, drafter,
                 blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
                 serving: None, host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners {
