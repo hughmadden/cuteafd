@@ -369,6 +369,9 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
         raise ValueError(f"{shape} needs {owners} device traces, found {devices}")
     # Frequency and heat use only each device's latest complete inventory:
     # identities missing from it have been forgotten and must not survive.
+    # Only replayed graphs rank the working set: a startup capture is an event
+    # (and a miss), never demand, so a zero-hit bootstrap shape can never be
+    # selected (#1652).
     for device, (_, trace) in latest.items():
         for graph in trace["graphs"]:
             if not graph["site"].startswith("qwen4."):
@@ -381,21 +384,16 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
                                     and graph.get("capture_bytes") is not None):
                 identities[identity] = (geometry, graph)
             cycles = graph.get("cycles")
-            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
-                if cycles is not None else int(graph["count"])
-            if count <= 0:
-                continue
+            replay = graph.get("hits")
+            if replay is None:
+                replay = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+                          if cycles is not None else int(graph["count"])) - int(graph.get("misses", 0))
             # Every layer segment runs once per decode step: rank a shape by its
             # busiest segment rather than summing all of them.
-            counts[geometry] = max(counts.get(geometry, 0), count)
-            identity = (device, graph["site"], graph.get("bank", 0),
-                        graph.get("key_id", graph["shape"]))
-            previous = identities.get(identity)
-            if previous is None or (previous[1].get("capture_bytes") is None
-                                    and graph.get("capture_bytes") is not None):
-                identities[identity] = (geometry, graph)
+            if int(replay) > 0:
+                counts[geometry] = max(counts.get(geometry, 0), int(replay))
     if not counts:
-        raise ValueError("trace contains no matching graph identities")
+        raise ValueError("trace records no replayed graph identities")
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):

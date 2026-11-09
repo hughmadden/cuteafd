@@ -497,6 +497,28 @@ def test_qwen_base_ignores_charged_and_counts_startup_only_siblings():
     assert MODULE.generate_qwen([loud], "single_0spark", coverage=0.99)["reserve_base_bytes"] == [4 << 20]
 
 
+def test_qwen_zero_hit_bootstrap_shapes_are_never_selected():
+    # The provisional startup set captures many shapes the traffic never
+    # replays. A startup capture is a miss and an event, never demand: ranking
+    # by replay hits keeps every zero-hit shape out of the list (#1652), even
+    # though their captured bytes are real.
+    data = qwen_trace()
+    hot = data["graphs"][0]
+    hot["hits"] = 100
+    cold = []
+    for segment in range(1, 12):
+        graph = dict(data["graphs"][1])
+        graph.update(key_id=segment, hits=0, count=1, misses=1, cycles={"decode": 1},
+                     capture_bytes=1 << 20, shape=qwen_identity(segment, rows=4))
+        cold.append(graph)
+    data["graphs"] = [hot] + cold
+    result = MODULE.generate_qwen([data], "single_0spark")
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 64,
+         "page_stride": 64, "pool_stride": 128, "pin": False}]
+    assert result["reserve_base_bytes"] == [2 << 20]
+
+
 def test_qwen_selected_identity_without_a_measured_share_fails():
     data = qwen_trace()
     data["graphs"][1]["capture_bytes"] = None
