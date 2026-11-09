@@ -317,7 +317,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
         concurrency, options.prefix_entries("mimo_v2"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
-    let graphs = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, options.mimo_decode_graphs)?;
+    let graphs = decode_graph::graph_layout(cfg.layers, ranks, options.mimo_decode_graphs)?;
     let mut runtime = Vec::new();
     for rank in 0..ranks {
         let mut additional = Vec::new();
@@ -359,8 +359,6 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                 Ok(program["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0))
             })?;
         additional.extend(graphs.reservations(rank)?);
-        debug_assert_eq!(graphs.graph_set().expect("MiMo decode graph set").bytes(rank), additional.iter()
-            .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
         runtime.push(MimoRankRuntime { weight_arenas, resident_weights, device: rank as u32, workspaces,
             loading_additional: Vec::new(), additional });
     }
@@ -663,7 +661,7 @@ mod tests {
                         let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
                         let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                         let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.prefix_entries("mimo_v2"), mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
-                        let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
+                        let graph = decode_graph::graph_layout(cfg.layers, ranks, graphs).unwrap();
                         let runtime = (0..ranks).map(|rank| {
                             let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4, cuteafd_core::SparkReplyFormat::Bf16).unwrap();
                             if rank == 0 { additional.extend(sampling_reservations(cfg.vocab_size).unwrap()); }

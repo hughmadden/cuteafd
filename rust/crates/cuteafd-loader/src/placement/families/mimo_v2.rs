@@ -19,6 +19,7 @@ pub fn reservation_category(name: &str) -> Category {
     else if name.starts_with("transport.") { Category::Transport }
     else if name.starts_with("prefix.") { Category::Prefix }
     else if name.starts_with("state.") || name.starts_with("context.") { Category::Kv }
+    else if name == "graph reserve" { Category::Runtime }
     else if name == "experts.local_scratch" { Category::Workspace }
     else if name.starts_with("experts.") { Category::Experts }
     else if name.starts_with("runtime.") || name.starts_with("graphs.") { Category::Runtime }

@@ -64,6 +64,7 @@ pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
 pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod v41_graphs;
+pub mod mimo_graphs;
 pub mod glm_graph_nodes;
 pub mod glmf_graphs;
 mod glmf_workspace;
@@ -261,6 +262,8 @@ pub enum CacheGeometryError {
         family: &'static str,
         what: &'static str,
     },
+    #[error("graph reserve: {0}")]
+    GraphReserve(String),
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
