@@ -210,6 +210,7 @@ mod tests {
             half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2,
             whole_supported: true, spark_ok: true };
         admission::ProductionInput {
+            startup_probe_bytes: 64 << 20,
             expert_usage: false,
             blas_head: crate::placement::planner::serving::BlasHead::Native, draft_head: false,
             cfg, layers: 4, kv: MimoKvFormats::default(), mtp_stages: 0, context,
@@ -232,6 +233,85 @@ mod tests {
                 &[0; 2][..ranks], vec![crate::placement::planner::Baseline::Forecast {
                     occupied: 0, source: "unit test".into(), assumed: false }; ranks],
                 (128 << 30, 128 << 30), 108 << 30, 6).unwrap(),
+        }
+    }
+
+    #[test]
+    fn measured_context_is_named_once_without_reducing_capacity_twice() {
+        use crate::placement::planner::{Baseline, Location, Operation, Phase};
+        for ranks in [1, 2] {
+            let (cfg, spark, no_spark) = fixture(ranks, 4096);
+            let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+            let occupancy = 686_424_064;
+            let before = facts.budgets[0].available().unwrap();
+            for budget in facts.budgets.iter_mut().take(ranks) {
+                budget.baseline = Baseline::Sampled { free: budget.physical_bytes - occupancy,
+                    phase: Phase::Load, source: "post-module test sample".into() };
+            }
+            let prepared = facts.prepare().unwrap();
+            for budget in prepared.budgets.iter().take(ranks) {
+                assert_eq!(budget.available().unwrap(), before);
+                assert!(matches!(budget.baseline, Baseline::Forecast { occupied: 0, .. }));
+            }
+            let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+            let admitted = prepared.admit(request).unwrap();
+            let capacity = admission::resolved_capacity(&admitted, 1, 1).unwrap();
+            for rank in 0..ranks {
+                let location = Location::coordinator(rank as u8);
+                for phase in [Phase::Load, Phase::Warmup, Phase::Ready, Phase::Growth] {
+                    let items = admitted.solved.items_at(location, phase).unwrap();
+                    let owners = items.iter().filter(|item| item.group.starts_with("MiMo context and selected modules:")).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, occupancy);
+                }
+                let receipt = &capacity.devices[rank];
+                assert_eq!(receipt.non_engine_bytes, 0);
+                assert_eq!(receipt.reservations.iter().filter(|item|
+                    item.name.starts_with("MiMo context and selected modules:")).map(|item| item.bytes).sum::<u64>(), occupancy);
+                assert_eq!(receipt.engine_budget_bytes, before);
+            }
+            // Offline forecasts are already itemized outside the recipe.
+            let mut offline = input(&cfg, &spark, &no_spark, ranks, 4096);
+            offline.budgets[0].baseline = Baseline::Forecast { occupied: occupancy,
+                source: "retained context/media items".into(), assumed: false };
+            let prepared = offline.prepare().unwrap();
+            assert!(prepared.recipe.context_owners.is_empty());
+            assert_eq!(prepared.budgets[0].available().unwrap(), before - occupancy);
+        }
+    }
+
+    #[test]
+    fn intake_probe_is_startup_only_and_lazy_prefill_still_publishes() {
+        use crate::placement::planner::{Location, Operation, Phase};
+        for ranks in [1, 2] {
+            let (cfg, mut spark, mut no_spark) = fixture(ranks, 4096);
+            for profile in [&mut spark, &mut no_spark] {
+                for costs in &mut profile.devices {
+                    costs.reservations.push(MemoryReservation { name: "prefill.test".into(), bytes: 128 << 20 });
+                    costs.reservations.push(MemoryReservation { name: "state.prefill_kv_wide".into(), bytes: 256 << 20 });
+                }
+            }
+            let prepared = input(&cfg, &spark, &no_spark, ranks, 4096).prepare().unwrap();
+            for onboard in [0, 3] {
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(onboard),
+                    prepared.recipe.prefill, Operation::Serving, ResidentWeights(u64::MAX), Default::default());
+                let admitted = prepared.admit(request).unwrap();
+                for rank in 0..ranks {
+                    for phase in [Phase::Warmup, Phase::Ready, Phase::Growth] {
+                        let items = admitted.solved.items_at(Location::coordinator(rank as u8), phase).unwrap();
+                        let probe = items.iter().filter(|item| item.group == "MiMo startup intake probe").map(|item| item.bytes).sum::<u64>();
+                        assert_eq!(probe, if phase == Phase::Warmup && onboard == 0 && rank == 0 { 64 << 20 } else { 0 });
+                        let prefill = items.iter().filter(|item| item.group == "prefill.test" || item.group == "state.prefill_kv_wide")
+                            .map(|item| item.bytes).sum::<u64>();
+                        assert_eq!(prefill, if phase == Phase::Growth { 384 << 20 } else { 0 });
+                    }
+                    let items = &admitted.placement.items[rank];
+                    assert!(!items.iter().any(|item| item.group == "MiMo startup intake probe"));
+                    assert_eq!(items.iter().filter(|item| item.group == "prefill.test").count(), 1);
+                    assert_eq!(items.iter().filter(|item| item.group == "state.prefill_kv_wide").count(), 1);
+                }
+            }
         }
     }
 

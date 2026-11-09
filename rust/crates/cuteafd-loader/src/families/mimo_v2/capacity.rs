@@ -308,7 +308,8 @@ pub fn mimo_capacity_profiles(
             costs.extend(kv_shadow.workspace_reservations(name, &layout, *workspace)?);
             // The allocator uses max(256, pages * table_rows * 4). Reserving
             // the fixed minimum plus its linear term is safe at every pool
-            // size, overcounting by at most 256 bytes per workspace.
+            // size, overcounting by at most the zero-page minimum (256 bytes
+            // for decode, waves * 256 bytes for prefill).
             let table_rows = if workspace.decode { workspace.rows } else { workspace.waves };
             unit_bytes = add(
                 "MiMo workspace pool tables",
@@ -615,6 +616,64 @@ mod tests {
                 predicted - actual_workspaces - records <= 2 * 256,
                 "pages={pages}"
             );
+        }
+    }
+
+    #[test]
+    fn flash_and_pro_workspace_owners_match_runtime_layout_at_live_shapes() {
+        use crate::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
+        use crate::plan::testing::{mimo_pro_config, mimo_pro_tensors};
+        for pro in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            write_snapshot(dir.path(), &if pro { mimo_pro_config() } else { mimo_flash_config() },
+                &if pro { mimo_pro_tensors() } else { mimo_flash_tensors() }, Some(if pro { 8 } else { 1 }));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let cfg = MimoV2Config::from_hf(&checkpoint.config).unwrap();
+            for ranks in [1, 2] {
+                for (rows, waves) in [(2048, 4), (2752, 3), (4096, 2)] {
+                    let mut options = options(ranks);
+                    for runtime in &mut options.ranks {
+                        runtime.workspaces[0].1.rows = rows;
+                        runtime.workspaces[0].1.waves = waves;
+                        runtime.workspaces[0].1.prefill_output = MimoPrefillOutput::LastRow;
+                    }
+                    let profile = mimo_capacity_profiles(&checkpoint, &cfg, weights(ranks), &options).unwrap().steady;
+                    let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, 2, ranks, options.kv_cache, 0).unwrap();
+                    for rank in 0..ranks {
+                        let admitted = &profile.devices[rank];
+                        let fixed = admitted.reservations.iter().filter(|r|
+                            r.name.starts_with("prefill.") || r.name.starts_with("decode.") || r.name == "state.prefill_kv_wide")
+                            .map(|r| r.bytes).sum::<u64>();
+                        let records = cache.ranks[rank].persistent_unit_bytes + cache.ranks[rank].pool_metadata_unit_bytes;
+                        let table_unit = admitted.pool_unit_bytes - records;
+                        for pages in [0, 1, 7, 64, 4096, 16384] {
+                            let mut shadow = MimoPrefillKvShadowPlan::default();
+                            let mut runtime = Vec::new();
+                            let mut minimums = 0;
+                            let mut tables = 0;
+                            for (name, shape) in &options.ranks[rank].workspaces {
+                                let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { pool_pages: pages, ..*shape }).unwrap();
+                                let zero = MimoWorkspaceLayout::new(&cfg, *shape).unwrap();
+                                minimums += zero.page_table;
+                                tables += layout.page_table;
+                                runtime.extend(shadow.workspace_reservations(name, &layout, *shape).unwrap());
+                            }
+                            runtime.extend(shadow.reservation());
+                            let actual = runtime.iter().map(|r| r.bytes).sum::<u64>();
+                            // The affine receipt retains each zero-page table minimum.
+                            let placeholder_overlap = minimums + pages * table_unit - tables;
+                            assert_eq!(fixed + pages * table_unit, actual + placeholder_overlap,
+                                "pro={pro} ranks={ranks} rank={rank} rows={rows} waves={waves} pages={pages}");
+                            assert!(placeholder_overlap <= minimums);
+                            assert_eq!(runtime.iter().filter(|r| r.name == "state.prefill_kv_wide").count(), 1);
+                            for owner in runtime.iter().filter(|r| !r.name.ends_with(".page_table")) {
+                                let receipt = admitted.reservations.iter().find(|r| r.name == owner.name).unwrap();
+                                assert_eq!(receipt.bytes, owner.bytes, "{}", owner.name);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

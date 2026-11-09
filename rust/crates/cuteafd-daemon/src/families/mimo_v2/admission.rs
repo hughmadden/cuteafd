@@ -517,7 +517,7 @@ fn preflight_shape(
     let operation = if args.full_prefill_logits { Operation::Scoring } else { Operation::Serving };
     let budgets = contract::production_budgets(
         &memory.iter().map(|sample| (sample.total_bytes, sample.total_bytes)).collect::<Vec<_>>(),
-        &(0..memory.len()).map(|rank| contract::device_headroom(rank, intake_probe_bytes)).collect::<Vec<_>>(),
+        &(0..memory.len()).map(|_| contract::device_headroom()).collect::<Vec<_>>(),
         memory.iter().map(|sample| Baseline::Sampled {
             free: sample.baseline_free_bytes, phase: Phase::Load,
             source: "measured post-module free memory".into() }).collect(),
@@ -528,6 +528,7 @@ fn preflight_shape(
         args.onboard.resolve(routed_layers), prefill, operation,
         crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
     let prepared = ProductionInput {
+        startup_probe_bytes: intake_probe_bytes,
         expert_usage: args.expert_usage_enabled()?,
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(
             opened.weight_formats.head == cuteafd_loader::families::mimo_v2::projection::MimoProjectionRepresentation::Bf16),
@@ -635,8 +636,7 @@ fn reservation_report(
             .total_bytes
             .checked_sub(sample.baseline_free_bytes)
             .context("invalid physical GPU memory sample")?;
-        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom(
-            usize::try_from(costs.device).unwrap_or(usize::MAX), 0);
+        let minimum_free = cuteafd_loader::placement::families::mimo_v2::admission::device_headroom();
         let budget = sample.total_bytes.saturating_sub(minimum_free).saturating_sub(non_engine);
         let mut fixed = std::collections::BTreeMap::<&str, u64>::new();
         for cost in &costs.reservations {

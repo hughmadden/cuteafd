@@ -554,7 +554,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         else { EmbeddingHome::Device(0) };
     let budgets = admission::production_budgets(
         &options.rtx_bytes[..ranks].iter().map(|&bytes| (bytes, bytes)).collect::<Vec<_>>(),
-        &(0..ranks).map(|rank| admission::device_headroom(rank, probe)).collect::<Vec<_>>(),
+        &(0..ranks).map(|_| admission::device_headroom()).collect::<Vec<_>>(),
         devices.iter().map(|device| Baseline::Forecast { occupied: device.used_bytes(),
             source: "retained checkpoint and media owners before the shared MiMo contract".into(),
             assumed: false }).collect(),
@@ -563,6 +563,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let request = admission::production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill,
         operation, ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
     let prepared = ProductionInput {
+        startup_probe_bytes: probe,
         expert_usage: options.expert_usage,
         blas_head: if checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
             .is_some_and(|t| t.meta.dtype == cuteafd_core::DType::Bf16)
@@ -584,7 +585,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
             // Failed plans still name the full fixed contract, not fictitious
             // free space left by returning before its storage was described.
             for (rank, device) in devices.iter_mut().enumerate() {
-                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom(rank, probe));
+                device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom());
                 for cost in &profiles.steady.devices[rank].reservations {
                     device.items.push(Item::new(reservation_category(&cost.name),
                         crate::placement::families::mimo_v2::reservation_group(&cost.name), "", cost.bytes, Basis::Formula));
@@ -599,7 +600,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let placement = admitted.placement;
     let working = admitted.spark;
     for (rank, device) in devices.iter_mut().enumerate() {
-        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom(rank, probe));
+        device.capacity_bytes = options.rtx_bytes[rank].saturating_sub(admission::device_headroom());
         device.items.extend(placement.items[rank].iter().cloned());
         device.kv_tokens = placement.pool_tokens;
     }
@@ -704,10 +705,11 @@ mod tests {
                         let probe = spark_intake_probe_bytes(true,
                             std::env::var("CUTEAFD_SPARK_INTAKE").ok().as_deref()).unwrap();
                         let budgets = production::production_budgets(&vec![(95 * GIB, 95 * GIB); ranks],
-                            &(0..ranks).map(|rank| production::device_headroom(rank, probe)).collect::<Vec<_>>(),
+                            &(0..ranks).map(|_| production::device_headroom()).collect::<Vec<_>>(),
                             vec![Baseline::Forecast { occupied: 0, source: "empty fixture devices".into(), assumed: false }; ranks],
                             opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
                         let runtime = production::ProductionInput {
+                            startup_probe_bytes: probe,
                             blas_head: if pro { crate::placement::planner::serving::BlasHead::Native }
                                 else { opts.bf16_target_head }, draft_head: false,
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
@@ -920,9 +922,9 @@ mod tests {
             profile.steady.devices[0].reservations.push(cuteafd_core::serving_capacity::MemoryReservation {
                 name: "runtime.cublas_first_gemm".into(), bytes: cublas,
             });
-            // The plan keeps the drained 64 MiB intake probe as rank 0's named reserve.
-            let reserve = crate::placement::families::mimo_v2::admission::device_headroom(0, 64 << 20);
-            assert_eq!(reserve, (64 << 20) + cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
+            // A drained startup probe does not remain in the serving headroom.
+            let reserve = crate::placement::families::mimo_v2::admission::device_headroom();
+            assert_eq!(reserve, cuteafd_core::memory_policy::MemoryPolicy::current().release_padding());
             profile.steady.devices[0].reserve_bytes = reserve;
             let policy = CapacityPolicy { concurrency: 4,
                 target_pool_tokens: if total <= 32 * GIB { 1 << 20 } else { 2 << 20 },
