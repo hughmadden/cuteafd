@@ -1,8 +1,21 @@
 // SM-issued peer reads keep lane-local waits off the shared DMA copy queue.
 #include "cuteafd_peer_copy.h"
+#include "peer_copy_internal.h"
 #include <cuda_runtime.h>
 #include <stdint.h>
 namespace {
+cudaError_t inspected(cudaError_t status) {
+  if (status != cudaSuccess) (void)cudaGetLastError();
+  return status;
+}
+int sm_count(cuteafd::PeerAttributeQuery query) {
+  int device = 0, sms = 0;
+  // Optional launch sizing must not poison the kernel's launch-status check.
+  if (inspected(cudaGetDevice(&device)) != cudaSuccess ||
+      inspected(query(&sms, cudaDevAttrMultiProcessorCount, device)) != cudaSuccess || sms <= 0)
+    return 64;
+  return sms;
+}
 __global__ void peer_copy(uint8_t* destination,const uint8_t* source,uint64_t bytes) {
   const uint64_t tid=uint64_t(blockIdx.x)*blockDim.x+threadIdx.x;
   const uint64_t stride=uint64_t(gridDim.x)*blockDim.x;
@@ -31,11 +44,9 @@ bool extent(uint64_t width,uint64_t rows,uint64_t pitch,uint64_t& bytes) {
   bytes=(rows-1)*pitch+width;return true;
 }
 template<class T> int32_t dispatch_rows(void* destination,const void* source,uint64_t width,
-    uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream) {
+    uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream, cuteafd::PeerAttributeQuery query) {
   const uint64_t blocks=(width/sizeof(T)*rows+255)/256;
-  int device=0,sms=0;
-  if(cudaGetDevice(&device)!=cudaSuccess ||
-      cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || sms<=0)sms=64;
+  const int sms=sm_count(query);
   const uint64_t cap=sms/8>8?uint64_t(sms/8):8;
   copy_rows<T><<<unsigned(blocks<cap?blocks:cap),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       static_cast<T*>(destination),static_cast<const T*>(source),width/sizeof(T),rows,
@@ -46,18 +57,18 @@ template<class T> int32_t dispatch_rows(void* destination,const void* source,uin
 }
 extern "C" int32_t cuteafd_peer_copy_initialize() {
   cudaFuncAttributes attributes{};
-  auto status=cudaFuncGetAttributes(&attributes,peer_copy);
+  auto status=inspected(cudaFuncGetAttributes(&attributes,peer_copy));
   if(status!=cudaSuccess)return status;
-  status=cudaFuncGetAttributes(&attributes,copy_rows<uint4>);
+  status=inspected(cudaFuncGetAttributes(&attributes,copy_rows<uint4>));
   if(status!=cudaSuccess)return status;
-  status=cudaFuncGetAttributes(&attributes,copy_rows<uint32_t>);
+  status=inspected(cudaFuncGetAttributes(&attributes,copy_rows<uint32_t>));
   if(status!=cudaSuccess)return status;
-  return cudaFuncGetAttributes(&attributes,copy_rows<uint8_t>);
+  return inspected(cudaFuncGetAttributes(&attributes,copy_rows<uint8_t>));
 }
 // Source peer access must be enabled on the stream's destination device.
 // Both buffers remain live and disjoint until completion; no allocation/wait.
-extern "C" int32_t cuteafd_peer_copy_async(void* destination,const void* source,
-    uint64_t bytes,void* stream) {
+int32_t cuteafd::peer_copy_with_query(void* destination,const void* source,
+    uint64_t bytes,void* stream, PeerAttributeQuery query) {
   const auto dst=reinterpret_cast<uintptr_t>(destination),src=reinterpret_cast<uintptr_t>(source);
   if(!stream || !dst || !src || bytes==0 || bytes>(1ull<<40) ||
       dst>UINTPTR_MAX-bytes || src>UINTPTR_MAX-bytes || !(dst+bytes<=src || src+bytes<=dst))
@@ -66,9 +77,7 @@ extern "C" int32_t cuteafd_peer_copy_async(void* destination,const void* source,
   // Bandwidth-bound: an eighth of this device's SMs (at least 8 blocks) saturate
   // a peer link and leave the rest to the compute it overlaps (RTX PRO 6000 and
   // 5090 alike; queried at runtime, never baked in).
-  int device=0,sms=0;
-  if(cudaGetDevice(&device)!=cudaSuccess ||
-      cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device)!=cudaSuccess || sms<=0)sms=64;
+  const int sms=sm_count(query);
   const uint64_t cap=sms/8>8?uint64_t(sms/8):8;
   const unsigned blocks=unsigned((units+255)/256<cap?(units+255)/256:cap);
   peer_copy<<<blocks,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
@@ -76,8 +85,8 @@ extern "C" int32_t cuteafd_peer_copy_async(void* destination,const void* source,
   return cudaGetLastError();
 }
 
-extern "C" int32_t cuteafd_peer_copy_rows_async(void* destination,const void* source,
-    uint64_t width,uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream) {
+int32_t cuteafd::peer_copy_rows_with_query(void* destination,const void* source,
+    uint64_t width,uint64_t rows,uint64_t destination_pitch,uint64_t source_pitch,void* stream, PeerAttributeQuery query) {
   uint64_t dst_bytes=0,src_bytes=0;
   const auto dst=reinterpret_cast<uintptr_t>(destination),src=reinterpret_cast<uintptr_t>(source);
   if(!stream || !dst || !src || !extent(width,rows,destination_pitch,dst_bytes) ||
@@ -85,7 +94,17 @@ extern "C" int32_t cuteafd_peer_copy_rows_async(void* destination,const void* so
       src>UINTPTR_MAX-src_bytes || !(dst+dst_bytes<=src || src+src_bytes<=dst))
     return cudaErrorInvalidValue;
   const auto alignment=dst|src|width|destination_pitch|source_pitch;
-  if((alignment&15)==0)return dispatch_rows<uint4>(destination,source,width,rows,destination_pitch,source_pitch,stream);
-  if((alignment&3)==0)return dispatch_rows<uint32_t>(destination,source,width,rows,destination_pitch,source_pitch,stream);
-  return dispatch_rows<uint8_t>(destination,source,width,rows,destination_pitch,source_pitch,stream);
+  if((alignment&15)==0)return dispatch_rows<uint4>(destination,source,width,rows,destination_pitch,source_pitch,stream,query);
+  if((alignment&3)==0)return dispatch_rows<uint32_t>(destination,source,width,rows,destination_pitch,source_pitch,stream,query);
+  return dispatch_rows<uint8_t>(destination,source,width,rows,destination_pitch,source_pitch,stream,query);
+}
+
+extern "C" int32_t cuteafd_peer_copy_async(void* destination, const void* source,
+    uint64_t bytes, void* stream) {
+  return cuteafd::peer_copy_with_query(destination, source, bytes, stream, cudaDeviceGetAttribute);
+}
+extern "C" int32_t cuteafd_peer_copy_rows_async(void* destination, const void* source,
+    uint64_t width, uint64_t rows, uint64_t destination_pitch, uint64_t source_pitch, void* stream) {
+  return cuteafd::peer_copy_rows_with_query(destination, source, width, rows,
+      destination_pitch, source_pitch, stream, cudaDeviceGetAttribute);
 }

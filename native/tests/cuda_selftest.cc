@@ -1,4 +1,6 @@
 #include "cuteafd_native.h"
+#include "cuteafd_peer_copy.h"
+#include "../shared/cuda/peer_copy_internal.h"
 
 #include <cuda_runtime_api.h>
 
@@ -2819,9 +2821,46 @@ void test_cuda_generic_kv_page_table_init_base_is_exported_and_correct() {
   free_buffer(&page_table);
 }
 
+void test_peer_copy_optional_query_failure_is_recoverable() {
+  constexpr size_t capacity = 256;
+  auto source = device_buffer(capacity);
+  auto destination = device_buffer(capacity);
+  require_cuda(cudaMemset(source.ptr, 0x5a, capacity), "peer query source");
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "peer query stream");
+  require_cuda(static_cast<cudaError_t>(cuteafd_peer_copy_initialize()), "peer query initialize");
+  auto failing = +[](int* value, cudaDeviceAttr attribute, int) -> cudaError_t {
+    return cudaDeviceGetAttribute(value, attribute, -1);
+  };
+  for (bool pitched : {false, true}) {
+    require_cuda(cudaMemsetAsync(destination.ptr, 0, capacity, stream), "peer query reset");
+    const int status = pitched
+        ? cuteafd::peer_copy_rows_with_query(destination.ptr, source.ptr, 32, 4, 64, 64, stream, failing)
+        : cuteafd::peer_copy_with_query(destination.ptr, source.ptr, capacity, stream, failing);
+    require_cuda(static_cast<cudaError_t>(status), "peer copy after failed optional attribute");
+    require_cuda(cudaPeekAtLastError(), "peer query cleared error");
+    require_cuda(cudaStreamSynchronize(stream), "peer query complete");
+    std::vector<uint8_t> actual(capacity);
+    require_cuda(cudaMemcpy(actual.data(), destination.ptr, capacity, cudaMemcpyDeviceToHost), "peer query result");
+    for (size_t i = 0; i < capacity; ++i) {
+      const uint8_t expected = !pitched || i % 64 < 32 ? 0x5a : 0;
+      if (actual[i] != expected) std::abort();
+    }
+  }
+  require_cuda(cudaStreamDestroy(stream), "peer query destroy");
+  free_buffer(&destination);
+  free_buffer(&source);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--peer-query-only") == 0) {
+    test_peer_copy_optional_query_failure_is_recoverable();
+    std::cout << "test result: ok. 2 passed; 0 failed\n";
+    return 0;
+  }
+  test_peer_copy_optional_query_failure_is_recoverable();
   if (argc == 2 && std::strcmp(argv[1], "--f32-to-bf16-only") == 0) {
     test_cuda_f32_to_bf16_rounds_nearest_even();
     std::cout << "test result: ok. 1 passed; 0 failed\n";
