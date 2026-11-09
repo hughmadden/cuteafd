@@ -1447,7 +1447,8 @@ impl<'a> Qwen4Engine<'a> {
             graph_capture: Cell::new(false),
             graph_pins: RefCell::new(Vec::new()),
             graph_warmed: Cell::new(false),
-            warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
+            warming_graphs: Cell::new(false),
+            w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4, Tag::drafter_workspace("qwen4/mtp-drafts"))?,
@@ -1691,10 +1692,9 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Prewarm the checked-in prewarm set for this launch's layout inside the
     /// graph reserve. Unlisted or uncaptured request shapes run eagerly or
-    /// capture lazily on a permitted miss; nothing here refuses. One eager pass
-    /// first puts module, workspace and BLAS first touch outside executable
-    /// residency, and the capture pass is charged at its completed step
-    /// boundaries. Returns the resident graph count.
+    /// capture lazily on a permitted miss; nothing here refuses. Capture is
+    /// charged at its completed step boundaries against an observer seeded
+    /// immediately before the first capture. Returns the resident graph count.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
         ensure!(!self.graph_warmed.get(), "Qwen prewarm already captured");
         if !self.use_graphs { return Ok(0); }
@@ -1709,8 +1709,16 @@ impl<'a> Qwen4Engine<'a> {
         tracing::info!(shape = ?shape, shapes = shapes.len(), graphs = shapes.len() * segments,
             plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS, "Qwen prewarm admission");
         let started = std::time::Instant::now();
-        let run = |warming: bool| -> Result<()> {
-            self.warming_graphs.set(warming);
+        // Seed each device's observer before capture: only growth from here on
+        // is charged to the startup shapes. The decode path allocates nothing
+        // inside a capture (v5 captured this set the same way), so no eager
+        // first-touch pass is needed.
+        self.drain_state()?;
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
+        }
+        self.warming_graphs.set(true);
+        let captured = (|| -> Result<()> {
             for shape in &shapes {
                 let geometry = shape.geometry();
                 let mut tables = StepTables { decode: true, spec: shape.spec, long: geometry.long,
@@ -1719,20 +1727,15 @@ impl<'a> Qwen4Engine<'a> {
                 let mut tokens = Vec::new();
                 pad_decode_tables(&mut tables, &mut tokens, shape.rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
                 self.step(&Arc::new(tables), &tokens, shape.rows, None, None, &Default::default(), true)?;
+                // Startup shapes reuse an arena admitted for one serving step.
+                self.drain_state()?;
             }
             Ok(())
-        };
-        // Eager pass: first touch of each module, workspace and BLAS lands here.
-        run(false)?;
+        })();
         self.warming_graphs.set(false);
-        // Fold the eager pass into each device's untracked high-water at zero charge.
-        self.drain_state()?;
-        for bank in &self.gdn_banks {
-            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
-        }
-        run(true)?;
-        self.warming_graphs.set(false);
-        self.drain_state()?;
+        let drained = self.drain_state();
+        captured?;
+        drained?;
         for bank in &self.gdn_banks {
             crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
         }
@@ -3694,8 +3697,8 @@ impl<'a> Qwen4Engine<'a> {
             unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
             return self.ple_consumed(&key);
         }
-        // Graphs unconfigured, or the prewarm's untimed eager pass: run the
-        // segment ungraphed without recording a miss.
+        // Graphs unconfigured, or a step before the prewarm: run the segment
+        // ungraphed without recording a miss.
         if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {
             segment()?;
             return self.ple_consumed(&key);
