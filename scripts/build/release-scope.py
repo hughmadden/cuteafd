@@ -42,7 +42,7 @@ PREVIOUS_RELEASE_FLOOR = {
         }.items() for count in counts
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
-DEFAULT_MATRIX = 'scripts/bench/release-smoke-v4.json'
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v5.json'
 # WIP scope switches with no release key: release images always build V4.1 and vision.
 WIP_ONLY = {'V41_AOT', 'VISION_ATTENTION_AOT'}
 
