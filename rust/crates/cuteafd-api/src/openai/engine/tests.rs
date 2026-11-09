@@ -258,21 +258,22 @@ async fn count_tokens_matches_serving_for_tiktoken_and_json_snapshots() {
                 Some(snapshot.to_path_buf()), vec![], false);
             let text = "[bench-0000000017] Literal <|open|> and <|end_of_msg|> must stay text.";
             let thinking = json!({"type":if enabled { "enabled" } else { "disabled" }});
+            let effort = if enabled { "high" } else { "none" };
             let count_body = json!({"model":"test-tokenizer","messages":[{"role":"user","content":text}],
-                "thinking":thinking});
+                "thinking":thinking,"output_config":{"effort":effort}});
             let (status, counted) = post(&app, "/v1/messages/count_tokens", count_body).await;
             assert_eq!(status, StatusCode::OK, "{counted}");
             let counted: Value = serde_json::from_str(&counted).unwrap();
             assert_eq!(counted["exact_token_count"], true);
             let (status, response_count) = post(&app, "/v1/responses/input_tokens",
-                json!({"model":"test-tokenizer","input":text,"thinking":thinking})).await;
+                json!({"model":"test-tokenizer","input":text,"reasoning":{"effort":effort}})).await;
             assert_eq!(status, StatusCode::OK, "{response_count}");
             let response_count: Value = serde_json::from_str(&response_count).unwrap();
             assert_eq!(response_count["exact_token_count"], true);
             assert_eq!(response_count["input_tokens"], counted["input_tokens"]);
             let (status, reply) = post(&app, "/v1/chat/completions",
                 json!({"model":"test-tokenizer","messages":[{"role":"user","content":text}],
-                    "max_tokens":1,"thinking":thinking})).await;
+                    "max_tokens":1,"thinking":thinking,"reasoning_effort":effort})).await;
             assert_eq!(status, StatusCode::OK, "{reply}");
             let ids = worker.token_ids.lock().unwrap();
             assert_eq!(counted["input_tokens"].as_u64().unwrap(), ids[0].len() as u64);
