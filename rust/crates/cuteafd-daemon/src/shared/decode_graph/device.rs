@@ -901,7 +901,7 @@ impl Drop for DeviceCache {
 
 pub(crate) fn shutdown_traces() {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().cloned().collect();
+        .values().filter_map(std::sync::Weak::upgrade).collect();
     for cache in caches {
         let writer = cache.lock().unwrap_or_else(|p| p.into_inner()).finish_trace();
         // No cache lock is held while waiting for JSON or filesystem work.
@@ -1129,11 +1129,52 @@ mod tests {
         cache.measured_capture(10);
         cache.remove_bank(1);
         cache.remove_bank(2);
-        drop(cache);
+        let owner = Arc::new(Mutex::new(cache));
+        let weak = Arc::downgrade(&owner);
+        DEVICES.get_or_init(Mutex::default).lock().unwrap().insert(-701, weak.clone());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        DEVICES.get().unwrap().lock().unwrap().remove(&-701);
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(value["graphs"][0]["hits"], 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_shutdown_upgrades_live_weak_controllers_and_joins_final_trace() {
+        const CHILD: &str = "CUTEAFD_TRACE_WEAK_SHUTDOWN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new("/usr/bin/timeout")
+                .args(["--signal=KILL", "30"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "shared::decode_graph::device::tests::explicit_shutdown_upgrades_live_weak_controllers_and_joins_final_trace"])
+                .env(CHILD, "1").env_remove("CUTEAFD_GRAPH_TRACE").status().unwrap().success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.json");
+        let mut cache = DeviceCache::new(-703, 100);
+        cache.trace = Some(TraceWriter::new(path.clone()).unwrap());
+        let id = capture(&mut cache, 1, false);
+        cache.hit(id);
+        cache.remove_bank(1);
+        let owner = Arc::new(Mutex::new(cache));
+        let weak = Arc::downgrade(&owner);
+        {
+            let mut registry = DEVICES.get_or_init(Mutex::default).lock().unwrap();
+            registry.insert(-703, weak.clone());
+            registry.insert(-704, std::sync::Weak::new());
+        }
+        shutdown_traces();
+        assert!(owner.lock().unwrap().trace.is_none());
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["graphs"][0]["hits"], 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        shutdown_traces();
+        drop(owner);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

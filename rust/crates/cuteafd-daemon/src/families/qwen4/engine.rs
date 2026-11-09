@@ -1477,7 +1477,7 @@ impl<'a> Qwen4Engine<'a> {
                 .with_context(|| format!("Qwen {shape:?} graph reserve has no rank {owner}"))?;
             let resolved = cuteafd_loader::placement::graph_reserve::current(owner, false, base, extra)
                 .map_err(anyhow::Error::msg)?;
-            bank.attach_device(self.gdn_banks[owner].device.id, resolved.bytes, Site {
+            bank.attach_device(self.library, self.gdn_banks[owner].device.id, resolved.bytes, Site {
                 name: "qwen4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
                 basis: Basis::Bytes,
