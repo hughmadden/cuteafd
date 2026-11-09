@@ -79,6 +79,14 @@ separately rounded. Review the proposal, update the family's checked-in list,
 and relaunch before accepting it. Extend the parser/consumer for each new
 family rather than pretending its keys are GLM keys.
 
+The GLM reference list comes from the trace6 ordinary EXL3 K4 1-RTX/4-Spark
+baseline plus C1/2/4/8/16 sweep: 28 geometries cover every one of 151,522
+request-cycle graph events (startup Other excluded), with 1x16 pinned. The
+measured base is 1,189,085,184 bytes and one-capture headroom is 2,097,152 bytes.
+All 7,742 inspected executables were width-one and single-device. A final
+fixed-DRAFT_LENGTH=4 dev/candidate C1/C16 relaunch must qualify this list and
+reserve before acceptance; the trace is a sizing receipt, not that final gate.
+
 ## Delete the old family policy
 
 Remove startup sealing, declared-key request refusals, per-bank lazy budgets,

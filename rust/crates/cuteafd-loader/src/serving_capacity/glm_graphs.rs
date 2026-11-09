@@ -172,6 +172,14 @@ mod tests {
     fn checked_in_prewarm_list_roundtrips_and_filters_to_supported_shapes() {
         let list = glm_prewarm_list();
         assert!(!list.entries.is_empty());
+        let mut identities = HashSet::new();
+        for entry in &list.entries {
+            assert!(identities.insert((entry.shape.rows, entry.shape.table_width)), "duplicate prewarm geometry");
+            assert!(entry.shape.rows > 0 && entry.shape.table_width > 0);
+        }
+        assert!(list.entries.iter().any(|entry| entry.pin && entry.shape == GlmGraphShape { rows: 1, table_width: 16 }));
+        assert_eq!(list.reserve_base_bytes % (2 << 20), 0);
+        assert_eq!(list.reserve_extra_bytes % (2 << 20), 0);
         let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
         let allowed = glm_graph_shapes(4096, 32);
         for entry in glm_prewarm_shapes(4096, 32) { assert!(allowed.contains(&entry.shape)); }
