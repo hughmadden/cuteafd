@@ -4,10 +4,10 @@
   "layouts": {
     "1-sparks": {
       "measured_bytes": [
-        119537664
+        113246208
       ],
       "measured_executables": [
-        690
+        644
       ],
       "reserve_extra_bytes": 2097152,
       "entries": [
@@ -27,15 +27,6 @@
           "pool_width": 64,
           "page_stride": 256,
           "pool_stride": 64,
-          "pin": false
-        },
-        {
-          "rows": 1,
-          "spec": false,
-          "long": true,
-          "pool_width": 128,
-          "page_stride": 1024,
-          "pool_stride": 256,
           "pin": false
         },
         {
@@ -150,12 +141,12 @@
     },
     "2": {
       "measured_bytes": [
-        136314880,
-        123731968
+        125829120,
+        117440512
       ],
       "measured_executables": [
-        690,
-        675
+        644,
+        630
       ],
       "reserve_extra_bytes": 2097152,
       "entries": [
@@ -175,15 +166,6 @@
           "pool_width": 64,
           "page_stride": 256,
           "pool_stride": 64,
-          "pin": false
-        },
-        {
-          "rows": 1,
-          "spec": false,
-          "long": true,
-          "pool_width": 128,
-          "page_stride": 1024,
-          "pool_stride": 256,
           "pin": false
         },
         {
