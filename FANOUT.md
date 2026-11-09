@@ -95,8 +95,9 @@ first_request stage objects. Each device row carries measured_bytes,
 charged_bytes excluding release padding, padding_bytes, owners, provenance,
 measurement_method and unavailable_reason, plus three signed byte fields:
 
-- `delta_vs_admitted`: raw CUDA used minus all admitted owners (padding excluded).
-  Negative values can simply be reserved but unused capacity.
+- `delta_vs_admitted`: observer-excluded CUDA used minus all admitted serving
+  Growth owners (padding excluded), including lazy Workspace/Staging,
+  allowances and derived tails. Negative values can be unused admitted capacity.
 - `graph_reserve_slack`: admitted graph reserve minus measured graph arena
   high-water; negative means the arena exceeded its reserve. The component
   values are `graph_reserve_bytes` and `graph_arena_high_water_bytes`.
@@ -110,11 +111,18 @@ is not drift. Missing physical samples yield null deltas/drift. Missing arena
 telemetry for a nonzero graph owner yields null measured delta/slack/drift and
 an explicit graph_measurement_unavailable_reason, never an assumed zero.
 Devices with no graph owner and no controller have zero arena/slack.
-Device-wide raw CUDA use is not process attribution. GB10 admission
-MemAvailable/allocatable samples remain separately labelled.
+RTX rows retain raw_used_bytes for audit and report observer_bytes plus
+observer_provenance (the measured sampler context). The same observer exclusion
+as cuda_allocatable_memory_info applies exactly once before either delta; absent
+observers contribute zero. Device-wide CUDA use is not process attribution.
+Ready still includes unused admitted Growth owners, so a negative Ready delta
+need not be an accounting defect. GB10 admission MemAvailable/allocatable samples
+remain separately labelled.
 
-Spark Ready aggregation uses the existing admission detail's optional
-memory_reconciliation object. New coordinators accept missing and unknown
+Spark Ready aggregation uses the reconciled worker resident/workspace and UMA
+host-owner ledger, not the coordinator's empty placeholder plan. Device/pinned
+detail aliases are not charged twice. Its physical sample comes from the existing
+admission detail's optional memory_reconciliation object. New coordinators accept missing and unknown
 optional detail fields; coordinator and Spark release images are a compatible
 pair, not arbitrary old/new binary combinations. Post-request Spark samples
 at the coordinator are null with the #1631 reason until control-plane telemetry

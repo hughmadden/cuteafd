@@ -452,6 +452,15 @@ pub fn device_memory(device: i32) -> Option<(usize, usize)> {
     value.free_bytes.zip(value.total_bytes)
 }
 
+/// Active-context diagnostic sample with the same observer exclusion as admission.
+/// Returns raw free/total and the independently measured external observer bytes.
+pub fn device_memory_observer(device: i32) -> anyhow::Result<Option<(usize, usize, usize)>> {
+    let observer = crate::observer_context::bytes(device)?;
+    let Some((free, total)) = device_memory(device) else { return Ok(None) };
+    crate::observer_context::exclude(free, total, observer)?;
+    Ok(Some((free, total, observer)))
+}
+
 fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureReport>> {
     let id = sequence();
     trigger_record(raw, id, None, "capture attempted");

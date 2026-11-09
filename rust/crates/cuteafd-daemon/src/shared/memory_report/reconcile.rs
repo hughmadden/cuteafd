@@ -1,4 +1,4 @@
-//! Signed physical-use versus admission-owner reconciliation. Samples are
+//! Signed observer-excluded use versus admission-owner reconciliation. Samples are
 //! diagnostic: never turn a missing sample or a positive delta into refusal.
 use super::*;
 use std::sync::{Mutex, OnceLock};
@@ -66,6 +66,23 @@ fn row(device: &str, measured: Option<u64>, owners: &cuteafd_core::memory_policy
         "unavailable_reason": reason, "provenance": provenance})
 }
 
+fn observed_row(device: &str, sample: Option<(usize, usize, usize)>,
+    owners: &cuteafd_core::memory_policy::DeviceBreakdown, graph_arena: Option<u64>,
+    provenance: Value, reason: Option<&str>) -> Value {
+    let raw = sample.map(|(free, total, _)| total.saturating_sub(free) as u64);
+    let observer = sample.map(|(_, _, observer)| observer as u64);
+    let measured = raw.zip(observer).and_then(|(raw, observer)| raw.checked_sub(observer));
+    let mut record = row(device, measured, owners, graph_arena, provenance, reason);
+    record["raw_used_bytes"] = json!(raw);
+    record["observer_bytes"] = json!(observer);
+    record["observer_provenance"] = json!({
+        "source": "CUTEAFD_OBSERVER_CONTEXT_FILE; measured sampler context per logical CUDA device",
+        "method": "same observer_context::exclude helper as cuda_allocatable_memory_info; excluded exactly once",
+        "present": observer.map(|bytes| bytes > 0)});
+    record["measurement_method"] = "active-context CUDA physical total minus free, excluding independently measured observer context".into();
+    record
+}
+
 /// Ready runs on a helper thread; first-request runs only once, after completed
 /// request retirement. Neither path creates a primary context or synchronizes a
 /// partial multi-rank submission.
@@ -81,14 +98,16 @@ pub(crate) fn capture(stage: &str) {
         let id = key.trim_start_matches("device.");
         if let Some(index) = id.strip_prefix("rtx").and_then(|n| n.parse::<usize>().ok()) {
             let physical = devices.get(index).and_then(|value| value["device"].as_i64());
-            let measured = physical.and_then(|device| i32::try_from(device).ok())
-                .and_then(memory_ledger::fault::device_memory).map(|(free, total)| total.saturating_sub(free) as u64);
+            let sample = physical.and_then(|device| i32::try_from(device).ok())
+                .map(memory_ledger::fault::device_memory_observer).transpose();
+            let sample_error = sample.as_ref().err().map(|error| format!("observer-aware CUDA sample unavailable: {error:#}"));
+            let sample = sample.ok().flatten().flatten();
             let mut identity = provenance.clone();
             identity["device_sample"] = devices.get(index).cloned().unwrap_or(Value::Null);
             let graph_arena = physical.and_then(|device| graph_samples.iter()
                 .find(|sample| i64::from(sample.device) == device)).map(|sample| sample.charged);
-            rows.push(row(id, measured, &owners, graph_arena, identity,
-                measured.is_none().then_some("no active CUDA primary context sample")));
+            rows.push(observed_row(id, sample, &owners, graph_arena, identity,
+                sample_error.as_deref().or_else(|| sample.is_none().then_some("no active CUDA primary context sample"))));
         } else if let Some(rank) = id.strip_prefix("spark").and_then(|n| n.trim_start_matches('.').parse::<u32>().ok()) {
             let worker = worker_samples.get(&rank);
             let measured = (stage == "ready").then(|| worker.and_then(|value|
@@ -122,6 +141,28 @@ pub(crate) fn capture(stage: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn observer_context_is_excluded_once_from_both_deltas_and_raw_sample_is_retained() {
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 900,
+            weights_bytes: 600, workspace_bytes: 100, kv_bytes: 0, other_bytes: 0,
+            reserve_overridden: false, reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
+                name: "graph reserve".into(), bytes: 100 }] };
+        let sample = observed_row("rtx0", Some((150, 1000, 100)), &owners, Some(50), json!({}), None);
+        assert_eq!(sample["raw_used_bytes"], 850);
+        assert_eq!(sample["observer_bytes"], 100);
+        assert_eq!(sample["measured_bytes"], 750);
+        assert_eq!(sample["delta_vs_admitted"], -50);
+        assert_eq!(sample["delta_vs_measured"], 0);
+        assert_eq!(sample["observer_provenance"]["present"], true);
+        let production = observed_row("rtx0", Some((250, 1000, 0)), &owners, Some(50), json!({}), None);
+        assert_eq!(production["measured_bytes"], sample["measured_bytes"]);
+        assert_eq!(production["delta_vs_measured"], 0);
+        let missing = observed_row("rtx0", None, &owners, Some(50), json!({}), Some("no sample"));
+        assert!(missing["measured_bytes"].is_null());
+        assert!(missing["observer_bytes"].is_null());
+        assert!(missing["delta_vs_measured"].is_null());
+    }
+
     #[test]
     fn spark_reconciled_owners_include_uma_backings_without_detail_aliases() {
         use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory};
