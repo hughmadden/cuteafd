@@ -1736,6 +1736,27 @@ mod tests {
         }
     }
 
+    /// The shared reconciliation reads only reserve components named exactly
+    /// `graph reserve` (`shared/memory_report/reconcile.rs`). The breakdown
+    /// names each component by its item group's leading label, so the family's
+    /// `graph reserve: qwen4.graphs.N` items must fold into exactly one
+    /// canonical, nonzero row per device, with no family-named graph owner.
+    fn canonical_graph_reserve(items: &[cuteafd_core::memory_layout::Item], gpu: u8) -> u64 {
+        let device = crate::placement::reserve::breakdown(format!("rtx{gpu}"),
+            cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, items);
+        let rows = device.reserve.iter().filter(|component| component.name == "graph reserve")
+            .collect::<Vec<_>>();
+        let named = device.reserve.iter().map(|component| (component.name.as_str(), component.bytes))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1, "one canonical graph reserve row per device: {named:?}");
+        assert!(rows[0].bytes > 0, "the canonical graph reserve is charged: {named:?}");
+        assert!(!device.reserve.iter().any(|component|
+            component.name.to_ascii_lowercase().contains("qwen")), "no family-named graph owner: {named:?}");
+        assert_eq!(rows[0].bytes, items.iter().filter(|item| item.group.starts_with("graph reserve: "))
+            .map(|item| item.bytes).sum::<u64>(), "the canonical row is the whole graph charge");
+        rows[0].bytes
+    }
+
     /// The graph reserve is one owner, charged before KV sizing whether or not
     /// this plan captures: a diagnostic plan reserves the same arena, and only
     /// `GPU_GRAPH_RESERVE=0` charges nothing.
@@ -1746,6 +1767,7 @@ mod tests {
             0, None, ResidentWeights(0), None)).unwrap();
         assert_eq!(lazy.items[0].iter().filter(|item| item.group.contains("graph"))
             .map(|item| item.group.as_str()).collect::<Vec<_>>(), ["graph reserve: qwen4.graphs.0"]);
+        assert!(canonical_graph_reserve(&lazy.items[0], 0) > 0);
         // An explicit pool below the context is the first typed refusal.
         let short = single_inputs(&cfg, Baseline::Measured { free_bytes: 96 << 30 }, 0,
             Some(65536), ResidentWeights(0), None);
@@ -1810,6 +1832,8 @@ mod tests {
         for gpu in 0..2 {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.group == format!("graph reserve: qwen4.graphs.{gpu}"))
                 .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserves[gpu]]);
+            // TP2: each device's breakdown carries one canonical graph row.
+            assert_eq!(canonical_graph_reserve(&placement.items[gpu], gpu as u8), reserves[gpu]);
         }
     }
 }

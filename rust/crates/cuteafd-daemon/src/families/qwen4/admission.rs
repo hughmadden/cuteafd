@@ -506,6 +506,8 @@ mod tests {
         let row = snapshot["ready"]["devices"].as_array().expect("reconciled rows").iter()
             .find(|row| row["device"].as_str() == Some("rtx0")).expect("admitted rtx0 row");
         assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(212 << 20));
+        assert!(row["graph_reserve_bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+            "the canonical graph reserve row must be charged");
         assert_eq!(row["provenance"]["family"], "qwen4");
         assert!(row.get("delta_vs_measured").is_some());
         assert!(row.get("graph_reserve_slack").is_some());
