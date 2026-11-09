@@ -326,7 +326,7 @@ constexpr int CUTEAFD_STATUS_INTERNAL_ERROR = 2, CUTEAFD_STATUS_CAPTURE_REQUIRES
 constexpr int CUBLAS_OP_T = 0, CUBLAS_OP_N = 1, CUDA_R_16BF = 0;
 constexpr int CUBLAS_COMPUTE_32F = 0, CUBLAS_GEMM_DEFAULT_TENSOR_OP = 0;
 constexpr int cudaStreamCaptureModeThreadLocal = 1;
-inline thread_local int device = 0, device_error = 0;
+inline thread_local int device = 0, device_error = 0, cuda_last_error = 0;
 inline thread_local bool capturing = false;
 inline int creates = 0, lt_creates = 0, destroys = 0, lt_destroys = 0;
 inline int allocations = 0, frees = 0, bindings = 0, gemms = 0, begins = 0, drains = 0;
@@ -367,8 +367,10 @@ template<class... Args> int cublasGemmEx(cublasHandle_t h, Args...) {
   assert(h->workspace && h->math == CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION && h->atomics == 0);
   ++gemms; last_gemm = h; return 0;
 }
+inline int cudaGetLastError() { const int status = cuda_last_error; cuda_last_error = 0; return status; }
 inline int cudaStreamBeginCapture(void* s, int mode) {
   assert(s && mode == cudaStreamCaptureModeThreadLocal && !capturing);
+  if (capture_error) cuda_last_error = capture_error;
   ++begins; capturing = capture_error == 0; return capture_error;
 }
 inline void cuteafd_set_last_error_message(const char* s) { last_error = s; }
@@ -402,8 +404,12 @@ def _compile_blas_fixture(tmp_path, main, extra=""):
     launch = "cuteafd_status_t launch_linear_bf16_cublas(" + linear.split(
         "cuteafd_status_t launch_linear_bf16_cublas(", 1)[1].split(
         "  if (bias != nullptr) {", 1)[0] + "  (void)bias; return 0;\n}\n"
+    diagnostics = (ROOT / "native/shared/include/cuteafd_graph_diagnostics.h").read_text()
+    clear_error = "inline cudaError_t diagnostic_cuda" + diagnostics.split(
+        "inline cudaError_t diagnostic_cuda", 1)[1].split("using GraphEdgesQuery", 1)[0]
     fixture = tmp_path / "blas.cc"
     fixture.write_text('#define CUTEAFD_NATIVE_ENABLE_CUDA 1\n#include "blas_owner.h"\n' +
+                       'namespace cuteafd {\n' + clear_error + '}\n' +
                        helper + prepare + capture + launch + main)
     sources = [str(fixture), str(CALLBACK_SOURCE)]
     if extra:
@@ -526,6 +532,7 @@ int main() {
   assert(frees == 1 && destroys == 1 && drains == 1);
   capture_error = 71;
   assert(cuteafd_cuda_graph_begin_capture(capture_stream) == 2);
+  assert(cudaGetLastError() == cudaSuccess);
   assert(!capturing && creates == 3 && begins == 5 && gemms == 5);
   assert(first->stream == eager_stream);
 }
