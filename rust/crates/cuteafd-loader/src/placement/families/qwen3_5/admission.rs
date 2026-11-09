@@ -55,7 +55,7 @@ pub fn forecast_budgets(physical: &ArchContext, capacity: u64, module_bytes: u64
     }
     Ok(vec![
         Budget {
-            id: "coordinator.0".into(),
+            id: "rtx0".into(),
             locations: vec![Location::coordinator(0)],
             physical_bytes: if physical.total_bytes == 0 { 32 << 30 } else { physical.total_bytes },
             logical_bytes: capacity,

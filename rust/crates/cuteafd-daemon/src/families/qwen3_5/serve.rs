@@ -715,6 +715,52 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_reads_dense_admitted_owner_rows() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_DENSE_RECONCILIATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Admission inputs and reconciliation snapshots are process-global.
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::qwen3_5::serve::tests::reconciliation_reads_dense_admitted_owner_rows",
+                    "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated dense reconciliation test failed");
+            return Ok(());
+        }
+        use cuteafd_loader::placement::{families::qwen3_5, planner};
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        let budgets = qwen3_5::sampled_budgets(80 << 30, 96 << 30, None,
+            (128 << 30, 128 << 30))?;
+        let gpu = &budgets[0];
+        assert_eq!(gpu.id, "rtx0");
+        assert_eq!(gpu.locations, vec![planner::Location::coordinator(0)]);
+        let owners = cuteafd_loader::placement::reserve::breakdown(gpu.id.clone(),
+            cuteafd_core::memory_policy::DeviceKind::Gpu, gpu.physical_bytes, gpu.headroom,
+            &[Item::new(Category::Weights, "dense target arena", "", 8 << 30, Basis::Exact),
+                Item::new(Category::Reserved, "graph reserve", "graph reserve: qwen3_5.graphs.0",
+                    128 << 20, Basis::Exact)]);
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {"family": "qwen3_5", "devices": [{"device": 0}]},
+            format!("device.{}", gpu.id): owners
+        }));
+        use crate::shared::memory_report::reconcile;
+        for stage in ["ready", "first_request"] {
+            reconcile::capture(stage);
+            let snapshot = reconcile::snapshot();
+            let rows = snapshot[stage]["devices"].as_array().expect("reconciled rows");
+            assert_eq!(rows.len(), 1, "exactly one physical GPU, no alias rows");
+            let row = &rows[0];
+            assert_eq!(row["device"], "rtx0");
+            assert_eq!(row["owners"]["weights_bytes"].as_u64(), Some(8 << 30));
+            assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(128 << 20));
+            assert!(row["charged_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+            assert_eq!(row["provenance"]["family"], "qwen3_5");
+            assert!(row.get("delta_vs_measured").is_some());
+            assert!(row.get("graph_reserve_slack").is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn explicit_plan_and_serve_host_quotas_have_identical_recipe_owners() -> Result<()> {
         use cuteafd_loader::placement::{families::qwen3_5::{self, DenseFacts, NativeBuffers, NativeWeights},
             planner::{self, Operation, Pin, PrefillShape, Request}};

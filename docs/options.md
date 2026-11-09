@@ -215,7 +215,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GLM5_FLASH_DECODE_ROWS` | `auto` (64) | `auto`, `64`, `128` | GLM Flash decode rows. |
 | `DECODE_LANES` | `1` | `1`, `2` | V4.1/MiMo forward decode lanes. |
 | `DECODE_SHARE` | `0.2` | `[0, 1)` | Share of time running requests keep while prompts prefill; 0 prefills whole prompts. |
-| `DECODE_GRAPHS` | MiMo `on`; dense Qwen `off` pending qualification | `on`, `off` | Dense Qwen graphs complete decode/verify layers on its supported single-RTX layouts; prefill stays eager. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Standalone `plan --mimo-decode-graphs on\|off` uses the same default. |
+| `DECODE_GRAPHS` | MiMo `on`; dense Qwen `off` pending qualification | `on`, `off` | Dense Qwen graphs complete decode/verify layers on its supported single-RTX layouts; prefill stays eager. With graphs off, its graph reserve is zero and page-table geometry stays on the original eager path. MiMo bounded per-layer CUDA graph replay, keyed by checkpoint and layout. Standalone `plan --mimo-decode-graphs on\|off` uses the same default. |
 | `KV_DECODE_RESERVE_CHUNK` | unset | tokens | Decode-chunk KV reserve top-up. |
 | `KV_RESERVE_DRAIN_BUFFER` | unset | 0 = whole remaining output | Drain buffer. |
 | `KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS` | unset | `-1` or non-negative | Early termination floor. |

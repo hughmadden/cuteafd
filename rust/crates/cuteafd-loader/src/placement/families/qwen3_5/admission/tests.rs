@@ -229,7 +229,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
-            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "coordinator.0"),
+            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "rtx0"),
                 "{refusal}"),
         }
     }
