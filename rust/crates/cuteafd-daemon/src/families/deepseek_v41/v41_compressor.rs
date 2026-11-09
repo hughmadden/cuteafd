@@ -1117,7 +1117,10 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             // Order the producer on the chain (forked from the query's
             // normalized input) instead of draining it on the host: a captured
             // shape replays, an uncaptured prefill width launches eagerly.
-            let graph = if uncaptured { None } else { self.selected_graph().map(|(raw, _, _)| raw) };
+            let graph = if uncaptured { None } else {
+                // The guard only checks liveness; count this actual chain replay once.
+                self.retained_graphs.cached_launch(&(prepared.rows, state.owner)).map(|graph| graph.raw)
+            };
             let queued = (|| -> Result<()> { unsafe {
                 crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?;
                 self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,

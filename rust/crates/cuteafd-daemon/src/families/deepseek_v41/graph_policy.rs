@@ -44,12 +44,7 @@ pub(crate) fn prefill_prewarm_rows(capacity: usize) -> Vec<usize> {
 }
 
 fn prefill_rows(capacity: usize, chunk: Option<u32>) -> Vec<usize> {
-    let mut rows = vec![cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS as usize];
-    if let Some(chunk) = chunk { rows.push(chunk as usize); }
-    rows.retain(|&row| row <= capacity);
-    rows.sort_unstable();
-    rows.dedup();
-    rows
+    cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(capacity, chunk.map(|row| row as usize))
 }
 
 /// Records one eager run of a shape the policy would graph but this owner's
@@ -119,6 +114,23 @@ mod tests {
     use cuteafd_ffi::NativeLibrary;
     use std::collections::BTreeMap;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn compressor_chain_counts_only_the_successful_replay_lookup() {
+        let source = include_str!("v41_compressor.rs");
+        let start = source.find("if crate::shared::memory::chain::active() && self.pending_query.is_none()").unwrap();
+        let end = start + source[start..].find("crate::shared::memory::chain::settle").unwrap();
+        let chain = &source[start..end];
+        // Liveness validation must not count a hit or keep an evicted pointer.
+        assert_eq!(chain.matches("self.selected_graph()").count(), 1);
+        assert_eq!(chain.matches("self.retained_graphs.cached_launch(&(prepared.rows, state.owner))").count(), 1);
+        assert!(chain.find("cached_launch").unwrap() < chain.find("census::dispatch").unwrap());
+        let select = &source[source.find("fn select_graph(").unwrap()..source.find("fn selected_graph(").unwrap()];
+        assert_eq!(select.matches("cached_launch").count(), 1);
+        let selected = &source[source.find("fn selected_graph(").unwrap()..];
+        let selected = &selected[..selected.find("\n    }").unwrap()];
+        assert!(!selected.contains("cached_launch"));
+    }
 
     #[test]
     fn startup_prefill_keys_are_reachable_from_slot_zero_and_selected_head_row() {

@@ -902,5 +902,15 @@
       "width": 7,
       "pin": false
     }
+  ],
+  "prefill_entries": [
+    {
+      "rows": 128,
+      "pin": true
+    },
+    {
+      "rows": 2048,
+      "pin": true
+    }
   ]
 }

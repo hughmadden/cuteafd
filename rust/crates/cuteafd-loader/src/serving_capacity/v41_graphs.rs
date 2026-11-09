@@ -32,6 +32,9 @@ pub struct V41PrewarmList {
     pub reserve_extra_bytes: u64,
     pub entries: Vec<V41PrewarmEntry>,
     pub draft_entries: Vec<V41DraftPrewarmEntry>,
+    /// Qualified exact full-chunk and replay widths; never approximate tails.
+    #[serde(default)]
+    pub prefill_entries: Vec<V41PrewarmEntry>,
 }
 
 pub fn v41_prewarm_list() -> &'static V41PrewarmList {
@@ -45,11 +48,22 @@ pub fn v41_prewarm_list() -> &'static V41PrewarmList {
     })
 }
 
-/// Decode widths the startup capture warms. The full prefill chunk and the
-/// 128-row decoder replay are added at runtime because the chunk is a launch
-/// argument, not a checked-in constant.
+/// Decode preferences are directly reachable under the live decode-row cap.
 pub fn v41_prewarm_rows(decode_rows: usize) -> Vec<V41PrewarmEntry> {
     v41_prewarm_list().entries.iter().copied().filter(|entry| entry.rows <= decode_rows).collect()
+}
+
+/// The chunk is a launch input. Substitute only the qualified full-chunk slot;
+/// keep the existing replay shape and do not warm any other large geometry.
+pub fn v41_prefill_rows(capacity: usize, chunk: Option<usize>) -> Vec<usize> {
+    let replay = cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS as usize;
+    let mut rows: Vec<_> = v41_prewarm_list().prefill_entries.iter().filter_map(|entry| {
+        let rows = if entry.rows == replay { Some(replay) } else { chunk }?;
+        (rows <= capacity).then_some(rows)
+    }).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    rows
 }
 
 /// Startup preferences remain a subset of the live draft domain; misses outside
@@ -86,14 +100,31 @@ mod tests {
             assert!(entry.rows > 0 && entry.rows <= cuteafd_core::V41_VERIFY_ROWS);
         }
         assert_eq!(list.reserve_base_bytes % (2 << 20), 0);
-        assert_eq!(list.reserve_extra_bytes, 2 << 20);
-        // One entry per decode width the startup capture enumerates.
-        assert_eq!(v41_prewarm_rows(cuteafd_core::V41_VERIFY_ROWS).len(), cuteafd_core::V41_VERIFY_ROWS);
-        assert_eq!(v41_prewarm_rows(8).len(), 8);
-        assert_eq!(v41_pinned_rows(cuteafd_core::V41_VERIFY_ROWS), vec![1]);
-        let drafts = v41_prewarm_drafts(4, 5);
-        assert_eq!(drafts.len(), 4);
-        assert!(drafts.iter().all(|entry| entry.width == 5 && (1..=4).contains(&entry.requests)));
+        assert_eq!(list.reserve_extra_bytes % (2 << 20), 0);
+        assert!(list.reserve_base_bytes > 0);
+        assert_eq!(v41_prewarm_rows(cuteafd_core::V41_VERIFY_ROWS), list.entries);
+        for cap in [1, 8, cuteafd_core::V41_VERIFY_ROWS] {
+            let expected: Vec<_> = list.entries.iter().copied().filter(|e| e.rows <= cap).collect();
+            assert_eq!(v41_prewarm_rows(cap), expected);
+            assert_eq!(v41_pinned_rows(cap), expected.iter().filter(|e| e.pin).map(|e| e.rows).collect::<Vec<_>>());
+        }
+        let expected: Vec<_> = list.draft_entries.iter().copied()
+            .filter(|e| e.requests <= 4 && e.width <= 5).collect();
+        assert_eq!(v41_prewarm_drafts(4, 5), expected);
+        let replay = cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS as usize;
+        let mut prefill = HashSet::new();
+        for entry in &list.prefill_entries {
+            assert!(entry.pin && (1..=4096).contains(&entry.rows));
+            assert!(prefill.insert(entry.rows), "duplicate prefill geometry");
+        }
+        assert!(prefill.contains(&replay));
+        assert_eq!(prefill.len(), 2, "one qualified full chunk plus replay");
+        for chunk in [128, 2048, 2752] {
+            let mut expected = vec![replay, chunk];
+            expected.sort_unstable(); expected.dedup();
+            assert_eq!(v41_prefill_rows(4096, Some(chunk)), expected);
+        }
+        assert_eq!(v41_prefill_rows(128, Some(2752)), vec![replay]);
         assert!(v41_prewarm_drafts(0, 7).is_empty());
         let mut keys = HashSet::new();
         for entry in &list.draft_entries {
@@ -102,6 +133,10 @@ mod tests {
             assert!(matches!(entry.width, 5 | 7));
         }
         let _: V41PrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
+        let mut without_prefill = serde_json::to_value(&list).unwrap();
+        without_prefill.as_object_mut().unwrap().remove("prefill_entries");
+        let optional: V41PrewarmList = serde_json::from_value(without_prefill).unwrap();
+        assert!(optional.prefill_entries.is_empty());
     }
 
 }
