@@ -267,7 +267,9 @@ struct HitHistogram {
 
 pub(crate) enum Miss { Capture(u64), Eager }
 pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
-static DEVICES: OnceLock<Mutex<HashMap<i32, SharedCache>>> = OnceLock::new();
+// Banks and capture tickets own the controller, not the process registry.
+// After teardown the next serving lifetime must sample a fresh baseline.
+static DEVICES: OnceLock<Mutex<HashMap<i32, std::sync::Weak<Mutex<DeviceCache>>>>> = OnceLock::new();
 
 pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
@@ -288,7 +290,7 @@ fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::R
 pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
     sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<SharedCache> {
     let mut devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cache) = devices.get(&device).cloned() {
+    if let Some(cache) = devices.get(&device).and_then(std::sync::Weak::upgrade) {
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).reserve == reserve,
             "graph banks on device {device} disagree on reserve");
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).basis == basis,
@@ -302,14 +304,15 @@ pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
     let (free, total, tracked) = sample()?;
     controller.observer.observe(free, total, tracked);
     let cache = Arc::new(Mutex::new(controller));
-    devices.insert(device, cache.clone());
+    devices.insert(device, Arc::downgrade(&cache));
     Ok(cache)
 }
 
 /// Attach the admitted charge's provenance after a family has bound its banks.
 pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement::graph_reserve::Resolved) -> anyhow::Result<()> {
     let devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
-    let cache = devices.get(&device).ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
+    let cache = devices.get(&device).and_then(std::sync::Weak::upgrade)
+        .ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     anyhow::ensure!(cache.reserve == policy.bytes, "graph reserve policy disagrees with admission on device {device}");
     cache.reserve_policy = Some(policy);
@@ -318,7 +321,7 @@ pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement:
 
 pub(crate) fn snapshots() -> Vec<Snapshot> {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().cloned().collect();
+        .values().filter_map(std::sync::Weak::upgrade).collect();
     let mut rows: Vec<_> = caches.iter().map(|cache| cache.lock().unwrap_or_else(|p| p.into_inner()).snapshot()).collect();
     rows.sort_by_key(|row| row.device);
     rows
@@ -342,7 +345,7 @@ pub(crate) type GraphVisitor<'a> = dyn FnMut(i32, &'static str, bool,
 
 fn existing_cache(device: i32) -> Option<SharedCache> {
     DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .get(&device).cloned()
+        .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
 /// Observe once per physical device, even when several banks or lanes completed.
@@ -1599,6 +1602,44 @@ mod observer_tests {
         pending(&cache);
         observe_device_sampled(-99105, || Ok((875, 1000, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn reattachment_after_last_owner_drops_seeds_a_fresh_controller() {
+        let cache = attached(-99106);
+        let old = Arc::downgrade(&cache);
+        pending(&cache);
+        observe_device_sampled(-99106, || Ok((500, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 400);
+        drop(cache);
+        assert!(old.upgrade().is_none());
+        assert!(existing_cache(-99106).is_none());
+        assert!(!snapshots().iter().any(|row| row.device == -99106));
+
+        // A new lifetime may have a different reserve and lower residual.
+        let cache = device_cache_sampled(-99106, 2000, Basis::Bytes,
+            || Ok((950, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99106, || Ok((925, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn temporary_owner_drop_preserves_another_live_owners_baseline() {
+        let owner = attached(-99107);
+        let temporary = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("a live controller must not be reseeded")).unwrap();
+        pending(&owner);
+        drop(temporary);
+        let rebuilt = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("lane rebuild must retain the other owner's baseline")).unwrap();
+        assert!(Arc::ptr_eq(&owner, &rebuilt));
+        observe_device_sampled(-99107, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(rebuilt.lock().unwrap().snapshot().charged, 25);
+        drop(owner);
+        let again = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("the rebuilt owner still pins the controller")).unwrap();
+        assert!(Arc::ptr_eq(&rebuilt, &again));
     }
 
     #[test]
