@@ -485,6 +485,12 @@ pub(super) struct Admitted {
     /// The admitted plan, kept so the Ready boundary can verify its predicted
     /// runtime-base owners against the device without re-solving.
     pub solved: cuteafd_loader::placement::planner::ResolvedPlan,
+    /// The checkpoint header the plan was admitted from, kept for the pre-pool
+    /// measurement's pool re-fit (never re-read from disk).
+    pub config: serde_json::Value,
+    /// The pool policy's ceiling, exactly the value `prepare` bounded the
+    /// solve with.
+    pub maximum_pool_tokens: u64,
 }
 
 pub(super) fn local_workspace(
@@ -777,6 +783,8 @@ pub(super) fn resolve_with_owners(
         reservation_bytes: ceilings,
         placement,
         solved: admitted.solved,
+        maximum_pool_tokens: pool.maximum_tokens(),
+        config,
     })
 }
 
@@ -860,6 +868,79 @@ pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admi
     }
     lib.cuda_set_device(current)?;
     Ok(())
+}
+
+/// Adopt the pre-pool device measurement into the admitted plan (#1634).
+///
+/// Called once, after the last loading owner and before the KV pool exists:
+/// the device's occupancy at that point is exactly the plan's owners plus
+/// what the plan cannot name — the driver's 2 MiB backing beyond each live
+/// request, and any remaining device state. The measurement is charged as
+/// named occupancy and the pool is re-fitted to what the budgets still hold,
+/// so a budget-bound boot loses KV instead of discovering the bytes at Ready.
+pub(super) fn adopt_measured_pool(
+    lib: &cuteafd_ffi::NativeLibrary,
+    args: &crate::cli::NativeServeArgs,
+    admitted: &mut Admitted,
+) -> Result<u32> {
+    use cuteafd_ffi::memory_ledger::{Space, snapshot};
+    use families::deepseek_v41::admission::{MeasuredOccupancy, adopt_measured, untracked_ready_owners, whole_gpu_reserve};
+    // A whole-GPU reserve replaces the named runtime owners with the budget's
+    // sampled baseline, so there is no prediction to reconcile.
+    if whole_gpu_reserve() { return Ok(admitted.served_context); }
+    let gpus = admitted.placement.items.len();
+    let current = lib.cuda_get_device()?;
+    let mut measured = Vec::with_capacity(gpus);
+    for gpu in 0..gpus {
+        lib.cuda_set_device(gpu as i32)?;
+        let (free, total) = lib.cuda_memory_info()?;
+        let used = (total as u64).saturating_sub(free as u64);
+        let device = lib.cuda_get_device()?;
+        let ledger = snapshot();
+        let tracked = ledger.total(Space::Device, device) as u64;
+        let rounding = ledger.granularity.get(&(Space::Device, device)).copied().unwrap_or_default();
+        let backing = rounding.tail as u64;
+        let named = untracked_ready_owners(&admitted.solved.facts, gpu as u8)?;
+        let unattributed = used
+            .saturating_sub(tracked)
+            .saturating_sub(named)
+            .saturating_sub(backing);
+        tracing::info!(gpu, used_bytes = used, tracked_bytes = tracked,
+            named_bytes = named, backing_bytes = backing,
+            large_requests = rounding.large_requests, small_bytes = rounding.small_bytes,
+            unattributed_bytes = unattributed,
+            "V4.1 pre-pool device measurement");
+        measured.push(MeasuredOccupancy { gpu: gpu as u8, backing, unattributed });
+    }
+    lib.cuda_set_device(current)?;
+    let ranks = gpus;
+    let slots = args.concurrency as u64;
+    let retained = args.resolved_prefix_entries() as u64;
+    let adopted = adopt_measured(&admitted.config, ranks, slots, retained,
+        args.tp2_attention, admitted.maximum_pool_tokens, &mut admitted.solved, &measured)
+        .context("V4.1 pre-pool measurement adoption")?;
+    let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
+        &admitted.config, ranks, slots, adopted.groups, args.tp2_attention)?;
+    ensure!(exact == adopted.bytes, "adopted V4.1 cache owners differ from allocator");
+    let groups = usize::try_from(adopted.groups)?;
+    // The runtime geometry follows the adopted plan exactly: the same page
+    // array, per-GPU cache bytes and global extent the solve would have built.
+    admitted.pages = [groups, groups, groups, 2 * groups];
+    admitted.cache_bytes = exact.into_iter()
+        .map(usize::try_from)
+        .collect::<std::result::Result<_, _>>()?;
+    admitted.global_bytes = groups * (5 * 256 * 356);
+    admitted.placement.pool_tokens = admitted.solved.pool_tokens;
+    admitted.placement.items = (0..ranks)
+        .map(|rank| admitted.solved.items(
+            cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
+        .collect::<std::result::Result<_, _>>()?;
+    admitted.served_context = u32::try_from(admitted.solved.served_context())?;
+    tracing::info!(pages = adopted.pages, groups = adopted.groups,
+        pool_tokens = admitted.placement.pool_tokens, cache_bytes = ?admitted.cache_bytes,
+        served_context = admitted.served_context,
+        "V4.1 pool re-fitted to the measured pre-pool device state");
+    Ok(admitted.served_context)
 }
 
 /// Charge all occupancy arriving after the context/module inventory, including

@@ -456,7 +456,7 @@ fn worker(
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
     let modules = inventory.gpus.iter().map(|gpu| gpu.module_bytes).collect::<Vec<_>>();
-    let pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
+    let mut pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -715,6 +715,14 @@ fn worker(
     vision_push.commit()?;
     drop(records);
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
+    // The solve priced the pool from the sample taken before any weight,
+    // workspace or exchange owner existed. The device now holds them: charge
+    // what it holds beyond the plan's owners and re-fit the pool to the
+    // budgets (#1634) before the pool's own pages exist.
+    args.max_context_tokens = admission::adopt_measured_pool(&lib, &args, &mut pool)?;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;

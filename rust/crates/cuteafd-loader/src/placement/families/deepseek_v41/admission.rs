@@ -232,6 +232,41 @@ pub fn runtime_base_check(facts: &Facts, gpu: u8, used: u64)
     Ok((predicted, used.saturating_sub(others)))
 }
 
+/// The Ready-resident device owners no allocator ledger row can see: the two
+/// predicted runtime-base owners, the SM120 cuBLAS/BLAS library owners that
+/// `serving::blas_occupancy` charges as occupancy, and the driver's page
+/// tables and arena tails. `runtime_base_check` prices exactly this set as
+/// `others`, so a live measurement of the device subtracts the same bytes
+/// before it calls the rest unattributed (#1634).
+///
+/// KV is excluded: the pre-pool measurement runs before the cache exists, so
+/// its owners are planned but not yet on the device. Every other Ready-active
+/// owner has been created by then (the predicted base before the weights, the
+/// loading owners as they load).
+pub fn untracked_ready_owners(facts: &Facts, gpu: u8) -> Result<u64, Refusal> {
+    let location = Location::coordinator(gpu);
+    let mut total = 0u64;
+    for allocation in &facts.allocations {
+        if allocation.location != location || allocation.view.is_some()
+            || allocation.category == Category::Kv
+            || !allocation.lifetime.contains(Phase::Ready, facts.phase_order)
+            || !(RUNTIME_OWNERS.contains(&allocation.group.as_str())
+                || allocation.group.starts_with(serving::CUBLAS_HANDLE_OWNER)
+                || allocation.group.starts_with(serving::BLAS_INITIALIZATION_OWNER))
+        {
+            continue;
+        }
+        total = total.checked_add(allocation.bytes).ok_or(Refusal::Overflow("V4.1 untracked owners"))?;
+    }
+    for mapping in facts.driver_page_tables.iter().filter(|mapping| mapping.location == location) {
+        total = total.checked_add(mapping.bytes()).ok_or(Refusal::Overflow("V4.1 untracked page tables"))?;
+    }
+    for owner in facts.allocation_granularity.iter().filter(|owner| owner.location == location) {
+        total = total.checked_add(owner.bytes()?).ok_or(Refusal::Overflow("V4.1 untracked arena tail"))?;
+    }
+    Ok(total)
+}
+
 /// The charged components of one GPU's predicted runtime base, named: the
 /// calibrated context and the measured module extent, exactly the allocations
 /// `runtime_base_check` sums into `predicted`. A Ready report prints these
@@ -510,6 +545,156 @@ pub fn cache_owners(
         }
     }
     Ok(out)
+}
+
+/// One coordinator GPU's measured pre-pool device state that no allocator
+/// ledger row and no named owner prices (#1634).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasuredOccupancy {
+    pub gpu: u8,
+    /// The driver's 2 MiB backing beyond the live requests' own bytes
+    /// (`memory_ledger::Granularity::tail`).
+    pub backing: u64,
+    /// Device bytes beyond both the ledger and every named owner.
+    pub unattributed: u64,
+}
+
+/// The pool after adopting a measurement: its page count, the allocator's
+/// group total (`pages + tails`) and each GPU's exact KV bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdoptedPool {
+    pub pages: u64,
+    pub groups: u64,
+    pub bytes: Vec<u64>,
+}
+
+/// The two owners a measurement is charged as. Names, not ids: the Ready
+/// report and the plan ledger print them, so the bytes are never opaque.
+pub const BACKING_OWNER: &str = "SM120 allocation backing";
+pub const UNATTRIBUTED_OWNER: &str = "unattributed runtime, measured";
+
+/// Adopt the pre-pool device measurement into a solved plan (#1634).
+///
+/// The solve sizes the KV pool from a sample taken before the family loads its
+/// weights, so the driver backing that weight, workspace and exchange
+/// allocations add, and the device state no owner names, are not in it. Both
+/// are measurable between the solve and the pool's creation: the ledger counts
+/// every request it made and its own rounding, the plan counts every owner it
+/// named, and the device holds the rest. This charges them as Ready-activated
+/// occupancy owners — the same activation the memory is live on — and then
+/// re-fits the pool to the largest page count whose exact facts still fit
+/// every budget, using the same `evaluate` the solver used. A boot with room
+/// to spare keeps its pool; a budget-bound one gives up KV instead of
+/// discovering the bytes at Ready.
+pub fn adopt_measured(
+    config: &serde_json::Value,
+    gpus: usize,
+    slots: u64,
+    retained_turns: u64,
+    replicated: bool,
+    maximum_pool_tokens: u64,
+    plan: &mut ResolvedPlan,
+    measured: &[MeasuredOccupancy],
+) -> Result<AdoptedPool, Refusal> {
+    let tails = slots
+        .checked_add(retained_turns.checked_mul(2).ok_or(Refusal::Overflow("V4.1 retained turns"))?)
+        .ok_or(Refusal::Overflow("V4.1 private tails"))?;
+    let maximum = maximum_pool_tokens
+        .div_ceil(plan.pool_page_rows)
+        .min(131_072u64.saturating_sub(tails));
+    // Zero is a measurement too: an owner with no bytes is not a charge.
+    for occupant in measured {
+        let location = Location::coordinator(occupant.gpu);
+        for (index, (group, bytes)) in [(BACKING_OWNER, occupant.backing),
+            (UNATTRIBUTED_OWNER, occupant.unattributed)].into_iter().enumerate() {
+            if bytes == 0 { continue; }
+            plan.facts.allocations.push(Allocation::buffer(
+                format!("v41.measured.{}.{index}", occupant.gpu),
+                location, bytes, Lifetime { first: Phase::Ready, last: Phase::Growth },
+                Category::Runtime, group));
+        }
+    }
+    let owners = cache_owners(config, gpus, slots, tails, replicated, maximum)?;
+    refit_pool(plan, &owners, tails)
+}
+
+/// Charge `owners` (one KV component list per GPU) in place of the solved
+/// pool's facts and return the largest page count that still fits every
+/// budget. Only the KV components depend on the page count, so the rest of the
+/// plan is re-priced untouched.
+fn refit_pool(plan: &mut ResolvedPlan, owners: &[Vec<Component>], tails: u64) -> Result<AdoptedPool, Refusal> {
+    let page_rows = plan.pool_page_rows;
+    let solved = plan.pool_tokens.div_ceil(page_rows);
+    let floor = if matches!(plan.request.pool, Pin::Exact(_)) {
+        solved
+    } else {
+        plan.request.context.required().div_ceil(page_rows).max(1)
+    }.min(solved);
+    let (mut low, mut high) = (floor, solved);
+    let mut best: Option<AdoptedPool> = None;
+    while low <= high {
+        let pages = low + (high - low) / 2;
+        let bytes = install_pool_facts(plan, owners, pages)?;
+        match evaluate(&plan.facts, &plan.budgets) {
+            Ok(_) => {
+                best = Some(AdoptedPool { pages, groups: pages.saturating_add(tails), bytes });
+                low = pages.saturating_add(1);
+            }
+            Err(Refusal::Capacity { .. }) if pages > 0 => high = pages - 1,
+            Err(_) => break,
+        }
+    }
+    let adopted = match best {
+        Some(best) => best,
+        None => {
+            // No probe fit. The floor is the smallest legal pool: adopt it
+            // when it fits (a degenerate solved pool can leave the search
+            // empty) and otherwise report why it does not.
+            let bytes = install_pool_facts(plan, owners, floor)?;
+            evaluate(&plan.facts, &plan.budgets)?;
+            AdoptedPool { pages: floor, groups: floor.saturating_add(tails), bytes }
+        }
+    };
+    // The search's last probe may be the rejected one just above `best`; the
+    // plan's facts must end at the adopted page count, not at that probe.
+    let bytes = install_pool_facts(plan, owners, adopted.pages)?;
+    debug_assert_eq!(bytes, adopted.bytes);
+    plan.pool_tokens = adopted.pages.checked_mul(page_rows).ok_or(Refusal::Overflow("pool tokens"))?;
+    plan.phases = evaluate(&plan.facts, &plan.budgets)?;
+    Ok(adopted)
+}
+
+/// Replace every coordinator KV owner with the component list at `pages` and
+/// return each GPU's exact total. The components are the ones `prepare` priced
+/// the solve with, so the pool's facts and the runtime's allocator agree.
+fn install_pool_facts(plan: &mut ResolvedPlan, owners: &[Vec<Component>], pages: u64)
+    -> Result<Vec<u64>, Refusal> {
+    let mut totals = Vec::with_capacity(owners.len());
+    for (gpu, components) in owners.iter().enumerate() {
+        let location = Location::coordinator(gpu as u8);
+        plan.facts.allocations.retain(|owner| !(owner.location == location && owner.category == Category::Kv));
+        let mut total = 0u64;
+        for component in components {
+            let ComponentKind::Allocation { template, shape, offset, deferred } = &component.kind else {
+                return Err(Refusal::InvalidFact("V4.1 KV component is not an allocation".into()));
+            };
+            if template.location != location || template.category != Category::Kv
+                || template.lifetime != Lifetime::TARGET || *deferred {
+                return Err(Refusal::InvalidFact(format!(
+                    "V4.1 KV owner {} differs from its cache geometry", template.id)));
+            }
+            let mut allocation = template.clone();
+            allocation.bytes = component.bytes.at(pages)?;
+            allocation.shape = shape.iter().map(|curve| curve.at(pages)).collect::<Result<_, _>>()?;
+            if let (Some(view), Some(offset)) = (&mut allocation.view, offset) {
+                view.offset = offset.at(pages)?;
+            }
+            total = total.checked_add(allocation.bytes).ok_or(Refusal::Overflow("V4.1 KV pool"))?;
+            plan.facts.allocations.push(allocation);
+        }
+        totals.push(total);
+    }
+    Ok(totals)
 }
 
 /// `min(pages + tails, cap) * per_page`, contiguous over the whole pool.
@@ -1665,8 +1850,15 @@ impl Recipe for V41Recipe<'_> {
         for (arch, coordinator) in [("sm_120", true), ("sm_121", false)] {
             let borrowers = blas.iter().filter(|owner| matches!(owner.location.device,
                 Device::Coordinator(_)) == coordinator).cloned().collect::<Vec<_>>();
-            contract.components.extend(serving::blas_components(arch, &borrowers,
-                self.maximum_pages, contract.phase_order)?);
+            let components = serving::blas_components(arch, &borrowers,
+                self.maximum_pages, contract.phase_order)?;
+            // The RTX coordinator's cuBLAS handles and shared BLAS
+            // initialization exist by Ready, so charge them as occupancy: the
+            // Ready check compares named owners against the device, and a
+            // reserve it cannot see leaves that memory unattributed (#1635).
+            let components = if arch == "sm_120" { serving::blas_occupancy(components) }
+                else { components };
+            contract.components.extend(components);
         }
         for components in cache_owners(
             self.config,
@@ -1793,5 +1985,148 @@ mod runtime_base_tests {
         assert_eq!(components.total(), predicted);
         assert_eq!(runtime_base_components(&facts, 1), RuntimeBaseComponents::default(),
             "another GPU's owners are never reported as this one's");
+    }
+}
+
+#[cfg(test)]
+mod measured_adoption_tests {
+    use super::*;
+    use crate::placement::planner::{DriverPageTable, DriverPageTableModel, PhaseOrder};
+
+    fn facts(allocations: Vec<Allocation>) -> Facts {
+        Facts {
+            phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+            resident_weights: Vec::new(),
+            allocations,
+            deferred: Vec::new(),
+            sequential: Vec::new(),
+            reservations: Vec::new(),
+            allowances: Vec::new(),
+            driver_page_tables: Vec::new(),
+            allocation_granularity: Vec::new(),
+        }
+    }
+
+    fn ready(id: &str, bytes: u64, category: Category, group: &str) -> Allocation {
+        Allocation::buffer(id, Location::coordinator(0), bytes, Lifetime::RESIDENT, category, group)
+    }
+
+    #[test]
+    fn untracked_owners_are_every_ready_owner_the_ledger_cannot_see() {
+        let arch = crate::placement::ArchContext::coordinator(
+            crate::placement::inventory::PRO_TOTAL_BYTES, None);
+        let mut facts = facts(vec![
+            ready("v41.arena", 6 << 30, Category::Weights, "weight arena"),
+            ready("v41.context", arch.context_bytes, Category::Runtime, CONTEXT_OWNER),
+            ready("v41.modules", 40 << 20, Category::Runtime, MODULE_OWNER),
+            ready("v41.blas", 64 << 20, Category::Runtime, serving::CUBLAS_HANDLE_OWNER),
+            ready("v41.blas.init", 2 << 20, Category::Runtime, serving::BLAS_INITIALIZATION_OWNER),
+            // Planned for Ready but not created until the pool is (the
+            // measurement runs before it), so it must not be subtracted.
+            ready("v41.kv.records.0", 40 << 30, Category::Kv, "records"),
+        ]);
+        facts.driver_page_tables.push(DriverPageTable {
+            model: DriverPageTableModel::Sm120Portable,
+            location: Location::coordinator(0),
+            lifetime: Lifetime::RESIDENT,
+            backing: "v41.arena".into(),
+            mapped_bytes: 6 << 30,
+        });
+        let tables = DriverPageTableModel::Sm120Portable.bytes(6 << 30);
+        assert_eq!(untracked_ready_owners(&facts, 0).unwrap(),
+            arch.context_bytes + (40 << 20) + (64 << 20) + (2 << 20) + tables);
+        assert_eq!(untracked_ready_owners(&facts, 1).unwrap(), 0,
+            "another GPU's owners are never subtracted from this one's device");
+    }
+
+    /// One linear 1 MiB owner per page, priced at `solved` pages inside a
+    /// budget that also holds a fixed 4 MiB weight arena.
+    fn plan(solved: u64, budget_bytes: u64) -> (ResolvedPlan, Vec<Vec<Component>>, u64) {
+        const UNIT: u64 = 1 << 20;
+        let maximum = 16;
+        let component = Component::allocation(
+            Allocation::buffer("v41.kv.records.0", Location::coordinator(0), UNIT,
+                Lifetime::TARGET, Category::Kv, "records"),
+            ByteCurve::linear(UNIT, UNIT, maximum), false, maximum);
+        let mut facts = facts(vec![
+            ready("v41.arena", 4 * UNIT, Category::Weights, "weight arena"),
+        ]);
+        facts.allocations.push(Allocation::buffer("v41.kv.records.0", Location::coordinator(0),
+            UNIT * solved, Lifetime::TARGET, Category::Kv, "records"));
+        let budgets = vec![Budget {
+            id: "gpu".into(),
+            locations: vec![Location::coordinator(0)],
+            physical_bytes: budget_bytes,
+            logical_bytes: budget_bytes,
+            baseline: Baseline::Forecast { occupied: 0, source: "test".into(), assumed: false },
+            headroom: 0,
+        }];
+        let plan = ResolvedPlan {
+            encoder_diagnostics: Vec::new(),
+            request: production_request(1024u64, None, crate::placement::Onboard::Auto,
+                PrefillShape { rows: 1, waves: 1 }, Operation::Serving, 0,
+                SparkReplyFormats::default()),
+            decisions: Decisions {
+                attention: Vec::new(), onboard_layers: vec![Vec::new()],
+                expert_homes: BTreeMap::new(), embedding: None, draft_home: None,
+                head_home: None, intake_home: None, encoder: None,
+                prefill: PrefillShape { rows: 1, waves: 1 }, lanes: 1,
+                spark_reply_formats: None,
+            },
+            pool_tokens: solved * 512,
+            pool_page_rows: 512,
+            budgets,
+            facts,
+            phases: Vec::new(),
+        };
+        (plan, vec![vec![component]], UNIT)
+    }
+
+    #[test]
+    fn a_measured_charge_shrinks_a_budget_bound_pool_and_keeps_a_free_one() {
+        // 16 MiB available, 4 MiB fixed and 12 MiB of KV: the solved pool fills it.
+        let (mut bound, owners, unit) = plan(12, 16 * (1 << 20));
+        let adopted = refit_pool(&mut bound, &owners, 0).unwrap();
+        assert_eq!(adopted.pages, 12, "an uncharged pool is not re-fitted");
+        assert_eq!(adopted.groups, 12);
+        assert_eq!(adopted.bytes, vec![12 * unit]);
+
+        // A 3 MiB charge only fits if the pool gives up three pages.
+        let (mut bound, owners, unit) = plan(12, 16 * (1 << 20));
+        bound.facts.allocations.push(Allocation::buffer("v41.measured.0.0",
+            Location::coordinator(0), 2 * unit, Lifetime { first: Phase::Ready, last: Phase::Growth },
+            Category::Runtime, BACKING_OWNER));
+        bound.facts.allocations.push(Allocation::buffer("v41.measured.0.1",
+            Location::coordinator(0), unit, Lifetime { first: Phase::Ready, last: Phase::Growth },
+            Category::Runtime, UNATTRIBUTED_OWNER));
+        let adopted = refit_pool(&mut bound, &owners, 0).unwrap();
+        assert_eq!((adopted.pages, adopted.groups, adopted.bytes), (9, 9, vec![9 * unit]));
+        assert_eq!(bound.pool_tokens, 9 * 512);
+        // The pool's facts are the components at the adopted page count, so the
+        // runtime allocator and the plan still charge the same bytes.
+        let kv = bound.facts.allocations.iter()
+            .filter(|owner| owner.category == Category::Kv).map(|owner| owner.bytes).sum::<u64>();
+        assert_eq!(kv, 9 * unit);
+        assert!(bound.phases.iter().all(|row| row.owned + row.opaque <= row.available),
+            "{:?}", bound.phases);
+
+        // A search whose final probe is the rejected page count still ends its
+        // facts at the adopted count (15 MiB: 8 pages fit, 9 do not).
+        let (mut tight, owners, unit) = plan(12, 15 * (1 << 20));
+        tight.facts.allocations.push(Allocation::buffer("v41.measured.0.0",
+            Location::coordinator(0), 2 * unit, Lifetime { first: Phase::Ready, last: Phase::Growth },
+            Category::Runtime, BACKING_OWNER));
+        tight.facts.allocations.push(Allocation::buffer("v41.measured.0.1",
+            Location::coordinator(0), unit, Lifetime { first: Phase::Ready, last: Phase::Growth },
+            Category::Runtime, UNATTRIBUTED_OWNER));
+        let adopted = refit_pool(&mut tight, &owners, 0).unwrap();
+        assert_eq!((adopted.pages, adopted.bytes), (8, vec![8 * unit]));
+        let kv = tight.facts.allocations.iter()
+            .filter(|owner| owner.category == Category::Kv).map(|owner| owner.bytes).sum::<u64>();
+        assert_eq!(kv, 8 * unit, "facts end at the adopted page count, not the last probe");
+
+        // A pool with room to spare keeps every page.
+        let (mut slack, owners, _) = plan(12, 24 * (1 << 20));
+        assert_eq!(refit_pool(&mut slack, &owners, 0).unwrap().pages, 12);
     }
 }

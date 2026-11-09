@@ -645,8 +645,8 @@ mod tests {
                 }
                 let admitted = prepared.admit(request)?;
                 assert_eq!(admitted.solved.decisions.encoder, Some(0));
-                let handles = admitted.solved.facts.allowances.iter().filter(|owner|
-                    owner.source.starts_with("cuBLAS handles:")
+                let handles = admitted.solved.facts.allocations.iter().filter(|owner|
+                    owner.group.starts_with("cuBLAS handles:")
                         && owner.lifetime.contains(Phase::Ready, admitted.solved.facts.phase_order))
                     .collect::<Vec<_>>();
                 // Spark media is covered by its existing measured overhead (#1568).

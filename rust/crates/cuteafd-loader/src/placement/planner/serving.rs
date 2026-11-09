@@ -103,6 +103,9 @@ pub struct BlasOwners {
 /// BLAS adds 201,461,760 B, later creates/plans zero. These are separate
 /// process-local owners, not a padded per-handle price. Probe: 2026-11-07,
 /// BF16 M16/K4096/N4096. SM121 Lt-only processes need a separate qualification.
+/// Every emitted owner is an `Allowance`: free in the phase budget, invisible to
+/// a Ready-time occupancy sum. `blas_occupancy` converts the SM120 ones where a
+/// family's borrowers are already resident by the phase they name.
 pub fn blas_components(arch: &str, owners: &[BlasOwners], maximum: u64,
     order: PhaseOrder) -> Result<Vec<Component>, Refusal> {
     let per_handle = match arch {
@@ -194,6 +197,39 @@ pub fn blas_components(arch: &str, owners: &[BlasOwners], maximum: u64,
         }
     }
     Ok(out)
+}
+
+/// The two SM120 library owners `blas_components` reserves: each retained
+/// cuBLAS handle pool and the shared BLAS device initialization. Both are
+/// device memory by Ready (a lazily created handle still pays its full
+/// workspace the moment the first compressor, index or vocabulary plan runs,
+/// which startup does), so a plan that verifies its Ready device state against
+/// named owners must price them as occupancy, not only as a free reserve.
+pub const CUBLAS_HANDLE_OWNER: &str = "cuBLAS handles";
+pub const BLAS_INITIALIZATION_OWNER: &str = "BLAS device initialization";
+
+/// Convert the SM120 library allowances into occupancy owners of the same
+/// bytes, lifetime and activation. Prefer this only for a family whose BLAS
+/// borrowers are resident from the phase the allowance names: the conversion
+/// changes nothing in any phase budget, it only lets a Ready-time occupancy
+/// check see the bytes. V4.1 does this (#1635); the reserved form stays the
+/// default for families that create their pools later.
+pub fn blas_occupancy(components: Vec<Component>) -> Vec<Component> {
+    components.into_iter().enumerate().map(|(index, mut component)| {
+        let ComponentKind::Allowance(allowance) = &component.kind else { return component };
+        if ![CUBLAS_HANDLE_OWNER, BLAS_INITIALIZATION_OWNER].into_iter()
+            .any(|owner| allowance.source.starts_with(owner))
+        { return component }
+        // Keep the borrowed source as the group so per-thread handle pools stay
+        // distinguishable and the `cuBLAS handles:`/`BLAS device initialization`
+        // prefixes that already price these owners keep matching.
+        let allocation = Allocation::buffer(format!("blas.occupancy.{index}"), allowance.location,
+            allowance.bytes, allowance.lifetime, Category::Runtime, allowance.source.clone());
+        component.kind = ComponentKind::Allocation {
+            template: allocation, shape: Vec::new(), offset: None, deferred: false,
+        };
+        component
+    }).collect()
 }
 
 #[derive(Debug, Clone, Copy)]
