@@ -18,6 +18,7 @@
 #include <new>
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
 #include <dlfcn.h>
@@ -1750,6 +1751,77 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream,
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA graph capture is unavailable in this build");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
+    void* cuda_stream, void** out_exec, size_t* out_nodes, size_t* out_width, int* out_spans_devices) {
+  if (!out_exec || !out_nodes || !out_width || !out_spans_devices) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph topology output");
+  }
+  *out_exec = nullptr;
+  *out_nodes = *out_width = 0;
+  *out_spans_devices = 0;
+  cuteafd_cuda_graph_capture_info_t capture = {};
+  cuteafd_status_t status = cuteafd_cuda_graph_end_capture_retained(cuda_stream, &capture);
+  if (status != CUTEAFD_STATUS_OK) return status;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaGraph_t graph = reinterpret_cast<cudaGraph_t>(capture.graph);
+  cudaGraphExec_t exec = reinterpret_cast<cudaGraphExec_t>(capture.graph_exec);
+  auto cleanup = [&]() { cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); };
+  size_t count = capture.node_count, edges = 0;
+  std::vector<cudaGraphNode_t> nodes(count);
+  cudaError_t err = cudaGraphGetNodes(graph, nodes.data(), &count);
+  if (err == cudaSuccess) err = cudaGraphGetEdges(graph, nullptr, nullptr, &edges);
+  std::vector<cudaGraphNode_t> from(edges), to(edges);
+  if (err == cudaSuccess && edges) err = cudaGraphGetEdges(graph, from.data(), to.data(), &edges);
+  if (err != cudaSuccess) {
+    cleanup();
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph topology query failed", err);
+  }
+  std::unordered_map<cudaGraphNode_t, size_t> index;
+  for (size_t n = 0; n < count; ++n) index[nodes[n]] = n;
+  std::vector<size_t> incoming(count, 0);
+  std::vector<std::vector<size_t>> outgoing(count);
+  for (size_t e = 0; e < edges; ++e) {
+    outgoing[index[from[e]]].push_back(index[to[e]]);
+    ++incoming[index[to[e]]];
+  }
+  std::vector<size_t> ready;
+  for (size_t n = 0; n < count; ++n) if (!incoming[n]) ready.push_back(n);
+  size_t width = ready.size();
+  // Maximum ready frontier. In particular, width == 1 proves a chain;
+  // non-chain graphs must never reuse the calibrated chain arena model.
+  for (size_t n = 0; n < ready.size(); ++n) {
+    for (size_t next : outgoing[ready[n]]) if (--incoming[next] == 0) ready.push_back(next);
+    width = std::max(width, ready.size() - n - 1);
+  }
+  int device = -1;
+  cudaGetDevice(&device);
+  for (auto node : nodes) {
+    cudaGraphNodeType type;
+    if (cudaGraphNodeGetType(node, &type) != cudaSuccess || type != cudaGraphNodeTypeMemcpy) continue;
+    cudaMemcpy3DParms params = {};
+    if (cudaGraphMemcpyNodeGetParams(node, &params) != cudaSuccess) continue;
+    for (void* ptr : {params.srcPtr.ptr, params.dstPtr.ptr}) {
+      if (!ptr) continue;
+      cudaPointerAttributes attributes = {};
+      if (cudaPointerGetAttributes(&attributes, ptr) == cudaSuccess) {
+        if (attributes.type == cudaMemoryTypeDevice && attributes.device != device) *out_spans_devices = 1;
+      } else { cudaGetLastError(); }
+    }
+  }
+  err = cudaGraphDestroy(graph);
+  if (err != cudaSuccess) {
+    cudaGraphExecDestroy(exec);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph source destroy failed", err);
+  }
+  *out_exec = capture.graph_exec;
+  *out_nodes = count;
+  *out_width = width;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA graph topology unavailable");
 #endif
 }
 

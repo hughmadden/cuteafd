@@ -1582,15 +1582,46 @@ impl<'a> GlmEngine<'a> {
 
     pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
         use crate::shared::decode_graph::device::{Cycle, Preference, Site};
+        if self.graph_basis() == crate::shared::decode_graph::device::Basis::Bytes {
+            tracing::warn!("GLM graph cache uses per-site byte estimates: local/TP2 or non-HQA node counts uncalibrated");
+        }
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
             let device = self.on(rank, || self.library.cuda_get_device())?;
             graphs.borrow_mut().attach_device(device, reserves[rank], Site {
                 name: "glm5.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
+                basis: self.graph_basis(),
             })?;
         }
         Ok(())
+    }
+
+    fn graph_basis(&self) -> crate::shared::decode_graph::device::Basis {
+        use crate::shared::decode_graph::device::Basis;
+        // #1612 rates cover this route only. One basis is selected for every
+        // bank on the device; local/TP2 must not mix node and byte units.
+        if self.ranks() == 1 && !self.has_local()
+            && matches!(self.cfg.variant, cuteafd_loader::families::glm5::GlmVariant::Glm)
+            && self.weights.layers.iter().all(|layer| !layer.attention_native.is_empty()) {
+            let rate = cuteafd_loader::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES[0];
+            Basis::Nodes { node_rate: rate.bytes_per_node, graph_rate: rate.bytes_per_executable }
+        } else { Basis::Bytes }
+    }
+
+    fn graph_estimate(&self, key: &GraphKey) -> Option<crate::shared::decode_graph::device::Estimate> {
+        use crate::shared::decode_graph::device::{Basis, Estimate};
+        use cuteafd_loader::serving_capacity::glm_graph_nodes::{glm_remote_hqa_nodes, GlmRemoteHqaNodeClass};
+        let Basis::Nodes { node_rate, graph_rate } = self.graph_basis() else { return None };
+        let layer = self.weights.layers.get(key.layer);
+        let nodes = glm_remote_hqa_nodes(key, GlmRemoteHqaNodeClass {
+            dense: layer.is_some_and(|layer| layer.dense),
+            paged_dsa: layer.is_some_and(|layer| layer.full_indexer),
+            speculator_tap: key.layer.checked_sub(1).is_some_and(|previous|
+                self.drafter.as_ref().is_some_and(|draft| draft.tap_index(previous).is_some())),
+        }).ok()?;
+        Some(Estimate { bytes: nodes.saturating_mul(node_rate).saturating_add(graph_rate),
+            nodes: Some(nodes), node_rate, graph_rate, parallel_width: 1 })
     }
 
     fn graph_free_samples(&self) -> Result<Vec<u64>> {
@@ -2226,11 +2257,14 @@ impl<'a> GlmEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
-        let pinned = key.rows == 1 && key.table_width == 1;
-        let ticket = graphs.borrow_mut().cache_miss(&key, pinned, None);
+        let pinned = key.rows == 1 && key.table_width == 16;
+        let ticket = graphs.borrow_mut().cache_miss(&key, pinned, self.graph_estimate(&key));
         let crate::shared::decode_graph::device::Miss::Capture(ticket) = ticket else { return segment() };
         if self.graph_before.borrow().is_none() {
-            *self.graph_before.borrow_mut() = Some(self.graph_free_samples()?);
+            match self.graph_free_samples() {
+                Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
+                Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
+            }
         }
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
@@ -2240,14 +2274,14 @@ impl<'a> GlmEngine<'a> {
             return segment();
         }
         let captured = segment();
-        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture(stream) });
+        let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_cancel(ticket);
-            if let Ok(raw) = exec { drop(GraphExec(raw, self.library)); }
+            if let Ok((raw, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
-        let raw = match exec {
-            Ok(raw) => raw,
+        let (raw, nodes, width, spans_devices) = match exec {
+            Ok(info) => info,
             Err(error) => {
                 graphs.borrow_mut().cache_cancel(ticket);
                 tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
@@ -2257,8 +2291,13 @@ impl<'a> GlmEngine<'a> {
         let graph = GraphExec(raw, self.library);
         crate::shared::decode_graph::census::capture_key("glm5", "decode",
             graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
-        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
+        graphs.borrow_mut().cache_topology(ticket, nodes as u64, width, spans_devices);
+        // Own the executable and ticket before launch: a launch error is drained
+        // by the submission guard before either its pointers or owner can retire.
         graphs.borrow_mut().cache_insert(key, graph, ticket, pinned);
+        let bank = graphs.borrow();
+        let graph = bank.get(&key).context("inserted graph")?;
+        self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) })?;
         Ok(())
     }
 

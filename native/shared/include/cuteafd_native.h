@@ -359,6 +359,9 @@ cuteafd_status_t cuteafd_cuda_prepare_cublas_stream(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_prepare_cublas_handle();
 cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream, void** out_cuda_graph_exec);
+// Topology is queried before destroying the source graph, without synchronizing.
+cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(void* cuda_stream,
+    void** out_cuda_graph_exec, size_t* out_nodes, size_t* out_width, int* out_spans_devices);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream);

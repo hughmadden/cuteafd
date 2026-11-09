@@ -124,7 +124,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn attach_device(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
-        let cache = super::device::device_cache(device, reserve)?;
+        let cache = super::device::device_cache(device, reserve, site.basis)?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
         let trace = cache.lock().unwrap_or_else(|p| p.into_inner()).tracing();
         self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, trace });
@@ -155,6 +155,12 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
     pub fn cache_cancel(&mut self, id: u64) {
         if let Some(binding) = &self.device { binding.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(id); }
+    }
+
+    pub fn cache_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).captured_topology(id, nodes, width, spans_devices);
+        }
     }
 
     /// Explicit teardown only, after the caller drains all consumers.
@@ -680,7 +686,7 @@ mod budget_tests {
 mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
-    fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10 } }
+    fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes } }
     #[test]
     fn device_eviction_destroys_only_after_successful_drain() {
         use std::{cell::Cell, rc::Rc};

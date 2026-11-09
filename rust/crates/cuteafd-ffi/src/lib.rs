@@ -1736,6 +1736,7 @@ native_symbols! {
     cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
+    cuteafd_cuda_graph_end_capture_topology: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize, *mut usize, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
     cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
     cuteafd_copy_h2d: CopyH2DFn,
@@ -2974,6 +2975,19 @@ impl NativeLibrary {
         Ok(cuda_graph_exec)
     }
 
+
+    /// # Safety
+    /// The stream is in capture mode and all captured storage remains live.
+    pub unsafe fn cuda_graph_end_capture_topology(&self, stream: *mut c_void)
+        -> Result<(*mut c_void, usize, usize, bool)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let end = self.cuteafd_cuda_graph_end_capture_topology()?;
+        let (mut exec, mut nodes, mut width, mut spans) = (std::ptr::null_mut(), 0, 0, 0);
+        // SAFETY: outputs are valid and stream's capture is caller-owned.
+        let status = unsafe { end(stream, &mut exec, &mut nodes, &mut width, &mut spans) };
+        self.status_to_result("cuteafd_cuda_graph_end_capture_topology", status)?;
+        Ok((exec, nodes, width, spans != 0))
+    }
 
     pub unsafe fn cuda_graph_launch(
         &self,

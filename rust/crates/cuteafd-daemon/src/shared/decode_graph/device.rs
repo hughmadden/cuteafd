@@ -11,6 +11,25 @@ pub(crate) enum Cycle { Decode, Verify, Prefill, Wave, Other }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Preference { Adaptive, Capture, Eager }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum Basis {
+    Bytes,
+    Nodes { node_rate: u64, graph_rate: u64 },
+}
+
+impl Basis {
+    fn pool_bytes(self, nodes: u64, execs: u64) -> u64 {
+        match self {
+            Self::Bytes => nodes,
+            Self::Nodes { node_rate, graph_rate } => {
+                let pack = |bytes: u64| bytes.div_ceil(2 << 20).saturating_mul(2 << 20);
+                pack(nodes.saturating_mul(node_rate)).saturating_add(pack(execs.saturating_mul(graph_rate)))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Site {
     pub name: &'static str,
@@ -18,6 +37,7 @@ pub(crate) struct Site {
     pub preference: Preference,
     /// Family estimate used only until the device has a measured graph.
     pub bootstrap: u64,
+    pub basis: Basis,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
@@ -45,6 +65,7 @@ pub(crate) struct Snapshot {
     pub pending_capture: u64,
     pub cycles: HashMap<Cycle, Counters>,
     pub pools: Pools,
+    pub basis: Basis,
 }
 
 /// Release observations are deliberately independent of cudaMemGetInfo. An
@@ -114,20 +135,26 @@ struct TraceRow {
     count: u64,
     first_seen_ms: u64,
     declared_capture_streams: usize,
+    max_parallel_width: usize,
+    spans_devices: bool,
 }
 
 pub(crate) enum Miss { Capture(u64), Eager }
 pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
 static DEVICES: OnceLock<Mutex<HashMap<i32, SharedCache>>> = OnceLock::new();
 
-pub(crate) fn device_cache(device: i32, reserve: u64) -> anyhow::Result<SharedCache> {
+pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
     let mut devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cache) = devices.get(&device).cloned() {
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).reserve == reserve,
             "graph banks on device {device} disagree on reserve");
+        anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).basis == basis,
+            "graph banks on device {device} disagree on estimator basis");
         return Ok(cache);
     }
-    let cache = Arc::new(Mutex::new(DeviceCache::new(device, reserve)));
+    let mut controller = DeviceCache::new(device, reserve);
+    controller.basis = basis;
+    let cache = Arc::new(Mutex::new(controller));
     devices.insert(device, cache.clone());
     Ok(cache)
 }
@@ -154,6 +181,9 @@ pub(crate) struct DeviceCache {
     classes: HashMap<&'static str, SizeClass>,
     pending_growth: u64,
     pools: Pools,
+    basis: Basis,
+    chain_only: bool,
+    unmeasured: bool,
     pending_destroy: usize,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
@@ -168,7 +198,8 @@ impl DeviceCache {
         Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
-            pending_growth: 0, pools: Pools::default(), pending_destroy: 0,
+            pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
+            chain_only: true, unmeasured: false, pending_destroy: 0,
             counters: HashMap::new(), started: Instant::now(), last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
             trace_rows: HashMap::new() }
@@ -177,7 +208,7 @@ impl DeviceCache {
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
     pub fn reserve(&self) -> u64 { self.reserve }
     pub fn needs_boundary(&self) -> bool {
-        self.pending_bytes > 0 || self.pending_growth > 0 || self.pending_destroy > 0
+        self.unmeasured || self.pending_destroy > 0
     }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
     pub fn tracing(&self) -> bool { self.trace.is_some() }
@@ -229,7 +260,8 @@ impl DeviceCache {
         if self.trace.is_none() { return }
         let row = self.trace_rows.entry(identity.clone()).or_insert_with(|| TraceRow {
             device: self.device, identity: identity.clone(), cycle, count: 0,
-            first_seen_ms: self.started.elapsed().as_millis() as u64, declared_capture_streams: 1 });
+            first_seen_ms: self.started.elapsed().as_millis() as u64, declared_capture_streams: 1,
+            max_parallel_width: 0, spans_devices: false });
         row.count += 1;
     }
 
@@ -248,9 +280,8 @@ impl DeviceCache {
 
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
         let class = self.classes.get(site.name);
-        let fallback = self.classes.values().map(|c| c.largest).max().unwrap_or(site.bootstrap);
         let estimate = node_estimate.filter(|n| *n > 0).unwrap_or_else(|| class
-            .filter(|c| c.samples > 0).map_or(fallback, |c| c.total.div_ceil(c.samples)));
+            .filter(|c| c.samples > 0).map_or(site.bootstrap, |c| c.total.div_ceil(c.samples)));
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
@@ -284,6 +315,18 @@ impl DeviceCache {
     pub fn miss(&mut self, identity: Identity, site: Site, node_estimate: Option<Estimate>, pinned: bool) -> Miss {
         self.trace(&identity, site.cycle);
         self.counters.entry(site.cycle).or_default().misses += 1;
+        let compatible = site.basis == self.basis && match (self.basis, &node_estimate) {
+            (Basis::Bytes, None | Some(Estimate { nodes: None, .. })) => true,
+            (Basis::Nodes { node_rate, graph_rate }, Some(estimate)) =>
+                estimate.nodes.is_some() && estimate.node_rate == node_rate && estimate.graph_rate == graph_rate,
+            _ => false,
+        };
+        if !compatible {
+            tracing::warn!(device = self.device, site = site.name, basis = ?self.basis,
+                "graph estimate basis mismatch; running eagerly");
+            self.counters.entry(site.cycle).or_default().eager_runs += 1;
+            return Miss::Eager;
+        }
         let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
         let old = self.identities.get(&identity).copied();
         let ghost = old.and_then(|id| self.records[&id].list)
@@ -304,13 +347,11 @@ impl DeviceCache {
         let nodes = metadata.nodes.unwrap_or(estimate);
         let next_nodes = self.pools.live_nodes.saturating_add(nodes);
         let next_execs = self.pools.live_execs.saturating_add(1);
-        let pool_bytes = |units: u64, rate: u64| {
-            let bytes = units.saturating_mul(rate);
-            if metadata.nodes.is_some() { bytes.div_ceil(2 << 20).saturating_mul(2 << 20) } else { bytes }
-        };
-        let growth = pool_bytes(next_nodes, metadata.node_rate).saturating_sub(pool_bytes(self.pools.node_high_water, metadata.node_rate))
-            .saturating_add(pool_bytes(next_execs, metadata.graph_rate).saturating_sub(pool_bytes(self.pools.exec_high_water, metadata.graph_rate)));
-        let reuse = growth == 0 && metadata.parallel_width <= 1;
+        let projected = self.basis.pool_bytes(next_nodes.max(self.pools.node_high_water),
+            next_execs.max(self.pools.exec_high_water)).saturating_sub(
+                self.basis.pool_bytes(self.pools.node_high_water, self.pools.exec_high_water));
+        let growth = projected.saturating_sub(self.pending_growth);
+        let reuse = projected == 0 && metadata.parallel_width <= 1 && self.chain_only && !self.unmeasured;
         let allowed = site.preference != Preference::Eager && estimate > 0;
         let room = may_capture(site.preference, growth, headroom, self.reserve,
             self.charged, self.pending_growth, self.pending_bytes, reuse);
@@ -327,11 +368,10 @@ impl DeviceCache {
             record.bytes = estimate; record.pinned = pinned; record.pending_capture = true;
             record.nodes = nodes; record.node_rate = metadata.node_rate;
             record.graph_rate = metadata.graph_rate; record.parallel_width = metadata.parallel_width;
-            self.pending_growth = self.pending_growth.saturating_add(growth);
+            self.pending_growth = self.pending_growth.max(projected);
+            self.unmeasured = true;
             self.pools.live_nodes = next_nodes;
             self.pools.live_execs = next_execs;
-            self.pools.node_high_water = self.pools.node_high_water.max(next_nodes);
-            self.pools.exec_high_water = self.pools.exec_high_water.max(next_execs);
             if let Some(row) = self.trace_rows.get_mut(&self.records[&id].identity) {
                 row.declared_capture_streams = metadata.parallel_width;
             }
@@ -383,11 +423,32 @@ impl DeviceCache {
         self.forget(id);
     }
 
+    pub fn captured_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
+        let Some(record) = self.records.get_mut(&id) else { return };
+        if width > 1 || spans_devices {
+            self.chain_only = false;
+            tracing::warn!(device = self.device, site = record.identity.site, width, spans_devices,
+                "non-chain graph capture; disabling high-water reuse assumption");
+        }
+        if let Basis::Nodes { .. } = self.basis {
+            self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes).saturating_add(nodes);
+            record.nodes = nodes;
+        }
+        record.parallel_width = width;
+        if let Some(row) = self.trace_rows.get_mut(&record.identity) {
+            row.max_parallel_width = width;
+            row.spans_devices = spans_devices;
+        }
+    }
+
     /// Called once per device after the complete multi-rank step has drained.
     /// `bytes` is the measured net graph allocation, not a sum of estimates.
     pub fn measured_capture(&mut self, bytes: u64) {
         let pending: Vec<_> = self.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, r)| (id, r.bytes)).collect();
-        if pending.is_empty() && self.pending_growth == 0 && bytes == 0 { return }
+        if pending.is_empty() && !self.unmeasured && bytes == 0 { return }
+        // Only successful owners surviving this completed boundary prove reuse.
+        self.pools.node_high_water = self.pools.node_high_water.max(self.pools.live_nodes);
+        self.pools.exec_high_water = self.pools.exec_high_water.max(self.pools.live_execs);
         let total = self.pending_bytes.max(1);
         let mut remaining = bytes;
         for (index, &(id, estimated)) in pending.iter().enumerate() {
@@ -408,6 +469,7 @@ impl DeviceCache {
         }
         self.pending_bytes = 0;
         self.pending_growth = 0;
+        self.unmeasured = false;
         self.charged = self.charged.saturating_add(bytes);
         if self.charged > self.reserve {
             tracing::warn!(device = self.device, charged = self.charged, reserve = self.reserve,
@@ -481,14 +543,14 @@ impl DeviceCache {
     fn snapshot(&self) -> Snapshot {
         Snapshot { device: self.device, reserve: self.reserve, charged: self.charged,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
-            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone() }
+            pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10 } }
+    fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes } }
     fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", shape: n.to_string() } }
     fn capture(cache: &mut DeviceCache, n: u64, pinned: bool) -> u64 {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
@@ -559,10 +621,13 @@ mod tests {
     #[test]
     fn node_and_exec_pools_have_independent_peaks() {
         let mut cache = DeviceCache::new(-205, 64 << 20);
+        cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
+        let mut node_site = site(Preference::Capture);
+        node_site.basis = cache.basis;
         let estimate = |nodes| Some(Estimate { bytes: nodes * 2560 + 65536,
             nodes: Some(nodes), node_rate: 2560, graph_rate: 65536, parallel_width: 1 });
         for n in 0..8 {
-            assert!(matches!(cache.miss(key(n), site(Preference::Capture), estimate(1), false), Miss::Capture(_)));
+            assert!(matches!(cache.miss(key(n), node_site, estimate(1), false), Miss::Capture(_)));
         }
         cache.measured_capture(4 << 20);
         let mut victims = Vec::new();
@@ -570,10 +635,12 @@ mod tests {
         cache.destroyed(&victims, ReleaseMeasurement { released: 0 });
         assert_eq!(cache.pools.exec_high_water, 8);
         assert_eq!(cache.pools.live_execs, 0);
-        assert!(matches!(cache.miss(key(99), site(Preference::Capture), estimate(1024), false), Miss::Capture(_)));
+        assert!(matches!(cache.miss(key(99), node_site, estimate(1024), false), Miss::Capture(_)));
+        assert_eq!(cache.pools.node_high_water, 8);
+        cache.measured_capture(2 << 20);
         assert_eq!(cache.pools.node_high_water, 1024);
         assert_eq!(cache.pools.exec_high_water, 8);
-        assert_eq!(cache.charged, 4 << 20);
+        assert_eq!(cache.charged, 6 << 20);
     }
 
     #[test]
