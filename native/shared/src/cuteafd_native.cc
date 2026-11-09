@@ -1740,7 +1740,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_begin_capture(void* cuda_stream) 
       cudaStreamBeginCapture(reinterpret_cast<cudaStream_t>(cuda_stream),
                              cudaStreamCaptureModeThreadLocal);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamBeginCapture failed", err);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamBeginCapture failed",
+                     cuteafd::diagnostic_cuda(err));
   }
   return ok();
 #else
@@ -1764,7 +1765,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture(void* cuda_stream,
   cudaError_t destroy_err = cudaGraphDestroy(reinterpret_cast<cudaGraph_t>(capture.graph));
   if (destroy_err != cudaSuccess) {
     cudaGraphExecDestroy(reinterpret_cast<cudaGraphExec_t>(capture.graph_exec));
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphDestroy failed", destroy_err);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphDestroy failed",
+                     cuteafd::diagnostic_cuda(destroy_err));
   }
   *out_cuda_graph_exec = capture.graph_exec;
   return ok();
@@ -1796,7 +1798,8 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
   cudaError_t err = cudaGraphDestroy(graph);
   if (err != cudaSuccess) {
     cudaGraphExecDestroy(exec);
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph source destroy failed", err);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph source destroy failed",
+                     cuteafd::diagnostic_cuda(err));
   }
   *out_exec = capture.graph_exec;
   *out_nodes = count;
@@ -1824,7 +1827,9 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   cudaGraph_t graph = nullptr;
   cudaError_t err = cudaStreamEndCapture(reinterpret_cast<cudaStream_t>(cuda_stream), &graph);
   if (err != cudaSuccess) {
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture failed", err);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture failed",
+                     cuteafd::diagnostic_cuda(err));
   }
   if (graph == nullptr) {
     return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaStreamEndCapture returned a null graph");
@@ -1837,17 +1842,22 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
   err = CUTEAFD_CHECK_MEMORY("cudaGraphInstantiate", "cuda", cudaGraphInstantiate(&graph_exec, graph, 0), 0, 0, graph);
   const cudaError_t after_status = census ? cuteafd::diagnostic_cuda(cudaMemGetInfo(&after_free, &total)) : cudaSuccess;
   if (err != cudaSuccess) {
+    if (graph_exec != nullptr) cudaGraphExecDestroy(graph_exec);
     cudaGraphDestroy(graph);
-    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph memory allocation/instantiation failed; increase GRAPH_NODE_PADDING for driver drift, lower GPU_MEMORY_CAP or increase GPU_RESERVE to leave graph headroom", err);
+    // A cache miss retries eagerly on the same host thread. OOM is not sticky,
+    // but leaving its last-error slot set makes the next valid peer-wait launch
+    // report the old OOM and permanently retire an otherwise healthy TP2 engine.
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate failed",
+                     cuteafd::diagnostic_cuda(err));
   }
   if (graph_exec == nullptr) {
-    cudaGraphDestroy(graph);
+    cuteafd::diagnostic_cuda(cudaGraphDestroy(graph));
     return fail(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphInstantiate returned a null graph exec");
   }
   cuteafd_status_t status = fill_cuda_graph_capture_info(graph, graph_exec, out);
   if (status != CUTEAFD_STATUS_OK) {
-    cudaGraphExecDestroy(graph_exec);
-    cudaGraphDestroy(graph);
+    cuteafd::diagnostic_cuda(cudaGraphExecDestroy(graph_exec));
+    cuteafd::diagnostic_cuda(cudaGraphDestroy(graph));
     return status;
   }
   if (census) { record_graph_census(graph, graph_exec, before_status, before_free, after_status, after_free); }

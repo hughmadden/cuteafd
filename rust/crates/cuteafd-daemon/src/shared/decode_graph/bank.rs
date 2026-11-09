@@ -849,6 +849,55 @@ mod device_tests {
     }
 
     #[test]
+    fn failed_peer_capture_cancels_ticket_without_retiring_submission_or_rerunning_peer() {
+        use crate::shared::experts::rtx::pair;
+        use std::cell::Cell;
+        for failed_rank in 0..2 {
+            let mut banks = [GraphBank::new(None), GraphBank::new(None)];
+            for (rank, bank) in banks.iter_mut().enumerate() {
+                bank.attach_device_for_test(-920 - (failed_rank * 2 + rank) as i32, 1000,
+                    Site { spans_devices: true, ..site() }).unwrap();
+            }
+            let eager = [Cell::new(0), Cell::new(0)];
+            let queued = [Cell::new(0), Cell::new(0)];
+            let retired = Cell::new(false);
+            pair::submit(|| Ok(()), || { retired.set(true); Ok(()) }, || {
+                for (rank, bank) in banks.iter_mut().enumerate() {
+                    let ticket = bank.cache_ticket(&1, false, None).unwrap();
+                    if rank == failed_rank {
+                        // The native regression injects this recoverable OOM and
+                        // checks that the next peer wait has no stale CUDA error.
+                        drop(ticket);
+                        eager[rank].set(eager[rank].get() + 1);
+                    } else {
+                        bank.cache_commit(1, 42, ticket, 2, 1, true);
+                    }
+                    queued[rank].set(queued[rank].get() + 1);
+                }
+                Ok(())
+            }).unwrap();
+            assert!(!retired.get());
+            assert_eq!([queued[0].get(), queued[1].get()], [1, 1]);
+            assert_eq!(eager[failed_rank].get(), 1);
+            assert_eq!(eager[1 - failed_rank].get(), 0);
+            let failed = &mut banks[failed_rank];
+            assert_eq!(failed.len(), 0);
+            let device = -920 - (failed_rank * 3) as i32;
+            let snapshot = || super::super::device::snapshots().into_iter()
+                .find(|snapshot| snapshot.device == device).unwrap();
+            let pending = snapshot();
+            assert_eq!(pending.pending_capture, 0);
+            assert_eq!(pending.pools.live_execs, 0);
+            // Failed instantiation can grow driver storage: observe it even
+            // though the ticket cancelled, then admit the next submission.
+            assert!(failed.cache_needs_boundary());
+            failed.cache_measured(10);
+            assert_eq!(snapshot().charged, 10);
+            assert!(failed.cache_ticket(&2, false, None).is_some());
+        }
+    }
+
+    #[test]
     fn persistent_eviction_without_victims_preserves_pending_capture() {
         let mut bank = GraphBank::new(None);
         bank.attach_device_for_test(-319, 1000, site()).unwrap();
