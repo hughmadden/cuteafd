@@ -633,6 +633,14 @@ def v41_geometry(shape, allowed, site):
 
 
 
+def glm_request_replays(graph):
+    """Startup hits and lazy capture misses are not request replay demand."""
+    cycles = graph.get("cycles")
+    requests = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+                if cycles is not None else int(graph["count"]))
+    return min(int(graph.get("hits", 0)), requests)
+
+
 def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
@@ -678,6 +686,8 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
         for graph in trace["graphs"]:
             if not graph["site"].startswith(prefix):
                 continue
+            if version == 1 and "hits" not in graph:
+                raise ValueError("legacy trace has no replay hits; regenerate with schema 2")
             match = GEOMETRY.search(graph["shape"])
             if match is None:
                 raise ValueError(f"cannot parse {family} geometry: {graph['shape']!r}")
@@ -687,8 +697,7 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
             if scale != 1 and width % 2:
                 raise ValueError(f"{family} layout {layout} key width {width} is not an even half table")
             key = (rows, width * scale)
-            cycles = graph.get("cycles")
-            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) if cycles is not None else int(graph["count"])
+            count = glm_request_replays(graph)
             if count > 0:
                 device_counts[key] = device_counts.get(key, 0) + count
                 if version == 1:
@@ -723,8 +732,9 @@ def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=
         covered += counts[key]
         if covered >= total * coverage:
             break
-    # A thrashing low-frequency key can fall outside frequency coverage.
-    selected.update(key for key, why in reasons.items() if why)
+    # A thrashing low-frequency key can fall outside replay coverage, but a
+    # geometry with no request replays must remain lazy even if it churns.
+    selected.update(key for key, why in reasons.items() if why and key in counts)
     peak = max(counts.values())
     minimum = min(counts, key=lambda key: (key[0] * key[1], key))
     if minimum in legacy and counts[minimum] >= peak * pin_frequency:
@@ -1241,9 +1251,7 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         device_counts = {}
         for graph in matching:
             key = glmf_identity(graph["shape"])
-            cycles = graph.get("cycles")
-            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
-                if cycles is not None else int(graph["count"])
+            count = glm_request_replays(graph)
             if count > 0:
                 device_counts[key] = device_counts.get(key, 0) + count
         for key, count in device_counts.items():

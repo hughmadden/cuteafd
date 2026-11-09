@@ -111,6 +111,14 @@ pub trait PinnedMemory {
     fn allocate_chunk(&mut self, bytes: usize) -> anyhow::Result<HostChunk>;
     /// Release a chunk previously returned by `allocate_chunk`.
     fn release_chunk(&mut self, chunk: HostChunk) -> anyhow::Result<()>;
+    /// Every chunk of a construction succeeded (`count` of them). A provider
+    /// whose backings map into device contexts publishes its measured per-device
+    /// cost here: the mapping's page tables are physical bytes no allocation
+    /// request describes, so only a before/after sample can name them.
+    fn chunks_reserved(&mut self, count: usize) -> anyhow::Result<()> {
+        let _ = count;
+        Ok(())
+    }
 }
 
 /// A slab handle: which chunk, which index within it. Copy engines address it through
@@ -245,6 +253,12 @@ impl SlabPool {
                     return Err(err);
                 }
             }
+        }
+        if let Err(error) = memory.chunks_reserved(count) {
+            for chunk in &chunks {
+                let _ = memory.release_chunk(chunk.host);
+            }
+            return Err(error);
         }
         let free_chunks = (0..chunks.len() as u32).collect();
         Ok(Self {
