@@ -365,9 +365,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   shared hot path that plausibly moves it); skip irrelevant changes,
   staleness is fine.
 - `benchmarks/current-matrix.json` is the table's input: one row per
-  family × checkpoint, each cell `current`, `simulated-5090` (the 5090
-  column's memory-capped simulation, replaced by a real card when one
-  exists), or `held`/`pending`/`na` with the reason it renders. A row
+  family × checkpoint, each cell `current` or `held`/`pending`/`na` with
+  the reason it renders. A memory-capped 5090 simulation stays `pending`
+  until measured, then uses `current` with its report path. Report metadata
+  (`BENCH_HARDWARE_CLASS=5090`, the GPU cap and `BENCH_SIMULATED=5090`)
+  labels it "simulated 5090"; a real card is preferred when available. A row
   leaves the table by leaving the matrix; its reports stay in
   `benchmarks/` and the index.
 - Other profiles run only when specifically requested: their exports

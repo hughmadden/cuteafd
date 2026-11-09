@@ -1290,17 +1290,15 @@ mod tests {
     }
 
     #[test]
-    fn current_exports_dry_render_only_adds_retired_section() {
+    fn current_matrix_dry_render_preserves_retired_provenance() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let placed = scan(&root).unwrap();
         let rendered = results(&placed, &matrix).unwrap();
-        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
-        let existing = readme.split_once(RESULTS_BEGIN).unwrap().1.split_once(RESULTS_END).unwrap().0.trim();
-        let current = rendered.split_once("\n### Retired").unwrap().0.trim();
-        // Once the generated README carries Retired, compare the same main section.
-        assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
-        assert_eq!(matrix.retired.len(), 21);
+        // The next release's pending matrix may lead the README's measured table.
+        // Rendering must still preserve every pinned historical card's provenance.
+        assert!(!matrix.rows.is_empty());
+        assert!(!matrix.retired.is_empty());
         let retired = rendered.split_once("\n### Retired").unwrap().1;
         assert!(!retired.contains("nearest final release"));
         for entry in &matrix.retired {
@@ -1312,7 +1310,7 @@ mod tests {
             assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
         }
         let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
-            root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
+            root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
     }
 

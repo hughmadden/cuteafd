@@ -443,18 +443,72 @@ def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> N
 
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 17
+    seen = set()
     for row in matrix["cells"]:
-        # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
-        assert row["5090"]["status"] in ("current", "na")
-        if row["5090"]["status"] == "current":
-            assert row["5090"]["report"].endswith("-5090")
-        current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
-        # Each published checkpoint has at least one PRO card; the other column says why not.
-        assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
-        for cell in current:
-            assert (ROOT / cell["report"] / "report.json").is_file()
-    assert "simulated-5090" not in json.dumps(matrix)
+        identity = (row["family"], row["checkpoint"])
+        assert all(identity) and identity not in seen
+        seen.add(identity)
+        for column in ("5090", "1rtx", "2rtx"):
+            cell = row[column]
+            assert cell["status"] in ("current", "held", "pending", "na")
+            if cell["status"] == "current":
+                assert (ROOT / cell["report"] / "report.json").is_file()
+                if column == "5090":
+                    assert cell["report"].endswith("-5090")
+            else:
+                assert cell["reason"].strip()
+        assert any(row[c]["status"] != "na" for c in ("1rtx", "2rtx"))
+    assert seen
+
+
+def test_v5_smoke_matches_pending_matrix_and_attention_comparison() -> None:
+    smoke = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    variants = json.loads((ROOT / "scripts/lib/attention-variants.json").read_text())
+    names, ports, cards = set(), set(), set()
+    comparisons = {}
+    for entry in smoke["entries"]:
+        name = entry["name"]
+        assert name not in names
+        names.add(name)
+        assert (ROOT / entry["config"]).is_file()
+        values = {**keys(ROOT / entry["config"]), **smoke["defaults"]["set"], **entry["set"]}
+        assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
+        for port in (values["ADDR"].rsplit(":", 1)[1], values["EXPERT_PORT"]):
+            assert port not in ports
+            ports.add(port)
+        assert len(entry["gpus"]) == int(values["RTX_GPUS"])
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
+        assert len(entry["sparks"]) == int(values["SPARK_COUNT"])
+        for rank, host in enumerate(entry["sparks"]):
+            assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
+        if values.get("ATTENTION_MODE"):
+            assert entry["family"] in variants
+            if len(entry["gpus"]) == 2:
+                comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
+        assert entry.get("baseline", True), "All cards retain baseline quick quality"
+        if name.endswith("compact"):
+            assert len(entry["gpus"]) == 2
+            assert values["ATTENTION_MODE"] in ("compact", "fp8-compact")
+            continue
+        column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
+        identity = (entry["family"], values["MODEL_ID"], column)
+        assert identity not in cards
+        cards.add(identity)
+        if column == "5090":
+            assert values["GPU_MEMORY_CAP"] == "31.8GiB"
+            assert values["BENCH_HARDWARE_CLASS"] == values["BENCH_SIMULATED"] == "5090"
+            assert len(entry["sparks"]) == 4
+    expected = {(row["family"], row["checkpoint"], column) for row in matrix["cells"]
+                for column in ("5090", "1rtx", "2rtx") if row[column]["status"] != "na"}
+    assert cards == expected
+    assert set(comparisons) == set(variants)
+    for family, modes in comparisons.items():
+        assert modes == ({"hqa", "compact"} if family == "mistral_large4"
+                         else {"hqa", "compact", "fp8-compact"})
+    assert smoke["retired"] == matrix["retired"]
+    assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
