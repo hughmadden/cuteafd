@@ -90,6 +90,9 @@ QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_SHAPES = ("single_0spark", "single_sparks", "dual_0spark", "dual_sparks")
+KIMI_ROWS = re.compile(r"rows=(\d+)")
+KIMI_OP = re.compile(r"op=(\w+)")
+KIMI_SPEC = re.compile(r"spec=(\d)")
 
 
 V41_DECODE_ROWS = 64
@@ -119,58 +122,99 @@ def sustained(graph):
     return len(complete) >= 3 and sum(int(count) > 0 for count in complete) >= len(complete) * 0.6
 
 
-# Hottest class wins when ranks disagree, because one prewarm set is shared.
-HEAT_ORDER = {"rare": 0, "regular": 1, "sustained": 2, "startup": 3}
-
-
-def heat(graph):
-    """The startup class of one traced geometry.
-
-    `rare` is a key the trace used once - a capture with no later hit - or only
-    inside a single sampling interval, which is one point or panel such as the
-    32K context pass; it stays lazy under the shared capture headroom.
-    `sustained` is the rolling-window heat a pin is earned by, and `regular` is
-    everything between: worth prewarming, not worth permanent residency.
-    """
-    histogram = graph.get("hit_histogram", {})
-    counts = histogram.get("counts", [])
-    intervals = sum(int(count) > 0 for count in counts) if counts else int(int(graph.get("count", 0)) > 0)
-    if int(graph.get("hits", 0)) == 0 or intervals <= 1:
-        return "rare"
-    return "sustained" if sustained(graph) else "regular"
-
-
-def geometry(family, shape):
-    """`(rows, table_width)` of a captured segment's display shape."""
-    if family != "deepseek_v4":
-        match = GEOMETRY.search(shape)
-        if match is None:
-            raise ValueError(f"cannot parse {family} geometry: {shape!r}")
-        rows, width, stride = map(int, match.groups())
-        if rows <= 0 or width <= 0 or stride != width:
-            raise ValueError("unsupported prewarm geometry")
-        return rows, width
-    match = V4_GEOMETRY.search(shape)
-    if match is None:
-        raise ValueError(f"cannot parse deepseek_v4 geometry: {shape!r}")
-    rows, width, stride = int(match[1]), int(match[3]), int(match[4])
-    if rows <= 0 or width < 0 or stride != width:
+def kimi_geometry(shape):
+    """Kimi keys print `rows=.. op=.. spec=..`; the prewarm identity is the
+    replay width and whether it is a verify capture."""
+    rows = KIMI_ROWS.search(shape)
+    op = KIMI_OP.search(shape)
+    if rows is None or op is None:
+        raise ValueError(f"cannot parse kimi_k3 graph geometry: {shape!r}")
+    if int(rows.group(1)) <= 0:
         raise ValueError("unsupported prewarm geometry")
-    return rows, width
+    spec = KIMI_SPEC.search(shape)
+    return int(rows.group(1)), op.group(1) != "residual" and op.group(1) != "ffn" and spec is not None and spec.group(1) == "1"
 
 
-def prewarmable(family, shape):
-    """Whether a captured key can stand as a prewarm entry.
+def generate_kimi(traces, ranks, layout, coverage=0.999):
+    """One layout row for the checked-in list: shapes at or below decode row
+    coverage, pinned only when the trace shows sustained heat or repeated
+    recapture. Prefill rows stay eager and never replay (#1646)."""
+    if ranks < 1 or not layout:
+        raise ValueError("kimi_k3 needs a coordinator rank count and layout name")
+    if not 0 < coverage <= 1:
+        raise ValueError("coverage must be in (0, 1]")
+    counts = {}
+    arenas = []
+    largest = 0
+    reasons = {}
+    identities = {}
+    latest = {}
+    for trace in traces:
+        version = trace.get("schema_version")
+        if version not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        cache = trace["cache"]
+        device = int(cache["device"])
+        arenas.append(int(cache["charged"]))
+        inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
+                            len(graph.get("hit_histogram", {}).get("counts", [])) *
+                            int(graph.get("hit_histogram", {}).get("interval_ms", 0))
+                            for graph in trace["graphs"]), default=0)
+        snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
+        if device not in latest or snapshot_time >= latest[device][0]:
+            latest[device] = (snapshot_time, trace)
+        for site, values in trace.get("sites", {}).items():
+            if site.startswith("kimi_k3."):
+                largest = max(largest, int(values["largest_bytes"]))
+        device_counts = {}
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("kimi_k3."):
+                continue
+            key = kimi_geometry(graph["shape"])
+            cycles = graph.get("cycles")
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
+                if cycles is not None else int(graph["count"])
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
+        for key, count in device_counts.items():
+            counts[key] = max(counts.get(key, 0), count)
+    if not counts:
+        raise ValueError("trace contains no matching graph identities")
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("kimi_k3."):
+                continue
+            identity = (device, graph["site"], graph.get("bank", 0),
+                        graph.get("key_id", graph["shape"]))
+            identities[identity] = (kimi_geometry(graph["shape"]), graph)
+    for identity, (key, graph) in identities.items():
+        cycles = graph.get("cycles", {})
+        if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
+            continue
+        why = reasons.setdefault(key, set())
+        histogram = graph.get("hit_histogram", {})
+        histogram_end = int(histogram.get("start_ms", 0)) + \
+            len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+        if histogram_end >= latest[identity[0]][0] and sustained(graph):
+            why.add("sustained_heat")
+        if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
+            why.add("repeated_recapture")
+    ranked = sorted(counts, key=lambda key: (-counts[key], key[0], key[1]))
+    total = sum(counts.values())
+    covered = 0
+    selected = set()
+    for key in ranked:
+        selected.add(key)
+        covered += counts[key]
+        if covered >= total * coverage:
+            break
+    selected.update(key for key, why in reasons.items() if why)
+    entries = [{"rows": rows, "speculative": speculative, "pin": bool(reasons.get((rows, speculative)))}
+               for rows, speculative in sorted(selected)]
+    return {"ranks": ranks, "layout": layout,
+            "reserve_base_bytes": packed(max(arenas)), "reserve_extra_bytes": packed(largest),
+            "entries": entries}
 
-    V4 keeps tails eager (#1638), so a width-0 tail capture must not become a
-    startup entry; every other width-0 key is the local-expert/TP2 startup set
-    (a 1-RTX shape captures `local-experts`, a 2-RTX one `tp2-broadcast` and
-    `tp2-replicated`), and their geometry is the same `(rows, 0)` key.
-    """
-    if family != "deepseek_v4":
-        return True
-    match = V4_GEOMETRY.search(shape)
-    return match is None or int(match[3]) > 0 or match[2] != "tail"
 
 
 def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency=0.9,
@@ -1365,7 +1409,7 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3")))
     parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1382,7 +1426,7 @@ def main():
                         help="qwen4 only: install the generated shape into this prewarm list in place")
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
-    parser.add_argument("--ranks", type=int, help="MiMo physical coordinator ranks")
+    parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
     parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
@@ -1418,6 +1462,11 @@ def main():
                               ranks=args.ranks, variant=args.variant,
                               sparks=None if args.sparks is None else args.sparks == "yes",
                               arena_report=arenas)
+        elif args.family == "kimi_k3":
+            if args.ranks is None or args.layout is None:
+                raise ValueError("kimi_k3 needs --ranks and --layout")
+            result = generate_kimi([json.loads(Path(path).read_text()) for path in args.trace],
+                                   args.ranks, args.layout, args.coverage)
         elif args.family == "qwen4":
             traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
@@ -1433,7 +1482,9 @@ def main():
                                       args.family, args.coverage, args.pin_frequency, report, layout)
     except (KeyError, TypeError, ValueError, ZeroDivisionError) as error:
         parser.error(str(error))
-    if args.merge is not None:
+    if args.family == "kimi_k3":
+        merge_kimi_layout(args.output, result)
+    elif args.merge is not None:
         document = merge_qwen(json.loads(args.merge.read_text()), result)
         args.merge.write_text(json.dumps(document, indent=2) + "\n")
     else:

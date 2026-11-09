@@ -17,6 +17,11 @@ pub fn qwen_default(shape: crate::serving_capacity::qwen_graphs::QwenGraphShapeK
 pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
     crate::serving_capacity::v41_graphs::v41_prewarm(ranks, rank)
         .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
+
+/// Kimi K3 selects its arena by coordinator layout (rank count): TP2 captures a
+/// different inventory than a single coordinator.
+pub fn kimi_default(ranks: usize) -> (u64, u64) {
+    crate::serving_capacity::kimi_prewarm::kimi_reserve(ranks)
 }
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }

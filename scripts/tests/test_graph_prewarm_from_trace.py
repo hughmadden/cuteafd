@@ -1304,3 +1304,56 @@ def test_mimo_order_is_pinned_then_latest_request_replay_hits_with_row_ties():
         assert [(entry["rows"], entry["pin"]) for entry in layout["entries"]] == \
             [(2, True), (1, True), (4, False), (8, False), (16, False)]
         assert layout["entry_capture_bytes"] == [[value << 20 for value in [2, 1, 4, 3, 5]]]
+
+def kimi_trace(device=0, charged=600 << 20, rows=1, speculative=False, cycles=None):
+    shape = (f"lane=0 rank=0 rows={rows} op="
+             + (f"attention layer=0 seq=1 spec={int(speculative)}" if speculative
+                else "residual site=Norm"))
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
+            "sites": {"kimi_k3.step": {"largest_bytes": 3 << 20}},
+            "graphs": [{"device": device, "site": "kimi_k3.step", "bank": 0, "shape": shape,
+                        "count": 100, "cycles": cycles if cycles is not None else {"decode": 100},
+                        "hits": 100, "evictions": 0, "recaptures": 0, "first_seen_ms": 0,
+                        "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                                          "counts": [25, 25, 25, 25, 0]}}]}
+
+
+def test_kimi_layout_row_keeps_replay_widths_and_skips_prefill():
+    trace = kimi_trace()
+    trace["graphs"].append(dict(trace["graphs"][0],
+                                shape="lane=0 rank=0 rows=4096 op=residual site=Norm",
+                                cycles={"prefill": 50}))
+    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min", coverage=0.999)
+    assert row["entries"] == [{"rows": 1, "speculative": False, "pin": True}]
+    assert row["reserve_base_bytes"] == 600 << 20
+    assert row["reserve_extra_bytes"] == 4 << 20
+
+
+def test_kimi_verify_width_is_its_own_pin(tmp_path):
+    trace = kimi_trace(rows=4, speculative=True)
+    row = MODULE.generate_kimi([trace], 2, "kimi-k3-exl3-k6-max")
+    assert row["entries"] == [{"rows": 4, "speculative": True, "pin": True}]
+    out = tmp_path / "kimi_prewarm.json"
+    MODULE.merge_kimi_layout(out, MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min"))
+    MODULE.merge_kimi_layout(out, row)
+    layouts = json.loads(out.read_text())["layouts"]
+    assert [layout["ranks"] for layout in layouts] == [1, 2]
+    assert layouts[1]["layout"] == "kimi-k3-exl3-k6-max"
+
+
+def test_kimi_cold_shape_is_listed_but_unpinned():
+    trace = kimi_trace()
+    trace["graphs"] = [dict(graph, cycles={"decode": 1}, hits=1,
+                           hit_histogram={"interval_ms": 10_000, "start_ms": 0,
+                                          "counts": [1, 0, 0, 0, 0]})
+                       for graph in trace["graphs"]]
+    row = MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min")
+    assert row["entries"] == [{"rows": 1, "speculative": False, "pin": False}]
+
+
+@pytest.mark.parametrize("shape", ["bad", "lane=0 rank=0 rows=0 op=residual site=Norm"])
+def test_kimi_invalid_shape_fails(shape):
+    trace = kimi_trace()
+    trace["graphs"][0]["shape"] = shape
+    with pytest.raises(ValueError):
+        MODULE.generate_kimi([trace], 1, "kimi-k3-exl3-k6-min")
