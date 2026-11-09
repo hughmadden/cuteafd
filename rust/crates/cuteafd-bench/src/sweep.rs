@@ -545,7 +545,7 @@ mod tests {
                         if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n }
                     };
                     let (kind, reply) = match path.as_str() {
-                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count()}).to_string()),
+                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count(), "exact_token_count": true}).to_string()),
                         "/v1/bench/status" => ("application/json", json!({"settings":[{
                             "name":"prefill-units", "value":"2752", "source":"resolved"
                         }]}).to_string()),

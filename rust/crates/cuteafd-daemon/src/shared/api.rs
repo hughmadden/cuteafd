@@ -118,14 +118,14 @@ impl ApiPolicy {
     /// `snapshot` holds the tokenizer `count_tokens` uses.
     pub(crate) fn serve(&self, profile: ModelProfile, snapshot: &std::path::Path) -> anyhow::Result<ModelProfile> {
         cuteafd_bench::context::set_thinking_off(profile.encoding.supports_thinking_off());
-        let profile = if snapshot.join("tokenizer.json").is_file() { profile.with_tokenizer(snapshot)? } else { profile };
+        let profile = profile.with_tokenizer(snapshot)?;
         let mut profile = profile_with_health(profile);
         profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats);
         if let Some(policy) = &self.gateway {
             use cuteafd_api::gateway::ModelMap;
             let mut models = if policy.official { ModelMap::official_names(profile.id.clone()) } else { ModelMap::single(profile.id.clone()) };
             if let Some(text) = &policy.names_file { models.apply_names_file(text).map_err(anyhow::Error::msg)?; }
-            let snapshot = snapshot.join("tokenizer.json").is_file().then(|| snapshot.to_path_buf());
+            let snapshot = Some(snapshot.to_path_buf());
             profile.gateway = Some(Arc::new(cuteafd_api::openai::GatewayMount { models, snapshot,
                 options: cuteafd_api::openai::engine::EngineOptions {
                     json_schema: cuteafd_api::openai::engine::probe_json_schema(&profile) },
@@ -529,12 +529,22 @@ mod tests {
             assert!(api.enable_bench);
         }
     }
+    #[test]
+    fn serving_requires_a_real_snapshot_tokenizer() {
+        let snapshot = tempfile::tempdir().unwrap();
+        let policy = ApiArgs::default().load().unwrap();
+        let profile = cuteafd_api::openai::ModelProfile::new("test", cuteafd_api::openai::ModelEncoding::DeepseekV41);
+        assert!(policy.serve(profile, snapshot.path()).is_err());
+    }
+
     #[tokio::test]
     async fn gateway_routes_mount_by_default_with_every_key_form_and_turn_off() {
         use axum::{body::Body, http::{Request, StatusCode}};
         use clap::Parser;
         use tower::ServiceExt;
         let snapshot = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(snapshot.path());
+        assert!(!snapshot.path().join("tokenizer.json").exists());
         for (gateway, mounted) in [(None, true), (Some("off"), false)] {
             let mut argv = vec!["cuteafd", "serve-qwen4", "--snapshot", "/model", "--native-lib", "/native.so"];
             if let Some(value) = gateway { argv.extend(["--gateway", value]); }

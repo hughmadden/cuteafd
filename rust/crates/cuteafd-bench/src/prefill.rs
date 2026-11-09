@@ -166,20 +166,25 @@ mod tests {
 
     #[test]
     fn exact_prompt_queries_fake_nonlinear_count_endpoint() {
-        fake_count_endpoint(false, false);
+        fake_count_endpoint(false, false, true);
     }
 
     #[test]
     fn exact_prompt_switches_corpus_after_a_tokenizer_gap() {
-        fake_count_endpoint(true, false);
+        fake_count_endpoint(true, false, true);
     }
 
     #[test]
     fn exact_prompt_fails_after_all_variants_miss() {
-        fake_count_endpoint(true, true);
+        fake_count_endpoint(true, true, true);
     }
 
-    fn fake_count_endpoint(gap: bool, all_miss: bool) {
+    #[test]
+    fn exact_prompt_rejects_an_estimated_count_before_searching() {
+        fake_count_endpoint(false, false, false);
+    }
+
+    fn fake_count_endpoint(gap: bool, all_miss: bool, exact: bool) {
         use std::io::{BufRead, BufReader, Read, Write};
         use serde_json::{json, Value};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -228,7 +233,7 @@ mod tests {
                 let text = body["messages"][0]["content"].as_str().unwrap();
                 let nonce_prefix = text.split_once("\n\n").unwrap().0;
                 assert_eq!(prefix.get_or_insert_with(|| nonce_prefix.to_string()), nonce_prefix);
-                let reply = json!({"input_tokens":count(text)}).to_string();
+                let reply = json!({"input_tokens":count(text), "exact_token_count":exact}).to_string();
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
                 requests += 1;
             }
@@ -237,8 +242,12 @@ mod tests {
         let client = Client::new(&format!("http://{address}"), None, Default::default());
         let result = prompt(&client, 99, 300, CARD_TOKENS, "Reply with the single word OK.");
         done.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(server.join().unwrap() > 2);
-        if all_miss {
+        let requests = server.join().unwrap();
+        if !exact {
+            assert_eq!(requests, 1, "estimated counts must not drive the sizing search");
+            assert!(result.unwrap_err().to_string().contains("estimated or unverified count"));
+        } else if all_miss {
+            assert!(requests > 2);
             let error = result.unwrap_err().to_string();
             assert!(error.contains("8192-token") && error.contains("16 deterministic corpus variants"), "{error}");
         } else {

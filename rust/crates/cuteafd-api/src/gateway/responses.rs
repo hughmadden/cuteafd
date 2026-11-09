@@ -287,7 +287,8 @@ async fn input_tokens(
     p.turn.tape = tape;
     account(&mut p, usage, false);
     match gateway.count_tokens(p.turn).await {
-        Ok(n) => Json(json!({"object":"response.input_tokens","input_tokens":n})).into_response(),
+        Ok(n) => Json(json!({"object":"response.input_tokens","input_tokens":n,
+            "exact_token_count":gateway.backend.capabilities().exact_token_count})).into_response(),
         Err(e) => e.openai_response(),
     }
 }
