@@ -214,24 +214,24 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
         run.step(if tail { 0.45 } else { 0.40 }, label);
         let estimate = ((target as f64 - intercept) / slope).max(64.0) as usize;
         let instruction = "Reply with the single word OK.";
-        let sized = crate::prefill::prompts(client, (98, 99), estimate, target, max_context, instruction);
+        let sized = crate::prefill::prompts(client, (98, 99), estimate, target, max_context, instruction, tail);
         let Some((warm, text)) = card_prefill_prompts(&mut run.baseline.card, target, tail, sized)? else {
             run.publish();
             continue;
         };
-        let chat = client.chat(plain(client, &warm, 1), None).with_context(|| format!("{label} warm-up"))?;
-        crate::prefill::validate(target, chat.timing.prompt_tokens)?;
+        let chat = client.chat(plain(client, &warm.text, 1), None).with_context(|| format!("{label} warm-up"))?;
+        crate::prefill::validate(warm.tokens, chat.timing.prompt_tokens)?;
         // A cold probe primes this exact route without retaining the prefix.
-        let warm = client.chat(plain(client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+        let probe = client.chat(plain(client, &text.text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
             .with_context(|| format!("{label} route warm-up"))?;
-        crate::prefill::validate(target, warm.timing.prompt_tokens)?;
+        crate::prefill::validate(text.tokens, probe.timing.prompt_tokens)?;
         let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(client, &text, 1), None).with_context(|| label.to_string())?;
+        let chat = client.chat(plain(client, &text.text, 1), None).with_context(|| label.to_string())?;
         if let Some(phase) = client.fabric_since(fabric_mark, if tail { "prefill/8k-tail" } else { "prefill/8k" }, true) {
             run.baseline.fabric.push(phase);
         }
         let t = chat.timing;
-        crate::prefill::validate(target, t.prompt_tokens)?;
+        crate::prefill::validate(text.tokens, t.prompt_tokens)?;
         anyhow::ensure!(t.cached_tokens == 0, "{label} cold prefill reused {} cached tokens", t.cached_tokens);
         let rate = PrefillRate { requested_tokens: target, prompt_tokens: t.prompt_tokens,
             shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s, runs: vec![t] };
@@ -259,7 +259,8 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
 }
 
 fn card_prefill_prompts(card: &mut crate::report::BasicCard, target: u64, diagnostic: bool,
-    sized: Result<(String, String)>) -> Result<Option<(String, String)>> {
+    sized: Result<(crate::prefill::SizedPrompt, crate::prefill::SizedPrompt)>)
+    -> Result<Option<(crate::prefill::SizedPrompt, crate::prefill::SizedPrompt)>> {
     match sized {
         Ok(prompts) => Ok(Some(prompts)),
         Err(error) if diagnostic => {

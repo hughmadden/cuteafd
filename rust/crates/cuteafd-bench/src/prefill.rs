@@ -35,13 +35,14 @@ const CORPUS_VARIANTS: u64 = 16;
 /// No inference, cache retention or timed work happens here.
 pub fn prompt(client: &Client, seed: u64, estimate: usize, target: u64, instruction: &str) -> Result<String> {
     let prefix = format!("[{}] {instruction}\n\n", crate::text::nonce());
-    sized_prompt(&prefix, seed, estimate, target,
+    sized_prompt(&prefix, seed, estimate, target, 0,
         |text| client.count_chat_tokens(&crate::baseline::plain(client, text, 1)))
 }
 
-fn sized_prompt(prefix: &str, seed: u64, estimate: usize, target: u64,
+fn sized_prompt(prefix: &str, seed: u64, estimate: usize, target: u64, tolerance: u64,
     mut count: impl FnMut(&str) -> Result<u64>) -> Result<String> {
-    for variant in 0..CORPUS_VARIANTS {
+    let variants = if tolerance == 0 { CORPUS_VARIANTS } else { 1 };
+    for variant in 0..variants {
         let mut reference_tokens = estimate.max(64);
         // Three seeds rotate back to the same corpus kind, with a new offset.
         let variant_seed = seed.wrapping_add(variant * 3);
@@ -49,9 +50,9 @@ fn sized_prompt(prefix: &str, seed: u64, estimate: usize, target: u64,
             let corpus = crate::text::corpus(variant_seed, reference_tokens);
             let whole = format!("{prefix}{corpus}");
             let n = count(&whole)?;
-            if n == target { return Ok(whole); }
+            if n.abs_diff(target) <= tolerance { return Ok(whole); }
             if n > target {
-                if let Some(body) = exact_prefix(&corpus, target, |body| count(&format!("{prefix}{body}")))? {
+                if let Some(body) = prefix_within(&corpus, target, tolerance, |body| count(&format!("{prefix}{body}")))? {
                     return Ok(format!("{prefix}{body}"));
                 }
                 break;
@@ -59,23 +60,44 @@ fn sized_prompt(prefix: &str, seed: u64, estimate: usize, target: u64,
             reference_tokens = reference_tokens.checked_mul(2).context("prefill corpus size overflow")?;
         }
     }
+    if tolerance != 0 {
+        bail!("no prefill within {tolerance} token of {target} found in the diagnostic corpus");
+    }
     bail!("no exact {target}-token prefill found after {CORPUS_VARIANTS} deterministic corpus variants; refusing an approximate prefill")
 }
 
 /// Size both requests before any inference, so an optional diagnostic can be
 /// skipped without partially warming or timing it.
+pub struct SizedPrompt {
+    pub text: String,
+    pub tokens: u64,
+}
+
 pub fn prompts(client: &Client, seeds: (u64, u64), estimate: usize, target: u64,
-    max_context: u64, instruction: &str) -> Result<(String, String)> {
-    ensure!(target <= max_context.saturating_sub(64),
-        "exact {target}-token prefill exceeds max context {max_context} with output headroom");
-    Ok((prompt(client, seeds.0, estimate, target, instruction)?,
-        prompt(client, seeds.1, estimate, target, instruction)?))
+    max_context: u64, instruction: &str, diagnostic: bool) -> Result<(SizedPrompt, SizedPrompt)> {
+    let tolerance = u64::from(diagnostic);
+    ensure!(target.saturating_add(tolerance) <= max_context.saturating_sub(64),
+        "{target}-token prefill (tolerance {tolerance}) exceeds max context {max_context} with output headroom");
+    let size = |seed| -> Result<SizedPrompt> {
+        let text = if diagnostic {
+            let prefix = format!("[{}] {instruction}\n\n", crate::text::nonce());
+            sized_prompt(&prefix, seed, estimate, target, tolerance,
+                |text| client.count_chat_tokens(&crate::baseline::plain(client, text, 1)))?
+        } else {
+            prompt(client, seed, estimate, target, instruction)?
+        };
+        let tokens = client.count_chat_tokens(&crate::baseline::plain(client, &text, 1))?;
+        ensure!(tokens.abs_diff(target) <= tolerance, "prefill count changed during sizing");
+        Ok(SizedPrompt { text, tokens })
+    };
+    Ok((size(seeds.0)?, size(seeds.1)?))
 }
 
 /// Token counts are not strictly monotone at character boundaries (a new
 /// character can merge earlier tokens). Bisect for proximity, then inspect a
 /// bounded local neighborhood rather than assuming a monotone tokenizer.
-fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u64>) -> Result<Option<String>> {
+fn prefix_within(text: &str, target: u64, tolerance: u64,
+    mut count: impl FnMut(&str) -> Result<u64>) -> Result<Option<String>> {
     let offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
     let mut seen = std::collections::BTreeMap::new();
     let (mut lo, mut hi) = (0, offsets.len() - 1);
@@ -83,7 +105,7 @@ fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u
         let mid = lo + (hi - lo) / 2;
         let n = count(&text[..offsets[mid]])?;
         seen.insert(mid, n);
-        if n == target { return Ok(Some(text[..offsets[mid]].to_string())); }
+        if n.abs_diff(target) <= tolerance { return Ok(Some(text[..offsets[mid]].to_string())); }
         if n < target { lo = mid + 1; }
         else if mid == 0 { break; }
         else { hi = mid - 1; }
@@ -91,7 +113,7 @@ fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u
     let center = lo.min(offsets.len() - 1);
     for index in center.saturating_sub(128)..=(center + 128).min(offsets.len() - 1) {
         let n = match seen.get(&index) { Some(n) => *n, None => count(&text[..offsets[index]])? };
-        if n == target { return Ok(Some(text[..offsets[index]].to_string())); }
+        if n.abs_diff(target) <= tolerance { return Ok(Some(text[..offsets[index]].to_string())); }
     }
     Ok(None)
 }
@@ -109,10 +131,37 @@ mod tests {
                 - u64::from(s.ends_with("tokenization")))
         };
         for target in [20, 127, 511, 819] {
-            let prompt = exact_prefix(&text, target, count).unwrap().unwrap();
+            let prompt = prefix_within(&text, target, 0, count).unwrap().unwrap();
             assert_eq!(count(&prompt).unwrap(), target);
             assert!(text.starts_with(&prompt));
         }
+    }
+
+    #[test]
+    fn diagnostic_accepts_first_neighbor_without_switching_corpus() {
+        let prefix = "[fixed] instruction\n\n";
+        let original = crate::text::corpus(98, 65536);
+        let count = |text: &str| (text.strip_prefix(prefix).unwrap().chars().count() as u64 / 3) * 2;
+        let mut queries = 0;
+        let mut last_count = 0;
+        let text = sized_prompt(prefix, 98, 8192, 8297, 1, |text| {
+            queries += 1;
+            assert!(original.starts_with(text.strip_prefix(prefix).unwrap()));
+            last_count = count(text);
+            Ok(last_count)
+        }).unwrap();
+        assert!(matches!(count(&text), 8296 | 8298));
+        assert_eq!(count(&text), last_count);
+        assert!(queries < 30, "stop at the first acceptable prefix: {queries} queries");
+    }
+
+    #[test]
+    fn diagnostic_accepts_either_neighbor_but_not_two_tokens_away() {
+        for actual in [8295, 8297] {
+            let text = prefix_within("abcdef", 8296, 1, |_| Ok(actual)).unwrap().unwrap();
+            assert_eq!(text, "abc"); // first bisection candidate, no exact-first scan
+        }
+        assert!(prefix_within("abcdef", 8296, 1, |_| Ok(8298)).unwrap().is_none());
     }
 
     #[test]
@@ -203,8 +252,8 @@ mod tests {
 
     #[test]
     fn unreachable_length_and_endpoint_errors_fail_loudly() {
-        assert!(exact_prefix(&"x".repeat(1000), 101, |s| Ok(s.len() as u64 * 2)).unwrap().is_none());
-        assert!(exact_prefix("abc", 1, |_| bail!("endpoint unavailable")).unwrap_err().to_string().contains("endpoint unavailable"));
+        assert!(prefix_within(&"x".repeat(1000), 101, 0, |s| Ok(s.len() as u64 * 2)).unwrap().is_none());
+        assert!(prefix_within("abc", 1, 0, |_| bail!("endpoint unavailable")).unwrap_err().to_string().contains("endpoint unavailable"));
     }
 
     #[test]

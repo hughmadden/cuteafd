@@ -284,11 +284,12 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
     for length in requested {
         let words = ((length as f64 - intercept) / slope).max(64.0) as usize;
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
+        let diagnostic = length == tail && !lengths.contains(&length);
         let sized = crate::prefill::prompts(client, (warm_seed, timed_seed), words, length,
-            max_context, "Summarize in one word.");
+            max_context, "Summarize in one word.", diagnostic);
         let (warm_text, timed_text) = match sized {
             Ok(prompts) => prompts,
-            Err(error) if length == tail && !lengths.contains(&length) => {
+            Err(error) if diagnostic => {
                 skipped.push(crate::report::SkippedPrefill { requested_tokens: length,
                     label: "8K w/tail".into(), reason: format!("{error:#}"), });
                 continue;
@@ -296,16 +297,16 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
             Err(error) => return Err(error),
         };
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
-        let warm = client.chat(plain(client, &warm_text, 1), None)
+        let warm = client.chat(plain(client, &warm_text.text, 1), None)
             .with_context(|| format!("{length}-token prefill warm-up"))?;
-        crate::prefill::validate(length, warm.timing.prompt_tokens)?;
+        crate::prefill::validate(warm_text.tokens, warm.timing.prompt_tokens)?;
         if !idle.is_zero() { std::thread::sleep(idle); }
         timed(on_timed)?;
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
         let counters = phase_counters(client);
-        let chat = client.chat(plain(client, &timed_text, 1), None).with_context(|| format!("{length}-token prefill"))?;
+        let chat = client.chat(plain(client, &timed_text.text, 1), None).with_context(|| format!("{length}-token prefill"))?;
         let after = phase_counters(client);
         let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
         let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
@@ -313,7 +314,7 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
-        crate::prefill::validate(length, t.prompt_tokens)?;
+        crate::prefill::validate(timed_text.tokens, t.prompt_tokens)?;
         points.push(PrefillPoint { length, label: (length == tail).then(|| "8K w/tail".into()),
             shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
             idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
@@ -506,8 +507,8 @@ mod tests {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
-        // No mismatch exercises an unreachable diagnostic without losing the
-        // successful strict 8K point, then checks an explicit tail stays strict.
+        // No mismatch skips the exact target but accepts a neighboring diagnostic
+        // count, then checks an explicitly requested tail still fails strictly.
         for mismatch_at in [Some(3), Some(4), None] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
@@ -539,13 +540,12 @@ mod tests {
                     }
                     let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
                     let body: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
-                    let count = || 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
+                    let count = || {
+                        let n = 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
+                        if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n }
+                    };
                     let (kind, reply) = match path.as_str() {
-                        "/v1/messages/count_tokens" => {
-                            let n = count();
-                            let n = if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n };
-                            ("application/json", json!({"input_tokens": n}).to_string())
-                        },
+                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count()}).to_string()),
                         "/v1/bench/status" => ("application/json", json!({"settings":[{
                             "name":"prefill-units", "value":"2752", "source":"resolved"
                         }]}).to_string()),
@@ -579,19 +579,22 @@ mod tests {
                 assert!(skipped.is_empty());
             } else {
                 let points = result.unwrap();
-                assert_eq!(points.len(), 1);
+                assert_eq!(points.len(), 2);
                 assert_eq!(points[0].prompt_tokens, crate::prefill::CARD_TOKENS);
-                assert_eq!(skipped.len(), 1);
+                assert!(skipped.is_empty());
+                assert_eq!(points[1].length, 8296);
+                assert!(matches!(points[1].prompt_tokens, 8295 | 8297));
+                assert_eq!(points[1].shape, Some(crate::prefill::shape(points[1].prompt_tokens, 2752)));
                 let sweep = Sweep { prefill: points, skipped_prefill: skipped, ..Default::default() };
                 let json = serde_json::to_value(&sweep).unwrap();
-                assert_eq!(json["skipped_prefill"][0]["requested_tokens"], 8296);
-                assert!(json["skipped_prefill"][0]["reason"].as_str().unwrap().contains("16 deterministic corpus variants"));
+                assert!(json.get("skipped_prefill").is_none());
+                assert!(matches!(json["prefill"][1]["prompt_tokens"].as_u64(), Some(8295 | 8297)));
                 // Explicit user-requested lengths remain strict, even at the diagnostic length.
                 let error = prefill(&client, &[8296], 32768, &PrefillOptions::default(), &mut hook,
                     &mut Vec::new()).unwrap_err().to_string();
                 assert!(error.contains("16 deterministic corpus variants"), "{error}");
                 done.store(true, Ordering::Relaxed);
-                assert_eq!(server.join().unwrap(), 6);
+                assert_eq!(server.join().unwrap(), 8);
             }
         }
     }
