@@ -40,7 +40,7 @@ pub(crate) fn snapshot() -> Value {
     records().lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-fn row(device: &str, measured: Option<u64>, owners: &cuteafd_core::memory_policy::DeviceBreakdown,
+fn row(device: &str, measured: Option<i128>, owners: &cuteafd_core::memory_policy::DeviceBreakdown,
     graph_arena: Option<u64>, provenance: Value, reason: Option<&str>) -> Value {
     let padding: u64 = owners.reserve.iter().filter(|owner| owner.name == "release padding")
         .map(|owner| owner.bytes).sum();
@@ -49,7 +49,7 @@ fn row(device: &str, measured: Option<u64>, owners: &cuteafd_core::memory_policy
         .saturating_add(owners.reserve_bytes()).saturating_sub(padding);
     let graph_reserve: u64 = owners.reserve.iter().filter(|owner| owner.name == "graph reserve")
         .map(|owner| owner.bytes).sum();
-    let delta_vs_admitted = measured.map(|used| i128::from(used) - i128::from(charged));
+    let delta_vs_admitted = measured.map(|used| used - i128::from(charged));
     // No graph owner needs no replacement. A missing live controller sample is
     // unknown, not zero; over-reserve arena growth produces negative slack.
     let graph_arena = graph_arena.or((graph_reserve == 0).then_some(0));
@@ -72,7 +72,7 @@ fn observed_row(device: &str, sample: Option<(usize, usize, usize)>,
     let raw = sample.map(|(free, total, _)| total.saturating_sub(free) as u64);
     let observer = sample.map(|(_, _, observer)| observer as u64);
     let measured = raw.zip(observer).and_then(|(raw, observer)| raw.checked_sub(observer));
-    let mut record = row(device, measured, owners, graph_arena, provenance, reason);
+    let mut record = row(device, measured.map(i128::from), owners, graph_arena, provenance, reason);
     record["raw_used_bytes"] = json!(raw);
     record["observer_bytes"] = json!(observer);
     record["observer_provenance"] = json!({
@@ -80,6 +80,54 @@ fn observed_row(device: &str, sample: Option<(usize, usize, usize)>,
         "method": "same observer_context::exclude helper as cuda_allocatable_memory_info; excluded exactly once",
         "present": observer.map(|bytes| bytes > 0)});
     record["measurement_method"] = "active-context CUDA physical total minus free, excluding independently measured observer context".into();
+    record
+}
+
+fn spark_row(id: &str, stage: &str, worker: Option<&Value>,
+    fallback: &cuteafd_core::memory_policy::DeviceBreakdown, provenance: &Value) -> Value {
+    let admission = worker.and_then(|value| value.get("admission_sample"));
+    let baseline = worker.and_then(|value|
+        value["physical_sample"]["baseline_allocatable_free_bytes"].as_u64());
+    let ready_free = admission.and_then(|sample| sample["free_bytes"].as_u64());
+    let measured = (stage == "ready").then(|| baseline.zip(ready_free)
+        .map(|(baseline, ready)| i128::from(baseline) - i128::from(ready))).flatten();
+    let absolute = (stage == "ready").then(|| admission.and_then(|sample|
+        sample["total_bytes"].as_u64().zip(sample["free_bytes"].as_u64())
+            .and_then(|(total, free)| total.checked_sub(free)))).flatten();
+    let raw = (stage == "ready").then(|| worker.and_then(|value|
+        value["physical_sample"]["cuda_used_bytes"].as_u64())).flatten();
+    let reason = if stage != "ready" { Some("post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples") }
+        else if baseline.is_none() { Some("worker omitted pre-weight allocatable baseline; no absolute-occupancy fallback") }
+        else if ready_free.is_none() { Some("worker omitted allocatable admission sample") } else { None };
+    let mut owners: Option<cuteafd_core::memory_policy::DeviceBreakdown> = worker
+        .and_then(|value| value.get("owners"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let future_rings = worker.filter(|value|
+        value["physical_sample"]["endpoint_rings_allocated"] == false)
+        .and_then(|value| value["owner_ledger"]["mapped_ring_bytes"].as_u64()).unwrap_or(0);
+    if let Some(owners) = owners.as_mut() {
+        owners.workspace_bytes = owners.workspace_bytes.saturating_sub(future_rings);
+    }
+    let mut record = row(id, measured, owners.as_ref().unwrap_or(fallback), None,
+        json!({"coordinator": provenance,
+            "worker": worker.and_then(|value| value.get("physical_sample")),
+            "owner_ledger": worker.and_then(|value| value.get("owner_ledger"))}), reason);
+    record["measurement_method"] = "launch-relative pre-weight allocatable free minus retained-owner allocatable free; GB10 MemAvailable/cgroup-bounded".into();
+    record["absolute_allocatable_used_bytes"] = json!(absolute);
+    record["baseline_allocatable_free_bytes"] = json!(baseline);
+    record["admitted_future_ring_bytes"] = json!(future_rings);
+    record["raw_used_bytes"] = json!(raw);
+    record["raw_measurement_method"] = "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568".into();
+    record["drift_measurement_basis"] = "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic".into();
+    record["charge_basis"] = "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings".into();
+    if owners.is_none() {
+        for field in ["charged_bytes", "delta_vs_admitted", "delta_vs_measured", "beyond_half_padding"] {
+            record[field] = Value::Null;
+        }
+        record["owner_unavailable_reason"] = "no reconciled worker owner ledger".into();
+    }
+    // Retained for provenance only, never labelled as a post-request sample.
+    record["admission_sample"] = admission.cloned().unwrap_or(Value::Null);
     record
 }
 
@@ -109,27 +157,8 @@ pub(crate) fn capture(stage: &str) {
             rows.push(observed_row(id, sample, &owners, graph_arena, identity,
                 sample_error.as_deref().or_else(|| sample.is_none().then_some("no active CUDA primary context sample"))));
         } else if let Some(rank) = id.strip_prefix("spark").and_then(|n| n.trim_start_matches('.').parse::<u32>().ok()) {
-            let worker = worker_samples.get(&rank);
-            let measured = (stage == "ready").then(|| worker.and_then(|value|
-                value["physical_sample"]["cuda_used_bytes"].as_u64())).flatten();
-            let reason = if stage != "ready" { Some("post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own CUDA sample") }
-                else if measured.is_none() { Some("worker omitted optional physical sample during rolling update") } else { None };
-            let worker_owners = worker.and_then(|value| value.get("owners"))
-                .and_then(|value| serde_json::from_value(value.clone()).ok());
-            let mut record = row(id, measured, worker_owners.as_ref().unwrap_or(&owners), None,
-                json!({"coordinator": provenance,
-                    "worker": worker.and_then(|value| value.get("physical_sample")),
-                    "owner_ledger": worker.and_then(|value| value.get("owner_ledger"))}), reason);
-            record["charge_basis"] = "reconciled worker resident/workspace and UMA host owners; device/pinned detail aliases not added twice; CUDA global occupancy is not an owner".into();
-            if worker_owners.is_none() {
-                for field in ["charged_bytes", "delta_vs_admitted", "delta_vs_measured", "beyond_half_padding"] {
-                    record[field] = Value::Null;
-                }
-                record["owner_unavailable_reason"] = "no reconciled worker owner ledger".into();
-            }
+            let mut record = spark_row(id, stage, worker_samples.get(&rank), &owners, provenance);
             record["rank"] = rank.into();
-            // This is the admission-time sample, never labelled post-request.
-            record["admission_sample"] = worker.map(|value| value["admission_sample"].clone()).unwrap_or(Value::Null);
             rows.push(record);
         }
     }
@@ -141,6 +170,43 @@ pub(crate) fn capture(stage: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spark_launch_relative_measurement_cancels_preexisting_occupancy_and_preserves_nulls() {
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "spark0".into(),
+            cap_bytes: 100_000, weights_bytes: 600, workspace_bytes: 150, kv_bytes: 0,
+            other_bytes: 0, reserve_overridden: false, reserve: vec![] };
+        // 80,000 bytes of unrelated occupancy predate this launch. Only 700
+        // newly consumed bytes match retained owners; 50 ring bytes come later.
+        let mut worker = json!({"owners": owners, "owner_ledger": {"mapped_ring_bytes": 50},
+            "admission_sample": {"total_bytes": 100_000, "free_bytes": 19_300},
+            "physical_sample": {"cuda_used_bytes": 95_000,
+                "baseline_allocatable_free_bytes": 20_000, "endpoint_rings_allocated": false}});
+        let sample = spark_row("spark0", "ready", Some(&worker), &owners, &json!({}));
+        assert_eq!(sample["raw_used_bytes"], 95_000);
+        assert_eq!(sample["absolute_allocatable_used_bytes"], 80_700);
+        assert_eq!(sample["measured_bytes"], 700);
+        assert_eq!(sample["charged_bytes"], 700);
+        assert_eq!(sample["admitted_future_ring_bytes"], 50);
+        assert_eq!(sample["delta_vs_measured"], 0);
+        assert_eq!(sample["beyond_half_padding"], false);
+        worker["admission_sample"]["free_bytes"] = json!(20_100);
+        let reclaimed = spark_row("spark0", "ready", Some(&worker), &owners, &json!({}));
+        assert_eq!(reclaimed["measured_bytes"], -100);
+        worker["physical_sample"]["baseline_allocatable_free_bytes"] = Value::Null;
+        let missing = spark_row("spark0", "ready", Some(&worker), &owners, &json!({}));
+        assert!(missing["measured_bytes"].is_null());
+        assert!(missing["delta_vs_measured"].is_null());
+        assert!(missing["beyond_half_padding"].is_null());
+        assert!(missing["unavailable_reason"].as_str().unwrap().contains("pre-weight"));
+        let post = spark_row("spark0", "first_request", Some(&worker), &owners, &json!({}));
+        assert!(post["raw_used_bytes"].is_null());
+        assert!(post["absolute_allocatable_used_bytes"].is_null());
+        assert!(post["delta_vs_measured"].is_null());
+        assert!(post["unavailable_reason"].as_str().unwrap().contains("#1631"));
+        let no_ledger = spark_row("spark0", "ready", None, &owners, &json!({}));
+        assert!(no_ledger["charged_bytes"].is_null());
+    }
+
     #[test]
     fn observer_context_is_excluded_once_from_both_deltas_and_raw_sample_is_retained() {
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 900,

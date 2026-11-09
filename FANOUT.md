@@ -129,9 +129,18 @@ remain separately labelled.
 
 Spark Ready aggregation uses the reconciled worker resident/workspace and UMA
 host-owner ledger, not the coordinator's empty placeholder plan. Device/pinned
-detail aliases are not charged twice. Its physical sample comes from the existing
-admission detail's optional memory_reconciliation object. New coordinators accept missing and unknown
-optional detail fields; coordinator and Spark release images are a compatible
+detail aliases are not charged twice. Its drift basis is launch-relative:
+allocatable free at the post-media/pre-expert retained-ledger baseline minus
+allocatable free at the admission snapshot, less owners allocated after that
+baseline. Preexisting system/page-cache occupancy cancels; changes during loading
+can still perturb this system-wide witness. Signed consumption can be negative.
+The admission snapshot precedes endpoint-ring creation: admitted future ring bytes
+are reported separately and excluded from this snapshot's charge. Missing baseline
+or Ready samples yield null deltas/drift with a reason, never an absolute fallback.
+Raw CUDA used and absolute allocatable used remain diagnostic fields only (#1568).
+Baseline phase and sample provenance live in the optional memory_reconciliation
+object. New coordinators accept missing and unknown optional detail fields;
+coordinator and Spark release images are a compatible
 pair, not arbitrary old/new binary combinations. Post-request Spark samples
 at the coordinator are null with the #1631 reason until control-plane telemetry
 exists. Worker first-request logs include their own raw CUDA sample and a

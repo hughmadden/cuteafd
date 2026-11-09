@@ -233,7 +233,7 @@ fn worker_reconciliation_provenance(config: &NativeExpertServiceConfig) -> serde
 
 fn measured_worker_runtime(library: &NativeLibrary,
     baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census,
-    config: &NativeExpertServiceConfig)
+    config: &NativeExpertServiceConfig, baseline_allocatable: Option<(usize, usize)>)
     -> Result<cuteafd_core::SparkRuntimeInventory> {
     use cuteafd_ffi::memory_ledger::{self, Space};
     let device = library.cuda_get_device()?;
@@ -249,6 +249,12 @@ fn measured_worker_runtime(library: &NativeLibrary,
     detail.memory_reconciliation = Some(serde_json::json!({"schema_version": 1,
         "cuda_free_bytes": free, "cuda_total_bytes": total, "cuda_used_bytes": total.saturating_sub(free),
         "admission_free_bytes": sample.free_bytes, "admission_total_bytes": sample.total_bytes,
+        "baseline_allocatable_free_bytes": baseline_allocatable.map(|(free, _)| free),
+        "baseline_allocatable_total_bytes": baseline_allocatable.map(|(_, total)| total),
+        "baseline_phase": "post-media before expert modules and weights; same boundary as retained-owner ledger",
+        "baseline_unavailable_reason": baseline_allocatable.is_none().then_some("pre-weight allocatable sample unavailable"),
+        "sample_phase": "retained owners before endpoint rings",
+        "endpoint_rings_allocated": false,
         "admission_measurement": "GB10 MemAvailable/cgroup-bounded headroom; discrete CUDA allocatable",
         "cuda_measurement": "raw CUDA physical total minus free; not NVML; page cache may differ",
         "device": device, "arch": sample.arch, "driver": sample.driver,
@@ -356,7 +362,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     library.release_sync_h2d_staging()?;
                     let baseline = cuteafd_ffi::memory_ledger::snapshot();
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
-                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census, &config)?,
+                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census, &config, None)?,
                         mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
                 };
                 cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
@@ -383,6 +389,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     library.release_sync_h2d_staging()?;
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
+    let baseline_allocatable = library.cuda_allocatable_memory_info().ok();
     census.sample("before_expert_modules", Some(&library))?;
     // Experts with a per-expert output norm reply per-expert partials through the
     // shared epilogue programs, which the image's PROGRAMS.json carries. The same
@@ -513,7 +520,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let model = selection.model().context("worker selection requires typed model admission")?;
                 weights.validate_ingress(&library, model)?;
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
-                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census, &config)?;
+                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census, &config, baseline_allocatable)?;
                 runtime.detail.load_transient = weights.load_inventory();
                 runtime.detail.allocations.extend(weights.retained_host_inventory()?);
                 tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
