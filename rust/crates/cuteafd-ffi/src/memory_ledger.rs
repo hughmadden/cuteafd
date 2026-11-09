@@ -93,6 +93,9 @@ struct State {
     peak: BTreeMap<(Space, i32), usize>,
     current: BTreeMap<(Space, i32), usize>,
     audits: Vec<Weak<Mutex<AuditEvents>>>,
+    /// Physical bytes a mapped backing reserves beyond any allocation request,
+    /// by pool, device and owner. See [`record_unclaimed`].
+    unclaimed: BTreeMap<(Space, i32), BTreeMap<MeasuredOwner, usize>>,
     ready: bool,
     post_ready_bytes: usize,
     post_ready_sites: BTreeMap<&'static std::panic::Location<'static>, usize>,
@@ -382,6 +385,87 @@ pub fn record_released(ptr: usize) {
     record_free(ptr);
 }
 
+/// The measured, driver-side source of physical bytes that no allocation
+/// request describes. Closed on purpose: the graph arena observer subtracts
+/// every recorded owner from its untracked residual, so a free-form label could
+/// hide real graph growth. A new variant needs its own measurement at the site
+/// that owns the cost, a name that identifies that site, and a test pinning
+/// both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeasuredOwner {
+    /// Device page tables a mapped pinned host pool reserves in each context it
+    /// is registered with, measured before/after the pool maps its chunks.
+    /// `chunks` names the pool size that was measured.
+    PinnedHostMapping { chunks: usize },
+}
+
+/// Every source allowed to publish an unclaimed row. Closed and explicit: the
+/// graph arena observer subtracts every recorded owner from its untracked
+/// residual, so an unvetted source would let arbitrary bytes hide real graph
+/// growth. Add a source only with a measured driver-side cost at a named
+/// construction site.
+pub const MEASURED_SOURCES: &[&str] = &["pinned host mapping"];
+
+fn measured_source_allowed(source: &str) -> bool {
+    MEASURED_SOURCES.contains(&source)
+}
+
+impl MeasuredOwner {
+    /// The vetted source this owner publishes under.
+    pub fn source(self) -> &'static str {
+        match self {
+            Self::PinnedHostMapping { .. } => "pinned host mapping",
+        }
+    }
+
+    /// The owner's name in snapshots and `/v1/stats`; interned so repeated
+    /// snapshots compare cheaply.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PinnedHostMapping { chunks } =>
+                intern(&format!("{}: {chunks} chunks", self.source())),
+        }
+    }
+}
+
+/// Records physical bytes a backing reserves beyond any allocation request, so
+/// they have a named owner instead of reading as unattributed growth. Mapped
+/// pinned host memory is the case today: registering a host chunk maps it into
+/// every device context, and each context's page tables grow by the mapped size
+/// divided by the driver's ratio (SM120: 512). No allocation request describes
+/// that memory, so it can neither enter `totals` nor carry the request rounding
+/// of [`Snapshot::granularity`]; callers measure it once, with a before/after
+/// physical sample at the construction site that owns the mapping. Zero bytes
+/// is not a measurement and records nothing. The graph arena observer subtracts
+/// the live total from its untracked residual, so a measured owner created
+/// after the observer's seed never funds the graph level or its reserve.
+///
+/// Accumulator: a repeated call for the same owner adds to its live bytes. An
+/// owner whose source is not in [`MEASURED_SOURCES`] is refused, so this
+/// registry cannot become a catch-all for bytes no site measured.
+pub fn record_unclaimed(space: Space, device: i32, owner: MeasuredOwner, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    if !measured_source_allowed(owner.source()) {
+        return;
+    }
+    let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    let owners = state.unclaimed.entry((space, device)).or_default();
+    let total = owners.entry(owner).or_default();
+    *total = total.saturating_add(bytes);
+}
+
+/// Retires a [`record_unclaimed`] owner when its mapping is torn down.
+pub fn release_unclaimed(space: Space, device: i32, owner: MeasuredOwner) {
+    let mut state = state().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(owners) = state.unclaimed.get_mut(&(space, device)) else { return };
+    owners.remove(&owner);
+    if owners.is_empty() {
+        state.unclaimed.remove(&(space, device));
+    }
+}
+
 #[track_caller]
 pub(crate) fn record_alloc(space: Space, device: i32, ptr: usize, bytes: usize, tag: Tag) {
     record_backing(space, device, ptr, bytes, None, None, tag);
@@ -562,6 +646,8 @@ pub struct Snapshot {
     pub peak: BTreeMap<(Space, i32), usize>,
     /// Per device pool: the live allocations' own rounding (zero off SM120).
     pub granularity: BTreeMap<(Space, i32), Granularity>,
+    /// Measured physical owners no allocation row claims, by pool and device.
+    pub unclaimed: BTreeMap<(Space, i32), BTreeMap<MeasuredOwner, usize>>,
 }
 
 impl Snapshot {
@@ -569,9 +655,25 @@ impl Snapshot {
     pub fn devices(&self) -> Vec<i32> {
         let mut devices: Vec<i32> = self.rows.iter().filter(|r| r.key.space != Space::Pinned && r.key.device >= 0)
             .map(|r| r.key.device).collect();
+        devices.extend(self.unclaimed.keys()
+            .filter(|(space, device)| *space != Space::Pinned && *device >= 0)
+            .map(|(_, device)| *device));
         devices.sort_unstable();
         devices.dedup();
         devices
+    }
+
+    /// Physical bytes measured for owners no allocation row claims (see
+    /// [`record_unclaimed`]).
+    pub fn unclaimed(&self, space: Space, device: i32) -> usize {
+        self.unclaimed.get(&(space, device)).map_or(0,
+            |owners| owners.values().copied().sum())
+    }
+
+    /// Unclaimed physical bytes by owner name for one pool and device.
+    pub fn by_unclaimed(&self, space: Space, device: i32) -> BTreeMap<&'static str, usize> {
+        self.unclaimed.get(&(space, device)).map_or_else(BTreeMap::new,
+            |owners| owners.iter().map(|(&owner, &bytes)| (owner.label(), bytes)).collect())
     }
 
     pub fn total(&self, space: Space, device: i32) -> usize {
@@ -639,6 +741,7 @@ pub fn snapshot() -> Snapshot {
             .map(|(&(device, name), formats)| (device, name, formats.clone())).collect(),
         peak: state.peak.clone(),
         granularity,
+        unclaimed: state.unclaimed.clone(),
     }
 }
 
@@ -801,6 +904,64 @@ mod tests {
         assert_eq!(current_bytes(Space::Device, device), 0);
         assert_eq!(current_bytes(Space::Device, device + 1), 0);
         assert_eq!(current_bytes(Space::Host, device), 0);
+    }
+
+    #[test]
+    fn measured_unclaimed_owners_are_named_and_retired_without_a_request() {
+        let _ledger = test_guard();
+        let owner = MeasuredOwner::PinnedHostMapping { chunks: 2 };
+        assert_eq!(owner.label(), "pinned host mapping: 2 chunks");
+        record_unclaimed(Space::Device, 32, owner, 524_288);
+        record_unclaimed(Space::Device, 32, owner, 524_288);
+        let other = MeasuredOwner::PinnedHostMapping { chunks: 1 };
+        record_unclaimed(Space::Device, 32, other, 1_048_576);
+        record_unclaimed(Space::Device, 33, owner, 262_144);
+        let seed = snapshot();
+        assert_eq!(seed.unclaimed(Space::Device, 32), 2_097_152);
+        assert_eq!(seed.by_unclaimed(Space::Device, 32)[owner.label()], 1_048_576);
+        assert_eq!(seed.by_unclaimed(Space::Device, 32)[other.label()], 1_048_576);
+        assert_eq!(seed.unclaimed(Space::Device, 33), 262_144);
+        // Unclaimed bytes carry no allocation row or request rounding, but the
+        // device still appears wherever owners are published.
+        assert_eq!(seed.total(Space::Device, 32), 0);
+        assert!(seed.granularity.get(&(Space::Device, 32)).is_none());
+        assert!(seed.devices().contains(&32));
+        assert!(seed.devices().contains(&33));
+        release_unclaimed(Space::Device, 32, other);
+        assert_eq!(snapshot().unclaimed(Space::Device, 32), 1_048_576);
+        release_unclaimed(Space::Device, 32, owner);
+        release_unclaimed(Space::Device, 33, owner);
+        assert_eq!(snapshot().unclaimed(Space::Device, 32), 0);
+        assert!(snapshot().by_unclaimed(Space::Device, 32).is_empty());
+        assert_eq!(snapshot().unclaimed(Space::Device, 33), 0);
+    }
+
+    #[test]
+    fn an_unmeasured_unclaimed_entry_is_rejected() {
+        let _ledger = test_guard();
+        // Zero bytes is not a measurement: a caller that sampled nothing (or a
+        // sample that came out backwards) must not create an owner, because the
+        // graph observer would subtract it from its residual.
+        record_unclaimed(Space::Device, 34, MeasuredOwner::PinnedHostMapping { chunks: 3 }, 0);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.unclaimed(Space::Device, 34), 0);
+        assert!(snapshot.by_unclaimed(Space::Device, 34).is_empty());
+        assert!(!snapshot.devices().contains(&34));
+    }
+
+    #[test]
+    fn an_unrecognized_measured_source_is_rejected() {
+        let _ledger = test_guard();
+        // The enum makes an unknown source unrepresentable at the call site;
+        // the allowlist is the runtime backstop a future variant must pass, so
+        // `unclaimed` never becomes a catch-all for arbitrary labels.
+        let owner = MeasuredOwner::PinnedHostMapping { chunks: 2 };
+        assert_eq!(owner.source(), "pinned host mapping");
+        assert!(measured_source_allowed(owner.source()));
+        assert_eq!(MEASURED_SOURCES, &["pinned host mapping"]);
+        for source in ["third-party cache", "graph arena", "pinned", "pinned host mapping "] {
+            assert!(!measured_source_allowed(source), "{source}");
+        }
     }
 
     #[test]

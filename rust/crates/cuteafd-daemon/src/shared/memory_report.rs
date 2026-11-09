@@ -101,6 +101,14 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
             entry["granularity"] = json!({"tail": g.tail, "large_requests": g.large_requests,
                 "small_bytes": g.small_bytes});
         }
+        let unclaimed = snapshot.by_unclaimed(Space::Device, device);
+        if !unclaimed.is_empty() {
+            // Measured physical owners with no allocation request behind them
+            // (mapped pinned host backings' device page tables): named here so
+            // the untracked residual is read with them beside it.
+            entry["unclaimed"] = json!(unclaimed);
+            entry["unclaimed_bytes"] = json!(snapshot.unclaimed(Space::Device, device));
+        }
         if let Some((free, total)) = device_memory(device) {
             let used = total - free;
             entry["used"] = json!(used);

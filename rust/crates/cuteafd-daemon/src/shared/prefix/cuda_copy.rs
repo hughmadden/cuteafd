@@ -3,6 +3,7 @@
 //! a nonblocking event probe per stream. Registered allocations route each copy
 //! to its owning GPU; the engine keeps those owners alive until its queues drain.
 use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::memory_ledger::{self, MeasuredOwner, Space};
 use cuteafd_ffi::{CopyMechanism, CudaRuntime, CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Event, Stream};
 use cuteafd_hostcache::pool::{HostChunk, HostRange, PinnedMemory};
@@ -98,6 +99,14 @@ pub(crate) trait SnapshotOwner {
     fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>>;
 }
 
+/// Device bytes a mapped host pool reserved, sampled around its chunk loop.
+struct HostMapping {
+    /// Free bytes per registered GPU before the first chunk was mapped.
+    before: Vec<(i32, usize)>,
+    /// Measured owner published once every chunk succeeded.
+    owner: Option<MeasuredOwner>,
+}
+
 pub(crate) struct CudaCopyEngine<'a> {
     library: &'a NativeLibrary,
     template: CuteafdDeviceBuffer,
@@ -105,6 +114,7 @@ pub(crate) struct CudaCopyEngine<'a> {
     chunks: Vec<Option<CuteafdHostBuffer>>,
     /// Two logical queues, with one physical queue per registered device.
     streams: Vec<[StreamState<'a>; 2]>,
+    mapping: Option<HostMapping>,
     next_event: u64,
     started: Instant,
     runtime: Option<CudaRuntime>,
@@ -191,9 +201,28 @@ impl<'a> CudaCopyEngine<'a> {
         tracing::info!(target: "cuteafd::host_cache", mechanism = mechanism.name(), devices = streams.len(),
             runtime_version = runtime.as_ref().map(CudaRuntime::version).unwrap_or(0),
             "host snapshot cache copy mechanism");
-        Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
+        Ok(Self { library, template, regions, chunks: Vec::new(), streams, mapping: None, next_event: 0,
             started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
             batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new(), retained: Vec::new() })
+    }
+    /// Free bytes per registered GPU. A pinned backing that is mapped into these
+    /// contexts reserves page-table bytes on each of them, which no allocation
+    /// request covers; sampling around the chunk loop is how the ledger learns
+    /// that measured cost. A device whose query fails is left out rather than
+    /// failing the pool: the owner is an accounting detail, and without a sample
+    /// it simply stays unmeasured (admission still charges driver page tables).
+    fn mapped_free(&self) -> Vec<(i32, usize)> {
+        let mut devices: Vec<(i32, usize)> = Vec::with_capacity(self.streams.len());
+        for rank in &self.streams {
+            let device = rank[0].device;
+            if devices.iter().any(|&(id, _)| id == device.id) { continue; }
+            match device.run(|| self.library.cuda_physical_memory_info()) {
+                Ok((free, _)) => devices.push((device.id, free)),
+                Err(error) => tracing::warn!(target: "cuteafd::memory", device = device.id,
+                    %error, "pinned host mapping cost unavailable"),
+            }
+        }
+        devices
     }
     fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
         let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
@@ -287,6 +316,9 @@ impl<'a> CudaCopyEngine<'a> {
 }
 impl PinnedMemory for CudaCopyEngine<'_> {
     fn allocate_chunk(&mut self, bytes: usize) -> Result<HostChunk> {
+        if self.mapping.is_none() {
+            self.mapping = Some(HostMapping { before: self.mapped_free(), owner: None });
+        }
         let buffer = self.library.alloc_host_buffer(bytes, Tag::prefix("shared/prefix-host"))?;
         self.chunks.push(Some(buffer));
         Ok(HostChunk { id: (self.chunks.len() - 1) as u32, bytes })
@@ -297,6 +329,26 @@ impl PinnedMemory for CudaCopyEngine<'_> {
         let mut buffer = self.chunks.get_mut(chunk.id as usize).and_then(Option::take)
             .context("host cache chunk already released")?;
         self.library.free_host_buffer(&mut buffer)
+    }
+    /// The pool's chunks are all mapped: publish what they cost each device as a
+    /// measured owner, so the graph level and the ledger residual stop treating
+    /// page-table bytes as unclaimed growth.
+    fn chunks_reserved(&mut self, count: usize) -> Result<()> {
+        let Some(mapping) = self.mapping.take() else { return Ok(()) };
+        let after = self.mapped_free();
+        let owner = MeasuredOwner::PinnedHostMapping { chunks: count };
+        let mut recorded = false;
+        for &(device, before) in &mapping.before {
+            let Some(&(_, now)) = after.iter().find(|&&(id, _)| id == device) else { continue };
+            if now > before { continue; }
+            let bytes = before - now;
+            memory_ledger::record_unclaimed(Space::Device, device, owner, bytes);
+            recorded = true;
+            tracing::info!(target: "cuteafd::memory", device, bytes, chunks = count,
+                "pinned host mapping device cost");
+        }
+        self.mapping = Some(HostMapping { before: mapping.before, owner: recorded.then_some(owner) });
+        Ok(())
     }
 }
 impl CopyEngine for CudaCopyEngine<'_> {
@@ -358,6 +410,11 @@ impl CopyEngine for CudaCopyEngine<'_> {
 }
 impl Drop for CudaCopyEngine<'_> {
     fn drop(&mut self) {
+        if let Some(HostMapping { before, owner: Some(owner) }) = self.mapping.take() {
+            for (device, _) in before {
+                memory_ledger::release_unclaimed(Space::Device, device, owner);
+            }
+        }
         let store = self.synchronize(Stream::Store);
         let restore = self.synchronize(Stream::Restore);
         if let Err(error) = store.and(restore) {

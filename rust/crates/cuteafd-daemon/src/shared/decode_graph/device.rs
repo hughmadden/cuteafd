@@ -279,7 +279,7 @@ pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
     // Policy fixtures use synthetic ordinals, never valid CUDA device IDs.
     #[cfg(test)]
-    if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0, 0))) }
+    if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0, 0, 0))) }
     let cache = device_cache_sampled(device, reserve, basis, || memory_sample(library, device))?;
     let mut controller = cache.lock().unwrap_or_else(|p| p.into_inner());
     if controller.memory_query.is_none() { controller.memory_query = Some(library.physical_memory_query()?); }
@@ -287,26 +287,27 @@ pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     Ok(cache)
 }
 
-/// Tracked and rounding-tail bytes for one physical device.
-fn ledger_sample(device: i32) -> (u64, u64) {
+/// Tracked, rounding-tail and measured-unclaimed bytes for one physical device.
+fn ledger_sample(device: i32) -> (u64, u64, u64) {
     let ledger = cuteafd_ffi::memory_ledger::snapshot();
     let space = cuteafd_ffi::memory_ledger::Space::Device;
     let tracked = ledger.total(space, device) as u64;
     let rounding = ledger.granularity.get(&(space, device))
         .map_or(0, |granularity| granularity.tail) as u64;
-    (tracked, rounding)
+    let unclaimed = ledger.unclaimed(space, device) as u64;
+    (tracked, rounding, unclaimed)
 }
 
-/// `(free, total, tracked, rounding)` for one physical device.
-fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<(u64, u64, u64, u64)> {
+/// `(free, total, tracked, rounding, unclaimed)` for one physical device.
+fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<(u64, u64, u64, u64, u64)> {
     let (free, total) = crate::shared::memory::device::Device { library, id: device }
         .run(|| library.cuda_physical_memory_info())?;
-    let (tracked, rounding) = ledger_sample(device);
-    Ok((free as u64, total as u64, tracked, rounding))
+    let (tracked, rounding, unclaimed) = ledger_sample(device);
+    Ok((free as u64, total as u64, tracked, rounding, unclaimed))
 }
 
 pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
-    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64)>) -> anyhow::Result<SharedCache> {
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> anyhow::Result<SharedCache> {
     let mut devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cache) = devices.get(&device).and_then(std::sync::Weak::upgrade) {
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).reserve == reserve,
@@ -319,8 +320,8 @@ pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
     controller.basis = basis;
     // Seed before the first attached bank can capture. Reattachment must not
     // consume growth from an earlier bank or overwrite an explicit baseline.
-    let (free, total, tracked, rounding) = sample()?;
-    controller.level = Some(controller.observer.observe(free, total, tracked, rounding).1);
+    let (free, total, tracked, rounding, unclaimed) = sample()?;
+    controller.level = Some(controller.observer.observe(free, total, tracked, rounding, unclaimed).1);
     let cache = Arc::new(Mutex::new(controller));
     devices.insert(device, Arc::downgrade(&cache));
     Ok(cache)
@@ -360,8 +361,8 @@ struct GrowthObserver {
 impl GrowthObserver {
     /// Returns `(high-water growth, current level)`; the first sample seeds
     /// both from the attach residual and reports no growth.
-    fn observe(&mut self, free: u64, total: u64, tracked: u64, rounding: u64) -> (u64, u64) {
-        let residual = untracked(free, total, tracked, rounding);
+    fn observe(&mut self, free: u64, total: u64, tracked: u64, rounding: u64, unclaimed: u64) -> (u64, u64) {
+        let residual = untracked(free, total, tracked, rounding, unclaimed);
         let baseline = *self.baseline.get_or_insert(residual);
         let level = residual.saturating_sub(baseline);
         let growth = self.high_water.map_or(0, |before| residual.saturating_sub(before));
@@ -373,8 +374,8 @@ impl GrowthObserver {
     /// The seed-relative residual at a settled sample without touching the
     /// high-water. Reconciliation uses this so its figure is the device now,
     /// not the last capture boundary, which can catch a transient peak.
-    fn current(&self, free: u64, total: u64, tracked: u64, rounding: u64) -> u64 {
-        let residual = untracked(free, total, tracked, rounding);
+    fn current(&self, free: u64, total: u64, tracked: u64, rounding: u64, unclaimed: u64) -> u64 {
+        let residual = untracked(free, total, tracked, rounding, unclaimed);
         residual.saturating_sub(self.baseline.unwrap_or(residual))
     }
 }
@@ -382,9 +383,12 @@ impl GrowthObserver {
 /// Physical bytes no ledger owner claims. `used - tracked` also contains the
 /// 2 MiB granule padding of every tracked request, so remove the ledger's
 /// known rounding tail: a page-aligned owner's padding is its own overhead, not
-/// graph growth, and must never fund the graph reserve.
-fn untracked(free: u64, total: u64, tracked: u64, rounding: u64) -> u64 {
-    total.saturating_sub(free).saturating_sub(tracked).saturating_sub(rounding)
+/// graph growth, and must never fund the graph reserve. Measured owners with no
+/// allocation request behind them (mapped pinned host page tables) come out too;
+/// the attach seed is itself such a residual, so an owner that predates the
+/// controller cancels in it.
+fn untracked(free: u64, total: u64, tracked: u64, rounding: u64, unclaimed: u64) -> u64 {
+    total.saturating_sub(free).saturating_sub(tracked).saturating_sub(rounding).saturating_sub(unclaimed)
 }
 
 pub(crate) type GraphVisitor<'a> = dyn FnMut(i32, &'static str, bool,
@@ -402,12 +406,12 @@ pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) 
 }
 
 fn observe_device_sampled(device: i32,
-    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64)>) -> anyhow::Result<()> {
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     if cache.needs_boundary() {
-        let (free, total, tracked, rounding) = sample()?;
-        let (growth, level) = cache.observer.observe(free, total, tracked, rounding);
+        let (free, total, tracked, rounding, unclaimed) = sample()?;
+        let (growth, level) = cache.observer.observe(free, total, tracked, rounding, unclaimed);
         cache.level = Some(level);
         if cache.unmeasured { cache.measured_capture(growth); }
     }
@@ -426,20 +430,20 @@ fn observe_device_sampled(device: i32,
 /// untouched, so admission still covers the peak. Stage samples only: never
 /// call this per round or expose the result as a live value mid-request.
 pub(crate) fn refreshed_arena(device: i32, free: u64, total: u64) -> Option<(u64, u64)> {
-    let (tracked, rounding) = ledger_sample(device);
-    refreshed_arena_sampled(device, || Ok((free, total, tracked, rounding)))
+    let (tracked, rounding, unclaimed) = ledger_sample(device);
+    refreshed_arena_sampled(device, || Ok((free, total, tracked, rounding, unclaimed)))
 }
 
 fn refreshed_arena_sampled(device: i32,
-    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64)>) -> Option<(u64, u64)> {
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> Option<(u64, u64)> {
     let cache = existing_cache(device)?;
-    let (free, total, tracked, rounding) = sample().ok()?;
+    let (free, total, tracked, rounding, unclaimed) = sample().ok()?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    let level = cache.observer.current(free, total, tracked, rounding).min(cache.charged);
+    let raw = cache.observer.current(free, total, tracked, rounding, unclaimed);
+    let level = raw.min(cache.charged);
     cache.level = Some(level);
-    tracing::info!(target: "cuteafd::memory", device, free, total, tracked,
-        raw = cache.observer.current(free, total, tracked, rounding), level, charged = cache.charged,
-        "graph level refresh");
+    tracing::info!(target: "cuteafd::memory", device, free, total, tracked, unclaimed,
+        raw, level, charged = cache.charged, "graph level refresh");
     Some((level, cache.charged))
 }
 
@@ -630,12 +634,12 @@ impl DeviceCache {
     }
 
     fn capture_baseline_sampled(&mut self,
-        sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64)>) -> anyhow::Result<()> {
+        sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> anyhow::Result<()> {
         if self.captured_since_observation { return Ok(()) }
         // Exclude eager first-touch since the last observation, but never swallow
         // growth from another capture in the same unobserved batch.
-        let (free, total, tracked, rounding) = sample()?;
-        let (_, level) = self.observer.observe(free, total, tracked, rounding);
+        let (free, total, tracked, rounding, unclaimed) = sample()?;
+        let (_, level) = self.observer.observe(free, total, tracked, rounding, unclaimed);
         self.level = Some(level);
         self.captured_since_observation = true;
         Ok(())
@@ -695,8 +699,8 @@ impl DeviceCache {
             if !self.captured_since_observation {
                 if let Some(query) = &self.memory_query {
                     let sample = query.sample(self.device).map(|(free, total)| {
-                        let (tracked, rounding) = ledger_sample(self.device);
-                        (free as u64, total as u64, tracked, rounding)
+                        let (tracked, rounding, unclaimed) = ledger_sample(self.device);
+                        (free as u64, total as u64, tracked, rounding, unclaimed)
                     });
                     if let Err(error) = self.capture_baseline_sampled(|| sample) {
                         tracing::warn!(%error, device = self.device, "graph capture baseline unavailable; running eagerly");
@@ -1687,7 +1691,7 @@ mod tests {
 mod observer_tests {
     use super::*;
     fn attached(device: i32) -> SharedCache {
-        device_cache_sampled(device, 1000, Basis::Bytes, || Ok((900, 1000, 0, 0))).unwrap()
+        device_cache_sampled(device, 1000, Basis::Bytes, || Ok((900, 1000, 0, 0, 0))).unwrap()
     }
 
     fn pending(cache: &SharedCache) {
@@ -1703,7 +1707,7 @@ mod observer_tests {
     fn attachment_measures_capture_before_explicit_observe() {
         let cache = attached(-99101);
         pending(&cache);
-        observe_device_sampled(-99101, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99101, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1712,7 +1716,7 @@ mod observer_tests {
         let cache = attached(-99111);
         observe_device_sampled(-99111, || panic!("unchanged cache must not sample")).unwrap();
         pending(&cache);
-        observe_device_sampled(-99111, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99111, || Ok((875, 1000, 0, 0, 0))).unwrap();
         observe_device_sampled(-99111, || panic!("measured capture must not resample")).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
@@ -1722,7 +1726,7 @@ mod observer_tests {
         let cache = attached(-99108);
         cache.lock().unwrap().pending_destroy = 1;
         let sampled = std::cell::Cell::new(false);
-        observe_device_sampled(-99108, || { sampled.set(true); Ok((900, 1000, 0, 0)) }).unwrap();
+        observe_device_sampled(-99108, || { sampled.set(true); Ok((900, 1000, 0, 0, 0)) }).unwrap();
         assert!(sampled.get());
         assert!(cache.lock().unwrap().has_pending_victims());
         cache.lock().unwrap().pending_destroy = 0;
@@ -1732,14 +1736,14 @@ mod observer_tests {
     #[test]
     fn capture_baseline_refreshes_once_per_observed_batch() {
         let cache = attached(-99109);
-        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0))).unwrap();
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
         cache.lock().unwrap().capture_baseline_sampled(|| panic!("must retain earlier capture growth")).unwrap();
-        observe_device_sampled(-99109, || Ok((775, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99109, || Ok((775, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
-        cache.lock().unwrap().capture_baseline_sampled(|| Ok((700, 1000, 0, 0))).unwrap();
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((700, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
-        observe_device_sampled(-99109, || Ok((675, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99109, || Ok((675, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 50);
     }
 
@@ -1749,7 +1753,7 @@ mod observer_tests {
         let library = fixture.load()?;
         fixture.configure_memory_usage(&library, 6, 1000, 100)?;
         let mut cache = DeviceCache::new(6, 1000);
-        cache.observer.observe(900, 1000, 0, 0);
+        cache.observer.observe(900, 1000, 0, 0, 0);
         cache.memory_query = Some(library.physical_memory_query()?);
         let site = Site { name: "observer-miss-fixture", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
@@ -1760,7 +1764,7 @@ mod observer_tests {
         // An invalid second sample proves another capture retains the first baseline.
         fixture.configure_memory(&library, 6, 0)?;
         assert!(matches!(cache.miss(identity(2), site, None, false), Miss::Capture(_)));
-        let growth = cache.observer.observe(750, 1000, 0, 0);
+        let growth = cache.observer.observe(750, 1000, 0, 0, 0);
         cache.measured_capture(growth.0);
         assert_eq!(cache.charged, 50);
         assert!(!cache.captured_since_observation);
@@ -1769,7 +1773,7 @@ mod observer_tests {
         assert!(!cache.unmeasured);
         fixture.configure_memory_usage(&library, 6, 1000, 300)?;
         assert!(matches!(cache.miss(identity(3), site, None, false), Miss::Capture(_)));
-        let growth = cache.observer.observe(675, 1000, 0, 0);
+        let growth = cache.observer.observe(675, 1000, 0, 0, 0);
         cache.measured_capture(growth.0);
         assert_eq!(cache.charged, 75);
         assert_eq!(cache.counters[&Cycle::Decode].eager_runs, 1);
@@ -1781,9 +1785,9 @@ mod observer_tests {
         let cache = attached(-99110);
         assert!(cache.lock().unwrap().capture_baseline_sampled(|| anyhow::bail!("query failed")).is_err());
         assert!(!cache.lock().unwrap().captured_since_observation);
-        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0))).unwrap();
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
-        observe_device_sampled(-99110, || Ok((775, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99110, || Ok((775, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1792,19 +1796,19 @@ mod observer_tests {
         let cache = attached(-99102);
         observe_device_sampled(-99102, || panic!("eager-only boundary must not sample")).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 0);
-        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0))).unwrap();
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
-        observe_device_sampled(-99102, || Ok((775, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99102, || Ok((775, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
     #[test]
     fn explicit_observe_does_not_double_seed_or_charge() {
         let cache = attached(-99103);
-        observe_device_sampled(-99103, || Ok((900, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99103, || Ok((900, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
-        observe_device_sampled(-99103, || Ok((875, 1000, 0, 0))).unwrap();
-        observe_device_sampled(-99103, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99103, || Ok((875, 1000, 0, 0, 0))).unwrap();
+        observe_device_sampled(-99103, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1815,11 +1819,11 @@ mod observer_tests {
         let again = device_cache_sampled(-99104, 1000, Basis::Bytes,
             || panic!("reattachment must not consume graph growth")).unwrap();
         assert!(Arc::ptr_eq(&cache, &again));
-        observe_device_sampled(-99104, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99104, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
         device_cache_sampled(-99104, 1000, Basis::Bytes,
             || panic!("reattachment must not reset the explicit baseline")).unwrap();
-        observe_device_sampled(-99104, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99104, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1831,7 +1835,7 @@ mod observer_tests {
         assert!(existing_cache(-99105).is_none());
         let cache = attached(-99105);
         pending(&cache);
-        observe_device_sampled(-99105, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99105, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1840,7 +1844,7 @@ mod observer_tests {
         let cache = attached(-99106);
         let old = Arc::downgrade(&cache);
         pending(&cache);
-        observe_device_sampled(-99106, || Ok((500, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99106, || Ok((500, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 400);
         drop(cache);
         assert!(old.upgrade().is_none());
@@ -1849,9 +1853,9 @@ mod observer_tests {
 
         // A new lifetime may have a different reserve and lower residual.
         let cache = device_cache_sampled(-99106, 2000, Basis::Bytes,
-            || Ok((950, 1000, 0, 0))).unwrap();
+            || Ok((950, 1000, 0, 0, 0))).unwrap();
         pending(&cache);
-        observe_device_sampled(-99106, || Ok((925, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99106, || Ok((925, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
     }
 
@@ -1865,7 +1869,7 @@ mod observer_tests {
         let rebuilt = device_cache_sampled(-99107, 1000, Basis::Bytes,
             || panic!("lane rebuild must retain the other owner's baseline")).unwrap();
         assert!(Arc::ptr_eq(&owner, &rebuilt));
-        observe_device_sampled(-99107, || Ok((875, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99107, || Ok((875, 1000, 0, 0, 0))).unwrap();
         assert_eq!(rebuilt.lock().unwrap().snapshot().charged, 25);
         drop(owner);
         let again = device_cache_sampled(-99107, 1000, Basis::Bytes,
@@ -1887,7 +1891,7 @@ mod observer_tests {
                 spans_devices: true };
             lane.attach_device_for_test(device, 1000, site).unwrap();
             assert!(matches!(lane.cache_miss(&1, true, None), Miss::Capture(_)));
-            observe_device_sampled(device, || Ok((875, 1000, 0, 0))).unwrap();
+            observe_device_sampled(device, || Ok((875, 1000, 0, 0, 0))).unwrap();
             assert_eq!(controllers[rank].lock().unwrap().snapshot().charged, 25);
             lanes.push(lane);
         }
@@ -1897,10 +1901,10 @@ mod observer_tests {
                 || panic!("Kimi lane attachment must retain the startup seed")).unwrap();
             assert!(Arc::ptr_eq(&cache, &weak[rank].upgrade().unwrap()));
             assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
-            observe_device_sampled(device, || Ok((875, 1000, 0, 0))).unwrap();
+            observe_device_sampled(device, || Ok((875, 1000, 0, 0, 0))).unwrap();
             assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
             pending(&cache);
-            observe_device_sampled(device, || Ok((865, 1000, 0, 0))).unwrap();
+            observe_device_sampled(device, || Ok((865, 1000, 0, 0, 0))).unwrap();
             assert_eq!(cache.lock().unwrap().snapshot().charged, 35);
         }
         drop(lanes);
@@ -1911,7 +1915,7 @@ mod observer_tests {
     fn seeded_startup_arena_is_nonzero_and_equals_capture_shares() {
         for device in [-8810, -8811] {
             let mut cache = DeviceCache::new(device, 64 << 20);
-            assert_eq!(cache.observer.observe(900 << 20, 1000 << 20, 100 << 20, 0).0, 0);
+            assert_eq!(cache.observer.observe(900 << 20, 1000 << 20, 100 << 20, 0, 0).0, 0);
             let site = Site { name: "kimi_k3.step", cycle: Cycle::Other,
                 preference: Preference::Adaptive, bootstrap: 128 << 10,
                 basis: Basis::Bytes, spans_devices: true };
@@ -1920,7 +1924,7 @@ mod observer_tests {
                     shape: format!("startup-{key}").into() };
                 assert!(matches!(cache.miss(identity, site, None, true), Miss::Capture(_)));
             }
-            let growth = cache.observer.observe(896 << 20, 1000 << 20, 100 << 20, 0).0;
+            let growth = cache.observer.observe(896 << 20, 1000 << 20, 100 << 20, 0, 0).0;
             cache.measured_capture(growth);
             assert_eq!(cache.charged, 4 << 20);
             assert!(cache.charged > 0);
@@ -1933,36 +1937,36 @@ mod observer_tests {
     #[test]
     fn lazy_tracked_workspaces_do_not_become_graph_growth() {
         let mut observer = GrowthObserver::default();
-        assert_eq!(observer.observe(900, 1000, 100, 0), (0, 0));
-        assert_eq!(observer.observe(590, 1000, 400, 0), (10, 10));
-        assert_eq!(observer.observe(590, 1000, 400, 0), (0, 10), "second lane cannot charge same capture twice");
-        assert_eq!(observer.observe(290, 1000, 700, 0), (0, 10), "lazy workspace is tracked at each sample");
-        assert_eq!(observer.observe(280, 1000, 700, 0), (10, 20));
-        assert_eq!(observer.observe(590, 1000, 400, 0), (0, 10));
-        assert_eq!(observer.observe(580, 1000, 400, 0), (0, 20), "returning physical high-water is not new growth");
-        assert_eq!(observer.observe(900, 1000, 100, 0), (0, 0), "the level falls back with the residual");
+        assert_eq!(observer.observe(900, 1000, 100, 0, 0), (0, 0));
+        assert_eq!(observer.observe(590, 1000, 400, 0, 0), (10, 10));
+        assert_eq!(observer.observe(590, 1000, 400, 0, 0), (0, 10), "second lane cannot charge same capture twice");
+        assert_eq!(observer.observe(290, 1000, 700, 0, 0), (0, 10), "lazy workspace is tracked at each sample");
+        assert_eq!(observer.observe(280, 1000, 700, 0, 0), (10, 20));
+        assert_eq!(observer.observe(590, 1000, 400, 0, 0), (0, 10));
+        assert_eq!(observer.observe(580, 1000, 400, 0, 0), (0, 20), "returning physical high-water is not new growth");
+        assert_eq!(observer.observe(900, 1000, 100, 0, 0), (0, 0), "the level falls back with the residual");
     }
 
     #[test]
     fn an_owners_granule_padding_is_not_graph_growth() {
         let mut observer = GrowthObserver::default();
         // 100 B of untracked bytes seed the attach baseline.
-        assert_eq!(observer.observe(900, 1000, 0, 0), (0, 0));
+        assert_eq!(observer.observe(900, 1000, 0, 0, 0), (0, 0));
         // A tracked owner requests 100 B and receives a full granule: physical
         // use rises by the request plus its padding, both reported by the
         // ledger. Without removing the tail the padding would read as growth.
-        assert_eq!(observer.observe(739, 1000, 100, 61), (0, 0), "rounding belongs to its owner");
+        assert_eq!(observer.observe(739, 1000, 100, 61, 0), (0, 0), "rounding belongs to its owner");
         // A real capture still counts once the ledger's rounding is removed.
-        assert_eq!(observer.observe(689, 1000, 100, 61), (50, 50), "untracked growth above the seed is graph growth");
+        assert_eq!(observer.observe(689, 1000, 100, 61, 0), (50, 50), "untracked growth above the seed is graph growth");
     }
 
     #[test]
     fn granule_padding_at_a_refresh_does_not_charge_the_graph_level() {
         let cache = attached(-99115);
         pending(&cache);
-        observe_device_sampled(-99115, || Ok((739, 1000, 100, 61))).unwrap();
+        observe_device_sampled(-99115, || Ok((739, 1000, 100, 61, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 0);
-        let arena = refreshed_arena_sampled(-99115, || Ok((739, 1000, 100, 61))).unwrap();
+        let arena = refreshed_arena_sampled(-99115, || Ok((739, 1000, 100, 61, 0))).unwrap();
         assert_eq!(arena, (0, 0), "padding at a settled sample is not level");
     }
 
@@ -1970,14 +1974,14 @@ mod observer_tests {
     fn transient_peak_leaves_the_level_at_baseline_while_charge_keeps_the_peak() {
         let cache = attached(-99116);
         pending(&cache);
-        observe_device_sampled(-99116, || Ok((800, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99116, || Ok((800, 1000, 0, 0, 0))).unwrap();
         let peak = cache.lock().unwrap().snapshot();
         assert_eq!(peak.charged, 100);
         assert_eq!(peak.level, Some(100));
         // The graph-instantiate/upload transient reverses within the request. No
         // boundary work is pending, so the settle refresh is what re-reads it:
         // an unchanged boundary never samples.
-        let arena = refreshed_arena_sampled(-99116, || Ok((900, 1000, 0, 0))).unwrap();
+        let arena = refreshed_arena_sampled(-99116, || Ok((900, 1000, 0, 0, 0))).unwrap();
         assert_eq!(arena, (0, 100));
         let settled = cache.lock().unwrap().snapshot();
         assert_eq!(settled.level, Some(0), "the current level returns to the attach baseline");
@@ -1992,11 +1996,11 @@ mod observer_tests {
         let cache = attached(-99117);
         pending(&cache);
         // A capture boundary catches the instantiate/upload peak.
-        observe_device_sampled(-99117, || Ok((800, 1000, 0, 0))).unwrap();
+        observe_device_sampled(-99117, || Ok((800, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().level, Some(100));
         // Reconciliation samples again once the stage has settled, with no
         // boundary observation in between.
-        let arena = refreshed_arena_sampled(-99117, || Ok((900, 1000, 0, 0))).unwrap();
+        let arena = refreshed_arena_sampled(-99117, || Ok((900, 1000, 0, 0, 0))).unwrap();
         assert_eq!(arena, (0, 100), "the level is current; the charge keeps the peak");
         let snapshot = cache.lock().unwrap().snapshot();
         assert_eq!(snapshot.level, Some(0));
@@ -2006,10 +2010,45 @@ mod observer_tests {
         assert_eq!(row["charged"], 100);
         // A live non-graph untracked allocation at the sample cannot inflate the
         // graph level past the admitted high-water.
-        let bounded = refreshed_arena_sampled(-99117, || Ok((600, 1000, 0, 0))).unwrap();
+        let bounded = refreshed_arena_sampled(-99117, || Ok((600, 1000, 0, 0, 0))).unwrap();
         assert_eq!(bounded, (100, 100), "the level never exceeds the charge");
         let snapshot = cache.lock().unwrap().snapshot();
         assert_eq!(snapshot.level, Some(100));
         assert_eq!(snapshot.charged, 100);
+    }
+
+    #[test]
+    fn a_measured_owner_created_after_the_seed_is_not_graph_growth() {
+        let mut observer = GrowthObserver::default();
+        // No measured owners at attach: 100 KiB of untracked bytes seed the baseline.
+        assert_eq!(observer.observe(900_000, 1_000_000, 0, 0, 0), (0, 0));
+        // A mapped pinned host pool is measured at construction: 64 KiB of
+        // device page tables that no allocation row claims. Physical use rises
+        // by exactly that, and the ledger names it.
+        assert_eq!(observer.observe(834_464, 1_000_000, 0, 0, 65_536), (0, 0),
+            "a measured owner's page tables belong to that owner");
+        // A capture above the seed still counts once the measured owner is removed.
+        assert_eq!(observer.observe(834_444, 1_000_000, 0, 0, 65_536), (20, 20));
+    }
+
+    #[test]
+    fn a_measured_owner_present_at_the_seed_cancels_and_never_reaches_the_level() {
+        let mut observer = GrowthObserver::default();
+        // The pool predates the graph controller: it is part of the attach
+        // residual, so it must not be removed twice.
+        assert_eq!(observer.observe(900, 1000, 0, 0, 64), (0, 0));
+        let arena = observer.current(900, 1000, 0, 0, 64);
+        assert_eq!(arena, 0);
+        // Its retirement leaves the residual without it and never lowers the level below zero.
+        assert_eq!(observer.observe(964, 1000, 0, 0, 0).1, 0);
+    }
+
+    #[test]
+    fn a_measured_owner_at_a_refresh_is_not_level() {
+        let cache = attached(-99112);
+        pending(&cache);
+        observe_device_sampled(-99112, || Ok((900, 1000, 0, 0, 64))).unwrap();
+        let arena = refreshed_arena_sampled(-99112, || Ok((900, 1000, 0, 0, 64))).unwrap();
+        assert_eq!(arena, (0, 0), "a measured owner at a settled sample is not level");
     }
 }

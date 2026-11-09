@@ -165,7 +165,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         site: super::device::Site) -> anyhow::Result<()> {
         anyhow::ensure!(device < 0, "policy fixtures require a synthetic device");
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
-        let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0, 0)))?;
+        let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0, 0, 0)))?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
         self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
         Ok(())

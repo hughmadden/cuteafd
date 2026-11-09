@@ -710,7 +710,16 @@ tracked total. `used - tracked` otherwise contains the page padding of every
 tracked owner, so a cache that builds many small device buffers would be read as
 graph growth and fund the graph reserve. Padding belongs to the owner that
 allocated it; only bytes no ledger row claims and no rounding explains count as
-graph arena.
+graph arena. Measured owners with no allocation request behind them are
+subtracted too: a mapped pinned host pool reserves device page-table bytes in
+every context it is mapped into (SM120: one byte per 512 bytes mapped, so a
+32 GiB host tier costs 64 MiB per GPU), which admission charges as driver page
+tables. The pool measures the real cost once, before its first chunk and after
+its last, and publishes it as `pinned host mapping: N chunks` in `/v1/stats`
+(`unclaimed`/`unclaimed_bytes`). That source set is closed: only a vetted,
+measured driver-side cost may publish an unclaimed row. The attach baseline is
+itself an untracked residual, so an owner that predates the controller cancels
+in it and never lowers the level.
 
 ### Pitfalls
 
