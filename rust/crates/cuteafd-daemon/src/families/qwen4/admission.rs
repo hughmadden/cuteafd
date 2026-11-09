@@ -6,7 +6,7 @@ use cuteafd_loader::families::qwen4::Qwen4Config;
 use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
-use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights};
+use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights, RuntimeSample};
 
 pub(super) fn single_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     cfg: &Qwen4Config, layers: usize, mtp: bool) -> Result<ResidentWeights> {
@@ -140,8 +140,8 @@ impl ExpertSource {
 /// Qwen's KV pool from one sample of free memory after weights, the PLE table and resident experts:
 /// the shared admission's fixed items, the graph reserve before them, and the largest pool that fits.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
-    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights, host: qwen4::QwenHost)
-    -> Result<(usize, qwen4::QwenHost)> {
+    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights,
+    host: qwen4::QwenHost, devices: &[RuntimeSample]) -> Result<(usize, qwen4::QwenHost)> {
     let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
         &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
@@ -159,11 +159,55 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     inputs.loaded_weights = loaded_weights;
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+    publish_reconciliation(args, devices, &solved, source.spark_ranks())?;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
         ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
         "Qwen shared solver admission before allocation");
     Ok((usize::try_from(placement.pool_tokens)?, inputs.host))
+}
+
+/// Publish the admission identity the shared Ready and first-request memory
+/// reconciliation reads (`shared::memory_report::reconcile`). The capture
+/// returns before sampling without `memory_reconciliation_provenance`, so
+/// `/v1/stats` would report no `delta_vs_measured` or `graph_reserve_slack`
+/// for the family. Identity only: hashes of the native library and program
+/// manifest, the served layout, and one inventory sample per physical GPU in
+/// rank order (the capture indexes `devices` by the `rtxN` owner row).
+pub(super) fn publish_reconciliation(args: &EngineArgs, devices: &[RuntimeSample],
+    solved: &cuteafd_loader::placement::planner::ResolvedPlan, spark_world: usize) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    let layout = format!("snapshot/{}; context/{}; slots/{}; kv/{:?}; prefill/{}x{} rows",
+        args.snapshot.display(), args.max_context, args.slots, args.kv_format,
+        solved.decisions.prefill.rows, solved.decisions.prefill.waves);
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": reconciliation_provenance(
+            env!("CUTEAFD_BUILD_COMMIT"), env!("CUTEAFD_BUILD_DIRTY"), env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            &hash(&args.native_lib)?, &hash(&args.manifest)?, &layout, devices, spark_world,
+            &solved.decisions.onboard_layers, solved.decisions.prefill)
+    }));
+    Ok(())
+}
+
+/// Split out so a CPU test checks the fields the shared capture reads.
+fn reconciliation_provenance(source_commit: &str, source_dirty: &str, toolchain: &str,
+    native_sha256: &str, programs_sha256: &str, layout: &str, devices: &[RuntimeSample],
+    spark_world: usize, onboard_layers: &[Vec<usize>],
+    prefill: cuteafd_loader::placement::planner::PrefillShape) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1, "family": "qwen4", "source_commit": source_commit,
+        "source_dirty": source_dirty, "toolchain": toolchain,
+        "native_sha256": native_sha256, "programs_sha256": programs_sha256,
+        "layout": layout, "devices": devices, "spark_world": spark_world,
+        "onboard_layers": onboard_layers, "prefill": prefill,
+        "graph_basis": "per-device bounded cache; Basis::Bytes from each shape's traced capture bytes (#1627)"
+    })
 }
 
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
@@ -427,6 +471,44 @@ mod tests {
             assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(123))))?.is_none());
             assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(u64::MAX)))).is_err());
         }
+        Ok(())
+    }
+
+    /// The shared Ready/first-request capture returns before sampling when
+    /// admission never registered `memory_reconciliation_provenance`, so the
+    /// family's `/v1/stats` would have no `delta_vs_measured` or
+    /// `graph_reserve_slack`. Register exactly what admission publishes and
+    /// read the reconciled device back.
+    #[test]
+    fn reconciliation_registers_the_identity_the_shared_capture_reads() -> anyhow::Result<()> {
+        let sample = |device: i32| cuteafd_loader::placement::RuntimeSample { device,
+            total_bytes: 96 << 30, free_bytes: 80 << 30, context_bytes: 1 << 20, module_bytes: 0,
+            sms: 188, arch: "sm_120".into(), driver: "580.65".into() };
+        let provenance = super::reconciliation_provenance("commit", "false", "toolchain", "native",
+            "programs", "layout", &[sample(0), sample(1)], 2, &[vec![0], vec![1]],
+            cuteafd_loader::placement::planner::PrefillShape { rows: 2048, waves: 1 });
+        assert_eq!(provenance["family"], "qwen4");
+        let devices = provenance["devices"].as_array().expect("devices array");
+        assert_eq!(devices.len(), 2, "one inventory sample per physical GPU, in rank order");
+        assert_eq!(devices[1]["device"].as_i64(), Some(1));
+        assert_eq!(provenance["spark_world"], 2);
+        assert_eq!(provenance["prefill"]["rows"], 2048);
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(),
+            cap_bytes: 96 << 30, weights_bytes: 64 << 30, workspace_bytes: 8 << 30, kv_bytes: 8 << 30,
+            other_bytes: 0, reserve_overridden: false,
+            reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
+                name: "graph reserve".into(), bytes: 212 << 20 }] };
+        use crate::shared::memory_report::reconcile;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": provenance, "device.rtx0": owners }));
+        reconcile::capture("ready");
+        let snapshot = reconcile::snapshot();
+        let row = snapshot["ready"]["devices"].as_array().expect("reconciled rows").iter()
+            .find(|row| row["device"].as_str() == Some("rtx0")).expect("admitted rtx0 row");
+        assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(212 << 20));
+        assert_eq!(row["provenance"]["family"], "qwen4");
+        assert!(row.get("delta_vs_measured").is_some());
+        assert!(row.get("graph_reserve_slack").is_some());
         Ok(())
     }
 
@@ -1142,4 +1224,5 @@ mod dual_push_tests {
         anyhow::ensure!(arms == 4, "every representation arm ran");
         Ok(())
     }
+
 }

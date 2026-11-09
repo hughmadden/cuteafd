@@ -614,7 +614,7 @@ impl Opened {
         // every other family's modules, which Qwen never launches.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
         let device = self.library.cuda_get_device()?;
-        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
             tracing::info!(loaded, skipped, "Qwen programs loaded");
             Ok(())
@@ -789,7 +789,7 @@ impl Opened {
                 self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), host_embedding, window_push)?;
             let (pool, host) = admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host)?;
+                future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host, &inventory.gpus)?;
             (pool, Some(host))
         } else { (args.pool_tokens, None) };
         let max_context = crate::shared::context::pool_context("qwen4", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;

@@ -105,6 +105,7 @@ impl Opened {
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+        admission::publish_reconciliation(args, &inventory.gpus, &solved, 0)?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
