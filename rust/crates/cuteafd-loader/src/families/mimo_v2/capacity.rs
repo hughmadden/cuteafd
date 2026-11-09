@@ -637,7 +637,9 @@ mod tests {
                         runtime.workspaces[0].1.waves = waves;
                         runtime.workspaces[0].1.prefill_output = MimoPrefillOutput::LastRow;
                     }
-                    let profile = mimo_capacity_profiles(&checkpoint, &cfg, weights(ranks), &options).unwrap().steady;
+                    let mut resident = weights(ranks);
+                    resident.checkpoint_tp = if pro { 8 } else { 1 };
+                    let profile = mimo_capacity_profiles(&checkpoint, &cfg, resident, &options).unwrap().steady;
                     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, 2, ranks, options.kv_cache, 0).unwrap();
                     for rank in 0..ranks {
                         let admitted = &profile.devices[rank];
