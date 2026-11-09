@@ -124,6 +124,29 @@ function segments(domain, foldSmall = true) {
   result.forEach((s,i)=>{s.variant=[...s.key].reduce((n,c)=>(n*31+c.charCodeAt(0))>>>0,0)%3;s.pattern=i>0&&result[i-1].group===s.group;});
   return result;
 }
+function reservationView(domain, hideWeights = false) {
+  const hidden = domain.items.filter(i=>ownerGroup(i)==='weights').reduce((n,i)=>n+i.bytes,0);
+  const items = hideWeights ? domain.items.filter(i=>ownerGroup(i)!=='weights') : domain.items;
+  const total = items.reduce((n,i)=>n+i.bytes,0);
+  return {parts:segments({...domain,items}),total,hidden,
+    scale:hideWeights ? Math.max(total,1) : Math.max(domain.cap || 0,total,1)};
+}
+function segmentLabel(size, height) { return height >= 14 ? bytes(size) : ''; }
+function labelInk(color, variant = 0) {
+  const rgb = color.trim().replace('#','').match(/../g).map(c=>parseInt(c,16));
+  const overlay = variant % 3 === 1 ? 255 : 0, alpha = variant % 3 === 0 ? 0 : .10;
+  const linear = rgb.map(c=>{const v=(c*(1-alpha)+overlay*alpha)/255;return v<=.04045?v/12.92:((v+.055)/1.055)**2.4;});
+  const luminance = linear[0]*.2126+linear[1]*.7152+linear[2]*.0722;
+  return (luminance+.05)/.05 >= 1.05/(luminance+.05) ? '#000000' : '#ffffff';
+}
+function weightPreference(viewer, value) {
+  // Only a display preference persists; telemetry/history never leaves memory.
+  try {
+    if (value === undefined) return viewer.localStorage.getItem('cuteafd.memory.hideWeights') === 'true';
+    viewer.localStorage.setItem('cuteafd.memory.hideWeights',String(value));
+  } catch (_) { /* Storage can be blocked or unavailable in private windows. */ }
+  return value === true;
+}
 function rates(current, previous, elapsed) {
   const out = {};
   for (const [cycle,counts] of Object.entries(current || {})) {
@@ -143,7 +166,7 @@ class Rolling {
   }
   series(key) { return this.samples.map(s => ({time:s.time,value:s.values[key]})); }
 }
-const model = {normalize,segments,rates,Rolling,bytes,exact,numeric,ownerLabel,graphIdentity};
+const model = {normalize,segments,reservationView,segmentLabel,labelInk,weightPreference,rates,Rolling,bytes,exact,numeric,ownerLabel,graphIdentity};
 if (typeof module !== 'undefined' && module.exports) module.exports = model;
 if (!root.document) return;
 const $ = id => document.getElementById(id), UI = root.CuteUI, esc = UI.fmt.esc;
@@ -183,7 +206,8 @@ function ownerPaint(s,id,variant) {
 function reservationText(domain,s) {
   return `${domain.id} / ${s.name}\n${exact(s.bytes)} (${bytes(s.bytes)})\n${s.members.map(i=>`${i.name}: ${exact(i.bytes)} [${i.category}]`).join('\n')}`;
 }
-let selectedDomain = null, reservationData = null;
+let selectedDomain = null, reservationData = null, hideWeights = weightPreference(root);
+$('hide-weights').checked = hideWeights;
 function renderDetail() {
   const d = reservationData.domains.find(d=>d.id === selectedDomain);
   if (!d) return;
@@ -196,19 +220,22 @@ function renderDetail() {
 function renderReservations(data) {
   reservationData = data;
   if (!data.domains.some(d=>d.id === selectedDomain)) selectedDomain = data.domains.find(d=>d.id.startsWith('rtx'))?.id || data.domains[0]?.id;
-  const owners = new Map(), rows = [];
+  const owners = new Map(), rows = [], views = data.domains.map(d=>reservationView(d,hideWeights));
+  const palette = getComputedStyle(document.documentElement);
+  $('reservation-scale').textContent = hideWeights ? 'Each bar fills to its remaining non-weight owners' : 'Each bar uses its own capacity scale';
   $('reservations').innerHTML = data.domains.map((d,index) => {
-    const parts = segments(d), total = d.items.reduce((s,i)=>s+i.bytes,0), scale = Math.max(d.cap || 0,total,1);
+    const {parts,total,hidden,scale} = views[index];
     let y = 428;
     const defs = parts.map((s,n)=>ownerPaint(s,`p${index}-${n}`,s.variant)).join('');
     const marks = parts.map((s,n) => {
       const h = s.bytes/scale*410; y -= h;
       if (!owners.has(s.key)) owners.set(s.key,{...s,texts:[]});
       owners.get(s.key).texts.push(reservationText(d,s));
-      return `<rect class="segment" id="s${index}-${n}" data-owner="${esc(s.key)}" x="24" y="${y}" width="76" height="${h}" fill="url(#p${index}-${n})" tabindex="0" role="img" aria-label="${esc(reservationText(d,s))}"/>`;
+      const label = segmentLabel(s.bytes,h), ink = labelInk(palette.getPropertyValue(`--mem-group-${groupIndex(s.group)}`),s.variant);
+      return `<g><rect class="segment" id="s${index}-${n}" data-owner="${esc(s.key)}" x="24" y="${y}" width="76" height="${h}" fill="url(#p${index}-${n})" tabindex="0" role="img" aria-label="${esc(reservationText(d,s))}"/>${label?`<text class="segment-label" x="62" y="${y+h/2}" fill="${ink}" text-anchor="middle" dominant-baseline="central" aria-hidden="true">${esc(label)}</text>`:''}</g>`;
     }).join('');
     rows.push(...d.items.map(i=>`<tr><td>${esc(d.id)} / ${esc(i.name)}</td><td>${esc(i.category)}</td><td>${exact(i.bytes)}</td></tr>`));
-    return `<article class="domain"><button class="domain-select" data-domain="${esc(d.id)}" type="button" aria-label="Inspect ${esc(d.id)} non-weight and non-KV owners">${esc(d.id)}</button><span class="capacity">${bytes(d.cap)} capacity</span><svg viewBox="0 0 125 455" aria-label="${esc(d.id)} reservations"><defs>${defs}</defs><rect x="24" y="18" width="76" height="410" fill="var(--well)"/>${marks}<text x="62" y="450" text-anchor="middle" fill="currentColor" font-size="9">${esc(d.reason?'unavailable':bytes(total)+' planned')}</text></svg><p class="hint">${esc(d.reason ? `Unavailable: ${d.reason}` : d.source)}</p>${numeric(d.cap)&&total>d.cap?'<p>Owners exceed capacity</p>':''}</article>`;
+    return `<article class="domain"><button class="domain-select" data-domain="${esc(d.id)}" type="button" aria-label="Inspect ${esc(d.id)} non-weight and non-KV owners">${esc(d.id)}</button><span class="capacity">${bytes(d.cap)} capacity</span><svg viewBox="0 0 125 455" aria-label="${esc(d.id)} reservations"><defs>${defs}</defs><rect x="24" y="18" width="76" height="410" fill="var(--well)"/>${marks}<text x="62" y="450" text-anchor="middle" fill="currentColor" font-size="9">${esc(d.reason?'unavailable':bytes(total)+' planned')}</text></svg><p class="hint bar-scale">${esc(d.reason ? `Unavailable: ${d.reason}` : hideWeights ? `Scale: excluding weights (${bytes(hidden)} hidden); ${bytes(total)} remaining` : `Scale: ${bytes(scale)} including weights`)}</p><p class="hint">${esc(d.reason ? `Unavailable: ${d.reason}` : d.source)}</p>${numeric(d.cap)&&d.items.reduce((n,i)=>n+i.bytes,0)>d.cap?'<p>Owners exceed capacity</p>':''}</article>`;
   }).join('');
   $('owners').innerHTML = rows.join('');
   $('legend').innerHTML = GROUPS.map(group=>{
@@ -218,7 +245,7 @@ function renderReservations(data) {
       return `<button type="button" data-owner="${esc(s.key)}"><svg class="swatch" viewBox="0 0 20 20" aria-hidden="true"><defs>${ownerPaint(s,id,s.variant)}</defs><rect width="20" height="20" fill="url(#${id})"/></svg>${esc(ownerLabel(s.name))}</button>`;
     }).join('')}</div>`:'';
   }).join('');
-  for (const [index,d] of data.domains.entries()) for (const [n,s] of segments(d).entries()) {
+  for (const [index,d] of data.domains.entries()) for (const [n,s] of views[index].parts.entries()) {
     inspect($(`s${index}-${n}`),reservationText(d,s),on=>highlightOwner(s.key,on));
     $(`s${index}-${n}`).addEventListener('click',()=>select(d.id));
   }
@@ -347,7 +374,12 @@ async function refresh() {
   finally { clearTimeout(timeout);busy=false; }
 }
 $('pause').addEventListener('click',()=>{paused=!paused;$('pause').textContent=paused?'Resume':'Pause';if(!paused)refresh();});
-$('theme').addEventListener('change',()=>{document.documentElement.dataset.theme=$('theme').value;});
+$('theme').addEventListener('change',()=>{document.documentElement.dataset.theme=$('theme').value;if(reservationData)renderReservations(reservationData);});
+$('hide-weights').addEventListener('change',()=>{
+  hideWeights=weightPreference(root,$('hide-weights').checked);
+  hide();
+  if(reservationData)renderReservations(reservationData);
+});
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){previous=null;refresh();}});
 root.addEventListener('pagehide',()=>clearInterval(timer));
 (async()=>{if(await UI.adminGate($('app'),'Memory dashboard','Inspect admitted memory owners, live caches and graph reserves.')){await refresh();timer=setInterval(refresh,1000);}})();
