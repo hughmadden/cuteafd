@@ -2335,10 +2335,11 @@ impl<'a> MimoEngine<'a> {
     /// Attaches one bounded device cache per physical rank: the resolved
     /// layout's reserve and one byte basis for the whole device. MiMo has no
     /// #1612 node calibration, so every capture is priced from bytes.
-    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
+    pub fn configure_graph_cache(&self, reserves: &[u64], bootstraps: &[u64],
+        policies: &[cuteafd_loader::placement::graph_reserve::Resolved]) -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-        ensure!(reserves.len() == self.ranks() && bootstraps.len() == self.ranks(),
-            "MiMo graph cache needs one reserve and bootstrap per physical rank");
+        ensure!(reserves.len() == self.ranks() && bootstraps.len() == self.ranks() && policies.len() == self.ranks(),
+            "MiMo graph cache needs one reserve, bootstrap and policy per physical rank");
         tracing::warn!("MiMo graph cache uses per-site byte estimates: no calibrated node rates for this family");
         for rank in 0..self.ranks() {
             let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
@@ -2347,6 +2348,7 @@ impl<'a> MimoEngine<'a> {
                 name: "mimo_v2.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis: Basis::Bytes, spans_devices: self.ranks() > 1,
             })?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policies[rank])?;
         }
         Ok(())
     }
@@ -2512,7 +2514,11 @@ impl<'a> MimoEngine<'a> {
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         let max_rows = max_rows.clamp(1, DECODE_ROWS);
         let rows = layout.rows.iter().copied().filter(|&rows| rows <= max_rows).collect::<Vec<_>>();
-        ensure!(!rows.is_empty(), "MiMo decode graph prewarm list is empty for {max_rows} rows");
+        if rows.is_empty() {
+            self.graphs_warmed.set(true);
+            tracing::warn!(max_rows, "MiMo prewarm selected no rows; runtime misses capture or run eagerly");
+            return Ok(0);
+        }
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
         }
@@ -3362,6 +3368,60 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn empty_prewarm_with_nonzero_reserve_captures_on_first_runtime_miss() -> anyhow::Result<()> {
+        use super::*;
+        use crate::shared::memory::device::Stream;
+        use crate::shared::token_io::{EmbedPlacement, EmbedSource};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        // Isolate this CPU-only cache from other tests' logical device owners.
+        fixture.configure_memory(&library, 7, 1 << 30)?;
+        library.cuda_set_device(7)?;
+        fixture.immediate_copies(&library)?;
+        let programs = library.programs()?;
+        let stream = Stream::new(Device { library: &library, id: 7 })?;
+        let mut cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_flash_config())?;
+        let mut layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(&cfg, 1, true, true)?;
+        layout.rows.clear();
+        layout.pinned.clear();
+        layout.executables_per_rank.fill(0);
+        // No model kernels execute: this fixture exercises startup and graph ownership only.
+        cfg.layers = 0;
+        cfg.attention.clear();
+        cfg.dense.clear();
+        cfg.vocab_size = 1;
+        let path = fixture.directory().join("embedding.bin");
+        std::fs::write(&path, vec![0u8; cfg.hidden * 2])?;
+        let (embedding, ()) = TokenEmbedding::load(&library, EmbedSource {
+            path, offset: 0, vocab: 1, hidden: cfg.hidden, snapshot: None,
+            tensor_name: "test.empty-prewarm.embedding".into(),
+        }, EmbedPlacement::Host, || Ok(()))?;
+        let weights = MimoWeights { layers: vec![],
+            norm: DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?,
+            head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?),
+            output_fp8: false };
+        let mut engine = MimoEngine::new(&library, &programs, cfg, weights, stream.raw,
+            64, 64, 16384, 1, 1, embedding, MimoKvFormats::default(), MimoPrefillOutput::AllRows)?;
+        engine.decode_graphs = true;
+        engine.configure_graph_cache(&layout.reserves, &layout.bootstraps, &layout.policies)?;
+        engine.graph_layout = Some(layout);
+        assert_eq!(engine.capture_decode_graphs(DECODE_ROWS)?, 0);
+        assert!(engine.graphs_warmed.get());
+        assert_eq!(engine.graphs.borrow().len(), 0);
+        let key = GraphKey { layer: 0, rows: 1, table_stride: 1, previous: Previous::First, head: true };
+        let calls = Cell::new(0);
+        engine.graph(0, key, || { calls.set(calls.get() + 1); Ok(()) })?;
+        engine.graph_end_of_step()?;
+        assert_eq!(calls.get(), 1);
+        assert_eq!(engine.graphs.borrow().len(), 1, "first miss must capture, not remain eager");
+        engine.graph(0, key, || anyhow::bail!("captured key must replay"))?;
+        engine.graph_end_of_step()?;
+        assert_eq!(fixture.events()?.matches('G').count(), 1);
+        assert_eq!(fixture.events()?.matches('L').count(), 2);
+        Ok(())
+    }
 
     #[test]
     fn graph_growth_excludes_separately_owned_device_allocations() {

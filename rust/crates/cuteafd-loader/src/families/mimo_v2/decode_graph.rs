@@ -28,7 +28,7 @@ pub const MIMO_GRAPH_PEER_OBSERVED: (u64, u64) = (4480, 566 << 20);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MimoGraphLayout {
     pub enabled: bool,
-    /// Prewarm row shapes, ascending.
+    /// Prewarm row shapes: pinned first, then descending request replay demand.
     pub rows: Vec<usize>,
     /// Row shapes that stay pinned in the cache.
     pub pinned: Vec<usize>,

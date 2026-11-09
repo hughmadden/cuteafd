@@ -431,6 +431,13 @@ int cuteafd_cuda_graph_end_capture_topology(void *stream, void **out,
     *nodes = *width = 1;
     return 0;
 }
+int cuteafd_cuda_graph_launch(void *handle, void *stream) {
+    (void)stream;
+    struct graph_exec *graph = handle;
+    if (!graph || graph->device != current_device) return 1;
+    event('L');
+    return 0;
+}
 int cuteafd_cuda_graph_exec_destroy(void *handle) {
     struct graph_exec *graph = handle;
     memory_used[graph->device] -= graph->bytes;
