@@ -59,9 +59,9 @@ pub(crate) struct EngineArgs {
     /// Concrete serving prefix arena reservation; filled before engine loading.
     #[arg(skip)]
     pub planner_prefix_bytes: Option<u64>,
-    /// Serving graph modes, set before weight/KV admission; diagnostics stay lazy.
+    /// A serving run pre-admits its experts before KV sizing (set before loading).
     #[arg(skip)]
-    pub planner_graph_modes: Option<(usize, bool)>,
+    pub budget_admission: bool,
     /// Resolve the serving host quota once the final pool and context are known.
     #[arg(skip)]
     pub planner_host_prefix: Option<(crate::shared::prefix::PrefixArgs, usize)>,
@@ -614,7 +614,7 @@ impl Opened {
         // every other family's modules, which Qwen never launches.
         let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "qwen4", split_family: None };
         let device = self.library.cuda_get_device()?;
-        crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
+        let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &[device], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name))?;
             tracing::info!(loaded, skipped, "Qwen programs loaded");
             Ok(())
@@ -744,10 +744,8 @@ impl Opened {
         // lazy first-use load; reserve the exact loader plan before sizing KV.
         let mut future_expert_bytes = 0;
         let mut expert_weights = ResidentWeights::default();
-        let startup_admission = args.planner_graph_modes.is_some() && engine::startup_graphs_enabled(
-            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
-            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
-        let budget_admission = args.full_prefill_logits || args.pool_tokens == 0 || cuteafd_ffi::coordinator_gpu_budget().is_some() || startup_admission;
+        let budget_admission = args.full_prefill_logits || args.pool_tokens == 0
+            || cuteafd_ffi::coordinator_gpu_budget().is_some() || args.budget_admission;
         let admitted_experts = if budget_admission {
             ensure!(args.shared_only || self.fp8().is_none() || args.expert_window.is_none(),
                 "Qwen automatic KV admission does not support diagnostic --expert-window paging; use a fixed pool or Sparks");
@@ -791,7 +789,7 @@ impl Opened {
                 self.checkpoint.spark_input_is_bf16(), ple.as_ref().map(|p| p.row_bytes as u64), host_embedding, window_push)?;
             let (pool, host) = admission::pool_tokens(&self.library, args, &admission::inputs(args, &self.cfg, layers, model.mtp.is_some(),
                 manifest_json.as_ref(), ple.as_ref().map(|p| (p.row_bytes as u64, p.fp8)),
-                future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host)?;
+                future_expert_bytes)?, source, cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), admitted_weights, host, &inventory.gpus)?;
             (pool, Some(host))
         } else { (args.pool_tokens, None) };
         let max_context = crate::shared::context::pool_context("qwen4", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
@@ -801,7 +799,6 @@ impl Opened {
         engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
-        if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
         if let Some(experts) = match admitted_experts { Some(experts) => experts,
             None => self.experts(args, layers, stream, loaded_weights)? } {

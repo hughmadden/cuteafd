@@ -1,4 +1,5 @@
 """Trace-derived startup lists preserve hot shapes and per-device ownership."""
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -441,3 +442,189 @@ def test_regeneration_reproduces_checked_in_base_and_tail(filename):
                              **({"layout": checked_in["layout"]} if checked_in.get("layout") else {}))
     for key in ("reserve_base_bytes", "reserve_extra_bytes"):
         assert result[key] == checked_in[key]
+
+
+def qwen_identity(segment, rows=64, spec=False, long=False, width=64, page_stride=64, pool_stride=128):
+    return (f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {str(spec).lower()}, "
+            f"long: {str(long).lower()}, pool_width: {width}, page_stride: {page_stride}, "
+            f"pool_stride: {pool_stride} }}")
+
+
+def qwen_trace(device=0, charged=8 << 20, capture=(1 << 20, 2 << 20, 4 << 20)):
+    def graph(segment, rows, count, share, hits=None):
+        return {"device": device, "site": "qwen4.segment", "bank": 0,
+                "key_id": segment * 1000 + rows,
+                "shape": qwen_identity(segment, rows=rows),
+                "count": count, "cycles": {"decode": count},
+                "hits": count if hits is None else hits,
+                "hit_histogram": {"rolling": True, "interval_ms": 10_000,
+                                  "start_ms": 0, "counts": [5, 0, 0, 0, 0]},
+                "evictions": 0, "recaptures": 0,
+                "capture_bytes": share, "permanent_bytes": share * 2,
+                "nodes": 10, "executables": 1, "basis": {"kind": "bytes"}}
+    return {"schema_version": 2,
+            "cache": {"device": device, "charged": charged, "sampled_at_ms": 10_000},
+            "sites": {"qwen4.segment": {"largest_bytes": 3 << 20}},
+            "graphs": [graph(0, 64, 100, capture[0]), graph(1, 64, 100, capture[1]),
+                       graph(1, 128, 1, capture[2])]}
+
+
+def test_qwen_shape_list_is_keyed_by_resolved_shape_and_device():
+    result = MODULE.generate_qwen([qwen_trace(0, 8 << 20), qwen_trace(1, 12 << 20)],
+                                  "dual_0spark", coverage=0.99)
+    assert result["shape"] == "dual_0spark"
+    # One 2 MiB chunk each: the selected (rows=64) identities' measured shares
+    # 1 MiB + 2 MiB on rank 0, 1 MiB + 2 MiB on rank 1, rounded once. The
+    # trace's charged high-water is never the base.
+    assert result["reserve_base_bytes"] == [4 << 20, 4 << 20]
+    assert result["reserve_extra_bytes"] == [2 << 20, 2 << 20]
+    # Layer segments share one capture shape: one entry, not one per segment.
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 64,
+         "page_stride": 64, "pool_stride": 128, "pin": False}]
+    assert "dual_0spark" in result["trace"]["provenance"]
+
+
+def test_qwen_base_ignores_charged_and_counts_startup_only_siblings():
+    quiet = qwen_trace(0, 64 << 20, capture=(1 << 20, 2 << 20, 4 << 20))
+    # A startup-only sibling is captured but never replayed; it still costs its
+    # share in the arena. Moving the charged counter must not move the base.
+    quiet["graphs"][1]["hits"] = 0
+    result = MODULE.generate_qwen([quiet], "single_0spark", coverage=0.99)
+    assert result["reserve_base_bytes"] == [4 << 20]
+    loud = copy.deepcopy(quiet)
+    loud["cache"]["charged"] = 5 << 30
+    assert MODULE.generate_qwen([loud], "single_0spark", coverage=0.99)["reserve_base_bytes"] == [4 << 20]
+
+
+def test_qwen_zero_hit_bootstrap_shapes_are_never_selected():
+    # The provisional startup set captures many shapes the traffic never
+    # replays. A startup capture is a miss and an event, never demand: ranking
+    # by replay hits keeps every zero-hit shape out of the list (#1652), even
+    # though their captured bytes are real.
+    data = qwen_trace()
+    hot = data["graphs"][0]
+    hot["hits"] = 100
+    cold = []
+    for segment in range(1, 12):
+        graph = dict(data["graphs"][1])
+        graph.update(key_id=segment, hits=0, count=1, misses=1, cycles={"decode": 1},
+                     capture_bytes=1 << 20, shape=qwen_identity(segment, rows=4))
+        cold.append(graph)
+    data["graphs"] = [hot] + cold
+    summary = {}
+    result = MODULE.generate_qwen([data], "single_0spark", summary=summary)
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 64,
+         "page_stride": 64, "pool_stride": 128, "pin": False}]
+    assert result["reserve_base_bytes"] == [2 << 20]
+    # Captured once, never replayed: never selected, and reported rather than
+    # hidden (11 cold identities, 1 MiB each).
+    assert summary == {"zero_replay_identities": len(cold), "zero_replay_bytes": len(cold) << 20,
+                       "zero_share_identities": 0, "zero_share_bytes": 0}
+    assert f"{len(cold)} zero-replay identities" in result["trace"]["provenance"]
+
+
+def test_qwen_zero_share_identity_is_charged_the_device_mean():
+    # A capture boundary with no new physical growth is allocator reuse, not a
+    # free graph. The shared cache keeps such a record's estimate; the base
+    # must not treat the zero as a measured zero, or a selected shape's share
+    # vanishes from the reserve.
+    data = qwen_trace()
+    data["graphs"][0]["capture_bytes"] = 0
+    data["graphs"][2]["capture_bytes"] = 1 << 20
+    summary = {}
+    result = MODULE.generate_qwen([data], "single_0spark", coverage=0.99, summary=summary)
+    # Device mean over three captures: (0 + 2 + 1) MiB / 3 = 1 MiB; the zero
+    # selected identity is charged it, so 1 + 2 = 3 MiB -> one 2 MiB chunk.
+    assert result["reserve_base_bytes"] == [4 << 20]
+    assert summary["zero_share_identities"] == 1
+    assert summary["zero_share_bytes"] == 1 << 20
+    assert "1 zero-share selected identities" in result["trace"]["provenance"]
+    # A measured zero outside the selected set is not filled.
+    data = qwen_trace()
+    data["graphs"][2]["capture_bytes"] = 0
+    assert MODULE.generate_qwen([data], "single_0spark", coverage=0.99)["reserve_base_bytes"] == [4 << 20]
+
+
+def test_qwen_selected_identity_without_a_measured_share_fails():
+    data = qwen_trace()
+    data["graphs"][1]["capture_bytes"] = None
+    with pytest.raises(ValueError, match="without a measured capture share"):
+        MODULE.generate_qwen([data], "single_0spark", coverage=0.99)
+    # A shape outside the selected set may stay unmeasured.
+    data = qwen_trace()
+    data["graphs"][2]["capture_bytes"] = None
+    assert MODULE.generate_qwen([data], "single_0spark", coverage=0.99)["trace"]["entries"]
+
+
+def test_qwen_regeneration_reproduces_a_checked_in_generation_exactly():
+    # A committed fixture trace reproduces byte-identical base and extra: the
+    # checked-in lists must never be hand-edited.
+    fixture = Path(__file__).resolve().parent / "fixtures" / "qwen-prewarm-trace"
+    traces = [json.loads(path.read_text()) for path in sorted(fixture.glob("trace.device-*.json"))]
+    generated = MODULE.generate_qwen(traces, "single_0spark", coverage=0.99)
+    expected = json.loads((fixture / "expected-single_0spark.json").read_text())
+    assert generated == expected
+
+
+def qwen_list():
+    def shape(name, owners):
+        return {"shape": name, "reserve_base_bytes": [5 << 30] * owners,
+                "reserve_extra_bytes": [2 << 20] * owners, "trace": None}
+    return {"schema_version": 1, "family": "qwen4", "provenance": "bootstrap",
+            "bootstrap": {"entries": []},
+            "shapes": [shape("single_0spark", 1), shape("single_sparks", 1),
+                       shape("dual_0spark", 2), shape("dual_sparks", 2)]}
+
+
+def fixture_traces():
+    fixture = Path(__file__).resolve().parent / "fixtures" / "qwen-prewarm-trace"
+    return [json.loads(path.read_text()) for path in sorted(fixture.glob("trace.device-*.json"))]
+
+
+def test_qwen_merge_replaces_only_the_traced_shape():
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    merged = MODULE.merge_qwen(qwen_list(), generated)
+    installed = {prewarm["shape"]: prewarm for prewarm in merged["shapes"]}
+    assert installed["single_0spark"] == generated
+    assert installed["dual_0spark"]["trace"] is None
+    assert installed["dual_0spark"]["reserve_base_bytes"] == [5 << 30, 5 << 30]
+    assert "single_0spark" in merged["provenance"]
+    assert "dual_sparks" in merged["provenance"], "untraced shapes are named"
+    assert MODULE.merge_qwen(merged, generated) == merged, "merging is idempotent"
+
+
+def test_qwen_merge_installs_the_generated_base_and_extra_exactly():
+    fixture = Path(__file__).resolve().parent / "fixtures" / "qwen-prewarm-trace"
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    merged = MODULE.merge_qwen(qwen_list(), generated)
+    installed = next(prewarm for prewarm in merged["shapes"] if prewarm["shape"] == "single_0spark")
+    assert installed == json.loads((fixture / "expected-single_0spark.json").read_text())
+
+
+def test_qwen_merge_rejects_a_list_without_the_shape():
+    generated = MODULE.generate_qwen(fixture_traces(), "single_0spark", coverage=0.99)
+    document = qwen_list()
+    document["shapes"] = [prewarm for prewarm in document["shapes"]
+                          if prewarm["shape"] != "single_0spark"]
+    with pytest.raises(ValueError, match="no single_0spark"):
+        MODULE.merge_qwen(document, generated)
+
+
+def test_qwen_single_shape_needs_exactly_one_device_trace():
+    assert len(MODULE.generate_qwen([qwen_trace()], "single_0spark")["reserve_base_bytes"]) == 1
+    with pytest.raises(ValueError):
+        MODULE.generate_qwen([qwen_trace()], "dual_sparks")
+
+
+def test_qwen_unparseable_identity_fails():
+    data = qwen_trace()
+    data["graphs"][0]["shape"] = "bad"
+    with pytest.raises(ValueError):
+        MODULE.generate_qwen([data], "single_0spark")
+
+
+def test_qwen_family_requires_shape_argument():
+    with pytest.raises(ValueError):
+        MODULE.generate([qwen_trace()], "qwen4")

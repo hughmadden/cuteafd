@@ -532,6 +532,13 @@ fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, req
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         probe::graph_capture_stats(&mut stats);
     }
+    // Sampled once, outside the stats lock, after the first request retires so a
+    // settled device is measured rather than a partial decode step. Silent when
+    // the family publishes no reconciliation provenance.
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
 }
 
 /// Message starts of the Qwen chat template: a snapshot right before one is a message boundary.

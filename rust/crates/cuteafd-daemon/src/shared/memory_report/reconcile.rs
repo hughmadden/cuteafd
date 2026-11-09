@@ -135,13 +135,27 @@ fn spark_row(id: &str, stage: &str, worker: Option<&Value>,
     record
 }
 
+/// The per-rank device inventory admission registered, or `None` when the
+/// family publishes no `memory_reconciliation_provenance` (Step-5 and Muse do
+/// not). A family without it keeps both `/v1/stats` rows null instead of
+/// reporting an empty or partial reconciliation.
+fn admitted_devices(inputs: &Value) -> Option<&Vec<Value>> {
+    inputs.get("memory_reconciliation_provenance")?.get("devices")?.as_array()
+}
+
 /// Ready runs on a helper thread; first-request runs only once, after completed
 /// request retirement. Neither path creates a primary context or synchronizes a
 /// partial multi-rank submission.
+///
+/// Both stages are per-process samples, so each has exactly one call site: the
+/// `Once` lives there, not here, and a second site would re-sample a settled
+/// device. `ready` belongs to the admission module; `first_request` is the
+/// shared Qwen scheduler's post-retire hook (GLM 5, which drives its own
+/// scheduler loop, guards its own call).
 pub(crate) fn capture(stage: &str) {
     let inputs = memory_ledger::fault::inputs();
-    let Some(provenance) = inputs.get("memory_reconciliation_provenance") else { return };
-    let Some(devices) = provenance["devices"].as_array() else { return };
+    let Some(devices) = admitted_devices(&inputs) else { return };
+    let provenance = &inputs["memory_reconciliation_provenance"];
     let worker_samples = workers().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let graph_samples = crate::shared::decode_graph::device::snapshots();
     let mut rows = Vec::new();
@@ -174,6 +188,18 @@ pub(crate) fn capture(stage: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Step-5 and Muse run the shared Qwen scheduler and register no
+    /// `memory_reconciliation_provenance`, so its first-request hook must find
+    /// no device inventory and leave both `/v1/stats` rows null. Admission
+    /// values belong to families that publish the identity (Qwen4, Kimi, GLM).
+    #[test]
+    fn a_family_that_publishes_no_provenance_has_no_sample() {
+        assert!(admitted_devices(&json!({"device.rtx0": {"device": "rtx0"}})).is_none());
+        assert!(admitted_devices(&json!({"memory_reconciliation_provenance": {"family": "step5"}})).is_none());
+        assert_eq!(admitted_devices(&json!({"memory_reconciliation_provenance": {"devices": [{"device": 0}]}}))
+            .map(|devices| devices.len()), Some(1));
+    }
+
     #[test]
     fn spark_launch_relative_measurement_cancels_preexisting_occupancy_and_preserves_nulls() {
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "spark0".into(),

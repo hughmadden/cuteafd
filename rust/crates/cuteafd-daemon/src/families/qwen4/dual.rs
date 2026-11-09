@@ -71,8 +71,6 @@ impl Opened {
                 &cuteafd_loader::placement::ProgramSet::from_manifest(&manifests[rank], &["qwen4"]))?;
         }
         let baselines = inventory.baselines(&[]);
-        let enabled = engine::startup_graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
-            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
         // Namespace identity alone selects push: both GPUs' dense records (and a
         // coordinator tower's) form one standalone group, admitted from headers here.
         use crate::shared::experts::rtx::push::{CoordinatorPush, PushPolicy};
@@ -102,12 +100,12 @@ impl Opened {
             spark_ranks: 0,
             onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
                 .unwrap_or(Onboard::Auto),
-            startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
             host: host.clone(), encoders: Default::default(),
         })?;
         tracing::info!(ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
             "Qwen dual admitted phase ledger");
         cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+        admission::publish_reconciliation(args, &inventory.gpus, &solved, 0)?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
         cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
@@ -198,7 +196,6 @@ impl Opened {
         engine.attention_plan = plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         engine.w8a8_prefill = args.fp8_prefill_w8a8;
-        if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
         engine.set_tp2(pair, experts.wire, draft, &placement, cuteafd_loader::placement::HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
             row_bytes: self.cfg.hc_width() as u64 * 2, rows: rows as u64, lanes: 1, entry_gpu: 0, head_gpu: 0, terminal: cuteafd_loader::placement::TerminalHome::AttentionOwner })?;
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {

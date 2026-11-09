@@ -1,0 +1,23 @@
+{
+  "shape": "single_0spark",
+  "reserve_base_bytes": [
+    4194304
+  ],
+  "reserve_extra_bytes": [
+    2097152
+  ],
+  "trace": {
+    "provenance": "GRAPH_TRACE 1 snapshots at single_0spark; devices [0]; 1 selected shapes; capture base [4194304] + 2097152 extra bytes; 0 zero-replay identities (0 bytes) stay lazy; 0 zero-share selected identities (0 bytes) charged at the device's measured mean capture",
+    "entries": [
+      {
+        "rows": 64,
+        "spec": false,
+        "long": false,
+        "pool_width": 64,
+        "page_stride": 64,
+        "pool_stride": 128,
+        "pin": false
+      }
+    ]
+  }
+}

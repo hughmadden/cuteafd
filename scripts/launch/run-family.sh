@@ -421,7 +421,7 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
-if [[ "$family" == glm5 || "$family" == glm5_flash ]]; then
+if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
     [[ -z "$(get "$key")" ]] || graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -1449,7 +1449,7 @@ if [[ "$family" == qwen4 ]]; then
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
-if [[ ( "$family" == glm5 || "$family" == glm5_flash ) && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
+if [[ ( "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 ) && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
   spark_worker_env+=" -e $(printf '%q' "CUTEAFD_SPARK_GRAPH_RESERVE=$(get SPARK_GRAPH_RESERVE)")"
 fi
 # Options only the Spark expert workers take.
@@ -1967,15 +1967,6 @@ served="$(get SERVED_MODEL_ID)"
 [[ -z "$served" ]] || served_args=(--model-id "$served")
 shared_probe_args
 shared_trace_args
-# Qwen serving defaults to qualified startup graphs; preserve explicit overrides.
-if [[ $family == qwen4 ]]; then
-  case "$(get QWEN_STARTUP_GRAPHS)" in
-    "") ;;
-    on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1) ;;
-    off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0) ;;
-    *) echo "QWEN_STARTUP_GRAPHS must be on or off" >&2; exit 2 ;;
-  esac
-fi
 spark_image="$(get SPARK_EXPERT_DOCKER_INFERENCE)"
 [[ -z "$wip_slot" ]] || spark_image="$(get SPARK_EXPERT_DOCKER_DEV cuteafd-spark-expert-dev)"
 port="$(get EXPERT_PORT 19441)"
@@ -2519,7 +2510,7 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
-  if [[ "$family" == glm5 || "$family" == glm5_flash ]]; then
+  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
     done

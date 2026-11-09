@@ -6,7 +6,7 @@ use cuteafd_loader::families::qwen4::Qwen4Config;
 use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
-use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights};
+use cuteafd_loader::placement::{families::qwen4, Baseline, ResidentWeights, RuntimeSample};
 
 pub(super) fn single_weights(args: &EngineArgs, checkpoint: &cuteafd_loader::plan::Checkpoint,
     cfg: &Qwen4Config, layers: usize, mtp: bool) -> Result<ResidentWeights> {
@@ -138,17 +138,13 @@ impl ExpertSource {
 }
 
 /// Qwen's KV pool from one sample of free memory after weights, the PLE table and resident experts:
-/// the shared admission's fixed items and, with startup graphs, the largest pool whose own graph set
-/// fits beside them.
+/// the shared admission's fixed items, the graph reserve before them, and the largest pool that fits.
 pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &QwenAdmissionInputs<'_>,
-    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights, host: qwen4::QwenHost)
-    -> Result<(usize, qwen4::QwenHost)> {
+    source: ExpertSource, context: cuteafd_loader::placement::planner::Context, loaded_weights: ResidentWeights,
+    host: qwen4::QwenHost, devices: &[RuntimeSample]) -> Result<(usize, qwen4::QwenHost)> {
     let pending = crate::shared::inventory::pending_code(library, args.device, 0, false, "qwen4", source.code_key(),
         &inputs.manifest.map(|m| cuteafd_loader::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| cuteafd_loader::placement::ProgramSet::from_names(&["qwen4"], [])))?;
-    let enabled = super::engine::startup_graphs_enabled(
-        std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
-        std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
     let current = library.cuda_get_device()?;
     library.cuda_set_device(args.device)?;
     let sample = library.cuda_memory_info();
@@ -159,10 +155,11 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
     let mut inputs = placement_inputs(args, admission, source,
-        (available as u64, total as u64), pending, enabled, context, host);
+        (available as u64, total as u64), pending, context, host);
     inputs.loaded_weights = loaded_weights;
     let (placement, solved) = qwen4::admitted(&inputs)?;
     cuteafd_loader::placement::reserve::log_plan(&solved, "qwen4");
+    publish_reconciliation(args, devices, &solved, source.spark_ranks())?;
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     tracing::info!(pool_tokens = placement.pool_tokens,
         ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&solved))?,
@@ -170,8 +167,51 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     Ok((usize::try_from(placement.pool_tokens)?, inputs.host))
 }
 
+/// Publish the admission identity the shared Ready and first-request memory
+/// reconciliation reads (`shared::memory_report::reconcile`). The capture
+/// returns before sampling without `memory_reconciliation_provenance`, so
+/// `/v1/stats` would report no `delta_vs_measured` or `graph_reserve_slack`
+/// for the family. Identity only: hashes of the native library and program
+/// manifest, the served layout, and one inventory sample per physical GPU in
+/// rank order (the capture indexes `devices` by the `rtxN` owner row).
+pub(super) fn publish_reconciliation(args: &EngineArgs, devices: &[RuntimeSample],
+    solved: &cuteafd_loader::placement::planner::ResolvedPlan, spark_world: usize) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    let layout = format!("snapshot/{}; context/{}; slots/{}; kv/{:?}; prefill/{}x{} rows",
+        args.snapshot.display(), args.max_context, args.slots, args.kv_format,
+        solved.decisions.prefill.rows, solved.decisions.prefill.waves);
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": reconciliation_provenance(
+            env!("CUTEAFD_BUILD_COMMIT"), env!("CUTEAFD_BUILD_DIRTY"), env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            &hash(&args.native_lib)?, &hash(&args.manifest)?, &layout, devices, spark_world,
+            &solved.decisions.onboard_layers, solved.decisions.prefill)
+    }));
+    Ok(())
+}
+
+/// Split out so a CPU test checks the fields the shared capture reads.
+fn reconciliation_provenance(source_commit: &str, source_dirty: &str, toolchain: &str,
+    native_sha256: &str, programs_sha256: &str, layout: &str, devices: &[RuntimeSample],
+    spark_world: usize, onboard_layers: &[Vec<usize>],
+    prefill: cuteafd_loader::placement::planner::PrefillShape) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1, "family": "qwen4", "source_commit": source_commit,
+        "source_dirty": source_dirty, "toolchain": toolchain,
+        "native_sha256": native_sha256, "programs_sha256": programs_sha256,
+        "layout": layout, "devices": devices, "spark_world": spark_world,
+        "onboard_layers": onboard_layers, "prefill": prefill,
+        "graph_basis": "per-device bounded cache; Basis::Bytes from each shape's traced capture bytes (#1627)"
+    })
+}
+
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
-    (available, total): (u64, u64), pending: u64, graphs_enabled: bool, context: cuteafd_loader::placement::planner::Context,
+    (available, total): (u64, u64), pending: u64, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
@@ -180,7 +220,7 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         spark_ranks: source.spark_ranks(),
-        startup_graph_modes: args.planner_graph_modes.filter(|_| graphs_enabled), host,
+        host,
         // The launcher placed the tower; it loaded before this solve and its
         // device bytes are in the measured baseline.
         encoders: Default::default() }
@@ -431,6 +471,46 @@ mod tests {
             assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(123))))?.is_none());
             assert!(super::loaded_media_weights(&devices, Some((9, ResidentWeights(u64::MAX)))).is_err());
         }
+        Ok(())
+    }
+
+    /// The shared Ready/first-request capture returns before sampling when
+    /// admission never registered `memory_reconciliation_provenance`, so the
+    /// family's `/v1/stats` would have no `delta_vs_measured` or
+    /// `graph_reserve_slack`. Register exactly what admission publishes and
+    /// read the reconciled device back.
+    #[test]
+    fn reconciliation_registers_the_identity_the_shared_capture_reads() -> anyhow::Result<()> {
+        let sample = |device: i32| cuteafd_loader::placement::RuntimeSample { device,
+            total_bytes: 96 << 30, free_bytes: 80 << 30, context_bytes: 1 << 20, module_bytes: 0,
+            sms: 188, arch: "sm_120".into(), driver: "580.65".into() };
+        let provenance = super::reconciliation_provenance("commit", "false", "toolchain", "native",
+            "programs", "layout", &[sample(0), sample(1)], 2, &[vec![0], vec![1]],
+            cuteafd_loader::placement::planner::PrefillShape { rows: 2048, waves: 1 });
+        assert_eq!(provenance["family"], "qwen4");
+        let devices = provenance["devices"].as_array().expect("devices array");
+        assert_eq!(devices.len(), 2, "one inventory sample per physical GPU, in rank order");
+        assert_eq!(devices[1]["device"].as_i64(), Some(1));
+        assert_eq!(provenance["spark_world"], 2);
+        assert_eq!(provenance["prefill"]["rows"], 2048);
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(),
+            cap_bytes: 96 << 30, weights_bytes: 64 << 30, workspace_bytes: 8 << 30, kv_bytes: 8 << 30,
+            other_bytes: 0, reserve_overridden: false,
+            reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
+                name: "graph reserve".into(), bytes: 212 << 20 }] };
+        use crate::shared::memory_report::reconcile;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": provenance, "device.rtx0": owners }));
+        reconcile::capture("ready");
+        let snapshot = reconcile::snapshot();
+        let row = snapshot["ready"]["devices"].as_array().expect("reconciled rows").iter()
+            .find(|row| row["device"].as_str() == Some("rtx0")).expect("admitted rtx0 row");
+        assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(212 << 20));
+        assert!(row["graph_reserve_bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+            "the canonical graph reserve row must be charged");
+        assert_eq!(row["provenance"]["family"], "qwen4");
+        assert!(row.get("delta_vs_measured").is_some());
+        assert!(row.get("graph_reserve_slack").is_some());
         Ok(())
     }
 
@@ -685,7 +765,7 @@ mod tests {
                     arenas: &arenas, layer_experts: &experts, layer_extra: &extra,
                     fixed: Vec::new(), tp2_workspace: [0; 2], pending_code_bytes: [0; 2], mark_slots: 18,
                     max_context: 131072, requested_pool: Some(2 << 20), spark_ranks: 0, onboard,
-                    startup_graph_modes: None, host: qwen4::QwenHost::ample(&cfg, 2, 4096)?, encoders: Default::default(),
+                    host: qwen4::QwenHost::ample(&cfg, 2, 4096)?, encoders: Default::default(),
                 };
                 let mapped = qwen4::dual_placement(&inputs)?;
                 assert!(mapped.movables.is_empty());
@@ -867,7 +947,7 @@ mod tests {
         args.planner_host_prefix = Some((prefix, 8));
         args.mtp = if mtp { 3 } else { 0 };
         args.planner_prefix_bytes = Some(0);
-        args.planner_graph_modes = Some((8, true));
+        args.budget_admission = true;
         for (host, fp8_projections, fp8_head, attention_rows, capacities) in [
             (false, false, true, None, [101_973_491_712; 2]),
             (true, false, true, None, [32 << 30, 101_973_491_712]),
@@ -912,7 +992,7 @@ mod tests {
                 arenas: &weights.arenas, layer_experts: &experts.costs,
                 layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace,
                 pending_code_bytes: [0; 2], mark_slots: 0, max_context: 131072, requested_pool: None,
-                spark_ranks: 0, onboard: Onboard::Auto, startup_graph_modes: args.planner_graph_modes,
+                spark_ranks: 0, onboard: Onboard::Auto,
                 host: super::host_owners_with_memory(&args, &cfg, 4, mtp, 2, 0, false, None,
                     host_embedding, Vec::new(), (128 << 30, 128 << 30))?, encoders: Default::default() })?;
             assert_eq!(runtime.pool_tokens, if capacities.iter().any(|&bytes| bytes <= 32 << 30) { 1 << 20 } else { 2 << 20 });
@@ -920,20 +1000,27 @@ mod tests {
             assert_eq!(runtime.tp2.unwrap().layers, 4);
             assert!(layout.notes.contains(&format!("placement: {}", runtime.summary())));
             for rank in 0..2 {
+                // TP2 samples free memory after the resident upload: the plan's
+                // `context+modules` bytes are what the runtime sees already
+                // occupied, and it charges them as one named owner at exactly
+                // those bytes. Every other runtime item is a plan item.
+                let sampled = layout.devices[rank].items.iter().filter(|item| item.group == "context+modules")
+                    .map(|item| item.bytes).sum::<u64>();
                 let planned = layout.devices[rank].items.iter().filter(|item| item.group != "context+modules")
                     .cloned().collect::<Vec<_>>();
-                assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
+                let mut actual = runtime.items[rank].clone();
+                let index = actual.iter().position(|item| item.group.starts_with("Qwen context and selected modules"))
+                    .unwrap_or_else(|| panic!("rank {rank}: no measured-occupancy owner in {actual:?}"));
+                let owner = actual.remove(index);
+                assert_eq!(owner.bytes, sampled,
+                    "rank {rank}: the owner charges the sampled bytes, not a second estimate");
+                assert_eq!(actual, planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
             }
         }
         std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
         assert!(super::dual_experts(&args, &catalog, 4).is_err());
         }
         Ok(())
-    }
-
-    fn set(count: u64) -> Option<cuteafd_loader::placement::GraphSet> {
-        Some(cuteafd_loader::placement::GraphSet::new(&[count], QWEN_GRAPH_BYTES_PER_GRAPH, 0, 0, 0,
-            cuteafd_loader::placement::Lifetime::Startup))
     }
 
     #[test]
@@ -982,7 +1069,7 @@ mod tests {
                     "--slots", &concurrency.to_string(),
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
-                args.planner_graph_modes = Some((concurrency as usize, true));
+                args.budget_admission = true;
                 let loaded_weights = super::single_weights(&args, &checkpoint, &cfg, cfg.layers, false)?
                     .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
@@ -992,40 +1079,32 @@ mod tests {
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
-                    startup_graph_modes: args.planner_graph_modes,
+
                     host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
-                // The graph reserve is priced once at the widest compiled pool.
-                let policy = qwen4::single_policy(&planned);
-                let extent = policy.maximum_tokens().max(policy.floor) as usize;
+                // The graph reserve is one owner at the resolved capture shape,
+                // charged once before KV sizing.
                 let placement = qwen4::placement(&planned)?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
-                let pool = layout.pool_tokens as usize;
-                let executables = super::super::engine::serving_graph_count(context as usize, pool,
-                    cfg.dense_context(), concurrency as usize, true, cfg.layers)?;
-                let graphs = qwen_startup_graphs(context as usize, pool, cfg.dense_context(),
-                    concurrency as usize, true, cfg.layers).unwrap();
-                assert_eq!(graphs.ranks[0].executables, executables as u64);
-                let admitted = device.items.iter().filter(|item| item.group == "startup graphs")
-                    .map(|item| item.bytes).sum::<u64>();
-                let reserve = qwen_startup_graphs(context as usize, extent, cfg.dense_context(),
-                    concurrency as usize, true, cfg.layers).unwrap();
-                assert_eq!(admitted, reserve.bytes(0));
-                let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
-                let mut invalid = qwen4::QwenInputs {
-        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
-                    loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
-                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,
-                    baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
-                    max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
-                    startup_graph_modes: Some((65, true)), host: qwen4::QwenHost::ample(&cfg, 1, 4096)?, encoders: Default::default() };
-                let error = qwen4::placement(&invalid).unwrap_err();
-                let error = error.downcast_ref::<cuteafd_core::concurrency::ConcurrencyError>().unwrap();
-                assert_eq!((error.requested, error.capacity), (65, 64));
-                invalid.startup_graph_modes = Some((0, true));
-                assert!(qwen4::placement(&invalid).is_err());
+                assert!(device.items.iter().any(|item| item.group == "graph reserve: qwen4.graphs.0"),
+                    "the plan charges the graph reserve");
+                assert!(!device.items.iter().any(|item| item.group == "startup graphs"),
+                    "the declared startup-graph owner is gone");
+                // The single-flavor sample is taken after the resident upload,
+                // so the whole measured occupancy is one named owner at the
+                // bytes the plan names for them; host embeddings are not mapped
+                // in this fixture (`QwenHost::ample` sets none). Every other
+                // runtime item is the plan's own item.
+                let mut measured = Vec::new();
                 for item in &placement.items[0] {
-                    assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
+                    if item.group.starts_with("Qwen context and selected modules") {
+                        measured.push(item);
+                    } else {
+                        assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
+                    }
                 }
+                assert_eq!(measured.len(), 1, "the sampled occupancy is one named owner");
+                assert_eq!(measured[0].bytes, baseline,
+                    "the owner charges the sampled bytes, not a second estimate");
             }
         }
         Ok(())
@@ -1049,7 +1128,7 @@ mod tests {
         with_peers.peers = Some("127.0.0.1:1234,127.0.0.1:1235".into());
         let input = |args, source, pending| -> anyhow::Result<_> {
             Ok(placement_inputs(args, super::inputs(args, &cfg, 48, false, None, None, 0)?,
-                source, (96 << 30, 96 << 30), pending, false, cuteafd_loader::placement::planner::Context::pinned(args.max_context as u64), qwen4::QwenHost::ample(&cfg, 1, 4096)?))
+                source, (96 << 30, 96 << 30), pending, cuteafd_loader::placement::planner::Context::pinned(args.max_context as u64), qwen4::QwenHost::ample(&cfg, 1, 4096)?))
         };
         for (source, key) in [(ExpertSource::LocalFp8, "fp8"), (ExpertSource::LocalExl3, "exl3")] {
             assert_eq!(source.code_key(), key);
@@ -1081,47 +1160,6 @@ mod tests {
         let shared = super::super::engine::Experts::SharedOnly;
         assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);
         Ok(())
-    }
-
-    #[test]
-    fn auto_admission_subtracts_measured_graph_reserve_and_separate_headroom() {
-        let (available, headroom, per_token) = (4_u64 << 30, 1_u64 << 30, 4096);
-        let (tokens, graphs) = qwen_graph_pool(available, headroom, per_token, 2_097_152, None, |_| set(12397)).unwrap();
-        let reserve = graphs.bytes(0);
-        assert_eq!(reserve, 12397 * QWEN_GRAPH_BYTES_PER_GRAPH);
-        assert_eq!(tokens, (available - headroom - reserve) / per_token / 256 * 256);
-        assert!(tokens * per_token + headroom + reserve <= available);
-    }
-
-    #[test]
-    fn admission_recounts_geometry_after_pool_shrinks_and_rejects_fixed_overcommit() {
-        let count = |tokens| set(if tokens >= 32768 { 21560 } else { 7840 });
-        let (tokens, graphs) = qwen_graph_pool(4 << 30, 512 << 20, 65536, 65536, None, count).unwrap();
-        assert!(tokens < 32768);
-        assert_eq!(graphs.ranks[0].executables, 7840);
-        assert!(tokens * 65536 + (512 << 20) + graphs.bytes(0) <= 4 << 30);
-        assert!(qwen_graph_pool(4 << 30, 512 << 20, 65536, 65536, Some(32768), count).is_err());
-    }
-
-    #[test]
-    fn graph_charge_is_the_measurement_and_fixed_pool_rounding_does_not_spend_headroom() {
-        let measured = 21560 * QWEN_GRAPH_BYTES_PER_GRAPH;
-        assert_eq!(set(21560).unwrap().bytes(0), measured);
-        let (tokens, graphs) = qwen_graph_pool(8 << 30, 3 << 30, 28422, 2097152, Some(73727), |_| set(12397)).unwrap();
-        assert_eq!(tokens, 73728);
-        assert!(tokens * 28422 + graphs.bytes(0) + (3 << 30) <= 8 << 30);
-        assert!(qwen_graph_pool(256 << 20, 0, 28422, 2097152, None, |_| set(12397)).is_err());
-    }
-
-    #[test]
-    fn graph_counts_match_actual_pool_context_layers_and_serving_modes() {
-        use super::super::engine::serving_graph_count;
-        assert_eq!(serving_graph_count(8192, 73728, 2051, 16, true, 48).unwrap(), 12397);
-        assert_eq!(serving_graph_count(8192, 2097152, 2051, 16, true, 48).unwrap(), 12397);
-        assert_eq!(serving_graph_count(8192, 73728, 2051, 16, false, 48).unwrap(), 4508);
-        assert_eq!(serving_graph_count(32768, 32768, 2051, 16, true, 48).unwrap(), 21560);
-        assert!(serving_graph_count(32768, 4096, 2051, 16, true, 48).unwrap() < 21560);
-        assert_eq!(qwen_startup_graphs(8192, 73728, 2051, 16, true, 48).unwrap().ranks[0].executables, 12397);
     }
 
     #[test]
@@ -1213,4 +1251,5 @@ mod dual_push_tests {
         anyhow::ensure!(arms == 4, "every representation arm ran");
         Ok(())
     }
+
 }
