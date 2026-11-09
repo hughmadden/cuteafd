@@ -276,14 +276,18 @@ pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     // Policy fixtures use synthetic ordinals, never valid CUDA device IDs.
     #[cfg(test)]
     if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0))) }
-    device_cache_sampled(device, reserve, basis, || memory_sample(library, device))
+    let cache = device_cache_sampled(device, reserve, basis, || memory_sample(library, device))?;
+    let mut controller = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if controller.memory_query.is_none() { controller.memory_query = Some(library.physical_memory_query()?); }
+    drop(controller);
+    Ok(cache)
 }
 
 fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<(u64, u64, u64)> {
     let (free, total) = crate::shared::memory::device::Device { library, id: device }
         .run(|| library.cuda_physical_memory_info())?;
-    let tracked = cuteafd_ffi::memory_ledger::snapshot()
-        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    let tracked = cuteafd_ffi::memory_ledger::current_bytes(
+        cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
     Ok((free as u64, total as u64, tracked))
 }
 
@@ -357,10 +361,12 @@ pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) 
 fn observe_device_sampled(device: i32,
     sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
-    let (free, total, tracked) = sample()?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    let growth = cache.observer.observe(free, total, tracked);
-    if cache.unmeasured { cache.measured_capture(growth); }
+    if cache.needs_boundary() {
+        let (free, total, tracked) = sample()?;
+        let growth = cache.observer.observe(free, total, tracked);
+        if cache.unmeasured { cache.measured_capture(growth); }
+    }
     cache.boundary();
     Ok(())
 }
@@ -404,6 +410,8 @@ pub(crate) struct DeviceCache {
     unmeasured: bool,
     pending_destroy: usize,
     observer: GrowthObserver,
+    memory_query: Option<cuteafd_ffi::PhysicalMemoryQuery>,
+    captured_since_observation: bool,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
     clock_ms: u64,
@@ -421,7 +429,7 @@ impl DeviceCache {
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
-            observer: GrowthObserver::default(),
+            observer: GrowthObserver::default(), memory_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
                 TraceWriter::new(std::path::PathBuf::from(path).with_extension(format!("device-{device}.json")))
@@ -437,6 +445,7 @@ impl DeviceCache {
     pub fn needs_boundary(&self) -> bool {
         self.unmeasured || self.pending_destroy > 0
     }
+    pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
 
     fn unlink(&mut self, id: u64) {
@@ -547,6 +556,17 @@ impl DeviceCache {
         Some(id)
     }
 
+    fn capture_baseline_sampled(&mut self,
+        sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<()> {
+        if self.captured_since_observation { return Ok(()) }
+        // Exclude eager first-touch since the last observation, but never swallow
+        // growth from another capture in the same unobserved batch.
+        let (free, total, tracked) = sample()?;
+        self.observer.observe(free, total, tracked);
+        self.captured_since_observation = true;
+        Ok(())
+    }
+
     pub fn miss(&mut self, identity: Identity, site: Site, node_estimate: Option<Estimate>, pinned: bool) -> Miss {
         let now = self.started.elapsed().as_millis() as u64;
         self.counters.entry(site.cycle).or_default().misses += 1;
@@ -598,6 +618,17 @@ impl DeviceCache {
         let room = may_capture(site.preference, growth, headroom, self.reserve,
             self.charged, self.pending_growth, self.pending_bytes, reuse);
         if allowed && room && old.is_none_or(|id| !self.records[&id].pending_destroy && !self.records[&id].pending_capture) {
+            if !self.captured_since_observation {
+                if let Some(query) = &self.memory_query {
+                    let sample = query.sample(self.device).map(|(free, total)| (free as u64, total as u64,
+                        cuteafd_ffi::memory_ledger::current_bytes(cuteafd_ffi::memory_ledger::Space::Device, self.device) as u64));
+                    if let Err(error) = self.capture_baseline_sampled(|| sample) {
+                        tracing::warn!(%error, device = self.device, "graph capture baseline unavailable; running eagerly");
+                        self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                        return Miss::Eager;
+                    }
+                }
+            }
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
                 let id = self.next_id;
@@ -732,6 +763,7 @@ impl DeviceCache {
         self.pending_bytes = 0;
         self.pending_growth = 0;
         self.unmeasured = false;
+        self.captured_since_observation = false;
         self.charged = self.charged.saturating_add(bytes);
         if self.charged > self.reserve {
             tracing::warn!(device = self.device, charged = self.charged, reserve = self.reserve,
@@ -1599,10 +1631,91 @@ mod observer_tests {
     }
 
     #[test]
+    fn unchanged_boundary_does_not_sample() {
+        let cache = attached(-99111);
+        observe_device_sampled(-99111, || panic!("unchanged cache must not sample")).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99111, || Ok((875, 1000, 0))).unwrap();
+        observe_device_sampled(-99111, || panic!("measured capture must not resample")).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn pending_destroy_still_samples_without_a_capture() {
+        let cache = attached(-99108);
+        cache.lock().unwrap().pending_destroy = 1;
+        let sampled = std::cell::Cell::new(false);
+        observe_device_sampled(-99108, || { sampled.set(true); Ok((900, 1000, 0)) }).unwrap();
+        assert!(sampled.get());
+        assert!(cache.lock().unwrap().has_pending_victims());
+        cache.lock().unwrap().pending_destroy = 0;
+        observe_device_sampled(-99108, || panic!("retired victims must not resample")).unwrap();
+    }
+
+    #[test]
+    fn capture_baseline_refreshes_once_per_observed_batch() {
+        let cache = attached(-99109);
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0))).unwrap();
+        pending(&cache);
+        cache.lock().unwrap().capture_baseline_sampled(|| panic!("must retain earlier capture growth")).unwrap();
+        observe_device_sampled(-99109, || Ok((775, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((700, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99109, || Ok((675, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 50);
+    }
+
+    #[test]
+    fn admitted_miss_refreshes_baseline_and_failed_query_runs_eagerly() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 1000, 100)?;
+        let mut cache = DeviceCache::new(6, 1000);
+        cache.observer.observe(900, 1000, 0);
+        cache.memory_query = Some(library.physical_memory_query()?);
+        let site = Site { name: "observer-miss-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
+            spans_devices: false };
+        let identity = |key| Identity { bank: 1, site: site.name, key, shape: key.to_string().into() };
+        fixture.configure_memory_usage(&library, 6, 1000, 200)?;
+        assert!(matches!(cache.miss(identity(1), site, None, false), Miss::Capture(_)));
+        // An invalid second sample proves another capture retains the first baseline.
+        fixture.configure_memory(&library, 6, 0)?;
+        assert!(matches!(cache.miss(identity(2), site, None, false), Miss::Capture(_)));
+        let growth = cache.observer.observe(750, 1000, 0);
+        cache.measured_capture(growth);
+        assert_eq!(cache.charged, 50);
+        assert!(!cache.captured_since_observation);
+        assert!(matches!(cache.miss(identity(3), site, None, false), Miss::Eager));
+        assert!(!cache.captured_since_observation);
+        assert!(!cache.unmeasured);
+        fixture.configure_memory_usage(&library, 6, 1000, 300)?;
+        assert!(matches!(cache.miss(identity(3), site, None, false), Miss::Capture(_)));
+        let growth = cache.observer.observe(675, 1000, 0);
+        cache.measured_capture(growth);
+        assert_eq!(cache.charged, 75);
+        assert_eq!(cache.counters[&Cycle::Decode].eager_runs, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_capture_baseline_can_retry_without_advancing_observer() {
+        let cache = attached(-99110);
+        assert!(cache.lock().unwrap().capture_baseline_sampled(|| anyhow::bail!("query failed")).is_err());
+        assert!(!cache.lock().unwrap().captured_since_observation);
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99110, || Ok((775, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
     fn explicit_observe_excludes_eager_first_touch() {
         let cache = attached(-99102);
-        observe_device_sampled(-99102, || Ok((800, 1000, 0))).unwrap();
+        observe_device_sampled(-99102, || panic!("eager-only boundary must not sample")).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 0);
+        cache.lock().unwrap().capture_baseline_sampled(|| Ok((800, 1000, 0))).unwrap();
         pending(&cache);
         observe_device_sampled(-99102, || Ok((775, 1000, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
