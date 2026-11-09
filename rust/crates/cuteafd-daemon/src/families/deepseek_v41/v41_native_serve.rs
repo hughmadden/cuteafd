@@ -447,6 +447,10 @@ fn worker(
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let _inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
+        // RuntimeInventory::measure loads every runtime-registered native
+        // module inside this window (#1554, #1600), so first-use module growth
+        // in a decode lane, a prefill slot or the drafter is never an
+        // untracked post-baseline owner.
         Ok(())
     })?;
     admission::startup_phase(&lib, "v41/after native preload", device_total)?;
@@ -1258,4 +1262,22 @@ fn prefill_continuation<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a Na
         console::Prefill::done(console::PrefillKind::Continuation, 0, index, count, chunk.len(), started);
     }
     anchor.context("prefix continuation produced no logits")
+}
+
+#[cfg(test)]
+mod tests {
+    /// First-use module load is post-baseline growth if it happens after the
+    /// admission sample. The shared measured window loads every
+    /// runtime-registered native module itself (#1600), so the family must not
+    /// also load modules by hand inside it.
+    #[test]
+    fn native_modules_load_once_inside_the_measured_window() {
+        let source = include_str!("v41_native_serve.rs");
+        let measured = source.split("RuntimeInventory::measure").nth(1).unwrap()
+            .split("let mut pool = admission::admit_startup").next().unwrap();
+        assert!(measured.contains("admission::preload("),
+            "the selected V4.1 programs still warm before admission");
+        assert!(!source.contains(concat!("tp2_native", "_initialize")),
+            "module loading belongs to the shared measured window, not the family");
+    }
 }
