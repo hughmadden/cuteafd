@@ -6132,12 +6132,12 @@ mod tests {
     #[test]
     fn native_last_error_preserves_non_buffer_status_failures() {
         unsafe extern "C" fn failed_last_error(_: *mut c_char, _: usize) -> CuteafdStatus {
-            CUTEAFD_STATUS_INVALID_ARGUMENT
+            1 // CUTEAFD_STATUS_INVALID_ARGUMENT
         }
         assert_eq!(read_native_last_error(failed_last_error).unwrap_err().to_string(),
             "cuteafd_last_error returned status 1");
         unsafe extern "C" fn failed_retry(_: *mut c_char, out_len: usize) -> CuteafdStatus {
-            if out_len == 512 { CUTEAFD_STATUS_BUFFER_TOO_SMALL } else { CUTEAFD_STATUS_INTERNAL_ERROR }
+            if out_len == 512 { CUTEAFD_STATUS_BUFFER_TOO_SMALL } else { 6 } // INTERNAL_ERROR
         }
         assert_eq!(read_native_last_error(failed_retry).unwrap_err().to_string(),
             "cuteafd_last_error returned status 6");
