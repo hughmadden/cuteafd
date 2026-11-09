@@ -556,6 +556,9 @@ These are the gates; the tiers and bars are in
    ([daemon/shared/launch_grid.rs:18](../../rust/crates/cuteafd-daemon/src/shared/launch_grid.rs#L18)).
    The SM188/170 export comparison is the CPU-side check that a build doesn't
    depend on one card.
+8. **Graphs.** Run the [graph-cache checklist and qualification](#8-graph-cache):
+   controller lifetime/cancellation tests, per-layout traces, joined memory
+   reconciliation and trace-free adaptive speed evidence.
 
 ## 7. Porting a new family: checklist
 
@@ -634,7 +637,7 @@ pending [#1702](https://github.com/tpurtell/cuteafd/pull/1702).
 Paths below use the prefixes defined at the top of this page; checklist items
 name the implementing code or regression-test location.
 
-1. Attach every bank before capture through `CacheAttached` or `attach_device`, with stable site names, actual cycle, preference, bootstrap bytes and explicit peer span; see `daemon/shared/decode_graph.rs`, `decode_graph/native.rs` and `decode_graph/binding.rs`.
+1. Attach every bank before capture through `CacheAttached` or `attach_device`, even with empty prewarm, with stable site names, cycle, preference, bootstrap bytes and explicit peer span (`daemon/shared/decode_graph.rs`, `decode_graph/native.rs`, `decode_graph/binding.rs`, `daemon/families/kimi_k3/engine.rs`).
 2. Use the same reserve and basis on each device: calibrated node rates only on their measured family/architecture/route, otherwise device-wide bytes with a warning; unknown node counts stay eager (`daemon/shared/decode_graph/device.rs`).
 3. Retain a strong controller per device across temporary startup banks until persistent banks attach; the registry is Weak and seeds the observer only on creation (`daemon/families/kimi_k3/startup.rs`, `daemon/shared/decode_graph/device.rs`).
 4. Key captures by exact typed geometry and retained resource owners; take a cancellable ticket before capture, report native nodes/width/span before insertion, and never use legacy `insert` after attachment (`daemon/shared/decode_graph/bank.rs`, `decode_graph/native.rs`).
@@ -692,6 +695,7 @@ admission and controller attachment together when enabling capture
 
 ### Pitfalls
 
+- Warmup must first-touch eagerly and upload synthetic tables before launch; all-masked rows must still satisfy MoE guards, and empty prewarm must still attach the lazy controller (#1663, #1645).
 - Family-named or duplicate graph owners break reconciliation even when bytes were charged: use exactly `graph reserve` (#1663, #1645).
 - Single-node executable overhead can dominate an arena: fold or delete it, never treat it as a graph win (#1673); legacy Qwen/V4.1 sites remain follow-up work (#1658, #1644).
 - Zero-replay prewarm wastes startup and storage; select whole replayed geometries, account siblings, and order by heat so reduced reserves keep the hot prefix (#1663, #1666).
