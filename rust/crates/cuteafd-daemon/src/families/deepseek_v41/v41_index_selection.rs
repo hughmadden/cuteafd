@@ -201,10 +201,12 @@ pub(crate) struct IndexSelectionWave<'a> {
     graph: Option<(*mut c_void, Vec<usize>)>,
     graphs: crate::shared::decode_graph::GraphBank<Vec<usize>, crate::shared::decode_graph::GraphOwner<'a, ()>>,
     capture_ticket: Option<crate::shared::decode_graph::CaptureTicket>,
-    retain_decode_graphs: bool,
     ready: Option<Ready>,
     pending: Option<Ready>,
     in_flight: bool,
+    /// A live eager enqueue initializes native modules/workspaces outside capture.
+    /// Its result is consumed normally; the next invocation follows lane ordering.
+    warmed: bool,
     audit: bool,
     async_audit: Option<AsyncAudit<'a>>,
 }
@@ -282,8 +284,8 @@ impl<'a> IndexSelectionWave<'a> {
             storage, window: RowWindow::NONE, shared_scratch_busy: None,
             staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40, "v41/index-metadata")?, capacity,
             graph: None, graphs: crate::shared::decode_graph::GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
-            capture_ticket: None, retain_decode_graphs: false,
-            ready: None, pending: None, in_flight: false,
+            capture_ticket: None,
+            ready: None, pending: None, in_flight: false, warmed: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
             async_audit: AsyncAudit::new(library, capacity)?,
         })
@@ -352,11 +354,6 @@ impl<'a> IndexSelectionWave<'a> {
     fn synchronize(&self) -> Result<()> {
         unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
-    pub fn enable_small_graph_shapes(&mut self) {
-        if !self.retain_decode_graphs {
-            self.retain_decode_graphs = true;
-        }
-    }
     /// Invalidate published selections without discarding immutable launch shapes.
     pub fn restart(&mut self) -> Result<()> {
         ensure!(!self.in_flight, "index selection pending");
@@ -376,13 +373,6 @@ impl<'a> IndexSelectionWave<'a> {
         let mut groups = Vec::new();
         extend_score_groups(&mut groups, 0, rows, source.binding());
         selection_fingerprint(query, &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false)
-    }
-    pub(crate) fn declare_startup(&mut self, keys: &[Vec<usize>]) -> Result<()> {
-        ensure!(!self.in_flight && self.ready.is_none(), "startup index selection requires idle owner");
-        self.storage.stream.require_complete()?;
-        self.retain_decode_graphs = true;
-        let _ = keys;
-        Ok(())
     }
     /// Record stable allocation geometry, never proposal/snapshot identities.
     /// # Safety
@@ -418,10 +408,6 @@ impl<'a> IndexSelectionWave<'a> {
             }
             (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
         }
-    }
-    pub(crate) fn finish_startup(&mut self) -> Result<()> {
-        self.graph = None;
-        Ok(())
     }
     pub(crate) fn visit_graph_banks(&mut self,
         f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
@@ -604,6 +590,7 @@ impl<'a> IndexSelectionWave<'a> {
         match ready {
             Ok(false) => Ok(false),
             Ok(true) => { self.ready = self.pending.take(); self.in_flight = false;
+                self.warmed = true;
                 if let Some(busy) = &self.shared_scratch_busy { busy.set(false); }
                 Ok(true) }
             Err(error) => { self.abort_pending()?; Err(error) }
@@ -724,7 +711,7 @@ impl<'a> IndexSelectionWave<'a> {
         // Prefill tails (and any other uncached large shape) bind eagerly.
         let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
-        let capture = if forced_eager { false } else { self.select_graph(&fingerprint)? };
+        let capture = if forced_eager || !self.warmed { false } else { self.select_graph(&fingerprint)? };
         // Local ownership cancels admission on every metadata/capture failure.
         let ticket = self.capture_ticket.take();
         if defer {
@@ -789,12 +776,14 @@ impl<'a> IndexSelectionWave<'a> {
             // SAFETY: snapshots are retained until the completed-step hook.
             unsafe { self.enqueue_async_audit(query, requests, &metadata, rows, width)?; }
         }
+        if launched.is_ok() { self.warmed = true; }
         let ready = Ready { origin: query.origin(), layer: query.layer, rows, bindings };
         if defer {
             launched?;
             self.pending = Some(ready);
         } else {
             launched.and(self.synchronize())?;
+            self.warmed = true;
             self.ready = Some(ready);
         }
         Ok(())
@@ -1199,14 +1188,37 @@ mod graph_tests {
     }
 
     #[test]
-    fn cold_unattached_index_binding_is_eager_not_a_request_error() -> Result<()> {
-        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
-        let library = fixture.load()?;
-        // Geometry admission itself is covered by the controller tests; this
-        // fixture checks eager return without allocating actual CUDA storage.
-        let mut bank = crate::shared::decode_graph::GraphBank::<Vec<usize>, ()>::new(None);
-        assert!(bank.cache_ticket(&vec![2, 4, 512], false, None).is_none());
-        drop(library);
+    fn bounded_index_geometry_keeps_exact_tiles_and_cancels_failed_admission() -> Result<()> {
+        use crate::shared::decode_graph::{device::{Basis, Cycle, Preference, Site}, GraphBank};
+        let buffer = |address, bytes| CuteafdDeviceBuffer {
+            ptr: address as *mut c_void, bytes, device_id: 0, flags: 0 };
+        let query = IndexQueryGeometry { layer: 2, packed: buffer(0x1000, 2048),
+            scales: buffer(0x2000, 128), head_weights: buffer(0x3000, 64) };
+        let mut bank = GraphBank::<Vec<usize>, ()>::new(None);
+        bank.attach_device(-164_402, 48, Site { name: "index_selection", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
+        let key = |length: usize| selection_fingerprint(&query, &[], None, 1,
+            length.div_ceil(tile_width(length, DECODE_WIDTH_BUCKET)).max(1),
+            tile_width(length, DECODE_WIDTH_BUCKET), false);
+        let short = key(512)?;
+        let long = key(16385)?;
+        assert_eq!(&short[short.len()-3..], &[512, 0, 1]);
+        assert_eq!(&long[long.len()-3..], &[16384, 0, 2]);
+        assert_ne!(key(16384)?, long, "width saturation must not alias tile counts");
+        let cancelled = bank.cache_ticket(&short, false, None).context("first admission")?;
+        drop(cancelled); // Metadata upload or capture failure cancels the reservation.
+        let ticket = bank.cache_ticket(&long, false, None).context("cancelled bytes reusable")?;
+        bank.cache_commit(long.clone(), (), ticket, 3, 1, false);
+        bank.cache_measured(16);
+        assert!(bank.cached_launch(&long).is_some());
+        let ticket = bank.cache_ticket(&short, false, None).context("remaining reserve")?;
+        bank.cache_commit(short.clone(), (), ticket, 3, 1, false);
+        bank.cache_measured(16);
+        assert!(bank.cache_ticket(&key(1024)?, false, None).is_none(), "full reserve chooses eager");
+        // SAFETY: these fixture owners contain no pointers or captured allocations.
+        unsafe { bank.cache_evict_persistent(); }
+        assert!(bank.cache_ticket(&key(1024)?, false, None).is_some());
+        bank.cache_clear_drained();
         Ok(())
     }
 }

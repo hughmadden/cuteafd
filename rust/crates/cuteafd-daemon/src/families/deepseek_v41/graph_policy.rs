@@ -3,33 +3,6 @@ use anyhow::{ensure, Result};
 
 pub(super) const MAX_DECODE_ROWS: u32 = cuteafd_core::V41_VERIFY_ROWS as u32;
 
-pub(super) const SMALL_CARD_FIXED_ROWS: &str = "1,6,16,24,32,40,43,48";
-static FIXED_SHAPES: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-
-pub(super) fn profile_fixed_shapes(total_bytes: usize, explicit: Option<&str>) -> Result<Option<Vec<u32>>> {
-    if total_bytes > 32usize << 30 { return Ok(None); }
-    let value = explicit.unwrap_or(SMALL_CARD_FIXED_ROWS);
-    if value.is_empty() { return Ok(None); }
-    Ok(Some(validate_fixed_shapes(value.split(',').map(str::parse::<u32>)
-        .collect::<std::result::Result<Vec<_>, _>>()?)?))
-}
-
-/// Startup-only small-card policy. Exact shapes outside the set execute eagerly,
-/// never evicting or recapturing a graph, and never changing causal/cache rows.
-pub(super) fn set_fixed_shapes(shapes: Vec<u32>) -> Result<()> {
-    FIXED_SHAPES.set(validate_fixed_shapes(shapes)?)
-        .map_err(|_| anyhow::anyhow!("target graph policy already set"))
-}
-
-fn validate_fixed_shapes(mut shapes: Vec<u32>) -> Result<Vec<u32>> {
-    ensure!(shapes.contains(&1) && shapes.contains(&6)
-        && shapes.iter().all(|r| (1..=MAX_DECODE_ROWS).contains(r)),
-        "fixed target graph set must include rows 1 and 6 and use decode rows only");
-    shapes.sort_unstable();
-    shapes.dedup();
-    Ok(shapes)
-}
-
 /// Rows of one full prefill chunk. Above the decode bank a live request captures
 /// only this and the 128-row decoder replay, the two large shapes every long
 /// prompt repeats. Unset (tests, tools), every shape keeps capturing.
@@ -59,6 +32,26 @@ pub(super) fn captures_shape(rows: u32) -> bool {
     large_shape_captured(rows, PREFILL_ROWS.get().copied())
 }
 
+/// Only slot zero serves non-unit prompt, replay and continuation work.
+pub(crate) const PREFILL_PREWARM_SLOTS: [usize; 1] = [0];
+/// The terminal projects the selected last row, not the whole backbone chunk.
+pub(crate) const PREFILL_HEAD_PREWARM_ROWS: [usize; 1] = [1];
+
+/// Nonwindowed prompt/replay paths reach these exact row counts. Streamed
+/// encoder units have offset bindings and deliberately remain eager (#1638).
+pub(crate) fn prefill_prewarm_rows(capacity: usize) -> Vec<usize> {
+    prefill_rows(capacity, PREFILL_ROWS.get().copied())
+}
+
+fn prefill_rows(capacity: usize, chunk: Option<u32>) -> Vec<usize> {
+    let mut rows = vec![cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS as usize];
+    if let Some(chunk) = chunk { rows.push(chunk as usize); }
+    rows.retain(|&row| row <= capacity);
+    rows.sort_unstable();
+    rows.dedup();
+    rows
+}
+
 /// Records one eager run of a shape the policy would graph but this owner's
 /// bank cannot capture. Every site that chooses eager for that reason reports
 /// through here, so `/v1/stats["graph_missing_variants"]` holds one entry per
@@ -72,8 +65,51 @@ fn large_shape_captured(rows: u32, prefill: Option<u32>) -> bool {
         || prefill.is_none_or(|chunk| rows == chunk)
 }
 
-pub(super) fn fixed_binding_limit() -> Option<usize> {
-    FIXED_SHAPES.get().map(|shapes| shapes.len() * 4)
+fn site_name(name: &'static str) -> &'static str {
+    match name {
+        "window" => "deepseek_v41.window", "compressor" => "deepseek_v41.compressor",
+        "index_selection" => "deepseek_v41.index_selection",
+        "target_head" => "deepseek_v41.target_head", "target_norm" => "deepseek_v41.target_norm",
+        "target_embedding" => "deepseek_v41.target_embedding", "tp2_ffn" => "deepseek_v41.tp2_ffn",
+        "vocabulary_logits" => "deepseek_v41.vocabulary_logits", "vocabulary_greedy" => "deepseek_v41.vocabulary_greedy",
+        "sparse_attention" => "deepseek_v41.sparse_attention", "dual_attention_tail" => "deepseek_v41.dual_attention_tail",
+        "v41.attention.query" => "deepseek_v41.attention.query",
+        "v41.attention.query.tp2_prefix" => "deepseek_v41.attention.query.tp2_prefix",
+        "v41.attention.output" => "deepseek_v41.attention.output",
+        "v41.backbone.shared" => "deepseek_v41.backbone.shared",
+        "v41.router.remote" => "deepseek_v41.router.remote",
+        "v41.router.local" => "deepseek_v41.router.local",
+        "v41.index.query" => "deepseek_v41.index.query", "v41.engram.gate" => "deepseek_v41.engram.gate",
+        "v41.projection.query.rank" => "deepseek_v41.projection.query.rank",
+        "v41.projection.query.gather" => "deepseek_v41.projection.query.gather",
+        "v41.projection.output.rank" => "deepseek_v41.projection.output.rank",
+        "v41.projection.output.gather" => "deepseek_v41.projection.output.gather",
+        "dspark_chain" => "deepseek_v41.dspark_chain",
+        "dspark_cache" => "deepseek_v41.dspark_cache",
+        "dspark_distributed_terminal" => "deepseek_v41.dspark_distributed_terminal",
+        // Empty standalone banks are visited too; they have no serving capture sites.
+        _ => name,
+    }
+}
+
+pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
+    mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+    let _ = library;
+    tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
+    let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
+    visit(&mut |device, name, spans, bank| {
+        let reserve = cuteafd_loader::placement::graph_reserve::current(device as usize,
+            false, base, extra).map_err(anyhow::Error::msg)?.bytes;
+        bank.attach(device, reserve, Site { name: site_name(name), cycle: Cycle::Other,
+            preference: Preference::Adaptive, bootstrap: extra, basis: Basis::Bytes,
+            spans_devices: spans || ranks > 1 })
+    })
+}
+
+pub(crate) fn cycle(cycle: crate::shared::decode_graph::device::Cycle,
+    mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
+    visit(&mut |_, _, _, bank| { bank.cycle(cycle); Ok(()) })
 }
 
 #[cfg(test)]
@@ -85,14 +121,50 @@ mod tests {
     use crate::shared::memory::{DeviceAllocation, LoadStream};
 
     #[test]
-    fn small_card_profile_defaults_to_qualified_bank_and_preserves_overrides() {
-        assert_eq!(profile_fixed_shapes(32usize << 30, None).unwrap(),
-            Some(vec![1, 6, 16, 24, 32, 40, 43, 48]));
-        assert_eq!(profile_fixed_shapes(32usize << 30, Some("")).unwrap(), None);
-        assert_eq!(profile_fixed_shapes(32usize << 30, Some("1,6")).unwrap(), Some(vec![1, 6]));
-        assert_eq!(profile_fixed_shapes(96usize << 30, None).unwrap(), None);
-        assert_eq!(profile_fixed_shapes(96usize << 30, Some("1,6")).unwrap(), None);
-        assert!(profile_fixed_shapes(32usize << 30, Some("1,80")).is_err());
+    fn startup_prefill_keys_are_reachable_from_slot_zero_and_selected_head_row() {
+        use crate::shared::memory::row_window::RowWindow;
+        // Enumerate the geometry consumed by startup, including a chunk that
+        // coincides with replay and a capacity that excludes the chunk.
+        for (capacity, chunk, expected) in [(2048, 2048, vec![128, 2048]),
+            (128, 128, vec![128]), (128, 2048, vec![128])] {
+            let rows = prefill_rows(capacity, Some(chunk));
+            assert_eq!(rows, expected);
+            let keys: Vec<_> = PREFILL_PREWARM_SLOTS.into_iter().flat_map(|slot| {
+                rows.iter().map(move |&rows| (slot, rows, RowWindow::NONE, false))
+            }).collect();
+            assert!(!keys.is_empty());
+            for (slot, rows, window, attention_decode) in keys {
+                assert_eq!(slot, 0);
+                assert!(!window.is_windowed());
+                assert!(!attention_decode);
+                assert!(rows == 128 || rows == chunk as usize);
+            }
+            let head_keys: Vec<_> = PREFILL_PREWARM_SLOTS.into_iter()
+                .flat_map(|slot| PREFILL_HEAD_PREWARM_ROWS.map(|rows| (slot, rows))).collect();
+            assert_eq!(head_keys, vec![(0, 1)]);
+        }
+        // Tie the enumeration to both live startup implementations rather than
+        // letting a correct policy test hide an unreachable caller inventory.
+        for source in [include_str!("v41_native_serve.rs"), include_str!("v41_native_serve/distributed.rs")] {
+            let at = source.find("for index in ").unwrap();
+            let end = source[at..].find("if let Some(draft)").unwrap() + at;
+            let startup = &source[at..end];
+            assert!(startup.contains("graph_policy::PREFILL_PREWARM_SLOTS"));
+            assert!(startup.contains("&mut prefill_slots.slots[index]"));
+            assert_eq!(source.matches("slot.capture_startup_prefill(").count(), 1);
+        }
+        for source in [include_str!("v41_target_pass.rs"), include_str!("v41_target_pass/distributed.rs")] {
+            let at = source.find("pub(crate) fn capture_startup_prefill").unwrap();
+            let end = source[at..].find("pub(crate) fn capture_startup(").unwrap() + at;
+            let startup = &source[at..end];
+            assert!(startup.contains("select_window(crate::shared::memory::row_window::RowWindow::NONE)?"));
+            assert!(startup.contains("graph_policy::PREFILL_HEAD_PREWARM_ROWS"));
+            assert!(!startup.contains("head.capture_startup(&rows)"));
+        }
+        let lane = include_str!("v41_backbone_lane.rs");
+        let at = lane.find("pub(crate) fn capture_startup_prefill").unwrap();
+        let end = lane[at..].find("pub(crate) fn startup_prefill_rows").unwrap() + at;
+        assert!(lane[at..end].contains("capture_startup_kind(&[], &[], false, false, local)"));
     }
 
     #[test]
@@ -106,15 +178,6 @@ mod tests {
             assert!(!large_shape_captured(rows, Some(2048)));
         }
         assert!(large_shape_captured(1982, None));
-    }
-
-    #[test]
-    fn fixed_shapes_preserve_c1_and_refuse_replacing_large_prefill_slots() {
-        assert_eq!(validate_fixed_shapes(vec![48, 6, 1, 24, 32, 40, 6]).unwrap(),
-            vec![1, 6, 24, 32, 40, 48]);
-        for shapes in [vec![], vec![1], vec![6], vec![1, 6, 0], vec![1, 6, 80]] {
-            assert!(validate_fixed_shapes(shapes).is_err());
-        }
     }
 
     #[test]

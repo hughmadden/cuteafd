@@ -648,20 +648,11 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     pub(crate) fn capture_startup(&mut self, rows: u32) -> Result<()> {
         self.validate(rows)?;
         self.stream().require_complete()?;
+        // The caller selects this layer's actual placement mode. Warming the
+        // opposite bank would pin an executable that live traffic never uses.
         // SAFETY: capture records stable owned buffers and borrowed weights;
         // no kernel executes and no routes are published during startup.
-        let local = !self.full_request;
-        let result = (|| -> Result<()> {
-            // Runtime swaps banks when expert placement changes the handoff mode.
-            for mode in [local, !local] {
-                self.set_local_mode(mode)?;
-                // SAFETY: both banks record the same stable owner-local enqueue.
-                unsafe { self.capture_ready(rows)?; }
-            }
-            Ok(())
-        })();
-        let restored = self.set_local_mode(local);
-        result.and(restored)
+        unsafe { self.capture_ready(rows) }
     }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {

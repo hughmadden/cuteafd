@@ -66,6 +66,11 @@ pub(crate) struct IndexLane<'w, 'a> {
     invalid: bool,
 }
 impl<'w, 'a> IndexLane<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        self.source.visit_graph_banks(f)?;
+        if let Some(reindex) = &mut self.reindex { reindex.visit_graph_banks(f)?; }
+        self.query.visit_graph_banks(f)
+    }
     pub(crate) fn startup_selections(&self) -> Vec<Option<cuteafd_ffi::CuteafdDeviceBuffer>> {
         (0..40).map(|layer| {
             if layer < 2 { None }
@@ -94,6 +99,8 @@ impl<'w, 'a> IndexLane<'w, 'a> {
                                 .capture_startup(&query, geometry, Some(shared), row)?;
                         } else { self.source.capture_startup(&query, geometry, None, row)?; }
                     }
+                    crate::shared::decode_graph::device::observe_device(self.weights.weights[i].device.library,
+                        self.weights.weights[i].device.id)?;
                 }
             }
             Ok(())
@@ -191,7 +198,6 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         self.next = Self::next_owned(self.weights, self.device, self.next + 1);
     }
     /// Begin a new batch after all consumers finish; also recovers failed work.
-    pub fn enable_small_graph_shapes(&mut self) {}
     pub fn restart(&mut self) -> Result<()> {
         self.restart_at(0)
     }

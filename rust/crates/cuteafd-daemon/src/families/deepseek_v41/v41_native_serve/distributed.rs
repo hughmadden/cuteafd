@@ -539,10 +539,19 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
-    // Pinned prewarm: exactly the set this family captured before the bounded
-    // cache existed (decode widths 1..=V41_VERIFY_ROWS at both target passes,
-    // plus the full prefill chunk). Best effort: a failed capture falls back to
-    // eager replay for that geometry and never refuses the request.
+    let mut visit = |f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>| -> Result<()> {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    };
+    crate::families::deepseek_v41::graph_policy::attach(&lib, 2, &mut visit)?;
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
+    drop(visit);
+    // The loader list is a best-effort preference, not a sealed capture set.
+    // Other shapes remain eligible for lazy bounded capture.
     {
         let memory = || -> Result<Vec<usize>> {
             devices.iter().map(|device| device.run(|| lib.cuda_memory_info().map(|(free, _)| free)))
@@ -560,10 +569,13 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 }
             };
         }
-        prewarm_step!("target pass 0", pass.capture_startup(requests.cache()));
-        prewarm_step!("target pass 1", second.capture_startup(requests.cache()));
-        for (slot, _) in &mut prefill_slots.slots {
-            prewarm_step!("prefill chunk", slot.capture_startup_prefill(requests.cache()));
+        let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+        prewarm_step!("target pass 0", pass.capture_startup(requests.cache(), &local));
+        prewarm_step!("target pass 1", second.capture_startup(requests.cache(), &local));
+        for index in super::super::graph_policy::PREFILL_PREWARM_SLOTS {
+            let (slot, transport) = &mut prefill_slots.slots[index];
+            let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+            prewarm_step!("prefill chunk", slot.capture_startup_prefill(requests.cache(), &local));
         }
         if let Some(draft) = &mut draft {
             let device = draft.device;
@@ -577,6 +589,14 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
             "V4.1 startup graphs warmed");
         memory_checkpoint("startup graphs warmed")?;
     }
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, |f| {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    }) }?;
     crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;

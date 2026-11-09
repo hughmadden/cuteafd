@@ -228,16 +228,15 @@ impl DsparkChain<'_, '_> {
         ensure!(geometry.iter().all(|g| g.ring.device_id == self.tokens.buffer.device_id),
             "draft startup ring device differs");
         let counts = self.tokens.buffer.bytes / 4;
-        let widths: Vec<_> = [5, 7].into_iter().filter(|&w| w <= self.maximum).collect();
+        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(counts, self.maximum);
         let original = self.width;
         let recorded = (|| -> Result<()> {
-            for width in widths {
-                self.set_width(width)?;
-                for count in 1..=counts {
-                    // SAFETY: real ring/weight owners stay pinned; capture only
-                    // records commands and never reads uninitialized metadata.
-                    unsafe { self.capture_geometry(&geometry, count)?; }
-                }
+            for entry in entries {
+                self.set_width(entry.width)?;
+                // SAFETY: real ring/weight owners stay pinned; capture only
+                // records commands and never reads uninitialized metadata.
+                unsafe { self.capture_geometry(&geometry, entry.requests)?; }
+                crate::shared::decode_graph::device::observe_device(self.stream.library, self.tokens.buffer.device_id)?;
             }
             Ok(())
         })();
@@ -485,7 +484,8 @@ impl DsparkChain<'_, '_> {
     unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
         let key = (count, self.width);
         if self.graphs.contains(&key) { return Ok(()); }
-        let Some(ticket) = self.graphs.cache_ticket(&key, false, None) else { return Ok(()); };
+        let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(count, self.width);
+        let Some(ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
             self.stream
                 .library

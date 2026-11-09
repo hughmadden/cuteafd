@@ -373,6 +373,8 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             // SAFETY: recording owned gate buffers does not execute kernels,
             // gather table rows, or publish residuals or request state.
             unsafe { self.capture_ready(row)?; }
+            crate::shared::decode_graph::device::observe_device(self.storage.stream.library,
+                self.storage.output.buffer.device_id)?;
         }
         Ok(())
     }

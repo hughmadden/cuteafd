@@ -134,6 +134,48 @@ def test_v41_draft_preferences_keep_count_and_width_separate():
                                         {"requests": 16, "width": 7, "pin": False}]
 
 
+@pytest.mark.parametrize("site,shape,expected", [
+    ("window", "(16, 987654321)", ("row", 16, 0)),
+    ("compressor", "(1, 998)", ("row", 1, 0)),
+    ("index_selection", "[7, 16, 100, 200, 300, 1, 500, 512, 0, 1]", ("row", 16, 0)),
+    ("sparse_attention", "(7, [7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("sparse_attention", "(7, [18446744073709551615, 7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("dual_attention_tail", "(7, [100, 200, 300, 16, 500])", ("row", 16, 0)),
+    ("target_head", "112", ("row", 112, 0)),
+    ("dspark_chain", "(16, 7)", ("draft", 16, 7)),
+    ("dspark_distributed_terminal", "(5, 1, 16)", ("draft", 16, 5)),
+    ("dspark_cache", "()", None),
+])
+def test_v41_native_site_axes(site, shape, expected):
+    assert MODULE.v41_geometry(shape, set(range(1, 65)) | {128}, "deepseek_v41." + site) == expected
+
+
+@pytest.mark.parametrize("site,shape", [
+    ("dspark_chain", "(5, 16)"),
+    ("dspark_distributed_terminal", "(7, 2, 16)"),
+    ("window", "(987654321, 16)"),
+    ("index_selection", "[7, 16]"),
+    ("sparse_attention", "(7, [1, 2, 3])"),
+    ("unknown", "16"),
+])
+def test_v41_unknown_or_invalid_axes_fail(site, shape):
+    with pytest.raises(ValueError):
+        MODULE.v41_geometry(shape, set(range(1, 65)), "deepseek_v41." + site)
+
+
+def test_v41_draft_preferences_keep_count_and_width_separate():
+    data = v41_trace()
+    data["graphs"] = [
+        {"site": "deepseek_v41.dspark_chain", "shape": "(1, 5)", "cycles": {"verify": 20, "other": 500}},
+        {"site": "deepseek_v41.dspark_distributed_terminal", "shape": "(7, 1, 16)", "cycles": {"verify": 19}},
+        {"site": "deepseek_v41.dspark_cache", "shape": "()", "cycles": {"verify": 20}},
+    ]
+    result = MODULE.generate([data, data], "deepseek_v41")
+    assert result["entries"] == []
+    assert result["draft_entries"] == [{"requests": 1, "width": 5, "pin": True},
+                                        {"requests": 16, "width": 7, "pin": False}]
+
+
 def test_v41_selection_vector_key_needs_a_site_rule():
     data = v41_trace()
     data["graphs"].append({"device": 0, "site": "deepseek_v41.sparse", "bank": 1,

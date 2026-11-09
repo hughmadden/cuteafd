@@ -215,7 +215,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members, &inputs);
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
-            let (inputs, mut batch, capture, retain_shapes) = {
+            let (inputs, mut batch, capture) = {
                 let active = active.borrow();
                 let mut requests = requests.borrow_mut();
                 let mut draft = draft.borrow_mut();
@@ -237,8 +237,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
-                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default(),
-                    draft.as_deref().is_some_and(DraftRuntime::has_policy))
+                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default())
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
@@ -247,7 +246,6 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {
-                if retain_shapes { pass.retain_small_graph_shapes()?; }
                 pass.set_capture(capture)?;
                 // Device-ordered passes only while the other lane is idle (two
                 // busy lanes interleave on host waits; see PLAN.md).

@@ -419,8 +419,6 @@ mod startup_tests {
         assert_eq!(rows, 64);
         assert_eq!(graph_policy::MAX_DECODE_ROWS as usize, rows);
         assert_eq!(cuteafd_core::MAX_DSPARK_PROPOSALS, 7);
-        assert!(graph_policy::profile_fixed_shapes(32usize << 30, Some("1,6,64"))?.is_some());
-        assert!(graph_policy::profile_fixed_shapes(32usize << 30, Some("1,6,65")).is_err());
         let sparse_growth = cuteafd_ffi::V41SparseAttention::split_scratch_bytes(rows, 10)?
             + cuteafd_ffi::V41SparseAttention::batch_descriptor_bytes(rows)?
             - cuteafd_ffi::V41SparseAttention::split_scratch_bytes(48, 10)?

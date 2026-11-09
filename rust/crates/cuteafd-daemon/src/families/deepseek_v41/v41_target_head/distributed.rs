@@ -90,7 +90,7 @@ impl<'w, 'a> Rank<'w, 'a> {
         if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
-            let Some(ticket) = self.graphs[mode].cache_ticket(&rows, rows == 1, None) else {
+            let Some(ticket) = self.graphs[mode].cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(rows as u32), None) else {
                 crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
                 return Ok(());
             };
@@ -164,7 +164,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         Ok(())
     }
 
-    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+    pub(crate) fn capture_startup(&mut self, rows: &[usize], greedy: bool) -> Result<()> {
         ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
             "vocabulary startup requires an idle owner");
         for rank in &mut self.ranks {
@@ -172,13 +172,12 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             device.run(|| {
                 let rank = rank.get_mut();
                 rank.stream.require_complete()?;
-                for mode in 0..2 {
-                    for &row in rows {
-                        ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
-                        // SAFETY: capture records the exact projection/argmax
-                        // operations without executing or publishing logits.
-                        unsafe { rank.capture_ready(row, mode == 1)?; }
-                    }
+                for &row in rows {
+                    ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
+                    // SAFETY: capture records only this owner's live mode:
+                    // target ranks include argmax, draft ranks retain logits.
+                    unsafe { rank.capture_ready(row, greedy)?; }
+                    crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
                 }
                 Ok(())
             })?;

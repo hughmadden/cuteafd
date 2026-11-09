@@ -672,7 +672,7 @@ pub(crate) struct CompressorWave<'w, 'a> {
     /// Per slot: descriptors and positions rewritten on the host per unit.
     staging: HostAllocation<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize, u64)>,
+    graph: Option<(usize, u64)>,
     // Lane-local decode shapes; large prefill retains only the current graph.
     retained_graphs: GraphBank<(usize, u64), GraphOwner<'a, &'w CompressorWeights<'a>>>,
     ready: Option<Prepared>,
@@ -1013,6 +1013,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 }
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
+            crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
         }
 
         self.graph = None;
@@ -1041,7 +1042,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             self.upload_queued(&prepared)?;
             unsafe {
                 crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
-                    prepared.rows, if capture || forced_eager { None } else { self.graph.map(|(raw,_,_)|raw) },
+                    prepared.rows, if capture || forced_eager { None } else { self.selected_graph().map(|(raw, _, _)| raw) },
                     || self.enqueue(state, prepared.rows))
             }
         })();
@@ -1112,11 +1113,11 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         // Windowed units run eagerly: graphs bake row-0 plane pointers.
         let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
-            && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
+            && (uncaptured || self.selected_graph().is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
             // Order the producer on the chain (forked from the query's
             // normalized input) instead of draining it on the host: a captured
             // shape replays, an uncaptured prefill width launches eagerly.
-            let graph = if uncaptured { None } else { Some(self.graph.unwrap().0) };
+            let graph = if uncaptured { None } else { self.selected_graph().map(|(raw, _, _)| raw) };
             let queued = (|| -> Result<()> { unsafe {
                 crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?;
                 self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
@@ -1205,7 +1206,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
     ) -> Result<CompressorOutput<'s>> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(!self.window.is_windowed(), "windowed compressor production is eager");
-        let (graph, rows, owner) = self.graph.context("compressor graph is not captured")?;
+        let (graph, rows, owner) = self.selected_graph().context("compressor graph is not captured")?;
         ensure!(
             rows == prepared.rows && owner == state.owner,
             "compressor capture binding differs"
@@ -1338,8 +1339,12 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         ensure!(self.pending_query.is_none() && self.pending_commit.is_none(),
             "cannot switch a pending cache producer graph");
         self.ready = None;
-        self.graph = self.retained_graphs.cached_launch(&(rows, owner)).map(|exec| (exec.raw, rows, owner));
+        self.graph = self.retained_graphs.cached_launch(&(rows, owner)).map(|_| (rows, owner));
         Ok(())
+    }
+    fn selected_graph(&self) -> Option<(*mut c_void, usize, u64)> {
+        let (rows, owner) = self.graph?;
+        Some((self.retained_graphs.get(&(rows, owner))?.raw, rows, owner))
     }
     fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64,
         ticket: crate::shared::decode_graph::CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
@@ -1351,7 +1356,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "compressor",
             &self.retained_graphs as *const _ as usize, device, None, &(rows, owner), graph);
         self.retained_graphs.cache_commit((rows, owner), exec, ticket, nodes, width, spans);
-        self.graph = Some((graph, rows, owner));
+        self.graph = Some((rows, owner));
         tracing::debug!(target: "cuteafd::graph_capture", site = "compressor", rows,
             layer = self.weights.layer, device, binding = owner,
             bank = ?(&self.retained_graphs as *const _), "captured graph binding");

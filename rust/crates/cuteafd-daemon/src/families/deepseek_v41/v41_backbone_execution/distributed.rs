@@ -106,6 +106,11 @@ impl Drop for PlacedPreparedLayer<'_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedExecution<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for wave in &mut self.producers.windows { wave.get_mut().visit_graph_banks(f)?; }
+        for wave in &mut self.producers.sources { wave.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    }
     pub(crate) fn startup_sinks(&self) -> &[cuteafd_ffi::CuteafdDeviceBuffer; 40] { &self.weights.sink_views }
     pub(crate) fn startup_source(&self, bank: &BackboneCache<'a>, layer: usize, rows: usize)
         -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry> {

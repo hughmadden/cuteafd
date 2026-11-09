@@ -250,39 +250,6 @@ impl DsparkMainContext<'_, '_> {
     }
     /// # Safety
     /// Same initialized-input and exclusive-use contract as execute.
-    pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        self.prepare(rows)?;
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready = None;
-        let key = rows;
-        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
-                super::chain::warn_topology(inspection);
-                // SAFETY: context pins captured storage through drained teardown.
-                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
-            },
-            (Err(error), Ok((graph, _, _, _, _))) => {
-                unsafe {
-                    self.stream.library.cuda_graph_exec_destroy(graph)?;
-                }
-                return Err(error);
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
-        }
-        Ok(())
-    }
-    /// # Safety
-    /// Same initialized-input and exclusive-use contract as execute.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<()> {
         self.prepare(rows)?;
         let Some(graph) = self.graph.cached_launch(&rows) else {

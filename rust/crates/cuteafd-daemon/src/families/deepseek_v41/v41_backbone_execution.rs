@@ -516,6 +516,22 @@ impl Drop for PendingProduction<'_, '_, '_> {
     }
 }
 impl<'w, 'a> BackboneExecution<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self, bank: &BackboneCache<'a>, rows: &[usize]) -> Result<()> {
+        bank.capture_startup_local_producers(&mut self.windows, &mut self.sources, rows)
+    }
+    pub(crate) fn startup_sinks(&self) -> &[cuteafd_ffi::CuteafdDeviceBuffer; 40] { &self.weights.sink_views }
+    pub(crate) fn startup_source(&self, bank: &BackboneCache<'a>, layer: usize, rows: usize)
+        -> Result<crate::families::deepseek_v41::v41_compressor::IndexScoreGeometry> {
+        let index = [2, 8, 14, 20].iter().position(|&source| source == layer)
+            .context("startup index source absent")?;
+        self.sources[index].startup_index_geometry(bank.sources()[index].get(), rows)
+    }
+
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for wave in &mut self.windows { wave.visit_graph_banks(f)?; }
+        for wave in &mut self.sources { wave.visit_graph_banks(f)?; }
+        Ok(())
+    }
     pub fn window_batch_enabled() -> bool {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
     }

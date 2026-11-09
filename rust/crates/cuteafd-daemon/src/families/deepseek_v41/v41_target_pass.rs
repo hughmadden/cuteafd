@@ -197,6 +197,40 @@ impl<'a, R> Pass<'a, R> {
     pub(crate) fn set_l2_prefetch(&mut self, on: bool) { self.l2_solo = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
+    pub(crate) fn capture_startup_prefill(&mut self, bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup prefill requires idle target pass");
+        self.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
+        let resources = &mut self.resources;
+        let rows = resources.lane.startup_prefill_rows();
+        resources.execution.capture_startup(bank, &rows)?;
+        resources.index.capture_startup(&rows, |layer, row| resources.execution.startup_source(bank, layer, row))?;
+        resources.lane.capture_startup_prefill(local)?;
+        for gate in &mut resources.gates { gate.capture_startup(&rows)?; }
+        resources.head.capture_startup(&crate::families::deepseek_v41::graph_policy::PREFILL_HEAD_PREWARM_ROWS)
+    }
+    pub(crate) fn capture_startup(&mut self, bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
+        ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
+        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(
+            cuteafd_core::V41_VERIFY_ROWS).into_iter().map(|entry| entry.rows).collect();
+        let resources = &mut self.resources;
+        resources.execution.capture_startup(bank, &rows)?;
+        resources.index.capture_startup(&rows, |layer, row| resources.execution.startup_source(bank, layer, row))?;
+        let selections = resources.index.startup_selections();
+        resources.lane.capture_startup(resources.execution.startup_sinks(), &selections, true, local)?;
+        for gate in &mut resources.gates { gate.capture_startup(&rows)?; }
+        resources.head.capture_startup(&rows)?;
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(resources.head.library(), |f| self.visit_graph_banks(f)) }
+    }
+
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        self.resources.embedding.visit_graph_banks(f)?;
+        self.resources.lane.visit_graph_banks(f)?;
+        self.resources.index.visit_graph_banks(f)?;
+        self.resources.execution.visit_graph_banks(f)?;
+        for gate in &mut self.resources.gates { gate.visit_graph_banks(f)?; }
+        self.resources.head.visit_graph_banks(f)
+    }
     pub fn bind_execution_plan(&self, placement: &cuteafd_loader::placement::Placement) -> Result<()> {
         let plan = cuteafd_loader::placement::LayerExecutionPlan::new(placement,
             cuteafd_loader::placement::families::deepseek_v41::execution_hops(1))?;
@@ -207,17 +241,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
     pub fn set_route_capture(&mut self, enabled: bool) {
         self.resources.lane.set_route_capture(enabled);
-        if enabled { self.resources.index.enable_small_graph_shapes(); }
     }
     /// Route ids and/or pass timing for the next pass (see `BackboneLane::set_capture`).
     pub fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) {
         self.resources.lane.set_capture(capture);
-        if capture.routes || capture.timing { self.resources.index.enable_small_graph_shapes(); }
-    }
-    /// Retain decode-row graph shapes for speculative verification (sticky).
-    pub fn retain_small_graph_shapes(&mut self) {
-        self.resources.lane.retain_small_graph_shapes();
-        self.resources.index.enable_small_graph_shapes();
     }
     pub fn captured_routes(&self) -> &[Vec<[u32; 6]>] { self.resources.lane.captured_routes() }
     /// Host FFN stage split of the last captured pass.
@@ -457,6 +484,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],
         suffix: Option<&mut EncoderSuffix<'a>>, encoder: Option<&BlockOutput<'_>>,
         terminal: HeadTerminal<'_>) -> Result<()> {
+        let cycle = if !self.resources.lane.attention_decode() {
+            crate::shared::decode_graph::device::Cycle::Prefill
+        } else if batch.cache()?.positions().len() == batch.cache()?.request_ids().len() {
+            crate::shared::decode_graph::device::Cycle::Decode
+        } else { crate::shared::decode_graph::device::Cycle::Verify };
+        super::graph_policy::cycle(cycle, |f| self.visit_graph_banks(f))?;
         // Only verification passes (greedy or device-sampled head) are chained.
         // Prefill, encoder and replay passes keep host-drained stages: their
         // many-row paths publish KV and encoder state through host-ordered copies.
@@ -472,7 +505,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             // A failed Spark wire released its waits over garbage planes.
             let result = result.and_then(|()| crate::shared::spark_waves::healthy());
             if result.is_ok() { self.resources.lane.drain_route_ring()?; }
-            return result;
+            let measured = unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+                crate::shared::decode_graph::device::observe_completed(
+                self.resources.head.library(), |f| self.visit_graph_banks(f)) };
+            return result.and(measured);
         };
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
             requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
@@ -490,7 +526,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 eager=!super::graph_policy::captures_shape(rows as u32),
                 elapsed_us=started.elapsed().as_micros() as u64, success=result.is_ok(), "V4.1 target verification step");
         }
-        result
+        let measured = unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(
+            self.resources.head.library(), |f| self.visit_graph_banks(f)) };
+        result.and(measured)
     }
     async unsafe fn execute_phase_inner(&mut self, requests: &impl RequestAccess<'a>, batch: &mut RequestBatch,
         transport: &mut NativeTp4Wave<'a>, placement: u64, selected: &[usize],

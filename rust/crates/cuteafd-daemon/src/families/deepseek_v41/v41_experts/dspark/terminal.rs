@@ -356,39 +356,6 @@ impl DsparkTerminal<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the complete sequence before capture.
-    pub unsafe fn capture(&mut self, requests: usize) -> Result<()> {
-        unsafe {
-            self.execute(requests)?;
-        }
-        self.ready_requests = None;
-        let key = requests;
-        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.enqueue(requests) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
-        match (launch, captured) {
-            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
-                super::chain::warn_topology(inspection);
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
-                Ok(())
-            }
-            (Err(error), Ok((graph, _, _, _, _))) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed terminal capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; prepare new sampling state for a fresh attempt.
     pub unsafe fn replay(&mut self, requests: usize) -> Result<[CuteafdDeviceBuffer; 3]> {
         self.ready_requests = None;

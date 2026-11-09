@@ -164,7 +164,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     greedy_ready: bool,
     sampling: TargetSamplingWave<'a>,
 }
-impl TargetHeadWave<'_, '_> {
+impl<'a> TargetHeadWave<'a, '_> {
     /// Target verification rows are bounded by the shared V4.1 verifier budget.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
@@ -237,6 +237,17 @@ impl TargetHeadWave<'_, '_> {
             self.execute(rows)?;
         }
         unsafe { self.capture_ready(rows) }
+    }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        self.synchronize()?;
+        for &row in rows {
+            if self.graph(row).is_none() {
+                // SAFETY: recording owns all buffers and never executes its inputs.
+                unsafe { self.capture_ready(row)?; }
+                crate::shared::decode_graph::device::observe_device(self.stream.library, self.b(0).device_id)?;
+            }
+        }
+        Ok(())
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
@@ -544,6 +555,7 @@ impl TargetHeadWave<'_, '_> {
         // The head remains exclusively borrowed through transfer completion.
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
+    pub(crate) fn library(&self) -> &'a NativeLibrary { self.stream.library }
     fn graph(&self, rows: usize) -> Option<*mut c_void> {
         self.graphs.get(rows)
     }

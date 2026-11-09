@@ -164,44 +164,6 @@ impl<'a> DsparkStage<'_, 'a> {
         self.output()
     }
     /// # Safety
-    /// Same initialization contract as execute; captured ring storage is bound to
-    /// this unique window owner and revalidated before every replay.
-    pub unsafe fn capture(
-        &mut self,
-        window: &DsparkWindow<'_>,
-        requests: &[(WindowLease, u64)],
-    ) -> Result<()> {
-        self.invalidate();
-        unsafe {
-            self.execute(window, requests)?;
-        }
-        let read = self.prepare(window, requests)?;
-        let key = (requests.len(), read.owner);
-        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
-        unsafe {
-            self.library.cuda_graph_begin_capture(self.ffn.stream()?)?;
-        }
-        let launched = unsafe { self.enqueue(&read, requests.len()) };
-        let captured = unsafe { self.library.cuda_graph_end_capture_topology(self.ffn.stream()?) };
-        self.invalidate();
-        match (launched, captured) {
-            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
-                super::chain::warn_topology(inspection);
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans || self.peer_stream().is_some())?; }
-                Ok(())
-            }
-            (Err(error), Ok((graph, _, _, _, _))) => {
-                unsafe {
-                    self.library.cuda_graph_exec_destroy(graph)?;
-                }
-                Err(error)
-            }
-            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same contract as execute; request count and cache owner must match capture.
     pub unsafe fn replay(
         &mut self,

@@ -125,39 +125,6 @@ impl<'a> DsparkFfn<'_, 'a> {
         }
     }
     /// # Safety
-    /// Same initialized-input contract as execute; captures only owned addresses.
-    pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.boundary.invalidate();
-        let key = rows;
-        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
-        unsafe {
-            self.library
-                .cuda_graph_begin_capture(self.stream()?)?;
-        }
-        let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.library.cuda_graph_end_capture_topology(self.stream()?) };
-        self.boundary.invalidate();
-        match (launched, captured) {
-            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
-                super::chain::warn_topology(inspection);
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans || self.peer_stream().is_some())?; }
-                Ok(())
-            }
-            (Err(error), Ok((graph, _, _, _, _))) => {
-                if let Err(cleanup) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                    tracing::error!(%cleanup,"destroying failed dSpark FFN capture");
-                }
-                Err(error)
-            }
-            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same initialized-input contract as execute; rows must match capture.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.boundary.invalidate();

@@ -718,6 +718,7 @@ impl WindowWave<'_, '_> {
                 }
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
+            crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
         }
 
         self.graph = None;

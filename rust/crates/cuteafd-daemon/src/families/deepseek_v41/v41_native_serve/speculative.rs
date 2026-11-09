@@ -106,6 +106,14 @@ struct DraftRequest {
     slot: usize,
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
+    pub(crate) fn capture_startup(&mut self) -> Result<()> {
+        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
+            "draft startup requires no admitted requests");
+        let windows = self.windows.each_ref();
+        for chain in &mut self.chains { chain.capture_startup(windows)?; }
+        self.graph_completed()
+    }
+
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
@@ -564,6 +572,21 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 
     /// Each lane owns its draft scratch and stream; both can replay concurrently.
     /// Short RefCell borrows never survive a scheduler yield.
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for main in &mut self.mains { main.visit_graph_banks(f)?; }
+        for chain in &mut self.chains { chain.visit_graph_banks(f)?; }
+        for window in &mut self.windows { window.visit_graph_banks(f)?; }
+        Ok(())
+    }
+    fn graph_cycle(&mut self) -> Result<()> {
+        crate::families::deepseek_v41::graph_policy::cycle(
+            crate::shared::decode_graph::device::Cycle::Verify, |f| self.visit_graph_banks(f))
+    }
+    fn graph_completed(&mut self) -> Result<()> {
+        let library = self.windows[0].device().library;
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(library, |f| self.visit_graph_banks(f)) }
+    }
     pub fn poll_propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Option<(Vec<Vec<u32>>, u64)>> {
@@ -593,6 +616,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
                     return Err(error);
                 },
             };
+            self.graph_completed()?;
             let (packed, values) = completed;
             let active: Vec<_> = inputs.iter().enumerate()
                 .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
@@ -649,6 +673,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
+        self.graph_cycle()?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
         // SAFETY: admitted leases and windows stay owned by the runtime through completion/cancellation.
@@ -736,6 +761,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
+        self.graph_cycle()?;
         let windows = self.windows.each_ref();
         let bindings = bindings.each_ref().map(|rows| rows.as_slice());
         if !self.chains[lane].has_graph(count) {
@@ -750,6 +776,7 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
             self.chains[lane].note_failure(&error);
             return Err(error);
         }
+        self.graph_completed()?;
         let buffer = match self.chains[lane].draft_output() {
             Ok(output) => output[0],
             Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
@@ -870,11 +897,12 @@ mod anchor_fallback_tests {
         polls: usize,
         cancelled: bool,
         downloads: Cell<usize>,
+        graph_bank: Option<crate::shared::decode_graph::GraphBank<usize, ()>>,
     }
     impl FailingChain {
         fn new(at: At, device_error: bool) -> Self {
             Self { failure: Default::default(), at, device_error, tokens: Vec::new(), polls: 0,
-                cancelled: false, downloads: Cell::new(0) }
+                cancelled: false, downloads: Cell::new(0), graph_bank: None }
         }
         // Deliberately does not record: only the real runtime can latch this mock.
         fn step(&self, at: At) -> Result<()> {
@@ -890,6 +918,10 @@ mod anchor_fallback_tests {
         }
     }
     impl<'a> DraftChain<'a> for FailingChain {
+        fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+            if let Some(bank) = &mut self.graph_bank { f(0, "dspark_chain", false, bank)?; }
+            Ok(())
+        }
         fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { None }
         fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> {
             self.tokens = tokens.iter().map(|&token| token as u32).collect();
@@ -1012,6 +1044,37 @@ mod anchor_fallback_tests {
         assert!(runtime.confidence_trace(1).is_none() && !runtime.neural_lengths.contains_key(&1));
         runtime.release(1)?;
         runtime.release(2)?;
+        Ok(())
+    }
+    #[test]
+    fn both_proposal_completion_paths_measure_pending_captures() -> Result<()> {
+        use crate::shared::decode_graph::{device::{Basis, Cycle, Preference, Site}, GraphBank};
+        let fixture = fixture()?;
+        let lib = fixture.load()?;
+        fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
+        for independent in [false, true] {
+            let mut runtime = runtime(&lib, At::Never, false)?;
+            let mut bank = GraphBank::new(None);
+            bank.attach_device(0, 4096, Site { name: "draft_completion_fixture", cycle: Cycle::Other,
+                preference: Preference::Adaptive, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
+            let ticket = bank.cache_ticket(&1, false, None).context("fixture admission")?;
+            bank.cache_commit(1, (), ticket, 1, 1, false);
+            assert!(bank.cache_needs_boundary());
+            runtime.chains[1].graph_bank = Some(bank);
+            let round = seeds(&[1, 2]);
+            if independent {
+                assert!(runtime.poll_propose(1, &round)?.is_none());
+                assert!(runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary());
+                assert!(runtime.poll_propose(1, &round)?.is_none());
+                assert!(runtime.poll_propose(1, &round)?.is_some());
+            } else {
+                runtime.propose(1, &round)?;
+            }
+            assert!(!runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary(),
+                "completed proposal must feed measured_capture, independent={independent}");
+            runtime.chains[1].graph_bank.as_mut().unwrap().cache_clear_drained();
+        }
         Ok(())
     }
     #[test]

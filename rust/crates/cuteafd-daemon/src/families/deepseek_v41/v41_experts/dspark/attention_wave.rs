@@ -268,44 +268,6 @@ impl DsparkAttentionWave<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute. The graph may only replay against this
-    /// window owner, revalidated on every call; destruction never reads its ring.
-    pub unsafe fn capture(
-        &mut self,
-        window: &DsparkWindow<'_>,
-        requests: &[(WindowLease, u64)],
-    ) -> Result<()> {
-        unsafe {
-            self.execute(window, requests)?;
-        }
-        let read = self.prepare(window, requests)?;
-        let key = (requests.len() as u32, read.owner);
-        let Some(ticket) = self.graph.cache_ticket(&key, false, None) else { return Ok(()); };
-        unsafe {
-            self.standalone.device
-                .library
-                .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
-        }
-        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.standalone.get()?.raw) };
-        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture_topology(self.standalone.get()?.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
-                super::chain::warn_topology(inspection);
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.cache_insert(key, graph, ticket, nodes as u64, width, spans)?; }
-                Ok(())
-            }
-            (Err(error), Ok((graph, _, _, _, _))) => {
-                if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup,"destroying failed attention wave capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; cache owner and captured request count must match.
     pub unsafe fn replay(
         &mut self,

@@ -377,15 +377,7 @@ fn worker(
     // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let (_, device_total) = lib.cuda_memory_info()?;
-    let small_card = device_total <= 32usize << 30;
     admission::startup_phase(&lib, "v41/context", device_total)?;
-    if small_card {
-        let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
-        if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
-            tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
-            super::graph_policy::set_fixed_shapes(shapes)?;
-        }
-    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
@@ -738,6 +730,34 @@ fn worker(
         device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
         "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
+    let mut visit = |f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>| -> Result<()> {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
+        Ok(())
+    };
+    super::graph_policy::attach(&lib, 1, &mut visit)?;
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
+    drop(visit);
+    let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+    for (site, result) in [("target pass 0", pass.capture_startup(requests.cache(), &local)),
+        ("target pass 1", second.capture_startup(requests.cache(), &local))] {
+        if let Err(error) = result { tracing::warn!(%error, site, "V4.1 best-effort startup graph prewarm failed"); }
+    }
+    for index in super::graph_policy::PREFILL_PREWARM_SLOTS {
+        let (slot, transport) = &mut prefill_slots.slots[index];
+        let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+        if let Err(error) = slot.capture_startup_prefill(requests.cache(), &local) {
+            tracing::warn!(%error, "V4.1 best-effort nonwindowed prefill prewarm failed");
+        }
+    }
+    if let Some(draft) = &mut draft {
+        if let Err(error) = draft.capture_startup() {
+            tracing::warn!(%error, "V4.1 best-effort draft graph prewarm failed");
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
