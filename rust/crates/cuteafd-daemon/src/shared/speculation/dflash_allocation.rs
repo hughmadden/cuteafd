@@ -21,9 +21,13 @@ impl DflashDrafter<'_> {
             ("context_positions", &self.context_positions)] {
             owner.inventory(&mut inventory, name)?;
         }
-        for (name, owner) in [("mask_rows", &self.mask_rows), ("markov_workspace", &self.markov_workspace),
-            ("fp8_workspace", &self.fp8_workspace)] {
+        for (name, owner) in [("mask_rows", &self.mask_rows), ("markov_workspace", &self.markov_workspace)] {
             if let Some(owner) = owner { owner.inventory(&mut inventory, name)?; }
+        }
+        if let Some(owner) = &self.fp8_workspace {
+            let mut scratch = Inventory::new(devices, prefix, lifetime, Category::Workspace, "draft owners");
+            owner.inventory(&mut scratch, "fp8_workspace")?;
+            inventory.receipts.extend(scratch.receipts);
         }
         inventory.host("mask_row", &self.mask_row)?;
         match &self.head_ops {

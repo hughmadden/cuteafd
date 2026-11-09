@@ -207,6 +207,11 @@ fn installed_standard_dflash_physical_layout_equals_serving_receipts() -> Result
                     let expected: BTreeMap<_, _> = forecast.allocations("draft", Location::coordinator(0))
                         .into_iter().map(|allocation| (allocation.id.clone(), allocation)).collect();
                     assert_eq!(actual, expected, "{repo}, slots={slots}, C={sequences}, {kv}, {mode:?}, {representation:?}");
+                    assert_eq!(actual["draft.workspace.tokens"].category, cuteafd_core::memory_layout::Category::Drafter);
+                    assert_eq!(actual["draft.workspace.tokens"].bytes, (sequences * cfg.drafts() * 4).max(256) as u64);
+                    if representation == GlmDraftRepresentation::Fp8Only {
+                        assert_eq!(actual["draft.fp8_workspace"].category, cuteafd_core::memory_layout::Category::Workspace);
+                    }
                     assert!(forecast.resident_weights().0 > 0);
                     assert!(forecast.weight_owners().all(|owner| owner.location == Location::coordinator(0)));
                     drop(drafter);
@@ -292,6 +297,14 @@ fn installed_tp2_dflash_physical_layout_equals_both_rank_receipts() -> Result<()
                         layout.allocations(if rank == 0 { "draft" } else { "draft.peer" }, Location::coordinator((rank ^ lead) as u8)))
                         .map(|allocation| (allocation.id.clone(), allocation)).collect();
                     assert_eq!(actual, expected, "{representation:?}, {kv}");
+                    assert_eq!(actual["draft.workspace.tokens"].category, cuteafd_core::memory_layout::Category::Drafter);
+                    assert_eq!(actual["draft.workspace.tokens"].location, Location::coordinator(lead as u8));
+                    assert!(!actual.contains_key("draft.peer.workspace.tokens"));
+                    if representation == GlmDraftRepresentation::Fp8Only {
+                        for name in ["draft.fp8_workspace", "draft.peer.fp8_workspace"] {
+                            assert_eq!(actual[name].category, cuteafd_core::memory_layout::Category::Workspace);
+                        }
+                    }
                     assert!(matches!(peer.head_ops, DraftHeadOps::Peer));
                     assert!(peer.workspace.borrow().as_ref().unwrap().head.is_none());
                     assert!(layouts[1].owners().iter().all(|owner| !owner.id.starts_with("head.")));
