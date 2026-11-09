@@ -1006,7 +1006,7 @@ def _rust_methods(source, names):
 
 
 @pytest.mark.parametrize("family,methods,launches,inventory_names", [
-    ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on"},
+    ("mimo_v2", {"norm_full", "attention_part", "dense_ffn", "moe_front_on", "moe_front_on_accounted"},
      {"mimo_norm", "mimo_{k}_producer{kv}_{cap}", "mimo_{k}_attention{}_{mode}_{cap}",
       "mimo_o_w8_{cap}", "mimo_o_{cap}", "mimo_ffn_{cap}", "mimo_router_scores", "mimo_expert_input_quant"},
      {"mimo_norm", "mimo_{k}_producer{kv}_m4096", "mimo_{k}_attention{kv}_prefill_m4096",

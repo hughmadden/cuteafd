@@ -29,6 +29,7 @@ mod tp2;
 use super::weights::{MimoLayer, MimoWeights};
 use super::head::BorrowedHead;
 use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
+use cuteafd_loader::placement::inventory::GraphMemorySample;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::experts::rtx::fp8moe::Fp8MoeTp2;
 use crate::shared::experts::rtx::{ExpertInput as RtxInput, FusedCombine,
@@ -208,6 +209,14 @@ impl Drop for GraphExec<'_> {
         // SAFETY: the exec came from end_capture and is destroyed once.
         let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
     }
+}
+
+/// Match the shared observer's untracked residual, excluding separately owned
+/// device allocations even when a lazy workspace grows during capture.
+fn graph_capture_growth(before: GraphMemorySample, after: GraphMemorySample) -> u64 {
+    let residual = |sample: GraphMemorySample| sample.total.saturating_sub(sample.free)
+        .saturating_sub(sample.tracked_device);
+    residual(after).saturating_sub(residual(before))
 }
 
 /// Native producers skip full-KV writes for negative slots; SWA commits skip
@@ -851,8 +860,8 @@ pub(crate) struct MimoEngine<'a> {
     graphs_warming: Cell<bool>,
     /// The startup prewarm completed; serving misses capture-or-run-eager.
     graphs_warmed: Cell<bool>,
-    /// Free bytes per rank sampled when the first capture miss was admitted.
-    graph_before: RefCell<Option<Vec<u64>>>,
+    /// Physical and tracked bytes per rank before the first capture miss.
+    graph_before: RefCell<Option<Vec<GraphMemorySample>>>,
     graphs_first_touch: Cell<bool>,
 }
 
@@ -2348,21 +2357,9 @@ impl<'a> MimoEngine<'a> {
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
     }
 
-    /// Physical free bytes per rank, for the growth window a capture opens.
-    fn graph_free_samples(&self) -> Result<Vec<u64>> {
-        (0..self.ranks()).map(|rank| self.on(rank, || self.library.cuda_physical_memory_info()
-            .map(|(free, _)| free as u64))).collect()
-    }
-
-    /// Physical free/total and ledger bytes on both ranks, their streams drained
-    /// so no queued work lands inside the measurement window.
-    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
-        use cuteafd_loader::placement::inventory::GraphMemorySample;
-        for rank in 0..self.ranks() {
-            let stream = self.stream_of(rank);
-            // SAFETY: the engine owns both streams; callers queue on them only.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
-        }
+    /// Sample without draining: a capture miss can occur inside a peer step
+    /// whose consumers have not all been queued yet.
+    fn graph_allocation_samples(&self) -> Result<Vec<GraphMemorySample>> {
         let ledger = cuteafd_ffi::memory_ledger::snapshot();
         use cuteafd_ffi::memory_ledger::Space;
         (0..self.ranks()).map(|rank| self.on(rank, || {
@@ -2377,10 +2374,20 @@ impl<'a> MimoEngine<'a> {
         })).collect()
     }
 
+    /// Physical free/total and ledger bytes after every rank has drained.
+    fn graph_memory_samples(&self) -> Result<Vec<GraphMemorySample>> {
+        for rank in 0..self.ranks() {
+            let stream = self.stream_of(rank);
+            // SAFETY: the engine owns both streams; callers queue on them only.
+            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
+        }
+        self.graph_allocation_samples()
+    }
+
     /// The completed multi-rank step is the only measurement boundary: every
-    /// rank's captures of this step are queued and drained together, then one
-    /// net growth figure per physical device is charged to its pending captures.
-    fn graph_boundary(&self, before: &[u64]) -> Result<()> {
+    /// rank's captures are drained together, then untracked device growth is
+    /// charged to pending captures, excluding separately owned lazy storage.
+    fn graph_boundary(&self, before: &[GraphMemorySample]) -> Result<()> {
         if !self.graphs.borrow().cache_needs_boundary()
             && self.peer.as_ref().is_none_or(|peer| !peer.graphs.borrow().cache_needs_boundary()) {
             return Ok(());
@@ -2388,7 +2395,7 @@ impl<'a> MimoEngine<'a> {
         let after = self.graph_memory_samples()?;
         for rank in 0..self.ranks() {
             let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
-            graphs.borrow_mut().cache_measured(before[rank].saturating_sub(after[rank].free));
+            graphs.borrow_mut().cache_measured(graph_capture_growth(before[rank], after[rank]));
             self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), || {
                 let (free, _) = self.library.cuda_physical_memory_info()?;
                 Ok(crate::shared::decode_graph::device::ReleaseMeasurement {
@@ -2406,7 +2413,7 @@ impl<'a> MimoEngine<'a> {
         if let Some(before) = before { self.graph_boundary(&before)?; }
         else if self.graphs.borrow().cache_needs_boundary()
             || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
-            self.graph_boundary(&self.graph_free_samples()?)?;
+            self.graph_boundary(&self.graph_allocation_samples()?)?;
         }
         self.graphs.borrow_mut().cache_tick();
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
@@ -2437,7 +2444,7 @@ impl<'a> MimoEngine<'a> {
         let crate::shared::decode_graph::device::Miss::Capture(ticket) =
             graphs.borrow_mut().cache_miss(&key, pinned, None) else { return segment() };
         if self.graph_before.borrow().is_none() {
-            match self.graph_free_samples() {
+            match self.graph_allocation_samples() {
                 Ok(samples) => *self.graph_before.borrow_mut() = Some(samples),
                 Err(error) => { graphs.borrow_mut().cache_cancel(ticket); return Err(error); }
             }
@@ -2596,7 +2603,9 @@ impl<'a> MimoEngine<'a> {
             }
             tracing::info!(rank, executables = actual, reserve_bytes = layout.reserves[rank],
                 source = layout.sources[rank], bootstrap_bytes = layout.bootstraps[rank],
-                measured_bytes = samples_before[rank].free.saturating_sub(samples_after[rank].free),
+                measured_bytes = graph_capture_growth(samples_before[rank], samples_after[rank]),
+                physical_growth_bytes = samples_before[rank].free.saturating_sub(samples_after[rank].free),
+                tracked_growth_bytes = samples_after[rank].tracked_device.saturating_sub(samples_before[rank].tracked_device),
                 "MiMo decode graph reserve and measured prewarm arena");
         }
         tracing::info!(graphs = after - before, shapes = rows.len(),
@@ -3353,6 +3362,41 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    fn graph_growth_excludes_separately_owned_device_allocations() {
+        use cuteafd_loader::placement::inventory::GraphMemorySample;
+        let sample = |free, tracked_device| GraphMemorySample {
+            total: 1024, free, tracked_device, tracked_pinned: 0, tracked_managed: 0,
+        };
+        let before = sample(800, 100);
+        for (after, expected) in [
+            (sample(700, 180), 20), // 80 workspace bytes, 20 graph bytes.
+            (sample(720, 180), 0),  // Only the workspace grew.
+            (sample(820, 60), 20),  // Tracked release must not hide graph growth.
+            (sample(820, 100), 0),  // Untracked release is not negative growth.
+            (before, 0),
+        ] {
+            assert_eq!(super::graph_capture_growth(before, after), expected);
+        }
+        // Physical ranks have independent ledgers and capture shares.
+        let peers = [(sample(800, 100), sample(700, 180)),
+            (sample(600, 200), sample(540, 210))];
+        assert_eq!(peers.map(|(before, after)| super::graph_capture_growth(before, after)), [20, 50]);
+    }
+
+    #[test]
+    fn capture_baseline_never_drains_a_partial_peer_step() {
+        let source = include_str!("engine.rs");
+        let sample = source.split_once("fn graph_allocation_samples(").unwrap().1
+            .split_once("fn graph_memory_samples(").unwrap().0;
+        assert!(sample.contains("memory_ledger::snapshot()"));
+        assert!(!sample.contains("cuda_stream_synchronize"));
+        let boundary = source.split_once("fn graph_boundary(").unwrap().1
+            .split_once("fn graph_end_of_step(").unwrap().0;
+        assert!(boundary.contains("self.graph_memory_samples()?"));
+        assert!(boundary.contains("cache_measured(graph_capture_growth(before[rank], after[rank]))"));
+    }
 
     #[test]
     fn startup_tables_never_write_persistent_kv_or_allocate_prefix_pages() {

@@ -95,8 +95,8 @@ mod tests {
     fn checkpoint_geometry_and_onboarding_are_independent_keys() {
         let flash = MimoV2Config::from_hf(&crate::plan::testing::mimo_flash_mopd_config()).unwrap();
         let pro = MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap();
-        assert_eq!(mimo_graph_variant(&flash), "mimof-48");
-        assert_eq!(mimo_graph_variant(&pro), "mimop-70");
+        assert_eq!(mimo_graph_variant(&flash), format!("mimof-{}", flash.layers));
+        assert_eq!(mimo_graph_variant(&pro), format!("mimop-{}", pro.layers));
         for cfg in [&flash, &pro] {
             for ranks in [1, 2] {
                 for sparks in [false, true] {

@@ -138,10 +138,16 @@ mod tests {
 
     #[test]
     fn layouts_charge_one_reserve_per_physical_rank() {
+        let cfg = config();
+        let lead_segments = cfg.layers + MIMO_DECODE_TAIL_HEAD_VARIANTS.len();
         for ranks in [1, 2] {
-            let layout = graph_layout(&config(), ranks, true, true).unwrap();
-            assert_eq!(layout.segments_per_rank[0], 72);
-            assert_eq!(layout.executables_per_rank[0], 72 * layout.rows.len());
+            let layout = graph_layout(&cfg, ranks, true, true).unwrap();
+            assert_eq!(layout.segments_per_rank[0], lead_segments);
+            assert_eq!(layout.executables_per_rank[0], lead_segments * layout.rows.len());
+            if ranks == 2 {
+                assert_eq!(layout.segments_per_rank[1], cfg.layers);
+                assert_eq!(layout.executables_per_rank[1], cfg.layers * layout.rows.len());
+            }
             assert_eq!(layout.reserves.len(), ranks);
             for rank in 0..ranks {
                 assert_eq!(layout.reservations(rank).unwrap()[0].bytes, layout.reserves[rank]);
