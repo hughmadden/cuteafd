@@ -997,8 +997,9 @@ fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe
                 bytes: ByteCurve::fixed(occupied, contract.maximum_pages),
                 kind: ComponentKind::Allowance(Allowance { location: *location, bytes: occupied,
                     lifetime: Lifetime::RESIDENT, assumed: false,
-                    source: format!("Muse context and selected modules: {occupied} B occupied at the \
-                        {free} B free sample of {} B; {source}", budget.physical_bytes) }) });
+                    source: crate::placement::sampled_baseline::source(&format!(
+                        "Muse context and selected modules; {occupied} B occupied at the \
+                        {free} B free sample of {} B; {source}", budget.physical_bytes)) }) });
         }
         // Transfer sampled occupancy to one named owner without changing capacity.
         budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
@@ -1212,13 +1213,13 @@ mod contract_tests {
                     for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
                         let items = plan.items_at(Location::coordinator(rank as u8), phase).unwrap();
                         let owners = items.iter().filter(|item|
-                            item.group.starts_with("Muse context and selected modules:")).collect::<Vec<_>>();
+                            crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
                         assert_eq!(owners.len(), usize::from(sampled > 0));
                         assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), sampled);
                         let breakdown = crate::placement::reserve::breakdown(format!("rtx{rank}"),
                             cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 100 << 20, &items);
                         assert_eq!(breakdown.reserve.iter().filter(|owner|
-                            owner.name == "Muse context and selected modules")
+                            owner.name == "sampled baseline")
                             .map(|owner| owner.bytes).sum::<u64>(), sampled);
                         let id = format!("rtx{rank}");
                         let now = plan.phases.iter().find(|row| row.budget == id && row.phase == phase).unwrap();
@@ -1233,7 +1234,7 @@ mod contract_tests {
             planned_budget(0, 96 << 30, 96 << 30, 0, 674_496_512),
             planned_budget(1, 96 << 30, 96 << 30, 0, 674_496_512)], &recipe).unwrap();
         assert!(!forecast.facts.allowances.iter().any(|owner|
-            owner.source.starts_with("Muse context and selected modules:")));
+            crate::placement::sampled_baseline::is_source(&owner.source)));
         assert!(solve_sampled(request(), vec![
             measured_budget(0, 96 << 30, 96 << 30, 0, (96 << 30) + 1)], &recipe).is_err());
     }

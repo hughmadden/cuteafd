@@ -113,10 +113,10 @@ mod tests {
         occupied: u64) -> cuteafd_loader::placement::Placement {
         for items in &mut placement.items {
             let owners = items.iter().filter(|item|
-                item.group.starts_with("Muse context and selected modules:")).collect::<Vec<_>>();
+                cuteafd_loader::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
             assert_eq!(owners.len(), usize::from(occupied > 0));
             assert_eq!(owners.iter().map(|item| item.bytes).sum::<u64>(), occupied);
-            items.retain(|item| !item.group.starts_with("Muse context and selected modules:"));
+            items.retain(|item| !cuteafd_loader::placement::sampled_baseline::is_source(&item.group));
         }
         placement
     }
@@ -323,6 +323,7 @@ mod tests {
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
                     vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
+            let live = without_sampled_baseline(live, arch.context_bytes);
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
