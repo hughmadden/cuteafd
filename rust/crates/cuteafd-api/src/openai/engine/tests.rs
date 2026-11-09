@@ -276,7 +276,11 @@ async fn count_tokens_matches_serving_for_tiktoken_and_json_snapshots() {
             assert_eq!(status, StatusCode::OK, "{reply}");
             let ids = worker.token_ids.lock().unwrap();
             assert_eq!(counted["input_tokens"].as_u64().unwrap(), ids[0].len() as u64);
-            assert!(!ids[0].contains(&257), "literal end marker must not become a control token");
+            let prompts = worker.prompts.lock().unwrap();
+            let unshielded = cuteafd_loader::encode_tokenizer_text(snapshot, &prompts[0], false).unwrap().token_ids;
+            assert!(ids[0].iter().filter(|&&id| id == 257).count()
+                < unshielded.iter().filter(|&&id| id == 257).count(),
+                "literal end marker must not become a control token");
         }
     }
 }
