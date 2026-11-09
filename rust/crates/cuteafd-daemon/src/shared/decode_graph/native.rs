@@ -10,8 +10,8 @@ use super::device::{Cycle, Estimate, Miss, ReleaseMeasurement, Site};
 // Explicit opt-in: unattached wrappers continue to use the legacy methods.
 macro_rules! cache_methods {
     ($key:ty) => {
-        pub fn attach_device(&mut self, device: i32, reserve: u64, site: Site) -> Result<()> {
-            self.bank.attach_device(device, reserve, site)
+        pub fn attach_device(&mut self, library: &NativeLibrary, device: i32, reserve: u64, site: Site) -> Result<()> {
+            self.bank.attach_device(library, device, reserve, site)
         }
         pub fn cache_cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
         pub fn cache_needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
@@ -292,7 +292,7 @@ mod tests {
     fn capture_ticket_cancels_and_commits_surviving_owner() -> Result<()> {
         use super::super::device::{Basis, Preference};
         let mut bank = GraphBank::<usize, ()>::new(None);
-        bank.attach_device(-8801, 64 << 20, Site { name: "ticket-fixture", cycle: Cycle::Other,
+        bank.attach_device_for_test(-8801, 64 << 20, Site { name: "ticket-fixture", cycle: Cycle::Other,
             preference: Preference::Capture, bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: true })?;
         let ticket = bank.cache_ticket(&1, false, None).expect("capture");
         drop(ticket);
@@ -328,7 +328,7 @@ mod visitor_tests {
         let mut bindings = BindingGraphs::<u16>::new(&library, "fixture")?;
         let banks: [&mut dyn CacheAttached; 4] = [&mut direct, &mut layers, &mut rows, &mut bindings];
         for bank in banks {
-            bank.attach(-8802, 64 << 20, Site { name: "visitor-fixture", cycle: Cycle::Other,
+            bank.attach(&library, -8802, 64 << 20, Site { name: "visitor-fixture", cycle: Cycle::Other,
                 preference: Preference::Capture, bootstrap: 2 << 20, basis: Basis::Bytes,
                 spans_devices: false })?;
             bank.cycle(Cycle::Verify);
@@ -356,7 +356,7 @@ mod clear_tests {
         let site = Site { name: "clear-test", cycle: Cycle::Other, preference: Preference::Capture,
             bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false };
         for bank in [&mut rows as &mut dyn CacheAttached, &mut layers, &mut bindings] {
-            bank.attach(-8804, 64 << 20, site)?;
+            bank.attach(&library, -8804, 64 << 20, site)?;
         }
         let capture = || -> Result<*mut c_void> {
             // SAFETY: fixture records no device work or referenced allocations.

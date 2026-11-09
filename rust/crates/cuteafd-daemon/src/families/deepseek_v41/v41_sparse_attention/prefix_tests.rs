@@ -246,7 +246,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             assert_eq!(batch.backend_key(),2);
             lib.copy_h2d(wave.storage.descriptors.buffer,batch.bytes())?;
             use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-            wave.graphs.attach_device(gpu, 64 << 20, Site { name: "sparse_attention",
+            wave.graphs.attach_device(&lib, gpu, 64 << 20, Site { name: "sparse_attention",
                 cycle: Cycle::Other, preference: Preference::Capture, bootstrap: 2 << 20,
                 basis: Basis::Bytes, spans_devices: false })?;
             let ticket = wave.graphs.cache_ticket(&(0, vec![]), false, None).expect("test reserve fits");

@@ -269,7 +269,24 @@ pub(crate) enum Miss { Capture(u64), Eager }
 pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
 static DEVICES: OnceLock<Mutex<HashMap<i32, SharedCache>>> = OnceLock::new();
 
-pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
+pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
+    reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
+    // Policy fixtures use synthetic ordinals, never valid CUDA device IDs.
+    #[cfg(test)]
+    if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0))) }
+    device_cache_sampled(device, reserve, basis, || memory_sample(library, device))
+}
+
+fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<(u64, u64, u64)> {
+    let (free, total) = crate::shared::memory::device::Device { library, id: device }
+        .run(|| library.cuda_physical_memory_info())?;
+    let tracked = cuteafd_ffi::memory_ledger::snapshot()
+        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    Ok((free as u64, total as u64, tracked))
+}
+
+pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<SharedCache> {
     let mut devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
     if let Some(cache) = devices.get(&device).cloned() {
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).reserve == reserve,
@@ -280,6 +297,10 @@ pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::R
     }
     let mut controller = DeviceCache::new(device, reserve);
     controller.basis = basis;
+    // Seed before the first attached bank can capture. Reattachment must not
+    // consume growth from an earlier bank or overwrite an explicit baseline.
+    let (free, total, tracked) = sample()?;
+    controller.observer.observe(free, total, tracked);
     let cache = Arc::new(Mutex::new(controller));
     devices.insert(device, cache.clone());
     Ok(cache)
@@ -327,13 +348,15 @@ fn existing_cache(device: i32) -> Option<SharedCache> {
 /// Observe once per physical device, even when several banks or lanes completed.
 /// Call only at a completed submission boundary, never within a peer segment.
 pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
+    observe_device_sampled(device, || memory_sample(library, device))
+}
+
+fn observe_device_sampled(device: i32,
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
-    let (free, total) = crate::shared::memory::device::Device { library, id: device }
-        .run(|| library.cuda_physical_memory_info())?;
-    let tracked = cuteafd_ffi::memory_ledger::snapshot()
-        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    let (free, total, tracked) = sample()?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    let growth = cache.observer.observe(free as u64, total as u64, tracked);
+    let growth = cache.observer.observe(free, total, tracked);
     if cache.unmeasured { cache.measured_capture(growth); }
     cache.boundary();
     Ok(())
@@ -1510,6 +1533,74 @@ mod tests {
 #[cfg(test)]
 mod observer_tests {
     use super::*;
+    fn attached(device: i32) -> SharedCache {
+        device_cache_sampled(device, 1000, Basis::Bytes, || Ok((900, 1000, 0))).unwrap()
+    }
+
+    fn pending(cache: &SharedCache) {
+        let mut cache = cache.lock().unwrap();
+        let site = Site { name: "observer-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
+            spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn attachment_measures_capture_before_explicit_observe() {
+        let cache = attached(-99101);
+        pending(&cache);
+        observe_device_sampled(-99101, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn explicit_observe_excludes_eager_first_touch() {
+        let cache = attached(-99102);
+        observe_device_sampled(-99102, || Ok((800, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 0);
+        pending(&cache);
+        observe_device_sampled(-99102, || Ok((775, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn explicit_observe_does_not_double_seed_or_charge() {
+        let cache = attached(-99103);
+        observe_device_sampled(-99103, || Ok((900, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99103, || Ok((875, 1000, 0))).unwrap();
+        observe_device_sampled(-99103, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn repeated_attachment_neither_samples_nor_advances_baseline() {
+        let cache = attached(-99104);
+        pending(&cache);
+        let again = device_cache_sampled(-99104, 1000, Basis::Bytes,
+            || panic!("reattachment must not consume graph growth")).unwrap();
+        assert!(Arc::ptr_eq(&cache, &again));
+        observe_device_sampled(-99104, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+        device_cache_sampled(-99104, 1000, Basis::Bytes,
+            || panic!("reattachment must not reset the explicit baseline")).unwrap();
+        observe_device_sampled(-99104, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn failed_attachment_sample_does_not_publish_cache() {
+        let result = device_cache_sampled(-99105, 1000, Basis::Bytes,
+            || anyhow::bail!("sample unavailable"));
+        assert!(result.is_err());
+        assert!(existing_cache(-99105).is_none());
+        let cache = attached(-99105);
+        pending(&cache);
+        observe_device_sampled(-99105, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
     #[test]
     fn lazy_tracked_workspaces_do_not_become_graph_growth() {
         let mut observer = GrowthObserver::default();

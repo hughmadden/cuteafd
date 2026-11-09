@@ -667,7 +667,7 @@ mod failure_tests {
     fn dspark_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
         let mut bank = GraphBank::<(usize, usize), usize>::new(None);
-        bank.attach_device(-164_401, 200, Site {
+        bank.attach_device_for_test(-164_401, 200, Site {
             name: "dspark_chain", cycle: Cycle::Wave, preference: Preference::Capture,
             bootstrap: 100, basis: Basis::Bytes, spans_devices: false,
         })?;
@@ -692,7 +692,7 @@ mod failure_tests {
     fn dspark_failed_capture_cancels_ticket_and_preserves_eager_fallback() -> Result<()> {
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
         let mut bank = GraphBank::<(usize, usize), usize>::new(None);
-        bank.attach_device(-164_402, 200, Site {
+        bank.attach_device_for_test(-164_402, 200, Site {
             name: "dspark_chain", cycle: Cycle::Other, preference: Preference::Capture,
             bootstrap: 100, basis: Basis::Bytes, spans_devices: true,
         })?;

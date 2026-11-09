@@ -739,7 +739,7 @@ mod window_graph_tests {
         assert_ne!(expect[0], expect[1], "distinct inputs must project differently");
         let storage = weights.storage(4 * rows, rows)?;
         let mut slot = weights.on_storage(storage)?;
-        slot.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+        slot.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 8 << 30,
             crate::shared::decode_graph::device::Site { name,
                 cycle: crate::shared::decode_graph::device::Cycle::Other,
                 preference: crate::shared::decode_graph::device::Preference::Capture,
@@ -909,7 +909,7 @@ mod bounded_graph_oracle {
         let weights = AttentionOutputWeights::load(&library, &catalog, 2,
             AttentionOutputWeights::device_bytes(&library, &catalog, 2)?, 1 << 20)?;
         let mut wave = weights.wave(16, usize::MAX)?;
-        wave.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 256 << 20,
+        wave.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 256 << 20,
             Site { name, cycle: Cycle::Wave, preference: Preference::Capture, bootstrap: 2 << 20,
                 basis: Basis::Bytes, spans_devices: spans }))?;
         for rows in [1, 16] {

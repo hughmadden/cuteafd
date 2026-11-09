@@ -90,13 +90,12 @@ fn site_name(name: &'static str) -> &'static str {
 pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
-    let _ = library;
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
     visit(&mut |device, name, spans, bank| {
         let reserve = cuteafd_loader::placement::graph_reserve::current(device as usize,
             false, base, extra).map_err(anyhow::Error::msg)?.bytes;
-        bank.attach(device, reserve, Site { name: site_name(name), cycle: Cycle::Other,
+        bank.attach(library, device, reserve, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: extra, basis: Basis::Bytes,
             spans_devices: spans || ranks > 1 })
     })

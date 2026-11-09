@@ -474,7 +474,7 @@ mod tests {
         let mut rank = Rank::new(&lib, &weights, 1, Fp8Head::All)?;
         use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
         // Capture now requires admission, just like the serving-reachable bank.
-        rank.graphs[0].attach_device(-8814, 64 << 20, Site {
+        rank.graphs[0].attach_device(&lib, -8814, 64 << 20, Site {
             name: "v41-vocabulary-error-fixture", cycle: Cycle::Other,
             preference: Preference::Capture, bootstrap: 2 << 20,
             basis: Basis::Bytes, spans_devices: false,

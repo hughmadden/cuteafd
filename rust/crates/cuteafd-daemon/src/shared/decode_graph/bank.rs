@@ -152,9 +152,20 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             frozen: None, retired: Vec::new(), device: None }
     }
 
-    pub fn attach_device(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+    pub fn attach_device(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
-        let cache = super::device::device_cache(device, reserve, site.basis)?;
+        let cache = super::device::device_cache(library, device, reserve, site.basis)?;
+        let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_device_for_test(&mut self, device: i32, reserve: u64,
+        site: super::device::Site) -> anyhow::Result<()> {
+        anyhow::ensure!(device < 0, "policy fixtures require a synthetic device");
+        anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
+        let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0)))?;
         let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
         self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new() });
         Ok(())
@@ -821,7 +832,7 @@ mod device_tests {
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
         let mut bank = GraphBank::new(None);
-        bank.attach_device(-301, 20, site()).unwrap();
+        bank.attach_device_for_test(-301, 20, site()).unwrap();
         let Miss::Capture(id) = bank.cache_miss(&1, false, None) else { panic!() };
         bank.cache_insert(1, Exec(drops.clone()), id, false);
         bank.cache_measured(10);
@@ -843,7 +854,7 @@ mod device_tests {
         impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
         let drops = Rc::new(Cell::new(0));
         let mut bank = GraphBank::new(None);
-        bank.attach_device(-318, 20, site()).unwrap();
+        bank.attach_device_for_test(-318, 20, site()).unwrap();
         let ticket = bank.cache_ticket(&1, false, None).unwrap();
         bank.cache_commit(1, Exec(drops.clone()), ticket, 1, 1, false);
         bank.cache_measured(10);
@@ -862,7 +873,7 @@ mod device_tests {
     #[test]
     fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
         let mut bank = GraphBank::new(None);
-        bank.attach_device(-303, 100, site()).unwrap();
+        bank.attach_device_for_test(-303, 100, site()).unwrap();
         for (key, pinned) in [(1, true), (2, false)] {
             let Miss::Capture(id) = bank.cache_miss(&key, pinned, None) else { panic!() };
             bank.cache_insert(key, key, id, pinned);
@@ -904,7 +915,7 @@ mod device_tests {
             }
         }
         let mut bank: GraphBank<Key, u32> = GraphBank::new(None);
-        bank.attach_device(-304, 100, Site { preference: Preference::Eager, ..site() }).unwrap();
+        bank.attach_device_for_test(-304, 100, Site { preference: Preference::Eager, ..site() }).unwrap();
         assert!(matches!(bank.cache_miss(&Key(1), false, None), Miss::Eager));
         assert!(matches!(bank.cache_miss(&Key(2), false, None), Miss::Eager));
         let first = bank.cache_keys[&Key(1)].clone();
@@ -923,7 +934,7 @@ mod device_tests {
     #[test]
     fn transient_interned_keys_are_pruned_at_boundary() {
         let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
-        bank.attach_device(-305, 1, site()).unwrap();
+        bank.attach_device_for_test(-305, 1, site()).unwrap();
         assert!(matches!(bank.cache_miss(&1, false, None), Miss::Eager));
         assert_eq!(bank.cache_keys.len(), 1);
         bank.cache_tick();
@@ -935,7 +946,7 @@ mod device_tests {
     fn cache_replay_nanoseconds() {
         use std::{hint::black_box, time::Instant};
         let mut bank = GraphBank::new(None);
-        bank.attach_device(-302, 1 << 20, site()).unwrap();
+        bank.attach_device_for_test(-302, 1 << 20, site()).unwrap();
         for key in [1, 2] {
             let Miss::Capture(id) = bank.cache_miss(&key, key == 1, None) else { panic!() };
             bank.cache_insert(key, key, id, key == 1); bank.cache_measured(10);
@@ -956,8 +967,8 @@ mod device_tests {
 }
 
 impl<K: Hash + Eq + Clone + std::fmt::Debug, E> super::CacheAttached for GraphBank<K, E> {
-    fn attach(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
-        self.attach_device(device, reserve, site)
+    fn attach(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+        self.attach_device(library, device, reserve, site)
     }
     fn cycle(&mut self, cycle: super::device::Cycle) { self.cache_cycle(cycle); }
     fn needs_boundary(&self) -> bool { self.cache_needs_boundary() }

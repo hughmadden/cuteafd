@@ -1143,7 +1143,7 @@ mod cold_capture_tests {
             let lease = state.begin_request(0, 1)?;
             let chunks = [WindowChunk { lease, position: 0, tokens: 2 }];
             let mut wave = weights.wave(2, usize::MAX)?;
-            wave.graphs.attach(0, 256 << 20, Site {
+            wave.graphs.attach(&library, 0, 256 << 20, Site {
                 name: if admitted { "Window.cold.admitted" } else { "Window.cold.denied" },
                 cycle: Cycle::Prefill, preference: Preference::Capture,
                 bootstrap: if admitted { 2 << 20 } else { 1 << 30 },

@@ -13,8 +13,8 @@ pub(crate) struct BindingGraphs<'a, K> {
 }
 
 impl<'a, K: Hash + Eq + Clone + std::fmt::Debug> BindingGraphs<'a, K> {
-    pub fn attach_device(&mut self, reserve: u64, site: super::device::Site) -> Result<()> {
-        self.bank.attach_device(self.device, reserve, site)
+    pub fn attach_device(&mut self, library: &NativeLibrary, reserve: u64, site: super::device::Site) -> Result<()> {
+        self.bank.attach_device(library, self.device, reserve, site)
     }
     pub fn cache_cycle(&mut self, cycle: super::device::Cycle) { self.bank.cache_cycle(cycle); }
     pub fn cache_needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }

@@ -1195,7 +1195,7 @@ mod graph_tests {
         let query = IndexQueryGeometry { layer: 2, packed: buffer(0x1000, 2048),
             scales: buffer(0x2000, 128), head_weights: buffer(0x3000, 64) };
         let mut bank = GraphBank::<Vec<usize>, ()>::new(None);
-        bank.attach_device(-164_402, 48, Site { name: "index_selection", cycle: Cycle::Decode,
+        bank.attach_device_for_test(-164_402, 48, Site { name: "index_selection", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
         let key = |length: usize| selection_fingerprint(&query, &[], None, 1,
             length.div_ceil(tile_width(length, DECODE_WIDTH_BUCKET)).max(1),

@@ -608,7 +608,7 @@ mod reuse_tests {
             .collect::<Result<Vec<_>>>()?;
         let budget = IndexQueryWave::device_bytes(&library, 4096)?;
         let mut reused = weights[0].wave(4096, budget)?;
-        reused.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+        reused.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 8 << 30,
             crate::shared::decode_graph::device::Site { name,
                 cycle: crate::shared::decode_graph::device::Cycle::Other,
                 preference: crate::shared::decode_graph::device::Preference::Capture,

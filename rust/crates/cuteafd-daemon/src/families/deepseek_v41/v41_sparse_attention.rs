@@ -1061,7 +1061,7 @@ mod bounded_cache_tests {
     #[test]
     fn sparse_full_reserve_miss_runs_eager_without_refusal() -> Result<()> {
         let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
-        bank.attach_device(-164_411, 200, site(false))?;
+        bank.attach_device_for_test(-164_411, 200, site(false))?;
         let hot = (0, vec![1]);
         let cold = (0, vec![7]);
         let ticket = bank.cache_ticket(&hot, true, None).expect("initial capture fits");
@@ -1082,7 +1082,7 @@ mod bounded_cache_tests {
     #[test]
     fn sparse_failed_capture_cancels_ticket() -> Result<()> {
         let mut bank = GraphBank::<(usize, Vec<usize>), usize>::new(None);
-        bank.attach_device(-164_412, 200, site(true))?;
+        bank.attach_device_for_test(-164_412, 200, site(true))?;
         let key = (0, vec![7]);
         let ticket = bank.cache_ticket(&key, false, None).expect("initial capture fits");
         let capture = || -> Result<()> { let _ticket = ticket; anyhow::bail!("capture failed") };

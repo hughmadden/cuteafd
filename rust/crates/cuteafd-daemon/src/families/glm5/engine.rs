@@ -1638,7 +1638,7 @@ impl<'a> GlmEngine<'a> {
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
             let device = self.on(rank, || self.library.cuda_get_device())?;
-            graphs.borrow_mut().attach_device(device, reserves[rank], Site {
+            graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
                 name: "glm5.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
                 basis: self.graph_basis(),

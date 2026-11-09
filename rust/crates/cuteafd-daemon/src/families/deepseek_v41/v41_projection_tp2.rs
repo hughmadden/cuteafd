@@ -421,7 +421,7 @@ mod tests {
             let mut lanes=[Wave::new(banks,capacity,0,Wave::device_bytes(&lib,kind,capacity,0)?)?,
                 Wave::new(banks,capacity,1,Wave::device_bytes(&lib,kind,capacity,1)?)?];
             for lane in &mut lanes {
-                lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+                lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&lib, device, 8 << 30,
                     crate::shared::decode_graph::device::Site { name,
                         cycle: crate::shared::decode_graph::device::Cycle::Other,
                         preference: crate::shared::decode_graph::device::Preference::Capture,

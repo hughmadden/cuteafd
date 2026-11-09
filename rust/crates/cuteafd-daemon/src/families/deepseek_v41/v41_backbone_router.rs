@@ -249,7 +249,7 @@ mod reuse_tests {
             .collect::<Result<Vec<_>>>()?;
         for rows in [1, 16, 80, 256] {
             let mut lane = weights[0].wave(rows, BackboneRouterWave::device_bytes(rows)?)?;
-            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 8 << 30,
                 crate::shared::decode_graph::device::Site { name,
                     cycle: crate::shared::decode_graph::device::Cycle::Other,
                     preference: crate::shared::decode_graph::device::Preference::Capture,
@@ -325,7 +325,7 @@ mod reuse_tests {
                 (0..40).collect()
             };
             let mut lane = weights[0].wave(rows, BackboneRouterWave::device_bytes(rows)?)?;
-            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+            lane.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 8 << 30,
                 crate::shared::decode_graph::device::Site { name,
                     cycle: crate::shared::decode_graph::device::Cycle::Other,
                     preference: crate::shared::decode_graph::device::Preference::Capture,
@@ -1138,7 +1138,7 @@ mod expert_usage_tests {
             let weights = BackboneRouterWeights::load(&library, &catalog, layer, usize::MAX, 1 << 20)?;
             let capacity = 2768;
             let mut wave = weights.wave(capacity, usize::MAX)?;
-            wave.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(device, 8 << 30,
+            wave.visit_graph_banks(&mut |device, name, spans, bank| bank.attach(&library, device, 8 << 30,
                 crate::shared::decode_graph::device::Site { name,
                     cycle: crate::shared::decode_graph::device::Cycle::Other,
                     preference: crate::shared::decode_graph::device::Preference::Capture,

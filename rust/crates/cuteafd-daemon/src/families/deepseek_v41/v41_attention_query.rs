@@ -964,8 +964,8 @@ mod bounded_graph_tests {
         let weights = ();
         let mut layers = LayerGraphs::new(&library, 64, "deepseek_v41");
         let mut rows = RowGraphs::new(&library, "engram", 64, "deepseek_v41");
-        layers.attach_device(-88441, 20, site)?;
-        rows.attach_device(-88441, 20, site)?;
+        layers.attach_device(&library, -88441, 20, site)?;
+        rows.attach_device(&library, -88441, 20, site)?;
         let ticket = layers.cache_ticket(&(0, 1), true, None).expect("pinned seed fits");
         // SAFETY: the CPU fixture records no device work. Weights outlive the
         // fake executable and every consumer completes before bank destruction.
