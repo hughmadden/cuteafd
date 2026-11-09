@@ -420,7 +420,7 @@ fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
     let (cfg, weights, buffers, arena) = fixture();
     let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
     let items = plan.reservation_items_at(Location::coordinator(0), Phase::Growth).unwrap();
-    let breakdown = crate::placement::reserve::breakdown("rtx0".into(),
+    let breakdown = crate::placement::reserve::breakdown("rtx0",
         cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, &items);
     let graphs = breakdown.reserve.iter().filter(|row| row.name.contains("graph")).collect::<Vec<_>>();
     assert_eq!(graphs.len(), 1);
