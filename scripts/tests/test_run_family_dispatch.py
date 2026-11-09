@@ -1716,18 +1716,19 @@ def _coordinator_launches(stderr: str) -> list[list[str]]:
         if not line.startswith("docker run -d "):
             continue
         tokens = shlex.split(line)
-        if any(command == "cuteafd" and re.fullmatch(r"serve-[a-z0-9-]+", argument)
-               for command, argument in zip(tokens, tokens[1:])):
+        if "cuteafd" in tokens and any(re.fullmatch(r"serve-[a-z0-9-]+", argument)
+                                      for argument in tokens[tokens.index("cuteafd") + 1:]):
             launches.append(tokens)
     return launches
 
 
 @pytest.mark.parametrize("path", ["/builds/graph-reserve-extra", "/builds/serve-fixture with spaces"])
-def test_coordinator_launch_matching_ignores_serve_in_worker_paths(path):
+@pytest.mark.parametrize("command", ["serve-dsv4", "--vision off --audio off serve-native"])
+def test_coordinator_launch_matching_ignores_serve_in_worker_paths(path, command):
     worker = (f'ssh worker-0 docker run -d -e HF_HOME={shlex.quote(path)} '
               'image cuteafd expertd-native --rank 0')
     local_worker = f'docker run -d -e HF_HOME={shlex.quote(path)} image cuteafd expertd-native'
-    coordinator = f'docker run -d -v {shlex.quote(path + ":/hf")} image cuteafd serve-dsv4 --listen 127.0.0.1:1'
+    coordinator = f'docker run -d -v {shlex.quote(path + ":/hf")} image cuteafd {command} --listen 127.0.0.1:1'
     assert _coordinator_launches("\n".join([worker, local_worker, coordinator])) == [shlex.split(coordinator)]
     assert not _coordinator_launches(worker + "\n" + local_worker)
 
