@@ -32,6 +32,47 @@ fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a Nat
 }
 
 #[test]
+fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
+    let (cfg, weights, buffers, arena) = fixture();
+    let occupied = 682_885_120;
+    for logical in [96 << 30, 80 << 30] {
+        for sampled in [0, occupied] {
+            let input = facts(&cfg, &weights, &buffers, &arena);
+            let live = sampled_budgets((96 << 30) - sampled, 96 << 30, Some(logical),
+                (128 << 30, 128 << 30)).unwrap();
+            let previous = solve(request(), live.clone(), &input).unwrap();
+            let plan = admit(request(), live, input).unwrap();
+            assert_eq!(plan.pool_tokens, previous.pool_tokens);
+            assert_eq!(plan.decisions, previous.decisions);
+            assert_eq!(plan.budgets[0].logical_bytes, logical);
+            assert!(matches!(plan.budgets[0].baseline, Baseline::Forecast { occupied: 0, .. }));
+            assert_eq!(plan.budgets[1], previous.budgets[1], "host sample is not moved");
+            for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                let items = plan.items_at(Location::coordinator(0), phase).unwrap();
+                let owners = items.iter().filter(|item|
+                    item.group.starts_with("Dense Qwen context and selected modules:")).collect::<Vec<_>>();
+                assert_eq!(owners.len(), usize::from(sampled > 0));
+                assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), sampled);
+                let breakdown = crate::placement::reserve::breakdown("rtx0",
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30,
+                    plan.budgets[0].headroom, &items);
+                assert_eq!(breakdown.reserve.iter().filter(|owner|
+                    owner.name == "Dense Qwen context and selected modules")
+                    .map(|owner| owner.bytes).sum::<u64>(), sampled);
+                let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                assert_eq!(now.available - now.owned, before.available - before.owned);
+            }
+        }
+    }
+    let offline = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    assert!(!offline.facts.allowances.iter().any(|owner|
+        owner.source.starts_with("Dense Qwen context and selected modules:")));
+    assert!(sampled_budgets((96 << 30) + 1, 96 << 30, None,
+        (128 << 30, 128 << 30)).is_err());
+}
+
+#[test]
 fn blas_heads_share_one_pool_only_for_genuine_bf16_drafts() {
     let (cfg, weights, buffers, arena) = fixture();
     for head in [serving::BlasHead::Native, serving::BlasHead::TensorLt, serving::BlasHead::Gemm] {
