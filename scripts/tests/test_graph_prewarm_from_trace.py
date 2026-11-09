@@ -299,7 +299,9 @@ def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     assert result["family"] == "glm5_flash"
     assert result["measured_bytes"] == 16 << 20
     assert result["measured_executables"] == 4
-    assert result["reserve_extra_bytes"] == 4 << 20
+    # The pinned shape holds two of the four demanded graphs (8 MiB); the
+    # headroom is the rest of the request demand the lazy captures need.
+    assert result["reserve_extra_bytes"] == 8 << 20
     # 99% coverage keeps the two hot shapes (190 and 30 hits); only the peak is pinned.
     assert result["entries"] == [
         {"rows": 4, "spec": False, "long": False, "pool_width": 0,

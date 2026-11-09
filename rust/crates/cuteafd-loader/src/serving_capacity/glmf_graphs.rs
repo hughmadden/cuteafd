@@ -60,11 +60,15 @@ impl GlmfPrewarmEntry {
     }
 }
 
-/// The provisional set is the former startup capture set (`300` shapes at a
-/// 1M context, `13,800` executables on one RTX PRO 6000), and its price is the
-/// measured arena of exactly that capture (#1636: 2,313,158,656 B / 13,800
-/// graphs, HQA `e0ecc3d5`, min config `glm53f-exl3-k4-core-k6-min`). Pinning
-/// is explicit, never inferred from order; a trace replaces the set.
+/// The prewarm set a device graph trace of the min config chose: the request
+/// demand's shapes (8 of 9, 99.9% of decode/verify graph events), one pinned
+/// to run in the startup prewarm, and the arena both sides need priced at the
+/// measured 175,691 B/graph. Provenance: standard card (`glmf-k6-min-full`,
+/// 1 RTX PRO 6000 + 2 Sparks, 1M context, full KV cap), C1/2/4/8/16 x 128
+/// adaptive drafts, live arena 2,315,255,808 B / 13,178 graphs (13,800
+/// captures, 622 refused at the provisional reserve's tail and run eagerly,
+/// 0 evictions). Pinning is explicit, never inferred from order; a trace
+/// replaces the set.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmList {
@@ -232,17 +236,23 @@ mod tests {
     /// set at the reference launch (300 shapes x 46 executable keys), and its
     /// reserve is the measured arena #1636 recorded for that capture.
     #[test]
-    fn provisional_prewarm_covers_the_reference_startup_set_and_its_measured_price() {
+    fn traced_prewarm_holds_the_pinned_shape_and_prices_the_traced_demand() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
         assert_eq!(shapes.len(), 300);
-        assert_eq!(glmf_prewarm_shapes(1_048_576, 2_097_152, 2051, 16, true, &buckets), shapes);
+        // The list pins one shape of the trace's demand, not the launch's whole set.
+        let warm = glmf_prewarm_shapes(1_048_576, 2_097_152, 2051, 16, true, &buckets);
+        assert_eq!(warm.len(), 1);
+        assert!(shapes.contains(&warm[0]));
         let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, 64, 188);
-        assert_eq!(plan.shapes.len(), 300);
-        assert_eq!(plan.reserves, [2_313_158_656]);
-        assert_eq!(plan.executables, [13_800]);
-        assert_eq!(plan.extra, 0);
-        assert_eq!(plan.bootstraps, [167_621]);
+        assert_eq!(plan.shapes, warm);
+        // The pinned set's share (46 graphs) is the base; the rest of the traced
+        // demand (414 graphs less those 46) is the capture headroom.
+        assert_eq!(plan.reserves, [8_388_608]);
+        assert_eq!(plan.executables, [46]);
+        assert_eq!(plan.extra, 65_011_712);
+        assert_eq!(plan.reserves[0] + plan.extra, 73_400_320);
+        assert_eq!(plan.bootstraps, [175_691]);
         assert_eq!(verify_budget(128, 170), 127);
         assert_eq!(verify_budget(128, 132), 99);
     }
@@ -252,24 +262,28 @@ mod tests {
         let list = glmf_prewarm_list();
         assert_eq!(list.schema_version, 1);
         assert_eq!(list.family, "glm5_flash");
-        assert_eq!(list.executable_bytes(), 167_621);
-        assert_eq!(list.reserve_extra_bytes, 0);
+        assert_eq!(list.executable_bytes(), 175_691);
+        assert_eq!(list.reserve_extra_bytes, 65_011_712);
         let mut identities = HashSet::new();
         for entry in &list.entries {
             assert!(identities.insert(entry.shape()), "duplicate prewarm geometry");
-            assert!(entry.pin, "the provisional set is pinned; a trace chooses pins");
         }
-        // A small context uses the geometries it has, never one it cannot key.
+        assert_eq!(list.entries.iter().filter(|entry| entry.pin).count(), 1,
+            "a trace chooses pins; the rest capture on first use");
+        // A launch that cannot key the pinned shape warms nothing, never a shape
+        // outside its own set: the list's pin is a speculation shape.
         let buckets = DecodeBuckets::new(64);
-        let small = glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets);
-        assert!(!small.is_empty());
-        for shape in &small {
-            assert!(serving_graph_shapes(65_536, 65_536 / PAGE_ROWS, 2051, 4, false, &buckets).contains(shape));
-            assert!(!shape.1, "no speculation shapes without speculation");
-        }
+        assert!(glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets).is_empty());
+        assert_eq!(glmf_prewarm_shapes(65_536, 65_536, 2051, 16, true, &buckets).len(), 1);
         let plan = glmf_graph_reserve(65_536, 65_536, 2051, 4, false, 45, 2, 64, 188);
+        assert_eq!(plan.executables, [0, 0]);
+        // Rank 0 also captures its head segment; chunk rounding can hide the
+        // 46-vs-45 difference in the packed counts.
+        let buckets = DecodeBuckets::new(verify_budget(64, 188));
+        let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 2, 64, 188);
+        assert_eq!(plan.executables, [46, 45]);
         assert_eq!(plan.reserves.len(), 2);
-        assert!(plan.reserves[0] > plan.reserves[1], "rank 0 captures its head segment");
+        assert!(plan.reserves[0] >= plan.reserves[1]);
     }
 }
 

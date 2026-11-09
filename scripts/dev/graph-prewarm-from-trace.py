@@ -189,22 +189,24 @@ def glmf_identity(shape):
 
 def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
     """A GLM Flash startup list: shapes by request frequency, the measured
-    arena of one device with the executables it held, and one capture of
-    headroom. Startup prewarm itself runs as Other, never as request demand."""
+    arena of one device with the executables it held, and capture headroom
+    sized from the same trace's request demand. Startup prewarm itself runs
+    as Other, never as request demand."""
     if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
         raise ValueError("coverage and pin frequency must be in (0, 1]")
     counts = {}
     arenas = []
-    largest = 0
+    nodes = {}
     for trace in traces:
         if trace.get("schema_version") != 1:
             raise ValueError("expected GRAPH_TRACE schema_version=1")
         matching = [graph for graph in trace["graphs"] if graph["site"].startswith("glm5_flash.")]
-        arenas.append((int(trace["cache"]["charged"]), len(matching)))
-        for site, values in trace.get("sites", {}).items():
-            if site.startswith("glm5_flash."):
-                largest = max(largest, int(values["largest_bytes"]))
+        # The arena held `live_execs` executables; trace rows also include keys
+        # whose capture was refused (they ran eagerly), which the arena never held.
+        held = int(trace["cache"].get("pools", {}).get("live_execs") or 0)
+        arenas.append((int(trace["cache"]["charged"]), held or len(matching)))
         device_counts = {}
+        device_nodes = {}
         for graph in matching:
             key = glmf_identity(graph["shape"])
             cycles = graph.get("cycles")
@@ -212,8 +214,11 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
                 if cycles is not None else int(graph["count"])
             if count > 0:
                 device_counts[key] = device_counts.get(key, 0) + count
+                device_nodes[graph["shape"]] = key
         for key, count in device_counts.items():
             counts[key] = max(counts.get(key, 0), count)
+        for shape, key in device_nodes.items():
+            nodes[shape] = key
     if not counts:
         raise ValueError("trace contains no matching graph identities")
     ranked = sorted(counts, key=lambda key: (-counts[key], key))
@@ -226,18 +231,22 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
         if covered >= total * coverage:
             break
     peak = max(counts.values())
+    pinned = {key for key in selected if counts[key] >= peak * pin_frequency}
     entries = [{"rows": key[0], "spec": key[1], "long": key[2], "pool_width": key[3],
-                "page_stride": key[4], "pool_stride": key[5],
-                "pin": counts[key] >= peak * pin_frequency}
+                "page_stride": key[4], "pool_stride": key[5], "pin": key in pinned}
                for key in sorted(selected)]
     charged, executables = max(arenas)
     if charged <= 0 or executables <= 0:
         raise ValueError("trace has no measured GLM Flash arena")
-    # One largest measured capture is the explicit capture-before-reuse
-    # headroom; the arena base already carries the prewarm set.
+    demanded = len(nodes)
+    held_pinned = sum(1 for key in nodes.values() if key in pinned)
+    # The launch's request demand is the arena its lazy captures need; the
+    # pinned shapes already hold their share of it in the reserve base.
+    demand = -(-charged * demanded // executables)
+    base = -(-charged * held_pinned // executables)
     return {"schema_version": 1, "family": "glm5_flash",
             "measured_bytes": charged, "measured_executables": executables,
-            "reserve_extra_bytes": packed(largest), "entries": entries}
+            "reserve_extra_bytes": packed(demand) - packed(base), "entries": entries}
 
 
 def main():
