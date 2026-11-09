@@ -9,14 +9,17 @@ Examples:
   python3 scripts/dev/graph-prewarm-from-trace.py --family glm5 \
     --trace trace.device-0.json --output prewarm.json
   python3 scripts/dev/graph-prewarm-from-trace.py --family glm5_flash \
-    --trace min=trace-min.json --trace max=trace-max.json --output prewarm.json
+    --trace 1-sparks=trace-1-sparks.json --trace 2=trace-2.json \
+    --trace 2-sparks=trace-2-sparks.json --output prewarm.json
 
 Input is the versioned GRAPH_TRACE JSON snapshot, not arbitrary log text.
 Frequencies are aggregated by geometry, not bank id or layer. Pin candidates
 must have both dominant frequency and the lowest row/table parameter rank.
 Reserve suggestions use the maximum per-device arena, never a sum of ranks.
-GLM Flash keys its list by card layout: each layout's own capture demand prices
-its own reserve, and a launch reads only its layout's entry.
+GLM Flash keys its list by resolved card shape, `<devices>[-sparks]`: onboarding
+and TP2 each add captured segments, so each shape's own capture demand prices
+its own reserve and a launch reads only its own entry. A shape with no trace
+warms the engine's bootstrap set, never another shape's list.
 """
 import argparse
 import json
@@ -24,7 +27,7 @@ import re
 from pathlib import Path
 
 CHUNK = 2 << 20
-GLM5_FLASH_LAYOUTS = {"min", "max"}
+GLM5_FLASH_LAYOUTS = {"1", "1-sparks", "2", "2-sparks"}
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
 SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
@@ -264,24 +267,24 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
 
 def layout_groups(specs, family):
     """Group `--trace` arguments by layout: `LAYOUT=PATH` for GLM Flash, a bare
-    path (the one layout) for GLM. GLM Flash requires every supported layout,
-    so a launch can never read a layout the file does not price."""
+    path (the one layout) for GLM. A GLM Flash key names a resolved card shape,
+    `<devices>[-sparks]`; a shape left out warms the engine's bootstrap set, so
+    a trace is required only for the shapes this run measured."""
     groups = {}
     for spec in specs:
         layout, path = spec.split("=", 1) if "=" in spec else ("min", spec)
         if family != "glm5_flash" and layout != "min":
             raise ValueError(f"{family} has one layout, not {layout!r}")
         if family == "glm5_flash" and layout not in GLM5_FLASH_LAYOUTS:
-            raise ValueError(f"unknown GLM Flash layout {layout!r}; expected {sorted(GLM5_FLASH_LAYOUTS)}")
+            raise ValueError(f"unknown GLM Flash layout {layout!r}; expected one of {sorted(GLM5_FLASH_LAYOUTS)}")
         groups.setdefault(layout, []).append(Path(path))
-    if family == "glm5_flash" and set(groups) != GLM5_FLASH_LAYOUTS:
-        raise ValueError(f"GLM Flash needs every layout {sorted(GLM5_FLASH_LAYOUTS)}")
     return groups
 
 
 def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
-    """The checked-in document: one entry per layout, each priced from its own
-    traces. A layout's shapes, pins and arena describe that layout's traffic."""
+    """The checked-in document: one entry per traced shape, each priced from its
+    own traces. A shape's pins and arena describe that shape's traffic; absent
+    keys fall back to the engine's bootstrap set."""
     layouts = {name: generate([json.loads(path.read_text()) for path in paths],
                               family, coverage, pin_frequency, pin_report, layout)
                for name, paths in sorted(groups.items())}
@@ -290,7 +293,7 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
     for values in layouts.values():
         for key in ("schema_version", "family"):
             values.pop(key)
-    return {"schema_version": 2, "family": family, "layouts": layouts}
+    return {"schema_version": 3, "family": family, "layouts": layouts}
 
 
 def main():

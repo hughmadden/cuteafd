@@ -357,28 +357,32 @@ def flash_trace_path(tmp_path, name, charged):
     return path
 
 
-def test_flash_layouts_are_priced_separately(tmp_path):
-    min_path = flash_trace_path(tmp_path, "min.json", 16 << 20)
-    max_path = flash_trace_path(tmp_path, "max.json", 32 << 20)
-    groups = MODULE.layout_groups([f"min={min_path}", f"max={max_path}"], "glm5_flash")
+def test_flash_shapes_are_priced_separately_by_resolved_shape(tmp_path):
+    one = flash_trace_path(tmp_path, "one.json", 16 << 20)
+    two = flash_trace_path(tmp_path, "two.json", 32 << 20)
+    groups = MODULE.layout_groups([f"1-sparks={one}", f"2={two}"], "glm5_flash")
     result = MODULE.generate_layouts(groups, "glm5_flash")
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     assert result["family"] == "glm5_flash"
-    assert set(result["layouts"]) == {"min", "max"}
-    assert result["layouts"]["min"]["measured_bytes"] == 16 << 20
-    assert result["layouts"]["max"]["measured_bytes"] == 32 << 20
-    # A layout entry carries only its own trace's prices, never the document's
-    # schema or another layout's shapes.
-    assert "schema_version" not in result["layouts"]["min"]
-    assert result["layouts"]["min"]["entries"] == result["layouts"]["max"]["entries"]
+    assert set(result["layouts"]) == {"1-sparks", "2"}
+    assert result["layouts"]["1-sparks"]["measured_bytes"] == 16 << 20
+    assert result["layouts"]["2"]["measured_bytes"] == 32 << 20
+    # A shape entry carries only its own trace's prices, never the document's
+    # schema or another shape's arena.
+    assert "schema_version" not in result["layouts"]["1-sparks"]
+    assert result["layouts"]["1-sparks"]["entries"] == result["layouts"]["2"]["entries"]
 
 
-def test_flash_requires_every_card_layout_and_no_others(tmp_path):
+def test_flash_accepts_a_subset_of_traced_shapes_and_no_unknown_keys(tmp_path):
     path = flash_trace_path(tmp_path, "trace.json", 16 << 20)
-    with pytest.raises(ValueError, match="every layout"):
+    # An untraced shape falls back to the engine's bootstrap set, so a partial
+    # document is valid; an unknown key is still refused.
+    groups = MODULE.layout_groups([f"2-sparks={path}"], "glm5_flash")
+    assert set(MODULE.generate_layouts(groups, "glm5_flash")["layouts"]) == {"2-sparks"}
+    with pytest.raises(ValueError, match="unknown GLM Flash layout"):
         MODULE.layout_groups([f"min={path}"], "glm5_flash")
     with pytest.raises(ValueError, match="unknown GLM Flash layout"):
-        MODULE.layout_groups([f"min={path}", f"max={path}", f"mid={path}"], "glm5_flash")
+        MODULE.layout_groups([f"1-sparks={path}", f"mid={path}"], "glm5_flash")
 
 
 def test_single_layout_families_keep_the_flat_document(tmp_path):

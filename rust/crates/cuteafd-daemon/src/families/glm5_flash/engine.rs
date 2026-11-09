@@ -1521,7 +1521,7 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_prewarm_shapes, glmf_prewarm_list};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_pinned, glmf_prewarm_shapes};
 #[allow(unused_imports)]
 use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
@@ -1817,7 +1817,7 @@ impl<'a> GlmfEngine<'a> {
         check_decode_thresholds(&self.buckets, sequences, speculation)?;
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
-        let layout = GlmfLayout::for_gpus(self.ranks());
+        let layout = self.graph_layout();
         let shapes = glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
             sequences.min(self.decode_rows), speculation, &self.buckets, layout);
         ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
@@ -1851,7 +1851,7 @@ impl<'a> GlmfEngine<'a> {
         self.graphs_warmed.set(true);
         let after = self.graph_memory_samples()?;
         let held: usize = (0..self.ranks()).map(|rank| self.graphs_of(rank).borrow().len()).sum();
-        tracing::info!(graphs = held, layout = layout.name(),
+        tracing::info!(graphs = held, layout = %layout,
             free = ?(0..self.ranks()).map(|rank| (before[rank].free, after[rank].free)).collect::<Vec<_>>(),
             shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM Flash decode graphs warmed at startup");
@@ -1881,13 +1881,19 @@ impl<'a> GlmfEngine<'a> {
         crate::shared::decode_graph::device::Basis::Bytes
     }
 
+    /// The resolved graph layout this launch serves under: its coordinator
+    /// device count, and whether Sparks are attached.
+    fn graph_layout(&self) -> GlmfLayout {
+        GlmfLayout::resolved(self.ranks(), self.peer.is_some())
+    }
+
     /// Whether this launch's layout's checked-in prewarm list pins this shape:
-    /// only what that layout's trace shows is always hot.
+    /// only what that layout's trace shows is always hot (or, for a layout with
+    /// no trace, its bootstrap set).
     fn graph_pinned(&self, key: &GraphKey) -> bool {
-        glmf_prewarm_list().layout(GlmfLayout::for_gpus(self.ranks())).entries.iter().any(|entry| entry.pin
-            && entry.rows == key.rows && entry.spec == key.spec && entry.long == key.long
-            && entry.pool_width == key.pool_width && entry.page_stride == key.page_stride
-            && entry.pool_stride == key.pool_stride)
+        let shape = (key.rows, key.spec, GraphGeometry { pool_width: key.pool_width,
+            page_stride: key.page_stride, pool_stride: key.pool_stride, long: key.long });
+        glmf_pinned(self.graph_layout(), &shape)
     }
 
     /// Every rank's launches for the completed step are queued: observe the
@@ -5938,8 +5944,8 @@ mod prefill_lane_tests {
                     }
                 }
             }
-            let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
-            let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
+            let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
+            let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188, true);
             // Startup prewarms every traced shape this context admits; the long
             // geometries only exist at the wide context, so the wide reserve is
             // a superset and pays for the trace's whole demand.
@@ -6009,19 +6015,19 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(9, false), 16);
         assert_eq!(super::decode_bucket(17, false), 32);
         let buckets = super::DecodeBuckets::new(super::DECODE_ROWS);
-        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, glmf_prewarm_list, serving_graph_shapes};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, glmf_prewarm_list, glmf_prewarm_shapes, serving_graph_shapes};
+        let layout = GlmfLayout::resolved(1, true);
         for sequences in [8, 16] {
             let shapes = serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            // Startup reserves the traced shapes this launch admits: rank 0
-            // carries the head segment, rank 1 the 45 layer segments.
-            let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 2, 64, 188);
-            let warm = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
-                32768, 2_097_152, 2051, sequences, true, &buckets, GlmfLayout::Max);
-            assert_eq!(plan.executables, [warm.len() as u64 * 46, warm.len() as u64 * 45]);
-            let list = glmf_prewarm_list().layout(GlmfLayout::Max);
+            // Startup reserves the traced shapes this launch admits; rank 0
+            // carries the head segment on top of the 45 layer segments.
+            let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 1, 64, 188, true);
+            let warm = glmf_prewarm_shapes(32768, 2_097_152, 2051, sequences, true, &buckets, layout);
+            assert_eq!(plan.executables, [warm.len() as u64 * 46]);
+            let list = glmf_prewarm_list().layout(layout).expect("the min column is traced");
             let packed = |count: u64| list.arena_bytes(count).div_ceil(2 << 20) * (2 << 20);
-            assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46), packed(warm.len() as u64 * 45)]);
+            assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46)]);
             assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
             assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
@@ -6273,9 +6279,10 @@ mod wide_decode_tests {
         // A wider verify budget adds shapes the prewarm does not reserve, so the
         // prewarm and its reserve stay the traced shapes this context admits.
         let reserve = |decode_rows: usize| glmf_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, 1,
-            decode_rows, 188);
+            decode_rows, 188, true);
         let short = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
-            8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS), GlmfLayout::Min);
+            8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS),
+            GlmfLayout::resolved(1, true));
         let admitted = serving_graph_shapes(8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS));
         assert!(short.iter().all(|shape| admitted.contains(shape)), "a prewarm never leaves its launch's set");
         assert_eq!(reserve(DECODE_ROWS).executables[0], short.len() as u64 * 46);

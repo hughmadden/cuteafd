@@ -748,7 +748,7 @@ pub(crate) mod tests {
             let context = input.max_context as usize;
             let expected = glmf_graphs::glmf_graph_reserve(context, 262_144, cfg.dense_context(),
                 input.sequences.min(input.decode_rows) as usize, input.speculation, input.layers,
-                ranks, input.decode_rows as usize, 188);
+                ranks, input.decode_rows as usize, 188, input.spark_ranks > 0);
             assert_eq!(admitted.graphs.reserves, expected.reserves);
             // One owner per device: the pinned arena plus its capture headroom.
             let whole: Vec<u64> = expected.reserves.iter()
@@ -784,7 +784,7 @@ pub(crate) mod tests {
         let context = crate::placement::planner::Context::automatic(input.max_context).served(placed.pool_tokens) as usize;
         let expected = glmf_graphs::glmf_graph_reserve(context, placed.pool_tokens as usize,
             cfg.dense_context(), input.sequences.min(input.decode_rows) as usize, input.speculation,
-            input.layers, 1, input.decode_rows as usize, 170);
+            input.layers, 1, input.decode_rows as usize, 170, input.spark_ranks > 0);
         assert_eq!(graphs.reserves, expected.reserves);
         assert_eq!(graphs.executables, expected.executables);
         assert!(graphs.reserves[0] <= 2_313_158_656, "never above the reference arena");
@@ -931,16 +931,19 @@ pub(crate) mod tests {
         config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
-        let spec = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, true, 45, 2, 64, 188);
-        let plain = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, false, 45, 2, 64, 188);
+        // The traced min column: one device with Sparks attached.
+        let spec = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, true, 45, 1, 64, 188, true);
+        let plain = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, false, 45, 1, 64, 188, true);
+        assert!(spec.traced);
         assert!(!spec.shapes.is_empty());
         assert!(spec.shapes.len() > plain.shapes.len());
         assert!(spec.shapes.iter().any(|shape| shape.1) && plain.shapes.iter().all(|shape| !shape.1));
         // Rank 0 adds its head segment; the peer splits the same shapes.
-        assert_eq!(spec.executables[0] - spec.executables[1], spec.shapes.len() as u64);
+        let two = glmf_graphs::glmf_graph_reserve(262_144, 262_144, cfg.dense_context(), 8, true, 45, 2, 64, 188, true);
+        assert_eq!(two.executables[0] - two.executables[1], two.shapes.len() as u64);
         // A shorter served context keeps the pinned short shapes and can only
         // drop longer geometries.
-        let short = glmf_graphs::glmf_graph_reserve(65_536, 65_536, cfg.dense_context(), 8, true, 45, 2, 64, 188);
+        let short = glmf_graphs::glmf_graph_reserve(65_536, 65_536, cfg.dense_context(), 8, true, 45, 1, 64, 188, true);
         assert!(short.shapes.len() <= spec.shapes.len());
         for shape in &short.shapes { assert!(spec.shapes.contains(shape)); }
     }

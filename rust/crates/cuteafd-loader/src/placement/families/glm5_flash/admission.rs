@@ -446,11 +446,12 @@ impl GlmfGraphs {
     pub fn extra_bytes(&self) -> Vec<u64> { vec![self.extra; self.charged.len()] }
 }
 
-/// A launch's reserve at `context` and `pool_tokens`, from the checked-in list.
+/// A launch's reserve at `context` and `pool_tokens`, from the checked-in list
+/// of its resolved card shape (coordinator devices, Sparks attached or not).
 fn graph_reserve(i: &GlmfInputs<'_>, context: usize, pool_tokens: usize, sms: usize)
     -> glmf_graphs::GlmfGraphReserve {
     glmf_graphs::glmf_graph_reserve(context, pool_tokens, i.cfg.dense_context(), i.sequences as usize,
-        i.speculation, i.layers, i.gpus.len(), i.decode_rows as usize, sms)
+        i.speculation, i.layers, i.gpus.len(), i.decode_rows as usize, sms, i.spark_ranks > 0)
 }
 
 /// One opaque per-device graph owner: the whole configured reserve, charged
@@ -1195,7 +1196,7 @@ impl PreparedGlmf<'_> {
         }
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
-            graph_reserve = ?graphs.charged, prewarm_shapes = graphs.shapes, layout = prepared.layout.name(),
+            graph_reserve = ?graphs.charged, prewarm_shapes = graphs.shapes, layout = %prepared.layout,
             "Flash recipe preparation, search and exact reconciliation completed");
         Ok(AdmittedGlmf { placement, graphs, working, solved,
             native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
