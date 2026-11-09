@@ -701,16 +701,18 @@ mod source_format_tests {
     }
 
     #[test]
-    fn serving_decode_graph_misses_join_the_shared_eager_inventory() {
+    fn serving_decode_graph_misses_go_through_the_bounded_cache() {
         let source = include_str!("engine.rs");
-        let eager = source.split_once("self.miss_graph(rank, &key);")
-            .expect("the serving miss branch records its variant").1;
-        assert!(eager.trim_start().starts_with("return segment();"),
-            "a serving miss must run eagerly, never capture on the request");
-        let missing = source.split_once("fn miss_graph(&self").expect("miss_graph body").1;
-        let missing = missing.split_once("\n    }\n").expect("miss_graph end").0;
-        assert!(missing.contains(concat!("crate::shared::decode_graph::note",
-            "_eager(\"mimo_v2\"")), "eager misses go through the one shared entry point");
+        let miss = source.split_once("let crate::shared::decode_graph::device::Miss::Capture(ticket) =")
+            .expect("the serving miss asks the bounded cache").1;
+        assert!(miss.trim_start().starts_with("graphs.borrow_mut().cache_miss(&key, pinned, None)"),
+            "a miss is admitted by the device cache, not a sealed startup inventory");
+        let capture = source.split_once("fn graph(&self, rank: usize, key: GraphKey")
+            .expect("graph body").1;
+        assert!(capture.contains("cache_cancel(ticket)"),
+            "every failed capture path cancels its ticket");
+        assert!(!source.contains(concat!("note", "_eager(\"mimo_v2\"")),
+            "the sealed startup policy and its miss inventory are gone");
     }
 }
 
@@ -1287,9 +1289,8 @@ impl Opened {
                 args.expert_usage_reader.clone())).transpose()?;
             engine.prefill_w8a8 = !args.prefill_w8a16;
             engine.output_fp8_decode = args.fp8_decode;
-            engine.decode_graphs = args.decode_graphs;
-            engine.graph_storage_plan = Some(preflight.graph_plan.clone());
-            engine.graph_storage_bound_bytes = Some(preflight.graph_bound_bytes.clone());
+            engine.graph_layout = Some(preflight.graph_layout.clone());
+            engine.decode_graphs = preflight.graph_layout.enabled;
             {
                 use cuteafd_loader::families::mimo_v2::MimoAttention;
                 let kv = args.kv_formats();
@@ -1304,6 +1305,10 @@ impl Opened {
             if let Some((device, stream)) = peer_stream {
                 engine.attach_peer(device, stream, shares.pop().context("head-split shares")?,
                     usize::try_from(preflight.working_set.prefill_lanes)?)?;
+            }
+            if preflight.graph_layout.enabled {
+                engine.configure_graph_cache(&preflight.graph_layout.reserves,
+                    &preflight.graph_layout.bootstraps)?;
             }
             engine.mtp = mtp;
             if let Some(dir) = &draft_dir {

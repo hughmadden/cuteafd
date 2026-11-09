@@ -11,8 +11,7 @@ use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillO
 pub(super) struct Preflight {
     pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub capacity: cuteafd_core::serving_capacity::ResolvedCapacity,
-    pub graph_plan: cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan,
-    pub graph_bound_bytes: Vec<u64>,
+    pub graph_layout: cuteafd_loader::families::mimo_v2::decode_graph::MimoGraphLayout,
     pub host_config: Option<cuteafd_hostcache::config::Config>,
     pub local_expert_budget: usize,
     pub placement: cuteafd_loader::placement::Placement,
@@ -322,23 +321,15 @@ fn preflight_shape(
         args.local_experts,
         args.peers.is_some(),
     );
-    let graph_plan = cuteafd_loader::families::mimo_v2::decode_graph::MimoDecodeGraphPlan::new(
+    // One bounded graph reserve per physical device, selected by the resolved
+    // layout and charged once, before KV sizing.
+    let graph_layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(
         cfg.layers,
         ranks,
-        super::engine::DECODE_ROWS,
         args.decode_graphs
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
     )?;
-    // Retained startup graph owners: measured whole-capture bytes per rank,
-    // charged before KV sizing. No driver margin or per-executable envelope.
-    let graph_reservations = (0..ranks)
-        .map(|rank| graph_plan.reservations(rank))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let graph_bound_bytes = graph_reservations
-        .iter()
-        .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
-        .collect::<Vec<_>>();
     let transport_lanes = resolved_prefill_shape(usize::from(args.peers.is_some()),
         args.prefill_rows, args.prefill_waves)?.waves as usize;
     let spark_ranks = match args
@@ -431,7 +422,7 @@ fn preflight_shape(
                 draft_packing[rank] = reservations.packing;
             }
         }
-        additional.extend(graph_reservations[rank].iter().cloned());
+        additional.extend(graph_layout.reservations(rank)?);
         let workspaces = workspace_options(
             cfg,
             args,
@@ -585,14 +576,13 @@ fn preflight_shape(
         allocated_pool = capacity.allocated_gpu_kv_tokens, requested_default = capacity.requested_kv_floor_tokens,
         requested_state_slots = capacity.state_slots, allocated_rings = args.rings,
         host_prefix_bytes = capacity.host_prefix_bytes, mark_slots, intake_probe_bytes,
-        ?graph_plan, ?graph_bound_bytes,
+        ?graph_layout,
         reservations = %serde_json::to_string(&capacity.devices)?,
         "MiMo pre-allocation capacity against measured post-module baseline");
     Ok(Preflight {
         expert_usage: prepared.recipe.expert_usage.clone(),
         capacity,
-        graph_plan,
-        graph_bound_bytes,
+        graph_layout,
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: working,

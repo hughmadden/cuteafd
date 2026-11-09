@@ -182,7 +182,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
             };
             let graph = GraphExec(exec, &library);
             if rank == 0 {
-                engine.graphs.borrow_mut().insert(key, graph);
+                engine.graphs.borrow_mut().insert(key, graph, None);
             } else {
                 engine
                     .peer
@@ -190,7 +190,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                     .unwrap()
                     .graphs
                     .borrow_mut()
-                    .insert(key, graph);
+                    .insert(key, graph, None);
             }
             engine.on(rank, || {
                 // SAFETY: captured exec and bound owners remain in the engine.
