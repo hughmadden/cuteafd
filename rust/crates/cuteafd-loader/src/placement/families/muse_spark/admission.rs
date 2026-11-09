@@ -981,13 +981,43 @@ pub const LOCAL_ONLY_REFUSAL: Refusal = Refusal::MissingExecutor {
     family: "Muse Spark", executor: "coordinator-only routed experts", issue: 1395,
 };
 
+fn solve_sampled(request: Request, mut budgets: Vec<Budget>, recipe: &MuseRecipe<'_>)
+    -> Result<ResolvedPlan, Refusal> {
+    let mut contract = recipe.prepare(&request)?;
+    for budget in &mut budgets {
+        let [location] = budget.locations.as_slice() else { continue; };
+        if !matches!(location.device, Device::Coordinator(_)) || location.domain != Domain::Device {
+            continue;
+        }
+        let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
+        let occupied = budget.physical_bytes.checked_sub(*free)
+            .ok_or_else(|| invalid("sample exceeds physical capacity"))?;
+        if occupied > 0 {
+            contract.components.push(Component { activation: Activation::always(),
+                bytes: ByteCurve::fixed(occupied, contract.maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location: *location, bytes: occupied,
+                    lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: format!("Muse context and selected modules: {occupied} B occupied at the \
+                        {free} B free sample of {} B; {source}", budget.physical_bytes) }) });
+        }
+        // Transfer sampled occupancy to one named owner without changing capacity.
+        budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
+            source: "physical capacity; pre-weight occupancy charged once in recipe".into() };
+    }
+    struct Prepared(Contract);
+    impl Recipe for Prepared {
+        fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
+    }
+    solve(request, budgets, &Prepared(contract))
+}
+
 impl PreparedMuse<'_> {
     /// The single admission solve. Planner and serving call this one verb.
     pub fn admit(self, request: Request) -> Result<AdmittedMuse, Refusal> {
         let PreparedMuse { recipe, budgets, prefill_logits_bytes, local, drafter, layouts, global, projections,
             spark_budget, mut host, push } = self;
         let started = std::time::Instant::now();
-        let solved = solve(request, budgets, &recipe)?;
+        let solved = solve_sampled(request, budgets, &recipe)?;
         let solve_us = started.elapsed().as_micros().try_into().unwrap_or(u64::MAX);
         let (placement, spark) = recipe.execution(&solved)?;
         if spark.spark_layers.is_empty() { return Err(LOCAL_ONLY_REFUSAL); }
@@ -1145,6 +1175,67 @@ mod contract_tests {
             } else { 0 });
             assert_eq!(nonweights.lifetime, Lifetime::RESIDENT);
         }
+    }
+
+    #[test]
+    fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
+        use crate::plan::encoder::EncoderKind;
+        let cfg = MuseSparkConfig::from_hf(&crate::plan::testing::muse_spark_config()).unwrap();
+        let off = EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
+            replicas: vec![], reason: "test".into(), shortfall: 0 };
+        let prefill = PrefillShape { rows: 64, waves: 1 };
+        let recipe = MuseRecipe { cfg: &cfg, context: 64, gpus: 2, maximum_pages: 2, prefill,
+            attention: vec![LayerMode::HeadSplit; cfg.layers], spark_ranks: 2,
+            encoders: vec![(off.clone(), off)], modes: (MediaMode::Off, MediaMode::Off),
+            cases: vec![], peaks: vec![[0; 2]; cfg.layers + 1],
+            local: LocalPackage::Unknown, drafter: None };
+        let request = || production_request(64, None, Onboard::Layers(0), prefill,
+            Operation::Serving, None, SparkReplyFormats::default());
+        for logical in [96 << 30, 80 << 30] {
+            for sampled in [0, 674_496_512] {
+                let budgets = vec![measured_budget(0, 96 << 30, logical, 100 << 20,
+                    (96 << 30) - sampled),
+                    measured_budget(1, 96 << 30, logical, 100 << 20, (96 << 30) - sampled),
+                    Budget { id: "host".into(), locations: vec![Location::HOST],
+                        physical_bytes: 128 << 30, logical_bytes: 128 << 30, headroom: 0,
+                        baseline: Baseline::Sampled { free: 120 << 30, phase: Phase::Load,
+                            source: "host sample".into() } }];
+                let previous = solve(request(), budgets.clone(), &recipe).unwrap();
+                let plan = solve_sampled(request(), budgets, &recipe).unwrap();
+                assert_eq!(plan.pool_tokens, previous.pool_tokens);
+                assert_eq!(plan.decisions, previous.decisions);
+                assert_eq!(plan.budgets[2], previous.budgets[2], "host baseline stays sampled");
+                for rank in 0..2 {
+                    assert_eq!(plan.budgets[rank].logical_bytes, logical);
+                    assert!(matches!(plan.budgets[rank].baseline,
+                        Baseline::Forecast { occupied: 0, .. }));
+                    for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                        let items = plan.items_at(Location::coordinator(rank as u8), phase).unwrap();
+                        let owners = items.iter().filter(|item|
+                            item.group.starts_with("Muse context and selected modules:")).collect::<Vec<_>>();
+                        assert_eq!(owners.len(), usize::from(sampled > 0));
+                        assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), sampled);
+                        let breakdown = crate::placement::reserve::breakdown(format!("rtx{rank}"),
+                            cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 100 << 20, &items);
+                        assert_eq!(breakdown.reserve.iter().filter(|owner|
+                            owner.name == "Muse context and selected modules")
+                            .map(|owner| owner.bytes).sum::<u64>(), sampled);
+                        let id = format!("rtx{rank}");
+                        let now = plan.phases.iter().find(|row| row.budget == id && row.phase == phase).unwrap();
+                        let before = previous.phases.iter().find(|row| row.budget == id && row.phase == phase).unwrap();
+                        assert_eq!(now.available - now.owned - now.opaque,
+                            before.available - before.owned - before.opaque);
+                    }
+                }
+            }
+        }
+        let forecast = solve_sampled(request(), vec![
+            planned_budget(0, 96 << 30, 96 << 30, 0, 674_496_512),
+            planned_budget(1, 96 << 30, 96 << 30, 0, 674_496_512)], &recipe).unwrap();
+        assert!(!forecast.facts.allowances.iter().any(|owner|
+            owner.source.starts_with("Muse context and selected modules:")));
+        assert!(solve_sampled(request(), vec![
+            measured_budget(0, 96 << 30, 96 << 30, 0, (96 << 30) + 1)], &recipe).is_err());
     }
 
     #[test]
