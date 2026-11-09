@@ -1794,10 +1794,9 @@ if [[ $family == mimo_v2 ]]; then
     bf16|int8|fp8) family_args+=(--swa-kv-cache "$mimo_swa_kv") ;;
     *) release_die "SWA_KV_CACHE must be bf16, int8 or fp8" ;;
   esac
-  # DECODE_GRAPHS=on: decode/verify steps replay per-layer CUDA graph segments captured at startup
-  # (default off: neutral against the host-driven Spark exchange, 0.4-1.2 GiB of graphs).
-  case "$(get DECODE_GRAPHS)" in
-    "") ;;
+  # Keep serving and admission on the same explicit graph policy.
+  mimo_decode_graphs="$(get DECODE_GRAPHS on)"
+  case "$mimo_decode_graphs" in
     on) family_args+=(--decode-graphs true) ;;
     off) family_args+=(--decode-graphs false) ;;
     *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
@@ -2368,7 +2367,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
-    [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
+    plan_draft_args+=(--mimo-decode-graphs "$mimo_decode_graphs")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
