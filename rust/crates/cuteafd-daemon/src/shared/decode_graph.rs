@@ -3,7 +3,7 @@
 /// Object-safe control surface for a family's heterogeneous graph owners.
 /// The caller drains the complete submitted step before invoking `drain`.
 pub(crate) trait CacheAttached {
-    fn attach(&mut self, device: i32, reserve: u64, site: device::Site) -> anyhow::Result<()>;
+    fn attach(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: device::Site) -> anyhow::Result<()>;
     fn cycle(&mut self, cycle: device::Cycle);
     fn needs_boundary(&self) -> bool;
     fn measured(&mut self, bytes: u64);
@@ -20,8 +20,8 @@ pub(crate) trait CacheAttached {
 // the family's visitor. Both concrete and trait-object paths share bank state.
 macro_rules! cache_attached_methods {
     ($field:ident) => {
-        fn attach(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
-            self.$field.attach_device(device, reserve, site)
+        fn attach(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+            self.$field.attach_device(library, device, reserve, site)
         }
         fn cycle(&mut self, cycle: super::device::Cycle) { self.$field.cache_cycle(cycle); }
         fn needs_boundary(&self) -> bool { self.$field.cache_needs_boundary() }

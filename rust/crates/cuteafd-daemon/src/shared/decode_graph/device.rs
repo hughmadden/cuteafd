@@ -267,11 +267,30 @@ struct HitHistogram {
 
 pub(crate) enum Miss { Capture(u64), Eager }
 pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
-static DEVICES: OnceLock<Mutex<HashMap<i32, SharedCache>>> = OnceLock::new();
+// Banks and capture tickets own the controller, not the process registry.
+// After teardown the next serving lifetime must sample a fresh baseline.
+static DEVICES: OnceLock<Mutex<HashMap<i32, std::sync::Weak<Mutex<DeviceCache>>>>> = OnceLock::new();
 
-pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
+pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
+    reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
+    // Policy fixtures use synthetic ordinals, never valid CUDA device IDs.
+    #[cfg(test)]
+    if device < 0 { return device_cache_sampled(device, reserve, basis, || Ok((0, 0, 0))) }
+    device_cache_sampled(device, reserve, basis, || memory_sample(library, device))
+}
+
+fn memory_sample(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<(u64, u64, u64)> {
+    let (free, total) = crate::shared::memory::device::Device { library, id: device }
+        .run(|| library.cuda_physical_memory_info())?;
+    let tracked = cuteafd_ffi::memory_ledger::snapshot()
+        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    Ok((free as u64, total as u64, tracked))
+}
+
+pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<SharedCache> {
     let mut devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(cache) = devices.get(&device).cloned() {
+    if let Some(cache) = devices.get(&device).and_then(std::sync::Weak::upgrade) {
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).reserve == reserve,
             "graph banks on device {device} disagree on reserve");
         anyhow::ensure!(cache.lock().unwrap_or_else(|p| p.into_inner()).basis == basis,
@@ -280,15 +299,20 @@ pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::R
     }
     let mut controller = DeviceCache::new(device, reserve);
     controller.basis = basis;
+    // Seed before the first attached bank can capture. Reattachment must not
+    // consume growth from an earlier bank or overwrite an explicit baseline.
+    let (free, total, tracked) = sample()?;
+    controller.observer.observe(free, total, tracked);
     let cache = Arc::new(Mutex::new(controller));
-    devices.insert(device, cache.clone());
+    devices.insert(device, Arc::downgrade(&cache));
     Ok(cache)
 }
 
 /// Attach the admitted charge's provenance after a family has bound its banks.
 pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement::graph_reserve::Resolved) -> anyhow::Result<()> {
     let devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
-    let cache = devices.get(&device).ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
+    let cache = devices.get(&device).and_then(std::sync::Weak::upgrade)
+        .ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
     anyhow::ensure!(cache.reserve == policy.bytes, "graph reserve policy disagrees with admission on device {device}");
     cache.reserve_policy = Some(policy);
@@ -297,7 +321,7 @@ pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement:
 
 pub(crate) fn snapshots() -> Vec<Snapshot> {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().cloned().collect();
+        .values().filter_map(std::sync::Weak::upgrade).collect();
     let mut rows: Vec<_> = caches.iter().map(|cache| cache.lock().unwrap_or_else(|p| p.into_inner()).snapshot()).collect();
     rows.sort_by_key(|row| row.device);
     rows
@@ -321,19 +345,21 @@ pub(crate) type GraphVisitor<'a> = dyn FnMut(i32, &'static str, bool,
 
 fn existing_cache(device: i32) -> Option<SharedCache> {
     DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .get(&device).cloned()
+        .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
 /// Observe once per physical device, even when several banks or lanes completed.
 /// Call only at a completed submission boundary, never within a peer segment.
 pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
+    observe_device_sampled(device, || memory_sample(library, device))
+}
+
+fn observe_device_sampled(device: i32,
+    sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
-    let (free, total) = crate::shared::memory::device::Device { library, id: device }
-        .run(|| library.cuda_physical_memory_info())?;
-    let tracked = cuteafd_ffi::memory_ledger::snapshot()
-        .total(cuteafd_ffi::memory_ledger::Space::Device, device) as u64;
+    let (free, total, tracked) = sample()?;
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    let growth = cache.observer.observe(free as u64, total as u64, tracked);
+    let growth = cache.observer.observe(free, total, tracked);
     if cache.unmeasured { cache.measured_capture(growth); }
     cache.boundary();
     Ok(())
@@ -875,7 +901,7 @@ impl Drop for DeviceCache {
 
 pub(crate) fn shutdown_traces() {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
-        .values().cloned().collect();
+        .values().filter_map(std::sync::Weak::upgrade).collect();
     for cache in caches {
         let writer = cache.lock().unwrap_or_else(|p| p.into_inner()).finish_trace();
         // No cache lock is held while waiting for JSON or filesystem work.
@@ -1103,11 +1129,52 @@ mod tests {
         cache.measured_capture(10);
         cache.remove_bank(1);
         cache.remove_bank(2);
-        drop(cache);
+        let owner = Arc::new(Mutex::new(cache));
+        let weak = Arc::downgrade(&owner);
+        DEVICES.get_or_init(Mutex::default).lock().unwrap().insert(-701, weak.clone());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+        DEVICES.get().unwrap().lock().unwrap().remove(&-701);
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(value["graphs"].as_array().unwrap().len(), 2);
         assert_eq!(value["graphs"][0]["hits"], 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_shutdown_upgrades_live_weak_controllers_and_joins_final_trace() {
+        const CHILD: &str = "CUTEAFD_TRACE_WEAK_SHUTDOWN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            assert!(std::process::Command::new("/usr/bin/timeout")
+                .args(["--signal=KILL", "30"])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "shared::decode_graph::device::tests::explicit_shutdown_upgrades_live_weak_controllers_and_joins_final_trace"])
+                .env(CHILD, "1").env_remove("CUTEAFD_GRAPH_TRACE").status().unwrap().success());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.json");
+        let mut cache = DeviceCache::new(-703, 100);
+        cache.trace = Some(TraceWriter::new(path.clone()).unwrap());
+        let id = capture(&mut cache, 1, false);
+        cache.hit(id);
+        cache.remove_bank(1);
+        let owner = Arc::new(Mutex::new(cache));
+        let weak = Arc::downgrade(&owner);
+        {
+            let mut registry = DEVICES.get_or_init(Mutex::default).lock().unwrap();
+            registry.insert(-703, weak.clone());
+            registry.insert(-704, std::sync::Weak::new());
+        }
+        shutdown_traces();
+        assert!(owner.lock().unwrap().trace.is_none());
+        let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["graphs"].as_array().unwrap().len(), 1);
+        assert_eq!(value["graphs"][0]["hits"], 1);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        shutdown_traces();
+        drop(owner);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
@@ -1510,6 +1577,112 @@ mod tests {
 #[cfg(test)]
 mod observer_tests {
     use super::*;
+    fn attached(device: i32) -> SharedCache {
+        device_cache_sampled(device, 1000, Basis::Bytes, || Ok((900, 1000, 0))).unwrap()
+    }
+
+    fn pending(cache: &SharedCache) {
+        let mut cache = cache.lock().unwrap();
+        let site = Site { name: "observer-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes,
+            spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn attachment_measures_capture_before_explicit_observe() {
+        let cache = attached(-99101);
+        pending(&cache);
+        observe_device_sampled(-99101, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn explicit_observe_excludes_eager_first_touch() {
+        let cache = attached(-99102);
+        observe_device_sampled(-99102, || Ok((800, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 0);
+        pending(&cache);
+        observe_device_sampled(-99102, || Ok((775, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn explicit_observe_does_not_double_seed_or_charge() {
+        let cache = attached(-99103);
+        observe_device_sampled(-99103, || Ok((900, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99103, || Ok((875, 1000, 0))).unwrap();
+        observe_device_sampled(-99103, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn repeated_attachment_neither_samples_nor_advances_baseline() {
+        let cache = attached(-99104);
+        pending(&cache);
+        let again = device_cache_sampled(-99104, 1000, Basis::Bytes,
+            || panic!("reattachment must not consume graph growth")).unwrap();
+        assert!(Arc::ptr_eq(&cache, &again));
+        observe_device_sampled(-99104, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+        device_cache_sampled(-99104, 1000, Basis::Bytes,
+            || panic!("reattachment must not reset the explicit baseline")).unwrap();
+        observe_device_sampled(-99104, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn failed_attachment_sample_does_not_publish_cache() {
+        let result = device_cache_sampled(-99105, 1000, Basis::Bytes,
+            || anyhow::bail!("sample unavailable"));
+        assert!(result.is_err());
+        assert!(existing_cache(-99105).is_none());
+        let cache = attached(-99105);
+        pending(&cache);
+        observe_device_sampled(-99105, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn reattachment_after_last_owner_drops_seeds_a_fresh_controller() {
+        let cache = attached(-99106);
+        let old = Arc::downgrade(&cache);
+        pending(&cache);
+        observe_device_sampled(-99106, || Ok((500, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 400);
+        drop(cache);
+        assert!(old.upgrade().is_none());
+        assert!(existing_cache(-99106).is_none());
+        assert!(!snapshots().iter().any(|row| row.device == -99106));
+
+        // A new lifetime may have a different reserve and lower residual.
+        let cache = device_cache_sampled(-99106, 2000, Basis::Bytes,
+            || Ok((950, 1000, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(-99106, || Ok((925, 1000, 0))).unwrap();
+        assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+    }
+
+    #[test]
+    fn temporary_owner_drop_preserves_another_live_owners_baseline() {
+        let owner = attached(-99107);
+        let temporary = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("a live controller must not be reseeded")).unwrap();
+        pending(&owner);
+        drop(temporary);
+        let rebuilt = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("lane rebuild must retain the other owner's baseline")).unwrap();
+        assert!(Arc::ptr_eq(&owner, &rebuilt));
+        observe_device_sampled(-99107, || Ok((875, 1000, 0))).unwrap();
+        assert_eq!(rebuilt.lock().unwrap().snapshot().charged, 25);
+        drop(owner);
+        let again = device_cache_sampled(-99107, 1000, Basis::Bytes,
+            || panic!("the rebuilt owner still pins the controller")).unwrap();
+        assert!(Arc::ptr_eq(&rebuilt, &again));
+    }
+
     #[test]
     fn lazy_tracked_workspaces_do_not_become_graph_growth() {
         let mut observer = GrowthObserver::default();

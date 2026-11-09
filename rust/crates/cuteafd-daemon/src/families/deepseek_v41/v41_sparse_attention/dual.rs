@@ -1,6 +1,5 @@
 //! Per-slot head-half waves on shared, guarded unit-cap attention storage.
 use super::*;
-use crate::shared::decode_graph::GraphPolicy;
 use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use crate::families::deepseek_v41::v41_backbone_cache::{BackboneCache,CacheAttention,peer_inputs::PeerAttentionInputs};
@@ -92,11 +91,13 @@ impl<'a> DualAttentionWave<'a> {
     pub(crate) fn on_storage(storage: std::rc::Rc<DualAttentionStorage<'a>>) -> Result<Self> {
         let devices = std::array::from_fn::<_, 2, _>(|i| Device {
             library: storage.halves[i].stream.library, id: storage.halves[i].query.buffer.device_id });
+        let mut halves = [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
+            devices[1].own(|| CompactSparseAttentionWave::on_storage(storage.halves[1].clone()))?];
+        for half in &mut halves { half.get_mut().spans_devices = true; }
         Ok(Self {
-            halves: [devices[0].own(|| CompactSparseAttentionWave::on_storage(storage.halves[0].clone()))?,
-                devices[1].own(|| CompactSparseAttentionWave::on_storage(storage.halves[1].clone()))?],
+            halves,
             capacity: storage.capacity, storage, window: crate::shared::memory::row_window::RowWindow::NONE,
-            pending: None, tails: GraphBank::with_family(GraphPolicy::Budgeted { bytes: None }, "deepseek_v41"),
+            pending: None, tails: GraphBank::new(None),
         })
     }
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
@@ -125,8 +126,11 @@ impl<'a> DualAttentionWave<'a> {
         }
         Ok(())
     }
-    pub fn enable_small_graph_shapes(&mut self) {
-        for half in &mut self.halves { half.enable_small_graph_shapes(); }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        for half in &mut self.halves { half.get_mut().visit_graph_banks(f)?; }
+        f(self.halves[0].device.id, "dual_attention_tail", true, &mut self.tails)
     }
     pub fn drain(&mut self) -> Result<()> {
         // Always attempt both drains, even if the first device reports an error.
@@ -168,7 +172,7 @@ impl<'a> DualAttentionWave<'a> {
         let (layer,rows)=(plan.layer,plan.rows);
         let mut key=tail.identity();
         key.extend([rows,self.storage.output.buffer.ptr as usize]);
-        let graph=if self.window.is_windowed() { None } else { self.tails.launch(&(layer,key.clone())).map(|graph|graph.raw) };
+        let graph=if self.window.is_windowed() { None } else { self.tails.cached_launch(&(layer,key.clone())).map(|graph|graph.raw) };
         let library=self.halves[0].device.library;
         let (attention,stream)=unsafe { self.complete_owned_then(|attention,stream| {
             tail.prepare(stream)?;
@@ -178,7 +182,14 @@ impl<'a> DualAttentionWave<'a> {
                 graph, || tail.enqueue(&attention,stream))?;
             Ok((attention,stream))
         }).await? };
-        if graph.is_some() || self.window.is_windowed() { return Ok(()); }
+        if graph.is_some() || self.window.is_windowed() || crate::shared::decode_graph::census::eager("layer_row") {
+            return Ok(());
+        }
+        let Some(ticket) = self.tails.cache_ticket(&(layer, key.clone()),
+            crate::families::deepseek_v41::graph_policy::pinned_shape(self.halves[0].device.id, rows as u32), None) else {
+            // The completed eager continuation already produced the result.
+            return Ok(());
+        };
         // The warmup is complete. Re-establish host-side block state, capture
         // the same operations and replay them before publishing FFN output.
         let mut guard=PendingDualAttention { wave:Some(self),cold:[false;2],rows,layer };
@@ -188,26 +199,20 @@ impl<'a> DualAttentionWave<'a> {
             tail.restore_warmup()?;
             library.cuda_graph_begin_capture(stream)?;
             let queued=tail.enqueue(&attention,stream);
-            let captured=library.cuda_graph_end_capture(stream);
-            let graph=match (queued,captured) {
+            let captured=library.cuda_graph_end_capture_topology(stream);
+            let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
                 (Ok(()),Ok(graph))=>graph,
-                (Err(error),Ok(graph))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },
+                (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },
                 (Err(error),Err(_)) | (Ok(()),Err(error))=>return Err(error),
             };
-            // Match the attention owner's bounded shape retention policy.
-            let limit=wave.halves[0].graph_limit;
-            if wave.tails.count(|(site,_)| *site==layer)>=limit {
-                wave.tails.retire_oldest(|(site,_)| *site==layer);
-                // The cold continuation above completed the entire owner chain.
-                drop(wave.tails.drain_retired(||Ok(()))?);
-            }
+            if let Some(error) = inspection { tracing::warn!(%error, "dual attention tail topology inspection failed"); }
             // SAFETY: the enclosing lane retains tail weights and storage and
             // drains this owner before releasing them.
             let exec=GraphOwner::new(library,owner.id,graph,())?;
             tracing::debug!(target:"cuteafd::graph_capture",site="dual_attention_tail",
                 layer,rows,device=owner.id,key=?key,bank=?(&wave.tails as *const _),
                 "captured graph binding");
-            wave.tails.insert((layer,key),exec,None);
+            wave.tails.cache_commit((layer,key),exec,ticket,nodes as u64,width,true);
             library.cuda_graph_launch(graph,stream)
         })?;
         owner.future(wave.halves[0].wait_chain()).await?;
@@ -338,8 +343,7 @@ impl Drop for DualAttentionWave<'_> {
     fn drop(&mut self) {
         if let Err(error) = self.drain() { crate::shared::decode_graph::fatal_drain(Err(error), "dual attention"); }
         let owner=self.halves[0].device;
-        self.tails.retire_all();
-        if let Err(error)=owner.run(||self.tails.drain_retired(||Ok(())).map(drop)) {
+        if let Err(error)=owner.run(|| { self.tails.cache_clear_drained(); Ok(()) }) {
             tracing::error!(%error,"destroying dual attention continuation graph");
         }
     }

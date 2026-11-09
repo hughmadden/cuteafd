@@ -14,7 +14,6 @@ use crate::families::deepseek_v41::v41_projection_tp2::Kind;
 pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
-    let startup_prototype = super::graph_startup_prototype(&args)?;
     // `all` becomes the expert inventory's exact count inside admission; this
     // load-time floor only asserts that one routed layer stays resident.
     match args.rtx_expert_layers {
@@ -61,7 +60,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     })?;
     memory_checkpoint("after native preload")?;
     let modules = inventory.gpus.iter().map(|gpu| gpu.module_bytes).collect::<Vec<_>>();
-    let pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
+    let mut pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -521,8 +520,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
-    // Allocation must consume exactly the admitted pages; do not run a second
-    // sizing policy after loading conditional owners.
+    args.max_context_tokens = admission::adopt_measured_pool(&lib, &args, &mut pool)?;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    // Allocation consumes exactly the final measured plan's pages.
     for gpu in 0..2 {
         let (free,_) = devices[gpu].run(|| lib.cuda_memory_info())?;
         ensure!(pool.cache_bytes[gpu] <= free,"TP2 setup exceeded shared cache admission on GPU {gpu}");
@@ -540,28 +542,64 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
-    if startup_prototype {
+    let mut visit = |f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>| -> Result<()> {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    };
+    crate::families::deepseek_v41::graph_policy::attach(&lib, 2, &mut visit)?;
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
+    drop(visit);
+    // The loader list is a best-effort preference, not a sealed capture set.
+    // Other shapes remain eligible for lazy bounded capture.
+    {
         let memory = || -> Result<Vec<usize>> {
             devices.iter().map(|device| device.run(|| lib.cuda_memory_info().map(|(free, _)| free)))
                 .collect()
         };
         let before = memory()?;
         let capture_started = Instant::now();
-        pass.capture_startup(requests.cache())?;
-        second.capture_startup(requests.cache())?;
-        for (slot, _) in &mut prefill_slots.slots { slot.capture_startup_prefill(requests.cache())?; }
+        // Every site is independent: one rejected geometry must not leave the
+        // rest of the warmed set uncaptured.
+        macro_rules! prewarm_step {
+            ($site:literal, $capture:expr) => {
+                if let Err(error) = $capture {
+                    tracing::warn!(%error, site = $site,
+                        "V4.1 startup graph prewarm step failed; those geometries run eagerly");
+                }
+            };
+        }
+        let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+        prewarm_step!("target pass 0", pass.capture_startup(requests.cache(), &local));
+        prewarm_step!("target pass 1", second.capture_startup(requests.cache(), &local));
+        for index in super::super::graph_policy::PREFILL_PREWARM_SLOTS {
+            let (slot, transport) = &mut prefill_slots.slots[index];
+            let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+            prewarm_step!("prefill chunk", slot.capture_startup_prefill(requests.cache(), &local));
+        }
         if let Some(draft) = &mut draft {
             let device = draft.device;
-            device.run(|| draft.get_mut().capture_startup())?;
+            prewarm_step!("drafter", device.run(|| draft.get_mut().capture_startup()));
         }
         let after = memory()?;
         let growth: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before.saturating_sub(after)).collect();
         tracing::info!(capture_ms=capture_started.elapsed().as_millis(), free_before_bytes=?before,
             free_after_bytes=?after, allocator_growth_bytes=?growth, target_passes=2,
             exact_rows=cuteafd_core::V41_VERIFY_ROWS, index_width=512,
-            "diagnostic fixed startup graph prototype recorded and sealed");
-        memory_checkpoint("startup graphs sealed")?;
+            "V4.1 startup graphs warmed");
+        memory_checkpoint("startup graphs warmed")?;
     }
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, |f| {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    }) }?;
     crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;
@@ -570,8 +608,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     vision.connect()?;
     // Same Ready-boundary verification as the single-rank worker: both GPUs'
     // predicted runtime bases against what their devices hold.
+    admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     memory_checkpoint("ready")?;
+    crate::shared::memory_report::reconcile::capture("ready");
     ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,

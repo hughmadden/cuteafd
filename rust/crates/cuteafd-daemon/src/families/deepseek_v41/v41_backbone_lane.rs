@@ -144,6 +144,8 @@ impl LaneL2<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Idle,
+    /// Successful window selection on an otherwise unused idle lane.
+    WindowSelectedIdle,
     Prepared,
     Query,
     Ffn,
@@ -154,6 +156,13 @@ enum Phase {
     Invalid,
 }
 
+fn rearm_startup_prefill(phase: &mut Phase) -> Result<()> {
+    ensure!(matches!(*phase, Phase::Idle | Phase::WindowSelectedIdle),
+        "startup prefill requires an idle lane or its successful window selection");
+    *phase = Phase::Idle;
+    Ok(())
+}
+
 // The containing lane's pending owner drains all consumer work before drop.
 // Keep this bank before the allocations referenced by its graphs.
 struct Tp2FfnGraphs<'w,'a> {
@@ -162,25 +171,27 @@ struct Tp2FfnGraphs<'w,'a> {
 }
 impl<'w,'a> Tp2FfnGraphs<'w,'a> {
     fn new(device:Device<'a>)->Self {
-        let mut bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
-        bank.enable_small_shapes();Self {device,bank}
+        let bank=crate::shared::decode_graph::LayerGraphs::new(device.library, cuteafd_core::V41_VERIFY_ROWS as u32, "deepseek_v41");
+        Self {device,bank}
     }
     unsafe fn capture_ready(&mut self,block:&mut BackboneBlockWave<'w,'a>,
         weights:&'w BackboneHcWeights<'a>,binding:QueryBinding,rows:usize,
         projected:CuteafdDeviceBuffer,stream:*mut std::ffi::c_void)->Result<()> {
         self.device.run(||unsafe {
+            let Some(ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
+                super::graph_policy::pinned_shape(self.device.id, rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
             self.device.library.cuda_graph_begin_capture(stream)?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=self.device.library.cuda_graph_end_capture(stream);
+            let captured=self.device.library.cuda_graph_end_capture_topology(stream);
             match (queued,captured) {
-                (Ok(_),Ok(graph))=> {
-                    if let Err(error)=self.bank.insert(binding.layer(),weights,rows as u32,graph) {
+                (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
+                    if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {
                         self.device.library.cuda_graph_exec_destroy(graph)?;return Err(error);
                     }
                     Ok(())
                 },
-                (Err(error),Ok(graph))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
+                (Err(error),Ok((graph,..)))=> {self.device.library.cuda_graph_exec_destroy(graph)?;Err(error)},
                 (Err(error),Err(_)) | (Ok(_),Err(error))=>Err(error),
             }
         })
@@ -290,7 +301,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             let weights=&lane.weights.layers[lane.layer].hc;
             let graphs=lane.tp2_ffn_graphs.as_mut().context("TP2 FFN graph owner absent")?;
             let windowed=lane.window.is_windowed();
-            let cached=if windowed { None } else { graphs.bank.get_shape(lane.layer,weights,rows as u32) };
+            let cached=if windowed { None } else { graphs.bank.cached_launch(lane.layer,weights,rows as u32) };
             let library=lane.weights.library;
             let (values,stream,projected)=unsafe { lane.projection.finish_tp2_then(rows as u32,output,producer,
                 |projected,stream| {
@@ -757,8 +768,6 @@ pub(crate) struct BackboneLane<'w, 'a> {
     capture_routes: bool,
     /// Layer clock marks and the FFN stage split (routes or a live console).
     capture_timing: bool,
-    /// Decode-row graph shapes are retained (see `retain_small_graph_shapes`).
-    retain_small_shapes: bool,
     route_capture: Vec<Vec<[u32; 6]>>,
     /// Host FFN stage times summed over the captured pass.
     ffn_split: FfnSplit,
@@ -771,6 +780,19 @@ pub(crate) struct BackboneLane<'w, 'a> {
 }
 
 impl<'w, 'a> BackboneLane<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        if let Some(graphs) = &mut self.tp2_ffn_graphs {
+            f(graphs.device.id, "tp2_ffn", true, &mut graphs.bank)?;
+        }
+        if let Some(sparse) = &mut self.sparse { sparse.visit_graph_banks(f)?; }
+        if let Some(sparse) = &mut self.dual_sparse { sparse.visit_graph_banks(f)?; }
+        self.query.visit_graph_banks(f)?;
+        if let Some(query) = &mut self.tp2_query { query.visit_graph_banks(f)?; }
+        if let Some(output) = &mut self.tp2_output { output.visit_graph_banks(f)?; }
+        self.projection.visit_graph_banks(f)?;
+        if let Some(shared) = &mut self.shared { shared.visit_graph_banks(f)?; }
+        self.router.visit_graph_banks(f)
+    }
     fn rebind_startup(&mut self, layer: usize) -> Result<()> {
         ensure!(self.phase == Phase::Idle && !self.window.is_windowed(),
             "startup rebind requires an idle full lane");
@@ -792,51 +814,49 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// stable until this lane's graph bank is destroyed.
     pub(crate) fn capture_startup(
         &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
-        aligned: bool,
+        aligned: bool, local: &[bool; 40],
     ) -> Result<()> {
-        self.capture_startup_kind(sinks, selections, aligned, true)
+        self.capture_startup_kind(sinks, selections, aligned, true, local)
     }
-    /// Prefill keeps its own sparse arithmetic eager: decode reduction recipes
-    /// are not prefill recipes. Empty inventories keep arbitrary tails eager.
-    pub(crate) fn capture_startup_prefill(&mut self) -> Result<()> {
-        self.capture_startup_kind(&[], &[], false, false)
+    /// Warm only nonwindowed prompt/replay primitive shapes. Sparse prefill
+    /// geometry depends on live request history and is captured lazily instead.
+    pub(crate) fn capture_startup_prefill(&mut self, local: &[bool; 40]) -> Result<()> {
+        // Only a successful window selection on an idle lane may be rearmed.
+        // Invalid also represents failed execution and must never be revived.
+        rearm_startup_prefill(&mut self.phase)?;
+        self.capture_startup_kind(&[], &[], false, false, local)
+    }
+    pub(crate) fn startup_prefill_rows(&self) -> Vec<usize> {
+        super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity)
     }
     fn capture_startup_kind(
         &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
-        aligned: bool, decode: bool,
+        aligned: bool, decode: bool, local: &[bool; 40],
     ) -> Result<()> {
         ensure!(self.phase == Phase::Idle && !self.window.is_windowed()
             && self.dual_sparse.is_none() && self.tp2_query.is_none() && self.tp2_output.is_none()
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
-        let rows = if decode { cuteafd_core::V41_VERIFY_ROWS } else { 0 };
-        ensure!(self.capacity >= rows && (!decode || (sinks.len() == 40 && selections.len() == 40)),
+        let prewarm: Vec<_> = if decode {
+            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
+                .into_iter().map(|entry| entry.rows).collect()
+        } else { super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity) };
+        ensure!(prewarm.iter().all(|&row| row <= self.capacity) && (!decode || (sinks.len() == 40 && selections.len() == 40)),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;
         let layers: Vec<usize> = self.weights.layers.iter().enumerate()
             .filter_map(|(layer, weights)| (weights.device.id == device).then_some(layer)).collect();
-        let keys: Vec<(usize, u32)> = layers.iter().flat_map(|&layer|
-            (1..=rows).map(move |rows| (layer, rows as u32))).collect();
         let original = self.layer;
         self.set_attention_decode(decode);
         let result = (|| -> Result<()> {
-            self.query.declare_startup(&keys)?;
-            self.router.declare_startup(&keys)?;
-            let mut sparse_keys = Vec::with_capacity(keys.len());
-            for &layer in layers.iter().filter(|_| decode) {
-                self.rebind_startup(layer)?;
-                let tail = StartupAttentionTail { projection: &mut self.projection, block: &mut self.block };
-                let sparse = self.sparse.as_ref().context("startup sparse owner absent")?;
-                for rows in 1..=rows {
-                    sparse_keys.push(sparse.startup_key(layer, rows, sinks[layer], selections[layer], aligned, Some(&tail))?);
-                }
-            }
-            self.sparse.as_mut().context("startup sparse owner absent")?.declare_startup(&sparse_keys)?;
             for &layer in &layers {
                 self.rebind_startup(layer)?;
-                for rows in 1..=rows {
+                self.router.set_local_mode(local[layer])?;
+                for &rows in &prewarm {
                     self.query.capture_startup(rows as u32)?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
                     self.router.capture_startup(rows as u32)?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
                     if !decode { continue; }
                     // SAFETY: only host phase is armed; sparse capture records
                     // stable geometry and never executes its descriptor storage.
@@ -846,11 +866,10 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                         .capture_startup(layer, rows, sinks[layer], selections[layer], aligned, Some(&mut tail)) };
                     self.block.reset();
                     captured?;
+                    crate::shared::decode_graph::device::observe_device(self.weights.library, device)?;
                 }
             }
-            self.query.finish_startup()?;
-            self.router.finish_startup()?;
-            self.sparse.as_mut().context("startup sparse owner absent")?.finish_startup()
+            Ok(())
         })();
         self.block.reset();
         let restored = self.rebind_startup(original);
@@ -910,7 +929,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill,
             capture_routes: false,
             capture_timing: false,
-            retain_small_shapes: false,
             route_capture: Vec::new(),
             ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?,
@@ -933,7 +951,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             sparse: Some(SparseAttentionWave::on_storage(storage.sparse.clone())?), dual_sparse: None,
             capacity: storage.unit as usize, router: first.router.on_storage(storage.router.clone())?,
             layer: storage.first_layer, phase: Phase::Idle, usage_phase: cuteafd_ffi::expert_usage::UsagePhase::Prefill, capture_routes: false, capture_timing: false,
-            retain_small_shapes: false, route_capture: Vec::new(), ffn_split: FfnSplit::default(),
+            route_capture: Vec::new(), ffn_split: FfnSplit::default(),
             layer_clock: LayerClock::new(weights.library, 40)?, l2: None,
         })
     }
@@ -946,6 +964,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// layer, the query/output readiness) are dropped as `invalidate` does;
     /// the next use restarts the lane. Pending work still refuses.
     pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        let was_idle = matches!(self.phase, Phase::Idle | Phase::WindowSelectedIdle);
         self.invalidate();
         self.query.discard_ready();
         self.projection.discard_ready();
@@ -958,6 +977,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         if let Some(projection) = &mut self.tp2_query { projection.select_window(window.clone())?; }
         if let Some(projection) = &mut self.tp2_output { projection.select_window(window.clone())?; }
         self.window = window;
+        if was_idle { self.phase = Phase::WindowSelectedIdle; }
         Ok(())
     }
     #[cfg(test)]
@@ -1394,15 +1414,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn trace_stream(&self) -> *mut std::ffi::c_void { self.block.trace_stream() }
     /// Keep every decode-row graph shape once captured (sticky): speculative
     /// verification varies its row count every round, with or without route capture.
-    pub fn retain_small_graph_shapes(&mut self) {
-        self.retain_small_shapes = true;
-        self.query.enable_small_graph_shapes();
-        if let Some(sparse)=&mut self.sparse { sparse.enable_small_graph_shapes(); }
-        if let Some(dual)=&mut self.dual_sparse { dual.enable_small_graph_shapes(); }
-        self.projection.enable_small_graph_shapes();
-        if let Some(shared) = &mut self.shared { shared.enable_small_graph_shapes(); }
-        self.router.enable_small_graph_shapes();
-    }
     /// Route ids (router ring and per-layer capture) and, with them, the
     /// pass timing: per-layer CUDA events and the FFN stage split. Disabling
     /// after a pass keeps that pass's routes and marks for reading.
@@ -1420,7 +1431,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_routes = routes;
         self.capture_timing = timing;
         self.router.set_ring_capture(routes);
-        if timing { self.retain_small_graph_shapes(); }
         if routes {
             self.route_capture.resize_with(40, Vec::new);
             for rows in &mut self.route_capture { rows.clear(); }
@@ -1467,6 +1477,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub(crate) fn install_expert_usage(&mut self, usage: Option<std::rc::Rc<cuteafd_ffi::expert_usage::ExpertUsage<'a>>>) {
         self.router.install_expert_usage(usage);
     }
+    pub(crate) fn attention_decode(&self) -> bool {
+        matches!(self.usage_phase, cuteafd_ffi::expert_usage::UsagePhase::Decode)
+    }
     pub fn set_attention_decode(&mut self, decode: bool) {
         self.usage_phase = if decode { cuteafd_ffi::expert_usage::UsagePhase::Decode }
             else { cuteafd_ffi::expert_usage::UsagePhase::Prefill };
@@ -1484,8 +1497,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn enable_dual_attention(&mut self,peer:Device<'a>,budgets:[usize;2])->Result<()> {
         ensure!(self.phase==Phase::Idle && self.dual_sparse.is_none(),"dual attention requires an unused lane");
         let source=Device { library:self.weights.library,id:self.query.input().device_id };
-        let mut dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
-        if self.retain_small_shapes { dual.enable_small_graph_shapes(); }
+        let dual=crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionWave::new([source,peer],self.capacity,budgets)?;
         source.run(|| { self.sparse=None; Ok(()) })?;
         self.dual_sparse=Some(dual);Ok(())
     }
@@ -1537,6 +1549,28 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
 mod tests {
     use super::*;
     use cuteafd_loader::read_official_v41_catalog;
+
+    #[test]
+    fn startup_prefill_rearms_only_successfully_selected_idle_lanes() -> Result<()> {
+        for initial in [Phase::Idle, Phase::WindowSelectedIdle] {
+            let mut phase = initial;
+            rearm_startup_prefill(&mut phase)?;
+            assert_eq!(phase, Phase::Idle);
+        }
+        for initial in [Phase::Invalid, Phase::Prepared, Phase::Query, Phase::Ffn,
+            Phase::UnitPending, Phase::SharedReady, Phase::Complete] {
+            let mut phase = initial;
+            assert!(rearm_startup_prefill(&mut phase).is_err());
+            assert_eq!(phase, initial);
+        }
+        let source = include_str!("v41_backbone_lane.rs");
+        let select = source.split("pub(crate) fn select_window(").nth(1).unwrap()
+            .split("#[cfg(test)]").next().unwrap();
+        assert!(select.contains("if was_idle { self.phase = Phase::WindowSelectedIdle; }"));
+        assert!(select.find("self.window = window;").unwrap()
+            < select.find("self.phase = Phase::WindowSelectedIdle").unwrap());
+        Ok(())
+    }
 
     #[test]
     fn replay_capture_never_drains_layer_events_without_profiling() -> Result<()> {

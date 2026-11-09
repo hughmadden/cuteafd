@@ -346,46 +346,12 @@ mod planned_peer_tests {
     }
 }
 
-fn parse_graph_startup_prototype(value: Option<&std::ffi::OsStr>) -> Result<bool> {
-    match value.map(std::ffi::OsStr::to_str) {
-        None | Some(Some("0")) => Ok(false),
-        Some(Some("1")) => Ok(true),
-        _ => anyhow::bail!("CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE must be 0 or 1 (unset means off)"),
-    }
-}
-fn graph_startup_prototype(args: &crate::cli::NativeServeArgs) -> Result<bool> {
-    let value = std::env::var_os("CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE");
-    let enabled = parse_graph_startup_prototype(value.as_deref())?;
-    ensure!(!enabled || (args.rtx_gpus == 2 && !args.tp2_attention
-        && !args.tp2_query_projection && !args.tp2_output_projection),
-        "CUTEAFD_DIAG_GRAPH_STARTUP_PROTOTYPE requires two RTX GPUs with unsplit target attention/query/output");
-    Ok(enabled)
-}
-#[cfg(test)]
-mod graph_startup_tests {
-    use super::parse_graph_startup_prototype;
-    use std::ffi::OsStr;
-    #[test]
-    fn prototype_switch_is_strict_and_default_off() {
-        assert!(!parse_graph_startup_prototype(None).unwrap());
-        assert!(!parse_graph_startup_prototype(Some(OsStr::new("0"))).unwrap());
-        assert!(parse_graph_startup_prototype(Some(OsStr::new("1"))).unwrap());
-        for value in ["", "true", "false", "2", " 1", "1 "] {
-            assert!(parse_graph_startup_prototype(Some(OsStr::new(value))).is_err());
-        }
-        #[cfg(unix)] {
-            use std::os::unix::ffi::OsStrExt;
-            assert!(parse_graph_startup_prototype(Some(OsStr::from_bytes(&[0xff]))).is_err());
-        }
-    }
-}
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<(Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, u32), anyhow::Error>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
-    graph_startup_prototype(&args)?;
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
@@ -411,15 +377,7 @@ fn worker(
     // SAFETY: the configured library remains owned by this worker until all CUDA work drains.
     let lib = unsafe { NativeLibrary::load(&args.native_lib)? };
     let (_, device_total) = lib.cuda_memory_info()?;
-    let small_card = device_total <= 32usize << 30;
     admission::startup_phase(&lib, "v41/context", device_total)?;
-    if small_card {
-        let explicit = std::env::var("CUTEAFD_V41_FIXED_GRAPH_ROWS").ok();
-        if let Some(shapes) = super::graph_policy::profile_fixed_shapes(device_total, explicit.as_deref())? {
-            tracing::info!(?shapes, "V4.1 small-card fixed exact graph set; other rows execute eagerly");
-            super::graph_policy::set_fixed_shapes(shapes)?;
-        }
-    }
     // Local expert waves need an exported AOT capacity; every other row
     // buffer follows the live prefill chunk (as the dual-RTX path does: the
     // FP8 plans keep their full scratch). 2048-row chunks: ~9 GiB less.
@@ -772,6 +730,34 @@ fn worker(
         device_occupied_bytes=occupied, device_budget_bytes=?pool.reservation_bytes,
         "native serving residency ready");
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
+    let mut visit = |f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>| -> Result<()> {
+        pass.visit_graph_banks(f)?;
+        second.visit_graph_banks(f)?;
+        for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+        if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
+        Ok(())
+    };
+    super::graph_policy::attach(&lib, 1, &mut visit)?;
+    unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+        crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
+    drop(visit);
+    let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+    for (site, result) in [("target pass 0", pass.capture_startup(requests.cache(), &local)),
+        ("target pass 1", second.capture_startup(requests.cache(), &local))] {
+        if let Err(error) = result { tracing::warn!(%error, site, "V4.1 best-effort startup graph prewarm failed"); }
+    }
+    for index in super::graph_policy::PREFILL_PREWARM_SLOTS {
+        let (slot, transport) = &mut prefill_slots.slots[index];
+        let local = std::array::from_fn(|layer| transport.has_local_layer(layer));
+        if let Err(error) = slot.capture_startup_prefill(requests.cache(), &local) {
+            tracing::warn!(%error, "V4.1 best-effort nonwindowed prefill prewarm failed");
+        }
+    }
+    if let Some(draft) = &mut draft {
+        if let Err(error) = draft.capture_startup() {
+            tracing::warn!(%error, "V4.1 best-effort draft graph prewarm failed");
+        }
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -781,8 +767,18 @@ fn worker(
     // Every other Ready owner is priced by now: weights, workspaces, KV,
     // transports, BLAS handles, page tables and arena tails. Report the two
     // predicted runtime-base owners against what the device actually holds.
+    unsafe { // SAFETY: startup work is complete and all backing owners remain live.
+        crate::shared::decode_graph::device::observe_completed(&lib, |f| {
+            pass.visit_graph_banks(f)?;
+            second.visit_graph_banks(f)?;
+            for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+            if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) }?;
+    admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
+    crate::shared::memory_report::reconcile::capture("ready");
     ready
         .take()
         .context("startup readiness missing")?

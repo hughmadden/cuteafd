@@ -195,6 +195,15 @@ Ready still includes unused admitted Growth owners, so a negative Ready delta
 need not be an accounting defect. GB10 admission MemAvailable/allocatable samples
 remain separately labelled.
 
+V4.1 publishes provenance for both one- and two-rank startups only after
+measured-pool adoption, and republishes the final plan owners before Ready.
+Its graph reserve remains one canonical `graph reserve` owner per physical
+rank. Request retirement marks local state only: the once-only first_request
+sample runs at the outer joined scheduler boundary after `observe_completed`,
+never inside either independent lane while its peer can still submit work.
+Runtime-base diagnostics subtract measured graph arena growth, not the
+configured reserve. Missing/null measured deltas are unavailable, never a pass.
+
 Spark Ready aggregation uses the reconciled worker resident/workspace and UMA
 host-owner ledger, not the coordinator's empty placeholder plan. Device/pinned
 detail aliases are not charged twice. Its drift basis is launch-relative:

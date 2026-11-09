@@ -291,6 +291,32 @@ mod tests {
     }
 
     #[test]
+    fn v41_admission_owner_reaches_canonical_reconciliation_once_per_rank() {
+        use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
+        use cuteafd_core::memory_policy::DeviceKind;
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let owner = cuteafd_loader::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank).unwrap();
+                let items = [Item { category: Category::Runtime, group: owner.source.clone(),
+                    format: String::new(), bytes: owner.bytes, basis: Basis::Calibrated,
+                    lifetime: ItemLifetime::PostReadyReserve }];
+                let id = format!("rtx{rank}");
+                let owners = cuteafd_loader::placement::reserve::breakdown(&id,
+                    DeviceKind::Gpu, 96 << 30, 0, &items);
+                let graphs: Vec<_> = owners.reserve.iter().filter(|owner| owner.name == "graph reserve").collect();
+                assert_eq!(graphs.len(), 1);
+                assert!(graphs[0].bytes > 0);
+                assert_eq!(graphs[0].bytes, owner.bytes);
+                let (base, _) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
+                let sample = row(&id, Some(i128::from(base)), &owners, Some(base), json!({}), None);
+                assert_eq!(sample["graph_reserve_bytes"], owner.bytes);
+                assert_eq!(sample["graph_reserve_slack"], owner.bytes - base);
+                assert_eq!(sample["delta_vs_measured"], 0);
+            }
+        }
+    }
+
+    #[test]
     fn graph_slack_includes_bounded_extra_charged_before_kv() {
         let policy = cuteafd_loader::placement::graph_reserve::resolve(None, 0, false, 100, 20).unwrap();
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 1000,

@@ -164,7 +164,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     greedy_ready: bool,
     sampling: TargetSamplingWave<'a>,
 }
-impl TargetHeadWave<'_, '_> {
+impl<'a> TargetHeadWave<'a, '_> {
     /// Target verification rows are bounded by the shared V4.1 verifier budget.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
@@ -238,28 +238,41 @@ impl TargetHeadWave<'_, '_> {
         }
         unsafe { self.capture_ready(rows) }
     }
+    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+        self.synchronize()?;
+        for &row in rows {
+            if self.graph(row).is_none() {
+                // SAFETY: recording owns all buffers and never executes its inputs.
+                unsafe { self.capture_ready(row)?; }
+                crate::shared::decode_graph::device::observe_device(self.stream.library, self.b(0).device_id)?;
+            }
+        }
+        Ok(())
+    }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
         self.invalidate();
         ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
             "target head graph for {rows} rows already captured or out of range");
+        let Some(ticket) = self.graphs.cache_ticket(&rows,
+            super::graph_policy::pinned_shape(self.b(0).device_id, rows as u32), None) else { return Ok(()) };
         unsafe {
             self.stream
                 .library
                 .cuda_graph_begin_capture(self.stream.raw)?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: warmup drained and the wave owns every captured pointer.
-                if let Err(error) = unsafe { self.graphs.insert(rows, graph) } {
+                if let Err(error) = unsafe { self.graphs.cache_insert(rows, graph, ticket, nodes as u64, width, spans) } {
                     // SAFETY: failed insertion did not take ownership of graph.
                     unsafe { self.stream.library.cuda_graph_exec_destroy(graph)?; }
                     return Err(error);
                 }
                 Ok(())
             }
-            (Err(e), Ok(graph)) => {
+            (Err(e), Ok((graph, ..))) => {
                 unsafe {
                     self.stream.library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -272,7 +285,7 @@ impl TargetHeadWave<'_, '_> {
     /// Same inputs as execute; live row count must match the captured graph.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<TargetLogits<'_>> {
         self.validate(rows)?;
-        let graph = self.graph(rows).context("target head graph missing")?;
+        let graph = self.graphs.cached_launch(rows).context("target head graph missing")?;
         let launched = unsafe {
             self.stream
                 .library
@@ -377,7 +390,9 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         self.synchronize()?;
         if super::graph_policy::captures_shape(selected.len() as u32) {
-            unsafe { self.capture_block_head(selected.len())?; self.replay(selected.len())?; }
+            if self.graph(selected.len()).is_none() {
+                unsafe { self.capture_block_head(selected.len())?; }
+            } else { unsafe { self.replay(selected.len())?; } }
         } else { unsafe { self.execute(selected.len())?; } }
         self.publish_block(block, selected);
         self.output()
@@ -389,12 +404,13 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         // Warmup and replay consume input copies on this same stream.
         let captured = super::graph_policy::captures_shape(selected.len() as u32);
-        if captured && self.graph(selected.len()).is_none() {
+        let warmed = captured && self.graph(selected.len()).is_none();
+        if warmed {
             unsafe { self.prepare_head_cooperative(selected.len()).await?; }
         }
         self.invalidate();
-        let launched = if captured {
-            let graph = self.graph(selected.len()).context("target head graph missing")?;
+        let launched = if warmed { Ok(()) }
+        else if let Some(graph) = self.graphs.cached_launch(selected.len()).filter(|_| captured) {
             unsafe { self.stream.library.cuda_graph_launch(graph, self.stream.raw) }
         } else { unsafe { self.enqueue(selected.len()) } };
         let drained = self.stream.wait().await;
@@ -408,19 +424,20 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
         let captured = super::graph_policy::captures_shape(rows as u32);
-        if captured && self.graph(rows).is_none() {
+        let warmed = captured && self.graph(rows).is_none();
+        if warmed {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
+        let graph = if captured && !warmed { self.graphs.cached_launch(rows) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let indices = Self::slice(self.b(5), 0, rows * 4)?;
         let scores = Self::slice(self.b(6), 0, rows * 4)?;
         let launched = (|| -> Result<()> { unsafe {
             let lib = self.stream.library;
             if let Some(graph) = graph { lib.cuda_graph_launch(graph, self.stream.raw)?; }
-            else { self.enqueue(rows)?; }
+            else if !warmed { self.enqueue(rows)?; }
             lib.cuda_logits_argmax_checked_f32_async(logits, indices, scores, rows, 129280, self.stream.raw)?;
             let host = self.greedy_staging.bytes_mut();
             lib.copy_d2h_async(&mut host[..rows*4], indices, self.stream.raw)?;
@@ -465,12 +482,13 @@ impl TargetHeadWave<'_, '_> {
         unsafe { self.copy_block(block, selected)?; }
         let rows = selected.len();
         let captured = super::graph_policy::captures_shape(rows as u32);
-        if captured && self.graph(rows).is_none() {
+        let warmed = captured && self.graph(rows).is_none();
+        if warmed {
             if cooperative { unsafe { self.prepare_head_cooperative(rows).await?; } }
             else { self.synchronize()?; unsafe { self.capture_block_head(rows)?; } }
         }
         self.invalidate();
-        let graph = if captured { Some(self.graph(rows).context("target head graph missing")?) } else { None };
+        let graph = if captured && !warmed { self.graphs.cached_launch(rows) } else { None };
         let logits = Self::slice(self.b(4), 0, rows * STRIDES[4])?;
         let staged = self
             .sampling
@@ -478,7 +496,7 @@ impl TargetHeadWave<'_, '_> {
         let launched: Result<()> = staged.and_then(|()| {
             (|| -> Result<()> { unsafe {
                 if let Some(graph) = graph { self.stream.library.cuda_graph_launch(graph, self.stream.raw)?; }
-                else { self.enqueue(rows)?; }
+                else if !warmed { self.enqueue(rows)?; }
                 self.sampling.launch(logits, rows, ordered_rows, self.stream.raw)?;
                 Ok(())
             } })()
@@ -537,8 +555,14 @@ impl TargetHeadWave<'_, '_> {
         // The head remains exclusively borrowed through transfer completion.
         unsafe { self.download.rows(logits, STRIDES[4], rows).await }
     }
+    pub(crate) fn library(&self) -> &'a NativeLibrary { self.stream.library }
     fn graph(&self, rows: usize) -> Option<*mut c_void> {
         self.graphs.get(rows)
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.b(0).device_id, "target_head", false, &mut self.graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.invalidate();

@@ -83,6 +83,10 @@ pub(crate) struct PlacedEngram<'w, 'a> {
     uploads: [Option<DeviceOwner<'a, EngramDeviceRows<'a>>>; 2],
 }
 impl<'w, 'a> PlacedEngram<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        for gate in &mut self.gates { gate.get_mut().visit_graph_banks(f)?; }
+        Ok(())
+    }
     pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
         for gate in &mut self.gates {
             let device = gate.device;

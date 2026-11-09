@@ -226,6 +226,20 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(bank)
     }
+    pub(crate) fn capture_startup_local_producers(&self,
+        windows: &mut [WindowWave<'_, 'a>], sources: &mut [CompressorWave<'_, 'a>], rows: &[usize]) -> Result<()> {
+        ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
+            "startup producer owner count differs");
+        for (wave, state) in windows.iter_mut().zip(&self.windows) {
+            wave.capture_startup(state.get(), rows)?;
+            crate::shared::decode_graph::device::observe_device(state.device.library, state.device.id)?;
+        }
+        for (wave, state) in sources.iter_mut().zip(&self.sources) {
+            wave.capture_startup(state.get(), rows)?;
+            crate::shared::decode_graph::device::observe_device(state.device.library, state.device.id)?;
+        }
+        Ok(())
+    }
     pub(crate) fn capture_startup_producers(&self, windows: &mut [DeviceOwner<'a, WindowWave<'_, 'a>>],
         sources: &mut [DeviceOwner<'a, CompressorWave<'_, 'a>>], rows: &[usize]) -> Result<()> {
         ensure!(windows.len() == self.windows.len() && sources.len() == self.sources.len(),
@@ -234,11 +248,13 @@ impl<'a> BackboneCache<'a> {
             ensure!(wave.device.id == state.device.id, "startup window device differs");
             let device = wave.device;
             device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+            crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
         }
         for (wave, state) in sources.iter_mut().zip(&self.sources) {
             ensure!(wave.device.id == state.device.id, "startup compressor device differs");
             let device = wave.device;
             device.run(|| wave.get_mut().capture_startup(state.get(), rows))?;
+            crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
         }
         Ok(())
     }

@@ -63,6 +63,45 @@ def test_invalid_trace_fails(change):
         MODULE.generate([data], "glm5")
 
 
+
+
+
+
+
+
+@pytest.mark.parametrize("site,shape,expected", [
+    ("window", "(16, 987654321)", ("row", 16, 0)),
+    ("compressor", "(1, 998)", ("row", 1, 0)),
+    ("index_selection", "[7, 16, 100, 200, 300, 1, 500, 512, 0, 1]", ("row", 16, 0)),
+    ("sparse_attention", "(7, [7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("sparse_attention", "(7, [18446744073709551615, 7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("dual_attention_tail", "(7, [100, 200, 300, 16, 500])", ("row", 16, 0)),
+    ("target_head", "112", ("row", 112, 0)),
+    ("dspark_chain", "(16, 7)", ("draft", 16, 7)),
+    ("dspark_distributed_terminal", "(5, 1, 16)", ("draft", 16, 5)),
+    ("dspark_cache", "()", None),
+])
+def test_v41_native_site_axes(site, shape, expected):
+    assert MODULE.v41_geometry(shape, set(range(1, 65)) | {128}, "deepseek_v41." + site) == expected
+
+
+@pytest.mark.parametrize("site,shape", [
+    ("dspark_chain", "(5, 16)"),
+    ("dspark_distributed_terminal", "(7, 2, 16)"),
+    ("window", "(987654321, 16)"),
+    ("index_selection", "[7, 16]"),
+    ("sparse_attention", "(7, [1, 2, 3])"),
+    ("unknown", "16"),
+])
+def test_v41_unknown_or_invalid_axes_fail(site, shape):
+    with pytest.raises(ValueError):
+        MODULE.v41_geometry(shape, set(range(1, 65)), "deepseek_v41." + site)
+
+
+
+
+
+
 def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0,
                 site="glm5_flash.decode", capture_bytes=1 << 20):
     return {"device": 0, "site": site, "bank": 1,
@@ -362,6 +401,14 @@ def test_latest_snapshot_row_wins_within_the_same_histogram_interval():
         assert not any(entry["pin"] for entry in MODULE.generate(inputs, "glm5")["entries"])
 
 
+
+
+
+
+
+
+
+
 def context_trace(device=0):
     """A two-rank trace: the context placement records each rank's half table."""
     data = trace(device=device)
@@ -408,11 +455,10 @@ def test_generator_prefix_matches_shared_engine_graph_site(family):
     assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
 
 
-@pytest.mark.parametrize("family", ["deepseek_v41"])
-def test_native_family_schemas_are_not_advertised_as_glm_consumers(family):
-    assert family not in MODULE.SITE_PREFIX
-    with pytest.raises(ValueError, match="no checked-in shape-list consumer"):
-        MODULE.generate([trace()], family)
+def test_v41_uses_its_layout_schema_not_a_glm_prefix_consumer():
+    assert "deepseek_v41" not in MODULE.SITE_PREFIX
+    with pytest.raises(ValueError, match="deepseek_v41 requires --layout 1 or 2"):
+        MODULE.generate([trace()], "deepseek_v41")
 
 
 def test_flash_is_not_advertised_as_a_glm_prefix_consumer():
@@ -864,3 +910,96 @@ def test_v4_shape_needs_one_trace_per_rank():
 def test_v4_unknown_layout_fails():
     with pytest.raises(ValueError):
         MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx4", existing=v4_list())
+
+
+def v41_graph(rows=1, *, hits=10, cost=1234, bank=1, key_id=1, site="lane_row", cycles=None):
+    return {"site": "deepseek_v41." + site, "shape": str((7, rows)), "hits": hits,
+            "capture_bytes": cost, "bank": bank, "key_id": key_id,
+            "cycles": {"verify": hits + 1} if cycles is None else cycles}
+
+
+def v41_trace(device=0, graphs=None, sampled=1):
+    return {"schema_version": 2, "cache": {"device": device, "charged": 999999999,
+            "sampled_at_ms": sampled}, "graphs": [v41_graph()] if graphs is None else graphs}
+
+
+def test_v41_replays_select_whole_geometry_but_not_capture_only_geometry():
+    hot = v41_graph()
+    sibling = v41_graph(hits=0, cost=4000, bank=2)
+    cold = v41_graph(rows=16, hits=0, cost=999999, key_id=2)
+    report = []
+    result = MODULE.generate([v41_trace(graphs=[hot, hot, sibling, cold])], "deepseek_v41", layout=1, pin_report=report)
+    rank = result["ranks"][0]
+    assert rank["entries"] == [{"rows": 1, "pin": False}]
+    assert rank["reserve_base_bytes"] == 2 << 20
+    assert rank["reserve_extra_bytes"] == 2 << 20
+    assert report[0]["capture_bytes"] == 5234
+    assert report[0]["zero_replay_sibling_bytes"] == 4000
+    assert report[0]["zero_replay_sibling_identities"] == 1
+
+
+def test_v41_latest_inventory_and_exact_ids_win_independently_per_rank():
+    old = v41_trace(graphs=[v41_graph(cost=99999999)], sampled=1)
+    new = v41_trace(graphs=[v41_graph(cost=0), v41_graph(cost=2345, key_id=2)], sampled=2)
+    second = v41_trace(device=1, graphs=[v41_graph(cost=5 << 20)])
+    for inputs in [[old, new, second], [second, new, old]]:
+        result = MODULE.generate(inputs, "deepseek_v41", layout=2)
+        assert [rank["reserve_base_bytes"] for rank in result["ranks"]] == [2 << 20, 6 << 20]
+
+
+@pytest.mark.parametrize("value", [None, True, False, -1, 1.5, "1"])
+def test_v41_capture_shares_are_strict_nonnegative_integers(value):
+    with pytest.raises(ValueError, match="capture_bytes"):
+        MODULE.generate([v41_trace(graphs=[v41_graph(cost=value)])], "deepseek_v41", layout=1)
+
+
+def test_v41_missing_share_and_missing_replay_count_fail():
+    for field in ["capture_bytes", "hits"]:
+        graph = v41_graph()
+        del graph[field]
+        with pytest.raises(ValueError, match=field):
+            MODULE.generate([v41_trace(graphs=[graph])], "deepseek_v41", layout=1)
+
+
+def test_v41_unreachable_full_chunk_is_not_a_pin():
+    replay = v41_graph(128, hits=1, cycles={"prefill": 2})
+    chunk = v41_graph(2752, hits=0, key_id=2, cycles={"other": 1})
+    rank = MODULE.generate([v41_trace(graphs=[replay, chunk])], "deepseek_v41", layout=1, prefill_rows=2752)["ranks"][0]
+    assert rank["prefill_entries"] == [{"rows": 128, "pin": True}]
+    chunk["cycles"] = {"prefill": 1}
+    rank = MODULE.generate([v41_trace(graphs=[replay, chunk])], "deepseek_v41", layout=1, prefill_rows=2752)["ranks"][0]
+    assert rank["prefill_entries"] == [{"rows": 128, "pin": True}, {"rows": 2752, "pin": True}]
+
+
+def test_v41_unknown_layout_or_missing_rank_has_no_fallback():
+    for layout in [None, 0, 2, 3]:
+        with pytest.raises(ValueError):
+            MODULE.generate([v41_trace()], "deepseek_v41", layout=layout)
+
+
+@pytest.mark.parametrize("width", [5, 7])
+def test_v41_flattened_draft_heads_keep_their_owner_and_cost(width):
+    graphs = []
+    for count in range(1, 17):
+        draft = v41_graph(hits=1, key_id=count, site="dspark_chain")
+        draft["shape"] = str((count, width))
+        head = v41_graph(hits=1000, key_id=count, site="target_head")
+        head["shape"] = str(count * width)
+        graphs.extend([draft, head])
+    rank = MODULE.generate([v41_trace(graphs=graphs)], "deepseek_v41", layout=1, coverage=0.01)["ranks"][0]
+    owners = {entry["requests"] * entry["width"] for entry in rank["draft_entries"]}
+    assert {count * width for count in range(1, 17) if count * width > 64} <= owners
+    head = v41_graph(site="target_head")
+    head["shape"] = "112"
+    with pytest.raises(ValueError, match="lack an observed"):
+        MODULE.generate([v41_trace(graphs=[head])], "deepseek_v41", layout=1)
+
+
+def test_v41_stale_histogram_cannot_pin_and_current_histogram_can():
+    graph = v41_graph()
+    graph["first_seen_ms"] = 0
+    graph["hit_histogram"] = {"start_ms": 0, "interval_ms": 10_000, "counts": [1] * 5}
+    for sampled, pinned in [(40_000, True), (500_000, False)]:
+        rank = MODULE.generate([v41_trace(graphs=[graph], sampled=sampled)],
+                               "deepseek_v41", layout=1)["ranks"][0]
+        assert rank["entries"][0]["pin"] is pinned

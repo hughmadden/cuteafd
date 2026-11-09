@@ -125,45 +125,13 @@ impl<'a> DsparkFfn<'_, 'a> {
         }
     }
     /// # Safety
-    /// Same initialized-input contract as execute; captures only owned addresses.
-    pub unsafe fn capture(&mut self, rows: u32) -> Result<()> {
-        ensure!(self.graph.is_none(), "dSpark FFN graph already captured");
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.boundary.invalidate();
-        unsafe {
-            self.library
-                .cuda_graph_begin_capture(self.stream()?)?;
-        }
-        let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.stream()?) };
-        self.boundary.invalidate();
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
-                    tracing::error!(%cleanup,"destroying failed dSpark FFN capture");
-                }
-                Err(error)
-            }
-            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same initialized-input contract as execute; rows must match capture.
     pub unsafe fn replay(&mut self, rows: u32) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.boundary.invalidate();
-        let (graph, captured_rows) = self.graph.get().context("dSpark FFN graph was not captured")?;
-        ensure!(
-            rows == captured_rows,
-            "dSpark FFN replay rows differ from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         let launched = unsafe { self.library.cuda_graph_launch(graph, self.stream()?) };
         let drained = self.synchronize();
         crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
@@ -179,5 +147,12 @@ impl Drop for DsparkFfn<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark ffn");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark ffn graphs");
+    }
+}
+
+impl DsparkFfn<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_ffn", self.peer_stream().is_some(), &mut self.graph)?;
+        Ok(())
     }
 }

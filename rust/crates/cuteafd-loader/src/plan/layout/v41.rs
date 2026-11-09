@@ -175,7 +175,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             reserves.push(Opaque { location: Location::coordinator(gpu as u8), bytes, basis,
                 lifetime: Lifetime::RESIDENT, source: source.into() });
         }
-        reserves.extend(admission::growth_allowances(total, ranks, gpu as u8));
+        reserves.push(admission::graph_allowance(ranks, gpu)?);
     }
     if let Some(draft) = &draft {
         startup.extend(owners.draft_load_phases(draft)?.iter().map(Owner::from_demand));
@@ -355,10 +355,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lazy_graph_reserves_remain_separate_from_native_code_and_blas() {
-        let growth = admission::growth_allowances(96 * GIB, 2, 0);
-        assert!(growth.iter().any(|owner| owner.bytes == 1472 << 20
-            && owner.lifetime.first == crate::placement::planner::Phase::Ready));
+    fn graph_reserve_stays_separate_from_native_code_and_blas() {
+        let owner = admission::graph_allowance(1, 0).unwrap();
+        let (base, tail) = crate::placement::graph_reserve::v41_default(1, 0);
+        assert_eq!(owner.bytes, crate::placement::graph_reserve::current(0, false, base, tail).unwrap().bytes);
+        assert_eq!(owner.lifetime.first, crate::placement::planner::Phase::Ready);
+        assert_eq!(owner.source, "graph reserve: v41.graphs.0");
     }
 
     /// The recipe's KV decomposition is the allocator's own total at every

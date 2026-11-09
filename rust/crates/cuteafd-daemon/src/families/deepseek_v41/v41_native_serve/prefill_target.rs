@@ -299,6 +299,38 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 
     fn execute(&mut self, cursor: &mut Self::Cursor, unit: &PrefillUnit<V41Unit>) -> Result<Option<RetainedScores>> {
+        let result = (|| self.execute_unit(cursor, unit))();
+        let measured = unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(self.lib, |f| {
+            for (pass, _) in &mut self.prefill.slots { pass.visit_graph_banks(f)?; }
+            if let Some(draft) = self.draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) };
+        result.and_then(|output| measured.map(|()| output))
+    }
+
+    fn observe(&mut self, unit: &PrefillUnit<V41Unit>, took: Duration) {
+        self.times.observe(unit.work.kind(), unit.rows, took);
+    }
+
+    fn abort_and_drain(&mut self, _cursor: &mut Self::Cursor) -> Result<()> {
+        // Batch failures discard locally; stream/commit helpers settle their lanes.
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(self.lib, |f| {
+            for (pass, _) in &mut self.prefill.slots { pass.visit_graph_banks(f)?; }
+            if let Some(draft) = self.draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) }
+    }
+}
+
+impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
+    fn execute_unit(&mut self, cursor: &mut V41Prefill<P::Suffix>, unit: &PrefillUnit<V41Unit>) -> Result<Option<RetainedScores>> {
+        crate::families::deepseek_v41::graph_policy::cycle(
+            crate::shared::decode_graph::device::Cycle::Prefill, |f| {
+                for (pass, _) in &mut self.prefill.slots { pass.visit_graph_banks(f)?; }
+                Ok(())
+            })?;
         super::scheduler::stall::tick();
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         self.initialize(cursor)?;
@@ -419,14 +451,6 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
         Ok(None)
     }
 
-    fn observe(&mut self, unit: &PrefillUnit<V41Unit>, took: Duration) {
-        self.times.observe(unit.work.kind(), unit.rows, took);
-    }
-
-    fn abort_and_drain(&mut self, _cursor: &mut Self::Cursor) -> Result<()> {
-        // Batch failures discard locally; the stream and commit helpers drain their own lanes.
-        Ok(())
-    }
 }
 
 /// The prefill slots (PLAN "Prefill contract"), apart from the decode lanes:
@@ -457,6 +481,7 @@ impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
 }
 
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
+    fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>;
     type Suffix;
     /// The one prefill transport (PLAN "Prefill contract"): its return slots
     /// hold the in-flight units' waves. Slot 0's FFN owner holds it.
@@ -505,6 +530,9 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()>;
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
+    fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        self.visit_graph_banks(f)
+    }
     type Suffix = EncoderSuffix<'a>;
     type PrefillLink = crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> { transport.take_link() }
@@ -567,6 +595,9 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
 }
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
+    fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        self.visit_graph_banks(f)
+    }
     type Suffix = DeviceOwner<'a, EncoderSuffix<'a>>;
     type PrefillLink = DeviceOwner<'a, crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>>;
     fn take_link(transport: &mut Self::Transport) -> Result<Self::PrefillLink> {

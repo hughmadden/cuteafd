@@ -164,42 +164,6 @@ impl<'a> DsparkStage<'_, 'a> {
         self.output()
     }
     /// # Safety
-    /// Same initialization contract as execute; captured ring storage is bound to
-    /// this unique window owner and revalidated before every replay.
-    pub unsafe fn capture(
-        &mut self,
-        window: &DsparkWindow<'_>,
-        requests: &[(WindowLease, u64)],
-    ) -> Result<()> {
-        self.invalidate();
-        ensure!(self.graph.is_none(), "dSpark stage already captured");
-        unsafe {
-            self.execute(window, requests)?;
-        }
-        let read = self.prepare(window, requests)?;
-        unsafe {
-            self.library.cuda_graph_begin_capture(self.ffn.stream()?)?;
-        }
-        let launched = unsafe { self.enqueue(&read, requests.len()) };
-        let captured = unsafe { self.library.cuda_graph_end_capture(self.ffn.stream()?) };
-        self.invalidate();
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert((requests.len(), read.owner), graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                unsafe {
-                    self.library.cuda_graph_exec_destroy(graph)?;
-                }
-                Err(error)
-            }
-            (Err(first), Err(second)) => Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
-            (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same contract as execute; request count and cache owner must match capture.
     pub unsafe fn replay(
         &mut self,
@@ -207,17 +171,16 @@ impl<'a> DsparkStage<'_, 'a> {
         requests: &[(WindowLease, u64)],
     ) -> Result<[CuteafdDeviceBuffer; 2]> {
         let read = self.prepare(window, requests)?;
-        let (graph, (count, owner)) = self.graph.get().context("dSpark stage not captured")?;
-        ensure!(
-            count == requests.len() && owner == read.owner,
-            "dSpark stage capture binding differs"
-        );
+        let Some(graph) = self.graph.cached_launch(&(requests.len(), read.owner)) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(window, requests) };
+        };
         self.attention.upload(&read, requests)?;
         let launched = unsafe { self.library.cuda_graph_launch(graph, self.ffn.stream()?) };
         let drained = self.ffn.synchronize();
         crate::families::deepseek_v41::v41_experts::dspark::settle(launched, drained)?;
         unsafe {
-            self.ffn.complete_replay(count as u32 * self.width as u32)?;
+            self.ffn.complete_replay(requests.len() as u32 * self.width as u32)?;
         }
         self.ready = true;
         self.output()
@@ -232,5 +195,14 @@ impl Drop for DsparkStage<'_, '_> {
         fatal_drain(self.ffn.synchronize(), "dSpark stage");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark stage graphs");
+    }
+}
+
+impl DsparkStage<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.inputs()[0].device_id, "dspark_stage", self.peer_stream().is_some(), &mut self.graph)?;
+        self.ffn.visit_graph_banks(f)?;
+        self.attention.visit_graph_banks(f)?;
+        Ok(())
     }
 }

@@ -192,7 +192,9 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
-    target.and(speculative.map(|_| ())).and(state)
+    let retired = target.and(speculative.map(|_| ())).and(state);
+    requests.mark_retired(retired.is_ok() && request.finished && !request.failed);
+    retired
 }
 
 /// Allocate the optional pinned pool before signalling HTTP readiness. A bad
@@ -847,6 +849,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut media_ready = std::collections::VecDeque::new();
     let result = crate::shared::api::run_scheduler(|| {
     loop {
+        unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(lib, |f| {
+            first.visit_graph_banks(f)?;
+            second.visit_graph_banks(f)?;
+            for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+            if let Some(draft) = draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) }?;
+        requests.reconcile_completed();
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
@@ -2052,7 +2063,6 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
-    if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
     let seeds = members.iter().map(|&slot| {
         let r = active[slot].as_ref().unwrap();
         Ok((r.id(), r.anchor, requests.cache().committed_end(r.lease)?, r.job.max_tokens-r.generated))

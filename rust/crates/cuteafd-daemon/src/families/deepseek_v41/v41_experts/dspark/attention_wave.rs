@@ -268,42 +268,6 @@ impl DsparkAttentionWave<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute. The graph may only replay against this
-    /// window owner, revalidated on every call; destruction never reads its ring.
-    pub unsafe fn capture(
-        &mut self,
-        window: &DsparkWindow<'_>,
-        requests: &[(WindowLease, u64)],
-    ) -> Result<()> {
-        ensure!(self.graph.is_none(), "attention wave already captured");
-        unsafe {
-            self.execute(window, requests)?;
-        }
-        let read = self.prepare(window, requests)?;
-        unsafe {
-            self.standalone.device
-                .library
-                .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
-        }
-        let launched = unsafe { self.enqueue_on(&read, requests.len() as u32, self.standalone.get()?.raw) };
-        let captured = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
-        match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert((requests.len() as u32, read.owner), graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup,"destroying failed attention wave capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; cache owner and captured request count must match.
     pub unsafe fn replay(
         &mut self,
@@ -311,11 +275,10 @@ impl DsparkAttentionWave<'_, '_> {
         requests: &[(WindowLease, u64)],
     ) -> Result<CuteafdDeviceBuffer> {
         let read = self.prepare(window, requests)?;
-        let (graph, (count, owner)) = self.graph.get().context("attention wave not captured")?;
-        ensure!(
-            count as usize == requests.len() && owner == read.owner,
-            "attention wave capture binding differs"
-        );
+        let Some(graph) = self.graph.cached_launch(&(requests.len() as u32, read.owner)) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(window, requests) };
+        };
         self.upload(&read, requests)?;
         let launched = unsafe {
             self.standalone.device
@@ -324,7 +287,7 @@ impl DsparkAttentionWave<'_, '_> {
         };
         let drained = self.synchronize();
         launched.and(drained)?;
-        self.ready = Some(count);
+        self.ready = Some(requests.len() as u32);
         self.output()
     }
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
@@ -350,4 +313,15 @@ fn wide_drafter_uses_its_own_flattened_cover() {
     assert_eq!(DsparkAttentionWave::projection_capacity_with_width(16, 5).unwrap(),
         cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32);
     assert!(DsparkAttentionWave::projection_capacity_with_width(33, 7).is_err());
+}
+
+impl DsparkAttentionWave<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_attention_wave", false, &mut self.graph)?;
+        self.qa.visit_graph_banks(f)?;
+        self.qb.visit_graph_banks(f)?;
+        self.kv.visit_graph_banks(f)?;
+        self.output.visit_graph_banks(f)?;
+        Ok(())
+    }
 }

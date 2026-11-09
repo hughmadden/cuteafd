@@ -107,8 +107,28 @@ pub(crate) struct Requests<'a> {
     prefetched: prefetch::PrefetchSlot<CacheLease, EngramWave>,
     /// Requests released so far; admission waiters retry when it moves.
     releases: u64,
+    reconciliation: FirstRequestReconciliation,
+}
+/// Retirement only marks local state. The joined scheduler samples once after
+/// completed graph observation; a lane must never sample while its peer runs.
+#[derive(Default)]
+struct FirstRequestReconciliation { retired: bool, sampled: bool }
+impl FirstRequestReconciliation {
+    fn retire(&mut self, successful: bool) { self.retired |= successful; }
+    fn completed_boundary(&mut self) -> bool {
+        if !self.retired || self.sampled { return false }
+        self.sampled = true;
+        true
+    }
 }
 impl<'a> Requests<'a> {
+    pub(crate) fn mark_retired(&mut self, successful: bool) { self.reconciliation.retire(successful); }
+    pub(crate) fn reconcile_completed(&mut self) {
+        if self.reconciliation.completed_boundary() {
+            crate::shared::memory_report::reconcile::capture("first_request");
+        }
+    }
+
     pub fn engram_host_formulas(&self) -> [(&'static str, u64); 2] {
         let shape = self.pipeline.shape();
         [("v41/engram-prefill", shape.host_resident_bytes() as u64),
@@ -139,6 +159,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            reconciliation: Default::default(),
         })
     }
     pub fn new_distributed(
@@ -159,6 +180,7 @@ impl<'a> Requests<'a> {
             image_requests: 0,
             prefetched: Default::default(),
             releases: 0,
+            reconciliation: Default::default(),
         })
     }
     pub fn cache(&self) -> &BackboneCache<'a> {
@@ -168,7 +190,7 @@ impl<'a> Requests<'a> {
         pages:[usize;4],map:crate::families::deepseek_v41::v41_backbone_cache::CachePlacement,budgets:[usize;2])->Result<Self> {
         Ok(Self { cache:BackboneCache::new_replicated(library,map,slots,pages,budgets)?,
             prefix_leases:[None,None],pipeline,slots:(0..slots).map(|_|None).collect(),units:vec![Vec::new();slots],
-            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0 })
+            released_units:Vec::new(),image_requests:0, prefetched: Default::default(),releases:0, reconciliation: Default::default() })
     }
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
@@ -969,3 +991,20 @@ mod tests {
 #[cfg(test)]
 mod image_tests;
 
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::FirstRequestReconciliation;
+    #[test]
+    fn retirement_marks_only_and_joined_boundary_samples_once() {
+        let mut state = FirstRequestReconciliation::default();
+        assert!(!state.completed_boundary());
+        state.retire(false);
+        assert!(!state.completed_boundary());
+        state.retire(true);
+        assert!(!state.sampled, "retirement inside a live lane must not sample");
+        assert!(state.completed_boundary());
+        state.retire(true);
+        assert!(!state.completed_boundary());
+    }
+}

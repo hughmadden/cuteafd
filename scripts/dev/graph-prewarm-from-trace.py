@@ -64,6 +64,7 @@ the heat report prints each class's keys and arena bytes. The engine warms the
 entries its pool can express and skips the rest.
 """
 import argparse
+import ast
 import json
 import re
 from pathlib import Path
@@ -88,6 +89,18 @@ QWEN_GEOMETRY = re.compile(
     r"GraphKey \{ segment: (\d+), rows: (\d+), spec: (true|false), long: (true|false), "
     r"pool_width: (\d+), page_stride: (\d+), pool_stride: (\d+) \}")
 QWEN_SHAPES = ("single_0spark", "single_sparks", "dual_0spark", "dual_sparks")
+
+
+V41_DECODE_ROWS = 64
+V41_REPLAY_ROWS = 128
+V41_PRODUCERS = {"window", "compressor"}
+V41_HEADS = {"target_head", "target_norm", "vocabulary_logits", "vocabulary_greedy"}
+V41_LAYER_ROWS = {
+    "lane_row", "lane_prefill", "attention.query", "attention.query.tp2_prefix",
+    "attention.output", "backbone.shared", "router.remote", "router.local", "index.query",
+    "projection.query.rank", "projection.query.gather",
+    "projection.output.rank", "projection.output.gather", "tp2_ffn",
+}
 
 
 def packed(value):
@@ -350,15 +363,59 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
             "layouts": layouts}
 
 
-def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None,
-             existing=None, heat_report=None):
-    if family == "deepseek_v4":
-        return generate_deepseek_v4(traces, layout, existing, coverage, pin_frequency, pin_report,
-                                    heat_report)
-    if family == "glm5_flash":
-        if layout is not None:
-            raise ValueError("--layout applies to mistral_large4 only")
-        return generate_glm5_flash(traces, coverage, pin_frequency)
+def v41_geometry(shape, allowed, site):
+    """Decode native Debug keys by site, never by guessing an integer axis.
+
+    Pointer/fingerprint axes identify executables, but startup consumes row
+    preferences and (request count, draft width) preferences, not addresses.
+    """
+    def integers(value, length=None):
+        return isinstance(value, (tuple, list)) and (length is None or len(value) == length) and all(type(v) is int and v >= 0 for v in value)
+
+    try:
+        value = ast.literal_eval(shape)
+    except (SyntaxError, ValueError) as error:
+        raise ValueError(f"cannot parse V4.1 geometry at site {site}: {shape!r}") from error
+    name = site.removeprefix("deepseek_v41.")
+    if name == "dspark_cache" and value == ():
+        return None
+    if name in {"dspark_chain", "dspark_distributed_terminal"}:
+        if name == "dspark_chain" and integers(value, 2):
+            count, width = value
+        elif name == "dspark_distributed_terminal" and integers(value, 3) and value[1] in (0, 1):
+            width, _, count = value
+        else:
+            raise ValueError(f"invalid V4.1 draft geometry at {site}: {shape!r}")
+        if not 1 <= count <= V41_DECODE_ROWS or width not in (5, 7):
+            raise ValueError(f"invalid V4.1 draft axes at {site}: {shape!r}")
+        return ("draft", count, width)
+    if name in V41_PRODUCERS and integers(value, 2):
+        rows = value[0]
+    elif name in V41_LAYER_ROWS and integers(value, 2):
+        rows = value[1]
+    elif name in V41_HEADS | {"target_embedding", "engram.gate"} and type(value) is int:
+        rows = value
+    elif name == "index_selection" and integers(value) and len(value) >= 9:
+        rows = value[1]
+    elif name in {"sparse_attention", "dual_attention_tail"} and isinstance(value, tuple) and len(value) == 2 and type(value[0]) is int and integers(value[1]):
+        fingerprint = value[1]
+        if name == "dual_attention_tail" and len(fingerprint) >= 2:
+            rows = fingerprint[-2]
+        elif name == "sparse_attention" and len(fingerprint) >= 5:
+            rows = fingerprint[2] if fingerprint[0] in (2**32 - 1, 2**64 - 1) else fingerprint[1]
+        else:
+            raise ValueError(f"invalid V4.1 fingerprint at {site}: {shape!r}")
+    else:
+        raise ValueError(f"cannot parse V4.1 geometry at site {site}: {shape!r}")
+    # TP2 draft heads flatten count * width into a row axis.
+    head_rows = {count * width for count in range(1, V41_DECODE_ROWS + 1) for width in (5, 7)}
+    if rows not in allowed and not (name in V41_HEADS and rows in head_rows):
+        raise ValueError(f"V4.1 row width {rows} at site {site} is outside the prewarm domain")
+    return ("row", rows, 0)
+
+
+
+def generate_glm5(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None, layout=None):
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
         raise ValueError(f"no checked-in shape-list consumer for {family}; qwen4 is keyed by --shape")
@@ -485,6 +542,137 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
         result["layout"] = layout
     result.update({"reserve_base_bytes": base, "reserve_extra_bytes": extra, "entries": entries})
     return result
+
+
+def generate_v41(traces, coverage, pin_frequency, prefill_rows, pin_report, layout):
+    if layout not in (1, 2):
+        raise ValueError("deepseek_v41 requires --layout 1 or 2")
+    if not 0 < coverage <= 1 or not 0 < pin_frequency <= 1:
+        raise ValueError("coverage and pin frequency must be in (0, 1]")
+    if prefill_rows is not None and not 1 <= prefill_rows <= 4096:
+        raise ValueError("prefill rows must be in 1..4096")
+    prefill = {V41_REPLAY_ROWS}
+    if prefill_rows is not None:
+        prefill.add(prefill_rows)
+    allowed = set(range(1, V41_DECODE_ROWS + 1)) | prefill
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        device = trace["cache"]["device"]
+        if type(device) is not int or not 0 <= device < layout:
+            raise ValueError("trace device is outside the declared layout")
+        sampled = trace["cache"].get("sampled_at_ms", 0)
+        if device not in latest or sampled >= latest[device][0]:
+            latest[device] = (sampled, trace)
+    if set(latest) != set(range(layout)):
+        raise ValueError("need a complete trace inventory for every layout rank")
+    identities = {}
+    drafts = set()
+    exercised_prefill = set()
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if not graph["site"].startswith("deepseek_v41."):
+                continue
+            cost = graph.get("capture_bytes")
+            if type(cost) is not int or cost < 0:
+                raise ValueError("capture_bytes must be a nonnegative integer for every identity")
+            hits = graph.get("hits")
+            if type(hits) is not int or hits < 0:
+                raise ValueError("hits must be a nonnegative integer (capture counts are not replays)")
+            geometry = v41_geometry(graph["shape"], allowed, graph["site"])
+            identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+            identities[identity] = (geometry, graph)
+            if geometry and geometry[0] == "draft":
+                drafts.add(geometry)
+            if geometry and geometry[0] == "row" and geometry[1] in prefill:
+                if graph.get("cycles", {}).get("prefill", 0) > 0:
+                    exercised_prefill.add(geometry[1])
+    if not identities:
+        raise ValueError("trace contains no matching graph identities")
+
+    def geometries(geometry, graph):
+        if geometry is None:
+            return set()
+        kind, rows, _ = geometry
+        if kind == "draft":
+            return {geometry}
+        name = graph["site"].removeprefix("deepseek_v41.")
+        keys = set()
+        if rows <= V41_DECODE_ROWS:
+            keys.add(geometry)
+        if rows in exercised_prefill:
+            keys.add(("prefill", rows, 0))
+        if name in V41_HEADS:
+            owners = {key for key in drafts if key[1] * key[2] == rows}
+            if rows > V41_DECODE_ROWS and rows not in exercised_prefill and not owners and graph["hits"]:
+                raise ValueError(f"flattened draft-head rows {rows} lack an observed draft_entries owner")
+            keys.update(owners)
+        return keys
+
+    counts, reasons = {}, {}
+    for identity, (geometry, graph) in identities.items():
+        # A startup capture is not demand. Only actual replay selects geometry.
+        if not graph["hits"] or not any(graph.get("cycles", {}).get(c, 0) for c in ("decode", "verify", "prefill")):
+            continue
+        for key in geometries(geometry, graph):
+            counts[key] = counts.get(key, 0) + graph["hits"]
+            why = reasons.setdefault(key, set())
+            histogram = graph.get("hit_histogram", {})
+            histogram_end = int(histogram.get("start_ms", 0)) + len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+            if histogram_end >= latest[identity[0]][0] and sustained(graph):
+                why.add("sustained_heat")
+            if graph.get("evictions", 0) >= 2 and graph.get("recaptures", 0) >= 2:
+                why.add("repeated_recapture")
+    selected, covered = set(), 0
+    for key in sorted(counts, key=lambda key: (-counts[key], key)):
+        selected.add(key)
+        covered += counts[key]
+        if covered >= sum(counts.values()) * coverage:
+            break
+    selected.update(key for key, why in reasons.items() if why)
+    # Exact repeated chunk/replay captures may have no hit in a short trace,
+    # but only when the workload actually exercised their prefill geometry.
+    selected.update(("prefill", rows, 0) for rows in exercised_prefill)
+    for geometry, graph in identities.values():
+        if graph["hits"] and geometry and geometry[0] == "row" and geometry[1] > V41_DECODE_ROWS:
+            selected.update(key for key in geometries(geometry, graph) if key[0] == "draft")
+    ranks = []
+    for device in range(layout):
+        inventory = [(geometry, graph) for identity, (geometry, graph) in identities.items() if identity[0] == device]
+        present = set().union(*(geometries(geometry, graph) for geometry, graph in inventory))
+        keys = selected & present
+        chosen = [graph for geometry, graph in inventory if geometries(geometry, graph) & keys
+                  or (geometry is None and any(key[0] == "draft" for key in keys))]
+        capture = sum(graph["capture_bytes"] for graph in chosen)
+        zero = [graph for graph in chosen if not graph["hits"]]
+        rank = {"rank": device, "reserve_base_bytes": packed(capture), "reserve_extra_bytes": CHUNK,
+                "entries": [{"rows": rows, "pin": bool(reasons.get((kind, rows, width)))}
+                            for kind, rows, width in sorted(keys) if kind == "row"],
+                "prefill_entries": [{"rows": rows, "pin": True} for kind, rows, _ in sorted(keys) if kind == "prefill"],
+                "draft_entries": [{"requests": rows, "width": width, "pin": bool(reasons.get((kind, rows, width)))}
+                                  for kind, rows, width in sorted(keys) if kind == "draft"]}
+        ranks.append(rank)
+        if pin_report is not None:
+            pin_report.append({"device": device, "capture_bytes": capture, "identities": len(chosen),
+                               "zero_replay_sibling_bytes": sum(graph["capture_bytes"] for graph in zero),
+                               "zero_replay_sibling_identities": len(zero),
+                               "cost_basis": "measured step growth, split by estimate within shared steps"})
+    return {"schema_version": 2, "family": "deepseek_v41", "layout": layout, "ranks": ranks}
+
+
+def generate(traces, family, coverage=0.999, pin_frequency=0.9, prefill_rows=None, pin_report=None, layout=None, existing=None, heat_report=None):
+    if family == "deepseek_v4":
+        return generate_deepseek_v4(traces, layout, existing, coverage, pin_frequency, pin_report, heat_report)
+    if family == "glm5_flash":
+        if layout is not None:
+            raise ValueError("--layout applies to mistral_large4 or deepseek_v41 only")
+        return generate_glm5_flash(traces, coverage, pin_frequency)
+    if family in SITE_PREFIX:
+        return generate_glm5(traces, family, coverage, pin_frequency, pin_report, layout)
+    if family != "deepseek_v41":
+        raise ValueError("only glm5 and deepseek_v41 have a checked-in shape-list consumer")
+    return generate_v41(traces, coverage, pin_frequency, prefill_rows, pin_report, layout)
 
 
 def glmf_identity(shape):
@@ -854,7 +1042,7 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
     own traces. A shape's pins and arena describe that shape's traffic; absent
     keys fall back to the engine's bootstrap set."""
     layouts = {name: generate([json.loads(path.read_text()) for path in paths],
-                              family, coverage, pin_frequency, pin_report, layout)
+                              family, coverage, pin_frequency, pin_report=pin_report, layout=layout)
                for name, paths in sorted(groups.items())}
     if family != "glm5_flash":
         return layouts.pop("min")
@@ -867,7 +1055,7 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41")))
     parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -875,6 +1063,7 @@ def main():
                         help="deepseek_v4 only: checked-in prewarm list the layout is replaced in")
     parser.add_argument("--shape", choices=QWEN_SHAPES,
                         help="qwen4 resolved capture shape (owner count, Sparks attached)")
+    parser.add_argument("--prefill-rows", type=int, help="V4.1 exact current full prefill chunk width")
     parser.add_argument("--trace", action="append", required=True,
                         help="PATH, or LAYOUT=PATH for GLM Flash (repeatable)")
     parser.add_argument("--output", type=Path,
@@ -900,12 +1089,12 @@ def main():
     if args.family != "deepseek_v4" and args.list is not None:
         parser.error("--list applies only to deepseek_v4")
     layout = args.layout
-    if args.family == "mistral_large4":
+    if args.family in ("mistral_large4", "deepseek_v41"):
         if layout not in ("1", "2"):
-            parser.error("mistral_large4 keys its list by layout: pass --layout 1 or 2")
+            parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
     elif layout is not None and args.family != "deepseek_v4":
-        parser.error("--layout applies to mistral_large4 and deepseek_v4 only")
+        parser.error("--layout applies to mistral_large4, deepseek_v4 and deepseek_v41 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
@@ -916,6 +1105,9 @@ def main():
             result = generate_deepseek_v4([json.loads(Path(spec).read_text()) for spec in args.trace],
                                           layout, json.loads(args.list.read_text()),
                                           args.coverage, args.pin_frequency, report, heat_rows)
+        elif args.family == "deepseek_v41":
+            result = generate([json.loads(Path(path).read_text()) for path in args.trace],
+                              args.family, args.coverage, args.pin_frequency, args.prefill_rows, report, layout)
         else:
             result = generate_layouts(layout_groups(args.trace, args.family),
                                       args.family, args.coverage, args.pin_frequency, report, layout)
@@ -950,7 +1142,7 @@ def main():
         for pin in report:
             print("pin " + json.dumps(pin, sort_keys=True))
         return
-    values = result["layouts"].values() if "layouts" in result else [result]
+    values = result["layouts"].values() if "layouts" in result else result.get("ranks", [result])
     for values in values:
         pinned = sum(entry["pin"] for entry in values["entries"])
         if "measured_bytes" in values:
@@ -961,6 +1153,7 @@ def main():
             layout = f" layout={values['layout']};" if "layout" in values else ""
             print(f"{len(values['entries'])} shapes;{layout} base={values['reserve_base_bytes']} "
                   f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
+
     for pin in report:
         print("pin " + json.dumps(pin, sort_keys=True))
 

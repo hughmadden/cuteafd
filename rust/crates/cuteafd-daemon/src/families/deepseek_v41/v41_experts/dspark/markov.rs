@@ -117,45 +117,13 @@ impl DsparkMarkov<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the launch before graph capture.
-    pub unsafe fn capture(&mut self, rows: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "markov graph already captured");
-        unsafe {
-            self.execute(rows)?;
-        }
-        self.ready_rows = None;
-        unsafe {
-            self.standalone.device
-                .library
-                .cuda_graph_begin_capture(self.standalone.get()?.raw)?;
-        }
-        let launch = unsafe { self.enqueue(rows) };
-        let capture = unsafe { self.standalone.device.library.cuda_graph_end_capture(self.standalone.get()?.raw) };
-        match (launch, capture) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(rows, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.standalone.device.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed markov capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; rows must match the captured shape.
     pub unsafe fn replay(&mut self, rows: usize) -> Result<[CuteafdDeviceBuffer; 2]> {
         self.ready_rows = None;
-        let (graph, captured_rows) = self.graph.get().context("markov graph is not captured")?;
-        ensure!(
-            rows == captured_rows,
-            "markov replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&rows) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(rows) };
+        };
         unsafe {
             self.standalone.device
                 .library
@@ -188,5 +156,12 @@ impl Drop for DsparkMarkov<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark markov");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark markov graphs");
+    }
+}
+
+impl DsparkMarkov<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.standalone.device.id, "dspark_markov", false, &mut self.graph)?;
+        Ok(())
     }
 }

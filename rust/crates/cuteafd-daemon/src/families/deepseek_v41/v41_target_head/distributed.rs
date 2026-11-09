@@ -80,7 +80,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             }
             let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
             crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
-                self.graphs[mode].get(rows), || self.enqueue(rows, greedy))?;
+                self.graphs[mode].cached_launch(rows), || self.enqueue(rows, greedy))?;
             if let Some(timing) = &self.draft_timing { timing.end(span, self.stream.raw)?; }
             Ok(())
         }
@@ -90,20 +90,24 @@ impl<'w, 'a> Rank<'w, 'a> {
         if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
+            let Some(ticket) = self.graphs[mode].cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.input.buffer.device_id, rows as u32), None) else {
+                crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
+                return Ok(());
+            };
             unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
             let queued = unsafe { self.enqueue(rows, greedy) };
-            let captured = unsafe { lib.cuda_graph_end_capture(self.stream.raw) };
+            let captured = unsafe { lib.cuda_graph_end_capture_topology(self.stream.raw) };
             match (queued, captured) {
-                (Ok(()), Ok(graph)) => {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                     // SAFETY: rank storage is stable and the eager projection drained.
                     unsafe {
-                        if let Err(error) = self.graphs[mode].insert(rows, graph) {
+                        if let Err(error) = self.graphs[mode].cache_insert(rows, graph, ticket, nodes as u64, width, spans) {
                             lib.cuda_graph_exec_destroy(graph)?;
                             return Err(error);
                         }
                     }
                 },
-                (Err(error), Ok(graph)) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
+                (Err(error), Ok((graph, ..))) => { unsafe { lib.cuda_graph_exec_destroy(graph)?; } return Err(error); }
                 (Err(first), Err(second)) => return Err(crate::families::deepseek_v41::v41_experts::dspark::prefer_device(first, second)),
                 (Ok(()), Err(error)) => return Err(error),
             }
@@ -160,7 +164,7 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
         Ok(())
     }
 
-    pub(crate) fn capture_startup(&mut self, rows: &[usize]) -> Result<()> {
+    pub(crate) fn capture_startup(&mut self, rows: &[usize], greedy: bool) -> Result<()> {
         ensure!(self.ready.is_none() && self.pending_logits.is_none() && !self.copy_pending,
             "vocabulary startup requires an idle owner");
         for rank in &mut self.ranks {
@@ -168,15 +172,12 @@ impl<'w, 'a> DistributedVocabularyWave<'w, 'a> {
             device.run(|| {
                 let rank = rank.get_mut();
                 rank.stream.require_complete()?;
-                for mode in 0..2 {
-                    rank.graphs[mode].declare_startup(rows)?;
-                    for &row in rows {
-                        ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
-                        // SAFETY: capture records the exact projection/argmax
-                        // operations without executing or publishing logits.
-                        unsafe { rank.capture_ready(row, mode == 1)?; }
-                    }
-                    rank.graphs[mode].finish_startup()?;
+                for &row in rows {
+                    ensure!(row <= rank.capacity, "vocabulary startup row exceeds capacity");
+                    // SAFETY: capture records only this owner's live mode:
+                    // target ranks include argmax, draft ranks retain logits.
+                    unsafe { rank.capture_ready(row, greedy)?; }
+                    crate::shared::decode_graph::device::observe_device(device.library, device.id)?;
                 }
                 Ok(())
             })?;
@@ -471,7 +472,13 @@ mod tests {
         fixture.extent_only(&lib)?;
         let weights = VocabularyShard::without_resident_weights_for_test();
         let mut rank = Rank::new(&lib, &weights, 1, Fp8Head::All)?;
-        rank.graphs[0].declare_startup(&[1])?;
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        // Capture now requires admission, just like the serving-reachable bank.
+        rank.graphs[0].attach_device(&lib, -8814, 64 << 20, Site {
+            name: "v41-vocabulary-error-fixture", cycle: Cycle::Other,
+            preference: Preference::Capture, bootstrap: 2 << 20,
+            basis: Basis::Bytes, spans_devices: false,
+        })?;
         fixture.configure_capture(&lib, 98)?;
         // SAFETY: the real enqueue guard rejects absent resident weights before launching;
         // the CPU fixture fails end_capture without publishing a graph or queued work.

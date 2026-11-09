@@ -356,37 +356,6 @@ impl DsparkTerminal<'_, '_> {
         self.output()
     }
     /// # Safety
-    /// Same input contract as execute; warms the complete sequence before capture.
-    pub unsafe fn capture(&mut self, requests: usize) -> Result<()> {
-        ensure!(self.graph.is_none(), "terminal graph already captured");
-        unsafe {
-            self.execute(requests)?;
-        }
-        self.ready_requests = None;
-        unsafe {
-            self.stream
-                .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
-        }
-        let launch = unsafe { self.enqueue(requests) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
-        match (launch, captured) {
-            (Ok(()), Ok(graph)) => {
-                // SAFETY: wave pins captured storage through drained teardown.
-                unsafe { self.graph.insert(requests, graph)?; }
-                Ok(())
-            }
-            (Err(error), Ok(graph)) => {
-                if let Err(cleanup) = unsafe { self.stream.library.cuda_graph_exec_destroy(graph) }
-                {
-                    tracing::error!(%cleanup, "destroying failed terminal capture");
-                }
-                Err(error)
-            }
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
-        }
-    }
-    /// # Safety
     /// Same input contract as execute; prepare new sampling state for a fresh attempt.
     pub unsafe fn replay(&mut self, requests: usize) -> Result<[CuteafdDeviceBuffer; 3]> {
         self.ready_requests = None;
@@ -394,11 +363,10 @@ impl DsparkTerminal<'_, '_> {
             self.sampling_requests == Some(requests),
             "sampling state does not match replay requests"
         );
-        let (graph, captured) = self.graph.get().context("terminal graph is not captured")?;
-        ensure!(
-            requests == captured,
-            "terminal replay shape differs from capture"
-        );
+        let Some(graph) = self.graph.cached_launch(&requests) else {
+            // SAFETY: replay and eager execution have the same input contract.
+            return unsafe { self.execute(requests) };
+        };
         unsafe {
             self.stream
                 .library
@@ -462,5 +430,14 @@ impl Drop for DsparkTerminal<'_, '_> {
         fatal_drain(self.synchronize(), "dSpark terminal");
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark terminal graphs");
+    }
+}
+
+impl DsparkTerminal<'_, '_> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut super::chain::GraphVisitor<'_>) -> Result<()> {
+        f(self.tokens.buffer.device_id, "dspark_terminal", false, &mut self.graph)?;
+        self.markov.visit_graph_banks(f)?;
+        self.confidence.visit_graph_banks(f)?;
+        Ok(())
     }
 }

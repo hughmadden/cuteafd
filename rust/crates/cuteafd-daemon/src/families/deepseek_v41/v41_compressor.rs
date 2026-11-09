@@ -672,7 +672,7 @@ pub(crate) struct CompressorWave<'w, 'a> {
     /// Per slot: descriptors and positions rewritten on the host per unit.
     staging: HostAllocation<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, usize, u64)>,
+    graph: Option<(usize, u64)>,
     // Lane-local decode shapes; large prefill retains only the current graph.
     retained_graphs: GraphBank<(usize, u64), GraphOwner<'a, &'w CompressorWeights<'a>>>,
     ready: Option<Prepared>,
@@ -993,26 +993,29 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             "compressor startup requires an idle matching owner");
         self.stream().require_complete()?;
         let keys: Vec<_> = rows.iter().map(|&row| (row, state.owner)).collect();
-        self.retained_graphs.declare_startup(&keys)?;
+        let _ = keys;
         for &row in rows {
             ensure!(row > 0 && row <= self.capacity, "compressor startup row exceeds capacity");
             let library = self.stream().library;
             let stream = self.stream().raw;
             // SAFETY: the real admitted state pins ratio-two pending buffers.
             // Capture records proposal kernels only, without execution/commit.
+            let Some(ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
             unsafe { library.cuda_graph_begin_capture(stream)?; }
             let queued = unsafe { self.enqueue(state, row) };
-            let captured = unsafe { library.cuda_graph_end_capture(stream) };
+            let captured = unsafe { library.cuda_graph_end_capture_topology(stream) };
             match (queued, captured) {
-                (Ok(()), Ok(graph)) => self.insert_graph(graph, row, state.owner)?,
-                (Err(error), Ok(graph)) => {
+                (Ok(()), Ok((graph, nodes, width, spans, _))) => self.insert_graph(graph, row, state.owner, ticket, nodes as u64, width, spans)?,
+                (Err(error), Ok((graph, ..))) => {
                     unsafe { library.cuda_graph_exec_destroy(graph)?; }
                     return Err(error);
                 }
                 (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
             }
+            crate::shared::decode_graph::device::observe_device(library, self.storage.input.buffer.device_id)?;
         }
-        self.retained_graphs.finish_startup()?;
+
         self.graph = None;
         Ok(())
     }
@@ -1028,15 +1031,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             && query.tokens()?.iter().copied().eq(chunks.iter().flat_map(|c|
                 c.position..c.position + u64::from(c.tokens))), "queued cache query differs");
         let forced_eager = crate::shared::decode_graph::census::eager("layer_row")
-            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
-            || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
-                && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
-        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
-            && !self.retained_graphs.contains(&(prepared.rows, state.owner))
-            && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)) {
-            super::graph_policy::note_miss(format!("compressor_query rows={} layer={}", prepared.rows, self.weights.layer),
-                || format!("windowed={} forced={forced_eager}", self.window.is_windowed()));
-        }
+            || !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if !forced_eager { self.select_graph(prepared.rows, state.owner, false)?; }
         let capture = !forced_eager && self.graph.is_none();
         let result = (|| -> Result<()> {
@@ -1047,7 +1042,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             self.upload_queued(&prepared)?;
             unsafe {
                 crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
-                    prepared.rows, if capture || forced_eager { None } else { self.graph.map(|(raw,_,_)|raw) },
+                    prepared.rows, if capture || forced_eager { None } else { self.selected_graph().map(|(raw, _, _)| raw) },
                     || self.enqueue(state, prepared.rows))
             }
         })();
@@ -1063,19 +1058,21 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             ensure!(prepared.owner == state.owner, "queued cache owner differs");
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
-            if *capture {
+            let ticket = if *capture { self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
+            if let Some(ticket) = ticket {
                 unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
-                let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
-                let graph = match (queued, captured) {
-                    (Ok(()), Ok(graph)) => graph,
-                    (Err(error), Ok(graph)) => {
+                let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
+                let (graph, nodes, width, spans, _) = match (queued, captured) {
+                    (Ok(()), Ok(topology)) => topology,
+                    (Err(error), Ok((graph, ..))) => {
                         unsafe { self.stream().library.cuda_graph_exec_destroy(graph)?; }
                         return Err(error);
                     }
                     (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
                 };
-                self.insert_graph(graph, prepared.rows, state.owner)?;
+                self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;
                 // Eager proposal is complete. Capture records future work without
                 // committing cache state; publish the existing result below.
             }
@@ -1114,21 +1111,16 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 c.position..c.position + u64::from(c.tokens))),
             "compressor query layer, rows or positions differ");
         // Windowed units run eagerly: graphs bake row-0 plane pointers.
-        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed()
-            || (!self.retained_graphs.contains(&(prepared.rows, state.owner))
-                && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)));
-        if !self.window.is_windowed() && super::graph_policy::captures_shape(prepared.rows as u32)
-            && !self.retained_graphs.contains(&(prepared.rows, state.owner))
-            && !self.retained_graphs.capture_allowed(&(prepared.rows, state.owner)) {
-            super::graph_policy::note_miss(format!("compressor_execute rows={} layer={}", prepared.rows, self.weights.layer),
-                || format!("windowed={}", self.window.is_windowed()));
-        }
+        let uncaptured = !super::graph_policy::captures_shape(prepared.rows as u32) || self.window.is_windowed();
         if crate::shared::memory::chain::active() && self.pending_query.is_none()
-            && (uncaptured || self.graph.is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
+            && (uncaptured || self.selected_graph().is_some_and(|(_, n, o)| n == prepared.rows && o == state.owner)) {
             // Order the producer on the chain (forked from the query's
             // normalized input) instead of draining it on the host: a captured
             // shape replays, an uncaptured prefill width launches eagerly.
-            let graph = if uncaptured { None } else { Some(self.graph.unwrap().0) };
+            let graph = if uncaptured { None } else {
+                // The guard only checks liveness; count this actual chain replay once.
+                self.retained_graphs.cached_launch(&(prepared.rows, state.owner)).map(|graph| graph.raw)
+            };
             let queued = (|| -> Result<()> { unsafe {
                 crate::shared::memory::chain::join_fork(self.stream().library, self.stream().raw)?;
                 self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
@@ -1152,6 +1144,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.select_graph(prepared.rows, state.owner, true)?;
         if self.graph.is_none() {
             unsafe { self.capture(state, chunks)?; }
+            return self.output(state);
         }
         unsafe { self.replay(state, chunks) }
     }
@@ -1172,7 +1165,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.output(state)
     }
     /// # Safety
-    /// Same input contract as execute. Warmup is unpublished and never commits.
+    /// Same input contract as execute. The drained eager proposal stays published and never commits.
     pub unsafe fn capture(
         &mut self,
         state: &CompressorState<'_>,
@@ -1183,20 +1176,28 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         unsafe {
             self.execute(state, chunks)?;
         }
-        let prepared = self.prepare(state, chunks)?;
+        // Preserve the completed proposal identity; preparing again would
+        // invalidate the eager result without running any replacement work.
+        let prepared = self.ready.take().context("compressor capture eager output missing")?;
+        let Some(ticket) = self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
+            super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) else {
+                self.ready = Some(prepared);
+                return Ok(());
+            };
         unsafe {
             self.stream()
                 .library
                 .cuda_graph_begin_capture(self.stream().raw)?;
         }
         let launched = unsafe { self.enqueue(state, prepared.rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture(self.stream().raw) };
+        let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
         match (launched, captured) {
-            (Ok(()), Ok(graph)) => {
-                self.insert_graph(graph, prepared.rows, state.owner)?;
+            (Ok(()), Ok((graph, nodes, width, spans, _))) => {
+                self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;
+                self.ready = Some(prepared);
                 Ok(())
             }
-            (Err(error), Ok(graph)) => {
+            (Err(error), Ok((graph, ..))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
@@ -1214,7 +1215,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
     ) -> Result<CompressorOutput<'s>> {
         let prepared = self.prepare(state, chunks)?;
         ensure!(!self.window.is_windowed(), "windowed compressor production is eager");
-        let (graph, rows, owner) = self.graph.context("compressor graph is not captured")?;
+        let (graph, rows, owner) = self.selected_graph().context("compressor graph is not captured")?;
         ensure!(
             rows == prepared.rows && owner == state.owner,
             "compressor capture binding differs"
@@ -1343,26 +1344,19 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
     }
     /// Switch only after prior launches finish. Graphs bind the cache owner and
     /// lane workspace, while current request descriptors are uploaded on replay.
-    fn select_graph(&mut self, rows: usize, owner: u64, drain: bool) -> Result<()> {
-        if self.graph.is_some_and(|(_, n, o)| n == rows && o == owner) { return Ok(()); }
+    fn select_graph(&mut self, rows: usize, owner: u64, _drain: bool) -> Result<()> {
         ensure!(self.pending_query.is_none() && self.pending_commit.is_none(),
             "cannot switch a pending cache producer graph");
-        if self.retained_graphs.count(|(_, o)| *o != owner) > 0 {
-            return self.clear_graph_inner(drain);
-        }
         self.ready = None;
-        if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
-        self.graph = None;
-        if rows > 64 && self.retained_graphs.count(|&(r, _)| r > 64 && r != rows)
-            >= crate::shared::decode_graph::LARGE_SHAPES {
-            // Keep the full prefill chunk and decoder replay across decode rounds.
-            self.retained_graphs.retire_oldest(|&(r, _)| r > 64 && r != rows);
-        }
-        drop(self.retained_graphs.drain_retired(|| Ok(()))?);
-        self.graph = self.retained_graphs.launch(&(rows, owner)).map(|exec| (exec.raw, rows, owner));
+        self.graph = self.retained_graphs.cached_launch(&(rows, owner)).map(|_| (rows, owner));
         Ok(())
     }
-    fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64) -> Result<()> {
+    fn selected_graph(&self) -> Option<(*mut c_void, usize, u64)> {
+        let (rows, owner) = self.graph?;
+        Some((self.retained_graphs.get(&(rows, owner))?.raw, rows, owner))
+    }
+    fn insert_graph(&mut self, graph: *mut c_void, rows: usize, owner: u64,
+        ticket: crate::shared::decode_graph::CaptureTicket, nodes: u64, width: usize, spans: bool) -> Result<()> {
         let library = self.stream().library;
         let device = library.cuda_get_device()?;
         // SAFETY: weights are borrowed and the containing wave retains workspace
@@ -1370,12 +1364,17 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         let exec = unsafe { GraphOwner::new(library, device, graph, self.weights)? };
         crate::shared::decode_graph::census::capture_device_key("deepseek_v41", "compressor",
             &self.retained_graphs as *const _ as usize, device, None, &(rows, owner), graph);
-        self.retained_graphs.insert((rows, owner), exec, None);
-        self.graph = Some((graph, rows, owner));
+        self.retained_graphs.cache_commit((rows, owner), exec, ticket, nodes, width, spans);
+        self.graph = Some((rows, owner));
         tracing::debug!(target: "cuteafd::graph_capture", site = "compressor", rows,
             layer = self.weights.layer, device, binding = owner,
             bank = ?(&self.retained_graphs as *const _), "captured graph binding");
         Ok(())
+    }
+    pub(crate) fn visit_graph_banks(&mut self,
+        f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>,
+    ) -> Result<()> {
+        f(self.storage.input.buffer.device_id, "compressor", false, &mut self.retained_graphs)
     }
     pub fn clear_graph(&mut self) -> Result<()> {
         self.clear_graph_inner(true)
@@ -1386,8 +1385,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         self.ready = None;
         if drain { self.synchronize()?; } else { self.stream().require_complete()?; }
         self.graph = None;
-        self.retained_graphs.retire_all();
-        drop(self.retained_graphs.drain_retired(|| Ok(()))?);
+        self.retained_graphs.cache_clear_drained();
         Ok(())
     }
 }
@@ -1413,5 +1411,76 @@ impl<'a> CompressorState<'a> {
 impl CompressorWeights<'_> {
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
+    }
+}
+
+#[cfg(test)]
+mod cold_capture_tests {
+    use super::*;
+    use crate::shared::decode_graph::CacheAttached;
+    use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
+    use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    #[test]
+    #[ignore = "requires V4.1 checkpoint, AOT native library and CUDA GPU"]
+    fn first_query_publishes_eager_result_with_admitted_or_denied_capture() -> Result<()> {
+        // SAFETY: checkpoint, library, inputs and request state outlive every wave.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(
+            &std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let query_weights = AttentionQueryWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let weights = CompressorWeights::load(&library, &catalog, 2, usize::MAX, 1 << 20)?;
+        let mut query = query_weights.wave(2, usize::MAX)?;
+        let input: Vec<_> = (0..2 * 5120).flat_map(|i| {
+            let value = ((i * 37 % 61) as f32 - 30.) / 32.;
+            ((value.to_bits() >> 16) as u16).to_ne_bytes()
+        }).collect();
+        for admitted in [true, false] {
+            let mut state = CompressorState::new(&library, 2, 1, 1, usize::MAX)?;
+            let lease = state.begin_request(0, 1)?;
+            let chunks = [CompressorChunk { lease, position: 0, tokens: 2 }];
+            let mut wave = weights.wave(2, usize::MAX)?;
+            wave.retained_graphs.attach(&library, 0, 256 << 20, Site {
+                name: if admitted { "Compressor.cold.admitted" } else { "Compressor.cold.denied" },
+                cycle: Cycle::Prefill, preference: Preference::Capture,
+                bootstrap: if admitted { 2 << 20 } else { 1 << 30 },
+                basis: Basis::Bytes, spans_devices: false,
+            })?;
+            // Startup recording must not publish or consume a request proposal.
+            wave.capture_startup(&state, &[1])?;
+            assert!(wave.ready.is_none());
+            // SAFETY: preparation stages finite matching hidden rows and positions.
+            let produced = unsafe { query.execute_tokens_prepared(&[0, 1], |stream, buffer| {
+                library.copy_h2d(buffer, &input)?;
+                unsafe { library.cuda_stream_synchronize(stream) }
+            })? };
+            // Obtain an eager reference from the identical normalized query input.
+            library.copy_d2d(wave.input(), produced.hidden, produced.hidden.bytes)?;
+            let expected = unsafe {
+                let output = wave.execute(&state, &chunks)?;
+                let mut bytes = vec![0; output.buffer.bytes];
+                library.copy_d2h(&mut bytes, output.buffer)?;
+                bytes
+            };
+            let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
+            // First real query misses the startup row-1 key. Capture records,
+            // but must return the completed eager row-2 proposal without replay.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let prepared = wave.ready.as_ref().context("first query output unpublished")?;
+            assert_eq!(prepared.snapshot, eager_snapshot + 2, "cold capture prepared more than its query and eager execution");
+            assert_eq!(prepared.rows, 2);
+            assert_eq!(wave.selected_graph().is_some(), admitted);
+            let output = wave.output(&state)?;
+            let mut actual = vec![0; output.buffer.bytes];
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
+            // A subsequent real query exercises replay or repeated eager denial.
+            unsafe { wave.execute_query(&state, &chunks, &produced)?; }
+            let output = wave.output(&state)?;
+            library.copy_d2h(&mut actual, output.buffer)?;
+            assert_eq!(actual, expected, "next query differs, admitted={admitted}");
+        }
+        Ok(())
     }
 }

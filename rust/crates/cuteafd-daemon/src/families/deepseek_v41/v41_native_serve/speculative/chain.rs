@@ -3,6 +3,7 @@ use super::*;
 use crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain;
 
 pub(crate) trait DraftChain<'a> {
+    fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>;
     fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>>;
     fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()>;
     fn stage_sampling(&mut self, rngs: &mut [&mut cuteafd_core::DsparkRng], temperatures: &[f32]) -> Result<()>;
@@ -69,6 +70,9 @@ impl<'w, 'a> ProposeChain<'a> for DsparkChain<'w, 'a> {
 macro_rules! chain {
     ($ty:ident, $device:expr, $live:expr) => {
         impl<'w, 'a> DraftChain<'a> for $ty<'w, 'a> {
+            fn visit_graph_banks(&mut self, f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+                self.visit_graph_banks(f)
+            }
             fn execution_device(&self) -> Option<crate::shared::memory::device::Device<'a>> { ($device)(self) }
             fn stage_tokens(&mut self, tokens: &[i32]) -> Result<()> {
                 self.stage_tokens(tokens)

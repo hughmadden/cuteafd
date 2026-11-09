@@ -74,13 +74,26 @@ impl Drop for ReservedPassGuard<'_, '_, '_, '_, '_> {
     }
 }
 impl<'w, 'a> DistributedTargetPass<'w, 'a> {
+    pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
+        self.resources.embedding.get_mut().visit_graph_banks(f)?;
+        for lane in &mut self.resources.lanes { lane.get_mut().visit_graph_banks(f)?; }
+        for index in self.resources.indices.iter_mut().flatten() { index.get_mut().visit_graph_banks(f)?; }
+        self.resources.execution.visit_graph_banks(f)?;
+        self.resources.engram.visit_graph_banks(f)?;
+        self.resources.head.visit_graph_banks(f)
+    }
     pub(crate) fn capture_startup_prefill(&mut self,
-        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup prefill capture requires idle target pass");
+        self.select_window(crate::shared::memory::row_window::RowWindow::NONE)?;
         let resources = &mut self.resources;
-        // Arbitrary restored tails have no safe padding mask. Keep prefill
-        // sealed eager rather than spending three owners' graph memory on them.
-        let rows = [];
+        // Nonwindowed single/continuation/replay paths use these exact sizes.
+        // Offset streamed-encoder units and odd tails remain eager (#1638).
+        let mut rows = resources.lanes[0].startup_prefill_rows();
+        for lane in resources.lanes.iter().skip(1) {
+            let measured = lane.startup_prefill_rows();
+            rows.retain(|rows| measured.contains(rows));
+        }
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
             &mut resources.execution.producers.sources, &rows)?;
         for index in resources.indices.iter_mut().flatten() {
@@ -90,15 +103,16 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         for lane in &mut resources.lanes {
             let device = lane.device;
-            device.run(|| lane.get_mut().capture_startup_prefill())?;
+            device.run(|| lane.get_mut().capture_startup_prefill(local))?;
         }
         resources.engram.capture_startup(&rows)?;
-        resources.head.capture_startup(&rows)
+        resources.head.capture_startup(&crate::families::deepseek_v41::graph_policy::PREFILL_HEAD_PREWARM_ROWS)
     }
     pub(crate) fn capture_startup(&mut self,
-        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>) -> Result<()> {
+        bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
-        let rows: Vec<_> = (1..=cuteafd_core::V41_VERIFY_ROWS).collect();
+        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(),
+            cuteafd_core::V41_VERIFY_ROWS);
         let resources = &mut self.resources;
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
             &mut resources.execution.producers.sources, &rows)?;
@@ -113,7 +127,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             let device = lane.device;
             // Admitted CUDA planes have native allocation alignment; live views
             // are validated again before every replay.
-            device.run(|| lane.get_mut().capture_startup(sinks, &selections, true))?;
+            device.run(|| lane.get_mut().capture_startup(sinks, &selections, true, local))?;
         }
         resources.engram.capture_startup(&rows)?;
         resources.head.capture_startup(&rows)
@@ -305,18 +319,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         Ok(())
     }
-    /// Retain decode-row graph shapes on both owning devices (sticky).
-    pub fn retain_small_graph_shapes(&mut self) -> Result<()> {
-        ensure!(self.state == State::Idle, "cannot change graph retention during a target pass");
-        for lane in &mut self.resources.lanes {
-            let device = lane.device;
-            device.run(|| { lane.retain_small_graph_shapes(); Ok(()) })?;
-        }
-        for index in self.resources.indices.iter_mut().flatten() {
-            index.get_mut().enable_small_graph_shapes();
-        }
-        Ok(())
-    }
     pub fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         if enabled {
             return self.set_capture(crate::families::deepseek_v41::v41_backbone_lane::Capture { routes: true, timing: true });
@@ -339,11 +341,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         }
         self.resources.capture_routes = capture.routes;
         if enabled {
-            // Match the single-GPU pass: adaptive row changes must retain the
-            // index projection and selection graphs on both owning devices.
-            for index in self.resources.indices.iter_mut().flatten() {
-                index.get_mut().enable_small_graph_shapes();
-            }
             for rows in &mut self.resources.route_capture { rows.clear(); }
         }
         Ok(())
@@ -449,8 +446,14 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     ) -> Result<()> {
         // Verification passes run with device-ordered stages. Peer-projection
         // modes (TP2 attention/query/output, all opt-in) keep host drains.
+        let library = self.resources.embedding.device.library;
         let verification = std::mem::replace(&mut self.resources.verification, false);
         self.set_attention_decode(verification);
+        let cycle = if !verification { crate::shared::decode_graph::device::Cycle::Prefill }
+            else if batch.cache()?.positions().len() == batch.cache()?.request_ids().len() {
+                crate::shared::decode_graph::device::Cycle::Decode
+            } else { crate::shared::decode_graph::device::Cycle::Verify };
+        super::super::graph_policy::cycle(cycle, |f| self.visit_graph_banks(f))?;
         // `--l2-prefetch` only while the other lane is idle (consumed per pass).
         let solo = std::mem::replace(&mut self.l2_solo, true);
         for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
@@ -461,7 +464,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             // A failed Spark wire released its waits over garbage planes.
             let result = result.and_then(|()| crate::shared::spark_waves::healthy());
             // Remote layers left their captured routes in the routers' rings.
-            return self.settle_route_rings(result);
+            let result = self.settle_route_rings(result);
+            return result.and(unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+                crate::shared::decode_graph::device::observe_completed(library,
+                |f| self.visit_graph_banks(f)) });
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -482,7 +488,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             tracing::debug!(target: "cuteafd::timing", route_ring_us=t.elapsed().as_micros() as u64,
                 "distributed route ring drain");
         }
-        result
+        result.and(unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
+            crate::shared::decode_graph::device::observe_completed(library,
+            |f| self.visit_graph_banks(f)) })
     }
     /// After a pass: a successful one's ring captures into the history; a
     /// failed one's dropped, so no router is left with an undrained ring (its
