@@ -1631,6 +1631,8 @@ pub(super) mod tests {
             let regions = (step as usize + 7) / 8;
             let mut sizes = vec![(step as usize * 8).max(256), (step as usize * 4).max(256),
                 (8192usize.div_ceil(64) * 4).max(256), (8192usize.div_ceil(64) * 4).max(256),
+                (step as usize * 4).max(256),
+                (8192usize.div_ceil(64) * 4).max(256), (8192usize.div_ceil(64) * 4).max(256),
                 (regions * 4).max(256), (regions * 4).max(256), (regions * 1024).max(256)];
             sizes.extend(vec![(step as usize + 7) * 512; 2 * 23]);
             let expected = cuteafd_loader::serving_capacity::PackedWeightRegions::new(sizes).unwrap().bytes;

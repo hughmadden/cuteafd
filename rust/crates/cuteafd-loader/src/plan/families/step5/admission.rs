@@ -644,6 +644,53 @@ mod tests {
     }
 
     #[test]
+    fn graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_STEP5_GRAPH_RESERVE";
+        let Ok(value) = std::env::var(CHILD) else {
+            // Isolate reserve policy from the parent environment without mutating
+            // process-wide variables while other Rust tests are running.
+            let name = format!("{}::graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank",
+                module_path!().split_once("::").unwrap().1);
+            for value in ["untraced", "gpu0=64MiB,gpu1=96MiB"] {
+                let mut child = std::process::Command::new(std::env::current_exe()?);
+                child.args(["--exact", &name, "--nocapture"]).env(CHILD, value)
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+                if value != "untraced" { child.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+                ensure!(child.status()?.success(), "Step-5 graph reserve child failed: {value}");
+            }
+            return Ok(());
+        };
+        for ranks in [1, 2] {
+            let mut policy = inputs(ranks);
+            let eager = run(&policy)?;
+            policy.decode_graphs = true;
+            let graphs = run(&policy)?;
+            assert_eq!(graphs.placement.pool_tokens, eager.placement.pool_tokens);
+            assert_eq!(graphs.placement.layers, eager.placement.layers);
+            for rank in 0..ranks {
+                let expected = if value == "untraced" { 0 } else { [64 << 20, 96 << 20][rank] };
+                let owners = graphs.solved.facts.allowances.iter().filter(|owner|
+                    owner.location == crate::placement::planner::Location::coordinator(rank as u8)
+                        && crate::placement::graph_reserve::is_source(&owner.source)).collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1);
+                assert_eq!(owners[0].bytes, expected);
+                assert_eq!(owners[0].source, crate::placement::graph_reserve::source(&format!("step5.graphs.{rank}")));
+                assert!(!owners[0].assumed);
+                for phase in [crate::placement::planner::Phase::Ready, crate::placement::planner::Phase::Growth] {
+                    let total = |admission: &Admission| admission.solved.facts.allowances.iter()
+                        .filter(|owner| owner.location == owners[0].location
+                            && owner.lifetime.contains(phase, admission.solved.facts.phase_order))
+                        .map(|owner| owner.bytes).sum::<u64>();
+                    assert_eq!(total(&graphs), total(&eager) + expected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn executor_metadata_matches_installed_csa_owners_and_swa_heads() -> Result<()> {
         assert_eq!(EXECUTOR.attention_default(), AttentionPlacement::Layers);
         let admitted = run(&inputs(2))?;

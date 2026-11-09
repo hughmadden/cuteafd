@@ -905,6 +905,14 @@ pub(super) fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>
     Ok(())
 }
 
+struct GraphEnableRestore<'a> { enabled: &'a Cell<bool>, previous: bool }
+impl<'a> GraphEnableRestore<'a> {
+    fn disable(enabled: &'a Cell<bool>) -> Self { Self { enabled, previous: enabled.replace(false) } }
+}
+impl Drop for GraphEnableRestore<'_> {
+    fn drop(&mut self) { self.enabled.set(self.previous); }
+}
+
 impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn configure_graphs(&mut self, enabled: bool) -> Result<()> {
         if enabled {
@@ -915,6 +923,11 @@ impl<'e, 'a> Execution<'e, 'a> {
         }
         self.main.graph_enabled.set(enabled);
         Ok(())
+    }
+
+    pub(super) fn without_graphs<T>(&self, work: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _restore = GraphEnableRestore::disable(&self.main.graph_enabled);
+        work()
     }
 
     fn graph_cycle(&self, kind: ExpertV2SourceKind) {
@@ -1663,6 +1676,23 @@ mod tests {
         order::{check_submission_faults, host::{HostSchedule, check_host}}};
     use cuteafd_loader::plan::families::step5::Config;
     use std::cell::Cell;
+
+    #[test]
+    fn explicit_eager_guard_restores_policy_on_failure_and_nested_calls() {
+        let enabled = Cell::new(true);
+        let result: Result<()> = (|| {
+            let _outer = GraphEnableRestore::disable(&enabled);
+            assert!(!enabled.get());
+            { let _inner = GraphEnableRestore::disable(&enabled); assert!(!enabled.get()); }
+            assert!(!enabled.get());
+            anyhow::bail!("diagnostic failed")
+        })();
+        assert!(result.is_err());
+        assert!(enabled.get());
+        enabled.set(false);
+        { let _disabled = GraphEnableRestore::disable(&enabled); }
+        assert!(!enabled.get());
+    }
 
     struct Trace {
         ownership: ExecutionOwnership,

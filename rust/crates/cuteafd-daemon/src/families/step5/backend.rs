@@ -556,8 +556,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         let source = ungraphed_kind(speculative, kind);
-        if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
-        else { self.immediate(sequences, pool, source, None).map(Some) }
+        self.execution.without_graphs(|| {
+            if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
+            else { self.immediate(sequences, pool, source, None).map(Some) }
+        })
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {

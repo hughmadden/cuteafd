@@ -112,6 +112,32 @@ mod tests {
         assert!(retain(2, true));
     }
     #[test]
+    fn untraced_zero_reserve_runs_every_section_eagerly_without_capture() {
+        let policy = cuteafd_loader::placement::graph_reserve::resolve(None, 0, false, 0, 0).unwrap();
+        assert_eq!(policy.bytes, 0);
+        let mut bank: GraphBank<Key, ()> = GraphBank::with_family(
+            GraphPolicy::Budgeted { bytes: None }, "step5");
+        bank.attach_device_for_test(-1639, policy.bytes, Site {
+            name: "step5.section", cycle: Cycle::Decode, preference: Preference::Adaptive,
+            bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: false,
+        }).unwrap();
+        for cycle in [Cycle::Decode, Cycle::Verify, Cycle::Prefill] {
+            bank.cache_cycle(cycle);
+            for layer in 0..92 {
+                for section in [Section::Projection, Section::Attention, Section::Dense,
+                    Section::Frontend, Section::Shared, Section::Finish] {
+                    for rows in [1, 4, 16, 64] {
+                        assert!(bank.cache_ticket(&Key { layer, rows, section }, false, None).is_none());
+                    }
+                }
+            }
+            bank.cache_tick();
+            assert!(!bank.cache_needs_boundary());
+        }
+        assert!(bank.cached_launch(&Key { layer: 0, rows: 1, section: Section::Projection }).is_none());
+    }
+
+    #[test]
     fn keys_are_geometry_only() {
         let key = Key { layer: 8, rows: 16, section: Section::Attention };
         assert_eq!(key, Key { layer: 8, rows: 16, section: Section::Attention });

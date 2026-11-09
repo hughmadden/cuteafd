@@ -662,6 +662,19 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_is_registered_and_shared_scheduler_samples_after_join() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(serve.contains("publish_reconciliation(args, &ids, &admission.solved)?"));
+        assert!(serve.contains("\"memory_reconciliation_provenance\""));
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        assert!(scheduler.contains("crate::shared::probe::first_request(&FIRST"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))"));
+        assert!(execution.contains("self.graph_completed()"));
+        assert!(!serve.contains("graph_capture_stats"));
+    }
+
+    #[test]
     fn serve_retains_selected_view_through_checkpoint_catalog_admission_and_push() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
         assert!(source.contains("census.normalize(admission.solved.facts.phase_order)?"));
