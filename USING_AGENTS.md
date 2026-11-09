@@ -398,7 +398,12 @@ Don't move all work to maxq.
   systemd expands `$VAR`/`${...}` in the unit command line itself, which
   mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
   `--expand-environment=no`, or put the commands in a script file and run
-  `bash /path/script.sh`.
+  `bash /path/script.sh`. Give the unit's executable as an absolute path
+  (or run it through `bash -c`/`python3`): systemd resolves a bare relative
+  executable such as `scripts/dev/cpu-gate` before applying
+  `--working-directory`, so it can silently run the main checkout's copy.
+  Pass `cpu-gate --source <worktree>` too, and check that the receipt's
+  HEAD is your commit.
 - Keep systemd's stop defaults on those units (KillMode=control-group,
   TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
   `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
