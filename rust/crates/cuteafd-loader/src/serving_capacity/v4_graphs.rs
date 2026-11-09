@@ -31,7 +31,9 @@
 //! layout's dominant verify geometry pin because they cost every step; elsewhere
 //! a pin follows the shared sustained-heat test, so a recurring or
 //! single-interval row is warmed into the ARC but stays evictable, and a
-//! workload that never revisits it lets ARC reclaim the space.
+//! workload that never revisits it lets ARC reclaim the space. Entries are
+//! ordered pinned first, then lifetime replay hits descending, so a pool too
+//! small for the list warms the rows serving replays most.
 //! `scripts/dev/graph-prewarm-from-trace.py` replaces one shape at a time and
 //! prints each heat class's keys and arena bytes; the consumer schema does not
 //! change.
@@ -281,6 +283,20 @@ mod tests {
     }
 
     #[test]
+    fn traced_layouts_order_pins_before_evictable_rows() {
+        // Warmed entries are captured in list order, so a shrunken reserve
+        // must meet the pinned set first; the generator orders the rest by
+        // lifetime replay hits.
+        for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
+            let entries = v4_prewarm(gpus, sparks).unwrap();
+            let split = entries.iter().position(|entry| !entry.pin).unwrap_or(entries.len());
+            assert!(entries[..split].iter().all(|entry| entry.pin), "{gpus}x{sparks}");
+            assert!(entries[split..].iter().all(|entry| !entry.pin), "{gpus}x{sparks}");
+            assert!(split > 0, "{gpus}x{sparks}: a traced layout always pins");
+        }
+    }
+
+    #[test]
     fn every_traced_shape_covers_its_working_set_at_reachable_rows() {
         for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
             let entries = v4_prewarm(gpus, sparks).unwrap();
@@ -290,8 +306,10 @@ mod tests {
             // interval stays prewarmed and evictable.
             let startup: Vec<_> = entries.iter().filter(|entry| entry.table_width == 0).collect();
             assert!(startup.len() >= 48);
-            let pinned: Vec<_> = startup.iter().filter(|entry| entry.pin)
+            // The list is ordered by replay heat, so compare the pinned set.
+            let mut pinned: Vec<_> = startup.iter().filter(|entry| entry.pin)
                 .map(|entry| entry.rows).collect();
+            pinned.sort_unstable();
             let expected = match (gpus, sparks) {
                 (1, true) => vec![1, 48],
                 (2, true) => vec![1, 4, 5],

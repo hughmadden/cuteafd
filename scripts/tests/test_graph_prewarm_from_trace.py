@@ -804,6 +804,32 @@ def test_v4_c1_and_dominant_verify_pin_whatever_their_heat():
     assert entry["reserve_base_bytes"] == [8 << 20]
 
 
+def test_v4_entries_order_pins_first_then_lifetime_hits():
+    # A shrunken reserve warms entries in list order, so the fan-out order puts
+    # the pinned set first and then the geometries serving replays most; order
+    # never changes the selected set, base or pin flags.
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].extend([
+        {"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+         "shape": v4_shape(1, 0, "local-experts"), "count": 60, "key_id": (1, 0),
+         "hits": 59, "cycles": {"decode": 60}, "capture_bytes": 2 << 20,
+         "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                           "counts": [1, 0, 0, 57, 0, 0]}},
+        {"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+         "shape": v4_shape(32, 0, "local-experts"), "count": 8, "key_id": (32, 0),
+         "hits": 7, "cycles": {"decode": 8}, "capture_bytes": 2 << 20,
+         "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                           "counts": [0, 0, 0, 7, 0, 0]}},
+    ])
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list())["layouts"]["rtx1-local"]
+    order = [(row["rows"], row["table_width"]) for row in entry["entries"]]
+    # Pins: (16, 512) has 99 lifetime hits, plain C1 59. Unpinned rows follow
+    # in hit order: (4, 0) 89, then (32, 0) 7; the one-use (1, 16) stays lazy.
+    assert order == [(16, 512), (1, 0), (4, 0), (32, 0)]
+    assert [row["pin"] for row in entry["entries"]] == [True, True, False, False]
+    assert entry["reserve_base_bytes"] == [8 << 20]
+
+
 def test_v4_startup_row_captured_once_is_not_warmed_or_pinned():
     # One miss and zero hits is a capture with no replay: warming it would
     # charge the startup arena for a graph the workload never reuses, and

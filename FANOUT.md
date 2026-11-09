@@ -45,9 +45,11 @@ boundary supplies those callbacks after every consumer has drained.
   Cancel a ticket on every failed capture path. After successful instantiate,
   report native nodes/width/span and insert the owner before launching it.
 - Supply a checked-in versioned prewarm list with stable geometry and explicit
-  pin flags, plus `reserve_base_bytes` and `reserve_extra_bytes`. Prewarm is
-  best effort, not a seal. First-touch eagerly before sampling capture growth.
-  Attribute startup activity to Other rather than decode/verify frequency.
+  pin flags, plus `reserve_base_bytes` and `reserve_extra_bytes`. Order each
+  list pinned first, then lifetime replay hits descending, so a reduced reserve
+  warms the hottest rows before the list ends. Prewarm is best effort, not a
+  seal. First-touch eagerly before sampling capture growth. Attribute startup
+  activity to Other rather than decode/verify frequency.
 - Admission owns the full configured graph reserve once, before KV sizing.
   Measured warmup does not replace or shrink that budget. GPU_RESERVE cannot
   remove it. A scalar GPU_GRAPH_RESERVE applies independently to each GPU;

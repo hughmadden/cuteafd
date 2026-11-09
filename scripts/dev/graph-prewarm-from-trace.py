@@ -57,10 +57,11 @@ it, so a row captured once and never looked up again stays lazy. Pins follow
 sustained heat, plus two keys that cost every step: plain C1 (rows 1, width 0)
 and the layout's dominant verify geometry pin whatever their heat class. A row
 hot in one sampling interval, or merely recurring, is otherwise prewarmed but
-stays evictable for ARC. A sustained geometry is pinned, a
-regular one prewarmed unpinned, and the heat report prints each class's keys
-and arena bytes. The engine warms the entries its pool can express and skips
-the rest.
+stays evictable for ARC. Entries follow the fan-out order - pinned first, then
+lifetime replay hits descending - so a reduced reserve warms the hottest rows
+first. A sustained geometry is pinned, a regular one prewarmed unpinned, and
+the heat report prints each class's keys and arena bytes. The engine warms the
+entries its pool can express and skips the rest.
 """
 import argparse
 import json
@@ -267,7 +268,10 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
     # single use. Two keys are the cost of every step, so they pin whatever
     # their heat class: plain C1 (rows 1, width 0) and the layout's
     # dominant verify geometry, the width>0 key with the most lifetime hits
-    # in the latest device snapshots.
+    # in the latest device snapshots. Entries keep the fan-out order -
+    # pinned first, then lifetime replay hits descending - so a reduced
+    # reserve warms the hottest rows before the list ends. Order never
+    # changes selection, base or pin flags.
     selected = {key for key in counts
                 if classes.get(key, "rare") != "rare" or reasons.get(key)}
     if (1, 0) in counts:
@@ -275,18 +279,22 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
         reasons.setdefault((1, 0), set()).add("c1_decode")
     lifetime_hits = {}
     for key, graph in identities.values():
-        if key[1] > 0:
-            lifetime_hits[key] = lifetime_hits.get(key, 0) + int(graph.get("hits", 0))
-    if lifetime_hits:
-        dominant = max(lifetime_hits, key=lambda key: (lifetime_hits[key], key))
+        lifetime_hits[key] = lifetime_hits.get(key, 0) + int(graph.get("hits", 0))
+    verify_hits = {key: hits for key, hits in lifetime_hits.items() if key[1] > 0}
+    if verify_hits:
+        dominant = max(verify_hits, key=lambda key: (verify_hits[key], key))
         selected.add(dominant)
         reasons.setdefault(dominant, set()).add("dominant_verify")
     peak = max(counts.values())
     minimum = min(counts, key=lambda key: (key[0] * key[1], key))
     if minimum in legacy and counts[minimum] >= peak * pin_frequency:
         reasons.setdefault(minimum, set()).add("legacy_frequency")
+    # Fan-out order: the pinned set first, then lifetime replay hits
+    # descending, so a shrunken reserve keeps what serving replays most.
+    order = sorted(selected, key=lambda key: (not reasons.get(key),
+                                              -lifetime_hits.get(key, 0), key[1], key[0]))
     entries = [{"rows": rows, "table_width": width, "pin": bool(reasons.get((rows, width)))}
-               for rows, width in sorted(selected, key=lambda key: (key[1], key[0]))]
+               for rows, width in order]
     if pin_report is not None:
         for key in sorted(selected):
             if not reasons.get(key):
