@@ -1803,7 +1803,10 @@ mod tests {
         let reserves: Vec<_> = [base, extra].iter().enumerate()
             .map(|(gpu, &(base, extra))| crate::placement::graph_reserve::current(gpu, false, base, extra)
                 .unwrap().bytes).collect();
-        assert!(reserves[0] > reserves[1]);
+        // Each rank's traced prewarm list is independent (rank 1's dual_0spark
+        // base is the larger of the two), so the plan must charge each device
+        // its own reserve rather than a shared value.
+        assert_ne!(reserves[0], reserves[1]);
         for gpu in 0..2 {
             assert_eq!(placement.items[gpu].iter().filter(|item| item.group == format!("graph reserve: qwen4.graphs.{gpu}"))
                 .map(|item| item.bytes).collect::<Vec<_>>(), vec![reserves[gpu]]);

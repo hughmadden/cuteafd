@@ -395,7 +395,8 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     census = launcher[launcher.index("shared_graph_census_args() {"):
                       launcher.index('if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]')]
     assert 'if [[ "$family" == glm5 || "$family" == qwen4 ]]; then' in census
-    assert 'CUTEAFD_GPU_GRAPH_RESERVE=$graph_reserve' in census
+    assert 'for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do' in census
+    assert 'graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")' in census
     assert 'CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/' in census
     assert "QWEN_STARTUP_GRAPHS" not in launcher
 
@@ -407,12 +408,23 @@ def test_qwen_prewarm_drains_at_pass_boundaries_without_serving_reachability():
         start = source.index("    pub fn warm_decode_graphs(")
         end = source.index("    /// Compare real logits", start)
         warm = source[start:end]
-        # Each pass captures every resolved shape, then drains and folds that
-        # device's untracked high-water in before the next pass starts.
+        # The observer is seeded once before the first capture, every resolved
+        # shape captures in turn with a drain after it, and a final drain and
+        # observe folds the last shape's untracked high-water in before the
+        # prewarm reports.
         assert warm.count("self.drain_state()?;") == 2
         assert warm.count("observe_device(self.library, bank.device.id)?;") == 2
-        assert warm.index("self.step(") < warm.index("self.drain_state()?;")
-        assert warm.index("run(false)?;") < warm.index("run(true)?;")
+        seed = warm.index("self.drain_state()?;")
+        assert seed < warm.index("observe_device(self.library, bank.device.id)?;")
+        assert warm.index("observe_device(self.library, bank.device.id)?;") < warm.index("for shape in &shapes {")
+        assert warm.index("for shape in &shapes {") < warm.index("self.step(")
+        assert warm.index("self.step(") < warm.index("self.drain_state()?;", seed + 1)
+        assert warm.index("self.drain_state()?;", seed + 1) < warm.index("let drained = self.drain_state();")
+        assert warm.index("let drained = self.drain_state();") < warm.rindex(
+            "observe_device(self.library, bank.device.id)?;")
+        # No eager first-touch pass: the decode path allocates nothing inside a
+        # capture, so the seeded drain is the whole warm-up.
+        assert "run(false)" not in warm
         # No engine execution helper may enter the prewarm, even indirectly.
         assert "warm_decode_graphs(" not in source[:start] + source[end:]
 
@@ -422,6 +434,10 @@ def test_qwen_prewarm_drains_at_pass_boundaries_without_serving_reachability():
     drain_at = engine.index(drain, warm_start)
     with pytest.raises(AssertionError):
         check(engine[:drain_at] + engine[drain_at + len(drain):])
+    final = "        let drained = self.drain_state();\n"
+    drained_at = engine.index(final, warm_start)
+    with pytest.raises((AssertionError, ValueError)):
+        check(engine[:drained_at] + engine[drained_at + len(final):])
     with pytest.raises(AssertionError):
         check(engine + "\nfn serving_step() { self.warm_decode_graphs(1, false); }\n")
 
