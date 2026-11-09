@@ -767,8 +767,18 @@ fn worker(
     // Every other Ready owner is priced by now: weights, workspaces, KV,
     // transports, BLAS handles, page tables and arena tails. Report the two
     // predicted runtime-base owners against what the device actually holds.
+    unsafe { // SAFETY: startup work is complete and all backing owners remain live.
+        crate::shared::decode_graph::device::observe_completed(&lib, |f| {
+            pass.visit_graph_banks(f)?;
+            second.visit_graph_banks(f)?;
+            for (slot, _) in &mut prefill_slots.slots { slot.visit_graph_banks(f)?; }
+            if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
+            Ok(())
+        }) }?;
+    admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
+    crate::shared::memory_report::reconcile::capture("ready");
     ready
         .take()
         .context("startup readiness missing")?

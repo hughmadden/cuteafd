@@ -57,7 +57,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
     }
     pub(crate) fn capture_startup(&mut self, capacity: usize, maximum: usize) -> Result<()> {
         ensure!(self.pending.is_none() && self.ready.is_none(), "terminal startup requires idle owner");
-        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(capacity, maximum);
+        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), 1, capacity, maximum);
         let original = self.terminal.width();
         let recorded = (|| -> Result<()> {
             let mut rows = Vec::new();
@@ -115,7 +115,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let width = terminal.width();
         let key = (width, mode, requests);
         if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
-            let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(requests, width);
+            let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
             let Some(ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
             let (graph, nodes, width, spans, inspection) = device.run(|| unsafe {
                 device.library.cuda_graph_begin_capture(terminal.stream.raw)?;

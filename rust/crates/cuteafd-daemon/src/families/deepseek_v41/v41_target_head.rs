@@ -254,7 +254,7 @@ impl<'a> TargetHeadWave<'a, '_> {
         ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
             "target head graph for {rows} rows already captured or out of range");
         let Some(ticket) = self.graphs.cache_ticket(&rows,
-            super::graph_policy::pinned_shape(rows as u32), None) else { return Ok(()) };
+            super::graph_policy::pinned_shape(self.b(0).device_id, rows as u32), None) else { return Ok(()) };
         unsafe {
             self.stream
                 .library

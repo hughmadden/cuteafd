@@ -413,7 +413,7 @@ impl AttentionOutputWave<'_, '_> {
         unsafe { self.capture_ready_on(rows, self.storage.stream.raw) }
     }
     unsafe fn capture_ready_on(&mut self, rows: u32, stream: *mut std::ffi::c_void) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
             super::graph_policy::note_miss(format!("attention_output rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };

@@ -186,7 +186,7 @@ impl<'a> DualAttentionWave<'a> {
             return Ok(());
         }
         let Some(ticket) = self.tails.cache_ticket(&(layer, key.clone()),
-            crate::families::deepseek_v41::graph_policy::pinned_shape(rows as u32), None) else {
+            crate::families::deepseek_v41::graph_policy::pinned_shape(self.halves[0].device.id, rows as u32), None) else {
             // The completed eager continuation already produced the result.
             return Ok(());
         };

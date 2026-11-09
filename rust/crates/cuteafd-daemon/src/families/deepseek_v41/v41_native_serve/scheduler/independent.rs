@@ -455,7 +455,9 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
-    target.and(speculative.map(|_| ())).and(state)
+    let retired = target.and(speculative.map(|_| ())).and(state);
+    requests.borrow_mut().mark_retired(retired.is_ok() && request.finished && !request.failed);
+    retired
 }
 
 /// Whether lane `lane` retires a request owned by `owner` at its boundary: a finished one, or one

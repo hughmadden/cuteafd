@@ -1001,7 +1001,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             // SAFETY: the real admitted state pins ratio-two pending buffers.
             // Capture records proposal kernels only, without execution/commit.
             let Some(ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
-                super::graph_policy::pinned_shape(row as u32), None) else { continue };
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
             unsafe { library.cuda_graph_begin_capture(stream)?; }
             let queued = unsafe { self.enqueue(state, row) };
             let captured = unsafe { library.cuda_graph_end_capture_topology(stream) };
@@ -1059,7 +1059,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
             let ticket = if *capture { self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
-                super::graph_policy::pinned_shape(prepared.rows as u32), None) } else { None };
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
             if let Some(ticket) = ticket {
                 unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
@@ -1180,7 +1180,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         // invalidate the eager result without running any replacement work.
         let prepared = self.ready.take().context("compressor capture eager output missing")?;
         let Some(ticket) = self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
-            super::graph_policy::pinned_shape(prepared.rows as u32), None) else {
+            super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) else {
                 self.ready = Some(prepared);
                 return Ok(());
             };

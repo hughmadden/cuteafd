@@ -656,7 +656,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
             super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer), || "graph cache selected eager".into());
             return Ok(());
         };

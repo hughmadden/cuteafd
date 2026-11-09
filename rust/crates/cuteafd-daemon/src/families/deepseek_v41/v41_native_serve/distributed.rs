@@ -60,7 +60,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     })?;
     memory_checkpoint("after native preload")?;
     let modules = inventory.gpus.iter().map(|gpu| gpu.module_bytes).collect::<Vec<_>>();
-    let pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
+    let mut pool = admission::admit_startup(&lib, &catalog, &args, &modules)?;
     args.max_context_tokens = pool.served_context;
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
     cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
@@ -520,8 +520,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
-    // Allocation must consume exactly the admitted pages; do not run a second
-    // sizing policy after loading conditional owners.
+    args.max_context_tokens = admission::adopt_measured_pool(&lib, &args, &mut pool)?;
+    cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
+    cuteafd_bench::context::set_resolved("kv-pool-size", &pool.global_bytes.to_string());
+    cuteafd_bench::context::ResolvedSettings::placement(&pool.placement).publish();
+    // Allocation consumes exactly the final measured plan's pages.
     for gpu in 0..2 {
         let (free,_) = devices[gpu].run(|| lib.cuda_memory_info())?;
         ensure!(pool.cache_bytes[gpu] <= free,"TP2 setup exceeded shared cache admission on GPU {gpu}");
@@ -605,8 +608,10 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     vision.connect()?;
     // Same Ready-boundary verification as the single-rank worker: both GPUs'
     // predicted runtime bases against what their devices hold.
+    admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;
     memory_checkpoint("ready")?;
+    crate::shared::memory_report::reconcile::capture("ready");
     ready.take().context("startup readiness missing")?.send(Ok((vision.health_handle(), args.max_context_tokens)))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,

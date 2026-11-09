@@ -20,12 +20,19 @@ pub(super) fn set_prefill_rows(rows: u32) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn pinned_shape(rows: u32) -> bool {
-    static PINNED: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
-    PINNED.get_or_init(|| cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_rows(
-        cuteafd_core::V41_VERIFY_ROWS)).contains(&(rows as usize))
-        || rows == cuteafd_core::coordinator_programs::V41_DECODER_REPLAY_ROWS
-        || PREFILL_ROWS.get().is_some_and(|&chunk| rows == chunk)
+thread_local! {
+    // Startup owns a dedicated CUDA worker thread. Avoid threading a layout
+    // field through every primitive owner; attach refreshes it before capture.
+    static RANKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+pub(crate) fn ranks() -> usize { RANKS.with(std::cell::Cell::get) }
+fn set_layout(ranks: usize) { RANKS.with(|layout| layout.set(ranks)); }
+
+pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
+    let Ok(rank) = usize::try_from(device) else { return false };
+    let Some(list) = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm(ranks(), rank) else { return false };
+    list.entries.iter().chain(&list.prefill_entries)
+        .any(|entry| entry.rows == rows as usize && entry.pin)
 }
 
 pub(super) fn captures_shape(rows: u32) -> bool {
@@ -39,12 +46,12 @@ pub(crate) const PREFILL_HEAD_PREWARM_ROWS: [usize; 1] = [1];
 
 /// Nonwindowed prompt/replay paths reach these exact row counts. Streamed
 /// encoder units have offset bindings and deliberately remain eager (#1638).
-pub(crate) fn prefill_prewarm_rows(capacity: usize) -> Vec<usize> {
-    prefill_rows(capacity, PREFILL_ROWS.get().copied())
+pub(crate) fn prefill_prewarm_rows(rank: usize, capacity: usize) -> Vec<usize> {
+    prefill_rows(rank, capacity, PREFILL_ROWS.get().copied())
 }
 
-fn prefill_rows(capacity: usize, chunk: Option<u32>) -> Vec<usize> {
-    cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(capacity, chunk.map(|row| row as usize))
+fn prefill_rows(rank: usize, capacity: usize, chunk: Option<u32>) -> Vec<usize> {
+    cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(ranks(), rank, capacity, chunk.map(|row| row as usize))
 }
 
 /// Records one eager run of a shape the policy would graph but this owner's
@@ -91,13 +98,15 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
-    let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
+    set_layout(ranks);
     visit(&mut |device, name, spans, bank| {
-        let reserve = cuteafd_loader::placement::graph_reserve::current(device as usize,
-            false, base, extra).map_err(anyhow::Error::msg)?.bytes;
-        bank.attach(library, device, reserve, Site { name: site_name(name), cycle: Cycle::Other,
-            preference: Preference::Adaptive, bootstrap: extra, basis: Basis::Bytes,
-            spans_devices: spans || ranks > 1 })
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
+        let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
+            false, base, extra).map_err(anyhow::Error::msg)?;
+        bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
+            preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
+            spans_devices: spans || ranks > 1 })?;
+        crate::shared::decode_graph::device::set_reserve_policy(device, policy)
     })
 }
 
@@ -113,6 +122,18 @@ mod tests {
     use cuteafd_ffi::NativeLibrary;
     use std::collections::BTreeMap;
     use crate::shared::memory::{DeviceAllocation, LoadStream};
+
+    #[test]
+    fn layout_state_is_local_to_the_engine_thread_and_refreshes_on_restart() {
+        std::thread::spawn(|| {
+            assert_eq!(ranks(), 0);
+            set_layout(1);
+            assert_eq!(ranks(), 1);
+            std::thread::spawn(|| assert_eq!(ranks(), 0)).join().unwrap();
+            set_layout(2);
+            assert_eq!(ranks(), 2);
+        }).join().unwrap();
+    }
 
     #[test]
     fn compressor_chain_counts_only_the_successful_replay_lookup() {
@@ -136,9 +157,9 @@ mod tests {
         use crate::shared::memory::row_window::RowWindow;
         // Enumerate the geometry consumed by startup, including a chunk that
         // coincides with replay and a capacity that excludes the chunk.
-        for (capacity, chunk, expected) in [(2048, 2048, vec![128, 2048]),
+        for (capacity, chunk, expected) in [(2048, 2048, vec![128]),
             (128, 128, vec![128]), (128, 2048, vec![128])] {
-            let rows = prefill_rows(capacity, Some(chunk));
+            let rows = cuteafd_loader::serving_capacity::v41_graphs::v41_prefill_rows(1, 0, capacity, Some(chunk as usize));
             assert_eq!(rows, expected);
             let keys: Vec<_> = PREFILL_PREWARM_SLOTS.into_iter().flat_map(|slot| {
                 rows.iter().map(move |&rows| (slot, rows, RowWindow::NONE, false))

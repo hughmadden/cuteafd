@@ -192,7 +192,9 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
         if let Err(error) = &state { probe.fail(format!("state diagnostic: {error:#}")); }
         probe.finish_state();
     }
-    target.and(speculative.map(|_| ())).and(state)
+    let retired = target.and(speculative.map(|_| ())).and(state);
+    requests.mark_retired(retired.is_ok() && request.finished && !request.failed);
+    retired
 }
 
 /// Allocate the optional pinned pool before signalling HTTP readiness. A bad
@@ -855,6 +857,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             if let Some(draft) = draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
             Ok(())
         }) }?;
+        requests.reconcile_completed();
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }

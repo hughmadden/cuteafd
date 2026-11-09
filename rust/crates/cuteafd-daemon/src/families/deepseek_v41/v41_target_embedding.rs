@@ -203,7 +203,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
             let warmup = unsafe { self.enqueue(rows) };
             warmup.and(self.synchronize())?;
             if let Some(ticket) = self.graphs.cache_ticket(&rows,
-                super::graph_policy::pinned_shape(rows as u32), None) {
+                super::graph_policy::pinned_shape(self.storage.ids.buffer.device_id, rows as u32), None) {
                 // SAFETY: warmup completed and the wave pins all recorded storage.
                 unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
                 let launched = unsafe { self.enqueue(rows) };

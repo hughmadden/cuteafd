@@ -386,7 +386,7 @@ impl<'a> IndexSelectionWave<'a> {
         self.storage.stream.require_complete()?;
         let mut groups = Vec::new();
         extend_score_groups(&mut groups, 0, rows, source.binding());
-        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(rows as u32), None)
+        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.buffers[0].buffer.device_id, rows as u32), None)
             else { return Ok(()) };
         // SAFETY: only commands are recorded; real metadata is uploaded before replay.
         unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
@@ -423,7 +423,7 @@ impl<'a> IndexSelectionWave<'a> {
             return Ok(true);
         }
         self.capture_ticket = self.graphs.cache_ticket(&key,
-            super::graph_policy::pinned_shape(fingerprint[1] as u32)
+            super::graph_policy::pinned_shape(self.storage.buffers[0].buffer.device_id, fingerprint[1] as u32)
                 && fingerprint[fingerprint.len()-3] == DECODE_WIDTH_BUCKET, None);
         if self.capture_ticket.is_none() {
             super::graph_policy::note_miss(format!("index_selection rows={} width={}", fingerprint[1], fingerprint[fingerprint.len()-3]),
@@ -1195,7 +1195,7 @@ mod graph_tests {
         let query = IndexQueryGeometry { layer: 2, packed: buffer(0x1000, 2048),
             scales: buffer(0x2000, 128), head_weights: buffer(0x3000, 64) };
         let mut bank = GraphBank::<Vec<usize>, ()>::new(None);
-        bank.attach_device_for_test(-164_402, 48, Site { name: "index_selection", cycle: Cycle::Decode,
+        bank.attach_device_for_test(-164_404, 48, Site { name: "index_selection", cycle: Cycle::Decode,
             preference: Preference::Capture, bootstrap: 16, basis: Basis::Bytes, spans_devices: false })?;
         let key = |length: usize| selection_fingerprint(&query, &[], None, 1,
             length.div_ceil(tile_width(length, DECODE_WIDTH_BUCKET)).max(1),

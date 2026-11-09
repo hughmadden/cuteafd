@@ -678,16 +678,16 @@ mod tests {
 
     #[test]
     fn graph_reserve_is_one_post_ready_owner_per_card_of_any_size() {
-        // Card size no longer changes the graph budget: the measured arena is
-        // one family number, and the small-card fixed-shape set is a capture
-        // policy, not a second envelope.
+        // Card size does not change a layout/rank's measured graph budget.
+        // Every device has one canonical owner, never a second envelope.
         for ranks in [1, 2] {
             for gpu in 0..ranks {
-                let owner = admission::graph_allowance(gpu).unwrap();
+                let owner = admission::graph_allowance(ranks, gpu).unwrap();
                 assert_eq!(owner.location, Location::coordinator(gpu as u8));
                 assert_eq!(owner.lifetime, Lifetime { first: Phase::Ready, last: Phase::Growth });
                 assert_eq!(owner.source, format!("graph reserve: v41.graphs.{gpu}"));
-                assert_eq!(owner.bytes, 1_048_576_000);
+                let (base, tail) = crate::placement::graph_reserve::v41_default(ranks, gpu);
+                assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve(None, gpu, false, base, tail).unwrap().bytes);
                 assert_eq!(owner.basis, Basis::Calibrated);
             }
         }

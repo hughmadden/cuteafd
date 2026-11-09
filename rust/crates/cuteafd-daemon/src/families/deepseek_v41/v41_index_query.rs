@@ -388,7 +388,7 @@ impl IndexQueryWave<'_, '_> {
         unsafe { self.capture_ready(rows) }
     }
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.hidden.buffer.device_id, rows), None) else {
             super::graph_policy::note_miss(format!("index_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };

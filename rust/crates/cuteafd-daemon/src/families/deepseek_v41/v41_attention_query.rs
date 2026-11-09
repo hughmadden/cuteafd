@@ -451,7 +451,7 @@ impl AttentionQueryWave<'_, '_> {
     }
     unsafe fn capture_ready_kind(&mut self, rows: u32, prefix: bool) -> Result<()> {
         let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
-        let Some(ticket) = graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.buffers[0].as_ref().unwrap().buffer.device_id, rows), None) else {
             super::graph_policy::note_miss(format!("attention_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };

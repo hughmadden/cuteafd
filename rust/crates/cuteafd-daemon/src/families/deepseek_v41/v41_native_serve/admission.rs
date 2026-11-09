@@ -620,7 +620,7 @@ pub(super) fn resolve_with_owners(
     // or replaces the configured reserve.
     let mut allowances = Vec::new();
     for gpu in 0..memory.len() {
-        allowances.push(admission::graph_allowance(gpu)?);
+        allowances.push(admission::graph_allowance(memory.len(), gpu)?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     if charged {
@@ -780,6 +780,37 @@ pub(super) fn resolve_with_owners(
     })
 }
 
+/// Publish identity only after measured-pool adoption has finalized owners.
+pub(super) fn publish_provenance(args: &crate::cli::NativeServeArgs,
+    inventory: &crate::shared::inventory::RuntimeInventory, admitted: &Admitted) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    let manifest = families::deepseek_v41::owners::native_manifest(&args.native_lib, "PROGRAMS.json")?;
+    let programs_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?));
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "deepseek_v41");
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": {
+            "schema_version": 1, "family": "deepseek_v41",
+            "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+            "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"), "native_sha256": hash(&args.native_lib)?,
+            "programs_sha256": programs_hash, "programs_hash_method": "sha256 canonical serde_json manifest",
+            "layout": {"snapshot": args.snapshot, "ranks": inventory.gpus.len(), "concurrency": args.concurrency,
+                "context": args.max_context_tokens, "prefill_rows": args.prefill_batch_tokens,
+                "attention": format!("{:?}", args.tp2_attention), "dspark": args.dspark,
+                "spark_world": args.peers.len()},
+            "devices": inventory.gpus, "onboard_layers": admitted.solved.decisions.onboard_layers,
+            "prefill": admitted.solved.decisions.prefill,
+            "graph_basis": "layout/rank measured step growth, split by estimate within shared steps"
+        }
+    }));
+    Ok(())
+}
+
 /// Native info, not an independently rounded padding formula, determines every
 /// resident pack. The checkpoint header supplies staging and EXL3 arena layout.
 pub(super) fn expert_demands(
@@ -840,7 +871,9 @@ pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admi
         let (free, total) = lib.cuda_memory_info()?;
         let used = (total as u64).saturating_sub(free as u64);
         let components = runtime_base_components(&admitted.solved.facts, gpu as u8);
-        let (predicted, measured) = runtime_base_check(&admitted.solved.facts, gpu as u8, used)
+        let graph_arena = crate::shared::decode_graph::device::snapshots().into_iter()
+            .find(|sample| sample.device == gpu as i32).map_or(0, |sample| sample.charged);
+        let (predicted, measured) = runtime_base_check(&admitted.solved.facts, gpu as u8, used.saturating_sub(graph_arena))
             .with_context(|| format!("V4.1 runtime base verification on GPU {gpu}"))?;
         ensure!(components.total() == predicted,
             "V4.1 runtime base on GPU {gpu} reports {} charged bytes against a prediction of {predicted}",
@@ -928,6 +961,7 @@ pub(super) fn adopt_measured_pool(
             cuteafd_loader::placement::planner::Location::coordinator(rank as u8)))
         .collect::<std::result::Result<_, _>>()?;
     admitted.served_context = u32::try_from(admitted.solved.served_context())?;
+    cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "deepseek_v41");
     tracing::info!(pages = adopted.pages, groups = adopted.groups,
         pool_tokens = admitted.placement.pool_tokens, cache_bytes = ?admitted.cache_bytes,
         served_context = admitted.served_context,
@@ -1422,7 +1456,7 @@ mod admission_tests {
             }
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
             assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
-            let graph_reserves = (0..ranks).map(graph_reserve_bytes).collect::<Result<Vec<_>>>()?;
+            let graph_reserves = (0..ranks).map(|rank| graph_reserve_bytes(ranks, rank)).collect::<Result<Vec<_>>>()?;
             let exact = admitted
                 .cache_bytes
                 .iter()
@@ -1558,21 +1592,24 @@ mod admission_tests {
     /// The same configured reserve admission charged, resolved through the
     /// family list and `GPU_GRAPH_RESERVE`, so a test cannot invent a third
     /// graph budget.
-    fn graph_reserve_bytes(rank: usize) -> Result<usize> {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
+    fn graph_reserve_bytes(ranks: usize, rank: usize) -> Result<usize> {
+        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
         Ok(cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
             .map_err(anyhow::Error::msg)?.bytes as usize)
     }
 
     #[test]
     fn graph_reserves_and_small_card_logical_target_remain_distinct() -> Result<()> {
-        // One configured arena per coordinator GPU, independent of card size
-        // and of the small card's logical target.
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default();
-        assert_eq!(base + extra, 1_048_576_000);
-        for rank in [0, 1] {
-            assert_eq!(graph_reserve_bytes(rank)?, (base + extra) as usize);
+        // Each physical rank owns its measured inventory and the shared
+        // extra; card size and logical KV target do not change that owner.
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let (base, tail) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
+                let expected = cuteafd_loader::placement::graph_reserve::resolve(None, rank, false, base, tail)?;
+                assert_eq!(graph_reserve_bytes(ranks, rank)?, expected.bytes as usize);
+            }
         }
+        assert_ne!(graph_reserve_bytes(2, 0)?, graph_reserve_bytes(2, 1)?);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

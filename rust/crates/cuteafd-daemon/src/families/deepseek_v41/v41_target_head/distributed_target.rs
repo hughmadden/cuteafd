@@ -81,7 +81,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
         if self.graphs.get(rows).is_none() && self.graphs.capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.weights.library;
-            let Some(ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(rows as u32), None) else {
+            let Some(ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.buffers[0].buffer.device_id, rows as u32), None) else {
                 crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
                 return Ok(());
             };

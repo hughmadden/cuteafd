@@ -228,7 +228,7 @@ impl DsparkChain<'_, '_> {
         ensure!(geometry.iter().all(|g| g.ring.device_id == self.tokens.buffer.device_id),
             "draft startup ring device differs");
         let counts = self.tokens.buffer.bytes / 4;
-        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(counts, self.maximum);
+        let entries = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_drafts(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, counts, self.maximum);
         let original = self.width;
         let recorded = (|| -> Result<()> {
             for entry in entries {
@@ -484,7 +484,7 @@ impl DsparkChain<'_, '_> {
     unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
         let key = (count, self.width);
         if self.graphs.contains(&key) { return Ok(()); }
-        let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(count, self.width);
+        let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, count, self.width);
         let Some(ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
             self.stream

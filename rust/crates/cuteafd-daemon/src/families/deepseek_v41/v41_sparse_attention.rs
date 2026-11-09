@@ -288,7 +288,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let key = self.startup_key(layer, rows, sink, selected, aligned,
             tail.as_ref().map(|tail| &**tail as &dyn AttentionGraphTail))?;
         if self.graphs.contains(&key) { return Ok(()); }
-        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(rows as u32), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None) else {
             return Ok(());
         };
         let plan = self.attention_plan.context("sparse startup reduction plan absent")?;
@@ -803,7 +803,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let ticket = if cached.is_none() && !self.window.is_windowed()
             && super::graph_policy::captures_shape(rows as u32)
             && !exact_small_shape(batch.is_some(), rows, self.batch_rows) {
-            self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(rows as u32), None)
+            self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None)
         } else { None };
         if cached.is_none() && ticket.is_none() {
             tracing::debug!(target: "cuteafd::target_step", layer, rows,

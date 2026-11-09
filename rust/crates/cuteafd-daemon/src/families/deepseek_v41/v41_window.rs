@@ -706,7 +706,7 @@ impl WindowWave<'_, '_> {
             // SAFETY: capture records the exact proposal operations on owned
             // buffers; it neither executes them nor commits cache storage.
             let Some(ticket) = self.graphs.cache_ticket(&(row, state.owner),
-                super::graph_policy::pinned_shape(row as u32), None) else { continue };
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
             unsafe { library.cuda_graph_begin_capture(stream)?; }
             let queued = unsafe { self.enqueue(row) };
             let captured = unsafe { library.cuda_graph_end_capture_topology(stream) };
@@ -767,7 +767,7 @@ impl WindowWave<'_, '_> {
             let chained = crate::shared::memory::chain::active();
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
             let ticket = if *capture { self.graphs.cache_ticket(&(prepared.rows, state.owner),
-                super::graph_policy::pinned_shape(prepared.rows as u32), None) } else { None };
+                super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
             if let Some(ticket) = ticket {
                 unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
                 let queued = unsafe { self.enqueue(prepared.rows) };
@@ -882,7 +882,7 @@ impl WindowWave<'_, '_> {
         // including when admission selects eager fallback.
         let p = self.ready.take().context("window capture eager output missing")?;
         let Some(ticket) = self.graphs.cache_ticket(&(p.rows, state.owner),
-            super::graph_policy::pinned_shape(p.rows as u32), None) else {
+            super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, p.rows as u32), None) else {
                 self.ready = Some(p);
                 return Ok(());
             };

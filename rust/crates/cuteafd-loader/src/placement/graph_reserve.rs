@@ -12,12 +12,11 @@ pub fn qwen_default(shape: crate::serving_capacity::qwen_graphs::QwenGraphShapeK
     -> Option<(u64, u64)> {
     crate::serving_capacity::qwen_graphs::qwen_reserve(shape, rank)
 }
-/// V4.1 bootstrap: the #1635 census10 measured lazy graph growth is the arena
-/// base; the extra is one capture quantum until the trace card measures the
-/// largest single capture on this family's qualification config.
-pub fn v41_default() -> (u64, u64) {
-    let list = crate::serving_capacity::v41_graphs::v41_prewarm_list();
-    (list.reserve_base_bytes, list.reserve_extra_bytes)
+/// Each layout rank charges only its trace-qualified identities and one tail.
+/// An unmeasured layout has no borrowed inventory; explicit policy still works.
+pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
+    crate::serving_capacity::v41_graphs::v41_prewarm(ranks, rank)
+        .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
 }
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }

@@ -179,7 +179,7 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
         projected:CuteafdDeviceBuffer,stream:*mut std::ffi::c_void)->Result<()> {
         self.device.run(||unsafe {
             let Some(ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
-                super::graph_policy::pinned_shape(rows as u32),None) else {return Ok(())};
+                super::graph_policy::pinned_shape(self.device.id, rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
             self.device.library.cuda_graph_begin_capture(stream)?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
@@ -827,7 +827,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_startup_kind(&[], &[], false, false, local)
     }
     pub(crate) fn startup_prefill_rows(&self) -> Vec<usize> {
-        super::graph_policy::prefill_prewarm_rows(self.capacity)
+        super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity)
     }
     fn capture_startup_kind(
         &mut self, sinks: &[CuteafdDeviceBuffer], selections: &[Option<CuteafdDeviceBuffer>],
@@ -838,9 +838,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             && !self.weights.split_query_b && !self.weights.split_output_b,
             "startup prototype requires idle unsplit target lanes");
         let prewarm: Vec<_> = if decode {
-            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(cuteafd_core::V41_VERIFY_ROWS)
+            cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), self.block.inputs()[0].device_id as usize, cuteafd_core::V41_VERIFY_ROWS)
                 .into_iter().map(|entry| entry.rows).collect()
-        } else { super::graph_policy::prefill_prewarm_rows(self.capacity) };
+        } else { super::graph_policy::prefill_prewarm_rows(self.block.inputs()[0].device_id as usize, self.capacity) };
         ensure!(prewarm.iter().all(|&row| row <= self.capacity) && (!decode || (sinks.len() == 40 && selections.len() == 40)),
             "startup target capacity or bindings differ");
         let device = self.block.inputs()[0].device_id;

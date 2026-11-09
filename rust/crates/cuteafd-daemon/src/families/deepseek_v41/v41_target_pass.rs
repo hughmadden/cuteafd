@@ -210,7 +210,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
     pub(crate) fn capture_startup(&mut self, bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
-        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(
+        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(), 0,
             cuteafd_core::V41_VERIFY_ROWS).into_iter().map(|entry| entry.rows).collect();
         let resources = &mut self.resources;
         resources.execution.capture_startup(bank, &rows)?;

@@ -987,6 +987,7 @@ mod anchor_fallback_tests {
         let fixture = fixture()?;
         let lib = fixture.load()?;
         fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
         for lane in 0..2 {
             for at in [At::Width, At::Tokens, At::Sampling, At::Capture, At::Replay, At::Output, At::TokensCopy, At::ConfidenceCopy] {
                 for device in [false, true] {
@@ -1007,6 +1008,7 @@ mod anchor_fallback_tests {
         let fixture = fixture()?;
         let lib = fixture.load()?;
         fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
         for lane in 0..2 {
             for at in [At::Width, At::Tokens, At::Sampling, At::Begin, At::Poll] {
                 for device in [false, true] {
@@ -1030,6 +1032,7 @@ mod anchor_fallback_tests {
         let fixture = fixture()?;
         let lib = fixture.load()?;
         fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
         let mut runtime = runtime(&lib, At::Never, false)?;
         let round = seeds(&[1, 2]);
         assert!(runtime.poll_propose(1, &round)?.is_none());
@@ -1082,6 +1085,7 @@ mod anchor_fallback_tests {
         let fixture = fixture()?;
         let lib = fixture.load()?;
         fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
         let mut runtime = runtime(&lib, At::Never, false)?;
         assert!(runtime.poll_propose(2, &seeds(&[1])).is_err());
         let round = seeds(&[2, 1]);
@@ -1098,6 +1102,7 @@ mod anchor_fallback_tests {
         let fixture = fixture()?;
         let lib = fixture.load()?;
         fixture.immediate_copies(&lib)?;
+        fixture.configure_memory(&lib, 0, 1 << 30)?;
         for independent in [false, true] {
             let mut runtime = runtime(&lib, At::Never, false)?;
             let previous = seeds(&[1, 2, 3, 4]);

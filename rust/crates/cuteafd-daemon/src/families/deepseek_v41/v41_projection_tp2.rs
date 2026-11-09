@@ -148,7 +148,7 @@ impl<'w,'a> Rank<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.storage.stream.device;
-        let Some(ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
             super::graph_policy::note_miss(format!("projection_rank rows={rows}"), || "graph cache selected eager".into());
             return Ok(());
         };
@@ -302,7 +302,7 @@ impl<'w,'a> Wave<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].storage.stream.raw;let device=self.storage.output.device;
-        let Some(ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(rows), None) else {
+        let Some(ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
             super::graph_policy::note_miss(format!("projection_gather rows={rows}"), || "graph cache selected eager".into());
             return Ok(());
         };

@@ -379,7 +379,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         Ok(())
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(rows as u32), None) else {
+        let Some(ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.storage.output.buffer.device_id, rows as u32), None) else {
             crate::families::deepseek_v41::graph_policy::note_miss(format!("engram_gate rows={rows} layer={}", self.layer()), || "graph cache selected eager".into());
             return Ok(());
         };

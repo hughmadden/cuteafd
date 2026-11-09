@@ -89,7 +89,11 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let resources = &mut self.resources;
         // Nonwindowed single/continuation/replay paths use these exact sizes.
         // Offset streamed-encoder units and odd tails remain eager (#1638).
-        let rows = resources.lanes[0].startup_prefill_rows();
+        let mut rows = resources.lanes[0].startup_prefill_rows();
+        for lane in resources.lanes.iter().skip(1) {
+            let measured = lane.startup_prefill_rows();
+            rows.retain(|rows| measured.contains(rows));
+        }
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
             &mut resources.execution.producers.sources, &rows)?;
         for index in resources.indices.iter_mut().flatten() {
@@ -107,8 +111,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub(crate) fn capture_startup(&mut self,
         bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
         ensure!(self.state == State::Idle, "startup graph capture requires idle target pass");
-        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm_rows(
-            cuteafd_core::V41_VERIFY_ROWS).into_iter().map(|entry| entry.rows).collect();
+        let rows: Vec<_> = cuteafd_loader::serving_capacity::v41_graphs::v41_joint_prewarm_rows(crate::families::deepseek_v41::graph_policy::ranks(),
+            cuteafd_core::V41_VERIFY_ROWS);
         let resources = &mut self.resources;
         bank.capture_startup_producers(&mut resources.execution.producers.windows,
             &mut resources.execution.producers.sources, &rows)?;
