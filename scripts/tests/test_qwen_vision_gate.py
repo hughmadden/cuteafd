@@ -394,7 +394,8 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     census = launcher[launcher.index("shared_graph_census_args() {"):
                       launcher.index('if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]')]
-    assert 'if [[ "$family" == glm5 || "$family" == qwen4 ]]; then' in census
+    # Every bounded-cache family shares the census: GLM 5.3, GLM Flash, Qwen4.
+    assert 'if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 ]]; then' in census
     assert 'for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do' in census
     assert 'graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")' in census
     assert 'CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/' in census

@@ -613,8 +613,8 @@ def main():
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
-        traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
         if args.family == "qwen4":
+            traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
         else:
             result = generate_layouts(layout_groups(args.trace, args.family),
@@ -634,11 +634,20 @@ def main():
               f"({summary.get('zero_replay_bytes', 0)} bytes); "
               f"zero_share={summary.get('zero_share_identities', 0)} "
               f"({summary.get('zero_share_bytes', 0)} bytes filled)")
-    else:
-        layout = f" layout={result['layout']};" if "layout" in result else ""
-        print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
-              f"extra={result['reserve_extra_bytes']} bytes; "
-              f"pinned={sum(entry['pin'] for entry in result['entries'])}")
+        for pin in report:
+            print("pin " + json.dumps(pin, sort_keys=True))
+        return
+    values = result["layouts"].values() if "layouts" in result else [result]
+    for values in values:
+        pinned = sum(entry["pin"] for entry in values["entries"])
+        if "measured_bytes" in values:
+            print(f"{len(values['entries'])} shapes; measured={values['measured_bytes']} bytes "
+                  f"for {values['measured_executables']} executables; "
+                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
+        else:
+            layout = f" layout={values['layout']};" if "layout" in values else ""
+            print(f"{len(values['entries'])} shapes;{layout} base={values['reserve_base_bytes']} "
+                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
     for pin in report:
         print("pin " + json.dumps(pin, sort_keys=True))
 
