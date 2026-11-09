@@ -201,7 +201,7 @@ pub const VERIFY_ROWS: usize = 64;
 pub const HEAD_WORKSPACE: usize = 4 << 20;
 
 /// Exact allocation recipe, excluding checkpoint weights and the KV pool.
-/// Dense execution currently launches directly; it captures no CUDA graphs.
+/// The separately admitted driver graph reserve is not a native allocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeBuffers {
     pub planes: [usize; 13],

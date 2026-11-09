@@ -613,6 +613,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some((&engine_args.prefix, lanes,
                     engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
+            engine.borrow_mut().warm_decode_graphs()?;
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
@@ -739,7 +740,7 @@ mod tests {
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
-                DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
+                DenseFacts { graph_variant: "fixture".into(), cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None,
                     blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;
             assert_eq!(admitted.request.context, requested_context);

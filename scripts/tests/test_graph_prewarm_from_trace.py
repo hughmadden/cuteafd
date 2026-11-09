@@ -1652,3 +1652,43 @@ def test_kimi_zero_share_is_valid_and_missing_rank_fails():
     assert row["entries"][0]["capture_bytes"] == [0]
     with pytest.raises(ValueError, match="missing a physical rank"):
         MODULE.generate_kimi([data], 2, "max")
+
+
+def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
+    def graph(segment, rows, stride, spec, hits, cost=1024):
+        return {"site": "qwen3_5.segment", "bank": 1, "key_id": segment * 100 + rows,
+                "shape": f"Key {{ segment: {segment}, rows: {rows}, table_stride: {stride}, spec: {str(spec).lower()} }}",
+                "hits": hits, "nodes": 8, "capture_bytes": cost}
+    data = {"schema_version": 2, "cache": {"device": 1}, "graphs": [
+        graph(0, 1, 16, False, 10), graph(1, 1, 16, False, 0),
+        graph(0, 4, 32, True, 100), graph(1, 4, 32, True, 50),
+        graph(0, 64, 128, True, 0, 10 << 20)]}
+    result = MODULE.generate_qwen35([data], "h5120-l64-fp8-kvfp8-rtx1")
+    layout = result["layouts"][0]
+    assert layout["entries"] == [
+        {"rows": 4, "table_stride": 32, "spec": True, "pin": False},
+        {"rows": 1, "table_stride": 16, "spec": False, "pin": False}]
+    assert layout["reserve_base_bytes"] == 2 << 20
+    assert layout["reserve_extra_bytes"] == 2 << 20
+    # Every selected sibling is charged, including the zero-hit sibling.
+    data["graphs"][1]["capture_bytes"] = 3 << 20
+    assert MODULE.generate_qwen35([data], layout["variant"])["layouts"][0]["reserve_base_bytes"] == 4 << 20
+    data["graphs"][0]["nodes"] = 1
+    with pytest.raises(ValueError, match="singleton"):
+        MODULE.generate_qwen35([data], layout["variant"])
+
+
+def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
+    root = SCRIPT.parents[2]
+    engine = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/engine.rs").read_text()
+    graph = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/graphs.rs").read_text()
+    scheduler = (root / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
+    assert engine.index("stream: Stream") < engine.index("graphs: graphs::Graphs") < engine.index("weights: DenseWeights")
+    assert '"memory_reconciliation_provenance"' in engine
+    assert '"devices": [{"device": device.id}]' in engine
+    assert 'capture("first_request")' in scheduler
+    assert "nodes < 2" in graph
+    assert "spans_devices: false" in graph
+    assert graph.count("device::observe_completed(") == 1
+    assert "cache_ticket" in graph and "cache_commit" in graph
+    assert "graph_capture_stats" not in graph

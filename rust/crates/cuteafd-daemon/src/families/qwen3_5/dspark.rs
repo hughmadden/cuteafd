@@ -167,6 +167,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     let demand = DrafterBytes::block_dspark(snapshot, &config, 1, library.sm_count()? as u64, cfg.max_context)?;
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(demand.clone()), 1, None, args.kv_cache, false, None, args.verify_check)?;
+    engine.warm_decode_graphs()?;
     ensure!(required <= engine.pool_tokens, "spec decode exceeds admitted target pool");
     if args.verify_check { engine.verify_check(prompt)?; }
     let plain = (|| -> Result<(Vec<u32>, Duration, Vec<(f32, Vec<u32>)>)> {
@@ -189,6 +190,7 @@ pub(super) fn spec_decode<'a>(args: &GoldenArgs, library: &'a NativeLibrary, pro
     drop(engine);
     let mut engine = DenseEngine::with_prefix(library, programs, checkpoint, cfg.clone(), args.pool_tokens,
         Some(demand), 1, None, args.kv_cache, false, None, args.verify_check)?;
+    engine.warm_decode_graphs()?;
     let stream = engine.target_stream().raw;
     let mask = engine.token_embedding().host_rows(&[draft_cfg.mask_token])?;
     let drafter = load_drafter(&engine, programs, snapshot, 1, mask)?;

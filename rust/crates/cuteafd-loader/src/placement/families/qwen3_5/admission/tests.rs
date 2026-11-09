@@ -27,7 +27,7 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
+    DenseFacts { graph_variant: "fixture".into(), cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
 }
 
@@ -413,4 +413,18 @@ fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
     let plain = admit(request(), budgets(), input).unwrap();
     assert!(!plain.facts.allocations.iter().any(|owner|
         owner.id.starts_with("host.prefix.") || owner.group == "diagnostic GDN reset staging"));
+}
+
+#[test]
+fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
+    let (cfg, weights, buffers, arena) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    let items = plan.reservation_items_at(Location::coordinator(0), Phase::Growth).unwrap();
+    let breakdown = crate::placement::reserve::breakdown("rtx0".into(),
+        cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, &items);
+    let graphs = breakdown.reserve.iter().filter(|row| row.name.contains("graph")).collect::<Vec<_>>();
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].name, "graph reserve");
+    assert_eq!(graphs[0].bytes, crate::serving_capacity::qwen35_graphs::reserve("fixture").unwrap().bytes);
+    assert!(graphs[0].bytes > 0);
 }

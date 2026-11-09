@@ -29,6 +29,7 @@ impl ServingFacts {
 #[derive(Clone)]
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
+    pub graph_variant: String,
     pub weights: &'a NativeWeights,
     pub target_arena: &'a crate::serving_capacity::WeightArenaLayout,
     pub buffers: &'a NativeBuffers,
@@ -367,6 +368,12 @@ impl DenseFacts<'_> {
         // The dense loader keeps one packed operand read in host memory at a
         // time; every device byte is a named owner above.
         let mut allowances = vec![
+            Allowance { location: gpu,
+                bytes: crate::serving_capacity::qwen35_graphs::reserve(&self.graph_variant)
+                    .map_err(|error| Refusal::InvalidFact(error.to_string()))?.bytes,
+                lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                source: crate::placement::graph_reserve::source("qwen3_5.graphs.0"),
+                assumed: false },
             Allowance { location: Location::HOST, bytes: step,
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
                 source: "estimated: one packed operand read and Vec capacity; read_exact_at, no shard buffer".into(),
