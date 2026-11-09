@@ -5265,13 +5265,7 @@ impl NativeLibrary {
 
     pub fn last_error(&self) -> Result<String> {
         let last_error_fn: LastErrorFn = self.cuteafd_last_error()?;
-        let mut buf = vec![0 as c_char; 512];
-        let status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
-        if status != CUTEAFD_STATUS_OK {
-            anyhow::bail!("cuteafd_last_error returned status {status}");
-        }
-        let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
-        Ok(cstr.to_string_lossy().into_owned())
+        read_native_last_error(last_error_fn)
     }
 
     fn status_to_result(&self, context: &str, status: CuteafdStatus) -> Result<()> {
@@ -5287,6 +5281,25 @@ impl NativeLibrary {
             detail: last_error,
         })))
     }
+}
+
+fn read_native_last_error(last_error_fn: LastErrorFn) -> Result<String> {
+    let mut buf = vec![0 as c_char; 512];
+    // SAFETY: native writes at most buf.len() bytes and retains the error across reads.
+    let mut status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
+    if status == CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        buf.resize(4096, 0);
+        // SAFETY: the resized output is live and bounded for this synchronous retry.
+        status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
+    }
+    if status != CUTEAFD_STATUS_OK && status != CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        anyhow::bail!("cuteafd_last_error returned status {status}");
+    }
+    let mut message = c_char_array_to_string(&buf);
+    if status == CUTEAFD_STATUS_BUFFER_TOO_SMALL {
+        message.push_str(" [truncated]");
+    }
+    Ok(message)
 }
 
 pub fn c_char_array_to_string(value: &[c_char]) -> String {
@@ -6074,6 +6087,61 @@ mod tests {
     use std::env;
     use std::path::PathBuf;
     use std::slice;
+
+    #[test]
+    fn native_last_error_retries_and_retains_truncated_diagnostics() -> Result<()> {
+        thread_local! {
+            static ERROR: std::cell::RefCell<(String, Vec<usize>)> =
+                std::cell::RefCell::new((String::new(), Vec::new()));
+        }
+        unsafe extern "C" fn fake_last_error(out: *mut c_char, out_len: usize) -> CuteafdStatus {
+            ERROR.with(|state| {
+                let mut state = state.borrow_mut();
+                state.1.push(out_len);
+                let bytes = state.0.as_bytes();
+                let count = bytes.len().min(out_len - 1);
+                // SAFETY: the reader provides out_len writable bytes, including the terminator.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.cast::<u8>(), count);
+                    *out.add(count) = 0;
+                }
+                if count == bytes.len() { CUTEAFD_STATUS_OK } else { CUTEAFD_STATUS_BUFFER_TOO_SMALL }
+            })
+        }
+        for (size, expected_calls) in [(0, vec![512]), (19, vec![512]), (511, vec![512]),
+            (512, vec![512, 4096]), (4095, vec![512, 4096]), (8192, vec![512, 4096])] {
+            let prefix = "cudaErrorMemoryAllocation owner=";
+            let original = if size < prefix.len() { "x".repeat(size) } else {
+                format!("{prefix}{}", "x".repeat(size - prefix.len()))
+            };
+            ERROR.with(|state| *state.borrow_mut() = (original.clone(), Vec::new()));
+            let message = read_native_last_error(fake_last_error)?;
+            let expected = if original.len() < 4096 { original } else {
+                format!("{} [truncated]", &original[..4095])
+            };
+            assert_eq!(message, expected);
+            ERROR.with(|state| assert_eq!(state.borrow().1, expected_calls));
+        }
+        let original = format!("{}\u{e9}", "x".repeat(4094));
+        ERROR.with(|state| *state.borrow_mut() = (original, Vec::new()));
+        assert_eq!(read_native_last_error(fake_last_error)?,
+            format!("{}{} [truncated]", "x".repeat(4094), char::REPLACEMENT_CHARACTER));
+        Ok(())
+    }
+
+    #[test]
+    fn native_last_error_preserves_non_buffer_status_failures() {
+        unsafe extern "C" fn failed_last_error(_: *mut c_char, _: usize) -> CuteafdStatus {
+            CUTEAFD_STATUS_INVALID_ARGUMENT
+        }
+        assert_eq!(read_native_last_error(failed_last_error).unwrap_err().to_string(),
+            "cuteafd_last_error returned status 1");
+        unsafe extern "C" fn failed_retry(_: *mut c_char, out_len: usize) -> CuteafdStatus {
+            if out_len == 512 { CUTEAFD_STATUS_BUFFER_TOO_SMALL } else { CUTEAFD_STATUS_INTERNAL_ERROR }
+        }
+        assert_eq!(read_native_last_error(failed_retry).unwrap_err().to_string(),
+            "cuteafd_last_error returned status 6");
+    }
 
     pub(super) fn draft_failure_library() -> Result<NativeLibrary> {
         let fixture = crate::native_library_lifetime_fixture::Fixture::build_for_tests()?;
