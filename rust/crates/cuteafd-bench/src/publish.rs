@@ -1290,14 +1290,17 @@ mod tests {
     }
 
     #[test]
-    fn current_matrix_dry_render_preserves_retired_provenance() {
+    fn current_exports_dry_render_only_adds_retired_section() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let placed = scan(&root).unwrap();
-        let rendered = retired_results(&placed, &matrix.retired).unwrap();
-        // Retired provenance remains renderable before the next release is measured.
-        assert!(!matrix.rows.is_empty());
-        assert!(!matrix.retired.is_empty());
+        let rendered = results(&placed, &matrix).unwrap();
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let existing = readme.split_once(RESULTS_BEGIN).unwrap().1.split_once(RESULTS_END).unwrap().0.trim();
+        let current = rendered.split_once("\n### Retired").unwrap().0.trim();
+        // Once the generated README carries Retired, compare the same main section.
+        assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
+        assert_eq!(matrix.retired.len(), 21);
         let retired = rendered.split_once("\n### Retired").unwrap().1;
         assert!(!retired.contains("nearest final release"));
         for entry in &matrix.retired {
@@ -1309,7 +1312,7 @@ mod tests {
             assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
         }
         let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
-            root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+            root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
     }
 
@@ -1642,26 +1645,17 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_measured_rows_and_defers_unmeasured_rows() {
+    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
-        assert!(!matrix.rows.is_empty());
-        for row in &matrix.rows {
-            assert!(row.cells[1..].iter().any(|cell| cell.status != Status::Na));
-            let single = Matrix { rows: vec![row.clone()], retired: Vec::new() };
-            if row.cells.iter().any(|cell| cell.status == Status::Current) {
-                let resolved = select(&placed, &single).unwrap();
-                assert_eq!(resolved.len(), 1);
-                assert!(resolved[0].cells.iter().any(|cell| matches!(cell, Resolved::Card(_))));
-            } else {
-                assert!(row.cells.iter().any(|cell| cell.status == Status::Pending));
-                let error = match select(&placed, &single) {
-                    Err(error) => error,
-                    Ok(_) => panic!("unmeasured row must not publish"),
-                };
-                assert!(error.to_string().contains("no cell publishes a report"));
-            }
+        let rows = select(&placed, &matrix).unwrap();
+        assert_eq!(rows.len(), matrix.rows.len());
+        for row in rows {
+            assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
+            // Every published checkpoint has at least one PRO card; other cells say why not.
+            assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
+            assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
         }
     }
 

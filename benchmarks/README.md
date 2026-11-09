@@ -34,8 +34,11 @@ that unsupported arm is not scheduled. Variant names append `-compact` or
 
 ### v5 Retirements
 
-The measured historical cards stay pinned in both matrices' `retired` lists:
+The v5 launch matrix pins measured historical cards in its `retired` list:
 all NVFP4 cards, Step-5 FP8, GLM Flash tr3, and the previously retired layouts.
+The published `current-matrix.json` and root README retain measured v4 cards;
+update each v5 row and its retirements when its first smoke report exists.
+Entirely pending checkpoint rows currently block publication (issue #1723).
 New measured retirements are `v41-flash-reference-tp4`,
 `v4-flash-reference-tp4`, `glm53f-exl3-5090` (K3.25 + Core FP8),
 `glm53-exlr8-a8-max`, `qwen38-27b-bf16-min-nospec`, and
