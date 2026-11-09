@@ -775,6 +775,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// Shared reconciliation (`memory_report/reconcile.rs`) replaces only the
+    /// reserve component named exactly "graph reserve" with the measured arena;
+    /// a family-named graph owner would make `graph_reserve_bytes` read zero.
+    #[test]
+    fn graph_reserve_is_the_canonical_reconciliation_component() {
+        use cuteafd_core::memory_policy::DeviceKind;
+        use crate::placement::planner::{Device, Location, Phase};
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        for ranks in [1, 2] {
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            input.requested_pool = Some(262_144);
+            let admitted = contract(&input).unwrap();
+            let mut found = 0;
+            for budget in &admitted.solved.budgets {
+                let Some(&location) = budget.locations.first() else { continue };
+                let Device::Coordinator(gpu) = location.device else { continue };
+                let items = admitted.solved.items_at(location, Phase::Growth).unwrap();
+                let device = crate::placement::reserve::breakdown(budget.id.clone(), DeviceKind::Gpu,
+                    budget.physical_bytes.min(budget.logical_bytes), budget.headroom, &items);
+                let graph: Vec<_> = device.reserve.iter()
+                    .filter(|row| row.name == "graph reserve").collect();
+                assert_eq!(graph.len(), 1, "one canonical graph reserve row per device");
+                assert_eq!(graph[0].bytes, admitted.graphs.charged[gpu as usize]);
+                assert!(!device.reserve.iter().any(|row| row.name != "graph reserve"
+                    && (row.name.starts_with("startup graph") || row.name.contains("glmf graph"))),
+                    "no family-named graph owner may follow the canonical row");
+                found += 1;
+            }
+            assert_eq!(found, ranks);
+        }
+    }
+
     /// A smaller pool or served context rebuilds the reserve from the same
     /// list and never charges more than the launch's maximum.
     #[test]
