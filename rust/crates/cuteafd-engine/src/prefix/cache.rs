@@ -1264,6 +1264,11 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         self.stats_with_detail(detail.as_ref().unwrap().1)
     }
 
+    /// Settled final occupancy must not remain stale after the scheduler parks.
+    pub fn refresh_serving_stats(&self) {
+        *self.serving_detail.borrow_mut() = Some((std::time::Instant::now(), self.occupancy_detail()));
+    }
+
     fn occupancy_detail(&self) -> [usize; 4] {
         let mut retained: Vec<u32> = self.entries.values()
             .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();

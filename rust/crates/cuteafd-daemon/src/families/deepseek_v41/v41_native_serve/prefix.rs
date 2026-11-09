@@ -404,7 +404,8 @@ impl<'a> V41Cache<'a> {
     pub fn turn_bank_enabled(&self) -> bool { self.cache.turn_bank_enabled() }
     pub fn host_config(&self) -> Option<&cuteafd_hostcache::config::Config> { self.cache.host_config() }
     pub fn host_metrics(&self) -> Option<cuteafd_hostcache::metrics::Snapshot> { self.cache.serving_stats().host }
-    pub fn stats(&self) -> cuteafd_engine::prefix::PrefixStats { self.cache.serving_stats() }
+    pub fn stats(&self) -> cuteafd_engine::prefix::PrefixStats { self.cache.stats() }
+    pub fn serving_stats(&self) -> cuteafd_engine::prefix::PrefixStats { self.cache.serving_stats() }
     pub fn prefill_hold(&mut self) -> Result<()> { self.cache.prefill_hold() }
 
     /// Unreference released requests' units (after the family drained) and poll the host tier.

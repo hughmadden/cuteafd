@@ -632,9 +632,11 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
         static FIRST: std::sync::Once = std::sync::Once::new();
         crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.serving_stats(), "kv_reserve": reserve.snapshot(stalled),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "kv_reserve": reserve.snapshot(stalled),
             "draft_policy": crate::shared::draft::resource::snapshot()});
     }
 }

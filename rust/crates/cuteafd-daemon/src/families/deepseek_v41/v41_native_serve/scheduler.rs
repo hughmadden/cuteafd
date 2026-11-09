@@ -251,7 +251,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "host_cache_config": prefixes.host_config(),
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
         // restores), captures, evictions and page/mark occupancy.
-        "prefix": prefixes.stats(),
+        "prefix": prefixes.serving_stats(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
