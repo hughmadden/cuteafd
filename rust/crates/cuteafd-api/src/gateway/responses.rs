@@ -342,11 +342,17 @@ async fn compact(
 
 async fn websocket(
     State(gateway): State<Arc<Gateway>>,
+    drain: Option<axum::Extension<crate::shutdown::Drain>>,
     usage: Option<crate::usage::UsageHandle>,
     tape: Tape,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| websocket_loop(socket, gateway, tape, usage))
+    let drain = drain.map(|axum::Extension(drain)| drain);
+    let session = drain.as_ref().map(crate::shutdown::Drain::session);
+    ws.on_upgrade(move |socket| async move {
+        let work = websocket_loop(socket, gateway, tape, usage, drain);
+        match session { Some(session) => session.run(work).await, None => work.await }
+    })
         .into_response()
 }
 
@@ -355,9 +361,15 @@ async fn recorded_send(socket: &mut WebSocket, tape: &Tape, text: String) -> Res
     socket.send(Message::Text(text)).await
 }
 
-async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape, usage: Option<crate::usage::UsageHandle>) {
+async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape, usage: Option<crate::usage::UsageHandle>, drain: Option<crate::shutdown::Drain>) {
     let mut last: Option<(String, Arc<Snapshot>)> = None;
-    while let Some(Ok(message)) = socket.next().await {
+    loop {
+        let message = tokio::select! {
+            biased;
+            _ = async { match &drain { Some(drain) => drain.monitor_stopped().await, None => std::future::pending().await } } => break,
+            message = socket.next() => message,
+        };
+        let Some(Ok(message)) = message else { break };
         let Message::Text(text) = message else {
             if matches!(message, Message::Close(_)) {
                 break;

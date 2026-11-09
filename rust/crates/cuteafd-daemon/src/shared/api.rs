@@ -251,9 +251,14 @@ async fn serve_http_until(listener: tokio::net::TcpListener, router: axum::Route
         signal_drain.stop_monitors();
         let _ = stopping.send(());
     };
-    let server = axum::serve(listener, drain.layer(router)
+    let http = axum::serve(listener, drain.layer(router)
         .into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(signal).into_future();
+    let server = async {
+        http.await?;
+        drain.sessions_finished().await;
+        Ok(())
+    };
     tokio::pin!(server);
     tokio::select! {
         result = &mut server => result,

@@ -51,6 +51,7 @@ struct Connect {
 }
 async fn upgrade(
     State(gateway): State<Arc<Gateway>>,
+    drain: Option<axum::Extension<crate::shutdown::Drain>>,
     Query(query): Query<Connect>,
     headers: HeaderMap,
     tape: Tape,
@@ -84,9 +85,14 @@ async fn upgrade(
         || protocols
             .split(',')
             .any(|v| v.trim() == "openai-beta.realtime-v1");
+    let drain = drain.map(|axum::Extension(drain)| drain);
+    let session = drain.as_ref().map(crate::shutdown::Drain::session);
     ws.protocols(["realtime"])
         .max_message_size(32 * 1024 * 1024)
-        .on_upgrade(move |socket| serve(socket, gateway, model, beta, transcription, tape, usage))
+        .on_upgrade(move |socket| async move {
+            let work = serve(socket, gateway, model, beta, transcription, tape, usage, drain);
+            match session { Some(session) => session.run(work).await, None => work.await }
+        })
         .into_response()
 }
 struct Connection {
@@ -118,6 +124,7 @@ async fn serve(
     transcription: bool,
     tape: Tape,
     usage: Option<crate::usage::UsageHandle>,
+    drain: Option<crate::shutdown::Drain>,
 ) {
     let session = gateway.sessions.create("sess");
     let session_id = session.lock().await.id.clone();
@@ -165,18 +172,23 @@ async fn serve(
         Cancel,
         Idle,
         Expire,
+        Shutdown,
     }
     let expires = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
     loop {
+        let stopping = drain.as_ref().is_some_and(crate::shutdown::Drain::is_stopping);
+        if stopping && c.active.is_none() { break; }
         let next = tokio::select! {
             biased;
-            message=socket.next()=>Next::Socket(message),
+            _ = async { match &drain { Some(drain) => drain.monitor_stopped().await, None => std::future::pending().await } }, if !stopping => Next::Shutdown,
+            message=socket.next(), if !stopping =>Next::Socket(message),
             _=async { if let Some(cancel)=c.cancel.as_mut(){let _=cancel.changed().await;} else {std::future::pending::<()>().await;} }=>Next::Cancel,
             event=async {if let Some(active)=c.active.as_mut(){active.stream.next().await} else {std::future::pending().await}}=>Next::Turn(event),
-            _=async {if let Some(deadline)=c.idle{tokio::time::sleep_until(deadline).await} else {std::future::pending().await}}=>Next::Idle,
+            _=async {if let Some(deadline)=c.idle{tokio::time::sleep_until(deadline).await} else {std::future::pending().await}}, if !stopping =>Next::Idle,
             _=tokio::time::sleep_until(expires)=>Next::Expire,
         };
         let events = match next {
+            Next::Shutdown => continue,
             Next::Socket(Some(Ok(Message::Text(text)))) => {
                 c.tape.frame("client", &text);
                 match serde_json::from_str::<Value>(&text) {
