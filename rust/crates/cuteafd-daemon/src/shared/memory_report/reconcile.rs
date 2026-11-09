@@ -42,6 +42,18 @@ pub(crate) fn snapshot() -> Value {
 
 fn row(device: &str, measured: Option<i128>, owners: &cuteafd_core::memory_policy::DeviceBreakdown,
     graph_arena: Option<u64>, provenance: Value, reason: Option<&str>) -> Value {
+    row_with_arena(device, measured, owners, graph_arena.map(|arena| (arena, arena)),
+        provenance, reason)
+}
+
+/// `graph_arena` is `(current level, high water)`. Reconciliation uses the
+/// current level: `charged`'s high-water keeps covering transient capture peaks
+/// for admission, but charging one forever would misreport a peak that already
+/// reversed. The level is refreshed from the stage's settled sample and bounded
+/// by the high-water, so it can only release peak credit. Both are published.
+fn row_with_arena(device: &str, measured: Option<i128>,
+    owners: &cuteafd_core::memory_policy::DeviceBreakdown,
+    graph_arena: Option<(u64, u64)>, provenance: Value, reason: Option<&str>) -> Value {
     let padding: u64 = owners.reserve.iter().filter(|owner| owner.name == "release padding")
         .map(|owner| owner.bytes).sum();
     let charged = owners.weights_bytes.saturating_add(owners.workspace_bytes)
@@ -52,13 +64,16 @@ fn row(device: &str, measured: Option<i128>, owners: &cuteafd_core::memory_polic
     let delta_vs_admitted = measured.map(|used| used - i128::from(charged));
     // No graph owner needs no replacement. A missing live controller sample is
     // unknown, not zero; over-reserve arena growth produces negative slack.
-    let graph_arena = graph_arena.or((graph_reserve == 0).then_some(0));
-    let slack = graph_arena.map(|arena| i128::from(graph_reserve) - i128::from(arena));
+    let graph_arena = graph_arena.or((graph_reserve == 0).then_some((0, 0)));
+    let graph_level = graph_arena.map(|(level, _)| level);
+    let graph_high_water = graph_arena.map(|(_, high_water)| high_water);
+    let slack = graph_level.map(|arena| i128::from(graph_reserve) - i128::from(arena));
     let delta_vs_measured = delta_vs_admitted.zip(slack).map(|(delta, slack)| delta + slack);
     json!({"device": device, "measured_bytes": measured, "charged_bytes": charged,
         "padding_bytes": padding, "delta_vs_admitted": delta_vs_admitted,
         "delta_vs_measured": delta_vs_measured, "graph_reserve_slack": slack,
-        "graph_reserve_bytes": graph_reserve, "graph_arena_high_water_bytes": graph_arena,
+        "graph_reserve_bytes": graph_reserve, "graph_arena_bytes": graph_level,
+        "graph_arena_high_water_bytes": graph_high_water,
         "beyond_half_padding": delta_vs_measured.map(|delta| delta.abs() * 2 > i128::from(padding)),
         "drift_flag_eligible": true, "drift_flag_unavailable_reason": null,
         "graph_measurement_unavailable_reason": graph_arena.is_none().then_some("no measured graph arena high-water for admitted graph reserve"),
@@ -68,12 +83,13 @@ fn row(device: &str, measured: Option<i128>, owners: &cuteafd_core::memory_polic
 }
 
 fn observed_row(device: &str, sample: Option<(usize, usize, usize)>,
-    owners: &cuteafd_core::memory_policy::DeviceBreakdown, graph_arena: Option<u64>,
+    owners: &cuteafd_core::memory_policy::DeviceBreakdown, graph_arena: Option<(u64, u64)>,
     provenance: Value, reason: Option<&str>) -> Value {
     let raw = sample.map(|(free, total, _)| total.saturating_sub(free) as u64);
     let observer = sample.map(|(_, _, observer)| observer as u64);
     let measured = raw.zip(observer).and_then(|(raw, observer)| raw.checked_sub(observer));
-    let mut record = row(device, measured.map(i128::from), owners, graph_arena, provenance, reason);
+    let mut record = row_with_arena(device, measured.map(i128::from), owners, graph_arena,
+        provenance, reason);
     record["raw_used_bytes"] = json!(raw);
     record["observer_bytes"] = json!(observer);
     record["observer_provenance"] = json!({
@@ -170,8 +186,18 @@ pub(crate) fn capture(stage: &str) {
             let sample = sample.ok().flatten().flatten();
             let mut identity = provenance.clone();
             identity["device_sample"] = devices.get(index).cloned().unwrap_or(Value::Null);
-            let graph_arena = physical.and_then(|device| graph_samples.iter()
-                .find(|sample| i64::from(sample.device) == device)).map(|sample| sample.charged);
+            // Refresh the level from this stage's settled sample: a capture
+            // boundary can catch a transient peak that has already reversed by
+            // the time the stage runs. A device without a live graph controller
+            // keeps the cached snapshot's figure.
+            let graph_arena = physical.and_then(|device| i32::try_from(device).ok())
+                .and_then(|device| sample.and_then(|(free, total, _)| {
+                    crate::shared::decode_graph::device::refreshed_arena(
+                        device, free as u64, total as u64)
+                }))
+                .or_else(|| physical.and_then(|device| graph_samples.iter()
+                    .find(|sample| i64::from(sample.device) == device))
+                    .map(|sample| (sample.level.unwrap_or(sample.charged), sample.charged)));
             rows.push(observed_row(id, sample, &owners, graph_arena, identity,
                 sample_error.as_deref().or_else(|| sample.is_none().then_some("no active CUDA primary context sample"))));
         } else if let Some(rank) = id.strip_prefix("spark").and_then(|n| n.trim_start_matches('.').parse::<u32>().ok()) {
@@ -250,20 +276,38 @@ mod tests {
             weights_bytes: 600, workspace_bytes: 100, kv_bytes: 0, other_bytes: 0,
             reserve_overridden: false, reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
                 name: "graph reserve".into(), bytes: 100 }] };
-        let sample = observed_row("rtx0", Some((150, 1000, 100)), &owners, Some(50), json!({}), None);
+        let sample = observed_row("rtx0", Some((150, 1000, 100)), &owners, Some((50, 50)), json!({}), None);
         assert_eq!(sample["raw_used_bytes"], 850);
         assert_eq!(sample["observer_bytes"], 100);
         assert_eq!(sample["measured_bytes"], 750);
         assert_eq!(sample["delta_vs_admitted"], -50);
         assert_eq!(sample["delta_vs_measured"], 0);
         assert_eq!(sample["observer_provenance"]["present"], true);
-        let production = observed_row("rtx0", Some((250, 1000, 0)), &owners, Some(50), json!({}), None);
+        let production = observed_row("rtx0", Some((250, 1000, 0)), &owners, Some((50, 50)), json!({}), None);
         assert_eq!(production["measured_bytes"], sample["measured_bytes"]);
         assert_eq!(production["delta_vs_measured"], 0);
-        let missing = observed_row("rtx0", None, &owners, Some(50), json!({}), Some("no sample"));
+        let missing = observed_row("rtx0", None, &owners, Some((50, 50)), json!({}), Some("no sample"));
         assert!(missing["measured_bytes"].is_null());
         assert!(missing["observer_bytes"].is_null());
         assert!(missing["delta_vs_measured"].is_null());
+    }
+
+    #[test]
+    fn graph_slack_uses_the_current_level_and_still_publishes_the_high_water() {
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 900,
+            weights_bytes: 600, workspace_bytes: 100, kv_bytes: 0, other_bytes: 0,
+            reserve_overridden: false, reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
+                name: "graph reserve".into(), bytes: 100 }] };
+        let sample = row_with_arena("rtx0", Some(100), &owners, Some((50, 80)), json!({}), None);
+        assert_eq!(sample["graph_arena_bytes"], 50);
+        assert_eq!(sample["graph_arena_high_water_bytes"], 80);
+        assert_eq!(sample["graph_reserve_slack"], 50);
+        assert_eq!(sample["delta_vs_admitted"], -700);
+        assert_eq!(sample["delta_vs_measured"], -650);
+        // A controller that never sampled reports the high-water as both.
+        let fallback = row("rtx0", Some(100), &owners, Some(80), json!({}), None);
+        assert_eq!(fallback["graph_arena_bytes"], 80);
+        assert_eq!(fallback["graph_reserve_slack"], 20);
     }
 
     #[test]

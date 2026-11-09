@@ -680,7 +680,18 @@ name the implementing code or regression-test location.
 Reconciliation ([daemon/shared/memory_report/reconcile.rs](../../rust/crates/cuteafd-daemon/src/shared/memory_report/reconcile.rs))
 compares observer-excluded CUDA use with admitted Growth owners, excluding
 release padding. `delta_vs_measured = delta_vs_admitted + graph_reserve_slack`;
-slack is reserve minus graph high-water. At Ready and joined first_request,
+slack is reserve minus the observed current graph-arena level, sampled again
+from the settled device sample at Ready and joined first_request rather than
+reused from the last capture boundary, which can catch a transient
+instantiate/upload peak that has already reversed. The refreshed level is
+bounded by the admitted high-water, so a non-graph untracked allocation live at
+the sample can only reduce the figure below the charge, never inflate it; the
+path releases peak credit and never raises the charge. Negative slack means the
+arena exceeded its reserve. Component values are `graph_reserve_bytes`,
+`graph_arena_bytes` (the level used) and `graph_arena_high_water_bytes` (the
+monotone charge admission and eviction keep, which still covers a transient
+capture peak); a family whose controller never samples reports the high-water as
+both. At Ready and joined first_request,
 require nonnegative slack and RTX `abs(delta_vs_measured) <= padding_bytes / 2`.
 Unused admitted Growth capacity can make Ready negative; explain it, do not hide
 it. Exclude the measured observer context once; missing provenance, physical
@@ -692,6 +703,14 @@ physical telemetry is unavailable (#1631). The live native worker has no graph
 sites today: `SPARK_GRAPH_RESERVE` forwarding is not active ownership; add worker
 admission and controller attachment together when enabling capture
 (`daemon/shared/experts/service/backend.rs`).
+
+The observer's untracked residual subtracts the ledger's reported granularity
+tail (the SM120 2 MiB backing beyond every live tracked request) as well as the
+tracked total. `used - tracked` otherwise contains the page padding of every
+tracked owner, so a cache that builds many small device buffers would be read as
+graph growth and fund the graph reserve. Padding belongs to the owner that
+allocated it; only bytes no ledger row claims and no rounding explains count as
+graph arena.
 
 ### Pitfalls
 
