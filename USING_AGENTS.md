@@ -521,3 +521,4 @@ duplicating it. Record the lesson in the table below.
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | ~2,700 hand-written driver scripts; most of one day's failures came from them (wrong container prefix, stale markers, dropped trace, missing --interleave) | The preamble's two commands; wip-cards preflights before queuing, `--resume` replaces retries, and agents ask for tooling instead of writing drivers |
 | Codex subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on another model from STATUS.md |
+| Six `while pgrep -f "PATTERN"` waiters never exited: the pattern appears in the loop's own `bash -c` argv, so `pgrep -f` always matched itself | Wait on a PID (`tail --pid=N -f /dev/null`), a systemd unit (`systemctl --user is-active`) or a result file, never on `pgrep -f` of a pattern your own command line contains |
