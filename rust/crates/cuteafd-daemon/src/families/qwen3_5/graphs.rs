@@ -3,7 +3,22 @@
 use super::*;
 use crate::shared::decode_graph::{GraphBank, GraphOwner, device::{self, Basis, Cycle, Preference, Site}};
 use cuteafd_loader::serving_capacity::qwen35_graphs::{self, Geometry};
-use std::cell::RefCell;
+use std::{cell::{Cell, RefCell}, rc::Rc};
+
+pub(crate) struct GraphBypass {
+    ready: Rc<Cell<bool>>,
+    previous: bool,
+}
+
+impl Drop for GraphBypass {
+    fn drop(&mut self) { self.ready.set(self.previous); }
+}
+
+impl GraphBypass {
+    fn new(ready: &Rc<Cell<bool>>) -> Self {
+        Self { previous: ready.replace(false), ready: ready.clone() }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Key {
@@ -19,7 +34,7 @@ pub(super) struct Graphs<'a> {
     bank: RefCell<GraphBank<Key, Executable<'a>>>,
     variant: String,
     pub(super) enabled: bool,
-    capture_ready: std::cell::Cell<bool>,
+    capture_ready: Rc<Cell<bool>>,
     warming: std::cell::Cell<bool>,
 }
 
@@ -40,7 +55,7 @@ impl<'a> Graphs<'a> {
         }
         Ok(Self { bank: RefCell::new(bank), variant,
             enabled,
-            capture_ready: std::cell::Cell::new(false), warming: std::cell::Cell::new(false) })
+            capture_ready: Rc::new(Cell::new(false)), warming: std::cell::Cell::new(false) })
     }
 
     pub(super) fn cycle(&self, speculative: bool) {
@@ -51,7 +66,44 @@ impl<'a> Graphs<'a> {
     pub(super) fn prefill(&self) { self.bank.borrow_mut().cache_cycle(Cycle::Prefill); }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_bypass_restores_on_error_nested_calls_and_unwind() {
+        let ready = Rc::new(Cell::new(true));
+        let fail = || -> Result<()> {
+            let _outer = GraphBypass::new(&ready);
+            assert!(!ready.get());
+            {
+                let _inner = GraphBypass::new(&ready);
+                assert!(!ready.get());
+            }
+            assert!(!ready.get());
+            anyhow::bail!("diagnostic failure")
+        };
+        assert!(fail().is_err());
+        assert!(ready.get());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _bypass = GraphBypass::new(&ready);
+            assert!(!ready.get());
+            panic!("diagnostic unwind");
+        })).is_err());
+        assert!(ready.get());
+        ready.set(false);
+        drop(GraphBypass::new(&ready));
+        assert!(!ready.get());
+    }
+}
+
 impl DenseEngine<'_> {
+    /// Only used across the synchronous single-lane diagnostic submission, with
+    /// no await or callback that can start another serving round on this engine.
+    pub(crate) fn bypass_graphs(&self) -> GraphBypass {
+        GraphBypass::new(&self.graphs.capture_ready)
+    }
+
     pub(super) fn graph_layer(&self, index: usize, step: &Step) -> Result<()> {
         let segment = || Blocks { programs: self.programs, admitted: &self.admitted,
             cfg: &self.cfg, homes: &self.homes, bank: &self.bank, stream: self.stream.raw }

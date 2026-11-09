@@ -71,6 +71,32 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
         Ok(census)
     }
 
+    pub(crate) fn check_diagnostic_graph_bypass(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(tokens.len() >= 2, "dense diagnostic graph check needs two tokens");
+        let device = self.library.cuda_get_device()?;
+        let counters = || crate::shared::decode_graph::device::snapshots().iter()
+            .filter(|row| row.device == device)
+            .flat_map(|row| row.cycles.values()).fold((0, 0), |(captures, hits), cycle|
+                (captures + cycle.captures, hits + cycle.hits));
+        let before = counters();
+        let pool = cuteafd_engine::prefix::RefPagePool::new(self.engine.borrow().pool_tokens / 64, 64);
+        for (speculative, kind) in [(false, scheduler::UngraphedKind::Decode),
+            (true, scheduler::UngraphedKind::Decode), (false, scheduler::UngraphedKind::Scoring)] {
+            self.engine.borrow_mut().reset_slot(0)?;
+            let mut placement = Placement { units: vec![0], slot: 0, len: 0, state_len: 0 };
+            for _ in 0..2 {
+                self.verify_device_ungraphed(&mut [(&mut placement, &tokens[..2])], speculative,
+                    kind, &pool)?.context("diagnostic needs logits")?
+                    .to_host(self.library)?;
+                if let Some(mark) = self.pending.borrow_mut().take() { self.engine.borrow_mut().restore(&mark)?; }
+            }
+        }
+        self.engine.borrow_mut().reset_slot(0)?;
+        ensure!(counters() == before, "dense diagnostic verify captured or replayed a graph");
+        println!("dense diagnostic verify: zero captures and zero replays (plain and speculative)");
+        Ok(())
+    }
+
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
         Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
@@ -347,7 +373,12 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         let rows = sequences.iter().flat_map(|(placement, tokens)|
             tokens.iter().enumerate().map(|(offset, _)| (placement.slot, placement.len + offset))).collect::<Vec<_>>();
-        let output = self.verify_device(sequences, speculative, pool)?;
+        let output = {
+            // The shared Qwen scheduler submits this single lane synchronously;
+            // the engine-local override never changes the shared device cache.
+            let _bypass = self.engine.borrow().bypass_graphs();
+            self.verify_device(sequences, speculative, pool)?
+        };
         if kind == scheduler::UngraphedKind::Scoring {
             ensure!(!speculative, "dense scoring cannot leave speculative state");
             if let Some(mtp) = &self.mtp {

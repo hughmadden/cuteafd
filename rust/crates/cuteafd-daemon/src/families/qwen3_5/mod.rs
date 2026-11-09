@@ -151,6 +151,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         if args.state_slots > 1 { engine.multislot_verify_check(&tokens)?; }
     }
     let engine = std::cell::RefCell::new(engine);
+    if args.verify_check { serve::DenseBackend::new(&engine, &library).check_diagnostic_graph_bypass(&tokens)?; }
     if let Some(members) = args.packed_check {
         ensure!(args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact || packed_windows.is_some(),
             "unrestricted packed check needs the sealed official reference");
