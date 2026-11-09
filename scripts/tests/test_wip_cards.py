@@ -1840,6 +1840,28 @@ def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entr
         assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
 
 
+def test_prefill_idle_seconds_reaches_matrix_and_rejects_invalid(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    for value in ['0', '1.5']:
+        state = tmp_path / ('idle-' + value)
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+            '--matrix', '--arm', 'a=b:s', '--state', str(state), '--panels', 'none',
+            '--prefill-lengths', '8310', '--prefill-idle-seconds', value, '--dry-run'])
+        assert cards.main() == 0
+        matrix = json.loads(next(state.glob('*/matrix.json')).read_text())
+        assert matrix['entries'][0]['prefill_idle_seconds'] == float(value)
+    for value in ['-1', 'nan', 'inf', '1e30']:
+        monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+            '--matrix', '--arm', 'a=b:s', '--state', str(tmp_path / 'invalid'),
+            '--prefill-lengths', '8310', '--prefill-idle-seconds', value, '--dry-run'])
+        with pytest.raises(SystemExit):
+            cards.main()
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'a=b:s', '--prefill-idle-seconds', '1', '--dry-run'])
+    with pytest.raises(SystemExit):
+        cards.main()
+
+
 def test_readiness_only_row_needs_no_report(entry, tmp_path):
     job = make({**entry, 'profile': 'panels:', 'baseline': False}, tmp_path)
     row = cards.summarize_job(job, 0)

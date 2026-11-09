@@ -86,12 +86,14 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
         let opened_at = Arc::new(Mutex::new(Vec::new()));
         let (record, counter) = (opened_at.clone(), seen.clone());
         let purge = || { purged_at.lock().unwrap().push(seen.load(Ordering::SeqCst)); Ok(()) };
-        let options = cuteafd_bench::sweep::PrefillOptions { repeat: true, purge: Some(&purge) };
+        let options = cuteafd_bench::sweep::PrefillOptions { repeat: true, purge: Some(&purge), idle_seconds: 0.03 };
+        let started = std::time::Instant::now();
         let sweep = cuteafd_bench::sweep::run_windowed(&base, None, &[], false, false, &[256, 512], &options, false,
             cuteafd_bench::sweep::TOKENS, Some(Box::new(move || {
                 record.lock().unwrap().push(counter.load(Ordering::SeqCst));
                 Ok(())
             }))).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(60));
         let purged = purged_at.lock().unwrap().clone();
         let opened = opened_at.lock().unwrap().clone();
         (purged, opened, sweep)
@@ -100,6 +102,7 @@ async fn prefill_purge_precedes_each_warm_up_and_timed_request() {
     assert_eq!(purged_at, vec![2, 3, 4, 5]);
     assert_eq!(opened_at, vec![3]);
     assert_eq!(sweep.prefill.len(), 2);
+    assert!(sweep.prefill.iter().all(|point| point.idle_seconds == 0.03));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
