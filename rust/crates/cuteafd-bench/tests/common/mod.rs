@@ -19,7 +19,8 @@ pub fn with_fake_token_count(router: axum::Router) -> axum::Router {
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         assert_eq!(body["thinking"]["type"], "disabled");
         let overhead = case["prompt"].as_str().unwrap().chars().count() - "hello".chars().count();
-        axum::Json(serde_json::json!({"input_tokens": overhead + body["messages"][0]["content"].as_str().unwrap().chars().count()}))
+        axum::Json(serde_json::json!({"input_tokens": overhead + body["messages"][0]["content"].as_str().unwrap().chars().count(),
+            "exact_token_count": true}))
     }
     axum::Router::new().route("/v1/messages/count_tokens", axum::routing::post(count)).fallback_service(router)
 }
