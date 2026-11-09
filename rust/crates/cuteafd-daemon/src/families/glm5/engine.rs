@@ -1544,7 +1544,8 @@ impl<'a> GlmEngine<'a> {
     /// reserve. Unlisted or uncaptured request shapes may capture or run eager.
     /// One eager pass first puts module, workspace and BLAS first touch outside
     /// executable residency. Returns resident keys and per-rank capture samples.
-    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>)
+    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
+        inventory: &cuteafd_loader::placement::families::glm5::admission::StartupGraphs, bootstraps: &[u64])
         -> Result<Vec<StartupGraphCapture>> {
         use cuteafd_loader::placement::inventory::GraphMemorySample;
         let started = std::time::Instant::now();
@@ -1552,8 +1553,42 @@ impl<'a> GlmEngine<'a> {
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "GLM startup graph inventory already captured");
+        let all_shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
+        let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
+        let policies = (0..self.ranks()).map(|rank|
+            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let bases: Vec<_> = policies.iter().map(|policy| policy.base_bytes).collect();
+        let costs = |selected: &[usize]| -> Vec<u64> {
+            inventory.declared().iter().enumerate().map(|(rank, declared)| {
+                let keys: Vec<_> = declared.iter().filter(|key| selected.iter().any(|index| {
+                    let shape = all_shapes[*index].shape;
+                    key.rows == shape.rows && key.table_width == if self.context_kv() {
+                        shape.table_width.div_ceil(2)
+                    } else { shape.table_width }
+                })).collect();
+                match self.graph_basis() {
+                    crate::shared::decode_graph::device::Basis::Nodes { node_rate, graph_rate } => {
+                        let nodes: u64 = keys.iter().filter_map(|key| self.graph_estimate(key).and_then(|estimate| estimate.nodes)).sum();
+                        let pack = |bytes: u64| bytes.div_ceil(2 << 20).saturating_mul(2 << 20);
+                        pack(nodes.saturating_mul(node_rate)).saturating_add(pack((keys.len() as u64).saturating_mul(graph_rate)))
+                    }
+                    _ => (keys.len() as u64).saturating_mul(bootstraps[rank]),
+                }
+            }).collect()
+        };
+        let pins: Vec<_> = all_shapes.iter().map(|entry| entry.pin).collect();
+        let selected = cuteafd_loader::placement::graph_reserve::prewarm_selection(&pins, &bases,
+            |selected, bases| costs(selected).iter().zip(bases).all(|(bytes, base)| bytes <= base));
+        if selected.len() < all_shapes.len() {
+            let full = costs(&(0..all_shapes.len()).collect::<Vec<_>>());
+            let kept = costs(&selected);
+            tracing::warn!(skipped_entries = all_shapes.len() - selected.len(),
+                skipped_bytes = ?full.iter().zip(&kept).map(|(full, kept)| full.saturating_sub(*kept)).collect::<Vec<_>>(),
+                base_bytes = ?bases, "GLM prewarm exceeds base; skipped entries remain runtime misses (pinned set is indivisible)");
+        }
+        let shapes: Vec<_> = selected.into_iter().map(|index| all_shapes[index].clone()).collect();
         use crate::shared::decode_graph::device::Cycle;
-        let shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
         self.graphs.borrow_mut().cache_cycle(Cycle::Other);
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         // Eager pass: each shape's first module, workspace and BLAS touch lands
@@ -1606,6 +1641,9 @@ impl<'a> GlmEngine<'a> {
                 basis: self.graph_basis(),
                 spans_devices: self.ranks() > 1,
             })?;
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::glm_default(self.prewarm_family(), self.ranks());
+            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
         }
         Ok(())
     }

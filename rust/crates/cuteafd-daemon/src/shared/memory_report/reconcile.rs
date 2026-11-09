@@ -265,6 +265,17 @@ mod tests {
     }
 
     #[test]
+    fn graph_slack_includes_bounded_extra_charged_before_kv() {
+        let policy = cuteafd_loader::placement::graph_reserve::resolve(None, 0, false, 100, 20).unwrap();
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 1000,
+            weights_bytes: 0, workspace_bytes: 0, kv_bytes: 0, other_bytes: 0, reserve_overridden: false,
+            reserve: vec![cuteafd_core::memory_policy::ReserveComponent { name: "graph reserve".into(), bytes: policy.bytes }] };
+        let sample = row("rtx0", Some(100), &owners, Some(100), json!({}), None);
+        assert_eq!(sample["graph_reserve_bytes"], 240);
+        assert_eq!(sample["graph_reserve_slack"], 140);
+        assert_eq!(sample["delta_vs_measured"], 0);
+    }
+    #[test]
     fn signed_delta_keeps_release_padding_separate_and_preserves_missing_samples() {
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 1000,
             weights_bytes: 60, workspace_bytes: 10, kv_bytes: 20, other_bytes: 0, reserve_overridden: false,

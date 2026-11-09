@@ -1791,13 +1791,13 @@ impl StartupGraphs {
         let (base, extra) = self.default_reserve();
         self.ranks.iter().enumerate().map(|(rank, _)| crate::placement::graph_reserve::current(
             rank, false, base, extra)
-            .map(|reserve| reserve.bytes).map_err(Refusal::InvalidFact)).collect()
+            .map(|reserve| reserve.bytes).map_err(|error| Refusal::InvalidFact(error.to_string()))).collect()
     }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero graph pool extent")); }
         let reserves = self.reserves()?;
-        self.ranks.iter().enumerate().map(|(rank, graph)| {
+        self.ranks.iter().enumerate().filter(|(rank, _)| reserves[*rank] != 0).map(|(rank, graph)| {
             let mut component = crate::placement::planner::serving::startup_graph_component(
                 &format!("glm.graphs.{rank}"), Location::coordinator(rank as u8),
                 GraphRank { bytes: reserves[rank], ..*graph }, maximum_pages)?;

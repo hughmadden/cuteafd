@@ -84,6 +84,7 @@ pub(crate) struct Counters {
 pub(crate) struct Snapshot {
     pub device: i32,
     pub reserve: u64,
+    pub reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     pub charged: u64,
     pub pinned: u64,
     pub pending_capture: u64,
@@ -270,6 +271,16 @@ pub(crate) fn device_cache(device: i32, reserve: u64, basis: Basis) -> anyhow::R
     Ok(cache)
 }
 
+/// Attach the admitted charge's provenance after a family has bound its banks.
+pub(crate) fn set_reserve_policy(device: i32, policy: cuteafd_loader::placement::graph_reserve::Resolved) -> anyhow::Result<()> {
+    let devices = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner());
+    let cache = devices.get(&device).ok_or_else(|| anyhow::anyhow!("no graph cache on device {device}"))?;
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    anyhow::ensure!(cache.reserve == policy.bytes, "graph reserve policy disagrees with admission on device {device}");
+    cache.reserve_policy = Some(policy);
+    Ok(())
+}
+
 pub(crate) fn snapshots() -> Vec<Snapshot> {
     let caches: Vec<_> = DEVICES.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
         .values().cloned().collect();
@@ -281,6 +292,7 @@ pub(crate) fn snapshots() -> Vec<Snapshot> {
 pub(crate) struct DeviceCache {
     device: i32,
     reserve: u64,
+    reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     charged: u64,
     pending_bytes: u64,
     next_id: u64,
@@ -308,7 +320,7 @@ pub(crate) struct DeviceCache {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
@@ -711,7 +723,7 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        Snapshot { device: self.device, reserve: self.reserve, charged: self.charged,
+        Snapshot { device: self.device, reserve: self.reserve, reserve_policy: self.reserve_policy, charged: self.charged,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
             sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: ranked(false), top_churn: ranked(true) }
@@ -752,6 +764,23 @@ mod tests {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
         cache.measured_capture(10);
         id
+    }
+    #[test]
+    fn reserve_policy_snapshot_distinguishes_admission_from_live_arena() {
+        let policy = cuteafd_loader::placement::graph_reserve::resolve_with_extra(
+            None, Some("50%"), Some("20MB"), 0, false, 100_000_000, 0).unwrap();
+        let mut cache = DeviceCache::new(-901, policy.bytes);
+        cache.reserve_policy = Some(policy);
+        let snapshot = serde_json::to_value(cache.snapshot()).unwrap();
+        assert_eq!(snapshot["reserve"], 120_000_000);
+        assert_eq!(snapshot["charged"], 0); // live graph arena, not the admission charge
+        let policy = &snapshot["reserve_policy"];
+        assert_eq!(policy["base_bytes"], 100_000_000);
+        assert_eq!(policy["extra_bytes"], 50_000_000);
+        assert_eq!(policy["cap_bytes"], 20_000_000);
+        assert_eq!(policy["charged_bytes"], 120_000_000);
+        assert_eq!(policy["charged_source"], "family default with extra");
+        assert_eq!(policy["extra_source"], "user override");
     }
     #[test]
     fn per_key_churn_cost_and_forget_lifetime() {

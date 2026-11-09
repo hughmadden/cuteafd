@@ -120,6 +120,25 @@ def test_plan_preflight_admits_under_the_launch_instrumentation(tmp_path):
         assert flag in plan, (flag, plan)
 
 
+@pytest.mark.parametrize("keys,expected", [
+    ("GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB\n", ["GPU_GRAPH_RESERVE=gpu0=300MB,gpu1=200MB"]),
+    ("GPU_GRAPH_RESERVE_EXTRA=gpu0=25%,gpu1=500MB\nGPU_GRAPH_RESERVE_EXTRA_CAP=100%\n",
+     ["GPU_GRAPH_RESERVE_EXTRA=gpu0=25%,gpu1=500MB", "GPU_GRAPH_RESERVE_EXTRA_CAP=100%"]),
+])
+def test_graph_reserve_policy_reaches_plan_and_coordinator_not_workers(tmp_path, keys, expected):
+    config = {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}
+    result = _family_launch_result(tmp_path, config, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    plan = next(line for line in result.stderr.splitlines() if 'cuteafd plan' in line)
+    coordinator = next(line for line in result.stderr.splitlines() if 'cuteafd serve-glm' in line)
+    for line in (plan, coordinator):
+        for value in expected:
+            assert f"CUTEAFD_{value}" in line, (value, line)
+    workers = [line for line in result.stderr.splitlines() if 'cuteafd expertd-native' in line]
+    assert workers
+    assert all('CUTEAFD_GPU_GRAPH_RESERVE' not in line for line in workers)
+
+
 def test_v41_native_census_probes_cover_all_card_sizes():
     family = ROOT / 'rust/crates/cuteafd-daemon/src/families/deepseek_v41'
     single = (family / 'v41_native_serve.rs').read_text()

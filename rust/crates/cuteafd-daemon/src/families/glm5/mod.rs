@@ -1777,26 +1777,32 @@ impl Opened {
             .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
         engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let (base, extra) = admitted.graphs.default_reserve();
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
-                .map_err(anyhow::Error::msg)?;
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE startup policy");
+            let (base, tail) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                base = reserve.base_bytes, base_source = reserve.base_source,
+                extra = reserve.extra_bytes, extra_source = reserve.extra_source,
+                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE startup policy");
         }
         // Current startup shapes are a best-effort prewarm list. Admission keeps
         // the entire graph reserve charged; measured warmup never shrinks it.
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
         for rank in 0..admitted.graphs.ranks().len() {
-            let (base, extra) = admitted.graphs.default_reserve();
-            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
-                .map_err(anyhow::Error::msg)?;
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE Ready summary");
+            let (base, tail) = admitted.graphs.default_reserve();
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
+                base = reserve.base_bytes, base_source = reserve.base_source,
+                extra = reserve.extra_bytes, extra_source = reserve.extra_source,
+                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE Ready summary");
         }
         engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);
