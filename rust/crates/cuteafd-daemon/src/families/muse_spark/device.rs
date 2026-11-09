@@ -216,19 +216,24 @@ impl RankDevice<'_, '_> {
                     self.lane.rows("attended", step.rows)?)
             });
         }
-        self.segment(layer, step, super::graphs::Section::Attention, || self.attention_prefix(layer, step))?;
-        let rows = step.rows;
+        self.attention_prepare(layer, step)?;
+        self.attention_exchange(layer, step.rows, peer.context("Muse TP2 o_proj needs the peer exchange")?)
+    }
+
+    pub(crate) fn attention_prepare(&self, layer: usize, step: &StepPlanes) -> Result<()> {
+        self.segment(layer, step, super::graphs::Section::Attention, || self.attention_prefix(layer, step))
+    }
+
+    pub(crate) fn attention_exchange(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange) -> Result<()> {
         let gated = self.lane.rows("gated", rows)?;
         let attended = self.lane.rows("attended", rows)?;
         let weights = self.weights(layer)?;
         match (self.ranks, weights.core("attn.o")) {
             (1, Some(core)) => self.core.local(rows, gated, core, attended, self.stream),
-            (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended,
-                peer.context("Muse TP2 o_proj needs the peer exchange")?),
+            (2, Some(core)) => self.k_split(Channel::Attention, rows, gated, core, attended, peer),
             (1, None) => self.project(layer, "attn.o", rows, gated, attended),
             (2, None) => self.native_k_split(rows, gated,
-                weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended,
-                peer.context("Muse native TP2 o_proj needs the peer exchange")?),
+                weights.native("attn.o").context("Muse TP2 o_proj owner absent")?, attended, peer),
             _ => anyhow::bail!("Muse attention needs one or two coordinator ranks"),
         }
     }
@@ -400,9 +405,13 @@ impl RankDevice<'_, '_> {
     /// The split frontend; `both`: an onboarded layer, whose experts run on both
     /// GPUs, so the halves are swapped and both assemble the full expert input.
     fn moe_frontend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
+        self.frontend_prepare(layer, rows)?;
+        self.frontend_exchange(layer, rows, peer, both)
+    }
+
+    pub(crate) fn frontend_prepare(&self, layer: usize, rows: usize) -> Result<()> {
         let lane = self.lane;
         let half = lane.rows("expert_half", rows)?;
-        let half_bytes = self.cfg.expert_hidden;
         let launch = || -> Result<()> {
             if self.graphs.is_some() { self.attention_residual(layer, rows)?; }
             let weights = self.weights(layer)?;
@@ -420,6 +429,13 @@ impl RankDevice<'_, '_> {
             graphs.run(super::graphs::Key { layer, rows, stride: 0, section: super::graphs::Section::Frontend },
                 self.stream, launch)?;
         } else { launch()?; }
+        Ok(())
+    }
+
+    pub(crate) fn frontend_exchange(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
+        let lane = self.lane;
+        let half = lane.rows("expert_half", rows)?;
+        let half_bytes = self.cfg.expert_hidden;
         let received = if both { peer.swap(Channel::ExpertInput, half)? } else {
             if self.rank == 1 { return peer.send(Channel::ExpertInput, half, rows, half_bytes, half_bytes); }
             peer.receive(Channel::ExpertInput, rows * half_bytes)?
@@ -463,7 +479,7 @@ impl RankDevice<'_, '_> {
     /// The K-split backend; `both`: an onboarded layer, where both ranks
     /// combined the full rows, so each packs its own half locally (no
     /// `Combined` exchange).
-    fn moe_backend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
+    pub(crate) fn moe_backend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
         let lane = self.lane;
         let half_bytes = self.cfg.expert_hidden;
         let full = 2 * half_bytes;
@@ -585,9 +601,8 @@ impl RankDevice<'_, '_> {
             return self.segment(layer, step, super::graphs::Section::Attention,
                 || eager.layer_local(layer, step, onboarded, None));
         }
-        let (rows, lane) = (step.rows, self.lane);
+        let rows = step.rows;
         ensure!(onboarded.holds(layer), "Muse layer {layer} is not onboarded on rank {}", self.rank);
-        let (hidden, normed, residual) = (lane.rows("hidden", rows)?, lane.rows("normed", rows)?, lane.rows("residual", rows)?);
         self.attention(layer, step, peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
         if self.ranks == 1 || self.graphs.is_none() { self.attention_residual(layer, rows)?; }
         self.trace(step, layer, &[("residual", self.cfg.hidden * 2)])?;
@@ -597,6 +612,18 @@ impl RankDevice<'_, '_> {
         }
         self.trace(step, layer, &[("route_ids", self.cfg.topk * 4), ("route_weights", self.cfg.topk * 4)])?;
         self.expert_wire(rows)?;
+        self.local_partials(layer, rows, onboarded)?;
+        let planes = self.local_exchange(rows, onboarded, peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
+        self.local_combine(layer, rows, onboarded, &planes)?;
+        self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
+        match peer {
+            Some(peer) => self.moe_backend_halves(layer, rows, peer, true)?,
+            None => self.moe_backend(layer, rows)?,
+        }
+        self.finish_residual(layer, step)
+    }
+
+    pub(crate) fn local_partials(&self, layer: usize, rows: usize, onboarded: &mut super::onboard::OnboardedExperts<'_>) -> Result<()> {
         let [ids, weights, wire] = self.wave_sources(rows)?;
         // Identity epilogue maps are initialized once, outside graph capture.
         let plan = cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4, regions: vec![0; rows] };
@@ -614,34 +641,42 @@ impl RankDevice<'_, '_> {
             graphs.run(super::graphs::Key { layer, rows, stride: 0, section: super::graphs::Section::LocalExperts },
                 self.stream, launch)?;
         } else { launch()?; }
-        let planes: Vec<u64> = match peer.as_mut() {
+        Ok(())
+    }
+
+    pub(crate) fn local_exchange(&self, rows: usize, onboarded: &super::onboard::OnboardedExperts<'_>,
+        peer: Option<&mut dyn PeerExchange>) -> Result<Vec<u64>> {
+        let own = onboarded.own_rows(self.cfg, rows);
+        Ok(match peer {
             Some(peer) => {
                 let received = peer.swap(Channel::Partials, own)?;
                 let (rank0, rank1) = if self.rank == 0 { (own, received) } else { (received, own) };
                 vec![rank0.ptr as u64, rank1.ptr as u64]
             }
             None => vec![own.ptr as u64],
-        };
-        onboarded.tables_for(self.library, &planes, self.stream)?;
+        })
+    }
+
+    pub(crate) fn local_combine(&self, layer: usize, rows: usize, onboarded: &mut super::onboard::OnboardedExperts<'_>,
+        planes: &[u64]) -> Result<()> {
+        onboarded.tables_for(self.library, planes, self.stream)?;
         let reply = cuteafd_loader::families::muse_spark::replies::ReplyPlan { bf16_rows: (0..rows as u32).collect(),
             wide_rows: Vec::new(), other_rows: Vec::new(), wide: cuteafd_loader::families::muse_spark::replies::PartialFormat::Nvfp4 };
-        self.combine(layer, rows, planes.len(), onboarded.tables.buffer, onboarded.layout, &reply)?;
-        self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
-        match peer {
-            Some(peer) => self.moe_backend_halves(layer, rows, peer, true)?,
-            None => self.moe_backend(layer, rows)?,
-        }
-        let moe = lane.rows("moe", rows)?;
+        self.combine(layer, rows, planes.len(), onboarded.tables.buffer, onboarded.layout, &reply)
+    }
+
+    pub(crate) fn finish_residual(&self, layer: usize, step: &StepPlanes) -> Result<()> {
+        let (rows, lane) = (step.rows, self.lane);
         self.segment(layer, step, super::graphs::Section::Residual, || {
-            self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
-            self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+            self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, lane.rows("moe", rows)?, lane.rows("normed", rows)?)?;
+            self.residual_gate(layer, "ffn", rows, lane.rows("residual", rows)?, lane.rows("normed", rows)?, lane.rows("hidden", rows)?)
         })?;
         self.trace(step, layer, &[("hidden", self.cfg.hidden * 2)])
     }
 
     /// The wave's staging sources from this lane (the unit's slot views): route
     /// ids, route weights and the FP8 K32 wire.
-    fn wave_sources(&self, rows: usize) -> Result<[Buffer; 3]> {
+    pub(crate) fn wave_sources(&self, rows: usize) -> Result<[Buffer; 3]> {
         Ok([self.lane.rows("route_ids", rows)?, self.lane.rows("route_weights", rows)?, self.lane.rows("expert_wire", rows)?])
     }
 

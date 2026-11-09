@@ -1,7 +1,8 @@
 //! One Muse step over the coordinator ranks (one RTX, or a head-split pair):
 //! the step metadata upload, the embedding, every layer in model order
-//! (`RankDevice::layer`; the host enqueues each layer on rank 0 then rank 1,
-//! and every cross-GPU wait is device-side), and the head.
+//! (`RankDevice::layer` for eager execution; graph-enabled pairs submit both
+//! ranks phase by phase before the next capture), and the head. Cross-GPU
+//! waits remain device-side.
 //!
 //! - Embedding: the BF16 table lives on rank 0 (single residency); each rank
 //!   gathers its step's rows into `residual` (rank 1 over peer access) and
@@ -73,6 +74,20 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     Ok(logits)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PairPhase { Attention, AttentionExchange, Frontend, FrontendExchange, Experts, Partials, Combine, Backend, Residual }
+
+fn pair_layer(onboarded: bool, mut submit: impl FnMut(PairPhase, usize) -> Result<()>) -> Result<()> {
+    use PairPhase::*;
+    // Instantiation may wait for earlier work on the device. Submit both sides
+    // of each eager peer exchange before either rank enters its next capture.
+    for phase in [Attention, AttentionExchange, Frontend, FrontendExchange, Experts, Partials, Combine, Backend, Residual] {
+        if matches!(phase, Partials | Combine) && !onboarded { continue; }
+        for rank in 0..2 { submit(phase, rank)?; }
+    }
+    Ok(())
+}
+
 /// One step: metadata, embedding, every layer, then the head over `head_rows`.
 /// `experts` is rank 0's Spark path; `peers[r]` rank r's exchange end on a pair.
 #[allow(clippy::too_many_arguments)]
@@ -86,7 +101,8 @@ pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], strea
     graphs: &[super::graphs::Graphs<'a>])
     -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
-        && (local.is_empty() || local.len() == ranks.len()), "Muse step geometry");
+        && (local.is_empty() || local.len() == ranks.len())
+        && (graphs.is_empty() || graphs.len() == ranks.len()), "Muse step geometry");
     let planes: Vec<StepPlanes> = ranks.iter().zip(streams).map(|(rank, &stream)| {
         let bank = if prefill { 0 } else { rank.step.tables.decode_bank() };
         rank.device.run(|| rank.step.upload(rank.device.library, bank, meta, prefill, wave.clone(), stream))
@@ -97,16 +113,58 @@ pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], strea
     }
     let mut experts = Some(experts);
     for layer in 0..cfg.layers {
-        for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
-            let mut device = rank.device(cfg, stream);
-            device.graphs = graphs.get(index).filter(|_| !prefill && planes[index].trace.is_none());
-            let peer = peers.get_mut(index).map(|end| &mut **end as &mut dyn PeerExchange);
-            if let Some(onboarded) = local.get_mut(index).filter(|onboarded| onboarded.holds(layer)) {
-                rank.device.run(|| device.layer_local(layer, &planes[index], onboarded, peer))?;
-                continue;
+        if ranks.len() == 2 && !graphs.is_empty() && !prefill && planes.iter().all(|plane| plane.trace.is_none()) {
+            let onboarded = local.first().is_some_and(|local| local.holds(layer));
+            ensure!(local.iter().all(|local| local.holds(layer) == onboarded), "Muse TP2 local layer differs between ranks");
+            let mut partials = [Vec::new(), Vec::new()];
+            pair_layer(onboarded, |phase, index| {
+                let rank = &ranks[index];
+                let stream = streams[index];
+                let mut device = rank.device(cfg, stream);
+                device.graphs = graphs.get(index);
+                let step = &planes[index];
+                let rows = step.rows;
+                rank.device.run(|| match phase {
+                    PairPhase::Attention => device.attention_prepare(layer, step),
+                    PairPhase::AttentionExchange => device.attention_exchange(layer, rows, &mut *peers[index]),
+                    PairPhase::Frontend => device.frontend_prepare(layer, rows),
+                    PairPhase::FrontendExchange => device.frontend_exchange(layer, rows, &mut *peers[index], onboarded),
+                    PairPhase::Experts if onboarded => {
+                        device.expert_wire(rows)?;
+                        device.local_partials(layer, rows, &mut local[index])
+                    }
+                    PairPhase::Experts if index == 0 => {
+                        device.expert_wire(rows)?;
+                        let experts = experts.as_deref_mut().context("Muse TP2 missing Spark path")?;
+                        let wave = experts.send(layer, &step.wave, device.wave_sources(rows)?)?;
+                        let landed = experts.land(wave)?;
+                        device.combine(layer, rows, landed.ranks, landed.tables, landed.layout, &landed.plan)?;
+                        experts.consumed(wave)
+                    }
+                    PairPhase::Experts => Ok(()),
+                    PairPhase::Partials => {
+                        partials[index] = device.local_exchange(rows, &local[index], Some(&mut *peers[index]))?;
+                        Ok(())
+                    }
+                    // tables_for may wait for ordered host staging. Do both
+                    // ranks before the backend queues another peer wait.
+                    PairPhase::Combine => device.local_combine(layer, rows, &mut local[index], &partials[index]),
+                    PairPhase::Backend => device.moe_backend_halves(layer, rows, &mut *peers[index], onboarded),
+                    PairPhase::Residual => device.finish_residual(layer, step),
+                })
+            })?;
+        } else {
+            for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
+                let mut device = rank.device(cfg, stream);
+                device.graphs = graphs.get(index).filter(|_| !prefill && planes[index].trace.is_none());
+                let peer = peers.get_mut(index).map(|end| &mut **end as &mut dyn PeerExchange);
+                if let Some(onboarded) = local.get_mut(index).filter(|onboarded| onboarded.holds(layer)) {
+                    rank.device.run(|| device.layer_local(layer, &planes[index], onboarded, peer))?;
+                    continue;
+                }
+                let path = if index == 0 { experts.as_deref_mut() } else { None };
+                rank.device.run(|| device.layer(layer, &planes[index], path, peer))?;
             }
-            let path = if index == 0 { experts.as_deref_mut() } else { None };
-            rank.device.run(|| device.layer(layer, &planes[index], path, peer))?;
         }
         // The drafter taps the head rank's hidden rows after the layer, on that rank's stream.
         let last = ranks.len() - 1;
@@ -143,6 +201,39 @@ pub(crate) fn step<'a>(cfg: &MuseSparkConfig, ranks: &[RankResources<'a>], strea
 
 #[cfg(test)]
 mod tests {
+    use super::{pair_layer, PairPhase};
+
+    #[test]
+    fn tp2_peer_publications_precede_each_capture_for_remote_and_local_layers() -> anyhow::Result<()> {
+        use PairPhase::*;
+        for onboarded in [false, true] {
+            let mut pending = [false; 2];
+            let mut calls = Vec::new();
+            let mut submit = |phase, rank| -> anyhow::Result<()> {
+                if matches!(phase, Attention | Frontend | Experts | Combine | Residual) {
+                    anyhow::ensure!(!pending.iter().any(|&waiting| waiting), "capture before peer submission: {phase:?} rank{rank}");
+                } else {
+                    pending[rank] = true;
+                    if pending.iter().all(|&submitted| submitted) { pending = [false; 2]; }
+                }
+                calls.push((phase, rank));
+                Ok(())
+            };
+            // Include the next layer/step: a last-rank join must not leak into
+            // the next attention capture. The same walker drives real launches.
+            for _ in 0..3 { pair_layer(onboarded, &mut submit)?; }
+            assert!(submit(AttentionExchange, 0).is_ok());
+            assert!(submit(Frontend, 0).is_err(), "old layer-major rank order must fail the model");
+            drop(submit);
+            assert_eq!(calls.iter().filter(|(phase, _)| *phase == Partials).count(), if onboarded { 6 } else { 0 });
+            for pair in calls[..calls.len() - 1].chunks_exact(2) {
+                assert_eq!(pair[0].0, pair[1].0);
+                assert_eq!((pair[0].1, pair[1].1), (0, 1));
+            }
+        }
+        Ok(())
+    }
+
     /// The head rank's logits planes are what admission charged.
     #[test]
     fn head_planes_equal_the_charge() -> anyhow::Result<()> {
