@@ -138,6 +138,8 @@ impl Client {
         self.check()?;
         let reply: Value = request.send_json(count).context("exact count endpoint /v1/messages/count_tokens")?
             .into_json()?;
+        anyhow::ensure!(reply["exact_token_count"].as_bool() == Some(true),
+            "exact prefill requires an exact token count; count endpoint returned an estimated or unverified count");
         reply["input_tokens"].as_u64().context("count endpoint omitted input_tokens")
     }
 
