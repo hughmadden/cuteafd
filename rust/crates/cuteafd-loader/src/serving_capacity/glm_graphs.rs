@@ -193,13 +193,17 @@ fn checked_in(source: &str, family: GlmPrewarmFamily, layout: Option<usize>) -> 
     list
 }
 
-/// GLM 5.3's list, measured on its 1-RTX/4-Spark EXL3 baseline plus the
-/// C1/2/4/8/16 sweep (docs/architecture/shared-engine.md, Graph cache).
+/// GLM 5.3's rank-specific lists: 1 RTX + 4 Sparks, or the native K6-core
+/// 2 RTX + 6 Sparks card, with C1/2/4/8/16 and 32K working-set coverage.
 pub fn glm_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
     static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
+    static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     static UNTRACED: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     let one = ONE.get_or_init(|| checked_in(include_str!("glm_prewarm_1.json"), GlmPrewarmFamily::Glm5, Some(1)));
     if ranks == 1 { return one; }
+    if ranks == 2 {
+        return TWO.get_or_init(|| checked_in(include_str!("glm_prewarm_2.json"), GlmPrewarmFamily::Glm5, Some(2)));
+    }
     // Until this rank count has its own trace, keep bootstrap work and sizing
     // but never claim another layout's pins.
     UNTRACED.get_or_init(|| {
@@ -285,7 +289,7 @@ mod tests {
         let glm = glm_prewarm(GlmPrewarmFamily::Glm5, 1);
         assert_eq!(glm.family, "glm5");
         assert_eq!(glm.layout, Some(1));
-        for ranks in [0, 2, 3] {
+        for ranks in [0, 3, 4] {
             let untraced = glm_prewarm(GlmPrewarmFamily::Glm5, ranks);
             assert_eq!(untraced.layout, None);
             assert_eq!(untraced.reserve_base_bytes, glm.reserve_base_bytes);
@@ -296,6 +300,21 @@ mod tests {
                 assert_eq!(entry.shape, bootstrap.shape);
             }
         }
+        for layout in [1usize, 2] {
+            let list = glm_prewarm(GlmPrewarmFamily::Glm5, layout);
+            assert_eq!(list.family, "glm5");
+            assert_eq!(list.layout, Some(layout));
+            assert!(!list.entries.is_empty());
+            assert!(list.reserve_base_bytes > 0 && list.reserve_extra_bytes > 0);
+            assert!(std::ptr::eq(glm_prewarm(GlmPrewarmFamily::Glm5, layout), list));
+            let mut identities = HashSet::new();
+            let allowed = glm_graph_shapes(1 << 20, 16384);
+            for entry in &list.entries {
+                assert!(identities.insert((entry.shape.rows, entry.shape.table_width)));
+                assert!(allowed.contains(&entry.shape));
+            }
+        }
+        assert!(!std::ptr::eq(glm_prewarm_list(1), glm_prewarm_list(2)));
         for layout in [1usize, 2] {
             let list = glm_prewarm(GlmPrewarmFamily::MistralLarge4, layout);
             assert_eq!(list.family, GlmPrewarmFamily::MistralLarge4.name());

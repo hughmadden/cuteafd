@@ -526,6 +526,41 @@ def test_layout_is_required_for_mistral_large4_and_optional_for_glm5():
     assert [(entry["rows"], entry["table_width"]) for entry in two["entries"]] == [(1, 16), (16, 32)]
 
 
+def test_glm_two_rank_cli_keeps_built_widths(tmp_path):
+    import subprocess
+    import sys
+
+    paths = []
+    for device in (0, 1):
+        path = tmp_path / f"trace.device-{device}.json"
+        path.write_text(json.dumps(context_trace(device)))
+        paths.extend(["--trace", str(path)])
+    output = tmp_path / "glm_prewarm_2.json"
+    subprocess.run([sys.executable, str(SCRIPT), "--family", "glm5", "--layout", "2",
+                    *paths, "--output", str(output)], check=True, capture_output=True, text=True)
+    expected = MODULE.generate([context_trace(0), context_trace(1)], "glm5", layout=2)
+    assert output.read_text() == json.dumps(expected, indent=2) + "\n"
+
+
+def test_glm_two_rank_trace_reproduces_checked_in_bytes():
+    import gzip
+
+    fixture = Path(__file__).parent / "fixtures/glm-prewarm-two-rank-trace.json.gz"
+    traces = json.loads(gzip.decompress(fixture.read_bytes()))
+    assert {trace["cache"]["device"] for trace in traces} == {0, 1}
+    generated = MODULE.generate(traces, "glm5", layout=2)
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/glm_prewarm_2.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    assert generated["layout"] == 2
+    assert generated["reserve_extra_bytes"] == MODULE.CHUNK
+    replayed = {MODULE.geometry("glm5", graph["shape"])
+                for trace in traces for graph in trace["graphs"]
+                if MODULE.glm_request_replays(graph) > 0}
+    assert all((entry["rows"], entry["table_width"] // 2) in replayed
+               for entry in generated["entries"])
+    assert fixture.stat().st_size < 1_000_000
+
+
 def test_odd_half_table_width_is_refused():
     data = context_trace()
     data["graphs"][0]["shape"] = data["graphs"][0]["shape"].replace(
