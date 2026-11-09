@@ -1,8 +1,7 @@
 //! A graph arena is a named owner, independent of GPU_RESERVE and KV policy.
 use cuteafd_core::memory_policy::Size;
 
-/// Per-rank measured startup base plus an enforced lazy-shape policy budget.
-pub const GLM_EXTRA: u64 = 64 << 20;
+/// Per-device prewarm base plus extra capture headroom from the family list.
 pub fn glm_default() -> (u64, u64) {
     let list = crate::serving_capacity::glm_graphs::glm_prewarm_list();
     (list.reserve_base_bytes, list.reserve_extra_bytes)

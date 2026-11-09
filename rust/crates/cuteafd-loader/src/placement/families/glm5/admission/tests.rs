@@ -1319,9 +1319,9 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
         };
         assert_eq!(allowance.location, Location::coordinator(rank as u8));
         assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
-        assert_eq!(allowance.bytes, max.ranks()[rank].bytes);
-        assert!(!allowance.assumed, "a measured row is never labelled assumed");
-        assert!(allowance.source.contains("startup graphs"));
+        assert_eq!(allowance.bytes, max.reserves().unwrap()[rank]);
+        assert!(!allowance.assumed, "the configured budget is not a census estimate");
+        assert!(allowance.source.starts_with("graph reserve: "));
     }
     // The declared key set, not the context alone, is the identity. Each of
     // these produces a fingerprint with no measured row; #1605 serves it on the
@@ -1359,7 +1359,10 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
             let ComponentKind::Allowance(allowance) = &component.kind else {
                 panic!("graphs are opaque, not physical allocations")
             };
-            assert!(allowance.assumed, "an estimated graph row is labelled assumed");
+            let (base, extra) = crate::placement::graph_reserve::glm_default();
+            assert_eq!(allowance.bytes, base + extra);
+            assert!(!allowance.assumed, "an estimated census does not change the configured budget");
+            assert!(allowance.source.starts_with("graph reserve: "));
         }
     }
     assert!(StartupGraphs::new(0, AttentionPlacement::Heads, 1, &min_layers, 4).is_err());

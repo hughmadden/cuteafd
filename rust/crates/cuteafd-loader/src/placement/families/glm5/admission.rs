@@ -1787,6 +1787,8 @@ impl StartupGraphs {
                 GraphRank { bytes: reserves[rank], ..*graph }, maximum_pages)?;
             if let ComponentKind::Allowance(owner) = &mut component.kind {
                 owner.source = crate::placement::graph_reserve::source(&format!("glm.graphs.{rank}"));
+                // This owner is the configured budget, not the census estimate.
+                owner.assumed = false;
             }
             Ok(component)
         }).collect()

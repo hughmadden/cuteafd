@@ -1520,11 +1520,10 @@ impl<'a> GlmEngine<'a> {
         tables.pad_rows(self.pages, bucket);
     }
 
-    /// Captures every decode graph serving can replay: one padded step per
-    /// (row bucket, table width) over the scratch page (one real row goes to
-    /// the Sparks), so no request captures. One eager pass first puts module,
-    /// workspace and BLAS first touch outside executable residency. Returns
-    /// each rank's captured keys and the samples around the capture pass.
+    /// Best-effort prewarm of the family's selected geometries within the graph
+    /// reserve. Unlisted or uncaptured request shapes may capture or run eager.
+    /// One eager pass first puts module, workspace and BLAS first touch outside
+    /// executable residency. Returns resident keys and per-rank capture samples.
     pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>)
         -> Result<Vec<StartupGraphCapture>> {
         use cuteafd_loader::placement::inventory::GraphMemorySample;
@@ -1564,8 +1563,8 @@ impl<'a> GlmEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         tracing::info!(graphs = captures.iter().map(|capture| capture.keys.len()).sum::<usize>(),
             free = ?captures.iter().map(|capture| (capture.before.free, capture.after.free)).collect::<Vec<_>>(),
-            widths = ?self.table_width_buckets(), rows = ?ROW_BUCKETS,
-            long_rows = ?cuteafd_loader::serving_capacity::GLM_LONG_ROW_BUCKETS,
+            prewarm_shapes = shapes.len(),
+            prewarm_geometries = ?shapes.iter().map(|entry| entry.shape).collect::<Vec<_>>(),
             elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
         Ok(captures)
     }
