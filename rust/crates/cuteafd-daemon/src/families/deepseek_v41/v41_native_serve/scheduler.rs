@@ -246,12 +246,12 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
     // forward-compatible as new knobs land.
-    let mut stats = serde_json::json!({
+    let stats = serde_json::json!({
         "host_cache": prefixes.host_metrics(),
         "host_cache_config": prefixes.host_config(),
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier
         // restores), captures, evictions and page/mark occupancy.
-        "prefix": prefixes.stats(),
+        "prefix": prefixes.serving_stats(),
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
@@ -263,7 +263,6 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
             super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
     });
-    crate::shared::probe::graph_capture_stats(&mut stats);
     stats
 }
 

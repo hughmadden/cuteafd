@@ -22,6 +22,7 @@ pub struct MediaStats {
 pub(crate) struct Latencies {
     samples: Vec<f64>,
     next: usize,
+    percentiles: std::cell::Cell<Option<(f64, f64)>>,
 }
 impl Latencies {
     pub fn record(&mut self, ms: f64) {
@@ -34,8 +35,10 @@ impl Latencies {
             self.samples[self.next] = ms;
         }
         self.next = (self.next + 1) % 1024;
+        self.percentiles.set(None);
     }
     pub fn percentiles(&self) -> (f64, f64) {
+        if let Some(cached) = self.percentiles.get() { return cached; }
         let mut sorted = self.samples.clone();
         sorted.sort_by(f64::total_cmp);
         let p = |percent: usize| {
@@ -45,7 +48,9 @@ impl Latencies {
                 sorted[(sorted.len() * percent).div_ceil(100).saturating_sub(1)]
             }
         };
-        (p(50), p(99))
+        let result = (p(50), p(99));
+        self.percentiles.set(Some(result));
+        result
     }
 }
 
@@ -68,6 +73,10 @@ mod tests {
             latencies.record(2.0);
         }
         assert_eq!(latencies.samples.len(), 1024);
+        assert_eq!(latencies.percentiles(), (2.0, 2.0));
+        assert_eq!(latencies.percentiles.get(), Some((2.0, 2.0)));
+        latencies.record(3.0);
+        assert_eq!(latencies.percentiles.get(), None);
         assert_eq!(latencies.percentiles(), (2.0, 2.0));
         assert!(serde_json::to_value(MediaStats::default()).is_ok());
     }

@@ -234,6 +234,7 @@ pub struct PrefixCache<E: CopyEngine, M = ()> {
     /// Where the last admission's restore came from (provenance only).
     restored_session: Option<String>,
     stats: PrefixStats,
+    serving_detail: std::cell::RefCell<Option<(std::time::Instant, [usize; 4])>>,
 }
 
 impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
@@ -283,6 +284,7 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
             capture_session: None,
             restored_session: None,
             stats: PrefixStats::default(),
+            serving_detail: std::cell::RefCell::new(None),
             layout,
             config,
         })
@@ -1248,22 +1250,47 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
     }
 
     pub fn stats(&self) -> PrefixStats {
+        self.stats_with_detail(self.occupancy_detail())
+    }
+
+    /// Live counters and constant-time gauges every round; entry/page walks at
+    /// most once a second. `stats()` remains exact for correctness callers.
+    pub fn serving_stats(&self) -> PrefixStats {
+        let mut detail = self.serving_detail.borrow_mut();
+        let now = std::time::Instant::now();
+        if detail.as_ref().is_none_or(|(last, _)| now.duration_since(*last) >= std::time::Duration::from_secs(1)) {
+            *detail = Some((now, self.occupancy_detail()));
+        }
+        self.stats_with_detail(detail.as_ref().unwrap().1)
+    }
+
+    /// Settled final occupancy must not remain stale after the scheduler parks.
+    pub fn refresh_serving_stats(&self) {
+        *self.serving_detail.borrow_mut() = Some((std::time::Instant::now(), self.occupancy_detail()));
+    }
+
+    fn occupancy_detail(&self) -> [usize; 4] {
+        let mut retained: Vec<u32> = self.entries.values()
+            .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();
+        retained.sort_unstable();
+        retained.dedup();
+        [self.pool.shared(), retained.len(),
+            self.entries.values().map(|e| e.mark_pages().len()).sum(),
+            self.entries.values().filter(|e| matches!(e.mark, Some(Mark::Pages(_)))).count()]
+    }
+
+    fn stats_with_detail(&self, detail: [usize; 4]) -> PrefixStats {
         let mut stats = self.stats.clone();
         stats.entries_prompt = self.retained.bank(SnapshotKind::Prompt).entries();
         stats.entries_turn = self.retained.bank(SnapshotKind::Turn).entries();
         stats.pages = self.pool.capacity();
         stats.pages_free = self.pool.free();
         stats.pages_used_by_gpu = self.pool.is_parity().then(|| self.pool.used_halves());
-        stats.pages_shared = self.pool.shared();
-        let mut retained: Vec<u32> = self.entries.values()
-            .flat_map(|e| e.pages.iter().chain(e.mark_pages()).copied()).collect();
-        retained.sort_unstable();
-        retained.dedup();
-        stats.pages_retained = retained.len();
+        stats.pages_shared = detail[0];
+        stats.pages_retained = detail[1];
         stats.mark_slots = self.arena.slots();
-        stats.mark_pages = self.entries.values().map(|e| e.mark_pages().len()).sum();
-        stats.marks_in_use = self.arena.in_use()
-            + self.entries.values().filter(|e| matches!(e.mark, Some(Mark::Pages(_)))).count();
+        stats.mark_pages = detail[2];
+        stats.marks_in_use = self.arena.in_use() + detail[3];
         stats.host = self.host.as_ref().map(HostCache::metrics);
         stats
     }

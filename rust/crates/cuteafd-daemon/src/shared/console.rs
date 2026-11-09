@@ -185,7 +185,7 @@ impl Gauges {
     /// owns its device page pool.
     pub fn prefix_cache<E: cuteafd_hostcache::copy::CopyEngine, M: Clone + Default>(
         cache: &cuteafd_engine::prefix::PrefixCache<E, M>, decoding: usize, prefilling: usize, queued: usize) -> Self {
-        let stats = cache.stats();
+        let stats = cache.serving_stats();
         let used = stats.pages.saturating_sub(stats.pages_free);
         let kv = Kv { pages: stats.pages as u64, free: stats.pages_free as u64,
             active: used.saturating_sub(stats.pages_retained) as u64,

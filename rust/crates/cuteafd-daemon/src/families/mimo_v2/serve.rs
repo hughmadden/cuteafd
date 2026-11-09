@@ -1388,10 +1388,12 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, prefix_draf
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, reserve: &Reserve, stalled: usize) {
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
-            "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "kv_reserve": reserve.snapshot(stalled),
+            "media": media.stats(prefix_stats.media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }
 

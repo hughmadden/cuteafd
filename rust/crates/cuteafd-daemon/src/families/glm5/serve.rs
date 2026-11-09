@@ -630,13 +630,14 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if requests > 0 {
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "kv_reserve": reserve.snapshot(stalled),
             "draft_policy": crate::shared::draft::resource::snapshot()});
-        crate::shared::probe::graph_capture_stats(&mut stats);
     }
 }
 
@@ -1454,16 +1455,13 @@ mod media_tests {
 #[cfg(test)]
 mod lane_tests {
     #[test]
-    fn publish_includes_shared_graph_cache_and_reconciliation_stats() {
+    fn publish_keeps_reconciliation_but_leaves_graph_inventory_to_http() {
         let source = include_str!("serve.rs");
         let publish = source.split_once("\nfn publish(").unwrap().1
             .split_once("\n/// Weak GLM").unwrap().0;
-        let replace = publish.find("*stats = serde_json::json!").unwrap();
-        let graph = publish.find("crate::shared::probe::graph_capture_stats(&mut stats)").unwrap();
-        assert!(replace < graph, "publish the shared graph fields after replacing per-request stats");
-        let shared = include_str!("../../shared/probe.rs");
-        assert!(shared.contains("stats[\"graph_cache\"]"));
-        assert!(shared.contains("stats[\"memory_reconciliation\"]"));
+        assert!(publish.contains("capture(\"first_request\")"));
+        assert!(!publish.contains("graph_capture_stats"));
+        assert!(include_str!("../../shared/api.rs").contains("profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)"));
     }
 
     #[test]

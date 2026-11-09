@@ -992,6 +992,32 @@ mod tests {
         id
     }
     #[test]
+    fn stats_publish_cost_with_five_thousand_graph_records() {
+        use std::hint::black_box;
+        let mut cache = DeviceCache::new(-991, 100_000);
+        for n in 0..5_000 {
+            let id = capture(&mut cache, n, false);
+            cache.hit(id);
+        }
+        let publish = || serde_json::json!({"requests": 1, "generated_tokens": 128,
+            "active": 16, "prefilling": 0, "prefix_cache": {}, "verify": {},
+            "draft_policy": null, "kv_reserve": {}, "media": {}});
+        let rounds = 256;
+        let before = Instant::now();
+        for _ in 0..rounds {
+            let mut stats = publish();
+            stats["graph_cache"] = serde_json::json!([cache.snapshot()]);
+            black_box(stats);
+        }
+        let before_us = before.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+        let after = Instant::now();
+        for _ in 0..rounds { black_box(publish()); }
+        let after_us = after.elapsed().as_secs_f64() * 1e6 / f64::from(rounds);
+        eprintln!("stats publish, 5000 hit records, {rounds} rounds, graph inventory inline -> lazy: {before_us:.2} -> {after_us:.2} us/round");
+        assert_eq!(cache.snapshot().top_hits.len(), 16);
+    }
+
+    #[test]
     fn sigterm_http_shutdown_writes_complete_nonempty_final_traces() {
         const CHILD: &str = "CUTEAFD_TRACE_SIGTERM_TEST_CHILD";
         if let Some(directory) = std::env::var_os(CHILD) {

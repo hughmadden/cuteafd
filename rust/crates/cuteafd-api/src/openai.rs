@@ -116,6 +116,8 @@ pub fn vision_input_enabled() -> bool {
 /// The served model's public id, prompt encoding and EOS token ids.
 #[derive(Debug, Clone)]
 pub struct ModelProfile {
+    /// Process diagnostics collected only by `/v1/stats` on a blocking worker.
+    pub stats_diagnostics: Option<fn(&mut Value)>,
     pub expert_usage: cuteafd_core::expert_usage::Reader,
     pub literal_tokens: Arc<cuteafd_loader::LiteralTokens>,
     pub engine_health: Option<health::HealthWitness>,
@@ -163,7 +165,7 @@ impl ModelProfile {
     pub fn new(id: impl Into<String>, encoding: ModelEncoding) -> Self {
         let eos_token_ids = encoding.eos_token_ids();
         let capabilities = MediaCapabilities { vision: matches!(encoding, ModelEncoding::DeepseekV41), audio: false };
-        Self { expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
+        Self { stats_diagnostics: None, expert_usage: Default::default(), id: id.into(), encoding, eos_token_ids, capabilities, engine_health: None, media_preparer: None, vision_health: None,
             audio_preparer: None, audio_health: None, gateway: None, v41_turns: V41Turns::default(),
             literal_tokens: Arc::new(cuteafd_loader::LiteralTokens::new([
                 "<｜deepseek_image｜>", "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>",
@@ -407,7 +409,7 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
     let admission = admission::Admission::new(queue.max_capacity(), wait);
     let images = images::ImageDecoder::new(queue.max_capacity());
     let expert_routes = expert_usage::routes(console.clone(), profile.expert_usage.clone());
-    let memory_routes = memory::routes(console.clone(), stats.clone());
+    let memory_routes = memory::routes(console.clone(), stats.clone(), profile.stats_diagnostics);
     let console_routes = Router::new()
         .route("/", get(console::page))
         .route("/v1/console", get(console::socket))
@@ -470,8 +472,14 @@ pub fn publish_host_heap(value: Value) {
 }
 
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
+    // Model-sized diagnostics never run on the serving thread or async reactor.
+    tokio::task::spawn_blocking(move || collect_stats(&state)).await.expect("stats worker panicked")
+}
+
+fn collect_stats(state: &NativeState) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
+    if let Some(collect) = state.profile.stats_diagnostics { collect(&mut value); }
     refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
     object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
@@ -1628,6 +1636,48 @@ mod tests {
     fn request(stream: bool) -> axum::http::Request<Body> {
         axum::http::Request::post("/v1/chat/completions").header("content-type","application/json").body(Body::from(json!({"model":MODEL,"messages":[{"role":"user","content":"What is 2 + 2? Answer with just the number."}],"thinking":{"type":"disabled"},"temperature":0,"max_tokens":16,"stream":stream}).to_string())).unwrap()
     }
+    #[tokio::test]
+    async fn stats_collect_diagnostics_lazily_off_the_request_thread() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        static CURRENT: AtomicU64 = AtomicU64::new(5);
+        thread_local! { static REQUEST_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        fn diagnostics(value: &mut Value) {
+            REQUEST_THREAD.with(|here| assert!(!here.get(), "diagnostics ran on HTTP reactor"));
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            value["graph_cache"] = json!([{"charged": CURRENT.load(Ordering::SeqCst)}]);
+            value["graph_captures"] = json!(CURRENT.load(Ordering::SeqCst));
+            value["memory_reconciliation"] = json!({"first_request": null});
+        }
+        REQUEST_THREAD.with(|here| here.set(true));
+        let (tx, _rx) = mpsc::channel(4);
+        let published = Arc::new(Mutex::new(json!({"requests": 2, "verify": {"output_tokens": 17}})));
+        let mut profile = ModelProfile::default();
+        profile.stats_diagnostics = Some(diagnostics);
+        let app = router_for_model(tx, NativeLimits::default(), published.clone(),
+            std::time::Duration::from_secs(25), ConsoleHub::disabled(), profile);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 0);
+        let mut keys = None;
+        for current in [5, 9] {
+            CURRENT.store(current, Ordering::SeqCst);
+            let response = app.clone().oneshot(axum::http::Request::get("/v1/stats")
+                .body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["graph_cache"][0]["charged"], current);
+            assert_eq!(value["graph_captures"], current);
+            assert_eq!(value["requests"], 2);
+            assert_eq!(value["verify"]["output_tokens"], 17);
+            let current_keys = value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            if let Some(keys) = &keys { assert_eq!(keys, &current_keys); }
+            keys = Some(current_keys);
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        assert!(published.lock().unwrap().get("graph_cache").is_none());
+        REQUEST_THREAD.with(|here| here.set(false));
+    }
+
     #[tokio::test]
     async fn stats_read_live_tables_before_first_publish_and_after_idle_batch() {
         use cuteafd_loader::{MappedTable, RowFormat, TablePart};

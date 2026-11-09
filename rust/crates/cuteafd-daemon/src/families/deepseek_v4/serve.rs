@@ -645,9 +645,11 @@ fn release(family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 #[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
+    if active == 0 && prefilling == 0 { cache.refresh_serving_stats(); }
+    let prefix_stats = cache.serving_stats();
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "draft_policy": resource::snapshot(),
+            "prefilling": prefilling, "prefix_cache": prefix_stats, "draft_policy": resource::snapshot(),
             "kv_reserve": reserve.snapshot(stalled)});
     }
 }

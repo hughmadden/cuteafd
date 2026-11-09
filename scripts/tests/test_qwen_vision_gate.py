@@ -308,14 +308,19 @@ def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     assert ".with_scoring(" not in cache
 
 
-def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
+def test_qwen_graph_stats_are_collected_on_request_not_every_update():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     startup = family[family.index("let result = opened.with_engine"):family.index("fn prefix_cache")]
     assert "scheduler::schedule(&Qwen4Backend" in startup
-    assert startup.index("probe::graph_capture_stats(&mut stats);") < startup.index("ready.send(Ok(")
+    assert "graph_capture_stats" not in startup
     publish = serve[serve.index("fn publish<E:"):serve.index("pub(crate) const MESSAGE_STARTS")]
-    assert publish.index("*stats = serde_json::json!") < publish.index("probe::graph_capture_stats(&mut stats);")
+    assert "graph_capture_stats" not in publish
+    api = (ROOT / "rust/crates/cuteafd-daemon/src/shared/api.rs").read_text()
+    assert "profile.stats_diagnostics = Some(crate::shared::probe::graph_capture_stats)" in api
+    http = (ROOT / "rust/crates/cuteafd-api/src/openai.rs").read_text()
+    assert "spawn_blocking(move || collect_stats(&state))" in http
+    assert "state.profile.stats_diagnostics" in http
 
 
 def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
@@ -357,7 +362,7 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     startup = family[family.index("let result = opened.with_engine"):family.index("fn prefix_cache")]
     assert "scheduler::schedule(&Qwen4Backend" in startup
-    assert startup.index("engine.warm_decode_graphs(") < startup.index("probe::graph_capture_stats(")
+    assert startup.index("engine.warm_decode_graphs(") < startup.index("ready.send(Ok(")
     assert startup.index("engine.check_decode_padding(") < startup.index("ready.send(Ok(")
     scoring = serve[serve.index("|placement, chunk|"):serve.index("|placement, chunk|") + 160]
     assert "verify_device_ungraphed" in scoring

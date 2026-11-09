@@ -90,7 +90,33 @@ pub(crate) fn image_spans(spec: &cuteafd_api::openai::probe::ProbeSpec, tokens: 
     Ok(spans)
 }
 
-/// Adds cumulative capture counts and site deltas since the last stats publication.
+/// Preserve the joined scheduler boundary independently of HTTP stats sampling.
+pub(crate) fn first_request(once: &std::sync::Once, completed: u64, capture: impl FnOnce()) {
+    if completed > 0 { once.call_once(capture); }
+}
+
+#[cfg(test)]
+mod first_request_tests {
+    #[test]
+    fn reconciliation_fires_once_at_the_completed_request_boundary_not_on_fetch() {
+        let once = std::sync::Once::new();
+        let calls = std::cell::Cell::new(0);
+        for completed in [0, 0, 1, 1, 2, 5] {
+            super::first_request(&once, completed, || calls.set(calls.get() + 1));
+            assert_eq!(calls.get(), usize::from(completed > 0));
+        }
+        for source in [include_str!("../families/glm5/serve.rs"),
+            include_str!("../families/glm5_flash/serve.rs"), include_str!("qwen/scheduler.rs")] {
+            let publish = source.split_once("\nfn publish").unwrap().1.split_once("\n}\n").unwrap().0;
+            assert!(publish.contains("first_request(&FIRST, requests"));
+            assert!(!publish.contains("graph_capture_stats"));
+            assert!(source.contains("cache.tick();\n        publish(stats, requests"));
+        }
+    }
+}
+
+/// Request-time diagnostics, called by the HTTP blocking worker, never a scheduler.
+/// Adds cumulative capture counts and site deltas since the last stats fetch.
 /// Gate clients subtract the cumulative fields across their own warmed interval.
 /// Startup-miss variants are cumulative too: each distinct shape a sealed graph
 /// set lacked with its eager run count, so a client sees which one to add.

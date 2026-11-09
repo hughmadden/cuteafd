@@ -401,6 +401,32 @@ fn cache(fake: &Fake, entries: usize, host_bytes: u64) -> PrefixCache<Shared> {
 }
 
 #[test]
+fn serving_stats_keep_counters_live_while_sampling_only_occupancy_walks() {
+    let fake = Fake::new(32, 2, 8);
+    let mut cache = cache(&fake, 8, 0);
+    assert_eq!(cache.serving_stats(), cache.stats());
+    let tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    let mut p = cache.admit_cold(&fake, tokens.len(), tokens.len(), |pages| Placement {
+        pages, ring: 0, len: 0, ring_from: 0 }).unwrap().placement;
+    let logits = fake.forward(&mut p, &tokens).unwrap();
+    cache.capture(&fake, SnapshotKind::Prompt, &tokens, &p, After::from_logits(&logits, true)).unwrap();
+    cache.tick();
+    let sampled = cache.serving_stats();
+    let exact = cache.stats();
+    assert_eq!(sampled.captures_prompt, exact.captures_prompt);
+    assert_eq!(sampled.entries_prompt, exact.entries_prompt);
+    assert_eq!(sampled.pages_free, exact.pages_free);
+    assert_eq!(sampled.marks_in_use, exact.marks_in_use);
+    assert_eq!(sampled.pages_retained, 0, "detail is cached inside one second");
+    assert!(exact.pages_retained > 0);
+    // The request retires within the sample interval, then the scheduler parks.
+    cache.release(&fake, &p.pages).unwrap();
+    cache.refresh_serving_stats();
+    assert_eq!(cache.serving_stats(), cache.stats(), "final idle publication is exact");
+    assert_eq!(cache.serving_stats().pages_retained, cache.pool().capacity() - cache.pool().free());
+}
+
+#[test]
 fn extending_a_live_placement_waits_instead_of_failing_and_counts_snapshot_pages() {
     let fake = Fake::new(8, 2, 4);
     let mut cache = cache(&fake, 0, 0);
