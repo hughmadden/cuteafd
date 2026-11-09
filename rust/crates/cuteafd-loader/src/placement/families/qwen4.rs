@@ -1,6 +1,8 @@
 //! Qwen's shared planner facts. Checkpoint weights, the mapped PLE table and
-//! the resident expert arenas are already in the admission baseline; every
-//! owner after that is declared once here and admitted by one typed request.
+//! the resident expert arenas are already on the device when the free sample
+//! is taken, so the sample's whole occupancy is one named owner (context,
+//! selected modules and resident weights) and every owner after it is declared
+//! once here and admitted by one typed request.
 //! The graph reserve is one owner keyed by the resolved capture shape (owner
 //! count and Sparks attached), charged before KV sizing, so admission needs one
 //! solve instead of a second pass over the pool.
@@ -121,20 +123,50 @@ fn plan_baseline(baseline: &Baseline, physical_bytes: u64, source: &str) -> Resu
                 .ok_or(Refusal::Overflow("Qwen planned baseline"))?,
             source: format!("{source}: plan-time owners already on the device; the recipe charges every later owner"),
             assumed: false },
-        // The legacy sample is a free-byte witness and the contract names the
-        // same witness, so both routes admit the same bytes without a second
-        // subtraction.
+        // The sample is the witness for every byte already on the device. Those
+        // bytes are charged once as a named owner (see `measured_occupancy`)
+        // instead of a baseline deduction, so the budget keeps its whole
+        // physical extent and a Ready capture sees the same bytes the sample saw.
         Baseline::Measured { free_bytes } => {
             if *free_bytes > physical_bytes {
                 return Err(Refusal::InvalidFact(
                     format!("{source}: free sample exceeds physical capacity")));
             }
-            PlanBaseline::Sampled {
-                free: *free_bytes,
-                phase: Phase::Load,
-                source: format!("{source}: free memory sampled before admission; the recipe charges every later owner") }
+            PlanBaseline::Forecast {
+                occupied: 0,
+                source: format!("{source}: {free_bytes} B free of {physical_bytes} B measured after \
+                    the resident weights were uploaded; that occupancy is one named owner and the \
+                    recipe charges every later owner"),
+                assumed: false }
         }
     })
+}
+
+/// Device bytes the family already held when a measured free sample was taken:
+/// the CUDA context, selected modules, resident dense weights and the PLE
+/// table. They are charged once as one named owner at their sampled bytes.
+/// `mapped` is mapping the recipe charges in its own named driver page-table
+/// rows even though the sample already counted those pages.
+fn measured_occupancy(baseline: &Baseline, physical_bytes: u64, mapped: u64) -> Result<u64, Refusal> {
+    let Baseline::Measured { free_bytes } = baseline else { return Ok(0) };
+    if *free_bytes > physical_bytes {
+        return Err(Refusal::InvalidFact("Qwen measured free sample exceeds physical capacity".into()));
+    }
+    physical_bytes.checked_sub(*free_bytes).and_then(|occupied| occupied.checked_sub(mapped))
+        .ok_or_else(|| Refusal::InvalidFact(format!(
+            "Qwen measured occupancy is below the {mapped} B of embedding mapping the recipe charges")))
+}
+
+/// The one measured-occupancy owner of a device, at the bytes the sample saw.
+fn measured_occupancy_owner(source: &str, baseline: &Baseline, physical_bytes: u64, mapped: u64,
+    location: Location, maximum: u64) -> Result<Option<Component>, Refusal> {
+    let occupied = measured_occupancy(baseline, physical_bytes, mapped)?;
+    if occupied == 0 { return Ok(None); }
+    let free = physical_bytes.saturating_sub(occupied).saturating_sub(mapped);
+    Ok(Some(allowance(&format!("{source}: {occupied} B occupied at the {free} B free sample of \
+        {physical_bytes} B ({mapped} B embedding mapping charged separately by driver page tables); \
+        CUDA context, selected modules, resident dense weights and the PLE table"),
+        location, occupied, PlanLifetime::RESIDENT, maximum)))
 }
 
 /// One fixed byte owner. Zero-byte owners are dropped mechanically by the
@@ -227,19 +259,13 @@ impl<'a> QwenSingle<'a> {
     }
 
     pub fn budget(&self) -> Result<Budget, Refusal> {
-        let mut baseline = plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
+        let baseline = plan_baseline(&self.inputs.baseline, self.inputs.capacity_bytes,
             "qwen4 single-owner")?;
-        if let PlanBaseline::Sampled { free, source, .. } = &mut baseline {
-            // TP1 loads the portable embedding before sampling. Credit its
-            // mapping here so only the named shared page-table row charges it.
-            let mapping = crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding);
-            *free = free.checked_add(mapping).filter(|bytes| *bytes <= self.inputs.capacity_bytes)
-                .ok_or_else(|| Refusal::InvalidFact(
-                    "Qwen single-owner embedding mapping credit exceeds physical capacity".into()))?;
-            if mapping > 0 {
-                source.push_str(&format!("; credited {mapping} B for qwen.host.embedding mapping charged by the recipe"));
-            }
-        }
+        // TP1 loads the portable embedding before sampling; its mapping is
+        // charged by the named driver page-table rows, so the measured owner
+        // excludes it. Validate the same fact the owner needs here.
+        measured_occupancy(&self.inputs.baseline, self.inputs.capacity_bytes,
+            crate::placement::planner::driver_page_table_bytes(self.inputs.host.host_embedding))?;
         Ok(Budget { id: "rtx0".into(), locations: vec![Location::coordinator(0)],
             physical_bytes: self.inputs.capacity_bytes, logical_bytes: self.inputs.capacity_bytes,
             baseline,
@@ -365,6 +391,15 @@ impl Recipe for QwenSingle<'_> {
         // measured bootstrap high-water plus one in-flight capture's headroom.
         components.push(graph_reserve_owner(QwenGraphShapeKey::resolve(1, inputs.spark_ranks > 0), 0, gpu,
             self.maximum_pages)?);
+        // Everything the free sample already saw is one measured owner, so the
+        // Ready capture reconciles against named bytes rather than a silent
+        // baseline deduction.
+        if let Some(owner) = measured_occupancy_owner("Qwen context and selected modules",
+            &inputs.baseline, inputs.capacity_bytes,
+            crate::placement::planner::driver_page_table_bytes(inputs.host.host_embedding),
+            gpu, self.maximum_pages)? {
+            components.push(owner);
+        }
         components.push(weights("qwen.loaded.owners", gpu, inputs.loaded_weights, self.maximum_pages));
         if inputs.host.uploads.len() != 1 {
             return Err(Refusal::InvalidFact("Qwen single-owner host owners must name one upload owner".into()));
@@ -1070,6 +1105,14 @@ impl Recipe for QwenDual<'_> {
             components.push(graph_reserve_owner(
                 QwenGraphShapeKey::resolve(2, inputs.spark_ranks > 0), gpu, location,
                 self.maximum_pages)?);
+            // The measured pre-admission occupancy of this rank is one owner.
+            // TP2 maps the host embedding after this sample, so its mapping is
+            // not part of the sample and no credit is taken for it.
+            if let Some(owner) = measured_occupancy_owner("Qwen context and selected modules",
+                &inputs.gpus[gpu].baseline, inputs.gpus[gpu].capacity_bytes, 0,
+                location, self.maximum_pages)? {
+                components.push(owner);
+            }
         }
         for (index, demand) in inputs.fixed.iter().enumerate() {
             if usize::from(demand.gpu) >= 2 {
@@ -1689,7 +1732,16 @@ mod tests {
             let control = build(0);
             for bytes in [327_680, 327_681] {
                 let embedded = build(bytes);
-                assert_eq!(embedded.budgets[0].available().unwrap(), capacity - occupied);
+                // A measured witness keeps the whole physical extent and charges
+                // its occupancy once as a named owner, so the engine budget is
+                // unchanged; a planned baseline names those owners itself.
+                assert_eq!(embedded.budgets[0].available().unwrap(),
+                    if measured { capacity } else { capacity - occupied });
+                let owners = embedded.items(Location::coordinator(0)).unwrap().into_iter()
+                    .filter(|item| item.group.starts_with("Qwen context and selected modules"))
+                    .map(|item| item.bytes).collect::<Vec<_>>();
+                assert_eq!(owners, if measured { vec![occupied] } else { vec![] },
+                    "the measured occupancy is one named owner at its sampled bytes");
                 assert_embedding_charge(&control, &embedded, bytes, 1);
             }
         }
@@ -1751,7 +1803,8 @@ mod tests {
         assert_eq!(rows.len(), 1, "one canonical graph reserve row per device: {named:?}");
         assert!(rows[0].bytes > 0, "the canonical graph reserve is charged: {named:?}");
         assert!(!device.reserve.iter().any(|component|
-            component.name.to_ascii_lowercase().contains("qwen")), "no family-named graph owner: {named:?}");
+            component.name != "graph reserve" && component.name.to_ascii_lowercase().contains("graph")),
+            "no family-named graph owner: {named:?}");
         assert_eq!(rows[0].bytes, items.iter().filter(|item| item.group.starts_with("graph reserve: "))
             .map(|item| item.bytes).sum::<u64>(), "the canonical row is the whole graph charge");
         rows[0].bytes
