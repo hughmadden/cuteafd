@@ -1684,6 +1684,40 @@ mod observer_tests {
     }
 
     #[test]
+    fn kimi_startup_owners_survive_lane_attachment_and_keep_physical_high_water() {
+        use crate::shared::decode_graph::GraphBank;
+        let devices = [-99108, -99109];
+        let controllers = devices.map(attached);
+        let weak = controllers.each_ref().map(Arc::downgrade);
+        let mut lanes = Vec::new();
+        for (rank, &device) in devices.iter().enumerate() {
+            let mut lane = GraphBank::<u64, ()>::new(None);
+            let site = Site { name: "kimi_k3.step", cycle: Cycle::Other,
+                preference: Preference::Adaptive, bootstrap: 10, basis: Basis::Bytes,
+                spans_devices: true };
+            lane.attach_device_for_test(device, 1000, site).unwrap();
+            assert!(matches!(lane.cache_miss(&1, true, None), Miss::Capture(_)));
+            observe_device_sampled(device, || Ok((875, 1000, 0))).unwrap();
+            assert_eq!(controllers[rank].lock().unwrap().snapshot().charged, 25);
+            lanes.push(lane);
+        }
+        drop(controllers);
+        for (rank, &device) in devices.iter().enumerate() {
+            let cache = device_cache_sampled(device, 1000, Basis::Bytes,
+                || panic!("Kimi lane attachment must retain the startup seed")).unwrap();
+            assert!(Arc::ptr_eq(&cache, &weak[rank].upgrade().unwrap()));
+            assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+            observe_device_sampled(device, || Ok((875, 1000, 0))).unwrap();
+            assert_eq!(cache.lock().unwrap().snapshot().charged, 25);
+            pending(&cache);
+            observe_device_sampled(device, || Ok((865, 1000, 0))).unwrap();
+            assert_eq!(cache.lock().unwrap().snapshot().charged, 35);
+        }
+        drop(lanes);
+        assert!(weak.iter().all(|cache| cache.upgrade().is_none()));
+    }
+
+    #[test]
     fn seeded_startup_arena_is_nonzero_and_equals_capture_shares() {
         for device in [-8810, -8811] {
             let mut cache = DeviceCache::new(device, 64 << 20);

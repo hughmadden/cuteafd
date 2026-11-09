@@ -325,7 +325,7 @@ def test_kimi_reconciliation_uses_shared_ready_first_request_and_stats_paths():
     scheduler = (root / "shared/qwen/scheduler.rs").read_text()
     hook = '''    if requests > 0 {
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }'''
     assert hook in scheduler
     assert scheduler.count('reconcile::capture("first_request")') == 1
@@ -343,6 +343,9 @@ def test_kimi_startup_capture_window_excludes_eager_first_touch():
     engine = (root / "engine.rs").read_text().split("pub(crate) fn warm_graphs(", 1)[1]
     assert engine.index("restore_startup_kda()?") < engine.index("let before_capture =")
     assert engine.index("let before_capture =") < engine.index("observe_device(")
+    assert engine.index("let mut controllers =") < engine.index("device_cache(")
+    assert engine.index("controllers.push(") < engine.index("local.warm_graphs(")
+    assert engine.index("local.warm_graphs(") < engine.index("drop(controllers)")
     assert engine.index("set_reserve_policy(") < engine.index("local.warm_graphs(")
     assert engine.index("observe_device(") < engine.index("local.warm_graphs(")
     assert engine.index("self.graph_settle()?") < engine.index("Ok(GraphWarmup")

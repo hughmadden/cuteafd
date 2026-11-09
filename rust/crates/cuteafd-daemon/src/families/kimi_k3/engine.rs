@@ -577,9 +577,10 @@ impl<'a> Engine<'a> {
         let before_capture = self.graph_free_bytes()?;
         // Seed after eager first-touch, before any graph allocates driver storage.
         // Otherwise the first completed boundary loses the whole startup arena.
+        let mut controllers = Vec::with_capacity(reserves.len());
         for (rank, stream) in self.exchange_streams.iter().enumerate() {
-            crate::shared::decode_graph::device::device_cache(stream.device.id, reserves[rank],
-                crate::shared::decode_graph::device::Basis::Bytes)?;
+            controllers.push(crate::shared::decode_graph::device::device_cache(stream.device.library,
+                stream.device.id, reserves[rank], crate::shared::decode_graph::device::Basis::Bytes)?);
             let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(reserves.len(), rank);
             let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
             crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policy)?;
@@ -593,6 +594,8 @@ impl<'a> Engine<'a> {
                 captured += local.warm_graphs(&binding, rank, reserves[rank])?;
             }
         }
+        // Lane banks now retain every controller seeded before startup capture.
+        drop(controllers);
         drop(lanes);
         // Startup activity is attributed to Other and charged once, here,
         // before the first serving step can see the arenas as its own.

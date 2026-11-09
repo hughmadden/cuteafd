@@ -122,6 +122,60 @@ def sustained(graph):
     return len(complete) >= 3 and sum(int(count) > 0 for count in complete) >= len(complete) * 0.6
 
 
+# Hottest class wins when ranks disagree, because one prewarm set is shared.
+HEAT_ORDER = {"rare": 0, "regular": 1, "sustained": 2, "startup": 3}
+
+
+def heat(graph):
+    """The startup class of one traced geometry.
+
+    `rare` is a key the trace used once - a capture with no later hit - or only
+    inside a single sampling interval, which is one point or panel such as the
+    32K context pass; it stays lazy under the shared capture headroom.
+    `sustained` is the rolling-window heat a pin is earned by, and `regular` is
+    everything between: worth prewarming, not worth permanent residency.
+    """
+    histogram = graph.get("hit_histogram", {})
+    counts = histogram.get("counts", [])
+    intervals = sum(int(count) > 0 for count in counts) if counts else int(int(graph.get("count", 0)) > 0)
+    if int(graph.get("hits", 0)) == 0 or intervals <= 1:
+        return "rare"
+    return "sustained" if sustained(graph) else "regular"
+
+
+def geometry(family, shape):
+    """`(rows, table_width)` of a captured segment's display shape."""
+    if family != "deepseek_v4":
+        match = GEOMETRY.search(shape)
+        if match is None:
+            raise ValueError(f"cannot parse {family} geometry: {shape!r}")
+        rows, width, stride = map(int, match.groups())
+        if rows <= 0 or width <= 0 or stride != width:
+            raise ValueError("unsupported prewarm geometry")
+        return rows, width
+    match = V4_GEOMETRY.search(shape)
+    if match is None:
+        raise ValueError(f"cannot parse deepseek_v4 geometry: {shape!r}")
+    rows, width, stride = int(match[1]), int(match[3]), int(match[4])
+    if rows <= 0 or width < 0 or stride != width:
+        raise ValueError("unsupported prewarm geometry")
+    return rows, width
+
+
+def prewarmable(family, shape):
+    """Whether a captured key can stand as a prewarm entry.
+
+    V4 keeps tails eager (#1638), so a width-0 tail capture must not become a
+    startup entry; every other width-0 key is the local-expert/TP2 startup set
+    (a 1-RTX shape captures `local-experts`, a 2-RTX one `tp2-broadcast` and
+    `tp2-replicated`), and their geometry is the same `(rows, 0)` key.
+    """
+    if family != "deepseek_v4":
+        return True
+    match = V4_GEOMETRY.search(shape)
+    return match is None or int(match[3]) > 0 or match[2] != "tail"
+
+
 def kimi_geometry(shape):
     """Kimi keys print `rows=.. op=.. spec=..`; the prewarm identity is the
     replay width and whether it is a verify capture."""
@@ -320,6 +374,19 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
     return {"ranks": ranks, "layout": layout,
             "reserve_base_bytes": bases, "reserve_extra_bytes": CHUNK,
             "entries": entries}
+
+
+
+def merge_kimi_layout(path, row):
+    """Replace one layout row so a min and a max trace update one list."""
+    data = {"schema_version": 1, "family": "kimi_k3", "layouts": []}
+    if path.exists():
+        data = json.loads(path.read_text())
+        if data.get("family") != "kimi_k3" or data.get("schema_version") != 1:
+            raise ValueError(f"{path} is not a Kimi K3 prewarm list")
+    layouts = [layout for layout in data["layouts"] if int(layout["ranks"]) != row["ranks"]] + [row]
+    data["layouts"] = sorted(layouts, key=lambda layout: int(layout["ranks"]))
+    path.write_text(json.dumps(data, indent=2) + "\n")
 
 
 
@@ -1516,7 +1583,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
                         choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3")))
-    parser.add_argument("--layout", choices=("1", "2", "rtx1-spark", "rtx1-local", "rtx2-spark", "rtx2-local"),
+    parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
     parser.add_argument("--list", type=Path,
@@ -1557,8 +1624,8 @@ def main():
         if layout not in ("1", "2"):
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
-    elif layout is not None and args.family != "deepseek_v4":
-        parser.error("--layout applies to mistral_large4, deepseek_v4 and deepseek_v41 only")
+    elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
+        parser.error("--layout applies to mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:

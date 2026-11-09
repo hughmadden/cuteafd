@@ -9,6 +9,7 @@ use crate::shared::{decode_graph::{device::{Basis, Cycle, Preference, Site}, Cac
         CaptureTicket, GraphBank, GraphOwner, GraphPolicy},
     memory::device::Stream};
 use anyhow::{ensure, Context, Result};
+use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
     placement::inventory::StartupGraphs,
     serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, kimi_selected, KimiPrewarmLayout, KimiPrewarmOp}};
@@ -279,13 +280,24 @@ impl<'a> Graphs<'a> {
 
     /// Attach to `device`'s bounded cache. `bootstrap` is one more capture at the
     /// family's measured per-executable rate, used until the device is measured.
-    pub(crate) fn attach(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64) -> Result<()> {
+    pub(crate) fn attach(&mut self, library: &NativeLibrary, device: i32, ranks: usize,
+        rank: usize, reserve: u64) -> Result<()> {
         self.device = device;
         self.spans_devices = ranks > 1;
-        self.bank.attach_device(device, reserve, Site { name: "kimi_k3.step",
-            cycle: Cycle::Other, preference: Preference::Adaptive,
+        self.bank.attach_device(library, device, reserve, self.site(ranks, rank))
+    }
+
+    fn site(&self, ranks: usize, rank: usize) -> Site {
+        Site { name: "kimi_k3.step", cycle: Cycle::Other, preference: Preference::Adaptive,
             bootstrap: kimi_bootstrap(ranks, rank), basis: Basis::Bytes,
-            spans_devices: self.spans_devices })
+            spans_devices: self.spans_devices }
+    }
+
+    #[cfg(test)]
+    fn attach_for_test(&mut self, device: i32, ranks: usize, rank: usize, reserve: u64) -> Result<()> {
+        self.device = device;
+        self.spans_devices = ranks > 1;
+        self.bank.attach_device_for_test(device, reserve, self.site(ranks, rank))
     }
 
     pub(crate) fn attached(&self) -> bool { self.bank.cache_attached() }
@@ -557,22 +569,22 @@ mod tests {
         let hot = Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) };
         // Distinct synthetic devices: the controller is per physical device.
         let mut graphs = Graphs::new();
-        graphs.attach(-901, 1, 0, 8 << 20).unwrap();
+        graphs.attach_for_test(-901, 1, 0, 8 << 20).unwrap();
         assert!(matches!(graphs.bank.cache_miss(&hot, true, None), Miss::Capture(_)));
         // A ticket is a reservation, not residency.
         assert!(graphs.is_empty() && !graphs.cached(&hot));
         // Zero reserve means every miss runs eagerly.
         let mut eager = Graphs::new();
-        eager.attach(-902, 1, 0, 0).unwrap();
+        eager.attach_for_test(-902, 1, 0, 0).unwrap();
         assert!(matches!(eager.bank.cache_miss(&hot, true, None), Miss::Eager));
         // No reserve at all also runs eagerly.
         let mut detached = Graphs::new();
         assert!(matches!(detached.bank.cache_miss(&hot, true, None), Miss::Eager));
         // One physical device has one reserve and basis.
         let mut same = Graphs::new();
-        assert!(same.attach(-901, 1, 0, 8 << 20).is_ok());
+        assert!(same.attach_for_test(-901, 1, 0, 8 << 20).is_ok());
         let mut other = Graphs::new();
-        assert!(other.attach(-901, 1, 0, 16 << 20).is_err());
+        assert!(other.attach_for_test(-901, 1, 0, 16 << 20).is_err());
     }
 
     #[test]

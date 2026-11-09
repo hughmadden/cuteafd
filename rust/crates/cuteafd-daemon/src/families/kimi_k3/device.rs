@@ -833,7 +833,7 @@ impl<'a> LocalLane<'a> {
         let stream = self.stream().clone();
         let staged = self.attention.take();
         let mut graphs = super::graphs::Graphs::new();
-        let result = graphs.attach(stream.device.id, self.programs.ranks, rank, reserve)
+        let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve)
             .and_then(|()| graphs.prewarm(&stream, self.programs.ranks, keys,
                 |key| self.submit_startup_graph(key)));
         self.attention = staged;
