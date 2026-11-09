@@ -7,6 +7,11 @@ pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
     let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
     (list.reserve_base_bytes, list.reserve_extra_bytes)
 }
+/// Qwen 3.8 Flash Next's per-device prewarm base plus extra, by resolved capture shape.
+pub fn qwen_default(shape: crate::serving_capacity::qwen_graphs::QwenGraphShapeKey, rank: usize)
+    -> Option<(u64, u64)> {
+    crate::serving_capacity::qwen_graphs::qwen_reserve(shape, rank)
+}
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }
 

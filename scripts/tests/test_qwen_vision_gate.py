@@ -211,7 +211,7 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
     assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
 
-    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    /// Pre-capture every reachable")]
+    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    /// Retain every admitted serving workspace")]
     assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
     assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
     assert "shape.slot_rows() as usize" in prepare
@@ -325,7 +325,7 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
-    assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
+    assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in engine
     assert "decode_bucket(rows, spec) } else { rows }" in engine
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
 
@@ -341,7 +341,7 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     substitute = serve.index("*proposal = copy.tokens;", select)
     assert copy < select < substitute < serve.index("let sequences: Vec<Vec<u32>>")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
-    assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
+    assert "self.use_graphs && self.graph_capture.get() && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route
     gate = engine[engine.index("// Exercise the serving trim helper"):engine.index("pub(crate) fn copy_verify_row_limit")]
     assert "crate::shared::qwen::scheduler::trim_copy_rows(&mut sequences, limit)" in gate
@@ -351,7 +351,7 @@ def test_shared_copy_extensions_precede_grammar_and_verify_width():
     assert "Qwen copy trim logits and cache/state byte-exact" in gate
 
 
-def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
+def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
@@ -365,54 +365,62 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert "if diagnostic {\n        engine.verify_device_ungraphed" in serve
     assert "logits.rows = rows;" in engine
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
-    # A shape outside the sealed startup set runs ungraphed and allocates no
-    # graph: replay records it once for /v1/stats and warns, and only the
-    # startup warm-up ever begins a capture.
+    # Only the prewarm and a request's miss capture. A shape the resolved
+    # shape's prewarm list did not cover starts a capture on its request (or
+    # runs eagerly when the policy has no room); diagnostics and the prewarm's
+    # untimed eager pass never capture, and a request-time miss is recorded
+    # once for /v1/stats.
     assert engine.count("cuda_graph_begin_capture(") == 1
-    fallback = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
-    assert "if !self.warming_graphs.get() {" in fallback
-    assert "self.miss_graph(key);" in fallback
+    replay = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]
+    assert "if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {" in replay
+    assert "if !self.warming_graphs.get() { self.miss_graph(key); }" in replay
+    assert "let Some(ticket) = ticket else {" in replay
     assert 'crate::shared::decode_graph::note_eager("qwen4", &variant' in engine
-    assert "return Ok(())" in fallback
+    assert "segment()?;\n            return self.ple_consumed(&key);" in replay
     graphed = engine[engine.index("    fn decode_graphed("):engine.index("    fn replay(")]
     assert "tables.positions.iter().take_while(|&&position| position >= 0).count()" in graphed
-    assert 'if self.startup_graphs { Ok(()) } else { self.moe_front(' in graphed
+    assert "if self.warming_graphs.get() {" in graphed
     host_experts = graphed[graphed.index("            cur ^= if index") :]
-    assert 'ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked")' in host_experts
+    assert 'ensure!(real_rows == 0, "Qwen prewarm MoE rows must all be masked")' in host_experts
     assert "clear_tail(0..t)?" in host_experts
     assert "real_row_moe(real_rows, t, |real_rows|" in host_experts
     assert "self.moe_front(w, index, &layers[index], real_rows, expert_rows)?" in host_experts
     assert "self.moe_experts(w, index, real_rows, expert_rows, true)" in host_experts
     assert "}, clear_tail)?" in host_experts
-    assert "self.moe_experts(w, index, t, rows, true)?" in host_experts
     assert "tail.start * self.cfg.hidden * 2" in host_experts
     assert "tail.len() * self.cfg.hidden * 2" in host_experts
     shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/decode_graph.rs").read_text()
     assert shared.index("run(real)?;") < shared.index("clear(real..bucket)?;")
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert 'get QWEN_STARTUP_GRAPHS' in launcher
-    assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher
-    assert 'off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0)' in launcher
+    census = launcher[launcher.index("shared_graph_census_args() {"):
+                      launcher.index('if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]')]
+    assert 'if [[ "$family" == glm5 || "$family" == qwen4 ]]; then' in census
+    assert 'CUTEAFD_GPU_GRAPH_RESERVE=$graph_reserve' in census
+    assert 'CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/' in census
+    assert "QWEN_STARTUP_GRAPHS" not in launcher
 
 
-def test_qwen_startup_shapes_drain_without_serving_warmup_reachability():
+def test_qwen_prewarm_drains_at_pass_boundaries_without_serving_reachability():
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
 
     def check(source):
         start = source.index("    pub fn warm_decode_graphs(")
         end = source.index("    /// Compare real logits", start)
         warm = source[start:end]
-        loop = warm[warm.index("            for &(rows, spec, geometry) in &shapes {"):]
-        loop = loop[:loop.index("\n            }")]
-        assert loop.index("self.step(") < loop.index("self.drain_state()?;")
-        # No engine execution helper may enter startup warm-up, even indirectly.
+        # Each pass captures every resolved shape, then drains and folds that
+        # device's untracked high-water in before the next pass starts.
+        assert warm.count("self.drain_state()?;") == 2
+        assert warm.count("observe_device(self.library, bank.device.id)?;") == 2
+        assert warm.index("self.step(") < warm.index("self.drain_state()?;")
+        assert warm.index("run(false)?;") < warm.index("run(true)?;")
+        # No engine execution helper may enter the prewarm, even indirectly.
         assert "warm_decode_graphs(" not in source[:start] + source[end:]
 
     check(engine)
-    drain = "                self.drain_state()?;\n"
+    drain = "        self.drain_state()?;\n"
     warm_start = engine.index("    pub fn warm_decode_graphs(")
     drain_at = engine.index(drain, warm_start)
-    with pytest.raises((AssertionError, ValueError)):
+    with pytest.raises(AssertionError):
         check(engine[:drain_at] + engine[drain_at + len(drain):])
     with pytest.raises(AssertionError):
         check(engine + "\nfn serving_step() { self.warm_decode_graphs(1, false); }\n")

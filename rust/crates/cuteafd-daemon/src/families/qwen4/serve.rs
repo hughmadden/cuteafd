@@ -173,7 +173,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     length: crate::shared::draft::length::DraftLength, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
     loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
-    args.planner_graph_modes = Some((max_sequences, !matches!(draft, Drafts::None)));
+    cuteafd_core::concurrency::validate("qwen4", max_sequences as u64)?;
+    args.budget_admission = true;
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -213,6 +214,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         }
         engine.prepare_serving_workspaces()?;
         crate::shared::memory_report::log("qwen4/workspaces");
+        let reserves = engine.configure_graph_cache()?;
+        tracing::info!(reserves = ?reserves, "Qwen graph reserves");
         engine.warm_decode_graphs(max_sequences, !matches!(draft, Drafts::None))?;
         crate::shared::memory_report::log("qwen4/graphs");
         if let Ok(path) = std::env::var("CUTEAFD_QWEN4_PADDING_TOKENS") {

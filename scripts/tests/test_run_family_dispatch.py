@@ -2017,17 +2017,6 @@ def test_mimo_small_card_profile_keeps_explicit_overrides(tmp_path, embedding):
     assert "--pool-tokens 131072" in launch
 
 
-@pytest.mark.parametrize("setting,expected", [("", None), ("on", "1"), ("off", "0")])
-def test_qwen_startup_graph_default_is_owned_by_engine(tmp_path, setting, expected):
-    keys = "" if not setting else f"QWEN_STARTUP_GRAPHS={setting}\n"
-    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/qwen", keys)
-    assert result.returncode == 0, result.stderr
-    if expected is None:
-        assert "CUTEAFD_QWEN4_STARTUP_GRAPHS=" not in result.stderr
-    else:
-        assert f"CUTEAFD_QWEN4_STARTUP_GRAPHS={expected}" in result.stderr
-
-
 @pytest.mark.parametrize("setting,expected", [("", "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
 def test_qwen_kv_cache_is_explicit_and_fp8_default(tmp_path, setting, expected):
     keys = "" if not setting else f"KV_CACHE={setting}\n"

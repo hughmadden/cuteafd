@@ -441,3 +441,53 @@ def test_regeneration_reproduces_checked_in_base_and_tail(filename):
                              **({"layout": checked_in["layout"]} if checked_in.get("layout") else {}))
     for key in ("reserve_base_bytes", "reserve_extra_bytes"):
         assert result[key] == checked_in[key]
+
+
+def qwen_identity(segment, rows=64, spec=False, long=False, width=64, page_stride=64, pool_stride=128):
+    return (f"GraphKey {{ segment: {segment}, rows: {rows}, spec: {str(spec).lower()}, "
+            f"long: {str(long).lower()}, pool_width: {width}, page_stride: {page_stride}, "
+            f"pool_stride: {pool_stride} }}")
+
+
+def qwen_trace(device=0, charged=8 << 20):
+    def graph(segment, rows, count):
+        return {"device": device, "site": "qwen4.segment", "bank": 0,
+                "shape": qwen_identity(segment, rows=rows),
+                "count": count, "cycles": {"decode": count},
+                "hit_histogram": {"rolling": True, "interval_ms": 10_000,
+                                  "start_ms": 0, "counts": [5, 0, 0, 0, 0]},
+                "evictions": 0, "recaptures": 0}
+    return {"schema_version": 2, "cache": {"device": device, "charged": charged},
+            "sites": {"qwen4.segment": {"largest_bytes": 3 << 20}},
+            "graphs": [graph(0, 64, 100), graph(1, 64, 100), graph(1, 128, 1)]}
+
+
+def test_qwen_shape_list_is_keyed_by_resolved_shape_and_device():
+    result = MODULE.generate_qwen([qwen_trace(0, 8 << 20), qwen_trace(1, 12 << 20)],
+                                  "dual_0spark", coverage=0.99)
+    assert result["shape"] == "dual_0spark"
+    assert result["reserve_base_bytes"] == [8 << 20, 12 << 20]
+    assert result["reserve_extra_bytes"] == [4 << 20, 4 << 20]
+    # Layer segments share one capture shape: one entry, not one per segment.
+    assert result["trace"]["entries"] == [
+        {"rows": 64, "spec": False, "long": False, "pool_width": 64,
+         "page_stride": 64, "pool_stride": 128, "pin": False}]
+    assert "dual_0spark" in result["trace"]["provenance"]
+
+
+def test_qwen_single_shape_needs_exactly_one_device_trace():
+    assert len(MODULE.generate_qwen([qwen_trace()], "single_0spark")["reserve_base_bytes"]) == 1
+    with pytest.raises(ValueError):
+        MODULE.generate_qwen([qwen_trace()], "dual_sparks")
+
+
+def test_qwen_unparseable_identity_fails():
+    data = qwen_trace()
+    data["graphs"][0]["shape"] = "bad"
+    with pytest.raises(ValueError):
+        MODULE.generate_qwen([data], "single_0spark")
+
+
+def test_qwen_family_requires_shape_argument():
+    with pytest.raises(ValueError):
+        MODULE.generate([qwen_trace()], "qwen4")

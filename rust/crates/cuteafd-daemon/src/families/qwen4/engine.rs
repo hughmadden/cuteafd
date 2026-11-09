@@ -39,7 +39,7 @@ use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
 use std::cell::{Cell, RefCell};
-use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, ProjectionThreshold};
+use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, real_row_moe, GraphBank, ProjectionThreshold};
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -62,7 +62,7 @@ fn record_arena_bytes(pages: usize, pool_pages: usize, record_bytes: usize) -> R
 
 /// Rows of the decode-shaped programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::qwen4::VERIFY_ROWS;
-use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS};
+use cuteafd_loader::serving_capacity::qwen_graphs::{QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS, QwenGraphShape, QwenGraphShapeKey};
 // Keep this registry aligned with the pinned fork; script contracts check its source thresholds.
 const GLM_BF16_SKINNY_ROWS: usize = 0;
 const QWEN_WIDE_SKINNY_ROWS: usize = 24;
@@ -87,8 +87,9 @@ const DECODE_PROJECTION_THRESHOLDS: &[ProjectionThreshold] = &[
     ProjectionThreshold { name: "attention.projections.fp8", skinny_rows: FP8_PROJECTION_SKINNY_ROWS },
 ];
 
-pub(super) fn startup_graphs_enabled(graphs: Option<&str>, startup: Option<&str>) -> bool {
-    graphs != Some("0") && startup.map_or(true, |value| value == "1")
+/// Serving graphs are on unless `CUTEAFD_QWEN4_GRAPHS=0`.
+pub(super) fn graphs_enabled(graphs: Option<&str>) -> bool {
+    graphs != Some("0")
 }
 
 fn decode_bucket(rows: usize, spec: bool) -> usize {
@@ -547,13 +548,11 @@ mod tests {
     }
 
     #[test]
-    fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
-        use super::startup_graphs_enabled;
-        assert!(startup_graphs_enabled(None, None));
-        assert!(startup_graphs_enabled(None, Some("1")));
-        assert!(!startup_graphs_enabled(None, Some("0")));
-        assert!(!startup_graphs_enabled(Some("0"), None));
-        assert!(!startup_graphs_enabled(Some("0"), Some("1")));
+    fn serving_graphs_default_on_and_respect_the_explicit_opt_out() {
+        use super::graphs_enabled;
+        assert!(graphs_enabled(None));
+        assert!(graphs_enabled(Some("1")));
+        assert!(!graphs_enabled(Some("0")));
     }
 
     #[test]
@@ -572,7 +571,6 @@ mod tests {
     #[test]
     fn serving_graph_inventory_covers_every_reachable_c64_plain_shape() {
         use super::*;
-        use cuteafd_loader::serving_capacity::qwen_graphs::qwen_startup_graphs;
         for concurrency in [1, 16, 17, 32, 64] {
             for speculation in [false, true] {
                 let shapes = serving_graph_shapes(32768, 512, 2051, concurrency, speculation);
@@ -581,9 +579,6 @@ mod tests {
                         assert!(shapes.contains(&(decode_bucket(live, false), false, geometry)));
                     }
                 }
-                let graphs = qwen_startup_graphs(32768, 32768, 2051, concurrency, speculation, 48).unwrap();
-                assert_eq!(graphs.shapes, shapes.len() as u64);
-                assert_eq!(graphs.ranks[0].executables, (shapes.len() * 49) as u64);
             }
         }
     }
@@ -1245,9 +1240,15 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     pub profile: RefCell<[f64; 2]>,
     draft_probes: RefCell<Vec<DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>>,
-    graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
+    graphs: RefCell<Vec<GraphBank<GraphKey, GraphExec<'a>>>>,
     use_graphs: bool,
-    startup_graphs: bool,
+    /// The bounded graph cache is configured for this launch: bucketing, lazy
+    /// capture and miss accounting are on. Cleared only by `CUTEAFD_QWEN4_GRAPHS=0`.
+    graph_capture: Cell<bool>,
+    graph_pins: RefCell<Vec<QwenGraphShape>>,
+    /// The capture pass of the startup prewarm has completed.
+    graph_warmed: Cell<bool>,
+    /// The startup warm-up (never a request) is running.
     warming_graphs: Cell<bool>,
     /// Prefill programs over FP8-only projections quantize their activations
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
@@ -1263,21 +1264,15 @@ pub(crate) struct Qwen4Engine<'a> {
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
 }
 
+#[cfg(test)]
 type GraphGeometry = cuteafd_loader::serving_capacity::qwen_graphs::QwenGraphGeometry;
 
+#[cfg(test)]
 fn graph_geometries(context: usize, pages: usize, dense: usize) -> Vec<GraphGeometry> {
     cuteafd_loader::serving_capacity::qwen_graphs::qwen_graph_geometries(context, pages, dense)
 }
 
-pub(super) fn serving_graph_count(context: usize, pool_tokens: usize, dense: usize,
-    sequences: usize, speculation: bool, layers: usize) -> Result<usize> {
-    let pages = cuteafd_loader::serving_capacity::qwen_graphs::qwen_pool_pages(pool_tokens)
-        .context("Qwen graph page count overflow")?;
-    serving_graph_shapes(context, pages, dense, sequences, speculation).len()
-        .checked_mul(layers.checked_add(1).context("Qwen graph segment count overflow")?)
-        .context("Qwen graph count overflow")
-}
-
+#[cfg(test)]
 fn serving_graph_shapes(context: usize, pages: usize, dense: usize, sequences: usize, speculation: bool)
     -> Vec<(usize, bool, GraphGeometry)> {
     cuteafd_loader::serving_capacity::qwen_graphs::qwen_serving_graph_shapes(context, pages, dense, sequences, speculation)
@@ -1440,15 +1435,18 @@ impl<'a> Qwen4Engine<'a> {
         } else {
             (None, None)
         };
+        let graphs = (0..gdn_banks.len()).map(|_| GraphBank::new(None)).collect::<Vec<_>>();
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
             peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
-            graphs: RefCell::new(std::collections::HashMap::new()),
-            use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
-            startup_graphs: false,
+            graphs: RefCell::new(graphs),
+            use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
+            graph_capture: Cell::new(false),
+            graph_pins: RefCell::new(Vec::new()),
+            graph_warmed: Cell::new(false),
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
             packed_row_cap: Cell::new(None),
             l2: None, embedding,
@@ -1456,10 +1454,85 @@ impl<'a> Qwen4Engine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
 
-    pub(super) fn enable_startup_graphs(&mut self) {
-        self.startup_graphs = startup_graphs_enabled(
-            std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref(),
-            std::env::var("CUTEAFD_QWEN4_STARTUP_GRAPHS").ok().as_deref());
+    /// The resolved capture shape: one or two layer owners, and whether Sparks
+    /// are attached (a 0-Spark card captures no onboarding graphs; a TP1 card
+    /// captures no TP2 peer segments).
+    fn graph_shape(&self) -> QwenGraphShapeKey {
+        QwenGraphShapeKey::resolve(self.gdn_banks.len(),
+            matches!(self.experts(), Some(Experts::Spark { .. })))
+    }
+
+    /// Attach the per-owner graph banks: one bounded cache per physical device,
+    /// charged to the family's graph reserve before KV sizing. Returns each
+    /// device's resolved reserve.
+    pub fn configure_graph_cache(&self) -> Result<Vec<u64>> {
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        let shape = self.graph_shape();
+        let prewarm = cuteafd_loader::serving_capacity::qwen_graphs::qwen_shape_prewarm(shape);
+        tracing::warn!(site = "qwen4.segment", "Qwen graph cache uses per-site byte estimates: no #1612 node calibration for this route");
+        let mut reserves = Vec::new();
+        for (owner, bank) in self.graphs.borrow_mut().iter_mut().enumerate() {
+            let (base, extra) = cuteafd_loader::serving_capacity::qwen_graphs::qwen_reserve(shape, owner)
+                .with_context(|| format!("Qwen {shape:?} graph reserve has no rank {owner}"))?;
+            let resolved = cuteafd_loader::placement::graph_reserve::current(owner, false, base, extra)
+                .map_err(anyhow::Error::msg)?;
+            bank.attach_device(self.gdn_banks[owner].device.id, resolved.bytes, Site {
+                name: "qwen4.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                bootstrap: cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
+                basis: Basis::Bytes,
+                spans_devices: self.gdn_banks.len() > 1,
+            })?;
+            tracing::info!(rank = owner, reserve = resolved.bytes, source = resolved.source,
+                bootstrap = cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
+                prewarm_shapes = prewarm.trace.as_ref().map_or(
+                    cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_list().bootstrap.entries.len(),
+                    |trace| trace.entries.len()),
+                shape = ?shape, "Qwen graph reserve");
+            reserves.push(resolved.bytes);
+        }
+        *self.graph_pins.borrow_mut() = cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_pinned(shape);
+        self.graph_capture.set(self.use_graphs);
+        Ok(reserves)
+    }
+
+    /// Visit every owner's bank (the shared observer's pass interface).
+    fn visit_graphs(&self, visit: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
+        let mut graphs = self.graphs.borrow_mut();
+        for (owner, bank) in graphs.iter_mut().enumerate() {
+            visit(self.gdn_banks[owner].device.id, "qwen4.segment", self.gdn_banks.len() > 1, bank)?;
+        }
+        Ok(())
+    }
+
+    /// The capture-pass boundary of one submitted step: every owner's launches
+    /// are drained, each physical device's graph growth is measured once, and
+    /// executables the policy retired are destroyed. Without pending work the
+    /// banks only flush their hit clocks.
+    fn graph_completed(&self) -> Result<()> {
+        let needs_boundary = self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary());
+        if !needs_boundary {
+            for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_tick(); }
+            return Ok(());
+        }
+        // A capture's growth is only observable once every owner's stream has
+        // completed its queued launches: this is the step boundary.
+        self.drain_state()?;
+        // SAFETY: Qwen graph owners pin only borrowed, persistent engine storage
+        // (weights, KV/state pools, workspaces and their owner streams); the
+        // GraphExec owns no allocation its segments captured, so destroying an
+        // executable needs no lane drain.
+        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| self.visit_graphs(visit)) }
+            .context("Qwen graph boundary observation")
+    }
+
+    /// Attribute the whole step's replay work to its cycle.
+    fn graph_cycle(&self, tables: &StepTables) {
+        use crate::shared::decode_graph::device::Cycle;
+        let cycle = if self.warming_graphs.get() { Cycle::Other }
+            else if !tables.decode { Cycle::Prefill }
+            else if tables.spec { Cycle::Verify }
+            else { Cycle::Decode };
+        for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_cycle(cycle); }
     }
 
     pub fn set_experts(&mut self, experts: Experts<'a>) {
@@ -1613,72 +1686,67 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// Pre-capture every reachable bucket/geometry on no-storage rows, without expert traffic.
+    /// Prewarm the checked-in prewarm set for this launch's layout inside the
+    /// graph reserve. Unlisted or uncaptured request shapes run eagerly or
+    /// capture lazily on a permitted miss; nothing here refuses. One eager pass
+    /// first puts module, workspace and BLAS first touch outside executable
+    /// residency, and the capture pass is charged at its completed step
+    /// boundaries. Returns the resident graph count.
     pub fn warm_decode_graphs(&self, sequences: usize, speculation: bool) -> Result<usize> {
-        if !self.use_graphs || !self.startup_graphs { return Ok(0); }
+        ensure!(!self.graph_warmed.get(), "Qwen prewarm already captured");
+        if !self.use_graphs { return Ok(0); }
+        ensure!(self.graph_capture.get(), "Qwen graphs must be configured before the prewarm");
         cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
         check_bucket_thresholds(PLAIN_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
         check_bucket_thresholds(SPEC_BUCKETS, DECODE_PROJECTION_THRESHOLDS)?;
-        let shapes = serving_graph_shapes(self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
+        let shape = self.graph_shape();
+        let shapes = cuteafd_loader::serving_capacity::qwen_graphs::qwen_prewarm_shapes(shape,
+            self.max_context, self.pages, self.cfg.dense_context(), sequences, speculation);
         let segments = self.weights.layers.len() + if self.gdn_banks.len() == 2 { 3 } else { 1 };
-        let expected = shapes.len() * segments;
-        tracing::info!(graphs = expected, shapes = shapes.len(), plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS,
-            "Qwen startup decode graph admission");
-        if self.decode_workspace.borrow().is_none() {
-            *self.decode_workspace.borrow_mut() = Some(self.on_owner(0, || self.workspace(DECODE_ROWS, true, DECODE_ROWS))?);
-        }
-        if self.gdn_banks.len() == 2 && self.peer_decode_workspace.borrow().is_none() {
-            *self.peer_decode_workspace.borrow_mut() = Some(self.on_owner(1, || self.workspace(DECODE_ROWS, true, DECODE_ROWS))?);
-        }
-        self.drain_state()?;
-        let sample = || self.gdn_banks.iter().map(|bank| bank.device.run(|| {
-            Ok(self.library.cuda_allocatable_memory_info()?.0)
-        })).collect::<Result<Vec<_>>>();
-        let before = sample()?;
+        tracing::info!(shape = ?shape, shapes = shapes.len(), graphs = shapes.len() * segments,
+            plain_rows = ?PLAIN_BUCKETS, spec_rows = ?SPEC_BUCKETS, "Qwen prewarm admission");
         let started = std::time::Instant::now();
-        self.warming_graphs.set(true);
-        let captured = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                let mut tables = StepTables { decode: true, spec, long: geometry.long,
+        let run = |warming: bool| -> Result<()> {
+            self.warming_graphs.set(warming);
+            for shape in &shapes {
+                let geometry = shape.geometry();
+                let mut tables = StepTables { decode: true, spec: shape.spec, long: geometry.long,
                     pool_width: geometry.pool_width, page_stride: geometry.page_stride,
                     page_width: geometry.page_stride, pool_stride: geometry.pool_stride, ..Default::default() };
                 let mut tokens = Vec::new();
-                pad_decode_tables(&mut tables, &mut tokens, rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
-                self.step(&Arc::new(tables), &tokens, rows, None, None, &Default::default(), true)?;
-                // Startup shapes reuse an arena admitted for one serving step.
-                self.drain_state()?;
+                pad_decode_tables(&mut tables, &mut tokens, shape.rows, self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
+                self.step(&Arc::new(tables), &tokens, shape.rows, None, None, &Default::default(), true)?;
             }
-            // SAFETY: queued captures/replays drain before reporting memory or publishing readiness.
-            self.drain_state()
-        })();
-        let drained = self.drain_state();
+            Ok(())
+        };
+        // Eager pass: first touch of each module, workspace and BLAS lands here.
+        run(false)?;
         self.warming_graphs.set(false);
-        captured?;
-        drained?;
-        let graphs = self.captured_graphs();
-        ensure!(graphs == expected, "Qwen startup captured {graphs} graphs, expected {expected}");
-        for &(rows, spec, geometry) in &shapes {
-            for segment in 0..segments {
-                ensure!(self.graphs.borrow().contains_key(&GraphKey { segment, rows, spec,
-                    long: geometry.long, pool_width: geometry.pool_width, page_stride: geometry.page_stride,
-                    pool_stride: geometry.pool_stride }), "Qwen startup graph coverage missing");
-            }
+        // Fold the eager pass into each device's untracked high-water at zero charge.
+        self.drain_state()?;
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
         }
-        let after = sample()?;
-        let bytes: Vec<_> = before.iter().zip(&after).map(|(&before, &after)| before as i64 - after as i64).collect();
-        tracing::info!(graphs, elapsed_ms = started.elapsed().as_millis() as u64,
-            graph_bytes = bytes.iter().sum::<i64>(), graph_bytes_by_owner = ?bytes,
-            graph_bytes_charged = graphs as u64
-                * cuteafd_loader::serving_capacity::qwen_graphs::QWEN_GRAPH_BYTES_PER_GRAPH,
-            "Qwen decode graphs captured at startup");
+        run(true)?;
+        self.warming_graphs.set(false);
+        self.drain_state()?;
+        for bank in &self.gdn_banks {
+            crate::shared::decode_graph::device::observe_device(self.library, bank.device.id)?;
+        }
+        self.graph_warmed.set(true);
+        let graphs = self.captured_graphs();
+        let snapshots = crate::shared::decode_graph::device::snapshots();
+        tracing::info!(graphs, shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
+            arenas = ?snapshots.iter().map(|s| (s.device, s.charged, s.reserve)).collect::<Vec<_>>(),
+            "Qwen prewarm captured");
         Ok(graphs)
     }
 
     /// Compare real logits and persistent cache/state bytes, including unused storage.
     /// Run only before serving: this diagnostic owns its allocator and state slots.
     pub fn check_decode_padding(&self, tokens: &[u32]) -> Result<()> {
-        ensure!(self.use_graphs && self.startup_graphs && self.weights.layers.len() == self.cfg.layers,
-            "Qwen padding check needs all layers and startup graphs");
+        ensure!(self.use_graphs && self.graph_capture.get() && self.weights.layers.len() == self.cfg.layers,
+            "Qwen padding check needs all layers and configured graphs");
         ensure!(tokens.len() >= 69 && self.max_context >= 69 && self.slots >= 10 && self.pages >= 40,
             "Qwen padding check needs 69 tokens, ten slots and forty pages");
         let snapshot = |buffers: &[cuteafd_ffi::CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
@@ -1779,14 +1847,14 @@ impl<'a> Qwen4Engine<'a> {
 
     /// Copy proposals may shrink to a lower spec bucket, never dropping a sequence.
     pub(crate) fn copy_verify_row_limit(&self, rows: usize, sequences: usize, diagnostic: bool) -> usize {
-        if self.startup_graphs && self.use_graphs && !diagnostic {
+        if self.use_graphs && self.graph_capture.get() && !diagnostic {
             copy_row_limit(rows, sequences)
         } else { rows }
     }
 
     /// Physical row extent for an ordinary serving verify; diagnostics are ungraphed.
     pub(crate) fn verify_bucket_rows(&self, rows: usize, spec: bool, diagnostic: bool) -> usize {
-        if self.startup_graphs && self.use_graphs && !diagnostic { decode_bucket(rows, spec) } else { rows }
+        if self.use_graphs && self.graph_capture.get() && !diagnostic { decode_bucket(rows, spec) } else { rows }
     }
 
     /// Logical record traffic, not measured DRAM traffic (GQA reuse and L2 can reduce it).
@@ -1806,7 +1874,7 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     pub fn captured_graphs(&self) -> usize {
-        self.graphs.borrow().len()
+        self.graphs.borrow().iter().map(|bank| bank.len()).sum()
     }
 
     pub fn experts(&self) -> Option<&Experts<'a>> {
@@ -2062,7 +2130,9 @@ impl<'a> Qwen4Engine<'a> {
             },
             graphs: || {
                 if let Some(Experts::Spark { transport, .. }) = &self.experts { transport.try_borrow_mut()?.terminal_release()?; }
-                self.graphs.borrow_mut().clear(); Ok(())
+                // The ranks above drained every consumer; captured storage is persistent engine storage.
+                for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_clear_drained(); }
+                Ok(())
             },
             finish: |drained| {
                 self.terminal.set(if drained { TerminalState::Drained } else { TerminalState::Retained });
@@ -2759,7 +2829,7 @@ impl<'a> Qwen4Engine<'a> {
             let media_rows: Vec<_> = sequences.iter().map(|(p, t)| (&**p, p.len, t.len())).collect();
             embedding_media(&media_rows)?
         } else { Default::default() };
-        let bucketed = self.startup_graphs && self.use_graphs && graphs && on_layer.is_none() && media.indices.is_empty();
+        let bucketed = self.use_graphs && self.graph_capture.get() && graphs && on_layer.is_none() && media.indices.is_empty();
         if bucketed {
             pad_decode_tables(&mut tables, &mut tokens, decode_bucket(rows, spec), self.ple.as_ref().map_or(0, |_| self.cfg.ple_rows()));
         }
@@ -3084,13 +3154,17 @@ impl<'a> Qwen4Engine<'a> {
 
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
-        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(),
-            || self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs))
+        crate::shared::experts::rtx::pair::submit(|| self.require_live(), || self.shutdown_submission(), || {
+            let output = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs)?;
+            self.graph_completed()?;
+            Ok(output)
+        })
     }
 
     fn step_inner(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, mut on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         self.last_stream_offset.set(0);
+        self.graph_cycle(tables);
         if let Some(w) = self.workspace.borrow().as_ref() {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false);
             w.terminal_valid.set(false);
@@ -3136,7 +3210,8 @@ impl<'a> Qwen4Engine<'a> {
         // Streams start as four copies of the embedding.
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = graphs && self.use_graphs && tables.decode && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
+        let graphed = graphs && self.use_graphs && self.graph_capture.get() && tables.decode
+            && on_layer.is_none() && forced.is_none() && media.indices.is_empty();
         self.stage_embedding(w, tokens, HC, &w.streams[0], graphed)?;
         self.inject_media(w, media, &tables.seq_first, &w.streams[0], t, HC)?;
         let rows = Scalar::I32(t as i32);
@@ -3339,9 +3414,8 @@ impl<'a> Qwen4Engine<'a> {
         let n = layers.len();
         let hops = self.hops.as_ref().context("Qwen graph residual hops")?;
         let head = n == self.cfg.layers && logit_rows == t;
-        let real_rows = if self.startup_graphs {
-            tables.positions.iter().take_while(|&&position| position >= 0).count()
-        } else { t };
+        // Bucket tails are a contiguous masked suffix; expert batches keep native geometry.
+        let real_rows = tables.positions.iter().take_while(|&&position| position >= 0).count();
         ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0), "Qwen decode mask tail");
         let expert_rows = Scalar::I32(i32::try_from(real_rows)?);
         let key = |segment| GraphKey { segment, rows: t, spec: tables.spec, long: tables.long,
@@ -3391,7 +3465,8 @@ impl<'a> Qwen4Engine<'a> {
                         Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                     }
                     self.post_pre(w, c, layer, "mlp", rows)?;
-                    if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
+                    // Routed experts run between segments (and outside capture).
+                    Ok(())
                 })?;
                 if index == 0 || boundary { cur[owner] ^= 1; }
                 let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
@@ -3399,13 +3474,15 @@ impl<'a> Qwen4Engine<'a> {
                     // SAFETY: suffix zeroing precedes graph consumption on the owner stream.
                     unsafe { self.library.cuda_zero_bytes_async(buffer, buffer.bytes, self.execution_stream()) }
                 };
-                if self.warming_graphs.get() { ensure!(real_rows == 0, "Qwen startup real expert rows"); clear_tail(0..t)?; }
-                else if self.startup_graphs {
+                if self.warming_graphs.get() {
+                    ensure!(real_rows == 0, "Qwen prewarm MoE rows must all be masked");
+                    clear_tail(0..t)?;
+                } else {
                     real_row_moe(real_rows, t, |real| {
                         self.moe_front(w, index, layer, real, expert_rows)?;
                         self.moe_experts(w, index, real, expert_rows, true)
                     }, clear_tail)?;
-                } else { self.moe_experts(w, index, t, rows, true)?; }
+                }
                 Ok(())
             })?;
             if !self.warming_graphs.get() {
@@ -3526,9 +3603,7 @@ impl<'a> Qwen4Engine<'a> {
         let head = layers.len() == self.cfg.layers && logit_rows == t;
         let gather = self.embedding.device_gather();
         // Bucket tails are a contiguous suffix; expert batches must retain native geometry.
-        let real_rows = if self.startup_graphs {
-            tables.positions.iter().take_while(|&&position| position >= 0).count()
-        } else { t };
+        let real_rows = tables.positions.iter().take_while(|&&position| position >= 0).count();
         ensure!(tables.positions[real_rows..].iter().all(|&position| position < 0),
             "Qwen decode mask is not a contiguous tail");
         let expert_rows = Scalar::I32(real_rows as i32);
@@ -3570,34 +3645,31 @@ impl<'a> Qwen4Engine<'a> {
                     Qwen4Attention::Full => self.full(w, index, layer, rows, "m64", tables)?,
                 }
                 self.post_pre(w, c, layer, "mlp", rows)?;
-                if self.startup_graphs { Ok(()) } else { self.moe_front(w, index, layer, t, rows) }
+                // Routed experts run between segments (and outside capture).
+                Ok(())
             })?;
             cur ^= if index == 0 || index == layers.len() { 1 } else { 0 };
             if index < layers.len() {
-                if self.startup_graphs {
-                    let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
-                        let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
-                            tail.len() * self.cfg.hidden * 2);
-                        // SAFETY: the masked suffix is inside persistent delta; the next graph
-                        // consumes it on this same stream after the zero and expert output.
-                        unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.execution_stream()) }
-                    };
-                    if self.warming_graphs.get() {
-                        ensure!(real_rows == 0, "Qwen startup MoE rows must all be masked");
-                        clear_tail(0..t)?;
-                    } else {
-                        real_row_moe(real_rows, t, |real_rows| {
-                            self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
-                            self.moe_experts(w, index, real_rows, expert_rows, true)
-                        }, clear_tail)?;
-                    }
-                } else if !self.warming_graphs.get() {
-                    self.moe_experts(w, index, t, rows, true)?;
+                let clear_tail = |tail: std::ops::Range<usize>| -> Result<()> {
+                    let tail = Self::region(&w.delta, tail.start * self.cfg.hidden * 2,
+                        tail.len() * self.cfg.hidden * 2);
+                    // SAFETY: the masked suffix is inside persistent delta; the next graph
+                    // consumes it on this same stream after the zero and expert output.
+                    unsafe { self.library.cuda_zero_bytes_async(tail, tail.bytes, self.execution_stream()) }
+                };
+                if self.warming_graphs.get() {
+                    ensure!(real_rows == 0, "Qwen prewarm MoE rows must all be masked");
+                    clear_tail(0..t)?;
+                } else {
+                    real_row_moe(real_rows, t, |real_rows| {
+                        self.moe_front(w, index, &layers[index], real_rows, expert_rows)?;
+                        self.moe_experts(w, index, real_rows, expert_rows, true)
+                    }, clear_tail)?;
                 }
                 if !self.warming_graphs.get() {
-                crate::shared::console::layer_mark(index);
-                self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
-            }
+                    crate::shared::console::layer_mark(index);
+                    self.on_owner(self.state_map.layers[index].owner, || self.probe_layer(w, index, real_rows))?;
+                }
             }
         }
         self.last_streams.set((true, cur));
@@ -3611,58 +3683,88 @@ impl<'a> Qwen4Engine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, head)))
     }
 
-    fn replay(&self, key: GraphKey, segment: impl FnOnce() -> Result<()>) -> Result<()> {
+    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
-        if let Some(graph) = self.graphs.borrow().get(&key) {
+        let owner = self.active_owner.get();
+        if let Some(graph) = self.graphs.borrow_mut()[owner].cached_launch(&key).map(|graph| graph.0) {
             // SAFETY: the graph's pointers are persistent engine buffers.
-            unsafe { self.library.cuda_graph_launch(graph.0, self.execution_stream())?; }
-            if self.cfg.ple_layers.contains(&key.segment) {
-                if let Some(ple) = &self.ple {
-                    // SAFETY: this replay contains the PLE reader; no later layer is queued yet.
-                    unsafe { ple.mapped().consumed(self.execution_stream())?; }
-                }
-            }
-            return Ok(());
+            unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+            return self.ple_consumed(&key);
         }
-        if !self.warming_graphs.get() {
-            // The startup set is exhaustive by construction, so a key outside it
-            // is a shape the warm-up never enumerated. Run the segment ungraphed:
-            // it allocates no graph executable and never captures at runtime.
-            // Name the variant once so the next restart can add it.
-            if self.startup_graphs {
-                self.miss_graph(key);
-            }
+        // Graphs unconfigured, or the prewarm's untimed eager pass: run the
+        // segment ungraphed without recording a miss.
+        if !self.graph_capture.get() || (!self.graph_warmed.get() && !self.warming_graphs.get()) {
             segment()?;
-            if self.cfg.ple_layers.contains(&key.segment) {
-                if let Some(ple) = &self.ple {
-                    // SAFETY: the ungraphed segment's PLE reader is on this stream; no later layer is queued yet.
-                    unsafe { ple.mapped().consumed(self.execution_stream())?; }
-                }
-            }
-            return Ok(());
+            return self.ple_consumed(&key);
         }
+        let pinned = self.graph_pinned(&key);
+        let ticket = self.graphs.borrow_mut()[owner].cache_ticket(&key, pinned, None);
+        let Some(ticket) = ticket else {
+            // The policy ran it eagerly (reserve/headroom or no headroom counted):
+            // record the shape once so the next trace can add it.
+            if !self.warming_graphs.get() { self.miss_graph(key); }
+            segment()?;
+            return self.ple_consumed(&key);
+        };
         // SAFETY: capture records this stream's launches; nothing in a segment
-        // synchronizes the host or allocates. Only the startup warm-up captures.
-        unsafe { self.library.cuda_graph_begin_capture(self.execution_stream())? };
+        // synchronizes the host or allocates.
+        if let Err(error) = unsafe { self.library.cuda_graph_begin_capture(self.execution_stream()) } {
+            drop(ticket);
+            tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
+            segment()?;
+            return self.ple_consumed(&key);
+        }
         let captured = segment();
         // SAFETY: ends the capture begun above on the same stream.
-        let device = Device { library: self.library, id: self.library.cuda_get_device()? };
-        let exec = unsafe { self.library.cuda_graph_end_capture(self.execution_stream()) }
-            .map(|exec| GraphExec(exec, device));
-        captured?;
-        let exec = exec?;
+        let exec = unsafe { self.library.cuda_graph_end_capture_topology(self.execution_stream()) };
+        if let Err(error) = captured {
+            if let Ok((raw, _, _, _, _)) = exec {
+                // SAFETY: the unlaunched executable owns no queued work.
+                unsafe { let _ = self.library.cuda_graph_exec_destroy(raw); }
+            }
+            return Err(error);
+        }
+        let (raw, nodes, width, spans_devices, inspection_error) = match exec {
+            Ok(info) => info,
+            Err(error) => {
+                drop(ticket);
+                tracing::warn!(%error, "Qwen graph instantiation unavailable; running eagerly");
+                segment()?;
+                return self.ple_consumed(&key);
+            }
+        };
+        if let Some(error) = inspection_error {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| tracing::warn!(site = "qwen4.segment", %error,
+                "graph topology unknown; retaining executable without chain reuse"));
+        }
         crate::shared::decode_graph::census::capture_key("qwen4", "decode",
-            self.graphs.as_ptr() as usize, self.active_owner.get() as i32, Some(0), &key, exec.0);
+            self.graphs.as_ptr() as usize, owner as i32, Some(0), &key, raw);
+        let graph = GraphExec(raw, Device { library: self.library, id: self.library.cuda_get_device()? });
+        self.graphs.borrow_mut()[owner].cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
+        let graph = self.graphs.borrow()[owner].get(&key).context("inserted Qwen graph")?.0;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { self.library.cuda_graph_launch(exec.0, self.execution_stream())? };
-        self.graphs.borrow_mut().insert(key, exec);
+        unsafe { self.library.cuda_graph_launch(graph, self.execution_stream())?; }
+        self.ple_consumed(&key)
+    }
+
+    /// The PLE reader of a graphed layer segment has just been launched: its
+    /// mapped rows are consumed, and no later layer is queued yet.
+    fn ple_consumed(&self, key: &GraphKey) -> Result<()> {
         if self.cfg.ple_layers.contains(&key.segment) {
             if let Some(ple) = &self.ple {
-                // SAFETY: newly launched PLE segment owns the current destination.
+                // SAFETY: this segment is the last work queued on the stream.
                 unsafe { ple.mapped().consumed(self.execution_stream())?; }
             }
         }
         Ok(())
+    }
+
+    /// Whether the resolved shape's prewarm pins this key.
+    fn graph_pinned(&self, key: &GraphKey) -> bool {
+        self.graph_pins.borrow().contains(&QwenGraphShape { rows: key.rows, spec: key.spec,
+            long: key.long, pool_width: key.pool_width, page_stride: key.page_stride,
+            pool_stride: key.pool_stride })
     }
 
     /// Record and warn about one ungraphed decode shape. The warning names the

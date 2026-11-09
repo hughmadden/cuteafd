@@ -284,7 +284,6 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         pending_code_bytes: 0, max_context: shape.context_tokens,
         requested_pool: options.pool_tokens.filter(|&n| n > 0),
         spark_ranks: if local { 0 } else { report.placement.spark_ranks() },
-        startup_graph_modes: Some((shape.concurrency as usize, true)),
         host,
         encoders,
     };
@@ -688,7 +687,6 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
         onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
-        startup_graph_modes: Some((concurrency as usize, true)),
         host: host_owners, encoders,
     };
     let (placement, solved) = qwen4::dual_admitted(&inputs).context("solving Qwen owner ranges")?;

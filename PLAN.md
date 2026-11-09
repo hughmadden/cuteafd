@@ -1058,8 +1058,8 @@ Work, in priority order:
    state, prefix, graph and headroom reserves. A fresh identical-config A/B
    uses 73,728 tokens in both arms so all sixteen requests fit. The distinct
    three-pair full-width medians pass the 0.98 floor for plain and Copy;
-   startup graphs now default on for serving, with `QWEN_STARTUP_GRAPHS=off`
-   restoring lazy capture. Golden/diagnostic engines keep exact-shape behavior.
+   startup graphs now default on for serving behind the bounded graph cache,
+   with a zero `GPU_GRAPH_RESERVE` running eagerly. Golden/diagnostic engines keep exact-shape behavior.
    Before KV allocation, admission solves the candidate pool's enumerated
    graph count (actual context, layers, sequence count and speculative modes)
    times the 2026-10-07 measured 149,712 bytes/graph, plus a margin of the
