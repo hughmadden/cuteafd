@@ -1560,6 +1560,71 @@ mod replay_cli_tests {
     }
 }
 
+/// The `memory_reconciliation_provenance` input the shared Ready and
+/// first-request captures attach to every device row. Admission publishes it
+/// once the placement is resolved; both captures early-return without it.
+fn reconciliation_provenance(manifest: &std::path::Path, native_lib: &std::path::Path, layout: String,
+    devices: &[cuteafd_loader::placement::RuntimeSample], spark_world: usize,
+    onboard_layers: &[Vec<usize>], prefill: &cuteafd_loader::placement::planner::PrefillShape)
+    -> Result<serde_json::Value> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)
+            .with_context(|| format!("memory reconciliation provenance input {}", path.display()))?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    Ok(serde_json::json!({
+        "schema_version": 1, "family": "glm5_flash", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+        "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+        "native_sha256": hash(native_lib)?, "programs_sha256": hash(manifest)?,
+        "layout": layout, "devices": devices, "spark_world": spark_world,
+        "onboard_layers": onboard_layers, "prefill": prefill,
+        "graph_basis": "trace-derived prewarm document keyed by resolved layout; uncalibrated byte fallback elsewhere"
+    }))
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::reconciliation_provenance;
+    use anyhow::Context as _;
+
+    fn sample(device: i32) -> cuteafd_loader::placement::RuntimeSample {
+        cuteafd_loader::placement::RuntimeSample { device, total_bytes: 96 << 30, free_bytes: 90 << 30,
+            context_bytes: 577 << 20, module_bytes: 12 << 20, sms: 188, arch: "sm_120".into(), driver: "test".into() }
+    }
+
+    #[test]
+    fn admission_publishes_memory_reconciliation_provenance() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let manifest = dir.path().join("PROGRAMS.json");
+        let native = dir.path().join("libcuteafd.so");
+        std::fs::write(&manifest, b"{\"families\":{}}")?;
+        std::fs::write(&native, b"native")?;
+        let prefill = cuteafd_loader::placement::planner::PrefillShape { rows: 4096, waves: 1 };
+        let value = reconciliation_provenance(&manifest, &native, "layout/test".into(),
+            &[sample(0), sample(1)], 2, &[vec![0, 1], vec![2, 3]], &prefill)?;
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": value }));
+        let inputs = cuteafd_ffi::memory_ledger::fault::inputs();
+        let published = inputs.get("memory_reconciliation_provenance").context("provenance input")?;
+        assert_eq!(published["schema_version"], 1);
+        assert_eq!(published["family"], "glm5_flash");
+        assert_eq!(published["spark_world"], 2);
+        assert_eq!(published["onboard_layers"], serde_json::json!([[0, 1], [2, 3]]));
+        assert_eq!(published["prefill"], serde_json::to_value(&prefill)?);
+        assert_eq!(published["devices"].as_array().map(Vec::len), Some(2));
+        assert_eq!(published["devices"][1]["device"], 1);
+        for key in ["native_sha256", "programs_sha256"] {
+            let hash = published[key].as_str().context("hash string")?;
+            assert_eq!(hash.len(), 64);
+            assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        }
+        Ok(())
+    }
+}
+
 /// Option combinations rejected before any checkpoint or native work.
 fn check_options(args: &EngineArgs) -> Result<()> {
     let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
@@ -2363,6 +2428,16 @@ impl Opened {
         let (placement, admitted_graphs, working, admitted_host, admitted_native_load,
             admitted_push_host, admitted_mount_load, admitted_plan) = admitted;
         if let Some(receipt) = admitted_mount_load { loader.dense.admit_mount(receipt)?; }
+        // The shared Ready and first-request reconciliation captures read this
+        // input; without it both stages early-return as unavailable.
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": reconciliation_provenance(&args.manifest, &args.native_lib,
+                format!("snapshot/{}; draft/{:?}; context/{}; attention/{:?}; sparks/{}; prefill/{:?}",
+                    self.checkpoint.snapshot.display(), args.draft, args.max_context, attention.mode,
+                    working.spark_ranks, admitted_plan.decisions.prefill),
+                &inventory.gpus, working.spark_ranks, &admitted_plan.decisions.onboard_layers,
+                &admitted_plan.decisions.prefill)?
+        }));
         let media = prepare_media()?;
         cuteafd_loader::placement::families::GLM5_FLASH.check(&placement)?;
         if native_admission.is_some() {

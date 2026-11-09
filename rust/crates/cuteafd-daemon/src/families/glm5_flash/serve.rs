@@ -902,6 +902,12 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     ring_misses: u64, cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
     memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>, reserve: &Reserve, stalled: usize) {
+    // The second reconciliation stage: the Ready row is resident only, so this one
+    // records what the first served request added (lazy graphs, wider workspaces).
+    if requests > 0 {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+    }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
