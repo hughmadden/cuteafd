@@ -491,7 +491,7 @@ pub fn tag_of(ptr: usize) -> Option<Tag> {
 }
 
 /// Read one live-byte counter without cloning the allocation ledger.
-pub(crate) fn current_bytes(space: Space, device: i32) -> usize {
+pub fn current_bytes(space: Space, device: i32) -> usize {
     state().lock().unwrap_or_else(|e| e.into_inner()).current.get(&(space, device)).copied().unwrap_or(0)
 }
 
@@ -778,6 +778,30 @@ pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_bytes_tracks_replacement_free_and_device_space_independently() {
+        let _ledger = test_guard();
+        let base = 0x7981_0000_0000usize;
+        let device = 99101;
+        assert_eq!(current_bytes(Space::Device, device), 0);
+        record_alloc(Space::Device, device, base, 512, TEST);
+        record_alloc(Space::Device, device, base + 1, 256, TEST);
+        record_alloc(Space::Device, device + 1, base + 2, 128, TEST);
+        record_alloc(Space::Host, device, base + 3, 64, TEST);
+        assert_eq!(current_bytes(Space::Device, device), 768);
+        assert_eq!(current_bytes(Space::Device, device + 1), 128);
+        assert_eq!(current_bytes(Space::Host, device), 64);
+        record_alloc(Space::Device, device, base, 1024, TEST);
+        assert_eq!(current_bytes(Space::Device, device), 1280);
+        assert_eq!(current_bytes(Space::Device, device), snapshot().total(Space::Device, device));
+        record_free(base);
+        assert_eq!(current_bytes(Space::Device, device), 256);
+        for address in base + 1..=base + 3 { record_free(address); }
+        assert_eq!(current_bytes(Space::Device, device), 0);
+        assert_eq!(current_bytes(Space::Device, device + 1), 0);
+        assert_eq!(current_bytes(Space::Host, device), 0);
+    }
 
     #[test]
     fn native_failure_retains_owners_before_unwind() {

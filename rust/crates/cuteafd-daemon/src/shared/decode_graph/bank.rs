@@ -308,6 +308,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let Some(binding) = &mut self.device else { return };
         let victims: Vec<_> = {
             let cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if !cache.has_pending_victims() { return }
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
@@ -845,6 +846,25 @@ mod device_tests {
         bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
             assert_eq!(drops.get(), 1); Ok(ReleaseMeasurement { released: 0 })
         }).unwrap();
+    }
+
+    #[test]
+    fn persistent_eviction_without_victims_preserves_pending_capture() {
+        let mut bank = GraphBank::new(None);
+        bank.attach_device_for_test(-319, 1000, site()).unwrap();
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        bank.cache_commit(1, 42, ticket, 1, 1, false);
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        assert!(cache.lock().unwrap().needs_boundary());
+        assert!(!cache.lock().unwrap().has_pending_victims());
+        // SAFETY: integers own no captured allocations or queued native work.
+        unsafe { bank.cache_evict_persistent(); }
+        assert_eq!(bank.len(), 1);
+        assert!(cache.lock().unwrap().needs_boundary());
+        bank.cache_measured(10);
+        // SAFETY: the same allocation-free fixture remains live.
+        unsafe { bank.cache_evict_persistent(); }
+        assert_eq!(bank.cached_launch(&1), Some(&42));
     }
 
     #[test]

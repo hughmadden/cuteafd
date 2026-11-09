@@ -1814,6 +1814,51 @@ native_symbols! {
     cuteafd_xgrammar_compiler_create_json: XGrammarCompilerCreateFn,
 }
 
+/// Lifetime-pinned physical memory reader for cache policy owners without a library borrow.
+pub struct PhysicalMemoryQuery {
+    _module: Arc<Library>,
+    get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    set_device: unsafe extern "C" fn(i32) -> CuteafdStatus,
+    memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus,
+}
+
+impl PhysicalMemoryQuery {
+    pub fn sample(&self, device: i32) -> Result<(usize, usize)> {
+        fn checked(context: &str, status: CuteafdStatus) -> Result<()> {
+            if status == CUTEAFD_STATUS_OK { return Ok(()) }
+            Err(anyhow::Error::new(NativeStatusError { context: context.into(), status,
+                detail: "physical memory query failed".into() }))
+        }
+        let mut previous = -1;
+        // SAFETY: the module pins these function pointers and previous is writable.
+        checked("memory query get device", unsafe { (self.get_device)(&mut previous) })?;
+        // SAFETY: CUDA ordinals are validated by the runtime.
+        checked("memory query set device", unsafe { (self.set_device)(device) })?;
+        struct Restore<'a> { query: &'a PhysicalMemoryQuery, previous: i32, armed: bool }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                // SAFETY: query pins the setter and previous came from the runtime.
+                if self.armed {
+                    let status = unsafe { (self.query.set_device)(self.previous) };
+                    if status != CUTEAFD_STATUS_OK { tracing::error!(status, "restoring memory query device"); }
+                }
+            }
+        }
+        let mut restore = Restore { query: self, previous, armed: previous != device };
+        let (mut free, mut total) = (0, 0);
+        // SAFETY: the module pins the query; both outputs are writable.
+        let result = checked("physical memory query", unsafe { (self.memory_info)(&mut free, &mut total) });
+        if restore.armed {
+            // SAFETY: previous is the runtime's ordinal and the module remains pinned.
+            checked("memory query restore device", unsafe { (self.set_device)(previous) })?;
+            restore.armed = false;
+        }
+        result?;
+        anyhow::ensure!(free <= total && total > 0, "invalid CUDA memory information");
+        Ok((free, total))
+    }
+}
+
 pub struct NativeLibrary {
     artifact_root: std::path::PathBuf,
     loaded_path: std::path::PathBuf,
@@ -2315,7 +2360,7 @@ impl Drop for NativeLibrary {
         if let Ok(mut staging) = self.sync_h2d_staging.lock() {
             staging.release_with_library(self);
         }
-        // SAFETY: this is the sole normal-path owner of the module. Staging
+        // SAFETY: release this library's module pin exactly once. Staging
         // was released while its free function was still loaded; quarantine
         // deliberately bypasses both releases.
         unsafe { ManuallyDrop::drop(&mut self.lib) };
@@ -2446,6 +2491,14 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_free_host_buffer", status)?;
         memory_ledger::record_free(address);
         Ok(())
+    }
+
+    /// Pin the native module for a physical-memory observer without a library borrow.
+    pub fn physical_memory_query(&self) -> Result<PhysicalMemoryQuery> {
+        Ok(PhysicalMemoryQuery { _module: Arc::clone(&self.lib),
+            get_device: self.cuteafd_cuda_get_device()?,
+            set_device: self.cuteafd_cuda_set_device()?,
+            memory_info: self.cuteafd_cuda_memory_info()? })
     }
 
     /// Physical free and total bytes, including other processes and CUDA's

@@ -351,11 +351,15 @@ impl Fixture {
     }
 
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
+        self.configure_memory_usage(library, device, total, 0)
+    }
+
+    pub fn configure_memory_usage(&self, library: &NativeLibrary, device: i32, total: usize, used: usize) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32, usize, usize, usize)> =
                 library.lib.get(b"fixture_configure_memory")?;
-            configure(device, total, 0, 0);
+            configure(device, total, used, 0);
         }
         Ok(())
     }
@@ -436,6 +440,29 @@ impl Fixture {
 #[cfg(test)]
 mod device_free_tests {
     use super::*;
+
+    #[test]
+    fn physical_query_restores_device_and_outlives_library() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 4096)?;
+        fixture.configure_memory(&library, 1, 8192)?;
+        library.cuda_set_device(0)?;
+        let query = library.physical_memory_query()?;
+        assert_eq!(query.sample(1)?, (8192, 8192));
+        assert_eq!(library.cuda_get_device()?, 0);
+        fixture.configure_memory(&library, 1, 0)?;
+        assert!(query.sample(1).is_err());
+        assert_eq!(library.cuda_get_device()?, 0);
+        fixture.configure_memory(&library, 1, 8192)?;
+        fixture.configure_bind_after(&library, 1)?;
+        assert!(query.sample(1).is_err(), "failed device restoration cannot report success");
+        fixture.configure_bind_after(&library, -1)?;
+        library.cuda_set_device(0)?;
+        drop(library);
+        assert_eq!(query.sample(0)?, (4096, 4096));
+        Ok(())
+    }
 
     #[test]
     fn strict_device_free_records_mismatch_and_preserves_the_live_owner() -> Result<()> {
