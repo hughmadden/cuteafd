@@ -25,7 +25,7 @@ def test_frequency_and_low_parameter_pin_candidate():
     assert result["entries"] == [{"rows": 1, "table_width": 16, "pin": True},
                                  {"rows": 16, "table_width": 32, "pin": False}]
     assert result["reserve_base_bytes"] == 8 << 20
-    assert result["reserve_extra_bytes"] == 4 << 20
+    assert result["reserve_extra_bytes"] == 2 << 20
 
 
 def test_devices_are_not_added_and_repeated_snapshots_do_not_duplicate_shapes():

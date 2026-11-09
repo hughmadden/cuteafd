@@ -75,6 +75,17 @@ assert.equal(host.items.reduce((s,i)=>s+i.bytes,0),400);
 // New graph-pin fields remain intact, old builds need not supply them.
 const pins = m.normalize({graph_cache:[{device:3,top_hits:[{hit_histogram:{counts:[0,3],interval_ms:10000},permanent_bytes:123}]}]});
 assert.equal(pins.graphs[0].top_hits[0].permanent_bytes,123);
+assert.deepEqual(m.graphReservePolicy({reserve:123}), []);
+const policy={base_bytes:100,base_source:'family default',extra_bytes:50,effective_extra_bytes:20,
+  extra_source:'user override',cap_bytes:20,cap_source:'user override',charged_bytes:120,
+  charged_source:'family default with extra'};
+const policyRows=m.graphReservePolicy({reserve:120,reserve_policy:policy});
+assert.equal(policyRows.length,4);
+assert.ok(policyRows[0].includes('family default'));
+assert.ok(policyRows[1].includes('requested')&&policyRows[1].includes('effective'));
+assert.ok(policyRows[2].includes('user override'));
+assert.ok(policyRows[3].includes('family default with extra'));
+assert.ok(m.graphReservePolicy({reserve_policy:{...policy,cap_bytes:null}})[2].includes('Cap none'));
 assert.equal(m.ownerLabel('GLM process ordinary RSS steady: Estimated { derivation: "long" }'), 'GLM process ordinary RSS');
 assert.equal(m.ownerLabel('glm.decode: Spark intake transport envelope; long provenance'), 'glm.decode Spark intake');
 assert.equal(m.ownerLabel('graph reserve: glm.graphs.0'), 'graph reserve');

@@ -42,7 +42,7 @@ h1 { font-size:23px; } }
 <details><summary>Exact reservation owners</summary><div class="table-scroll"><table><caption>Named owners are counted once; physical budgets combine shared memory domains.</caption><thead><tr><th>Domain / owner</th><th>Category</th><th>Bytes</th></tr></thead><tbody id="owners"></tbody></table></div></details>
 </section>
 <section class="panel"><div class="section-head"><h2>Live usage</h2><span class="hint">One scale per metric; current value and limit are explicit</span></div><p class="hint">KV page occupancy is shared unless per-GPU counters are present. Cache marks may alias KV pages: do not add them. Reconciliation is a named stage sample, not live device accounting. Spark launch-relative values are diagnostic only (#1568).</p><div id="live" class="grid"></div></section>
-<section class="panel"><div class="section-head"><h2>Graph cache</h2><span class="hint">Counter rates since the preceding sample, not lifetime averages</span></div><div id="graphs"></div></section>
+<section class="panel"><div class="section-head"><h2>Graph cache</h2><span class="hint">Admitted base + bounded extra; arena is measured usage. Counter rates are sample deltas.</span></div><div id="graphs"></div></section>
 </main>
 <div id="tooltip" role="tooltip" hidden></div>
 <script src="/assets/cuteafd-ui.js"></script><script src="/assets/memory.js"></script>

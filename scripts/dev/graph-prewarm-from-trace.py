@@ -49,7 +49,6 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
     counts = {}
     arenas = []
     reserves = {}
-    largest = 0
     reasons = {}
     # Costs/heat use only the latest complete inventory per device.
     identities = {}
@@ -73,9 +72,6 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
         if device not in latest or snapshot_time >= latest[device][0]:
             latest[device] = (snapshot_time, trace)
 
-        for site, values in trace.get("sites", {}).items():
-            if site.startswith(prefix):
-                largest = max(largest, int(values["largest_bytes"]))
         device_counts = {}
         for graph in trace["graphs"]:
             if not graph["site"].startswith(prefix):
@@ -155,7 +151,8 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
                                    "basis": graphs[0].get("basis"),
                                    "cost_basis": "observed_inventory_lower_bound_unknown_total" if known else "unknown_legacy_trace"})
     base = packed(max(arenas))
-    extra = packed(largest)
+    # Runtime headroom is resolved by GPU_GRAPH_RESERVE_EXTRA, not the trace.
+    extra = CHUNK
     result = {"schema_version": 1, "family": family}
     if layout is not None:
         result["layout"] = layout
