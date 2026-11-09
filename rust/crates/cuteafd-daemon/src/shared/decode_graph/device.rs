@@ -194,6 +194,7 @@ pub(crate) struct DeviceCache {
     last_report: Instant,
     interval_evictions: u64,
     trace: Option<std::path::PathBuf>,
+    last_trace: Instant,
     trace_rows: HashMap<Identity, TraceRow>,
 }
 
@@ -206,7 +207,7 @@ impl DeviceCache {
             chain_only: true, unmeasured: false, pending_destroy: 0,
             counters: HashMap::new(), started: Instant::now(), last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
-            trace_rows: HashMap::new() }
+            last_trace: Instant::now() - Duration::from_secs(1), trace_rows: HashMap::new() }
     }
 
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
@@ -553,6 +554,10 @@ impl DeviceCache {
     pub fn boundary(&mut self) {
         self.report_due(self.last_report.elapsed());
         if let Some(path) = &self.trace {
+            // Trace mode counts every hit, but serializing thousands of keys
+            // on every token would perturb the concurrency being observed.
+            if self.last_trace.elapsed() < Duration::from_secs(1) { return; }
+            self.last_trace = Instant::now();
             // Each device has its own snapshot file, avoiding concurrent writers.
             let path = path.with_extension(format!("device-{}.json", self.device));
             let mut rows: Vec<_> = self.trace_rows.values().collect();

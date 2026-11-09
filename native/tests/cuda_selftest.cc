@@ -2638,11 +2638,14 @@ void test_cuda_graph_topology_chain_and_fork() {
     size_t nodes = 0, width = 0;
     int spans = -1;
     require_status(cuteafd_cuda_graph_end_capture_topology(lead, &exec, &nodes, &width, &spans), "topology end capture");
-    assert(nodes >= 2 && spans == 0);
-    assert(parallel ? width > 1 : width == 1);
+    if (nodes < 2 || spans != 0 || (parallel ? width <= 1 : width != 1)) {
+      std::cerr << "unexpected graph topology: parallel=" << parallel
+                << " nodes=" << nodes << " width=" << width << " spans=" << spans << "\n";
+      std::abort();
+    }
     require_status(cuteafd_cuda_graph_launch(exec, lead), "topology launch");
     require_cuda(cudaStreamSynchronize(lead), "topology complete");
-    require_status(cuteafd_cuda_graph_destroy(exec), "topology destroy");
+    require_status(cuteafd_cuda_graph_exec_destroy(exec), "topology destroy");
   }
   require_cuda(cudaEventDestroy(join), "topology join destroy");
   require_cuda(cudaEventDestroy(fork), "topology fork destroy");

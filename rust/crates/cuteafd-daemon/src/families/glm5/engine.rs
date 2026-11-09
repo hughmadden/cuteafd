@@ -623,6 +623,7 @@ pub(crate) struct GlmEngine<'a> {
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
     graph_before: RefCell<Option<Vec<u64>>>,
+    graph_basis: Cell<Option<crate::shared::decode_graph::device::Basis>>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::drafter::GlmDrafter<'a>>,
     /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
@@ -782,7 +783,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new(None)), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_before: RefCell::new(None), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -1596,16 +1597,19 @@ impl<'a> GlmEngine<'a> {
 
     fn graph_basis(&self) -> crate::shared::decode_graph::device::Basis {
         use crate::shared::decode_graph::device::Basis;
-        // #1612 rates cover this route only. One basis is selected for every
-        // bank on the device; local/TP2 must not mix node and byte units.
+        if let Some(basis) = self.graph_basis.get() { return basis; }
+        // #1612 rates cover this route only. Resolve once before serving;
+        // device-info probes must not appear on request misses.
         let sm120 = self.library.cuda_get_device().and_then(|device| self.library.cuda_device_info(device))
             .is_ok_and(|info| info.compute_capability_major == 12 && info.compute_capability_minor == 0);
-        if sm120 && self.ranks() == 1 && !self.has_local()
+        let basis = if sm120 && self.ranks() == 1 && !self.has_local()
             && matches!(self.cfg.variant, cuteafd_loader::families::glm5::GlmVariant::Glm)
             && self.weights.layers.iter().all(|layer| !layer.attention_native.is_empty()) {
             let rate = cuteafd_loader::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES[0];
             Basis::Nodes { node_rate: rate.bytes_per_node, graph_rate: rate.bytes_per_executable }
-        } else { Basis::Bytes }
+        } else { Basis::Bytes };
+        self.graph_basis.set(Some(basis));
+        basis
     }
 
     fn graph_estimate(&self, key: &GraphKey) -> Option<crate::shared::decode_graph::device::Estimate> {

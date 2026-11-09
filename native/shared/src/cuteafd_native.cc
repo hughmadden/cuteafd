@@ -1772,9 +1772,9 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
   size_t count = capture.node_count, edges = 0;
   std::vector<cudaGraphNode_t> nodes(count);
   cudaError_t err = cudaGraphGetNodes(graph, nodes.data(), &count);
-  if (err == cudaSuccess) err = cudaGraphGetEdges(graph, nullptr, nullptr, &edges);
+  if (err == cudaSuccess) err = cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edges);
   std::vector<cudaGraphNode_t> from(edges), to(edges);
-  if (err == cudaSuccess && edges) err = cudaGraphGetEdges(graph, from.data(), to.data(), &edges);
+  if (err == cudaSuccess && edges) err = cudaGraphGetEdges(graph, from.data(), to.data(), nullptr, &edges);
   if (err != cudaSuccess) {
     cleanup();
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "graph topology query failed", err);
