@@ -555,12 +555,12 @@ def test_summary_reads_c8_from_the_concurrency_sweep(entry, tmp_path):
     job = make(entry, tmp_path)
     report_dir = Path(job['state']) / 'reports' / 'one'
     report_dir.mkdir(parents=True)
-    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0},
+    card = {'decode': [{'content': 'code', 'tok_s': 48.0}], 'prefill': {'tok_s': 2700.0}, 'prefill_tail': {'tok_s': 2500.0},
             'concurrency': [{'width': 4, 'aggregate_tok_s': 70.0}, {'width': 8, 'aggregate_tok_s': 90.5},
                             {'width': 16, 'aggregate_tok_s': 114.0}]}
     (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
     row = cards.summarize_job(job, 0)
-    assert (row['C1'], row['C8'], row['8K']) == (48.0, 90.5, 2700.0)
+    assert (row['C1'], row['C8'], row['8K'], row['8K w/tail']) == (48.0, 90.5, 2700.0, 2500.0)
     card['concurrency'] = [{'width': 4, 'aggregate_tok_s': 70.0}]
     (report_dir / 'report.json').write_text(json.dumps({'baseline': {'card': card}}))
     assert cards.summarize_job(job, 0)['C8'] is None
@@ -1874,9 +1874,11 @@ def test_prefill_sweep_rows(entry, tmp_path):
     job = make(entry, tmp_path)
     sweep = Path(job['state']) / 'reports' / 'sweep-only' / job['entry']['name'] / 'sweep.json'
     sweep.parent.mkdir(parents=True)
-    sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8170, 'tok_s': 9000.0, 'ttft_s': 0.91}]}))
+    sweep.write_text(json.dumps({'points': [], 'prefill': [{'length': 8192, 'prompt_tokens': 8192, 'tok_s': 9000.0, 'ttft_s': 0.91},
+        {'length': 8296, 'label': '8K w/tail', 'prompt_tokens': 8296, 'tok_s': 8800.0, 'ttft_s': 0.94}]}))
     row = cards.summarize_job(job, 0)
     assert row['status'] == 'pass' and row['prefill 8192'] == 9000.0 and row['prefill 8192 TTFT s'] == 0.91
+    assert row['8K w/tail'] == 8800.0
 
 
 def test_build_scopes_are_per_card_zero_spark_and_family_counts():

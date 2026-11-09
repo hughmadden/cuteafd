@@ -92,6 +92,55 @@ mod tests {
     }
 
     #[test]
+    fn exact_prompt_queries_fake_nonlinear_count_endpoint() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use serde_json::{json, Value};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = done.clone();
+        let count = |text: &str| 17 + text.split_whitespace().map(|w| w.chars().count().div_ceil(3) as u64).sum::<u64>();
+        let server = std::thread::spawn(move || {
+            let mut requests = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1)); continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("POST /v1/messages/count_tokens "));
+                let mut length = 0;
+                loop {
+                    line.clear(); reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" { break; }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
+                let body: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["thinking"]["type"], "disabled");
+                let reply = json!({"input_tokens":count(body["messages"][0]["content"].as_str().unwrap())}).to_string();
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
+                requests += 1;
+            }
+            requests
+        });
+        let client = Client::new(&format!("http://{address}"), None, Default::default());
+        let result = prompt(&client, 99, 300, CARD_TOKENS, "Reply with the single word OK.");
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(server.join().unwrap() > 2);
+        assert_eq!(count(&result.unwrap()), CARD_TOKENS);
+    }
+
+    #[test]
     fn unreachable_length_and_endpoint_errors_fail_loudly() {
         assert!(exact_prefix(&"x".repeat(1000), 101, |s| Ok(s.len() as u64 * 2)).is_err());
         assert!(exact_prefix("abc", 1, |_| bail!("endpoint unavailable")).unwrap_err().to_string().contains("endpoint unavailable"));
