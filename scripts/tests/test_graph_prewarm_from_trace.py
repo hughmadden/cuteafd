@@ -1663,7 +1663,14 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
         graph(0, 1, 16, False, 10), graph(1, 1, 16, False, 0),
         graph(0, 4, 32, True, 100), graph(1, 4, 32, True, 50),
         graph(0, 64, 128, True, 0, 10 << 20)]}
-    result = MODULE.generate_qwen35([data], "h5120-l64-fp8-kvfp8-rtx1")
+    summary = {}
+    result = MODULE.generate_qwen35([data], "h5120-l64-fp8-kvfp8-rtx1", summary)
+    assert summary["zero_replay_identities"] == 1
+    assert summary["zero_replay_bytes"] == 10 << 20
+    assert summary["selected_zero_hit_siblings"] == 1
+    assert summary["selected_zero_hit_sibling_bytes"] == 1024
+    assert summary["always_zero_hit_segments"] == []
+    assert summary["zero_share_identities"] == 0
     layout = result["layouts"][0]
     assert layout["entries"] == [
         {"rows": 4, "table_stride": 32, "spec": True, "pin": False},

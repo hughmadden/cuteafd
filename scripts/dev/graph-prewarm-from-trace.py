@@ -1583,7 +1583,7 @@ DENSE_QWEN_GEOMETRY = re.compile(
     r"Key \{ segment: (\d+), rows: (\d+), table_stride: (\d+), spec: (true|false) \}")
 
 
-def generate_qwen35(traces, variant):
+def generate_qwen35(traces, variant, summary=None):
     """Every replayed complete-layer geometry, heat ordered, single RTX only."""
     if not variant or not variant.endswith("-rtx1"):
         raise ValueError("dense Qwen needs --variant ending in -rtx1")
@@ -1631,6 +1631,21 @@ def generate_qwen35(traces, variant):
                 if graph.get("capture_bytes") is not None and int(graph["capture_bytes"]) > 0]
     mean = math.ceil(sum(measured) / len(measured)) if measured else 0
     base = packed(sum(int(graph["capture_bytes"]) or mean for _, graph in selected))
+    if summary is not None:
+        lazy = [graph for key, graph in identities.values() if key not in counts]
+        siblings = [graph for _, graph in selected if not int(graph.get("hits", 0))]
+        zero_share = [graph for _, graph in selected if not int(graph["capture_bytes"])]
+        segments = {int(DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+                    for _, graph in selected}
+        replayed_segments = {int(DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+                             for _, graph in selected if int(graph.get("hits", 0)) > 0}
+        summary.update(
+            zero_replay_identities=len(lazy),
+            zero_replay_bytes=sum(int(graph.get("capture_bytes") or 0) for graph in lazy),
+            selected_zero_hit_siblings=len(siblings),
+            selected_zero_hit_sibling_bytes=sum(int(graph["capture_bytes"]) or mean for graph in siblings),
+            zero_share_identities=len(zero_share), zero_share_bytes=len(zero_share) * mean,
+            always_zero_hit_segments=sorted(segments - replayed_segments))
     keys = sorted(counts, key=lambda key: (key not in pins, -counts[key], key))
     return {"schema_version": 1, "family": "qwen3_5", "layouts": [{
         "variant": variant, "traced": True, "reserve_base_bytes": base,
@@ -1690,7 +1705,7 @@ def main():
         parser.error("exactly one of --output or --merge is required")
     try:
         if args.family == "qwen3_5":
-            result = generate_qwen35([json.loads(Path(path).read_text()) for path in args.trace], args.variant)
+            result = generate_qwen35([json.loads(Path(path).read_text()) for path in args.trace], args.variant, summary)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,
@@ -1749,6 +1764,8 @@ def main():
             print("pin " + json.dumps(pin, sort_keys=True))
         return
     if args.family in ("mimo_v2", "qwen3_5"):
+        if args.family == "qwen3_5":
+            print("selection " + json.dumps(summary, sort_keys=True))
         for layout in result["layouts"]:
             print(f"{len(layout['entries'])} shapes; ranks={layout.get('ranks', 1)} "
                   f"base={layout['reserve_base_bytes']} extra={layout['reserve_extra_bytes']} bytes; "
