@@ -622,11 +622,16 @@ impl ResolvedPlan {
     pub fn served_context(&self) -> u64 { self.request.context.served(self.pool_tokens) }
 
     pub fn items(&self, location: Location) -> Result<Vec<Item>, Refusal> {
+        self.items_at(location, Phase::Ready)
+    }
+
+    /// Project admitted owners at a completed phase, including lazy serving growth.
+    pub fn items_at(&self, location: Location, phase: Phase) -> Result<Vec<Item>, Refusal> {
         let mut groups = BTreeMap::new();
         for allocation in &self.facts.allocations {
             if allocation.location != location
                 || allocation.view.is_some()
-                || !allocation.lifetime.contains(Phase::Ready, self.facts.phase_order)
+                || !allocation.lifetime.contains(phase, self.facts.phase_order)
             {
                 continue;
             }
@@ -644,14 +649,14 @@ impl ResolvedPlan {
         items.extend(self.facts.allowances.iter().filter(|allowance|
             allowance.location == location
                 && allowance.bytes != 0
-                && allowance.lifetime.contains(Phase::Ready, self.facts.phase_order))
+                && allowance.lifetime.contains(phase, self.facts.phase_order))
             .map(|allowance| Item::new(Category::Runtime, &allowance.source, "", allowance.bytes,
                 if allowance.assumed { Basis::Estimated } else { Basis::Calibrated })));
         items.extend(self.facts.driver_page_tables.iter().filter(|mapping|
-            mapping.location == location && mapping.lifetime.contains(Phase::Ready, self.facts.phase_order))
+            mapping.location == location && mapping.lifetime.contains(phase, self.facts.phase_order))
             .map(|mapping| Item::new(Category::Runtime, DRIVER_PAGE_TABLES_GROUP, mapping.source(), mapping.bytes(), Basis::Calibrated)));
         for owner in self.facts.allocation_granularity.iter().filter(|owner|
-            owner.location == location && owner.lifetime.contains(Phase::Ready, self.facts.phase_order)) {
+            owner.location == location && owner.lifetime.contains(phase, self.facts.phase_order)) {
             // Arena tails inherit the root's kind. Legacy request groups keep
             // their aggregate forecast: small requests share driver blocks.
             let category = if let [backing] = owner.backings.as_slice() {

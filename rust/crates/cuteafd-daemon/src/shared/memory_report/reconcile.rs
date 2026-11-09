@@ -12,9 +12,27 @@ fn workers() -> &'static Mutex<BTreeMap<u32, Value>> {
     WORKERS.get_or_init(Default::default)
 }
 
+fn spark_owners(report: &cuteafd_core::ModelAdmissionResponse)
+    -> cuteafd_core::memory_policy::DeviceBreakdown {
+    // These values passed SparkAssignment::validate. Device/pinned detail rows
+    // describe these same owners: only extra host backings are additive on UMA.
+    let workspace = report.runtime.workspace_bytes
+        .saturating_add(report.runtime.pinned_workspace_bytes)
+        .saturating_add(report.mapped_ring_bytes)
+        .saturating_add(report.host_exchange_bytes)
+        .saturating_add(report.row_indices_bytes)
+        .saturating_add(report.runtime.detail.allocations.iter()
+            .filter(|owner| owner.space == "host").map(|owner| owner.bytes).sum::<u64>());
+    cuteafd_core::memory_policy::DeviceBreakdown { device: format!("spark{}", report.rank),
+        cap_bytes: report.runtime.sample.total_bytes, weights_bytes: report.resident_bytes,
+        workspace_bytes: workspace, reserve: vec![], reserve_overridden: false,
+        kv_bytes: 0, other_bytes: 0 }
+}
+
 pub(crate) fn spark_ready(report: &cuteafd_core::ModelAdmissionResponse) {
     workers().lock().unwrap_or_else(|e| e.into_inner()).insert(report.rank,
-        json!({"admission_sample": report.runtime.sample,
+        json!({"admission_sample": report.runtime.sample, "owners": spark_owners(report),
+            "owner_ledger": report,
             "physical_sample": report.runtime.detail.memory_reconciliation}));
 }
 
@@ -77,8 +95,19 @@ pub(crate) fn capture(stage: &str) {
                 value["physical_sample"]["cuda_used_bytes"].as_u64())).flatten();
             let reason = if stage != "ready" { Some("post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own CUDA sample") }
                 else if measured.is_none() { Some("worker omitted optional physical sample during rolling update") } else { None };
-            let mut record = row(id, measured, &owners, None, json!({"coordinator": provenance,
-                "worker": worker.and_then(|value| value.get("physical_sample"))}), reason);
+            let worker_owners = worker.and_then(|value| value.get("owners"))
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            let mut record = row(id, measured, worker_owners.as_ref().unwrap_or(&owners), None,
+                json!({"coordinator": provenance,
+                    "worker": worker.and_then(|value| value.get("physical_sample")),
+                    "owner_ledger": worker.and_then(|value| value.get("owner_ledger"))}), reason);
+            record["charge_basis"] = "reconciled worker resident/workspace and UMA host owners; device/pinned detail aliases not added twice; CUDA global occupancy is not an owner".into();
+            if worker_owners.is_none() {
+                for field in ["charged_bytes", "delta_vs_admitted", "delta_vs_measured", "beyond_half_padding"] {
+                    record[field] = Value::Null;
+                }
+                record["owner_unavailable_reason"] = "no reconciled worker owner ledger".into();
+            }
             record["rank"] = rank.into();
             // This is the admission-time sample, never labelled post-request.
             record["admission_sample"] = worker.map(|value| value["admission_sample"].clone()).unwrap_or(Value::Null);
@@ -93,6 +122,30 @@ pub(crate) fn capture(stage: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spark_reconciled_owners_include_uma_backings_without_detail_aliases() {
+        use cuteafd_core::{ModelAdmissionResponse, RuntimeSample, SparkRuntimeInventory};
+        use cuteafd_core::expert_geometry::{SparkAllocationTerm, SparkRuntimeDetail};
+        let term = |space: &str, bytes| SparkAllocationTerm { space: space.into(), scope: "test".into(),
+            tensor: None, format: None, bytes, allocations: 1, method: "fixture".into() };
+        let report = ModelAdmissionResponse { rank: 2, resident_bytes: 100, slices: vec![],
+            runtime: SparkRuntimeInventory { sample: RuntimeSample { device: 0,
+                total_bytes: 1000, free_bytes: 500, context_bytes: 123, module_bytes: 0,
+                sms: 48, arch: "sm_121".into(), driver: "test".into() },
+                workspace_bytes: 20, pinned_workspace_bytes: 3,
+                detail: SparkRuntimeDetail { allocations: vec![term("device", 120), term("pinned", 3),
+                    term("host", 7)], ..Default::default() } },
+            mapped_ring_bytes: 11, host_exchange_bytes: 13, row_indices_bytes: 17 };
+        let owners = spark_owners(&report);
+        assert_eq!(owners.device, "spark2");
+        assert_eq!(owners.weights_bytes, 100);
+        assert_eq!(owners.workspace_bytes, 71);
+        assert!(owners.reserve.is_empty()); // The raw/global residual is not a named owner.
+        let sample = row("spark2", Some(170), &owners, None, json!({}), None);
+        assert_eq!(sample["charged_bytes"], 171);
+        assert_eq!(sample["delta_vs_measured"], -1);
+    }
+
     #[test]
     fn signed_delta_keeps_release_padding_separate_and_preserves_missing_samples() {
         let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(), cap_bytes: 1000,

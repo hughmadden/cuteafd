@@ -979,6 +979,38 @@ fn ready_items_include_opaque_attribution_but_not_startup_peaks_or_views() {
 }
 
 #[test]
+fn growth_items_include_lazy_workspace_staging_allowances_and_derived_owners_once() {
+    let location = Location::coordinator(0);
+    let growth = Lifetime { first: Phase::Growth, last: Phase::Growth };
+    let mut workspace = allocation("prefill", 100);
+    workspace.category = Category::Workspace;
+    workspace.lifetime = growth;
+    let mut staging = allocation("staging", 200);
+    staging.category = Category::Staging;
+    staging.lifetime = growth;
+    let mut alias = allocation("alias", 50);
+    alias.lifetime = growth;
+    alias.view = Some(View { backing: workspace.id.clone(), offset: 0 });
+    let mut startup = allocation("startup", 300);
+    startup.lifetime = Lifetime { first: Phase::Load, last: Phase::Warmup };
+    let mut p = plan(vec![workspace, staging, alias, startup]);
+    p.facts.allowances.push(Allowance { location, bytes: 17, lifetime: growth,
+        source: "lazy modules".into(), assumed: false });
+    p.facts.driver_page_tables.push(DriverPageTable { model: DriverPageTableModel::Sm120Portable,
+        location, lifetime: growth, backing: "staging".into(), mapped_bytes: 200 });
+    let tail = granular_owner("prefill-tail", "prefill", vec![100], growth);
+    let expected = 300 + 17 + tail.bytes().unwrap() + driver_page_table_bytes(200);
+    p.facts.allocation_granularity.push(tail);
+    assert!(p.items(location).unwrap().is_empty());
+    let items = p.items_at(location, Phase::Growth).unwrap();
+    assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), expected);
+    assert_eq!(items.iter().filter(|item| item.category == Category::Workspace)
+        .map(|item| item.bytes).sum::<u64>(), 100);
+    assert_eq!(items.iter().filter(|item| item.category == Category::Staging)
+        .map(|item| item.bytes).sum::<u64>(), 200);
+}
+
+#[test]
 fn capacity_refusal_names_binding_budget_phase_and_exact_bytes() {
     let refusal = Refusal::Capacity { budget: "coordinator GPU 0".into(),
         phase: Phase::Warmup, required: 1025, available: 1024, owners: vec![] };
