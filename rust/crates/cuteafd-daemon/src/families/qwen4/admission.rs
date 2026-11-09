@@ -1178,7 +1178,7 @@ mod tests {
             for sparks in [0, 1, 4] {
                 for mtp in [false, true] {
                     let mut args = Cli::parse_from(["test", "--snapshot", ".", "--native-lib", "native.so"]).engine;
-                    args.prefill_rows = 8192;
+                    args.prefill_rows = if sparks > 0 { 2752 } else { 4096 };
                     args.prefill_waves = if sparks > 0 { 3 } else { 1 };
                     args.local_experts = sparks == 0;
                     args.peers = (sparks > 0).then(|| (0..sparks).map(|rank| format!("host{rank}:9000")).collect::<Vec<_>>().join(","));
