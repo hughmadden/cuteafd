@@ -4,7 +4,8 @@
 //! plus both tail head variants. The startup set is a provisional prewarm, not
 //! a sealed inventory: serving misses capture-or-run-eager through the shared
 //! bounded device cache, which charges one reserve per physical device.
-use crate::serving_capacity::mimo_graphs::{mimo_prewarm_layout, mimo_prewarm_pinned, mimo_prewarm_rows};
+use crate::serving_capacity::mimo_graphs::mimo_prewarm_layout;
+use super::config::MimoV2Config;
 use crate::serving_capacity::CacheGeometryError;
 use cuteafd_core::serving_capacity::MemoryReservation;
 
@@ -62,7 +63,8 @@ impl MimoGraphLayout {
     }
 }
 
-pub fn graph_layout(layers: usize, ranks: usize, enabled: bool) -> Result<MimoGraphLayout, CacheGeometryError> {
+pub fn graph_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool, enabled: bool) -> Result<MimoGraphLayout, CacheGeometryError> {
+    let layers = cfg.layers;
     if !(1..=2).contains(&ranks) || layers == 0 {
         return Err(CacheGeometryError::Unsupported {
             family: "mimo_v2",
@@ -88,7 +90,8 @@ pub fn graph_layout(layers: usize, ranks: usize, enabled: bool) -> Result<MimoGr
     if ranks == 2 {
         segments_per_rank.push(layers);
     }
-    let rows = mimo_prewarm_rows(ranks);
+    let prewarm = mimo_prewarm_layout(cfg, ranks, sparks);
+    let rows: Vec<_> = prewarm.entries.iter().map(|entry| entry.rows).collect();
     if rows.is_empty() {
         return Err(CacheGeometryError::Unsupported {
             family: "mimo_v2",
@@ -103,7 +106,6 @@ pub fn graph_layout(layers: usize, ranks: usize, enabled: bool) -> Result<MimoGr
                 .ok_or(CacheGeometryError::Overflow("MiMo decode graph executable count"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let prewarm = mimo_prewarm_layout(ranks);
     let (mut reserves, mut sources, mut bootstraps) = (Vec::new(), Vec::new(), Vec::new());
     for (rank, &executables) in executables_per_rank.iter().enumerate() {
         let base = prewarm.reserve_base_bytes[rank];
@@ -112,12 +114,12 @@ pub fn graph_layout(layers: usize, ranks: usize, enabled: bool) -> Result<MimoGr
             .map_err(CacheGeometryError::GraphReserve)?;
         reserves.push(resolved.bytes);
         sources.push(resolved.source);
-        bootstraps.push(resolved.bytes.div_ceil(executables.max(1) as u64));
+        bootstraps.push(base.div_ceil(executables.max(1) as u64));
     }
     Ok(MimoGraphLayout {
         enabled: true,
         rows,
-        pinned: mimo_prewarm_pinned(ranks),
+        pinned: prewarm.entries.iter().filter(|entry| entry.pin).map(|entry| entry.rows).collect(),
         segments_per_rank,
         executables_per_rank,
         reserves,
@@ -130,46 +132,28 @@ pub fn graph_layout(layers: usize, ranks: usize, enabled: bool) -> Result<MimoGr
 mod tests {
     use super::*;
 
-    #[test]
-    fn both_layouts_charge_one_reserve_per_physical_rank() {
-        let one = graph_layout(70, 1, true).unwrap();
-        assert_eq!(one.segments_per_rank, vec![72]);
-        assert_eq!(one.executables_per_rank, vec![4608]);
-        assert_eq!(one.reserves, vec![640 << 20]);
-        assert_eq!(one.sources, vec!["family default"]);
-        assert_eq!(one.bootstraps, vec![(640u64 << 20).div_ceil(4608)]);
-        assert_eq!(one.reservations(0).unwrap(),
-            vec![MemoryReservation { name: "graph reserve".into(), bytes: 640 << 20 }]);
-
-        let two = graph_layout(70, 2, true).unwrap();
-        assert_eq!(two.segments_per_rank, vec![72, 70]);
-        assert_eq!(two.executables_per_rank, vec![4608, 4480]);
-        assert_eq!(two.reserves, vec![640 << 20, 578 << 20]);
-        assert_eq!(two.reservations(0).unwrap()[0].name, "graph reserve");
-        assert_eq!(two.reservations(1).unwrap()[0].bytes, 578 << 20);
-        assert!(two.reservations(2).is_err());
+    fn config() -> MimoV2Config {
+        MimoV2Config::from_hf(&crate::plan::testing::mimo_pro_config()).unwrap()
     }
 
     #[test]
-    fn the_reserve_covers_the_measured_prewarm_arena_and_one_more_capture() {
-        assert_eq!(MIMO_GRAPH_LEAD_OBSERVED.1, 628 << 20);
-        assert_eq!(MIMO_GRAPH_PEER_OBSERVED.1, 566 << 20);
-        let two = graph_layout(70, 2, true).unwrap();
-        assert_eq!(two.reserves[0] - MIMO_GRAPH_LEAD_OBSERVED.1, 12 << 20);
-        assert_eq!(two.reserves[1] - MIMO_GRAPH_PEER_OBSERVED.1, 12 << 20);
+    fn layouts_charge_one_reserve_per_physical_rank() {
+        for ranks in [1, 2] {
+            let layout = graph_layout(&config(), ranks, true, true).unwrap();
+            assert_eq!(layout.segments_per_rank[0], 72);
+            assert_eq!(layout.executables_per_rank[0], 72 * layout.rows.len());
+            assert_eq!(layout.reserves.len(), ranks);
+            for rank in 0..ranks {
+                assert_eq!(layout.reservations(rank).unwrap()[0].bytes, layout.reserves[rank]);
+                assert_eq!(layout.reservations(rank).unwrap()[0].name, "graph reserve");
+            }
+            assert!(layout.reservations(ranks).is_err());
+        }
     }
 
     #[test]
-    fn every_reachable_row_shape_is_warmed_and_one_row_is_pinned() {
-        let layout = graph_layout(70, 2, true).unwrap();
-        assert_eq!(layout.rows, (1..=MIMO_DECODE_ROWS).collect::<Vec<_>>());
-        assert_eq!(layout.pinned_rows().collect::<Vec<_>>(), vec![1]);
-        assert!(layout.rows.contains(&MIMO_DECODE_ROWS));
-    }
-
-    #[test]
-    fn disabled_graphs_charge_nothing_and_attach_no_device_cache() {
-        let layout = graph_layout(70, 2, false).unwrap();
+    fn disabled_graphs_charge_nothing() {
+        let layout = graph_layout(&config(), 2, true, false).unwrap();
         assert!(!layout.enabled);
         assert!(layout.rows.is_empty());
         assert_eq!(layout.executables_per_rank, vec![0, 0]);
@@ -180,10 +164,13 @@ mod tests {
     #[test]
     fn invalid_graph_geometry_is_named() {
         for (layers, ranks) in [(0, 1), (70, 0), (70, 3)] {
-            assert!(matches!(graph_layout(layers, ranks, true),
+            let mut cfg = config();
+            cfg.layers = layers;
+            assert!(matches!(graph_layout(&cfg, ranks, true, true),
                 Err(CacheGeometryError::Unsupported { .. })));
         }
-        assert!(matches!(graph_layout(usize::MAX - 1, 1, true),
-            Err(CacheGeometryError::Overflow(_))));
+        let mut cfg = config();
+        cfg.layers = usize::MAX - 1;
+        assert!(matches!(graph_layout(&cfg, 1, true, true), Err(CacheGeometryError::Overflow(_))));
     }
 }

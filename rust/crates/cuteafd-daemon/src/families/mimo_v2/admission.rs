@@ -324,8 +324,9 @@ fn preflight_shape(
     // One bounded graph reserve per physical device, selected by the resolved
     // layout and charged once, before KV sizing.
     let graph_layout = cuteafd_loader::families::mimo_v2::decode_graph::graph_layout(
-        cfg.layers,
+        cfg,
         ranks,
+        backend == ExpertBackend::Spark,
         args.decode_graphs
             && layers == cfg.layers
             && (routed_layers == 0 || backend != ExpertBackend::None),
