@@ -536,7 +536,7 @@ fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, req
     // the family publishes no reconciliation provenance.
     if requests > 0 {
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }
 }
 

@@ -246,7 +246,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
     // forward-compatible as new knobs land.
-    let mut stats = serde_json::json!({
+    let stats = serde_json::json!({
         "host_cache": prefixes.host_metrics(),
         "host_cache_config": prefixes.host_config(),
         // The engine's prefix counters: hits by kind, hit tokens, host promotions (host-tier

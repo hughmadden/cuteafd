@@ -907,7 +907,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     // records what the first served request added (lazy graphs, wider workspaces).
     if requests > 0 {
         static FIRST: std::sync::Once = std::sync::Once::new();
-        FIRST.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
+        crate::shared::probe::first_request(&FIRST, requests, || crate::shared::memory_report::reconcile::capture("first_request"));
     }
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
