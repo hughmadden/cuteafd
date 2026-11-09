@@ -98,7 +98,7 @@ pub struct GlmOwnedSegment {
     pub phase: GlmOwnedPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GlmGraphShape {
     pub rows: usize,
     pub table_width: usize,
@@ -128,6 +128,39 @@ pub fn glm_graph_shapes(context: usize, pool_pages: usize) -> Vec<GlmGraphShape>
     glm_decode_table_widths(context, pool_pages).into_iter().flat_map(|table_width| {
         glm_decode_row_buckets(table_width).iter().map(move |&rows| GlmGraphShape { rows, table_width })
     }).collect()
+}
+
+/// Checked-in trace-derived startup work. A shape warms every segment sharing
+/// its stable row/table geometry; pinning is explicit, not inferred from order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmPrewarmEntry {
+    #[serde(flatten)]
+    pub shape: GlmGraphShape,
+    pub pin: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmPrewarmList {
+    pub schema_version: u32,
+    pub family: String,
+    pub reserve_base_bytes: u64,
+    pub reserve_extra_bytes: u64,
+    pub entries: Vec<GlmPrewarmEntry>,
+}
+
+pub fn glm_prewarm_list() -> GlmPrewarmList {
+    let list: GlmPrewarmList = serde_json::from_str(include_str!("glm_prewarm.json"))
+        .expect("checked-in GLM prewarm list");
+    assert_eq!(list.schema_version, 1);
+    assert_eq!(list.family, "glm5");
+    list
+}
+
+pub fn glm_prewarm_shapes(context: usize, pool_pages: usize) -> Vec<GlmPrewarmEntry> {
+    let allowed = glm_graph_shapes(context, pool_pages);
+    glm_prewarm_list().entries.into_iter().filter(|entry| allowed.contains(&entry.shape)).collect()
 }
 
 #[cfg(test)]

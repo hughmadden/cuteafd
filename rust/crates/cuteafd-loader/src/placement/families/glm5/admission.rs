@@ -1772,8 +1772,9 @@ impl StartupGraphs {
     }
 
     pub fn reserves(&self) -> Result<Vec<u64>, Refusal> {
-        self.ranks.iter().enumerate().map(|(rank, graph)| crate::placement::graph_reserve::current(
-            rank, false, graph.bytes, crate::placement::graph_reserve::GLM_EXTRA)
+        let (base, extra) = crate::placement::graph_reserve::glm_default();
+        self.ranks.iter().enumerate().map(|(rank, _)| crate::placement::graph_reserve::current(
+            rank, false, base, extra)
             .map(|reserve| reserve.bytes).map_err(Refusal::InvalidFact)).collect()
     }
 

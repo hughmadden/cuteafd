@@ -1529,26 +1529,17 @@ impl<'a> GlmEngine<'a> {
         -> Result<Vec<StartupGraphCapture>> {
         use cuteafd_loader::placement::inventory::GraphMemorySample;
         let started = std::time::Instant::now();
-        use cuteafd_loader::placement::attention::AttentionPlacement;
-        use cuteafd_loader::serving_capacity::glm_graphs::{glm_declared_graphs, glm_graph_shapes, GlmGraphLayer};
+        use cuteafd_loader::serving_capacity::glm_graphs::glm_prewarm_shapes;
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "GLM startup graph inventory already captured");
-        let attention = if self.layers_kv() { AttentionPlacement::Layers }
-            else if self.context_kv() { AttentionPlacement::Context } else { AttentionPlacement::Heads };
-        let layers: Vec<_> = self.weights.layers.iter().enumerate().map(|(index, layer)| GlmGraphLayer {
-            dense: layer.dense, local: self.local_layer(index), attention_owner: layer.attention_owner }).collect();
-        let return_ranks = if self.skip.is_some() { SKIP_RANKS }
-            else if let Some((link, _)) = experts.as_mut() { link.exchange()?.ranks() } else { 0 };
-        let shapes = glm_graph_shapes(self.max_context, self.pages);
-        let declared = glm_declared_graphs(&shapes, attention, self.ranks(), &layers, return_ranks)
-            .map_err(anyhow::Error::msg)?;
+        let shapes = glm_prewarm_shapes(self.max_context, self.pages);
         // Eager pass: each shape's first module, workspace and BLAS touch lands
         // outside executable residency, before the before-sample.
         let mut run = |warming: bool| -> Result<()> {
             self.graphs_warming.set(warming);
             for shape in &shapes {
-                let (width, bucket) = (shape.table_width, shape.rows);
+                let (width, bucket) = (shape.shape.table_width, shape.shape.rows);
                 let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(),
                     page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
                     lengths: Vec::new(), exchange_rows: 1 };
@@ -1564,7 +1555,6 @@ impl<'a> GlmEngine<'a> {
         self.graphs_warming.set(false);
         captured?;
         // Prewarm is best effort within the reserve, not a sealed inventory.
-        let _ = declared;
         let after = self.graph_memory_samples()?;
         self.graphs_warmed.set(true);
         let captures = (0..self.ranks()).map(|rank| {
@@ -2257,7 +2247,9 @@ impl<'a> GlmEngine<'a> {
             return self.on(rank, || unsafe { self.library.cuda_graph_launch(graph.0, stream) });
         }
         if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
-        let pinned = key.rows == 1 && key.table_width == 16;
+        static PREWARM: std::sync::OnceLock<cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmList> = std::sync::OnceLock::new();
+        let pinned = PREWARM.get_or_init(cuteafd_loader::serving_capacity::glm_graphs::glm_prewarm_list).entries.iter()
+            .any(|entry| entry.pin && entry.shape.rows == key.rows && entry.shape.table_width == key.table_width);
         let ticket = graphs.borrow_mut().cache_miss(&key, pinned, self.graph_estimate(&key));
         let crate::shared::decode_graph::device::Miss::Capture(ticket) = ticket else { return segment() };
         if self.graph_before.borrow().is_none() {

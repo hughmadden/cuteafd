@@ -534,7 +534,11 @@ impl DeviceCache {
             let mut rows: Vec<_> = self.trace_rows.values().collect();
             rows.sort_by(|a, b| (a.identity.site, a.identity.bank, &a.identity.shape)
                 .cmp(&(b.identity.site, b.identity.bank, &b.identity.shape)));
-            let result = serde_json::to_vec(&rows).map_err(std::io::Error::other)
+            let document = serde_json::json!({"schema_version": 1, "cache": self.snapshot(), "graphs": rows,
+                "sites": self.classes.iter().map(|(name, class)| (*name, serde_json::json!({
+                    "samples": class.samples, "total_bytes": class.total, "largest_bytes": class.largest
+                }))).collect::<HashMap<_, _>>()});
+            let result = serde_json::to_vec(&document).map_err(std::io::Error::other)
                 .and_then(|bytes| std::fs::write(&path, bytes));
             if let Err(error) = result { tracing::warn!(%error, path = %path.display(), "graph trace write failed"); }
         }
@@ -641,6 +645,51 @@ mod tests {
         assert_eq!(cache.pools.node_high_water, 1024);
         assert_eq!(cache.pools.exec_high_water, 8);
         assert_eq!(cache.charged, 6 << 20);
+    }
+
+    #[test]
+    fn canceled_tickets_never_prove_pool_reuse() {
+        let mut cache = DeviceCache::new(-208, 20);
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        assert_eq!(cache.pools.node_high_water, 0);
+        cache.cancel_capture(id);
+        assert!(cache.needs_boundary());
+        cache.measured_capture(10); // Failed instantiate may retain driver pages.
+        assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (0, 0));
+        assert_eq!(cache.pools.live_nodes, 0);
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+    }
+
+    #[test]
+    fn device_basis_and_coefficients_cannot_mix() {
+        let mut cache = DeviceCache::new(-209, 64 << 20);
+        let estimate = Some(Estimate { bytes: 1000, nodes: Some(10), node_rate: 2560,
+            graph_rate: 65536, parallel_width: 1 });
+        assert!(matches!(cache.miss(key(1), site(Preference::Capture), estimate.clone(), false), Miss::Eager));
+        cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
+        let mut nodes = site(Preference::Capture);
+        nodes.basis = cache.basis;
+        assert!(matches!(cache.miss(key(2), nodes, None, false), Miss::Eager));
+        assert!(matches!(cache.miss(key(3), nodes, estimate, false), Miss::Capture(_)));
+        assert_eq!(cache.pools.node_high_water, 0);
+        cache.measured_capture(4 << 20);
+        assert_eq!(cache.pools.node_high_water, 10);
+    }
+
+    #[test]
+    fn pending_node_pool_growth_is_reserved_once_per_chunk() {
+        let mut cache = DeviceCache::new(-210, 5 << 20);
+        cache.basis = Basis::Nodes { node_rate: 2560, graph_rate: 65536 };
+        let mut nodes = site(Preference::Capture);
+        nodes.basis = cache.basis;
+        for n in 0..10 {
+            let estimate = Some(Estimate { bytes: 68096, nodes: Some(1), node_rate: 2560,
+                graph_rate: 65536, parallel_width: 1 });
+            assert!(matches!(cache.miss(key(n), nodes, estimate, false), Miss::Capture(_)));
+        }
+        assert_eq!(cache.pending_growth, 4 << 20);
+        cache.measured_capture(4 << 20);
+        assert_eq!((cache.pools.node_high_water, cache.pools.exec_high_water), (10, 10));
     }
 
     #[test]

@@ -3,8 +3,12 @@ use cuteafd_core::memory_policy::Size;
 
 /// Per-rank measured startup base plus an enforced lazy-shape policy budget.
 pub const GLM_EXTRA: u64 = 64 << 20;
+pub fn glm_default() -> (u64, u64) {
+    let list = crate::serving_capacity::glm_graphs::glm_prewarm_list();
+    (list.reserve_base_bytes, list.reserve_extra_bytes)
+}
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
-pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") }
+pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolved { pub bytes: u64, pub source: &'static str }
