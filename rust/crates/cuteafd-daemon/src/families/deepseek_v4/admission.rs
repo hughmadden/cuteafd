@@ -63,6 +63,28 @@ mod spark_tests {
     }
 
     #[test]
+    fn provenance_names_the_admitted_layout_and_graph_arena() {
+        let sample = cuteafd_loader::placement::RuntimeSample { device: 0, total_bytes: 96 << 30,
+            free_bytes: 80 << 30, context_bytes: 0, module_bytes: 0, sms: 188,
+            arch: "sm_120".into(), driver: "test".into() };
+        let provenance = super::Provenance { layout: "snapshot/x; context/1048576".into(),
+            native_sha256: "native".into(), programs_sha256: "programs".into(), gpus: vec![sample],
+            spark_world: 2, onboard_layers: vec![vec![0, 1]], prefill: cuteafd_loader::placement::planner::PrefillShape {
+                rows: 2752, waves: 3 }, graph_reserves: vec![1 << 20, 2 << 20], graph_bootstraps: vec![1 << 19, 1 << 19] };
+        let value = provenance.value();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["family"], "deepseek_v4");
+        assert_eq!(value["devices"][0]["arch"], "sm_120");
+        assert_eq!(value["onboard_layers"][0], serde_json::json!([0, 1]));
+        assert_eq!(value["graph_reserve_bytes"], serde_json::json!([1 << 20, 2 << 20]));
+        assert_eq!(value["graph_bootstrap_bytes"], serde_json::json!([1 << 19, 1 << 19]));
+        provenance.register();
+        let registered = cuteafd_ffi::memory_ledger::fault::inputs();
+        assert_eq!(registered["memory_reconciliation_provenance"]["layout"], "snapshot/x; context/1048576");
+        assert_eq!(registered["memory_reconciliation_provenance"]["programs_sha256"], "programs");
+    }
+
+    #[test]
     fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for (decode_rows, compiled) in [(16, 16), (64, 80), (80, 80)] {
@@ -119,11 +141,19 @@ pub(crate) struct GraphCache {
     pub bootstraps: Vec<u64>,
 }
 
+/// One admission: what was placed, what it charged, and the decisions
+/// `/v1/stats` reconciliation cites.
+pub(crate) struct Admission {
+    pub placement: cuteafd_loader::placement::Placement,
+    pub host_prefix: cuteafd_loader::placement::planner::serving::HostPrefixOwners,
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
+    pub graphs: GraphCache,
+    pub decisions: cuteafd_loader::placement::planner::Decisions,
+}
+
 /// Admit one placement from these inputs: one solve over every device and
 /// host owner, before any allocation.
-pub(crate) fn admit(inputs: &v4::V4Inputs)
-    -> Result<(cuteafd_loader::placement::Placement, cuteafd_loader::placement::planner::serving::HostPrefixOwners,
-        Option<cuteafd_core::expert_usage::Geometry>, GraphCache)> {
+pub(crate) fn admit(inputs: &v4::V4Inputs) -> Result<Admission> {
     let prepared = v4::prepare(inputs).map_err(anyhow::Error::msg)?;
     let prefix = prepared.prefix().owners;
     let expert_usage = prepared.expert_usage().cloned();
@@ -134,8 +164,44 @@ pub(crate) fn admit(inputs: &v4::V4Inputs)
     tracing::info!(solve_us = admitted.solve_us, admissions = 1,
         "V4 admission prepare + solve/execution (excludes checkpoint inventory)");
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
-    Ok((admitted.placement, prefix, expert_usage,
-        GraphCache { reserves: admitted.graph_reserves, bootstraps: admitted.graph_bootstraps }))
+    Ok(Admission { placement: admitted.placement, host_prefix: prefix, expert_usage,
+        graphs: GraphCache { reserves: admitted.graph_reserves, bootstraps: admitted.graph_bootstraps },
+        decisions: admitted.solved.decisions })
+}
+
+/// The admitted layout identity `/v1/stats` Ready and first_request memory
+/// reconciliation rows cite. Pure data, so the CPU half can test it.
+pub(crate) struct Provenance {
+    pub layout: String,
+    pub native_sha256: String,
+    pub programs_sha256: String,
+    pub gpus: Vec<cuteafd_loader::placement::RuntimeSample>,
+    pub spark_world: usize,
+    pub onboard_layers: Vec<Vec<usize>>,
+    pub prefill: cuteafd_loader::placement::planner::PrefillShape,
+    pub graph_reserves: Vec<u64>,
+    pub graph_bootstraps: Vec<u64>,
+}
+
+impl Provenance {
+    pub fn value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1, "family": "deepseek_v4",
+            "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+            "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": self.native_sha256, "programs_sha256": self.programs_sha256,
+            "layout": self.layout, "devices": &self.gpus, "spark_world": self.spark_world,
+            "onboard_layers": &self.onboard_layers, "prefill": self.prefill,
+            "graph_basis": "per-site byte estimates; no calibrated node rates for this family",
+            "graph_reserve_bytes": &self.graph_reserves, "graph_bootstrap_bytes": &self.graph_bootstraps
+        })
+    }
+
+    /// Register with the memory ledger so every reconciliation row names it.
+    pub fn register(&self) {
+        cuteafd_ffi::memory_ledger::fault::set_inputs(
+            serde_json::json!({ "memory_reconciliation_provenance": self.value() }));
+    }
 }
 
 /// The family facts serve-dsv4 admits: the same inputs `plan --layout` builds.

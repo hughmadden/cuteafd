@@ -547,8 +547,30 @@ pub(crate) fn with_engine<T>(
             host_memory: cuteafd_loader::formats::mapped_preload::host_memory()? };
         let facts = admission::inputs(args, &inputs)?;
         // One solve over every device and host owner, before the first allocation.
-        let (placement, host_prefix, expert_usage, graphs) = admission::admit(&facts)
+        let admitted = admission::admit(&facts)
             .map_err(|error| anyhow::anyhow!("DeepSeek V4 admission: {error}"))?;
+        {
+            use sha2::{Digest, Sha256};
+            let hash = |path: &std::path::Path| -> Result<String> {
+                let mut file = std::fs::File::open(path)?;
+                let mut digest = Sha256::new();
+                std::io::copy(&mut file, &mut digest)?;
+                Ok(format!("{:x}", digest.finalize()))
+            };
+            let layout = format!("snapshot/{}; dspark/{}/tp2={}; attention/{}; context/{}; sequences/{}; \
+                pool/{}; onboard/{:?}; device/{}{}; host-prefix/{}; replies/{:?}; graph-sparks/{}",
+                loaded.snapshot.display(), args.dspark, args.tp2_dspark_experts, args.attention_placement,
+                max_context, args.max_sequences, args.pool_tokens, args.rtx_expert_layers, args.device,
+                split_device.map(|device| format!("/{device}")).unwrap_or_default(),
+                admitted.host_prefix.quota_bytes, cuteafd_core::spark_reply::requested(), peers.len());
+            admission::Provenance { layout, native_sha256: hash(&args.native_lib)?,
+                programs_sha256: hash(&args.manifest)?, gpus: inventory.gpus.clone(), spark_world: peers.len(),
+                onboard_layers: admitted.decisions.onboard_layers.clone(), prefill: admitted.decisions.prefill,
+                graph_reserves: admitted.graphs.reserves.clone(),
+                graph_bootstraps: admitted.graphs.bootstraps.clone() }.register();
+        }
+        let (placement, host_prefix, expert_usage, graphs) = (admitted.placement, admitted.host_prefix,
+            admitted.expert_usage, admitted.graphs);
         check_modes(&placement, split_device.is_some(), &loaded.cfg)?;
         if !skip {
             use cuteafd_loader::placement::{ExpertHome, SparkWorkingSet};
