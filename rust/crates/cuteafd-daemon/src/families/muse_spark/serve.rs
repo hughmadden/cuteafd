@@ -273,7 +273,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
                 "native_sha256": hash(library.loaded_path())?, "programs_sha256": hash(&args.manifest)?,
                 "layout": format!("snapshot/{}; draft/{:?}; ranks/{}; sparks/{}; C{}; pool/{}",
                     args.snapshot.display(), args.draft, gpus, args.peers.len(), args.max_sequences, placement.pool_tokens),
-                "devices": device_ids, "spark_world": args.peers.len(),
+                "devices": inventory.gpus, "spark_world": args.peers.len(),
                 "onboard_layers": built.solved.decisions.onboard_layers,
                 "prefill": built.solved.decisions.prefill,
                 "graph_basis": { "basis": "bytes", "enabled": args.decode_graphs, "reserve_policy": policies }

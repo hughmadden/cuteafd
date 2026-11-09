@@ -88,6 +88,20 @@ mod tests {
     }
 
     #[test]
+    fn measured_min_inventory_prices_only_its_own_rows_and_pins() {
+        let list = layout(1, 2).expect("measured 1 RTX/onboard 2 inventory");
+        assert_eq!(list.entries.len(), 55);
+        assert_eq!(list.entries.iter().filter(|entry| entry.pin).map(|entry| entry.rows)
+            .collect::<Vec<_>>(), [56]);
+        assert_eq!(list.reserve_base_bytes, [1_056_964_608]);
+        let sum = list.entries.iter().map(|entry| entry.capture_bytes[0]).sum::<u64>();
+        assert_eq!(sum.next_multiple_of(2 << 20), list.reserve_base_bytes[0]);
+        assert_eq!(selected(list, &list.reserve_base_bytes).len(), list.entries.len());
+        assert!(list.entries.iter().any(|entry| entry.rows == 1));
+        assert!(layout(2, 2).is_none(), "untraced TP2 cannot inherit min inventory");
+    }
+
+    #[test]
     fn smaller_base_fits_pins_as_a_set_then_a_heat_ordered_prefix() {
         let list = Layout { ranks: 1, onboard_layers: 2, provenance: "fixture".into(),
             reserve_base_bytes: vec![8 << 20], reserve_extra_bytes: vec![2 << 20],

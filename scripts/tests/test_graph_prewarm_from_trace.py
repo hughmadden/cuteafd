@@ -1934,6 +1934,20 @@ def test_muse_latest_snapshot_and_physical_rank_costs_are_not_borrowed():
         MODULE.generate_muse([missing], 1, 2)
 
 
+def test_muse_measured_min_inventory_prices_its_selected_rows():
+    checked = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/muse_prewarm.json").read_text())
+    assert {(row["ranks"], row["onboard_layers"]) for row in checked["layouts"]} == {(1, 2)}
+    layout = checked["layouts"][0]
+    assert len(layout["entries"]) == 55
+    assert [entry["rows"] for entry in layout["entries"] if entry["pin"]] == [56]
+    assert len({entry["rows"] for entry in layout["entries"]}) == 55
+    assert 1 in {entry["rows"] for entry in layout["entries"]}
+    assert layout["reserve_base_bytes"] == [1056964608]
+    assert layout["reserve_extra_bytes"] == [2 << 20]
+    assert MODULE.packed(sum(entry["capture_bytes"][0] for entry in layout["entries"])) == 1056964608
+
+
 def test_muse_synthetic_trace_regeneration_is_byte_stable():
     expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n"
     assert json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n" == expected
