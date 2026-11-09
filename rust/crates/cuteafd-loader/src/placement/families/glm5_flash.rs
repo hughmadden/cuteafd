@@ -750,9 +750,11 @@ pub(crate) mod tests {
                 input.sequences.min(input.decode_rows) as usize, input.speculation, input.layers,
                 ranks, input.decode_rows as usize, 188, input.spark_ranks > 0);
             assert_eq!(admitted.graphs.reserves, expected.reserves);
-            // One owner per device: the pinned arena plus its capture headroom.
-            let whole: Vec<u64> = expected.reserves.iter()
-                .map(|base| base + expected.extra).collect();
+            // One owner per device: the traced base plus its allocation tail, then the
+            // shared runtime capture headroom on top (500 MB capped at that base).
+            let whole: Vec<u64> = expected.reserves.iter().enumerate()
+                .map(|(gpu, &base)| crate::placement::graph_reserve::resolve_with_extra(
+                    None, None, None, gpu, false, base, expected.extra).unwrap().bytes).collect();
             assert_eq!(admitted.graphs.charged, whole, "no override in the gate");
             assert_eq!(admitted.graphs.executables, expected.executables);
             assert_eq!(admitted.graphs.bootstraps, expected.bootstraps);

@@ -439,9 +439,8 @@ pub struct GlmfGraphs {
 
 impl GlmfGraphs {
     /// The measured prewarm arena the reserve is sized from, per device.
-    pub fn prewarm_bytes(&self) -> Vec<u64> {
-        self.charged.iter().map(|charged| charged.saturating_sub(self.extra)).collect()
-    }
+    /// Headroom and the allocation tail sit on top of it in `charged`.
+    pub fn prewarm_bytes(&self) -> &[u64] { &self.reserves }
 }
 
 /// A launch's reserve at `context` and `pool_tokens`, from the checked-in list
