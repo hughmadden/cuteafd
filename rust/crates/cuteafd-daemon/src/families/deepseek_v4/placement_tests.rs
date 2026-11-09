@@ -217,8 +217,19 @@ fn assert_equal(shared: &Shared, case: &Case<'_>, label: &str) -> Placement {
     assert_eq!(layout.pool_tokens, runtime.pool_tokens, "{label}: pool");
     for (gpu, items) in runtime.items.iter().enumerate() {
         let device = &layout.devices[gpu];
+        let sampled_source = cuteafd_loader::placement::sampled_baseline::source("V4 context and selected modules");
+        let sampled = items.iter().filter(|item| item.group == sampled_source).collect::<Vec<_>>();
+        assert_eq!(sampled.len(), 1, "{label}: rtx{gpu} has one measured context owner");
+        let context = device.items.iter().filter(|item| item.group == "context+modules")
+            .map(|item| item.bytes).sum::<u64>();
+        assert_eq!(sampled[0].bytes, context, "{label}: rtx{gpu} sampled context matches plan");
+        assert_eq!(sampled[0].category, Category::Runtime);
+        assert_eq!(sampled[0].basis, cuteafd_core::memory_layout::Basis::Calibrated);
         for item in items {
-            assert!(device.items.contains(item), "{label}: rtx{gpu} lacks {item:?}");
+            // A physical sample is an opaque allowance, not the plan's context estimate.
+            if item.group != sampled_source {
+                assert!(device.items.contains(item), "{label}: rtx{gpu} lacks {item:?}");
+            }
         }
         let budget = if gpu == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget };
         // No headroom floor: the cap less the V4 family reserve (0 by default).
