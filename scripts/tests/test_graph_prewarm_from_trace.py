@@ -733,17 +733,42 @@ def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
     trace = v4_trace(0, 5 << 20)
     trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
                             "shape": v4_shape(64, 0, "local-experts"), "count": 90,
-                            "key_id": (64, 0), "cycles": {"decode": 90},
-                            "capture_bytes": 2 << 20})
+                            "key_id": (64, 0), "hits": 89, "cycles": {"decode": 90},
+                            "capture_bytes": 2 << 20,
+                            "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                                              "counts": [18, 18, 18, 18, 18, 0]}})
     entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list())
     entries = {(row["rows"], row["table_width"]): row["pin"]
                for row in entry["layouts"]["rtx1-local"]["entries"]}
-    # Every observed width-0 row class is a startup row, at every row count.
+    # A width-0 row the trace replayed is a startup row, at every row count.
     assert entries[(4, 0)] is True
     assert entries[(64, 0)] is True
     # A regular verify geometry is prewarmed unpinned; a rare one stays lazy.
     assert entries[(16, 512)] is False
     assert (1, 16) not in entries
+
+
+def test_v4_startup_row_captured_once_is_not_warmed_or_pinned():
+    # One miss and zero hits is a capture with no replay: warming it would
+    # charge the startup arena for a graph the workload never reuses, and
+    # pinning it would make that one-off permanent (TJ, 2026-11-09).
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+                            "shape": v4_shape(50, 0, "local-experts"), "count": 18,
+                            "key_id": (50, 0), "hits": 0, "misses": 18,
+                            "cycles": {"verify": 18}, "capture_bytes": 3 << 20,
+                            "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                                              "counts": [0, 0, 0, 0, 0, 0]}})
+    heat = []
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list(),
+                            heat_report=heat)["layouts"]["rtx1-local"]
+    entries = {(row["rows"], row["table_width"]): row["pin"] for row in entry["entries"]}
+    assert (50, 0) not in entries
+    # It is a rare leftover, not startup residency, and stays lazy.
+    classes = {row["heat"]: row for row in heat}
+    assert classes["rare"]["keys"] == 2  # the one-use verify geometry and this row
+    assert classes["rare"]["selected"] is False
+    assert entry["reserve_base_bytes"] == [4 << 20]
 
 
 def test_v4_shape_needs_one_trace_per_rank():

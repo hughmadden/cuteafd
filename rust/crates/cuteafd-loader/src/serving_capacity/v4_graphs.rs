@@ -169,19 +169,20 @@ pub fn v4_bootstraps(gpus: usize, sparks: bool) -> Result<Vec<u64>, String> {
 /// The startup prewarm set for this shape: entries whose `table_width` is 0
 /// are the local-expert row classes the engine captures before serving, best
 /// effort within the reserve. A width above 0 is a recurring verify geometry the
-/// startup warm captures on a synthetic placement at that C4 class; a rare one
-/// the trace saw once, or inside a single panel, is left lazy.
+/// startup warm captures on a synthetic placement at that C4 class. A geometry
+/// the trace never replayed - captured once, or used only inside a single panel
+/// such as the 32K context pass - is left lazy, at width 0 as anywhere else.
 pub fn v4_prewarm(gpus: usize, sparks: bool) -> Result<Vec<V4PrewarmEntry>, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).entries)
 }
 
 /// The pinned geometries this shape keeps resident, as `(rows, table_width)`:
 /// a graph the trace shows as always hot is captured pinned, so churn elsewhere
-/// cannot evict it. V4's startup set is the width-0 row classes; a verify
-/// geometry is pinned only where its own trace showed sustained heat. Only
-/// trace-derived entries may pin: a shape without a trace has no entries, so
-/// it warms nothing and pins nothing, and every graph it captures lives in the
-/// shared ARC like any other family's.
+/// cannot evict it. V4's startup set is the replayed width-0 row classes; a
+/// verify geometry is pinned only where its own trace showed sustained heat.
+/// Only trace-derived entries may pin: a shape without a trace has no entries,
+/// so it warms nothing and pins nothing, and every graph it captures lives in
+/// the shared ARC like any other family's.
 pub fn v4_pinned(gpus: usize, sparks: bool) -> Result<Vec<(usize, usize)>, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).entries.into_iter()
         .filter(|entry| entry.pin)
@@ -258,13 +259,13 @@ mod tests {
         let one = &list.layouts["rtx1-spark"];
         assert!(one.traced);
         // The warmed set's own arena on the min card: 53 verify geometries and
-        // 51 width-0 row classes, plus its allocation tail.
-        assert_eq!(one.reserve_base_bytes, [671_088_640]);
+        // 50 replayed width-0 row classes, plus its allocation tail.
+        assert_eq!(one.reserve_base_bytes, [668_991_488]);
         assert_eq!(one.reserve_extra_bytes, [2 << 20]);
         assert_eq!(one.bootstrap_bytes, [2 << 20]);
         let spark = &list.layouts["rtx2-spark"];
         assert!(spark.traced);
-        assert_eq!(spark.reserve_base_bytes, [966_787_072, 968_884_224]);
+        assert_eq!(spark.reserve_base_bytes, [952_107_008, 952_107_008]);
         let local = &list.layouts["rtx2-local"];
         assert!(local.traced);
         assert_eq!(local.reserve_base_bytes, [912_261_120, 922_746_880]);
@@ -278,10 +279,11 @@ mod tests {
     fn every_traced_shape_covers_its_working_set_at_reachable_rows() {
         for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
             let entries = v4_prewarm(gpus, sparks).unwrap();
-            // Every width-0 row class the trace observed is the boot-warmed
-            // startup set, captured before serving, so it is pinned.
+            // Every width-0 row class the trace replayed is the boot-warmed
+            // startup set, captured before serving, so it is pinned. A row
+            // captured once and never replayed is not.
             let startup: Vec<_> = entries.iter().filter(|entry| entry.table_width == 0).collect();
-            assert!(startup.len() >= 50);
+            assert!(startup.len() >= 48);
             assert!(startup.iter().all(|entry| entry.pin));
             assert!(startup.iter().any(|entry| entry.rows == 1));
             assert!(startup.iter().any(|entry| entry.rows == 64));

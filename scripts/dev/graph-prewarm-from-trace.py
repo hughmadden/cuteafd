@@ -48,12 +48,14 @@ the emitted prewarm set's own measured captures (the trace's whole charged
 arena also holds lazy captures, which the shared reserve-extra policy covers),
 `reserve_extra_bytes` is the arena's 2 MiB allocation tail (the shared capture
 headroom is separate), and `bootstrap_bytes` is the largest measured capture
-unless the trace has none. Every geometry the trace observed becomes an entry unless it is rare - used
-once, or only inside one sampling interval, such as one panel or the 32K
-context pass - which stays lazy under the shared capture headroom; a sustained
-geometry is pinned, a regular one prewarmed unpinned, and the heat report
-prints each class's keys and arena bytes. The engine warms the entries its pool
-can express and skips the rest.
+unless the trace has none. Every verify geometry the trace observed becomes an entry unless it is rare -
+used once, or only inside one sampling interval, such as one panel or the 32K
+context pass - which stays lazy under the shared capture headroom. A width-0
+startup row follows a stricter test: it is warmed and pinned only when the
+trace replayed it, so a row captured once and never looked up again stays
+lazy. A sustained geometry is pinned, a regular one prewarmed unpinned, and
+the heat report prints each class's keys and arena bytes. The engine warms the
+entries its pool can express and skips the rest.
 """
 import argparse
 import json
@@ -98,7 +100,7 @@ def sustained(graph):
 
 
 # Hottest class wins when ranks disagree, because one prewarm set is shared.
-HEAT_ORDER = {"rare": 0, "regular": 1, "sustained": 2}
+HEAT_ORDER = {"rare": 0, "regular": 1, "sustained": 2, "startup": 3}
 
 
 def heat(graph):
@@ -230,10 +232,15 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
             continue
-        # Width-0 rows are the startup set whatever their heat, and the hottest
-        # rank decides a shared entry's class.
-        observed = "startup" if key[1] == 0 else heat(graph)
-        if key not in classes or observed == "startup" or HEAT_ORDER[observed] > HEAT_ORDER[classes[key]]:
+        # A width-0 row is a startup row once the trace proves a replay; a
+        # capture with no later hit stays an ordinary lazy graph. Interval
+        # concentration is a verify-geometry test: a short panel still proves a
+        # decode row is reachable at that layout. The hottest rank decides a
+        # shared entry's class.
+        observed = heat(graph)
+        if key[1] == 0:
+            observed = "startup" if int(graph.get("hits", 0)) > 0 else "rare"
+        if key not in classes or HEAT_ORDER[observed] > HEAT_ORDER[classes[key]]:
             classes[key] = observed
         why = reasons.setdefault(key, set())
         histogram = graph.get("hit_histogram", {})
@@ -242,14 +249,15 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
             why.add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             why.add("repeated_recapture")
-    # Startup residency is for heat the trace proves. Width-0 rows are the
-    # local-expert/TP2 startup set the engine captures before serving, so
-    # they are pinned whatever their heat; a sustained verify geometry is
-    # pinned, a regular one is prewarmed unpinned, and a rare one - captured
-    # once, or used only inside one sampling interval such as the 32K
-    # context pass - stays lazy under the shared capture headroom. A
-    # thrashing key is kept even when rare, because the trace shows the
-    # churn rather than a single use.
+    # Startup residency is for heat the trace proves. A sustained verify
+    # geometry is pinned, a regular one is prewarmed unpinned, and a rare
+    # one - captured once, or used only inside one sampling interval such
+    # as the 32K context pass - stays lazy under the shared capture
+    # headroom. A width-0 startup row is kept when the trace replayed it,
+    # and pinned because the engine captures the startup set before
+    # serving; one captured once and never replayed is neither warmed nor
+    # pinned. A thrashing key is kept even when rare, because the trace
+    # shows the churn rather than a single use.
     selected = {key for key in counts
                 if classes.get(key, "rare") != "rare" or reasons.get(key)}
     for key in selected:

@@ -5,7 +5,7 @@
     "rtx1-spark": {
       "traced": true,
       "reserve_base_bytes": [
-        671088640
+        668991488
       ],
       "reserve_extra_bytes": [
         2097152
@@ -251,11 +251,6 @@
         },
         {
           "rows": 48,
-          "table_width": 0,
-          "pin": true
-        },
-        {
-          "rows": 50,
           "table_width": 0,
           "pin": true
         },
@@ -552,8 +547,8 @@
     "rtx2-spark": {
       "traced": true,
       "reserve_base_bytes": [
-        966787072,
-        968884224
+        952107008,
+        952107008
       ],
       "reserve_extra_bytes": [
         2097152,
@@ -770,11 +765,6 @@
           "pin": true
         },
         {
-          "rows": 43,
-          "table_width": 0,
-          "pin": true
-        },
-        {
           "rows": 44,
           "table_width": 0,
           "pin": true
@@ -796,11 +786,6 @@
         },
         {
           "rows": 48,
-          "table_width": 0,
-          "pin": true
-        },
-        {
-          "rows": 54,
           "table_width": 0,
           "pin": true
         },
