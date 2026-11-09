@@ -220,7 +220,7 @@ pub fn glm_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
 /// high-water (the larger device under the context placement); `reserve_extra`
 /// is its largest measured boundary capture, one 2 MiB chunk. Neither trace
 /// evicted or recaptured a graph, so the only pin is the C1 decode geometry
-/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm.json`.
+/// (rows 1, width 16) that the qualified run pinned, as in `glm_prewarm_1.json`.
 pub fn ml4_prewarm_list(ranks: usize) -> &'static GlmPrewarmList {
     static ONE: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     static TWO: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();

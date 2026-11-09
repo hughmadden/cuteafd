@@ -1665,7 +1665,7 @@ def main():
     parser.add_argument("--family", required=True,
                         choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5")))
     parser.add_argument("--layout",
-                        help="coordinator layout the trace was recorded on (mistral_large4), "
+                        help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
     parser.add_argument("--list", type=Path,
                         help="deepseek_v4 only: checked-in prewarm list the layout is replaced in")
@@ -1706,7 +1706,7 @@ def main():
             parser.error(f"{args.family} keys its list by layout: pass --layout 1 or 2")
         layout = int(layout)
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41 and kimi_k3 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
