@@ -1882,9 +1882,13 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// The resolved graph layout this launch serves under: its coordinator
-    /// device count, and whether Sparks are attached.
+    /// device count, and whether Spark ranks serve its routed experts. The
+    /// second coordinator GPU under a head split is not a Spark attachment:
+    /// a 2-RTX launch with local TP2 experts (Sparks idle) and one with Spark
+    /// experts are different layouts, and a 1-RTX launch with Sparks is not
+    /// `1`.
     fn graph_layout(&self) -> GlmfLayout {
-        GlmfLayout::resolved(self.ranks(), self.peer.is_some())
+        GlmfLayout::resolved(self.ranks(), matches!(self.experts, Some(Experts::Spark { .. })))
     }
 
     /// Whether this launch's layout's checked-in prewarm list pins this shape:
