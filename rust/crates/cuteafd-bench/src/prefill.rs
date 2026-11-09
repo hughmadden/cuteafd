@@ -28,30 +28,54 @@ pub fn validate(requested: u64, actual: u64) -> Result<()> {
     Ok(())
 }
 
-/// Keep one nonce throughout sizing; only truncate the seeded corpus, at UTF-8
-/// character boundaries. No inference, cache retention or timed work happens here.
+const CORPUS_VARIANTS: u64 = 16;
+
+/// Keep one nonce throughout sizing. If a tokenizer skips the target at every
+/// nearby character boundary, try another deterministic offset in the same bank.
+/// No inference, cache retention or timed work happens here.
 pub fn prompt(client: &Client, seed: u64, estimate: usize, target: u64, instruction: &str) -> Result<String> {
     let prefix = format!("[{}] {instruction}\n\n", crate::text::nonce());
-    let count = |text: &str| client.count_chat_tokens(&crate::baseline::plain(client, text, 1));
-    let mut reference_tokens = estimate.max(64);
-    for _ in 0..20 {
-        let corpus = crate::text::corpus(seed, reference_tokens);
-        let whole = format!("{prefix}{corpus}");
-        let n = count(&whole)?;
-        if n == target { return Ok(whole); }
-        if n > target {
-            return exact_prefix(&corpus, target, |body| count(&format!("{prefix}{body}")))
-                .map(|body| format!("{prefix}{body}"));
+    sized_prompt(&prefix, seed, estimate, target,
+        |text| client.count_chat_tokens(&crate::baseline::plain(client, text, 1)))
+}
+
+fn sized_prompt(prefix: &str, seed: u64, estimate: usize, target: u64,
+    mut count: impl FnMut(&str) -> Result<u64>) -> Result<String> {
+    for variant in 0..CORPUS_VARIANTS {
+        let mut reference_tokens = estimate.max(64);
+        // Three seeds rotate back to the same corpus kind, with a new offset.
+        let variant_seed = seed.wrapping_add(variant * 3);
+        for _ in 0..20 {
+            let corpus = crate::text::corpus(variant_seed, reference_tokens);
+            let whole = format!("{prefix}{corpus}");
+            let n = count(&whole)?;
+            if n == target { return Ok(whole); }
+            if n > target {
+                if let Some(body) = exact_prefix(&corpus, target, |body| count(&format!("{prefix}{body}")))? {
+                    return Ok(format!("{prefix}{body}"));
+                }
+                break;
+            }
+            reference_tokens = reference_tokens.checked_mul(2).context("prefill corpus size overflow")?;
         }
-        reference_tokens = reference_tokens.checked_mul(2).context("prefill corpus size overflow")?;
     }
-    bail!("could not bracket exact {target}-token prefill prompt")
+    bail!("no exact {target}-token prefill found after {CORPUS_VARIANTS} deterministic corpus variants; refusing an approximate prefill")
+}
+
+/// Size both requests before any inference, so an optional diagnostic can be
+/// skipped without partially warming or timing it.
+pub fn prompts(client: &Client, seeds: (u64, u64), estimate: usize, target: u64,
+    max_context: u64, instruction: &str) -> Result<(String, String)> {
+    ensure!(target <= max_context.saturating_sub(64),
+        "exact {target}-token prefill exceeds max context {max_context} with output headroom");
+    Ok((prompt(client, seeds.0, estimate, target, instruction)?,
+        prompt(client, seeds.1, estimate, target, instruction)?))
 }
 
 /// Token counts are not strictly monotone at character boundaries (a new
 /// character can merge earlier tokens). Bisect for proximity, then inspect a
 /// bounded local neighborhood rather than assuming a monotone tokenizer.
-fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u64>) -> Result<String> {
+fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u64>) -> Result<Option<String>> {
     let offsets: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
     let mut seen = std::collections::BTreeMap::new();
     let (mut lo, mut hi) = (0, offsets.len() - 1);
@@ -59,7 +83,7 @@ fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u
         let mid = lo + (hi - lo) / 2;
         let n = count(&text[..offsets[mid]])?;
         seen.insert(mid, n);
-        if n == target { return Ok(text[..offsets[mid]].to_string()); }
+        if n == target { return Ok(Some(text[..offsets[mid]].to_string())); }
         if n < target { lo = mid + 1; }
         else if mid == 0 { break; }
         else { hi = mid - 1; }
@@ -67,9 +91,9 @@ fn exact_prefix(text: &str, target: u64, mut count: impl FnMut(&str) -> Result<u
     let center = lo.min(offsets.len() - 1);
     for index in center.saturating_sub(128)..=(center + 128).min(offsets.len() - 1) {
         let n = match seen.get(&index) { Some(n) => *n, None => count(&text[..offsets[index]])? };
-        if n == target { return Ok(text[..offsets[index]].to_string()); }
+        if n == target { return Ok(Some(text[..offsets[index]].to_string())); }
     }
-    bail!("no exact {target}-token corpus prefix found near the tokenizer boundary; refusing an approximate prefill")
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -85,7 +109,7 @@ mod tests {
                 - u64::from(s.ends_with("tokenization")))
         };
         for target in [20, 127, 511, 819] {
-            let prompt = exact_prefix(&text, target, count).unwrap();
+            let prompt = exact_prefix(&text, target, count).unwrap().unwrap();
             assert_eq!(count(&prompt).unwrap(), target);
             assert!(text.starts_with(&prompt));
         }
@@ -93,6 +117,20 @@ mod tests {
 
     #[test]
     fn exact_prompt_queries_fake_nonlinear_count_endpoint() {
+        fake_count_endpoint(false, false);
+    }
+
+    #[test]
+    fn exact_prompt_switches_corpus_after_a_tokenizer_gap() {
+        fake_count_endpoint(true, false);
+    }
+
+    #[test]
+    fn exact_prompt_fails_after_all_variants_miss() {
+        fake_count_endpoint(true, true);
+    }
+
+    fn fake_count_endpoint(gap: bool, all_miss: bool) {
         use std::io::{BufRead, BufReader, Read, Write};
         use serde_json::{json, Value};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -100,9 +138,20 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop = done.clone();
-        let count = |text: &str| 17 + text.split_whitespace().map(|w| w.chars().count().div_ceil(3) as u64).sum::<u64>();
+        let original = crate::text::corpus(99, 64);
+        let original_start = original.chars().take(32).collect::<String>();
+        let count = move |text: &str| {
+            let n = 17 + text.split_whitespace().map(|w| w.chars().count().div_ceil(3) as u64).sum::<u64>();
+            let body = text.split_once("\n\n").unwrap().1;
+            if gap && (all_miss || body.is_empty() || original_start.starts_with(body) || body.starts_with(&original_start)) {
+                // Every original-corpus prefix jumps from target - 1 to target + 1.
+                if n >= CARD_TOKENS { n + 1 } else { n }
+            } else { n }
+        };
+        let expected = count.clone();
         let server = std::thread::spawn(move || {
             let mut requests = 0;
+            let mut prefix = None;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 let (mut socket, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -127,7 +176,10 @@ mod tests {
                 let mut bytes = vec![0; length]; reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(body["thinking"]["type"], "disabled");
-                let reply = json!({"input_tokens":count(body["messages"][0]["content"].as_str().unwrap())}).to_string();
+                let text = body["messages"][0]["content"].as_str().unwrap();
+                let nonce_prefix = text.split_once("\n\n").unwrap().0;
+                assert_eq!(prefix.get_or_insert_with(|| nonce_prefix.to_string()), nonce_prefix);
+                let reply = json!({"input_tokens":count(text)}).to_string();
                 write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).unwrap();
                 requests += 1;
             }
@@ -137,12 +189,21 @@ mod tests {
         let result = prompt(&client, 99, 300, CARD_TOKENS, "Reply with the single word OK.");
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(server.join().unwrap() > 2);
-        assert_eq!(count(&result.unwrap()), CARD_TOKENS);
+        if all_miss {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("8192-token") && error.contains("16 deterministic corpus variants"), "{error}");
+        } else {
+            let text = result.unwrap();
+            assert_eq!(expected(&text), CARD_TOKENS);
+            if gap {
+                assert!(!original.starts_with(text.split_once("\n\n").unwrap().1));
+            }
+        }
     }
 
     #[test]
     fn unreachable_length_and_endpoint_errors_fail_loudly() {
-        assert!(exact_prefix(&"x".repeat(1000), 101, |s| Ok(s.len() as u64 * 2)).is_err());
+        assert!(exact_prefix(&"x".repeat(1000), 101, |s| Ok(s.len() as u64 * 2)).unwrap().is_none());
         assert!(exact_prefix("abc", 1, |_| bail!("endpoint unavailable")).unwrap_err().to_string().contains("endpoint unavailable"));
     }
 

@@ -600,6 +600,9 @@ pub struct BasicCard {
     /// Development-only 3 execution units + 40 rows; never rendered on cards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_tail: Option<PrefillRate>,
+    /// Diagnostic points that could not be sized; never represented as a rate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_prefill: Vec<SkippedPrefill>,
     /// Server tokens per reference token from the corpus warm-up fit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_token_ratio: Option<f64>,
@@ -609,6 +612,13 @@ pub struct BasicCard {
     /// The serving capacity the numbers were measured under.
     #[serde(default)]
     pub capacity: Option<Capacity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SkippedPrefill {
+    pub label: String,
+    pub requested_tokens: u64,
+    pub reason: String,
 }
 
 /// KV pool, request and context limits, host prefix cache.
