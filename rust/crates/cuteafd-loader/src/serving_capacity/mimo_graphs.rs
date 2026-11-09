@@ -19,6 +19,9 @@ pub struct MimoLayoutPrewarm {
     pub sparks: bool,
     pub reserve_base_bytes: Vec<u64>,
     pub reserve_extra_bytes: Vec<u64>,
+    /// Per-rank measured row shares, in entry order; absent for bootstrap keys.
+    #[serde(default)]
+    pub entry_capture_bytes: Vec<Vec<u64>>,
     pub entries: Vec<MimoPrewarmEntry>,
 }
 
@@ -47,6 +50,8 @@ pub fn mimo_prewarm_list() -> MimoPrewarmList {
         assert!((1..=2).contains(&layout.ranks), "MiMo prewarm layout ranks");
         assert_eq!(layout.reserve_base_bytes.len(), layout.ranks);
         assert_eq!(layout.reserve_extra_bytes, vec![2 << 20; layout.ranks]);
+        assert_eq!(layout.entry_capture_bytes.len(), layout.ranks);
+        assert!(layout.entry_capture_bytes.iter().all(|shares| shares.len() == layout.entries.len()));
         let mut rows = std::collections::HashSet::new();
         for entry in &layout.entries {
             assert!((1..=MIMO_DECODE_ROWS).contains(&entry.rows) && rows.insert(entry.rows), "MiMo prewarm rows");
@@ -72,6 +77,7 @@ pub fn mimo_prewarm_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool) -> Mi
         sparks,
         reserve_base_bytes,
         reserve_extra_bytes: vec![2 << 20; ranks],
+        entry_capture_bytes: Vec::new(),
         entries: (1..=MIMO_DECODE_ROWS).map(|rows| MimoPrewarmEntry { rows, pin: false }).collect(),
     }
 }

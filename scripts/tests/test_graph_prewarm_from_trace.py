@@ -1003,3 +1003,304 @@ def test_v41_stale_histogram_cannot_pin_and_current_histogram_can():
         rank = MODULE.generate([v41_trace(graphs=[graph], sampled=sampled)],
                                "deepseek_v41", layout=1)["ranks"][0]
         assert rank["entries"][0]["pin"] is pinned
+
+
+def mimo_trace(device=0, charged=640 << 20, largest=12 << 20):
+    def graph(layer, rows, count, head):
+        return {"device": device, "site": "mimo_v2.segment", "bank": 1,
+                "shape": f"GraphKey {{ layer: {layer}, rows: {rows}, table_stride: 128, previous: First, head: {str(head).lower()} }}",
+                "count": count, "hits": count, "capture_bytes": (device + 1) * (3 << 20)}
+    return {"schema_version": 1, "cache": {"device": device, "charged": charged},
+            "sites": {"mimo_v2.segment": {"largest_bytes": largest}},
+            "graphs": [graph(0, 1, 100, True), graph(1, 1, 100, False),
+                       graph(0, 16, 99, True), graph(0, 64, 1, True)]}
+
+
+
+def test_mimo_rows_are_the_only_prewarm_dimension():
+    result = MODULE.generate([mimo_trace()], "mimo_v2", coverage=0.99, ranks=1, variant="mimof-48", sparks=True)
+    layout = result["layouts"][0]
+    assert layout["ranks"] == 1
+    assert layout["variant"] == "mimof-48"
+    assert layout["sparks"] is True
+    assert result["schema_version"] == 2
+    assert layout["entries"] == [{"rows": 1, "pin": True}, {"rows": 16, "pin": False}]
+    assert layout["reserve_base_bytes"] == [10 << 20]
+    assert layout["reserve_extra_bytes"] == [2 << 20]
+
+
+
+def test_mimo_layout_carries_one_reserve_per_physical_rank():
+    result = MODULE.generate([mimo_trace(0), mimo_trace(1, 578 << 20, 16 << 20)],
+                             "mimo_v2", ranks=2, variant="mimop-70", sparks=True)
+    layout = result["layouts"][0]
+    assert layout["ranks"] == 2
+    assert layout["reserve_base_bytes"] == [12 << 20, 24 << 20]
+    assert layout["reserve_extra_bytes"] == [2 << 20, 2 << 20]
+
+
+
+def test_mimo_selected_arena_includes_cold_siblings_not_rare_tail_or_high_water():
+    import copy
+    data = mimo_trace()
+    sibling = copy.deepcopy(data["graphs"][0])
+    sibling.update(key_id=7, cycles={"other": 2}, hits=0, capture_bytes=1 << 20)
+    data["graphs"].append(sibling)
+    data["graphs"][-2]["capture_bytes"] = 100 << 20
+    arenas = []
+    result = MODULE.generate([data, data], "mimo_v2", coverage=0.99, ranks=1,
+                             variant="mimof-48", sparks=True, arena_report=arenas)
+    assert result["layouts"][0]["reserve_base_bytes"] == [10 << 20]
+    assert arenas == [{"device": 0, "prewarm_capture_bytes": 10 << 20,
+                       "prewarm_base_bytes": 10 << 20, "lazy_capture_bytes": 100 << 20,
+                       "lazy_unknown_identities": 0, "zero_replay_keys": 1,
+                       "zero_replay_capture_bytes": 1 << 20, "zero_replay_unknown_identities": 0,
+                       "selected_zero_hit_siblings": 1, "selected_zero_hit_sibling_bytes": 1 << 20,
+                       "always_zero_hit_sibling_classes": [], "device_high_water_bytes": 640 << 20}]
+
+
+
+def test_mimo_capture_only_rows_stay_lazy_even_with_heat_or_recaptures():
+    data = mimo_trace()
+    cold = data["graphs"][-1]
+    cold.update(hits=0, misses=1, captures=1, count=10000, cycles={"verify": 10000},
+                evictions=3, recaptures=3, first_seen_ms=0,
+                hit_histogram={"interval_ms": 10000, "start_ms": 0, "counts": [1, 1, 1, 1, 0]})
+    arenas = []
+    result = MODULE.generate([data], "mimo_v2", coverage=1, ranks=1,
+                             variant="mimof-48", sparks=True, arena_report=arenas)
+    assert [entry["rows"] for entry in result["layouts"][0]["entries"]] == [1, 16]
+    assert result["layouts"][0]["reserve_base_bytes"] == [10 << 20]
+    assert arenas[0]["zero_replay_keys"] == 1
+    assert arenas[0]["zero_replay_capture_bytes"] == 3 << 20
+    assert arenas[0]["selected_zero_hit_siblings"] == 0
+    assert arenas[0]["lazy_capture_bytes"] == 3 << 20
+
+
+
+def test_mimo_all_zero_replay_rows_refuse_a_prewarm_proposal():
+    data = mimo_trace()
+    for graph in data["graphs"]:
+        graph.update(hits=0, misses=1, captures=1)
+    with pytest.raises(ValueError, match="no matching graph identities"):
+        MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+
+
+
+def test_mimo_consistently_zero_hit_head_siblings_are_flagged_not_omitted():
+    import copy
+    data = mimo_trace()
+    data["graphs"] = [data["graphs"][0], data["graphs"][2]]
+    for graph in list(data["graphs"]):
+        sibling = copy.deepcopy(graph)
+        sibling.update(key_id=graph["count"], hits=0, count=1, cycles={"other": 1}, capture_bytes=1 << 20)
+        sibling["shape"] = sibling["shape"].replace("head: true", "head: false")
+        data["graphs"].append(sibling)
+    arenas = []
+    result = MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True, arena_report=arenas)
+    assert result["layouts"][0]["reserve_base_bytes"] == [8 << 20]
+    assert arenas[0]["selected_zero_hit_siblings"] == 2
+    assert arenas[0]["selected_zero_hit_sibling_bytes"] == 2 << 20
+    assert len(arenas[0]["always_zero_hit_sibling_classes"]) == 1
+    assert "head: false" in arenas[0]["always_zero_hit_sibling_classes"][0]["shape"]
+
+
+
+def test_mimo_latest_inventory_replaces_capture_shares_in_either_input_order():
+    import copy
+    old = mimo_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 2
+    for graph in new["graphs"]:
+        graph["capture_bytes"] = 1 << 20
+    for traces in ([old, new, new], [new, old]):
+        result = MODULE.generate(traces, "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+        assert result["layouts"][0]["reserve_base_bytes"] == [4 << 20]
+
+
+
+@pytest.mark.parametrize("share", [None, -1, True, "1024"])
+def test_mimo_selected_identity_requires_measured_nonnegative_capture_share(share):
+    data = mimo_trace()
+    data["graphs"][0]["capture_bytes"] = share
+    with pytest.raises(ValueError, match="lacks measured capture_bytes"):
+        MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+
+
+
+def test_mimo_zero_capture_share_is_valid_allocator_reuse():
+    data = mimo_trace()
+    data["graphs"][0]["capture_bytes"] = 0
+    result = MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+    assert result["layouts"][0]["reserve_base_bytes"] == [10 << 20]
+
+
+
+def test_mimo_forgotten_selected_sibling_refuses_incomplete_arena():
+    import copy
+    old = mimo_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 2
+    new["graphs"] = new["graphs"][1:]
+    with pytest.raises(ValueError, match="forgotten"):
+        MODULE.generate([old, new], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+
+
+
+def test_mimo_missing_selected_geometry_on_a_peer_fails():
+    peer = mimo_trace(1)
+    peer["graphs"] = peer["graphs"][:2]
+    with pytest.raises(ValueError, match="lacks selected MiMo geometries"):
+        MODULE.generate([mimo_trace(), peer], "mimo_v2", ranks=2, variant="mimof-48", sparks=True)
+
+
+
+def test_mimo_sustained_verify_rows_outside_startup_join_prewarm_and_pin():
+    data = mimo_trace()
+    data["schema_version"] = 2
+    for graph in data["graphs"]:
+        graph["cycles"] = {"verify": graph["count"]}
+    data["graphs"][-1].update(cycles={"verify": 1}, first_seen_ms=0,
+        hit_histogram={"interval_ms": 10000, "start_ms": 0, "counts": [1, 1, 1, 1, 0]})
+    result = MODULE.generate([data], "mimo_v2", coverage=0.99, ranks=1,
+                             variant="mimof-48", sparks=True)
+    assert {"rows": 64, "pin": True} in result["layouts"][0]["entries"]
+    assert result["layouts"][0]["reserve_base_bytes"] == [12 << 20]
+
+
+
+def test_mimo_lifetime_pins_c1_dominant_verify_and_half_hit_tier():
+    import copy
+    data = mimo_trace()
+    template = data["graphs"][0]
+    data["schema_version"] = 2
+    data["graphs"] = []
+    for rows, hits, cycle in [(1, 10, "decode"), (2, 40, "verify"),
+                              (4, 30, "verify"), (8, 20, "verify")]:
+        graph = copy.deepcopy(template)
+        graph.update(shape=template["shape"].replace("rows: 1,", f"rows: {rows},"),
+                     hits=hits, count=hits, cycles={cycle: hits},
+                     hit_histogram={"interval_ms": 10000, "counts": [0, 0, 0, 0]})
+        data["graphs"].append(graph)
+    report = []
+    result = MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48",
+                             sparks=True, pin_report=report)
+    assert {entry["rows"] for entry in result["layouts"][0]["entries"] if entry["pin"]} == {1, 2, 4}
+    reasons = {entry["rows"]: entry["reasons"] for entry in report}
+    assert "plain_c1" in reasons[1]
+    assert "dominant_verify" in reasons[2]
+    assert "lifetime_hit_tier" in reasons[2]
+    assert "lifetime_hit_tier" in reasons[4]
+    assert all(entry["capture_bytes"] == 3 << 20 for entry in report)
+
+
+
+def test_mimo_lifetime_pins_keep_cutoff_ties_and_ignore_startup_hits():
+    import copy
+    data = mimo_trace()
+    data["schema_version"] = 2
+    for graph in data["graphs"]:
+        graph.update(hits=20, cycles={"verify": 20})
+    cold = copy.deepcopy(data["graphs"][-1])
+    cold["shape"] = cold["shape"].replace("rows: 64,", "rows: 32,")
+    cold.update(hits=10000, cycles={"other": 10000})
+    data["graphs"].append(cold)
+    result = MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+    assert {entry["rows"] for entry in result["layouts"][0]["entries"] if entry["pin"]} == {1}
+    # The two C1 layer siblings aggregate to 40 hits, exactly half the total.
+    data["graphs"][0]["hits"] = 10
+    data["graphs"][0]["cycles"] = {"verify": 10}
+    result = MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+    assert {entry["rows"] for entry in result["layouts"][0]["entries"] if entry["pin"]} == {1, 16, 64}
+    assert 32 not in {entry["rows"] for entry in result["layouts"][0]["entries"]}
+
+
+
+def test_mimo_lifetime_pins_use_each_device_latest_inventory():
+    import copy
+    old = mimo_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 2
+    peer = mimo_trace(1)
+    for data, dominant in [(old, 64), (new, 16), (peer, 64)]:
+        data["schema_version"] = 2
+        for graph in data["graphs"]:
+            rows = MODULE.key_of("mimo_v2", graph["shape"])[0]
+            hits = 1000 if rows == dominant else 1
+            graph.update(hits=hits, cycles={"verify": hits})
+    result = MODULE.generate([old, new, peer], "mimo_v2", ranks=2, variant="mimop-70", sparks=True)
+    assert {entry["rows"] for entry in result["layouts"][0]["entries"] if entry["pin"]} == {1, 16, 64}
+
+
+
+def test_mimo_rank_count_must_match_the_trace():
+    with pytest.raises(ValueError):
+        MODULE.generate([mimo_trace(0)], "mimo_v2", ranks=2, variant="mimop-70", sparks=True)
+    with pytest.raises(ValueError):
+        MODULE.generate([mimo_trace(0)], "mimo_v2")
+
+
+
+def test_mimo_rejects_rows_outside_the_decode_geometry():
+    data = mimo_trace()
+    data["graphs"][0]["shape"] = "GraphKey { layer: 0, rows: 65, table_stride: 128, previous: First, head: true }"
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "mimo_v2", ranks=1, variant="mimof-48", sparks=True)
+
+
+
+def test_mimo_checked_in_row_shares_reproduce_bases_and_tail():
+    import json
+    checked_in = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/mimo_prewarm.json").read_text())
+    assert {(layout["variant"], layout["ranks"], layout["sparks"])
+            for layout in checked_in["layouts"]} == {("mimof-48", 1, True), ("mimop-70", 2, True)}
+    for layout in checked_in["layouts"]:
+        traces = []
+        for device, shares in enumerate(layout["entry_capture_bytes"]):
+            graphs = []
+            for entry, share in zip(layout["entries"], shares, strict=True):
+                graphs.append({"site": "mimo_v2.segment", "bank": 1,
+                    "shape": f"GraphKey {{ layer: 0, rows: {entry['rows']}, head: true }}",
+                    "hits": 1, "count": 1, "cycles": {"verify": 1}, "capture_bytes": share})
+            traces.append({"schema_version": 2, "cache": {"device": device, "charged": sum(shares)},
+                           "graphs": graphs})
+        regenerated = MODULE.generate(traces, "mimo_v2", coverage=1, ranks=layout["ranks"],
+            variant=layout["variant"], sparks=layout["sparks"])["layouts"][0]
+        for key in ("reserve_base_bytes", "reserve_extra_bytes"):
+            assert regenerated[key] == layout[key]
+        for original, rebuilt in zip(layout["entry_capture_bytes"], regenerated["entry_capture_bytes"], strict=True):
+            assert dict(zip((entry["rows"] for entry in layout["entries"]), original, strict=True)) == \
+                dict(zip((entry["rows"] for entry in regenerated["entries"]), rebuilt, strict=True))
+        assert 1 in {entry["rows"] for entry in layout["entries"] if entry["pin"]}
+
+
+
+def test_mimo_order_is_pinned_then_latest_request_replay_hits_with_row_ties():
+    import copy
+    old = mimo_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    latest = copy.deepcopy(old)
+    latest["cache"]["sampled_at_ms"] = 2
+    template = latest["graphs"][0]
+    latest["schema_version"] = 2
+    latest["graphs"] = []
+    for rows, hits, share in [(1, 1, 1), (2, 100, 2), (8, 20, 3), (4, 20, 4), (16, 10, 5)]:
+        graph = copy.deepcopy(template)
+        graph.update(shape=template["shape"].replace("rows: 1,", f"rows: {rows},"),
+            hits=hits + 10000, count=hits + 10000,
+            cycles={"verify": hits, "other": 10000}, capture_bytes=share << 20)
+        latest["graphs"].append(graph)
+    # Obsolete lifetime heat and startup Other must not change ordering.
+    old = copy.deepcopy(latest)
+    old["cache"]["sampled_at_ms"] = 1
+    old["graphs"][-1].update(hits=100000, count=100000, cycles={"verify": 100000})
+    for traces in ([old, latest], [latest, old]):
+        layout = MODULE.generate(traces, "mimo_v2", coverage=1, ranks=1,
+            variant="mimof-48", sparks=True)["layouts"][0]
+        assert [(entry["rows"], entry["pin"]) for entry in layout["entries"]] == \
+            [(2, True), (1, True), (4, False), (8, False), (16, False)]
+        assert layout["entry_capture_bytes"] == [[value << 20 for value in [2, 1, 4, 3, 5]]]

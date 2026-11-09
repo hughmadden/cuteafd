@@ -1813,7 +1813,7 @@ if [[ "$family" == qwen3_5 ]]; then
 fi
 prefill_packing="$(get PREFILL_PACKING)"
 if [[ -n "$prefill_packing" ]]; then
-  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == mimo_v2 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
+  [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 || "$family" == muse_spark ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
     unrestricted|exact) family_args+=(--prefill-packing "$prefill_packing") ;;
     *) echo "PREFILL_PACKING must be unrestricted or exact" >&2; exit 2 ;;
@@ -1919,7 +1919,7 @@ if [[ $serve == serve-dsv4 || $serve == serve-glm || $serve == serve-mimo ]]; th
     *) family_args+=("$onboard_flag" "$local_layers") ;;
   esac
 fi
-if [[ "$family" == mimo_v2 || "$family" == glm5 || "$family" == glm5_flash || "$family" == deepseek_v41 || "$family" == mimo_v2 ]]; then
+if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == deepseek_v41 || "$family" == mimo_v2 ]]; then
   draft_kv_cache="$(get DRAFT_KV_CACHE fp8)"
   case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--draft-kv-cache "$draft_kv_cache")
@@ -2427,7 +2427,7 @@ audio_encoder_hash=""
     [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || plan_draft_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
     [[ "$speculator" != dflash2 ]] || plan_draft_args+=(--draft-kv-cache "${muse_draft_kv:-fp8}")
   fi
-  if [[ "$family" == mimo_v2 || "$family" == glm5 || "$family" == glm5_flash || "$family" == deepseek_v41 || "$family" == mimo_v2 ]]; then
+  if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == deepseek_v41 || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == glm5 ]]; then

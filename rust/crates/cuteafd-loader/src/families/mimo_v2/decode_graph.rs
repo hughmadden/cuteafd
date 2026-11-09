@@ -42,6 +42,8 @@ pub struct MimoGraphLayout {
     pub sources: Vec<&'static str>,
     /// Per-graph bootstrap estimate until the device has a measured capture.
     pub bootstraps: Vec<u64>,
+    /// Admission and runtime telemetry share the same resolved per-device policy.
+    pub policies: Vec<crate::placement::graph_reserve::Resolved>,
 }
 
 impl MimoGraphLayout {
@@ -81,6 +83,7 @@ pub fn graph_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool, enabled: boo
             reserves: vec![0; ranks],
             sources: vec!["disabled"; ranks],
             bootstraps: vec![0; ranks],
+            policies: Vec::new(),
         });
     }
     let lead = layers
@@ -91,22 +94,15 @@ pub fn graph_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool, enabled: boo
         segments_per_rank.push(layers);
     }
     let prewarm = mimo_prewarm_layout(cfg, ranks, sparks);
-    let rows: Vec<_> = prewarm.entries.iter().map(|entry| entry.rows).collect();
-    if rows.is_empty() {
-        return Err(CacheGeometryError::Unsupported {
-            family: "mimo_v2",
-            what: "decode graph prewarm layout",
-        });
-    }
     let executables_per_rank = segments_per_rank
         .iter()
         .map(|&segments| {
             segments
-                .checked_mul(rows.len())
+                .checked_mul(prewarm.entries.len())
                 .ok_or(CacheGeometryError::Overflow("MiMo decode graph executable count"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let (mut reserves, mut sources, mut bootstraps) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut reserves, mut sources, mut bootstraps, mut policies) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for (rank, &executables) in executables_per_rank.iter().enumerate() {
         let base = prewarm.reserve_base_bytes[rank];
         let extra = prewarm.reserve_extra_bytes[rank];
@@ -115,16 +111,46 @@ pub fn graph_layout(cfg: &MimoV2Config, ranks: usize, sparks: bool, enabled: boo
         reserves.push(resolved.bytes);
         sources.push(resolved.source);
         bootstraps.push(base.div_ceil(executables.max(1) as u64));
+        policies.push(resolved);
     }
+    let bases: Vec<_> = policies.iter().map(|policy| policy.base_bytes).collect();
+    let selected = select_prewarm(&prewarm, &bases);
+    if selected.len() < prewarm.entries.len() {
+        tracing::warn!(skipped_entries = prewarm.entries.len() - selected.len(), base_bytes = ?bases,
+            "MiMo prewarm exceeds base; skipped rows remain runtime misses (pinned set is indivisible)");
+    }
+    let rows = selected.iter().map(|&index| prewarm.entries[index].rows).collect::<Vec<_>>();
+    let pinned = selected.iter().filter_map(|&index| {
+        let entry = prewarm.entries[index];
+        entry.pin.then_some(entry.rows)
+    }).collect();
+    let executables_per_rank = segments_per_rank.iter().map(|segments| segments * rows.len()).collect();
     Ok(MimoGraphLayout {
         enabled: true,
         rows,
-        pinned: prewarm.entries.iter().filter(|entry| entry.pin).map(|entry| entry.rows).collect(),
+        pinned,
         segments_per_rank,
         executables_per_rank,
         reserves,
         sources,
         bootstraps,
+        policies,
+    })
+}
+
+fn select_prewarm(prewarm: &crate::serving_capacity::mimo_graphs::MimoLayoutPrewarm, bases: &[u64]) -> Vec<usize> {
+    let pins: Vec<_> = prewarm.entries.iter().map(|entry| entry.pin).collect();
+    crate::placement::graph_reserve::prewarm_selection(&pins, bases, |selected, bases| {
+        bases.iter().enumerate().all(|(rank, base)| {
+            let bytes = if let Some(shares) = prewarm.entry_capture_bytes.get(rank) {
+                selected.iter().fold(0u64, |sum, &index| sum.saturating_add(shares[index]))
+            } else {
+                prewarm.reserve_base_bytes[rank].div_ceil(prewarm.entries.len().max(1) as u64)
+                    .saturating_mul(selected.len() as u64)
+            };
+            let arena = bytes.div_ceil(2 << 20).saturating_mul(2 << 20);
+            arena <= *base
+        })
     })
 }
 
@@ -155,6 +181,25 @@ mod tests {
             }
             assert!(layout.reservations(ranks).is_err());
         }
+    }
+
+    #[test]
+    fn prewarm_fits_pinned_set_then_prefix_on_every_device_without_runtime_extra() {
+        use crate::serving_capacity::mimo_graphs::{MimoLayoutPrewarm, MimoPrewarmEntry};
+        let list = MimoLayoutPrewarm {
+            variant: "mimop-70".into(), ranks: 2, sparks: true,
+            reserve_base_bytes: vec![20 << 20; 2], reserve_extra_bytes: vec![2 << 20; 2],
+            entry_capture_bytes: vec![vec![8 << 20, 2 << 20, 8 << 20, 2 << 20],
+                vec![2 << 20, 4 << 20, 2 << 20, 4 << 20]],
+            entries: (1..=4).map(|rows| MimoPrewarmEntry { rows, pin: rows % 2 == 0 }).collect(),
+        };
+        assert_eq!(select_prewarm(&list, &[12 << 20, 10 << 20]), vec![1, 3, 0]);
+        assert_eq!(select_prewarm(&list, &[20 << 20, 6 << 20]), Vec::<usize>::new());
+        assert_eq!(select_prewarm(&list, &[0, 20 << 20]), Vec::<usize>::new());
+        let lazy = crate::placement::graph_reserve::resolve_with_extra(None, Some("500MB"), None,
+            0, false, 0, 0).unwrap();
+        assert!(lazy.bytes > 0);
+        assert!(select_prewarm(&list, &[lazy.base_bytes; 2]).is_empty());
     }
 
     #[test]

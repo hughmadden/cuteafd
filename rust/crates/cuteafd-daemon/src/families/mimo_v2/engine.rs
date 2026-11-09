@@ -2344,7 +2344,7 @@ impl<'a> MimoEngine<'a> {
         for rank in 0..self.ranks() {
             let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
             let device = self.on(rank, || self.library.cuda_get_device())?;
-            graphs.borrow_mut().attach_device(device, reserves[rank], Site {
+            graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
                 name: "mimo_v2.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis: Basis::Bytes, spans_devices: self.ranks() > 1,
             })?;
@@ -3421,6 +3421,25 @@ mod tests {
         let key = GraphKey { layer: 0, rows: 1, table_stride: 1, previous: Previous::First, head: true };
         let calls = Cell::new(0);
         engine.graph(0, key, || { calls.set(calls.get() + 1); Ok(()) })?;
+        // A transient lane bank must not discard the engine's controller or
+        // consume the capture's original allocation baseline on reattachment.
+        let before_free = engine.graph_before.borrow().as_ref().unwrap()[0].free;
+        for _ in 0..2 {
+            let mut temporary = GraphBank::<GraphKey, ()>::default();
+            temporary.attach_device(&library, 7, engine.graph_layout.as_ref().unwrap().reserves[0],
+                crate::shared::decode_graph::device::Site {
+                    name: "mimo_v2.segment", cycle: crate::shared::decode_graph::device::Cycle::Decode,
+                    preference: crate::shared::decode_graph::device::Preference::Adaptive,
+                    bootstrap: 1, basis: crate::shared::decode_graph::device::Basis::Bytes,
+                    spans_devices: false,
+                })?;
+            drop(temporary);
+            let snapshots = crate::shared::decode_graph::device::snapshots();
+            let cache = snapshots.iter().find(|cache| cache.device == 7).unwrap();
+            assert_eq!(cache.reserve_policy, Some(engine.graph_layout.as_ref().unwrap().policies[0]));
+            assert!(cache.pending_capture > 0, "engine bank retains pending growth across lane rebuilds");
+            assert_eq!(engine.graph_before.borrow().as_ref().unwrap()[0].free, before_free);
+        }
         engine.graph_end_of_step()?;
         assert_eq!(calls.get(), 1);
         assert_eq!(engine.graphs.borrow().len(), 1, "first miss must capture, not remain eager");

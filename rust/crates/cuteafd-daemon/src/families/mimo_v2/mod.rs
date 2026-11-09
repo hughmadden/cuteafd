@@ -1308,7 +1308,7 @@ impl Opened {
             }
             if preflight.graph_layout.enabled {
                 engine.configure_graph_cache(&preflight.graph_layout.reserves,
-                    &preflight.graph_layout.bootstraps)?;
+                    &preflight.graph_layout.bootstraps, &preflight.graph_layout.policies)?;
             }
             engine.mtp = mtp;
             if let Some(dir) = &draft_dir {
