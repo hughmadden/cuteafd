@@ -199,7 +199,7 @@ fn checked_in(source: &str, family: GlmPrewarmFamily, layout: Option<usize>) -> 
 }
 
 /// GLM 5.3's list, measured on its 1-RTX/4-Spark EXL3 baseline plus the
-/// C1/2/4/8/16 sweep (FANOUT.md).
+/// C1/2/4/8/16 sweep (docs/architecture/shared-engine.md, Graph cache).
 pub fn glm_prewarm_list() -> &'static GlmPrewarmList {
     static LIST: std::sync::OnceLock<GlmPrewarmList> = std::sync::OnceLock::new();
     LIST.get_or_init(|| checked_in(include_str!("glm_prewarm.json"), GlmPrewarmFamily::Glm5, None))
