@@ -370,8 +370,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         Ok(output)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts}))
     }
     fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         if self.mtp.is_some() {
@@ -656,11 +657,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "qwen3_5") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "qwen3_5").await?;
     Ok(())
 }
 

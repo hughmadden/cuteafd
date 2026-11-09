@@ -757,6 +757,7 @@ name = "cuteafd-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "axum",
  "bincode",
  "bytes",
@@ -772,6 +773,7 @@ dependencies = [
  "cuteafd-usage",
  "io-uring",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

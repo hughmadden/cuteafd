@@ -1,17 +1,73 @@
-//! One append owner per speculation trace file, shared by every producer.
+//! One bounded, buffered append owner per file, shared by every producer.
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
+
+// Field expressions only capture owned data. JSON trees are built by the writer.
+macro_rules! record {
+    ($($field:ident: $value:expr),* $(,)?) => {{
+        #[allow(non_camel_case_types)]
+        #[derive(serde::Serialize)]
+        struct Record<$($field),*> { $($field: $field),* }
+        Record { $($field: $value),* }
+    }};
+}
+pub(crate) use record;
+
+/// Small family-specific metadata whose JSON formatting also belongs to the writer.
+pub(crate) struct Deferred(Box<dyn Fn() -> serde_json::Value + Send>);
+impl Deferred {
+    pub(crate) fn new(build: impl Fn() -> serde_json::Value + Send + 'static) -> Self { Self(Box::new(build)) }
+}
+impl serde::Serialize for Deferred {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        (self.0)().serialize(serializer)
+    }
+}
+
+type Job = Box<dyn FnOnce() -> io::Result<serde_json::Value> + Send>;
+// At five records per round this buffers >800 C16 rounds, without unbounded growth.
+const CAPACITY: usize = 4096;
+type FileId = (u64, u64);
+type Writers = HashMap<FileId, Weak<Writer>>;
+static WRITERS: OnceLock<Mutex<Writers>> = OnceLock::new();
 
 #[derive(Clone)]
-pub(crate) struct Trace(Arc<Mutex<File>>);
+pub(crate) struct Trace(Arc<Writer>);
+struct Writer {
+    sender: Mutex<Option<mpsc::SyncSender<Job>>>,
+    thread: Mutex<Option<JoinHandle<io::Result<()>>>>,
+}
 
-type FileId = (u64, u64);
-type Writers = HashMap<FileId, Weak<Mutex<File>>>;
+impl Writer {
+    fn shutdown(&self) -> io::Result<()> {
+        // Serialize shutdowns as well as sends; never join while holding sender.
+        let mut thread = self.thread.lock().unwrap_or_else(|p| p.into_inner());
+        self.sender.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(thread) = thread.take() {
+            thread.join().map_err(|_| io::Error::other("speculation trace writer panicked"))??;
+        }
+        Ok(())
+    }
+}
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() { tracing::warn!(%error, "speculation trace drain failed"); }
+    }
+}
+
+pub(crate) fn shutdown() {
+    let writers: Vec<_> = WRITERS.get_or_init(Mutex::default).lock().unwrap_or_else(|p| p.into_inner())
+        .values().filter_map(Weak::upgrade).collect();
+    for writer in writers {
+        if let Err(error) = writer.shutdown() { tracing::warn!(%error, "speculation trace drain failed"); }
+    }
+}
 
 impl Trace {
     pub(crate) fn open() -> Result<Option<Self>> {
@@ -21,49 +77,111 @@ impl Trace {
     }
 
     fn open_path(path: &Path) -> io::Result<Self> {
-        static WRITERS: OnceLock<Mutex<Writers>> = OnceLock::new();
         let mut writers = WRITERS.get_or_init(Mutex::default).lock()
             .map_err(|_| io::Error::other("speculation trace registry poisoned"))?;
-        // Identity, rather than path spelling, also unifies symlinks and hard links.
+        // Identity also unifies symlinks and hard links. Only this worker writes.
         let file = OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
         let metadata = file.metadata()?;
         let id = (metadata.dev(), metadata.ino());
-        if let Some(writer) = writers.get(&id).and_then(Weak::upgrade) {
-            return Ok(Self(writer));
-        }
+        if let Some(writer) = writers.get(&id).and_then(Weak::upgrade) { return Ok(Self(writer)); }
         writers.retain(|_, writer| writer.strong_count() != 0);
-        let writer = Arc::new(Mutex::new(file));
+        let (sender, receiver) = mpsc::sync_channel::<Job>(CAPACITY);
+        let thread = std::thread::Builder::new().name("speculation-trace".into()).spawn(move || {
+            write_records(file, receiver)
+        })?;
+        let writer = Arc::new(Writer { sender: Mutex::new(Some(sender)), thread: Mutex::new(Some(thread)) });
         writers.insert(id, Arc::downgrade(&writer));
         Ok(Self(writer))
     }
 
-    pub(crate) fn write(&self, value: &serde_json::Value) -> io::Result<()> {
-        let line = record_line(value)?;
-        let mut writer = self.0.lock()
-            .map_err(|_| io::Error::other("speculation trace writer poisoned"))?;
-        // Keep partial-write retries under the same lock. File has no userspace
-        // buffer: completed records survive process exit without flush or fsync.
-        write_line(&mut *writer, &line)
+    pub(crate) fn write<T: serde::Serialize + Send + 'static>(&self, record: T) -> io::Result<()> {
+        self.defer(move || serde_json::to_value(record).map_err(io::Error::other))
+    }
+
+    pub(crate) fn defer(&self, record: impl FnOnce() -> io::Result<serde_json::Value> + Send + 'static) -> io::Result<()> {
+        self.0.sender.lock().map_err(|_| io::Error::other("speculation trace sender poisoned"))?
+            .as_ref().ok_or_else(|| io::Error::other("speculation trace closed"))?
+            .send(Box::new(record)).map_err(|_| io::Error::other("speculation trace writer stopped"))
     }
 }
 
-fn record_line(value: &serde_json::Value) -> io::Result<Vec<u8>> {
-    let mut line = serde_json::to_vec(value)?;
-    line.push(b'\n');
-    Ok(line)
-}
-
-fn write_line(writer: &mut impl Write, line: &[u8]) -> io::Result<()> {
-    writer.write_all(line)
+fn write_records(file: File, receiver: mpsc::Receiver<Job>) -> io::Result<()> {
+    let mut writer = BufWriter::with_capacity(256 << 10, file);
+    let mut error = None;
+    // Continue draining after an error, releasing producers and reporting failure on join.
+    for record in receiver {
+        if error.is_some() { continue; }
+        let result = record().and_then(|value| {
+            serde_json::to_writer(&mut writer, &value).map_err(io::Error::other)?;
+            writer.write_all(b"\n")
+        });
+        if let Err(failed) = result { tracing::warn!(%failed, "speculation trace write failed"); error = Some(failed); }
+    }
+    writer.flush()?;
+    error.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    #[test]
+    #[ignore = "CPU speculation trace round microbenchmark; run explicitly with --nocapture"]
+    fn round_capture_microseconds() {
+        // Five JSON records matching MiMo's measured 57/16/2.5/2.2/0.3 KB mix.
+        let payloads: Vec<_> = [57_000, 16_000, 2_500, 2_200, 300].into_iter()
+            .map(|bytes| vec![12345u32; bytes / 6]).collect();
+        let repeats = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..repeats {
+            for (kind, tokens) in payloads.iter().enumerate() {
+                let value = serde_json::json!({"kind": kind, "tokens": tokens});
+                std::hint::black_box(serde_json::to_vec(&value).unwrap());
+            }
+        }
+        let before = start.elapsed().as_secs_f64() * 1e6 / repeats as f64;
+        let directory = tempfile::tempdir().unwrap();
+        let trace = Trace::open_path(&directory.path().join("trace.jsonl")).unwrap();
+        let mut cost = std::time::Duration::ZERO;
+        for _ in 0..repeats {
+            let start = std::time::Instant::now();
+            for (kind, tokens) in payloads.iter().enumerate() {
+                trace.write(record! { kind: kind, tokens: tokens.clone() }).unwrap();
+            }
+            cost += start.elapsed();
+            // Outside timing: do not include artificial writer saturation in caller cost.
+            let (done, wait) = mpsc::channel();
+            trace.defer(move || { done.send(()).unwrap(); Ok(serde_json::Value::Null) }).unwrap();
+            wait.recv().unwrap();
+        }
+        drop(trace);
+        println!("speculation trace 78 KB / 5 records: legacy {:.1} us -> typed copy+send {:.1} us ({} iterations, no legacy filesystem)",
+            before, cost.as_secs_f64() * 1e6 / repeats as f64, repeats);
+    }
 
     #[test]
-    fn concurrent_producers_keep_every_complete_record() {
+    fn full_channel_blocks_instead_of_losing_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = Trace::open_path(&directory.path().join("trace.jsonl")).unwrap();
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        trace.defer(move || { entered.send(()).unwrap(); wait.recv().unwrap(); Ok(serde_json::Value::Null) }).unwrap();
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        for n in 0..CAPACITY { trace.write(record! { record: n }).unwrap(); }
+        let (done, completed) = mpsc::channel();
+        let other = trace.clone();
+        let producer = std::thread::spawn(move || { other.write(record! { last: true }).unwrap(); done.send(()).unwrap(); });
+        assert!(completed.recv_timeout(std::time::Duration::from_millis(10)).is_err());
+        release.send(()).unwrap();
+        completed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        producer.join().unwrap();
+        drop(trace);
+        let text = std::fs::read_to_string(directory.path().join("trace.jsonl")).unwrap();
+        assert_eq!(text.lines().count(), CAPACITY + 2);
+        assert_eq!(text.lines().last(), Some("{\"last\":true}"));
+    }
+
+    #[test]
+    fn concurrent_producers_keep_order_and_every_complete_record_on_drop() {
         const PRODUCERS: usize = 8;
         const RECORDS: usize = 128;
         let directory = tempfile::tempdir().unwrap();
@@ -73,109 +191,48 @@ mod tests {
         std::os::unix::fs::symlink(&path, &symlink).unwrap();
         let hardlink = directory.path().join("hardlink.jsonl");
         std::fs::hard_link(&path, &hardlink).unwrap();
-        let barrier = Barrier::new(PRODUCERS);
         std::thread::scope(|scope| {
             for producer in 0..PRODUCERS {
                 let path = match producer % 3 { 0 => &path, 1 => &symlink, _ => &hardlink };
-                let barrier = &barrier;
                 let owner = &owner;
                 scope.spawn(move || {
                     let writer = Trace::open_path(path).unwrap();
                     assert!(Arc::ptr_eq(&owner.0, &writer.0));
-                    barrier.wait();
                     for record in 0..RECORDS {
-                        // Large route arrays exceed BufWriter's default 8 KiB capacity;
-                        // short confidence/cycle records exercise competing producers.
-                        let routes = vec![producer; if producer % 2 == 0 { 12_000 } else { 4 }];
-                        writer.write(&serde_json::json!({
-                            "type": if producer % 2 == 0 { "draft_round" } else { "confidence" },
-                            "producer": producer, "record": record, "routes": routes,
-                            "text": "escaped\nnewline\"quote"
-                        })).unwrap();
+                        writer.write(record! { producer: producer, record: record,
+                            routes: vec![producer; if producer % 2 == 0 { 12_000 } else { 4 }],
+                            text: "escaped\nnewline\"quote" }).unwrap();
                     }
                 });
             }
         });
-        // Read before dropping the owner: no shutdown/flush is needed for visibility.
+        drop(owner);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(bytes.last(), Some(&b'\n'));
-        let text = std::str::from_utf8(&bytes).unwrap();
-        let mut seen = vec![vec![false; RECORDS]; PRODUCERS];
-        let mut count = 0;
-        for line in text.lines() {
+        let mut next = [0; PRODUCERS];
+        for line in std::str::from_utf8(&bytes).unwrap().lines() {
             let value: serde_json::Value = serde_json::from_str(line).unwrap();
             let producer = value["producer"].as_u64().unwrap() as usize;
-            let record = value["record"].as_u64().unwrap() as usize;
-            assert!(!seen[producer][record], "duplicate producer {producer} record {record}");
-            seen[producer][record] = true;
-            let routes = value["routes"].as_array().unwrap();
-            assert_eq!(routes.len(), if producer % 2 == 0 { 12_000 } else { 4 });
-            assert!(routes.iter().all(|route| route.as_u64() == Some(producer as u64)));
+            assert_eq!(value["record"], next[producer]);
+            next[producer] += 1;
+            assert_eq!(value["routes"].as_array().unwrap().len(), if producer % 2 == 0 { 12_000 } else { 4 });
             assert_eq!(value["text"], "escaped\nnewline\"quote");
-            count += 1;
         }
-        assert_eq!(count, PRODUCERS * RECORDS);
-        assert!(seen.iter().flatten().all(|&record| record));
+        assert_eq!(next, [RECORDS; PRODUCERS]);
     }
 
     #[test]
-    fn complete_lines_prevent_old_buffer_flush_interleaving() {
-        // Model a second append handle writing between two write syscalls.
-        // The former writeln!(BufWriter<File>, "{value}") splits large JSON
-        // records at 8 KiB; no concurrent thread is needed to force the race.
-        #[derive(Default)]
-        struct CompetingAppend { bytes: Vec<u8>, inserted: bool }
-        impl Write for CompetingAppend {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.bytes.extend_from_slice(bytes);
-                if !self.inserted {
-                    self.bytes.extend_from_slice(b"{\"type\":\"confidence\"}\n");
-                    self.inserted = true;
-                }
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> { Ok(()) }
-        }
-        fn valid_lines(bytes: &[u8]) -> usize {
-            bytes.split(|&byte| byte == b'\n').filter(|line| !line.is_empty())
-                .filter(|line| serde_json::from_slice::<serde_json::Value>(line).is_ok()).count()
-        }
-        let value = serde_json::json!({"type": "draft_round", "routes": vec![42; 12_000]});
-        let mut old = std::io::BufWriter::new(CompetingAppend::default());
-        writeln!(old, "{value}").unwrap();
-        old.flush().unwrap();
-        assert_eq!(valid_lines(&old.get_ref().bytes), 0, "old fragmented writes must reproduce corrupt JSONL");
-        let mut fixed = CompetingAppend::default();
-        write_line(&mut fixed, &record_line(&value).unwrap()).unwrap();
-        assert_eq!(valid_lines(&fixed.bytes), 2);
-    }
-
-    #[test]
-    fn records_are_one_serialized_write_and_errors_propagate() {
-        struct Writer { calls: usize, bytes: Vec<u8> }
-        impl Write for Writer {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                self.calls += 1;
-                self.bytes.extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> { panic!("trace must not flush") }
-        }
-        let value = serde_json::json!({"type": "draft_round", "routes": vec![42; 12_000]});
-        let line = record_line(&value).unwrap();
-        let mut writer = Writer { calls: 0, bytes: Vec::new() };
-        write_line(&mut writer, &line).unwrap();
-        assert_eq!(writer.calls, 1);
-        assert_eq!(writer.bytes.last(), Some(&b'\n'));
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&writer.bytes).unwrap(), value);
-
-        struct Broken;
-        impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "trace sink closed"))
-            }
-            fn flush(&mut self) -> io::Result<()> { panic!("trace must not flush") }
-        }
-        assert_eq!(write_line(&mut Broken, &line).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    fn writer_builds_json_off_producer_and_explicit_shutdown_joins() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("trace.jsonl");
+        let trace = Trace::open_path(&path).unwrap();
+        let producer = std::thread::current().id();
+        trace.defer(move || {
+            assert_ne!(std::thread::current().id(), producer);
+            Ok(serde_json::json!({"last": true}))
+        }).unwrap();
+        trace.0.shutdown().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"last\":true}\n");
+        assert!(trace.write(record! { last: false }).is_err());
     }
 }

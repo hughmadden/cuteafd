@@ -179,11 +179,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "glm5") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "glm5").await?;
     Ok(())
 }
 
@@ -484,16 +485,16 @@ impl Trace {
     #[allow(clippy::too_many_arguments)]
     fn cycle(&mut self, id: u64, position: usize, rows: usize, committed: usize, planned: usize, copy: bool,
         draft: Option<&crate::shared::speculation::dflash::Draft>, verify_ms: f64) -> Result<()> {
-        let line = serde_json::json!({"kind": "cycle", "id": id, "position": position, "rows": rows,
-            "committed": committed, "planned": planned, "copy": copy, "verify_ms": verify_ms,
-            "draft": draft.map(|d| &d.tokens), "features": draft.map(|d| &d.features)});
-        self.0.write(&line)?;
+        let line = crate::shared::speculation_trace::record! {kind: "cycle", id: id, position: position, rows: rows,
+            committed: committed, planned: planned, copy: copy, verify_ms: verify_ms,
+            draft: draft.map(|d| d.tokens.clone()), features: draft.map(|d| d.features.clone())};
+        self.0.write(line)?;
         Ok(())
     }
 
     fn done(&mut self, id: u64, prompt_tokens: usize, generated: &[u32]) -> Result<()> {
-        self.0.write(&serde_json::json!({"kind": "done", "id": id, "prompt_tokens": prompt_tokens,
-            "generated": generated}))?;
+        self.0.write(crate::shared::speculation_trace::record! {kind: "done", id: id, prompt_tokens: prompt_tokens,
+            generated: generated.to_vec()})?;
         Ok(())
     }
 }

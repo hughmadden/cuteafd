@@ -169,8 +169,9 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         self.engine.step_device(sequences, pool, rows, false).map(Some)
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
-        serde_json::json!({"kind":"kimi_owned_mla_tp2_kda", "rows":rows, "contexts":contexts})
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
+        let contexts = contexts.to_vec();
+        crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"kimi_owned_mla_tp2_kda", "rows":rows, "contexts":contexts}))
     }
     fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         ensure!(self.engine.native_draft().is_some(), "Kimi drafter was not admitted");

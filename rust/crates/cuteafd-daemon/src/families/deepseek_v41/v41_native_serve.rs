@@ -56,12 +56,10 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     profile.expert_usage = expert_usage;
     let router = cuteafd_api::openai::router_for_model(send, limits, stats, http_queue_wait, console_hub.clone(),
         api.serve(profile, &snapshot)?);
-    axum::serve(listener, api.app(router, console_hub).into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(cuteafd_bench::shutdown_signal())
-        .await?;
-    tokio::task::spawn_blocking(move || worker_thread.join())
-        .await?
-        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))?;
+    crate::shared::api::serve_http(listener, api.app(router, console_hub), "deepseek_v41").await?;
+    let mut worker = Some(tokio::task::spawn_blocking(move || worker_thread.join()
+        .map_err(|_| anyhow::anyhow!("native CUDA worker panicked during shutdown"))));
+    crate::shared::api::finish_scheduler(&mut worker, "deepseek_v41").await?;
     Ok(())
 }
 

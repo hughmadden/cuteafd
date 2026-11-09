@@ -14,6 +14,7 @@ mod families {
 #[path = "../src/shared"]
 mod shared {
     pub(crate) mod decode_graph;
+    pub(crate) mod speculation_trace;
     pub(crate) mod fp8_linear;
     pub(crate) mod fp8_load_quant;
     pub(crate) mod memory;

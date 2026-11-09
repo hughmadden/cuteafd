@@ -169,7 +169,7 @@ pub(crate) trait Backend<'a> {
         kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value;
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
     fn draft_geometry(&self, snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry>;
     fn arm_draft_probe(&self) -> Result<()>;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
@@ -380,8 +380,8 @@ impl Trace {
         Ok(crate::shared::speculation_trace::Trace::open()?.map(Self))
     }
 
-    fn cycle(&mut self, line: serde_json::Value) {
-        if let Err(error) = self.0.write(&line) {
+    fn cycle(&mut self, line: impl serde::Serialize + Send + 'static) {
+        if let Err(error) = self.0.write(line) {
             tracing::warn!("trace: {error:#}");
         }
     }
@@ -1547,21 +1547,21 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     if let Some(trace) = trace.as_mut() {
         let contexts: Vec<Vec<usize>> = starts.iter().zip(&sequences)
             .map(|(&start, rows)| (1..=rows.len()).map(|offset| start + offset).collect()).collect();
-        trace.cycle(serde_json::json!({"rows": tokens.len(), "seqs": sequences.len(),
-            "attention": engine.verify_attention_trace(&contexts,
+        trace.cycle(crate::shared::speculation_trace::record! {rows: tokens.len(), seqs: sequences.len(),
+            attention: engine.verify_attention_trace(&contexts,
                 engine.verify_bucket_rows(tokens.len(), spec, diagnostic)),
-            "contexts": contexts,
-            "ids": active.iter().map(|a| a.id).collect::<Vec<_>>(),
-            "depths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
-            "kept": kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
-            "verify_ms": 1e3 * elapsed, "draft_steps": lane.timing.steps - steps_before,
-            "draft_ms": 1e3 * (lane.timing.seconds - draft_s_before), "cycle_ms": 1e3 * cycle.elapsed().as_secs_f64(),
-            "neural_tokens": trace_neural,
-            "copy_windows": trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
-                serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})).collect::<Vec<_>>()),
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "predicted_us": predicted, "rates": neural_confidence,
-            "draft_policy": resource::snapshot()}));
+            contexts: contexts,
+            ids: active.iter().map(|a| a.id).collect::<Vec<_>>(),
+            depths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+            kept: kept.iter().map(|k| k.map_or(0, |(n, _)| n)).collect::<Vec<_>>(),
+            verify_ms: 1e3 * elapsed, draft_steps: lane.timing.steps - steps_before,
+            draft_ms: 1e3 * (lane.timing.seconds - draft_s_before), cycle_ms: 1e3 * cycle.elapsed().as_secs_f64(),
+            neural_tokens: trace_neural,
+            copy_windows: trace_copy.as_ref().map(|windows| windows.iter().map(|(start, suffix, tokens)|
+                crate::shared::speculation_trace::record! {start: *start, matched_suffix: *suffix, tokens: tokens.clone()}).collect::<Vec<_>>()),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            predicted_us: predicted, rates: neural_confidence,
+            draft_policy: resource::trace_snapshot()});
     }
     Ok(Some(finished))
 }

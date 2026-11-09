@@ -130,11 +130,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "Qwen 3.8 Flash Next API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "qwen4") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "qwen4").await?;
     Ok(())
 }
 
@@ -413,7 +414,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize {
         self.engine.verify_bucket_rows(rows, speculative, diagnostic)
     }
-    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
+    fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         self.engine.verify_attention_trace(contexts, rows)
     }
     fn draft_geometry(&self, snapshot: &std::path::Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {

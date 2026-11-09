@@ -536,11 +536,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
     cuteafd_bench::ready(&listener);
     crate::shared::memory_report::log("ready");
+    let mut handle = Some(handle);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "muse_spark") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut handle) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut handle, "muse_spark").await?;
     Ok(())
 }
 

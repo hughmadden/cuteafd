@@ -372,13 +372,20 @@ async fn merged(State(bench): State<Arc<Bench>>, Path(fingerprint): Path<String>
     }
 }
 
-async fn events(State(bench): State<Arc<Bench>>) -> Response {
+async fn events(State(bench): State<Arc<Bench>>, drain: Option<axum::Extension<cuteafd_api::shutdown::Drain>>) -> Response {
     let mut receiver = bench.subscribe();
     let first = json!({"type": "status", "status": bench.status()}).to_string();
     let stream = async_stream::stream! {
+        let stopped = cuteafd_api::shutdown::monitor_stopped(drain);
+        tokio::pin!(stopped);
         yield Ok::<_, std::convert::Infallible>(format!("data: {first}\n\n"));
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(15), receiver.recv()).await {
+            let event = tokio::select! {
+                biased;
+                _ = &mut stopped => break,
+                event = tokio::time::timeout(std::time::Duration::from_secs(15), receiver.recv()) => event,
+            };
+            match event {
                 Ok(Ok(event)) => yield Ok(format!("data: {event}\n\n")),
                 Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(_)) => break,

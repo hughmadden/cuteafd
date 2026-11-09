@@ -272,14 +272,21 @@ pub(super) async fn snapshot(State(hub): State<Arc<ConsoleHub>>, headers: Header
 
 /// Browsers cannot send bearer headers on WebSocket handshakes; offer the same
 /// authenticated feed over fetch/SSE without putting credentials in a URL.
-pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMap) -> Response {
+pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>, drain: Option<axum::Extension<crate::shutdown::Drain>>, headers: HeaderMap) -> Response {
     let mut frames = hub.frames.subscribe();
     let (viewer, unlocked) = hub.viewer(&headers);
     let stream = async_stream::stream! {
+        let stopped = crate::shutdown::monitor_stopped(drain);
+        tokio::pin!(stopped);
         let _viewer = viewer;
         yield Ok::<_, std::convert::Infallible>(format!("data: {}\n\n", hub.snapshot_for(unlocked)));
         loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(15), frames.recv()).await {
+            let frame = tokio::select! {
+                biased;
+                _ = &mut stopped => break,
+                frame = tokio::time::timeout(std::time::Duration::from_secs(15), frames.recv()) => frame,
+            };
+            match frame {
                 Ok(Ok(frame)) => yield Ok(format!("data: {}\n\n", frame.for_viewer(unlocked))),
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => yield Ok(format!("data: {}\n\n", hub.snapshot_for(unlocked))),
                 Ok(Err(broadcast::error::RecvError::Closed)) => break,
@@ -290,8 +297,14 @@ pub(super) async fn events(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMa
     ([(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")],
         axum::body::Body::from_stream(stream)).into_response()
 }
-pub(super) async fn socket(State(hub): State<Arc<ConsoleHub>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve(hub, headers, socket))
+pub(super) async fn socket(State(hub): State<Arc<ConsoleHub>>, drain: Option<axum::Extension<crate::shutdown::Drain>>, headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| async move {
+        tokio::select! {
+            biased;
+            _ = crate::shutdown::monitor_stopped(drain) => (),
+            _ = serve(hub, headers, socket) => (),
+        }
+    })
 }
 
 async fn serve(hub: Arc<ConsoleHub>, headers: HeaderMap, mut socket: WebSocket) {

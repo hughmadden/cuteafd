@@ -226,11 +226,12 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     // lazy graphs or loads more code.
     crate::shared::memory_report::log("ready");
     tracing::info!(listen = %args.listen, model = %profile.id, "GLM 5.3 Flash API is ready");
+    let mut worker = Some(worker);
     tokio::select! {
-        served = axum::serve(listener, api.app(router, hub)
-            .into_make_service_with_connect_info::<std::net::SocketAddr>()) => served?,
-        _ = crate::shared::api::watch_scheduler(worker) => unreachable!(),
+        served = crate::shared::api::serve_http(listener, api.app(router, hub), "glm5_flash") => served?,
+        _ = crate::shared::api::watch_scheduler(&mut worker) => unreachable!(),
     }
+    crate::shared::api::finish_scheduler(&mut worker, "glm5_flash").await?;
     Ok(())
 }
 
@@ -1544,7 +1545,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let copy_windows = trace.as_ref().map(|_| active.iter().zip(&drafted).map(|(a, d)| {
         let (start, suffix, tokens) = crate::shared::draft::copy::trace_window(&a.history,
             d.as_ref().map_or(0, |d| d.tokens.len()) + crate::shared::draft::copy::COPY_EXTENSION);
-        serde_json::json!({"start": start, "matched_suffix": suffix, "tokens": tokens})
+        crate::shared::speculation_trace::record! {start: start, matched_suffix: suffix, tokens: tokens.to_vec()}
     }).collect::<Vec<_>>());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let plan_us = console::us(plan_timer);
@@ -1665,21 +1666,21 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     }
     if let Some(trace) = trace.as_mut() {
         lane.trace_round += 1;
-        let line = serde_json::json!({
-            "round": lane.trace_round, "spec": spec,
-            "request_ids": active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
-            "starts": starts,
-            "prompt_ids": active.iter().zip(&starts).map(|(a, &start)|
+        let line = crate::shared::speculation_trace::record! {
+            round: lane.trace_round, spec: spec,
+            request_ids: active.iter().map(|a| a.ticket.id()).collect::<Vec<_>>(),
+            starts: starts.clone(),
+            prompt_ids: active.iter().zip(&starts).map(|(a, &start)|
                 (a.counts[0] == 1).then(|| a.history[..start].to_vec())).collect::<Vec<_>>(),
-            "lengths": sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
-            "accepted": verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
-            "neural_tokens": drafted.iter().map(|d| d.as_ref().map(|d| &d.tokens)).collect::<Vec<_>>(),
-            "copy_windows": copy_windows,
-            "verify_tokens": sequences,
-            "committed_tokens": active.iter().zip(&before).map(|(a, &n)| &a.history[n..]).collect::<Vec<_>>(),
-            "finished": finished,
-        });
-        if let Err(error) = trace.write(&line) {
+            lengths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
+            accepted: verified.iter().map(|v| v.1.saturating_sub(1)).collect::<Vec<_>>(),
+            neural_tokens: drafted.iter().map(|d| d.as_ref().map(|d| d.tokens.clone())).collect::<Vec<_>>(),
+            copy_windows: copy_windows,
+            verify_tokens: sequences.clone(),
+            committed_tokens: active.iter().zip(&before).map(|(a, &n)| a.history[n..].to_vec()).collect::<Vec<_>>(),
+            finished: finished.clone(),
+        };
+        if let Err(error) = trace.write(line) {
             tracing::warn!(%error, "GLM Flash speculation trace write failed");
         }
     }

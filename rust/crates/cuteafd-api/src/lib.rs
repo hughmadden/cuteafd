@@ -1,3 +1,4 @@
+pub mod shutdown;
 pub mod usage_log;
 pub mod console_gate;
 pub mod usage;
