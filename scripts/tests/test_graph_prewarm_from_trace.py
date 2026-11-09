@@ -1721,6 +1721,29 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     assert "graph_capture_stats" not in graph
 
 
+def test_dense_qwen_trimmed_trace_reproduces_checked_in_bytes():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/qwen35-prewarm-trace.json.gz"
+    trace = json.loads(gzip.decompress(fixture.read_bytes()))
+    summary = {}
+    generated = MODULE.generate_qwen35([trace], "h5120-l64-bf16-kvfp8-rtx1", summary)
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/qwen35_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    layout = generated["layouts"][0]
+    assert layout["traced"]
+    assert layout["reserve_extra_bytes"] == MODULE.CHUNK
+    assert len(layout["entries"]) == 67
+    assert not any(entry["pin"] for entry in layout["entries"])
+    assert layout["reserve_base_bytes"] == 599_785_472
+    assert summary["zero_replay_identities"] == 896
+    assert summary["always_zero_hit_segments"] == []
+    assert {int(MODULE.DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+            for graph in trace["graphs"]} == set(range(64))
+    assert all(graph["nodes"] == 13 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
+
+
 def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
     root = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families/qwen3_5"
     graph = (root / "graphs.rs").read_text()

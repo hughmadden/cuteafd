@@ -1,5 +1,416 @@
 {
   "schema_version": 1,
   "family": "qwen3_5",
-  "layouts": []
+  "layouts": [
+    {
+      "variant": "h5120-l64-bf16-kvfp8-rtx1",
+      "traced": true,
+      "reserve_base_bytes": 599785472,
+      "reserve_extra_bytes": 2097152,
+      "entries": [
+        {
+          "rows": 3,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 3,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 3,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 5,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 7,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 6,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 33,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 8,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 17,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 9,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 33,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 13,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 5,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 17,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 14,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 5,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 11,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 7,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 6,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 3,
+          "table_stride": 64,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 3,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 10,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 12,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 15,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 17,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 9,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 2,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 15,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 14,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 6,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 4,
+          "table_stride": 16,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 5,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 16,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 8,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 16,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 13,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 1,
+          "table_stride": 4,
+          "spec": false,
+          "pin": false
+        },
+        {
+          "rows": 9,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 7,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 12,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 18,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 41,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 1,
+          "table_stride": 8,
+          "spec": false,
+          "pin": false
+        },
+        {
+          "rows": 8,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 38,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 3,
+          "table_stride": 16,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 6,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 10,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 12,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 32,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 35,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 7,
+          "table_stride": 8,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 11,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 13,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 16,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 19,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 21,
+          "table_stride": 2,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 25,
+          "table_stride": 1,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 25,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        },
+        {
+          "rows": 29,
+          "table_stride": 4,
+          "spec": true,
+          "pin": false
+        }
+      ]
+    }
+  ]
 }
