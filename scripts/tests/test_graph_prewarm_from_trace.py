@@ -512,11 +512,16 @@ def test_qwen_zero_hit_bootstrap_shapes_are_never_selected():
                      capture_bytes=1 << 20, shape=qwen_identity(segment, rows=4))
         cold.append(graph)
     data["graphs"] = [hot] + cold
-    result = MODULE.generate_qwen([data], "single_0spark")
+    summary = {}
+    result = MODULE.generate_qwen([data], "single_0spark", summary=summary)
     assert result["trace"]["entries"] == [
         {"rows": 64, "spec": False, "long": False, "pool_width": 64,
          "page_stride": 64, "pool_stride": 128, "pin": False}]
     assert result["reserve_base_bytes"] == [2 << 20]
+    # Captured once, never replayed: never selected, and reported rather than
+    # hidden (11 cold identities, 1 MiB each).
+    assert summary == {"zero_replay_identities": len(cold), "zero_replay_bytes": len(cold) << 20}
+    assert f"{len(cold)} zero-replay identities" in result["trace"]["provenance"]
 
 
 def test_qwen_selected_identity_without_a_measured_share_fails():

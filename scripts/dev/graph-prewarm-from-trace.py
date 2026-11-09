@@ -330,15 +330,28 @@ def qwen_geometry(graph):
             int(page_stride), int(pool_stride))
 
 
-def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
+def qwen_replay(graph):
+    """Replayed launches for one qwen4 graph identity (0 = captured, never used)."""
+    replay = graph.get("hits")
+    if replay is None:
+        cycles = graph.get("cycles")
+        replay = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
+                  if cycles is not None else int(graph["count"])) - int(graph.get("misses", 0))
+    return int(replay)
+
+
+def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
     """One `QwenShapePrewarm` object for a resolved capture shape.
 
-    The reserve base is the traced working set's arena: each selected
-    identity's measured `capture_bytes`, summed per device, deduplicated by
-    identity, rounded once to the 2 MiB chunk. Startup-only siblings (captured
-    but never replayed) contribute too, and a selected identity without a
-    measured share fails. The trace's charged high-water is never the base;
-    `reserve_extra_bytes` is the fixed 2 MiB capture headroom.
+    Only identities with at least one replay can be selected: a capture is an
+    event, not demand, so a shape captured once and never replayed stays lazy
+    and its count and bytes are reported. The reserve base is the traced
+    working set's arena: each identity of a selected shape's measured
+    `capture_bytes` (every segment row, replayed or a startup-only sibling),
+    summed per device, deduplicated by identity, rounded once to the 2 MiB
+    chunk, and a selected identity without a measured share fails. The trace's
+    charged high-water is never the base; `reserve_extra_bytes` is the fixed
+    2 MiB capture headroom.
     """
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
@@ -384,16 +397,20 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
                                     and graph.get("capture_bytes") is not None):
                 identities[identity] = (geometry, graph)
             cycles = graph.get("cycles")
-            replay = graph.get("hits")
-            if replay is None:
-                replay = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
-                          if cycles is not None else int(graph["count"])) - int(graph.get("misses", 0))
+            replay = qwen_replay(graph)
             # Every layer segment runs once per decode step: rank a shape by its
             # busiest segment rather than summing all of them.
-            if int(replay) > 0:
-                counts[geometry] = max(counts.get(geometry, 0), int(replay))
+            if replay > 0:
+                counts[geometry] = max(counts.get(geometry, 0), replay)
     if not counts:
         raise ValueError("trace records no replayed graph identities")
+    # A captured-but-never-replayed identity is first touch, not demand: it is
+    # never selected, and its count and bytes are reported rather than hidden.
+    zero_replay = [graph for (_, graph) in identities.values() if qwen_replay(graph) == 0]
+    zero_replay_bytes = sum(int(graph.get("capture_bytes") or 0) for graph in zero_replay)
+    if summary is not None:
+        summary["zero_replay_identities"] = len(zero_replay)
+        summary["zero_replay_bytes"] = zero_replay_bytes
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
@@ -462,7 +479,8 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
         base.append(packed(total))
     extra = [EXTRA_BYTES for _ in devices]
     provenance = (f"GRAPH_TRACE {len(traces)} snapshots at {shape}; devices {devices}; "
-                  f"{len(selected)} selected shapes; capture base {base} + {EXTRA_BYTES} extra bytes")
+                  f"{len(selected)} selected shapes; capture base {base} + {EXTRA_BYTES} extra bytes; "
+                  f"{len(zero_replay)} zero-replay identities ({zero_replay_bytes} bytes) stay lazy")
     return {"shape": shape, "reserve_base_bytes": base,
             "reserve_extra_bytes": extra,
             "trace": {"provenance": provenance, "entries": entries}}
@@ -570,8 +588,8 @@ def main():
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
+        traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
         if args.family == "qwen4":
-            traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
         else:
             result = generate_layouts(layout_groups(args.trace, args.family),
@@ -588,23 +606,12 @@ def main():
               f"base={result['reserve_base_bytes']} extra={result['reserve_extra_bytes']} bytes; "
               f"pinned={sum(entry['pin'] for entry in result['trace']['entries'])}; "
               f"zero_replay={summary.get('zero_replay_identities', 0)} "
-              f"({summary.get('zero_replay_bytes', 0)} bytes); "
-              f"zero_share={summary.get('zero_share_identities', 0)} "
-              f"({summary.get('zero_share_bytes', 0)} bytes filled)")
-        for pin in report:
-            print("pin " + json.dumps(pin, sort_keys=True))
-        return
-    values = result["layouts"].values() if "layouts" in result else [result]
-    for values in values:
-        pinned = sum(entry["pin"] for entry in values["entries"])
-        if "measured_bytes" in values:
-            print(f"{len(values['entries'])} shapes; measured={values['measured_bytes']} bytes "
-                  f"for {values['measured_executables']} executables; "
-                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
-        else:
-            layout = f" layout={values['layout']};" if "layout" in values else ""
-            print(f"{len(values['entries'])} shapes;{layout} base={values['reserve_base_bytes']} "
-                  f"extra={values['reserve_extra_bytes']} bytes; pinned={pinned}")
+              f"({summary.get('zero_replay_bytes', 0)} bytes)")
+    else:
+        layout = f" layout={result['layout']};" if "layout" in result else ""
+        print(f"{len(result['entries'])} shapes;{layout} base={result['reserve_base_bytes']} "
+              f"extra={result['reserve_extra_bytes']} bytes; "
+              f"pinned={sum(entry['pin'] for entry in result['entries'])}")
     for pin in report:
         print("pin " + json.dumps(pin, sort_keys=True))
 

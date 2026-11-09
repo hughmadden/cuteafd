@@ -7,7 +7,7 @@
     2097152
   ],
   "trace": {
-    "provenance": "GRAPH_TRACE 1 snapshots at single_0spark; devices [0]; 1 selected shapes; capture base [4194304] + 2097152 extra bytes",
+    "provenance": "GRAPH_TRACE 1 snapshots at single_0spark; devices [0]; 1 selected shapes; capture base [4194304] + 2097152 extra bytes; 0 zero-replay identities (0 bytes) stay lazy",
     "entries": [
       {
         "rows": 64,
