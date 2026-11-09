@@ -315,7 +315,7 @@ fn host_sample(options: &LayoutOptions) -> Result<(u64, u64)> {
 fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::super::PlanInput,
     cfg: &Qwen4Config, owners: usize, span_rows: u64, mtp: bool) -> Result<qwen4::QwenHost> {
     use crate::placement::families::qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs,
-        pinned_logits_bytes, scoring_logits_bytes};
+        mtp_pinned_logits_bytes, pinned_logits_bytes, scoring_logits_bytes};
     let checkpoint = input.checkpoint();
     let (total, available) = host_sample(options)?;
     let all_onboarded = cfg.layers > 0
@@ -362,6 +362,7 @@ fn host_owners(report: &mut PlanReport, options: &LayoutOptions, input: &super::
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
         pinned_logits: pinned_logits_bytes(owners, options.full_prefill_logits, span_rows, cfg.vocab_size as u64)?,
+        mtp_pinned_logits: mtp_pinned_logits_bytes(waves > 1, uploads.mtp, cfg.vocab_size as u64)?,
         scoring_logits: scoring_logits_bytes(options.full_prefill_logits, span_rows, cfg.vocab_size as u64)?,
         prefix_quota, prefix_chunk, loaded_media_cache: 0,
         host_embedding,

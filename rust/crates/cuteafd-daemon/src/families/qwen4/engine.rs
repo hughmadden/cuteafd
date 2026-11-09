@@ -479,6 +479,7 @@ pub(super) fn validate_admitted_host(host: &cuteafd_loader::placement::families:
     for (name, bytes) in tables {
         let parts: Vec<_> = name.split('/').collect();
         let bound = match parts.as_slice() {
+            ["qwen4", "owner-0", "mtp-prefill", "pinned-logits"] => host.mtp_pinned_logits,
             ["qwen4", _, _, "pinned-logits"] => {
                 logits = logits.checked_add(*bytes).context("Qwen pinned logits overflow")?;
                 continue;
