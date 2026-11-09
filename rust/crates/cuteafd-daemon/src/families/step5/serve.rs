@@ -1,4 +1,4 @@
-//! Eager native target and default-on MTP over the shared scheduler.
+//! Native target, bounded decode sections and default-on MTP over the shared scheduler.
 use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, cache::CacheRank,
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
@@ -66,6 +66,9 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Replay bounded persistent decode/verify sections (prefill remains eager).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    decode_graphs: bool,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
@@ -321,7 +324,7 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let reserve = cuteafd_loader::placement::reserve::gpu("step5");
-    let mut inputs = RuntimeInputs { bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+    let mut inputs = RuntimeInputs { decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
@@ -345,6 +348,7 @@ fn with_backend<T>(args: &ServeArgs,
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
+    publish_reconciliation(args, &ids, &admission.solved)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
@@ -537,8 +541,9 @@ fn with_backend<T>(args: &ServeArgs,
         Ok(link)
     })?) };
     library.cuda_set_device(args.device)?;
-    let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
+    let mut execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         transport, 92, 1)?;
+    execution.configure_graphs(args.decode_graphs)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_served_context(usize::try_from(admission.solved.served_context())?)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
@@ -552,8 +557,32 @@ fn with_backend<T>(args: &ServeArgs,
         "Step-5 startup native binding complete");
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
-        "Step-5 admitted eager target and native predictor depth");
+        "Step-5 admitted target and native predictor depth");
     run(&backend, inputs.sequences)
+}
+
+fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
+    solved: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": {
+            "schema_version": 1, "family": "step5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+            "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": hash(&args.native_lib)?, "programs_sha256": hash(&args.manifest)?,
+            "devices": ids.iter().map(|id| serde_json::json!({"device": id})).collect::<Vec<_>>(),
+            "spark_world": args.peers.len(), "onboard_layers": solved.decisions.onboard_layers,
+            "prefill": solved.decisions.prefill, "context": solved.served_context(),
+            "kv_cache": format!("{:?}", args.kv_cache), "decode_graphs": args.decode_graphs,
+            "graph_basis": "per-device bounded byte basis; untraced layout has no pins or measured base"
+        }
+    }));
+    Ok(())
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
@@ -795,7 +824,7 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+        let mut inputs = RuntimeInputs { decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,

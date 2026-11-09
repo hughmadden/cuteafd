@@ -54,9 +54,13 @@ pub(super) struct Staging<'a> {
     ring_table: Plane<'a>,
     page_table: Plane<'a>,
     table_width: usize,
+    graph_requests: Plane<'a>,
+    graph_ring_table: Plane<'a>,
+    graph_page_table: Plane<'a>,
     sequences: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct StepInputs<'s, 'a> {
     pub stream: &'s crate::shared::memory::device::Stream<'a>,
     pub positions: CuteafdDeviceBuffer,
@@ -70,6 +74,7 @@ pub(super) struct StepInputs<'s, 'a> {
 
 /// Borrowed only inside the transaction callback, after this layer was staged.
 /// The transaction retains page leases, staging metadata and all queued inputs.
+#[derive(Clone)]
 pub(super) struct AttentionRead<'s, 'a> {
     pub inputs: StepInputs<'s, 'a>,
     pub start: usize,
@@ -78,6 +83,7 @@ pub(super) struct AttentionRead<'s, 'a> {
     pub summaries: Option<CuteafdDeviceBuffer>,
     pub table: CuteafdDeviceBuffer,
     pub table_width: usize,
+    pub table_batch: usize,
     pub pages: usize,
 }
 
@@ -159,6 +165,7 @@ impl<'a> Staging<'a> {
             arena.planes(device, &[region.len()], region.start)?.pop().context("Step-5 empty staging view")
         };
         let (positions, requests, ring_table, page_table) = (next()?, next()?, next()?, next()?);
+        let (graph_requests, graph_ring_table, graph_page_table) = (next()?, next()?, next()?);
         let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
             let spec = programs.spec("step5_region_compress")?;
             ensure!(spec.scalar_kinds == b"il" && spec.scratch.is_empty()
@@ -202,6 +209,7 @@ impl<'a> Staging<'a> {
             sparse,
             compact,
             positions, requests, ring_table, page_table,
+            graph_requests, graph_ring_table, graph_page_table,
             table_width,
             sequences,
             rows,
@@ -228,6 +236,12 @@ impl<'a> Staging<'a> {
             .flat_map(|page| ((page as u64 % physical_pages) as i32).to_le_bytes())
             .collect();
         device.run(|| device.library.copy_h2d(owner.ring_table.buffer, &table))?;
+        for sequence in 0..sequences {
+            let table: Vec<u8> = (0..table_width).flat_map(|page|
+                ((sequence as u64 * physical_pages + page as u64 % physical_pages) as i32).to_le_bytes()).collect();
+            let target = view(owner.graph_ring_table.buffer, sequence * table_width * 4, table_width * 4)?;
+            device.run(|| device.library.copy_h2d(target, &table))?;
+        }
         Ok(owner)
     }
     pub(super) fn positions(&self) -> CuteafdDeviceBuffer { self.positions.buffer }
@@ -589,7 +603,14 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         step.active = true;
         let positions: Vec<u8> = step.sequences.iter().flat_map(|sequence|
             (sequence.base..sequence.base + sequence.rows).flat_map(|p| (p as i64).to_le_bytes())).collect();
+        let graph_requests: Vec<u8> = step.sequences.iter().flat_map(|sequence|
+            (0..sequence.rows).flat_map(|_| (sequence.sequence as i32).to_le_bytes())).collect();
         for stage in &step.staging {
+            stage.stream.device.run(|| {
+                // SAFETY: persistent row IDs are uploaded on their consuming lane stream.
+                unsafe { stage.stream.device.library.copy_h2d_ordered(
+                    stage.graph_requests.buffer, &graph_requests, stage.stream.raw) }
+            })?;
             stage.stream.device.run(|| {
                 // SAFETY: owned metadata and lane allocations survive the Drop drain.
                 unsafe { stage.stream.device.library.copy_h2d_ordered(
@@ -599,6 +620,12 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 let table: Vec<u8> = sequence.pages.iter().flat_map(|p| (*p as i32).to_le_bytes()).collect();
                 let bytes = (stage.table_width * 4).max(256);
                 let target = view(stage.page_table.buffer, index * bytes, bytes)?;
+                let graph_target = view(stage.graph_page_table.buffer,
+                    sequence.sequence as usize * stage.table_width * 4, stage.table_width * 4)?;
+                stage.stream.device.run(|| {
+                    // SAFETY: physical-sequence tables survive all graph replays and are stream ordered.
+                    unsafe { stage.stream.device.library.copy_h2d_ordered(graph_target, &table, stage.stream.raw) }
+                })?;
                 stage.stream.device.run(|| {
                     // SAFETY: sequence-local tables are disjoint; ordered uploads retain sources.
                     unsafe { stage.stream.device.library.copy_h2d_ordered(target, &table, stage.stream.raw) }
@@ -752,12 +779,53 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                 }, sequence.start)
             };
             work(input_owner, AttentionRead { inputs, start, key, value, summaries, table,
-                table_width: stage.table_width, pages })?;
+                table_width: stage.table_width, table_batch: 1, pages })?;
         }
         self.attended[rank].insert((layer, self.unit));
         self.failed = false;
         guard.complete = true;
         Ok(())
+    }
+
+    /// Native selected attention indexes persistent cache components through device row IDs.
+    /// No sequence, absolute position, physical page or request offset enters a graph key.
+    pub(super) fn attend_batched<O>(&mut self, rank: usize, layer: usize, input_owner: &'e O,
+        work: impl FnOnce(&'e O, AttentionRead<'_, 'a>) -> Result<()>) -> Result<bool> {
+        if self.unit_mode() { return Ok(false); }
+        let cache = self.ranks[rank].borrow();
+        let state = &cache.layout().ranks[rank];
+        let stage = self.staging[rank];
+        let (key, value, summaries, table, pages) =
+            if let Some(ring) = state.sliding.iter().find(|r| r.layer == layer && !r.mtp) {
+                (cache.component(ring.key)?, cache.component(ring.value)?, None,
+                    stage.graph_ring_table.buffer,
+                    usize::try_from(cache.layout().ring.rows / 64 * cache.sequences())?)
+            } else {
+                let region = state.regions.iter().find(|r| r.layer == layer)
+                    .context("Step-5 batched attention layer")?;
+                let summary = region.summaries.context("Step-5 batched summary span")?;
+                // The native region-score ABI's request stride is compiled at 1M/8 summaries.
+                // Shorter explicit contexts retain the sequence-local eager reader.
+                if summary.bytes != 131072 * 256 { return Ok(false); }
+                let (key, value) = cache.csa_planes(layer)?;
+                (key, value, Some(cache.component(summary)?), stage.graph_page_table.buffer,
+                    usize::try_from(cache.page_count())?)
+            };
+        ensure!(!self.failed && self.complete[rank].contains(&(layer, self.unit)),
+            "Step-5 batched attention requires staged layer");
+        self.failed = true;
+        let mut guard = stage.stream.cancellation_guard("Step-5 batched attention callback");
+        guard.complete = self.submission.get();
+        work(input_owner, AttentionRead { inputs: StepInputs {
+            stream: &stage.stream, positions: stage.positions.buffer, requests: stage.graph_requests.buffer,
+            rows: self.rows, base: self.base, extent: self.extent,
+            heads: cache.layout().query_heads(rank, layer)?, kv_format: cache.layout().kv_format,
+        }, start: 0, key, value, summaries, table, table_width: stage.table_width,
+            table_batch: stage.sequences, pages })?;
+        self.attended[rank].insert((layer, self.unit));
+        self.failed = false;
+        guard.complete = true;
+        Ok(true)
     }
 
     /// BF16 projections are ordered on the lane stream. Borrowed allocations

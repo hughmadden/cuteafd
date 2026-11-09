@@ -254,10 +254,11 @@ fn admit_native<T>(admission: &[RankAdmission],
 
 pub(super) struct Execution<'e, 'a> {
     main: MainExecution<'e, 'a>,
-    startup_captures: u64,
 }
 
 struct MainExecution<'e, 'a> {
+    graphs: Vec<super::graphs::Graphs<'a>>,
+    graph_enabled: Cell<bool>,
     checkpoint: &'a Checkpoint,
     ownership: ExecutionOwnership,
     native: NativeOwners<'a>,
@@ -507,7 +508,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(transport.is_some() == (count == 92), "Step-5 main Spark transport inventory");
         let main = MainExecution::bind(checkpoint, ownership, native.0, caches, stages, rows, transport, count,
             placement_version)?;
-        Ok(Self { main, startup_captures: cuteafd_ffi::graph_captures() })
+        Ok(Self { main })
     }
 }
 
@@ -750,7 +751,8 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 Some(onboard)
             }
         };
-        let execution = Self { checkpoint, ownership, native, caches, stages, exchange,
+        let execution = Self { graphs: (0..devices.len()).map(|_| super::graphs::Graphs::new()).collect(),
+            graph_enabled: Cell::new(false), checkpoint, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, tp2, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
@@ -867,7 +869,10 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             },
             links: || self.with_transport(|link| link.terminal_quiesce()),
             copies: || self.with_transport(|link| { link.terminal_drain_copies()?; link.terminal_release() }),
-            graphs: || Ok(()),
+            graphs: || {
+                for bank in &self.graphs { bank.clear_drained(); }
+                Ok(())
+            },
             finish: |drained| {
                 self.exchange.finish_terminal(drained);
                 if !drained { self.caches[0].borrow().stream.device.library.quarantine_module_after_failed_drain(); }
@@ -901,6 +906,41 @@ pub(super) fn collect_lane_results(results: impl IntoIterator<Item = Result<()>>
 }
 
 impl<'e, 'a> Execution<'e, 'a> {
+    pub(super) fn configure_graphs(&mut self, enabled: bool) -> Result<()> {
+        if enabled {
+            for rank in 0..self.main.graphs.len() {
+                let device = self.main.device(rank)?;
+                self.main.graphs[rank].attach(device.library, device.id, rank)?;
+            }
+        }
+        self.main.graph_enabled.set(enabled);
+        Ok(())
+    }
+
+    fn graph_cycle(&self, kind: ExpertV2SourceKind) {
+        use crate::shared::decode_graph::device::Cycle;
+        let cycle = match kind {
+            ExpertV2SourceKind::Decode => Cycle::Decode,
+            ExpertV2SourceKind::MtpVerify => Cycle::Verify,
+            ExpertV2SourceKind::Prefill => Cycle::Prefill,
+            ExpertV2SourceKind::Benchmark => Cycle::Other,
+        };
+        for bank in &self.main.graphs { bank.cycle(cycle); }
+    }
+
+    fn graph_completed(&self) -> Result<()> {
+        if !self.main.graph_enabled.get() { return Ok(()); }
+        if !self.main.graphs.iter().any(|bank| bank.needs_boundary()) {
+            for bank in &self.main.graphs { bank.tick(); }
+            return Ok(());
+        }
+        // enqueue drains every rank before reaching this outer step boundary.
+        // SAFETY: graph owners hold no allocations; native, cache and staging storage
+        // stays live in this execution and its borrowed owners until terminal drainage.
+        unsafe { crate::shared::decode_graph::device::observe_completed(self.main.device(0)?.library,
+            |visit| { for bank in &self.main.graphs { bank.visit(visit)?; } Ok(()) }) }
+    }
+
     pub(super) fn validate_caches(&self, caches: &[&RefCell<CacheRank<'a>>], rows: usize) -> Result<()> {
         let owner = &self.main;
         ensure!(owner.rows == rows && caches.len() == owner.caches.len()
@@ -913,7 +953,6 @@ impl<'e, 'a> Execution<'e, 'a> {
         Ok((self.main.device(rank)?, self.main.terminal_output.take().context("Step-5 terminal wave absent")?))
     }
     pub(super) fn require_live(&self) -> Result<()> {
-        check_captures(self.startup_captures, cuteafd_ffi::graph_captures())?;
         self.main.exchange.require_live()?;
         if let Some(tp2) = &self.main.tp2 { tp2.pair.routes.require_live()?; }
         ensure!(self.main.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
@@ -977,6 +1016,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub fn enqueue<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
         input: &'s Allocation<'a>, kind: ExpertV2SourceKind) -> Result<()> {
         let main = &self.main;
+        self.graph_cycle(kind);
         main.terminal_output.set(None);
         step.validate_binding(&main.caches, &main.stages, main.rows)?;
         if let Exchange::Pair { peer, hops } = &main.exchange {
@@ -999,7 +1039,8 @@ impl<'e, 'a> Execution<'e, 'a> {
             ensure!(output.device_id == main.device(head)?.id, "Step-5 terminal output rank mismatch");
             main.terminal_output.set(Some(output));
             collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
-        }))
+        }))?;
+        self.graph_completed()
     }
 }
 
@@ -1017,6 +1058,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub fn enqueue_units<'s, E: CopyEngine>(&'s self, step: &mut Step<'s, 'a, E>,
         input: &'s Allocation<'a>, kind: ExpertV2SourceKind, units: &[crate::shared::prefill_pipeline::Unit],
         waves: usize) -> Result<()> {
+        self.graph_cycle(kind);
         let main = &self.main;
         main.terminal_output.set(None);
         step.validate_binding(&main.caches, &main.stages, main.rows)?;
@@ -1198,11 +1240,6 @@ pub(super) fn bootstrap_shape(rows: usize, format: &super::experts::StepExperts)
     Ok(shape)
 }
 
-fn check_captures(startup: u64, current: u64) -> Result<()> {
-    ensure!(startup == current, "Step-5 zero-steady-capture contract: startup={startup}, current={current}");
-    Ok(())
-}
-
 fn request_identity(ordinal: u64) -> Result<u64> {
     ordinal.checked_add(1).context("Step-5 request namespace exhausted")
 }
@@ -1219,6 +1256,11 @@ struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     lane: usize,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
+    fn graphing(&self) -> bool {
+        self.execution.graph_enabled.get() && !self.units && self.diagnostic.is_none()
+            && !self.execution.poison_scratch.get()
+            && matches!(self.kind, ExpertV2SourceKind::Decode | ExpertV2SourceKind::MtpVerify)
+    }
     /// Rows of the selected unit: every hook runs these, never the span.
     fn rows(&self) -> usize { self.step.unit_rows().len() }
 
@@ -1270,6 +1312,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     /// result's rank for `finish_ffn` (its join adds the shared expert).
     fn tp2_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Option<usize>> {
         let execution = self.execution;
+        let graphing = self.graphing();
         let onboard = execution.tp2.as_ref().context("Step-5 TP2 onboarding not bound")?;
         let rows = self.rows();
         let lane = self.lane;
@@ -1289,7 +1332,11 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             self.copy(rank, local.ffn_input(), local.post())?;
             let Ffn::Routed(ffn) = &local.ffn else { anyhow::bail!("Step-5 TP2 layer without a routed FFN"); };
             self.step.compose(rank, ffn, |ffn, meta| ffn.frontend_on(meta.rows, meta.stream))?;
-            self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+            self.step.compose(rank, ffn, |ffn, meta| {
+                            if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                                section: super::graphs::Section::Shared }, meta.stream, || ffn.shared_on(meta.rows, meta.stream)) }
+                            else { ffn.shared_on(meta.rows, meta.stream) }
+                        })?;
             self.current[rank] = Some(local.output());
         }
         let slot = if source.is_some() { 5 } else { 4 };
@@ -1380,9 +1427,16 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             self.execution.stages[rank].stream.drain()?;
             self.execution.native.arenas[rank].poison_after(self.rows() * H * 4)?;
         }
-        match &owner.attention {
-            Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
-            Attention::Sparse(owner) => owner.enqueue_attention_step(self.step, rank),
+        if self.graphing() {
+            match &owner.attention {
+                Attention::Sliding(owner) => owner.enqueue_attention_graphed(self.step, rank, &self.execution.graphs[rank]),
+                Attention::Sparse(owner) => owner.enqueue_attention_graphed(self.step, rank, &self.execution.graphs[rank]),
+            }
+        } else {
+            match &owner.attention {
+                Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
+                Attention::Sparse(owner) => owner.enqueue_attention_step(self.step, rank),
+            }
         }
     }
 }
@@ -1460,20 +1514,33 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             let local = execution.layer(rank, layer)?;
             self.copy(rank, local.ffn_input(), local.post())?;
             match &local.ffn {
-                Ffn::Dense(ffn) => self.step.compose(rank, ffn, |ffn, meta| {
-                    ffn.enqueue_on(meta.rows, meta.stream)
-                })?,
+                Ffn::Dense(ffn) => {
+                    let graphing = self.graphing();
+                    self.step.compose(rank, ffn, |ffn, meta| {
+                        if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                            section: super::graphs::Section::Dense }, meta.stream, || ffn.enqueue_on(meta.rows, meta.stream)) }
+                        else { ffn.enqueue_on(meta.rows, meta.stream) }
+                    })?;
+                },
                 Ffn::Routed(ffn) => {
                     let dispatch = execution.ownership.layer(layer, rank)?.routed_wave;
+                    let graphing = self.graphing();
                     self.step.compose(rank, ffn, |ffn, meta| {
-                        if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
+                        if dispatch && graphing {
+                            execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                                section: super::graphs::Section::Frontend }, meta.stream, || ffn.frontend_on(meta.rows, meta.stream))
+                        } else if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
                     if dispatch && execution.ownership.onboarded(layer) {
                         // Onboarded: the entry GPU's EXL3 experts replace the Spark wave.
                         ensure!(wave.is_none(), "Step-5 duplicate routed dispatch");
                         let experts = execution.native.onboarded.as_ref().context("Step-5 onboarded experts not loaded")?;
-                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                        self.step.compose(rank, ffn, |ffn, meta| {
+                            if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                                section: super::graphs::Section::Shared }, meta.stream, || ffn.shared_on(meta.rows, meta.stream)) }
+                            else { ffn.shared_on(meta.rows, meta.stream) }
+                        })?;
                         self.step.compose(rank, ffn, |ffn, meta| ffn.onboard_on(experts, meta.rows, meta.stream))?;
                         wave = Some(rank);
                     } else if dispatch {
@@ -1503,12 +1570,18 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         }))?;
                         drop(transport);
                         // The shared expert runs while the worker sends and the Sparks compute.
-                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                        self.step.compose(rank, ffn, |ffn, meta| {
+                            if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                                section: super::graphs::Section::Shared }, meta.stream, || ffn.shared_on(meta.rows, meta.stream)) }
+                            else { ffn.shared_on(meta.rows, meta.stream) }
+                        })?;
                         execution.pending_wave.borrow_mut().push_back(ticket);
                         wave = Some(rank);
                     } else {
                         self.step.compose(rank, ffn, |ffn, meta| {
-                            ffn.shared_on(meta.rows, meta.stream)
+                            if graphing { execution.graphs[rank].run(super::graphs::Key { layer, rows: meta.rows,
+                                section: super::graphs::Section::Shared }, meta.stream, || ffn.shared_on(meta.rows, meta.stream)) }
+                            else { ffn.shared_on(meta.rows, meta.stream) }
                         })?;
                     }
                 }
@@ -1556,7 +1629,12 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         for at in 0..execution.ownership.ranks() {
             if !split && at != rank { continue; }
             let Ffn::Routed(ffn) = &execution.layer(at, layer)?.ffn else { anyhow::bail!("Step-5 native routed join missing"); };
-            self.step.compose(at, ffn, |ffn, meta| ffn.finish_on(meta.rows, meta.stream))?;
+            let graphing = self.graphing();
+            self.step.compose(at, ffn, |ffn, meta| {
+                if graphing { execution.graphs[at].run(super::graphs::Key { layer, rows: meta.rows,
+                    section: super::graphs::Section::Finish }, meta.stream, || ffn.finish_on(meta.rows, meta.stream)) }
+                else { ffn.finish_on(meta.rows, meta.stream) }
+            })?;
         }
         self.retain_diagnostic_output(layer)
     }
@@ -2001,12 +2079,6 @@ mod tests {
             for rows in [0, 4097] { assert!(bootstrap_shape(rows, &format).is_err()); }
         }
         Ok(())
-    }
-
-    #[test]
-    fn eager_execution_never_grows_the_capture_count() {
-        check_captures(19, 19).unwrap();
-        assert!(check_captures(19, 20).is_err());
     }
 
     #[test]

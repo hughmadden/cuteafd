@@ -812,6 +812,29 @@ impl<'a> SwaLayer<'a> {
         })
     }
 
+    pub(super) fn enqueue_attention_graphed<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e self, step: &mut Step<'e, 'a, E>, rank: usize, graphs: &super::graphs::Graphs<'a>,
+    ) -> Result<()> {
+        use super::graphs::{Key, Section};
+        ensure!(self.ffn.is_none(), "shared SWA owns its FFN separately");
+        step.project(rank, self.immutable.layer, self, |layer, input| {
+            layer.check_input(&input)?;
+            graphs.run(Key { layer: self.immutable.layer, rows: input.rows, section: Section::Projection },
+                input.stream, || layer.project_on(input.rows, input.positions, input.stream))
+        })?;
+        step.stage(rank, self.immutable.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
+        let batched = step.attend_batched(rank, self.immutable.layer, self, |layer, read| {
+            let rows = read.inputs.rows;
+            let stream = read.inputs.stream;
+            graphs.run(Key { layer: self.immutable.layer, rows, section: Section::Attention }, stream, || {
+                layer.read_attention_on(read.clone())?;
+                layer.finish_on(rows, stream)
+            })
+        })?;
+        ensure!(batched, "Step-5 SWA graph path requires a whole decode wave");
+        Ok(())
+    }
+
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
             input.heads == self.immutable.heads
@@ -861,6 +884,7 @@ impl<'a> SwaLayer<'a> {
             read.table,
             read.table_width,
             read.pages,
+            read.table_batch,
             input.stream,
         )
     }
@@ -877,6 +901,7 @@ impl<'a> SwaLayer<'a> {
             self.planes[TABLE].buffer,
             self.admission.pages,
             self.admission.pages,
+            1,
             self.stream.get()?,
         )
     }
@@ -892,6 +917,7 @@ impl<'a> SwaLayer<'a> {
         table: CuteafdDeviceBuffer,
         table_width: usize,
         pages: usize,
+        table_batch: usize,
         stream: &Stream<'a>,
     ) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
@@ -916,7 +942,7 @@ impl<'a> SwaLayer<'a> {
             ],
             &[
                 Scalar::I64(pages as i64),
-                Scalar::I64(1),
+                Scalar::I64(table_batch as i64),
                 Scalar::I64(table_width as i64),
                 Scalar::F32(192f32.sqrt().recip()),
                 Scalar::I32(rows as i32),

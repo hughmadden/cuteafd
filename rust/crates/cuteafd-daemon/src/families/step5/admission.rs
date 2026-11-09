@@ -286,7 +286,7 @@ mod tests {
                 .collect();
             let contract = cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
             let cfg = cuteafd_loader::plan::families::step5::Config::parse(&checkpoint)?;
-            let mut inputs = RuntimeInputs {
+            let mut inputs = RuntimeInputs { decode_graphs: false,
                 bf16_target_head: opts.bf16_target_head,
                 host: admission::HostInputs::from_contract(&contract, &cfg, ranks,
                     opts.host_memory.unwrap(), host, 8 << 30)?, resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()),

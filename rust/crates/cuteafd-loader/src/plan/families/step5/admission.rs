@@ -149,7 +149,10 @@ pub fn staging_layout(layout: &Step5CacheLayout, rank: usize, sequences: usize)
         .max(256);
     let mut sizes = vec![step.checked_mul(8).context("Step-5 positions overflow")?.max(256),
         step.checked_mul(4).context("Step-5 requests overflow")?.max(256), table,
-        table.checked_mul(sequences).context("Step-5 page tables overflow")?];
+        table.checked_mul(sequences).context("Step-5 page tables overflow")?,
+        step.checked_mul(4).context("Step-5 graph requests overflow")?.max(256),
+        table.checked_mul(sequences).context("Step-5 graph ring tables overflow")?,
+        table.checked_mul(sequences).context("Step-5 graph page tables overflow")?];
     if layers > 0 { sizes.extend([metadata, metadata, scratch]); }
     let raw = rows.checked_mul(256 * 2).context("Step-5 raw staging overflow")?;
     for _ in 0..layers { sizes.extend([raw, raw]); }
@@ -173,6 +176,7 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// absolute additional peaks above that same sample, not steady-state deltas.
 #[derive(Clone)]
 pub struct RuntimeInputs {
+    pub decode_graphs: bool,
     pub host: HostInputs,
     pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     pub resident_weight_limit: Option<ResidentWeights>,
@@ -588,7 +592,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,

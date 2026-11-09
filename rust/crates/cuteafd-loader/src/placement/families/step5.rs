@@ -443,6 +443,17 @@ impl<'a> Step5Recipe<'a> {
                 }
             })).collect::<Vec<_>>();
         let mut runtime = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
+        if inputs.decode_graphs {
+            for rank in 0..ranks {
+                // No traced Step-5 arena exists yet. Explicit totals enable bounded
+                // bootstrap captures; zero base means zero default charge.
+                let reserve = crate::placement::graph_reserve::current(rank, false, 0, 0)?;
+                runtime.push(Component { activation: Activation::always(), bytes: ByteCurve::fixed(reserve.bytes, maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
+                        bytes: reserve.bytes, lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                        assumed: false, source: crate::placement::graph_reserve::source(&format!("step5.graphs.{rank}")) }) });
+            }
+        }
         let peak = crate::plan::families::step5::admission::startup_peak_live_streams();
         let bytes = cuda_stream_slab_bytes(peak)?;
         for rank in 0..ranks {

@@ -825,6 +825,27 @@ impl<'a> CsaLayer<'a> {
         step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_attention_on(read))
     }
 
+    pub(super) fn enqueue_attention_graphed<'e, E: cuteafd_hostcache::copy::CopyEngine>(
+        &'e self, step: &mut Step<'e, 'a, E>, rank: usize, graphs: &super::graphs::Graphs<'a>,
+    ) -> Result<()> {
+        use super::graphs::{Key, Section};
+        ensure!(self.ffn.is_none(), "shared CSA owns its FFN separately");
+        step.project(rank, self.immutable.layer, self, |layer, input| {
+            layer.check_input(&input)?;
+            graphs.run(Key { layer: self.immutable.layer, rows: input.rows, section: Section::Projection },
+                input.stream, || layer.project_on(input.rows, input.positions, input.stream))
+        })?;
+        step.stage(rank, self.immutable.layer, &self.planes[KEY], &self.planes[VALUE],
+            Some((&self.planes[IK], &self.planes[IZ])))?;
+        if !step.attend_batched(rank, self.immutable.layer, self, |layer, read| {
+            graphs.run(Key { layer: self.immutable.layer, rows: read.inputs.rows, section: Section::Attention },
+                read.inputs.stream, || layer.read_attention_on(read.clone()))
+        })? {
+            step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_attention_on(read))?;
+        }
+        Ok(())
+    }
+
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
             input.heads == 64
@@ -860,6 +881,7 @@ impl<'a> CsaLayer<'a> {
                 read.inputs.positions,
                 read.inputs.requests,
                 summary,
+                read.table_batch,
                 read.inputs.stream,
             )?;
             self.attend_on(
@@ -872,6 +894,7 @@ impl<'a> CsaLayer<'a> {
                 read.table,
                 read.table_width,
                 read.pages,
+                read.table_batch,
                 read.inputs.stream,
             )?;
             self.finish_on(start, count, read.inputs.stream)?;
@@ -952,6 +975,7 @@ impl<'a> CsaLayer<'a> {
             self.planes[POSITIONS].buffer,
             self.planes[REQUESTS].buffer,
             self.planes[SUMMARY].buffer,
+            1,
             self.stream.get()?,
         )
     }
@@ -962,6 +986,7 @@ impl<'a> CsaLayer<'a> {
         positions: CuteafdDeviceBuffer,
         requests: CuteafdDeviceBuffer,
         summary: CuteafdDeviceBuffer,
+        table_batch: usize,
         stream: &Stream<'a>,
     ) -> Result<()> {
         ensure!(
@@ -983,7 +1008,7 @@ impl<'a> CsaLayer<'a> {
                 positions.ptr.wrapping_byte_add(start * 8),
                 self.ptr(SCORES, 0),
             ],
-            &[Scalar::I32(rows as i32), Scalar::I64(1)],
+            &[Scalar::I32(rows as i32), Scalar::I64(table_batch as i64)],
         )?;
         self.select_on(start, rows, positions, requests, stream)
     }
@@ -1032,6 +1057,7 @@ impl<'a> CsaLayer<'a> {
             self.planes[TABLE].buffer,
             self.admission.pages,
             self.admission.pages,
+            1,
             self.stream.get()?,
         )
     }
@@ -1046,6 +1072,7 @@ impl<'a> CsaLayer<'a> {
         table: CuteafdDeviceBuffer,
         table_width: usize,
         pages: usize,
+        table_batch: usize,
         stream: &Stream<'a>,
     ) -> Result<()> {
         let q = self.ptr(QUERY, start * Q * 2);
@@ -1068,7 +1095,7 @@ impl<'a> CsaLayer<'a> {
             ],
             &[
                 Scalar::I64(pages as i64),
-                Scalar::I64(1),
+                Scalar::I64(table_batch as i64),
                 Scalar::I64(table_width as i64),
                 Scalar::F32(192f32.sqrt().recip()),
                 Scalar::I32(rows as i32),
