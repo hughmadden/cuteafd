@@ -243,7 +243,7 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
     spark_ranks: usize, spark_bf16: bool, ple_row_bytes: Option<u64>, host_embedding: u64,
     push: Vec<(&'static str, cuteafd_loader::push_load::PushHostEnvelope)>, memory: (u64, u64))
     -> Result<qwen4::QwenHost> {
-    use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, pinned_logits_bytes, scoring_logits_bytes};
+    use qwen4::host::{HostMemory, PleHost, QwenHost, UploadInputs, mtp_pinned_logits_bytes, pinned_logits_bytes, scoring_logits_bytes};
     let (total, available) = memory;
     let shape = args.resolved_prefill()?;
     let unit_rows = shape.unit_rows.max(super::engine::DECODE_ROWS as u64);
@@ -278,6 +278,7 @@ fn host_owners_with_memory(args: &EngineArgs, cfg: &Qwen4Config, layers: usize, 
         memory: HostMemory { total, available },
         ple, uploads: vec![bounds; owners], mtp_upload,
         pinned_logits: pinned_logits_bytes(owners, args.full_prefill_logits, shape.span_rows, cfg.vocab_size as u64)?,
+        mtp_pinned_logits: mtp_pinned_logits_bytes(args.prefill_shape()?.is_some(), mtp && cfg.mtp_layers > 0, cfg.vocab_size as u64)?,
         scoring_logits: scoring_logits_bytes(args.full_prefill_logits, shape.span_rows, cfg.vocab_size as u64)?,
         prefix_quota, prefix_chunk,
         loaded_media_cache: args.planner_media_cache_bytes,
@@ -1009,7 +1010,7 @@ mod tests {
                 let planned = layout.devices[rank].items.iter().filter(|item| item.group != "context+modules")
                     .cloned().collect::<Vec<_>>();
                 let mut actual = runtime.items[rank].clone();
-                let index = actual.iter().position(|item| item.group.starts_with("Qwen context and selected modules"))
+                let index = actual.iter().position(|item| item.group.starts_with("sampled baseline: Qwen context and selected modules"))
                     .unwrap_or_else(|| panic!("rank {rank}: no measured-occupancy owner in {actual:?}"));
                 let owner = actual.remove(index);
                 assert_eq!(owner.bytes, sampled,
@@ -1096,7 +1097,7 @@ mod tests {
                 // runtime item is the plan's own item.
                 let mut measured = Vec::new();
                 for item in &placement.items[0] {
-                    if item.group.starts_with("Qwen context and selected modules") {
+                    if item.group.starts_with("sampled baseline: Qwen context and selected modules") {
                         measured.push(item);
                     } else {
                         assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
@@ -1159,6 +1160,44 @@ mod tests {
         assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
         let shared = super::super::engine::Experts::SharedOnly;
         assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);
+        Ok(())
+    }
+
+    #[test]
+    fn spark_layouts_admit_the_separate_mtp_logits_landing() -> anyhow::Result<()> {
+        use clap::Parser;
+        use super::super::engine::validate_admitted_host;
+        use super::HostWorkspaceBytes;
+        #[derive(Parser)]
+        struct Cli { #[command(flatten)] engine: super::super::EngineArgs }
+        let mut cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(4))?;
+        cfg.mtp_layers = 1;
+        // Two requested RTX cards with Sparks still use one attention owner.
+        for requested_gpus in [1, 2] {
+            for sparks in [0, 1, 4] {
+                for mtp in [false, true] {
+                    let mut args = Cli::parse_from(["test", "--snapshot", ".", "--native-lib", "native.so"]).engine;
+                    args.prefill_rows = if sparks > 0 { 2752 } else { 4096 };
+                    args.prefill_waves = if sparks > 0 { 3 } else { 1 };
+                    args.local_experts = sparks == 0;
+                    args.peers = (sparks > 0).then(|| (0..sparks).map(|rank| format!("host{rank}:9000")).collect::<Vec<_>>().join(","));
+                    let owners = if sparks == 0 { requested_gpus } else { 1 };
+                    let host = super::host_owners_with_memory(&args, &cfg, 4, mtp,
+                        owners, sparks, false, None, 0, Vec::new(), (1 << 40, 1 << 40))?;
+                    let expected = if sparks > 0 && mtp { cfg.vocab_size as u64 * 4 } else { 0 };
+                    assert_eq!(host.mtp_pinned_logits, expected);
+                    assert_eq!(host.pinned_logits, owners as u64 * 65 * cfg.vocab_size as u64 * 4);
+                    if expected > 0 {
+                        let exact = HostWorkspaceBytes::mtp(&cfg, 2752, 16, 1, 3)?;
+                        let tables = [("qwen4/owner-0/mtp-prefill/pinned-logits".into(), exact.logits)];
+                        validate_admitted_host(&host, &tables, 0, 1)?;
+                        let over = [(tables[0].0.clone(), exact.logits + 1)];
+                        assert!(validate_admitted_host(&host, &over, 0, 1).is_err());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

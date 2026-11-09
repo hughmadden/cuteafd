@@ -237,6 +237,31 @@ mod tests {
     }
 
     #[test]
+    fn sampled_context_survives_zero_gpu_reserve() {
+        cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+            for ranks in [1, 2] {
+                let (cfg, spark, no_spark) = fixture(ranks, 4096);
+                let mut facts = input(&cfg, &spark, &no_spark, ranks, 4096);
+                let occupancy = 686_424_064;
+                for budget in facts.budgets.iter_mut().take(ranks) {
+                    budget.baseline = crate::placement::planner::Baseline::Sampled {
+                        free: budget.physical_bytes - occupancy, phase: crate::placement::planner::Phase::Load,
+                        source: "test preweight sample".into() };
+                }
+                let prepared = facts.prepare().unwrap();
+                let request = admission::production_request(4096, Some(4096), Onboard::Layers(0),
+                    prepared.recipe.prefill, crate::placement::planner::Operation::Serving,
+                    ResidentWeights(u64::MAX), Default::default());
+                let admitted = prepared.admit(request).unwrap();
+                let owners: Vec<_> = admitted.solved.facts.allowances.iter().filter(|owner|
+                    crate::placement::sampled_baseline::is_source(&owner.source)).collect();
+                assert_eq!(owners.len(), ranks);
+                assert!(owners.iter().all(|owner| owner.bytes == occupancy));
+            }
+        });
+    }
+
+    #[test]
     fn measured_context_is_named_once_without_reducing_capacity_twice() {
         use crate::placement::planner::{Baseline, Location, Operation, Phase};
         for ranks in [1, 2] {
@@ -261,14 +286,14 @@ mod tests {
                 let location = Location::coordinator(rank as u8);
                 for phase in [Phase::Load, Phase::Warmup, Phase::Ready, Phase::Growth] {
                     let items = admitted.solved.items_at(location, phase).unwrap();
-                    let owners = items.iter().filter(|item| item.group.starts_with("MiMo context and selected modules:")).collect::<Vec<_>>();
+                    let owners = items.iter().filter(|item| item.group.starts_with("sampled baseline: MiMo context and selected modules:")).collect::<Vec<_>>();
                     assert_eq!(owners.len(), 1);
                     assert_eq!(owners[0].bytes, occupancy);
                 }
                 let receipt = &capacity.devices[rank];
                 assert_eq!(receipt.non_engine_bytes, 0);
                 assert_eq!(receipt.reservations.iter().filter(|item|
-                    item.name.starts_with("MiMo context and selected modules:")).map(|item| item.bytes).sum::<u64>(), occupancy);
+                    item.name.starts_with("sampled baseline: MiMo context and selected modules:")).map(|item| item.bytes).sum::<u64>(), occupancy);
                 assert_eq!(receipt.engine_budget_bytes, before);
             }
             // Offline forecasts are already itemized outside the recipe.

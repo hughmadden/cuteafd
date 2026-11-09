@@ -3687,6 +3687,28 @@ fn graph_cache_reserve_survives_gpu_reserve_override() {
 }
 
 #[test]
+fn sampled_family_occupancy_survives_zero_gpu_reserve() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    for family in ["Qwen context and selected modules", "MiMo context and selected modules",
+        "CUDA context and loaded modules", "V4 context and selected modules",
+        "Dense Qwen context and selected modules"] {
+        let mut contract = with_reserve_components(1 << 15);
+        let source = crate::placement::sampled_baseline::source(family);
+        contract.components.push(Component { activation: Activation::always(),
+            bytes: ByteCurve::fixed(500, 1 << 15),
+            kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+                bytes: 500, lifetime: Lifetime::RESIDENT, source: source.clone(), assumed: false }) });
+        let solved = MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(||
+            solve(request(), vec![budget(1500 + 64 * 100)], &Prepared(contract))).unwrap();
+        assert_eq!(solved.facts.allowances.len(), 1, "{family}");
+        assert_eq!(solved.facts.allowances[0].source, source);
+        assert_eq!(solved.facts.allowances[0].bytes, 500);
+        assert_eq!(solved.budgets[0].physical_bytes, 1500 + 64 * 100);
+        assert_eq!(solved.budgets[0].headroom, 0);
+    }
+}
+
+#[test]
 fn dashboard_reservations_include_deferred_host_prefix_and_match_assess() {
     let mut p = plan(vec![]);
     p.budgets[0].id = "host".into();

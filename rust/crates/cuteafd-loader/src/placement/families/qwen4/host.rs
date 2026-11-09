@@ -129,6 +129,8 @@ pub struct QwenHost {
     pub mtp_upload: Option<UploadBound>,
     /// Pinned logits landing, all owners (FP32).
     pub pinned_logits: u64,
+    /// Owner 0's separate MTP prefill workspace, when unit prefill runs MTP.
+    pub mtp_pinned_logits: u64,
     /// Host FP32 scoring logits (`host_logits_bytes`).
     pub scoring_logits: u64,
     /// Host prefix retention quota and its chunk.
@@ -180,6 +182,12 @@ pub fn pinned_logits_bytes(owners: usize, full_prefill_logits: bool, span_rows: 
     host_logits_bytes(rows, rows, vocab).ok_or(Refusal::Overflow("Qwen pinned logits"))
 }
 
+/// The separate MTP prefill workspace lands one row, even in full-logit mode.
+pub fn mtp_pinned_logits_bytes(prefill_shape: bool, mtp: bool, vocab: u64) -> Result<u64, Refusal> {
+    if !prefill_shape || !mtp { return Ok(0); }
+    host_logits_bytes(1, 1, vocab).ok_or(Refusal::Overflow("Qwen MTP pinned logits"))
+}
+
 /// Host FP32 scoring logits: the full span when scoring, else one decode wave.
 pub fn scoring_logits_bytes(full_prefill_logits: bool, span_rows: u64, vocab: u64) -> Result<u64, Refusal> {
     let rows = if full_prefill_logits { span_rows } else { 64 };
@@ -227,6 +235,8 @@ impl QwenHost {
         }
         out.push(fixed_owner("qwen.host.logits.pinned".into(), Location::PINNED, self.pinned_logits,
             Lifetime::TARGET, Category::Workspace, "workspace/logits-host", max));
+        out.push(fixed_owner("qwen4/owner-0/mtp-prefill/pinned-logits".into(), Location::PINNED,
+            self.mtp_pinned_logits, Lifetime::TARGET, Category::Workspace, "workspace/logits-host", max));
         out.push(fixed_owner("qwen.host.logits.scoring".into(), Location::HOST, self.scoring_logits,
             post_ready, Category::Workspace, "scoring/full-logits", max));
         if self.prefix_quota > 0 {
@@ -359,7 +369,7 @@ impl QwenHost {
         let (bounds, _) = UploadInputs { prefill_rows: prefill_rows.max(64), waves: 1, spark: false,
             mtp: false, ple_ids: cfg.ple_layers.is_empty() }.bounds(cfg)?;
         Ok(Self { memory: HostMemory { total: 1 << 40, available: 1 << 40 }, ple: None,
-            uploads: vec![bounds; owners], mtp_upload: None, pinned_logits: 0, scoring_logits: 0,
+            uploads: vec![bounds; owners], mtp_upload: None, pinned_logits: 0, mtp_pinned_logits: 0, scoring_logits: 0,
             prefix_quota: 0, prefix_chunk: 0, loaded_media_cache: 0, host_embedding: 0, table_reactor: 0,
             preloaded_tables: 0, spark: [0; 3], push: Vec::new() })
     }
@@ -371,6 +381,35 @@ pub fn units_of(pool_tokens: u64) -> u64 { pool_tokens.div_ceil(QWEN_UNIT_ROWS a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_prefill_logits_are_one_separate_row_only_when_the_workspace_exists() {
+        let vocab = 248_320;
+        for owners in [1, 2] {
+            for full in [false, true] {
+                for shape in [false, true] {
+                    for mtp in [false, true] {
+                        let target = pinned_logits_bytes(owners, full, 8192, vocab).unwrap();
+                        let extra = mtp_pinned_logits_bytes(shape, mtp, vocab).unwrap();
+                        assert_eq!(target, owners as u64 * (64 + if full { 8192 } else { 1 }) * vocab * 4);
+                        assert_eq!(extra, if shape && mtp { vocab * 4 } else { 0 });
+                        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+                        let mut host = QwenHost::ample(&cfg, owners, 8192).unwrap();
+                        host.pinned_logits = target;
+                        host.mtp_pinned_logits = extra;
+                        let components = host.components(1).unwrap();
+                        let rows: Vec<_> = components.iter().filter(|c| matches!(&c.kind,
+                            ComponentKind::Allocation { template, .. }
+                                if template.id == "qwen4/owner-0/mtp-prefill/pinned-logits")).collect();
+                        assert_eq!(rows.len(), usize::from(shape && mtp));
+                        assert_eq!(rows.iter().map(|c| c.bytes.at(1).unwrap()).sum::<u64>(), extra);
+                    }
+                }
+            }
+        }
+        assert_eq!(pinned_logits_bytes(1, false, 8192, vocab).unwrap(), 64_563_200);
+        assert_eq!(mtp_pinned_logits_bytes(true, true, vocab).unwrap(), 993_280);
+    }
 
     #[test]
     fn upload_bound_covers_every_pool_extent_it_admits() {

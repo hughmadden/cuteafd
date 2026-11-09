@@ -366,7 +366,7 @@ impl<'a> ProductionInput<'a> {
                     bytes: ByteCurve::fixed(bytes, maximum_pages),
                     kind: crate::placement::planner::ComponentKind::Allowance(crate::placement::planner::Allowance {
                         location: budget.locations[0], bytes, lifetime: Lifetime::RESIDENT, assumed: false,
-                        source: format!("MiMo context and selected modules: {source}"),
+                        source: crate::placement::sampled_baseline::source(&format!("MiMo context and selected modules: {source}")),
                     }),
                 });
             }

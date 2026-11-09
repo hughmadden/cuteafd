@@ -711,6 +711,19 @@ impl Recipe for KimiRecipe {
             }
         }
         for fixed in &self.fixed {
+            if fixed.group == allocation::CONTEXT_MEASURED {
+                if fixed.weights != 0 || fixed.category != Category::Runtime || fixed.basis != Basis::Exact
+                    || fixed.lifetime != Lifetime::RESIDENT {
+                    return Err(invalid("measured context must be an Exact opaque resident owner"));
+                }
+                if fixed.bytes == 0 { continue; }
+                contract.components.push(Component { activation: Activation::always(),
+                    bytes: ByteCurve::fixed(fixed.bytes, self.maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(fixed.rank),
+                        bytes: fixed.bytes, lifetime: fixed.lifetime, assumed: false,
+                        source: crate::placement::sampled_baseline::source(&fixed.group) }) });
+                continue;
+            }
             if fixed.group == allocation::CODE_OWNER {
                 if fixed.weights != 0 || fixed.category != Category::Runtime || fixed.basis != Basis::Estimated
                     || fixed.lifetime != Lifetime::RESIDENT {
@@ -1108,6 +1121,21 @@ mod tests {
         };
         toy_weight_owners(&mut recipe);
         recipe
+    }
+
+    #[test]
+    fn sampled_context_survives_zero_gpu_reserve() {
+        cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+            let mut recipe = recipe();
+            recipe.fixed.push(FixedOwner { rank: 0, category: Category::Runtime,
+                group: allocation::CONTEXT_MEASURED.into(), bytes: 686_424_064, weights: 0,
+                lifetime: Lifetime::RESIDENT, basis: Basis::Exact });
+            let admitted = recipe.admit(single(), budgets(&[(1 << 30, 1 << 30)], 0, &[0], &[]).unwrap()).unwrap();
+            let owners: Vec<_> = admitted.solved.facts.allowances.iter().filter(|owner|
+                crate::placement::sampled_baseline::is_source(&owner.source)).collect();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, 686_424_064);
+        });
     }
 
     #[test]

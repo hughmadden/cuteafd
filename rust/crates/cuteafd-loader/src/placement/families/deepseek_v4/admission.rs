@@ -903,6 +903,17 @@ impl Recipe for PreparedV4<'_> {
         for (index, demand) in fixed.iter().enumerate() {
             let id = format!("v4.fixed.{index}");
             let activation = Activation::always();
+            if demand.group == "context+modules"
+                && matches!(inputs.gpus[demand.gpu as usize].1, crate::placement::Baseline::Measured { .. }) {
+                owners.components.push(Component { activation,
+                    bytes: ByteCurve::fixed(demand.bytes, self.maximum_pages),
+                    kind: ComponentKind::Allowance(crate::placement::planner::Allowance {
+                        location: Location::coordinator(demand.gpu), bytes: demand.bytes,
+                        lifetime: Lifetime::RESIDENT, assumed: false,
+                        source: crate::placement::sampled_baseline::source("V4 context and selected modules"),
+                    }) });
+                continue;
+            }
             // The daemon's own builders report their exact cudaMalloc request
             // lists for the step workspaces, Spark intake planes and route
             // probe; the prefix mark arena is one request. Both thereby price
