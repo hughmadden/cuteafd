@@ -145,7 +145,7 @@ pub struct Opaque {
 pub fn graph_allowance(rank: usize) -> Result<Opaque, Refusal> {
     let (base, extra) = crate::placement::graph_reserve::v41_default();
     let resolved = crate::placement::graph_reserve::current(rank, false, base, extra)
-        .map_err(Refusal::InvalidFact)?;
+        .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     Ok(Opaque {
         location: Location::coordinator(rank as u8),
         bytes: resolved.bytes,
