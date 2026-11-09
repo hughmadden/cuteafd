@@ -2517,6 +2517,11 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
+  if [[ "$family" == glm5 ]]; then
+    for key in GPU_GRAPH_RESERVE SPARK_GRAPH_RESERVE; do
+      [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
+    done
+  fi
   release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
   plan_profile_mount=0
   for arg in ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"}; do

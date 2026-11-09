@@ -52,5 +52,12 @@ mod tests {
         assert_eq!(resolve(Some("0B"), 1, false, 100, 20).unwrap().bytes, 0);
         assert_eq!(resolve(Some("1GiB"), 1, true, 100, 20).unwrap().bytes, 1 << 30);
         assert!(resolve(Some("gpu0=1GiB,gpu0=2GiB"), 0, false, 0, 0).is_err());
+        assert!(resolve(Some("spark=512MiB"), 0, false, 0, 0).is_err());
+        assert!(resolve(text, 0, true, 0, 0).is_err());
+        assert_eq!(resolve(text, 2, false, 300, 20).unwrap().bytes, 320);
+        for rank in [0, 1, 7] {
+            assert_eq!(resolve(Some("2GiB"), rank, false, 0, 0).unwrap().bytes, 2 << 30);
+            assert_eq!(resolve(Some("1GiB"), rank, true, 0, 0).unwrap().bytes, 1 << 30);
+        }
     }
 }
