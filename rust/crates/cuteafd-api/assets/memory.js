@@ -92,11 +92,12 @@ function normalize(payload) {
   domains.sort((a,b) => (a.id === 'host' ? -1 : b.id === 'host' ? 1 : a.id.localeCompare(b.id,undefined,{numeric:true})));
   return {stats,inventory,stages,domains,graphs:arr(stats.graph_cache)};
 }
-function segments(domain) {
+function segments(domain, foldSmall = true) {
   const named = new Map(), small = [];
+  const threshold = numeric(domain.cap) ? Math.min(domain.cap * .002, 16 * 2 ** 20) : 0;
   for (const i of domain.items) {
     const required = /graph|draft|workspace|transport|intake|ring|exchange|indices|page table|BLAS|padding/i.test(i.name);
-    if (!required && numeric(domain.cap) && i.bytes < domain.cap * .01) { small.push(i);continue; }
+    if (foldSmall && !required && i.bytes < threshold) { small.push(i);continue; }
     const key = `${i.category}:${i.name}`;
     if (!named.has(key)) named.set(key,{key,name:i.name,category:i.category,group:ownerGroup(i),members:[],bytes:0});
     const s=named.get(key);s.members.push(i);s.bytes+=i.bytes;
@@ -171,7 +172,7 @@ let selectedDomain = null, reservationData = null;
 function renderDetail() {
   const d = reservationData.domains.find(d=>d.id === selectedDomain);
   if (!d) return;
-  const parts = segments(d).filter(s=>!['weights','kv'].includes(s.group)).sort((a,b)=>b.bytes-a.bytes);
+  const parts = segments(d, false).filter(s=>!['weights','kv'].includes(s.group)).sort((a,b)=>b.bytes-a.bytes);
   const total = parts.reduce((n,s)=>n+s.bytes,0);
   $('detail-summary').textContent = d.reason ? `Unavailable: ${d.reason}` : `${d.id}: ${bytes(total)} outside target weights / KV. Each mini-bar is scaled to this subtotal, not device capacity. Drafter owners stay visible.`;
   $('owner-detail').innerHTML = parts.map((s,i)=>`<button class="owner-detail" data-owner="${esc(s.key)}" type="button"><span>${esc(s.name)}</span><strong>${exact(s.bytes)}</strong><svg viewBox="0 0 600 12" preserveAspectRatio="none" aria-hidden="true"><defs>${ownerPaint(s,`detail${i}`,s.variant)}</defs><rect width="600" height="12" fill="var(--well)"/><rect width="${total?s.bytes/total*600:0}" height="12" fill="url(#detail${i})"/></svg></button>`).join('') || '<p class="hint">No non-weight/non-KV owners published.</p>';
