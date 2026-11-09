@@ -5940,11 +5940,12 @@ mod prefill_lane_tests {
             }
             let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
             let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
-            // The reserved prewarm is the trace's pins, the same three shapes at
-            // every context; other geometries capture lazily out of the headroom.
-            assert_eq!(wide.executables[0], 138);
-            assert_eq!(wide.shapes, narrow.shapes);
-            assert_eq!(wide.reserves, narrow.reserves);
+            // Startup prewarms every traced shape this context admits; the long
+            // geometries only exist at the wide context, so the wide reserve is
+            // a superset and pays for the trace's whole demand.
+            assert_eq!(wide.executables[0], 644);
+            assert!(narrow.shapes.iter().all(|shape| wide.shapes.contains(shape)));
+            assert!(narrow.reserves[0] <= wide.reserves[0]);
         }
     }
 
@@ -6012,13 +6013,15 @@ mod prefill_lane_tests {
         for sequences in [8, 16] {
             let shapes = serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
-            // The reserved prewarm is the trace's pin at every capacity: rank 0
+            // Startup reserves the traced shapes this launch admits: rank 0
             // carries the head segment, rank 1 the 45 layer segments.
             let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 2, 64, 188);
-            assert_eq!(plan.executables, [138, 135]);
+            let warm = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
+                32768, 2_097_152, 2051, sequences, true, &buckets, GlmfLayout::Max);
+            assert_eq!(plan.executables, [warm.len() as u64 * 46, warm.len() as u64 * 45]);
             let list = glmf_prewarm_list().layout(GlmfLayout::Max);
             let packed = |count: u64| list.arena_bytes(count).div_ceil(2 << 20) * (2 << 20);
-            assert_eq!(plan.reserves, [packed(138), packed(135)]);
+            assert_eq!(plan.reserves, [packed(warm.len() as u64 * 46), packed(warm.len() as u64 * 45)]);
             assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
             assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
@@ -6248,7 +6251,7 @@ mod wide_decode_tests {
     #[test]
     fn the_startup_set_grows_by_one_speculative_bucket_per_geometry() {
         use super::{startup_tables, GraphKey, PAGE_ROWS};
-        use cuteafd_loader::serving_capacity::glmf_graphs::{glmf_graph_reserve, serving_graph_shapes};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, serving_graph_shapes};
         let pages = 2_097_152usize.div_ceil(PAGE_ROWS);
         let (narrow, wide) = (DecodeBuckets::new(DECODE_ROWS), DecodeBuckets::new(127));
         for (context, before, after) in [(8_192usize, 50usize, 55usize), (32_768, 140, 154), (131_072, 270, 297)] {
@@ -6268,10 +6271,14 @@ mod wide_decode_tests {
                 serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
         }
         // A wider verify budget adds shapes the prewarm does not reserve, so the
-        // pinned prewarm and its reserve stay the trace's three shapes.
+        // prewarm and its reserve stay the traced shapes this context admits.
         let reserve = |decode_rows: usize| glmf_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, 1,
             decode_rows, 188);
-        assert_eq!(reserve(DECODE_ROWS).executables[0], 138);
+        let short = cuteafd_loader::serving_capacity::glmf_graphs::glmf_prewarm_shapes(
+            8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS), GlmfLayout::Min);
+        let admitted = serving_graph_shapes(8_192, 2_097_152, 2051, 16, true, &DecodeBuckets::new(DECODE_ROWS));
+        assert!(short.iter().all(|shape| admitted.contains(shape)), "a prewarm never leaves its launch's set");
+        assert_eq!(reserve(DECODE_ROWS).executables[0], short.len() as u64 * 46);
         assert_eq!(reserve(DECODE_ROWS), reserve(127));
     }
 

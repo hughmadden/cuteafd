@@ -75,11 +75,12 @@ impl GlmfLayout {
 }
 
 /// One layout's prewarm set: the request demand a device graph trace of that
-/// layout recorded on default adaptive drafts, the always-hot shapes pinned to
-/// run in the startup prewarm, and the arena both sides need priced at the
-/// layout's measured bytes per graph. Provenance lives in the checked-in
-/// document (`glmf_prewarm.json`); pinning is explicit, never inferred from
-/// order, and a new trace replaces the set.
+/// layout recorded on default adaptive drafts, the always-hot shapes pinned
+/// against eviction, and the arena both sides need priced at the layout's
+/// measured bytes per graph. Startup prewarms every entry, so requests hit
+/// their graphs instead of capturing on latency. Provenance lives in the
+/// checked-in document (`glmf_prewarm.json`); pinning is explicit, never
+/// inferred from order, and a new trace replaces the set.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmLayout {
@@ -135,17 +136,16 @@ pub fn glmf_prewarm_list() -> &'static GlmfPrewarmList {
     })
 }
 
-/// The prewarm shapes this launch can request, in the startup set's order:
-/// the checked-in pinned entries of `layout` restricted to the launch's own
-/// geometries and row buckets. A context or row set the list does not cover
-/// warms nothing.
+/// The prewarm shapes this launch can request: every checked-in entry of
+/// `layout` restricted to the launch's own geometries and row buckets, in the
+/// list's order. A context or row set the list does not cover warms nothing.
 pub fn glmf_prewarm_shapes(context: usize, pool_tokens: usize, dense: usize, sequences: usize,
     speculation: bool, buckets: &DecodeBuckets, layout: GlmfLayout) -> Vec<(usize, bool, GraphGeometry)> {
     let allowed = serving_graph_shapes(context, pool_tokens.div_ceil(PAGE_ROWS), dense,
         sequences, speculation, buckets);
     let list = glmf_prewarm_list().layout(layout);
     allowed.into_iter().filter(|shape| list.entries.iter()
-        .any(|entry| entry.pin && entry.shape() == *shape)).collect()
+        .any(|entry| entry.shape() == *shape)).collect()
 }
 
 /// Per-device graph reserve: the packed measured arena of this launch's
@@ -270,25 +270,28 @@ mod tests {
     }
 
     /// The checked-in set is the sizing trace's demand (644 graphs at the
-    /// reference launch), its three always-hot shapes are the pinned startup
-    /// set, and its reserve prices the whole demand plus one largest capture.
+    /// reference launch), every traced shape prewarms at startup, its three
+    /// always-hot shapes are pinned against eviction, and its reserve prices
+    /// the whole demand plus one largest capture.
     #[test]
     fn traced_prewarm_holds_the_pinned_shape_and_prices_the_traced_demand() {
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let shapes = serving_graph_shapes(1_048_576, 2_097_152 / PAGE_ROWS, 2051, 16, true, &buckets);
         assert_eq!(shapes.len(), 300);
-        // The list pins the trace's always-hot shapes, not the launch's whole set.
+        // Startup prewarms the trace's shapes, not the launch's whole set.
         let warm = glmf_prewarm_shapes(1_048_576, 2_097_152, 2051, 16, true, &buckets, GlmfLayout::Min);
-        assert_eq!(warm.len(), 3);
+        assert_eq!(warm.len(), 14);
         assert!(warm.iter().all(|shape| shapes.contains(shape)));
+        let list = glmf_prewarm_list().layout(GlmfLayout::Min);
+        assert!(list.entries.iter().filter(|entry| entry.pin)
+            .all(|entry| warm.contains(&entry.shape())), "every pin prewarms");
         let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, 64, 188);
         assert_eq!(plan.shapes, warm);
-        // The pinned set's share (138 graphs) is the base; the rest of the
-        // traced demand (644 graphs less those 138) plus one largest capture
-        // is the capture headroom.
-        assert_eq!(plan.reserves, [23_068_672]);
-        assert_eq!(plan.executables, [138]);
-        assert_eq!(plan.extra, 85_983_232);
+        // The traced demand (644 graphs) is the base; one packed largest
+        // capture is headroom for a shape the trace did not cover.
+        assert_eq!(plan.reserves, [106_954_752]);
+        assert_eq!(plan.executables, [644]);
+        assert_eq!(plan.extra, 2_097_152);
         assert_eq!(plan.reserves[0] + plan.extra, 109_051_904);
         assert_eq!(plan.bootstraps, [166_079]);
         assert_eq!(verify_budget(128, 170), 127);
@@ -324,25 +327,35 @@ mod tests {
         assert_eq!(list.family, "glm5_flash");
         let min = list.layout(GlmfLayout::Min);
         assert_eq!(min.executable_bytes(), 166_079);
-        assert_eq!(min.reserve_extra_bytes, 85_983_232);
+        assert_eq!(min.reserve_extra_bytes, 2_097_152);
         let mut identities = HashSet::new();
         for entry in &min.entries {
             assert!(identities.insert(entry.shape()), "duplicate prewarm geometry");
         }
         assert_eq!(min.entries.iter().filter(|entry| entry.pin).count(), 3,
-            "a trace chooses pins; the rest capture on first use");
-        // A launch that cannot key the pinned shapes warms nothing, never a shape
-        // outside its own set: every pin is a speculation shape.
+            "a trace chooses pins; every other traced shape stays evictable");
+        // A launch warms exactly the traced shapes its own geometries and row
+        // buckets admit: here the rows=1 plain shape at both its short and long
+        // geometry, and every traced shape the speculative set can request.
         let buckets = DecodeBuckets::new(64);
-        assert!(glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets, GlmfLayout::Min).is_empty());
-        assert_eq!(glmf_prewarm_shapes(65_536, 65_536, 2051, 16, true, &buckets, GlmfLayout::Min).len(), 3);
+        let plain = serving_graph_shapes(65_536, 65_536, 2051, 4, false, &buckets);
+        let plain_warm = glmf_prewarm_shapes(65_536, 65_536, 2051, 4, false, &buckets, GlmfLayout::Min);
+        assert_eq!(plain_warm.len(), 2);
+        assert!(plain_warm.iter().all(|shape| shape.0 == 1), "one plain row bucket");
+        assert!(plain_warm.iter().all(|shape| plain.contains(shape)));
+        let speculative = serving_graph_shapes(65_536, 65_536, 2051, 16, true, &buckets);
+        let spec_warm = glmf_prewarm_shapes(65_536, 65_536, 2051, 16, true, &buckets, GlmfLayout::Min);
+        assert_eq!(spec_warm.len(), min.entries.iter()
+            .filter(|entry| speculative.contains(&entry.shape())).count());
+        assert!(min.entries.iter().filter(|entry| entry.pin)
+            .all(|entry| spec_warm.contains(&entry.shape())), "every admitted pin prewarms");
         let plan = glmf_graph_reserve(65_536, 65_536, 2051, 4, false, 45, 2, 64, 188);
-        assert_eq!(plan.executables, [0, 0]);
+        assert_eq!(plan.executables, [2 * 46, 2 * 45]);
         // Rank 0 also captures its head segment; chunk rounding can hide the
-        // 138-vs-135 difference in the packed counts.
+        // 644-vs-630 difference in the packed counts.
         let buckets = DecodeBuckets::new(verify_budget(64, 188));
         let plan = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 2, 64, 188);
-        assert_eq!(plan.executables, [138, 135]);
+        assert_eq!(plan.executables, [644, 630]);
         assert_eq!(plan.reserves.len(), 2);
         assert!(plan.reserves[0] >= plan.reserves[1]);
     }
