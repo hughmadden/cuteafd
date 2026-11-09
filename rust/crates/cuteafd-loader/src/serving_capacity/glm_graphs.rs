@@ -98,7 +98,7 @@ pub struct GlmOwnedSegment {
     pub phase: GlmOwnedPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct GlmGraphShape {
     pub rows: usize,
     pub table_width: usize,
@@ -130,10 +130,63 @@ pub fn glm_graph_shapes(context: usize, pool_pages: usize) -> Vec<GlmGraphShape>
     }).collect()
 }
 
+/// Checked-in trace-derived startup work. A shape warms every segment sharing
+/// its stable row/table geometry; pinning is explicit, not inferred from order.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmPrewarmEntry {
+    #[serde(flatten)]
+    pub shape: GlmGraphShape,
+    pub pin: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlmPrewarmList {
+    pub schema_version: u32,
+    pub family: String,
+    pub reserve_base_bytes: u64,
+    pub reserve_extra_bytes: u64,
+    pub entries: Vec<GlmPrewarmEntry>,
+}
+
+pub fn glm_prewarm_list() -> GlmPrewarmList {
+    let list: GlmPrewarmList = serde_json::from_str(include_str!("glm_prewarm.json"))
+        .expect("checked-in GLM prewarm list");
+    assert_eq!(list.schema_version, 1);
+    assert_eq!(list.family, "glm5");
+    list
+}
+
+pub fn glm_prewarm_shapes(context: usize, pool_pages: usize) -> Vec<GlmPrewarmEntry> {
+    let allowed = glm_graph_shapes(context, pool_pages);
+    glm_prewarm_list().entries.into_iter().filter(|entry| allowed.contains(&entry.shape)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn checked_in_prewarm_list_roundtrips_and_filters_to_supported_shapes() {
+        let list = glm_prewarm_list();
+        assert!(!list.entries.is_empty());
+        let mut identities = HashSet::new();
+        for entry in &list.entries {
+            assert!(identities.insert((entry.shape.rows, entry.shape.table_width)), "duplicate prewarm geometry");
+            assert!(entry.shape.rows > 0 && entry.shape.table_width > 0);
+        }
+        assert!(list.entries.iter().any(|entry| entry.pin && entry.shape == GlmGraphShape { rows: 1, table_width: 16 }));
+        assert_eq!(list.reserve_base_bytes % (2 << 20), 0);
+        assert_eq!(list.reserve_extra_bytes % (2 << 20), 0);
+        assert_eq!(list.reserve_base_bytes, 335_544_320);
+        assert_eq!(list.reserve_extra_bytes, 855_638_016);
+        assert_eq!(list.reserve_base_bytes + list.reserve_extra_bytes, 1_191_182_336);
+        let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
+        let allowed = glm_graph_shapes(4096, 32);
+        for entry in glm_prewarm_shapes(4096, 32) { assert!(allowed.contains(&entry.shape)); }
+    }
 
     #[test]
     fn split_declarations_match_rank_local_segments_and_terminal_head() {

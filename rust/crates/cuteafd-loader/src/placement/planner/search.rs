@@ -824,9 +824,7 @@ pub(crate) fn apply_reserve_override(contract: &mut Contract, budgets: &mut [Bud
         .is_some_and(|kind| policy.reserve_override(kind).is_some());
     contract.components.retain(|component| {
         let reserve = match &component.kind {
-            // Retained startup graph executables are physical owners, not an
-            // anonymous reserve; their node padding survives reserve overrides.
-            ComponentKind::Allowance(allowance) if allowance.source.starts_with("startup graphs: ") => None,
+            ComponentKind::Allowance(allowance) if crate::placement::graph_reserve::is_source(&allowance.source) => None,
             ComponentKind::Allowance(allowance) => Some(allowance.location),
             // Explicit reserve replaces anonymous reserve owners, not physical driver costs.
             ComponentKind::DriverPageTables { .. } => None,

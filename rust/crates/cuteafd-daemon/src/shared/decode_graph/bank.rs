@@ -76,6 +76,15 @@ pub(crate) fn note_eager(family: &'static str, shape: &str, context: impl FnOnce
 struct Entry<E> {
     exec: E,
     launched: u64,
+    cached: Option<(u64, bool)>,
+}
+
+struct DeviceBinding {
+    cache: super::device::SharedCache,
+    bank: u64,
+    site: super::device::Site,
+    pinned_hits: u64,
+    trace: bool,
 }
 
 /// E owns the capture's GraphOwner (including its resource pins). The bank is
@@ -93,6 +102,7 @@ pub(crate) struct GraphBank<K, E> {
     measured: u64,
     frozen: Option<u64>,
     retired: Vec<E>,
+    device: Option<DeviceBinding>,
 }
 
 impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
@@ -109,7 +119,113 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn with_family(policy: GraphPolicy, family: &'static str) -> Self {
         Self { entries: HashMap::new(), seen: HashSet::new(), policy, family, startup: None, startup_sealed: false,
             clock: 0, stats: GraphStats::default(), measured_bytes: 0, measured: 0,
-            frozen: None, retired: Vec::new() }
+            frozen: None, retired: Vec::new(), device: None }
+    }
+
+    pub fn attach_device(&mut self, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
+        anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
+        let cache = super::device::device_cache(device, reserve, site.basis)?;
+        let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
+        let trace = cache.lock().unwrap_or_else(|p| p.into_inner()).tracing();
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, trace });
+        Ok(())
+    }
+
+    /// Change attribution at a whole-cycle boundary, retaining the pinned-hit
+    /// fast path and flushing its previous cycle before switching.
+    pub fn cache_cycle(&mut self, cycle: super::device::Cycle) {
+        if let Some(binding) = &mut self.device {
+            if binding.site.cycle != cycle {
+                binding.cache.lock().unwrap_or_else(|p| p.into_inner())
+                    .pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+                binding.site.cycle = cycle;
+            }
+        }
+    }
+
+    pub fn cached_launch(&mut self, key: &K) -> Option<&E> {
+        let entry = self.entries.get(key)?;
+        if let (Some(binding), Some((id, pinned))) = (&mut self.device, entry.cached) {
+            if pinned && !binding.trace {
+                binding.pinned_hits += 1;
+            } else {
+                binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_cycle(id, binding.site.cycle);
+            }
+        }
+        Some(&entry.exec)
+    }
+
+    pub fn cache_miss(&mut self, key: &K, pinned: bool, node_estimate: Option<super::device::Estimate>) -> super::device::Miss {
+        let Some(binding) = &self.device else { return super::device::Miss::Eager };
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).miss(super::device::Identity {
+            bank: binding.bank, site: binding.site.name, shape: format!("{key:?}") }, binding.site, node_estimate, pinned)
+    }
+
+    pub fn cache_insert(&mut self, key: K, exec: E, id: u64, pinned: bool) {
+        self.entries.insert(key, Entry { exec, launched: 0, cached: Some((id, pinned)) });
+    }
+
+    pub fn cache_cancel(&mut self, id: u64) {
+        if let Some(binding) = &self.device { binding.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(id); }
+    }
+
+    pub fn cache_topology(&mut self, id: u64, nodes: u64, width: usize, spans_devices: bool) {
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).captured_topology(id, nodes, width, spans_devices);
+        }
+    }
+
+    /// Explicit teardown only, after the caller drains all consumers.
+    pub fn cache_clear_drained(&mut self) {
+        self.entries.clear();
+        self.retired.clear();
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
+        }
+    }
+
+    pub fn cache_tick(&mut self) {
+        if let Some(binding) = &mut self.device {
+            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            cache.boundary();
+        }
+    }
+
+    pub fn cache_needs_boundary(&self) -> bool {
+        self.device.as_ref().is_some_and(|binding| binding.cache.lock().unwrap_or_else(|p| p.into_inner()).needs_boundary())
+    }
+
+    pub fn cache_measured(&mut self, bytes: u64) {
+        if let Some(binding) = &mut self.device {
+            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            cache.measured_capture(bytes);
+        }
+    }
+
+    /// The caller drains ALL device consumers at a cycle boundary first. The
+    /// callback samples after destruction; failed drains retain every owner.
+    pub fn cache_drain(&mut self, drain: impl FnOnce() -> anyhow::Result<()>,
+        measure: impl FnOnce() -> anyhow::Result<super::device::ReleaseMeasurement>) -> anyhow::Result<()> {
+        let Some(binding) = &mut self.device else { return Ok(()) };
+        let victims: Vec<_> = {
+            let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+            self.entries.iter().filter_map(|(key, entry)| entry.cached
+                .filter(|(id, _)| cache.pending(*id)).map(|(id, _)| (key.clone(), id))).collect()
+        };
+        if !victims.is_empty() {
+            drain()?;
+            for (key, _) in &victims { if let Some(entry) = self.entries.remove(key) { self.retired.push(entry.exec); } }
+            // drain_retired's ordering, with the already completed drain proof.
+            self.retired.clear();
+            let measurement = measure()?;
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).destroyed(
+                &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>(), measurement);
+        }
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).boundary();
+        Ok(())
     }
 
     /// Declare the planner's exact inventory before owner-local capture begins.
@@ -235,7 +351,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.measured_bytes += bytes;
             self.measured += 1;
         }
-        if let Some(old) = self.entries.insert(key.clone(), Entry { exec, launched: self.clock }) {
+        if let Some(old) = self.entries.insert(key.clone(), Entry { exec, launched: self.clock, cached: None }) {
             self.freeze();
             self.retired.push(old.exec);
         }
@@ -302,6 +418,9 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
 
 impl<K, E> Drop for GraphBank<K, E> {
     fn drop(&mut self) {
+        if let Some(binding) = &self.device {
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).remove_bank(binding.bank);
+        }
         if self.policy == GraphPolicy::FixedStartup && self.stats.eager_runs > 0 {
             tracing::info!(target: "cuteafd::graph_capture", family = self.family, bank = self as *const Self as usize,
                 eager_runs = self.stats.eager_runs, captures = self.stats.captures,
@@ -572,5 +691,72 @@ mod budget_tests {
         insert(&mut cache, 1u32, 10, Some(4));
         assert_eq!(insert(&mut cache, 1, 11, Some(6)), vec![10]);
         assert_eq!((cache.len(), cache.launch(&1)), (1, Some(&11)));
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+    use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
+    fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
+    #[test]
+    fn device_eviction_destroys_only_after_successful_drain() {
+        use std::{cell::Cell, rc::Rc};
+        struct Exec(Rc<Cell<usize>>);
+        impl Drop for Exec { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+        let drops = Rc::new(Cell::new(0));
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-301, 20, site()).unwrap();
+        let Miss::Capture(id) = bank.cache_miss(&1, false, None) else { panic!() };
+        bank.cache_insert(1, Exec(drops.clone()), id, false);
+        bank.cache_measured(10);
+        // Same proven kind in another bank needs this graph's slot.
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        let Miss::Eager = cache.lock().unwrap().miss(super::super::device::Identity {
+            bank: 99, site: "bank-test", shape: "1".into() }, site(), None, false) else { panic!() };
+        assert!(bank.cache_drain(|| anyhow::bail!("not drained"), || unreachable!()).is_err());
+        assert_eq!(drops.get(), 0);
+        bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
+            assert_eq!(drops.get(), 1); Ok(ReleaseMeasurement { released: 0 })
+        }).unwrap();
+    }
+
+    #[test]
+    fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-303, 100, site()).unwrap();
+        for (key, pinned) in [(1, true), (2, false)] {
+            let Miss::Capture(id) = bank.cache_miss(&key, pinned, None) else { panic!() };
+            bank.cache_insert(key, key, id, pinned);
+            bank.cache_measured(10);
+        }
+        bank.cache_cycle(Cycle::Verify);
+        assert_eq!(bank.cached_launch(&1), Some(&1));
+        assert_eq!(bank.cached_launch(&2), Some(&2));
+        bank.cache_cycle(Cycle::Decode);
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Verify), 2);
+        assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Decode), 0);
+    }
+
+    #[test]
+    #[ignore = "CPU microbenchmark; run explicitly with --nocapture"]
+    fn cache_replay_nanoseconds() {
+        use std::{hint::black_box, time::Instant};
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-302, 1 << 20, site()).unwrap();
+        for key in [1, 2] {
+            let Miss::Capture(id) = bank.cache_miss(&key, key == 1, None) else { panic!() };
+            bank.cache_insert(key, key, id, key == 1); bank.cache_measured(10);
+        }
+        let iterations = 1_000_000;
+        for (label, key) in [("pinned", 1), ("arc", 2), ("miss", 3)] {
+            let started = Instant::now();
+            for _ in 0..iterations {
+                if key == 3 { black_box(bank.cache_miss(&key, false, Some(super::super::device::Estimate { bytes: u64::MAX, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 }))); }
+                else { black_box(bank.cached_launch(black_box(&key))); }
+            }
+            println!("{label}: {:.1} ns/replay", started.elapsed().as_nanos() as f64 / iterations as f64);
+        }
     }
 }

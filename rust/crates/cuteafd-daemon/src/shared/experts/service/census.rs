@@ -88,7 +88,7 @@ impl Census {
             runtime_sample_method: format!("{verdict}; PostLoad system/cache remainder is measured_residual, not CUDA context/modules calibration"),
             // A process cannot certify that the entire host was quiet. The offline
             // qualified proof constructor also requires that external evidence.
-            context_modules_qualified: false })
+            context_modules_qualified: false, memory_reconciliation: None })
     }
 }
 

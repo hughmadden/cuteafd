@@ -1,5 +1,6 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 mod bank;
+pub(crate) mod device;
 pub(crate) mod census;
 mod owner;
 mod native;

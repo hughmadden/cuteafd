@@ -68,6 +68,14 @@ pub fn set_inputs(inputs: serde_json::Value) {
     }
 }
 
+/// A copy of the daemon's allowlisted, resolved admission inputs.
+/// This performs no CUDA calls and never exposes arbitrary environment values.
+pub fn inputs() -> serde_json::Value {
+    let data = attachments().lock().unwrap_or_else(|e| e.into_inner());
+    serde_json::Value::Object(data.inputs.as_object().into_iter().flatten()
+        .map(|(key, value)| (key.clone(), value["value"].clone())).collect())
+}
+
 struct Service { spools: Vec<(File, PathBuf)>, directory: PathBuf, host: String, role: String, scratch: Box<[u8; 65536]> }
 static SERVICE: OnceLock<Mutex<Service>> = OnceLock::new();
 static TRIGGERS: OnceLock<(File, PathBuf)> = OnceLock::new();
@@ -442,6 +450,15 @@ fn observe_with(q: &CudaQueries, device: i32) -> Observation {
 pub fn device_memory(device: i32) -> Option<(usize, usize)> {
     let value = observe(device, false);
     value.free_bytes.zip(value.total_bytes)
+}
+
+/// Active-context diagnostic sample with the same observer exclusion as admission.
+/// Returns raw free/total and the independently measured external observer bytes.
+pub fn device_memory_observer(device: i32) -> anyhow::Result<Option<(usize, usize, usize)>> {
+    let observer = crate::observer_context::bytes(device)?;
+    let Some((free, total)) = device_memory(device) else { return Ok(None) };
+    crate::observer_context::exclude(free, total, observer)?;
+    Ok(Some((free, total, observer)))
 }
 
 fn capture(raw: &NativeFailure, before_cleanup: bool) -> Option<Arc<FailureReport>> {

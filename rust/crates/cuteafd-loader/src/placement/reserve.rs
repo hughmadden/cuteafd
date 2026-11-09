@@ -261,14 +261,9 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
             tracing::info!(target: "cuteafd::memory_policy", device = %budget.id,
                 graph_bytes = graph.bytes, "{} (padding included, not a reserve)", graph.source);
         }
-        let Ok(mut items) = plan.items(location) else { continue };
-        // Growth-only reserve allowances (lazy graphs, runtime growth) are reserve too.
-        items.extend(plan.facts.allocations.iter().filter(|allocation| allocation.location == location
-            && allocation.view.is_none() && matches!(allocation.category,
-                cuteafd_core::memory_layout::Category::Runtime | cuteafd_core::memory_layout::Category::Reserved)
-            && !allocation.lifetime.contains(super::planner::Phase::Ready, plan.facts.phase_order))
-            .map(|allocation| cuteafd_core::memory_layout::Item::new(allocation.category, &allocation.group, "",
-                allocation.bytes, cuteafd_core::memory_layout::Basis::Exact)));
+        // Admission protects the serving peak, not just the backings allocated
+        // at Ready. Lazy prefill workspaces and their derived owners start at Growth.
+        let Ok(items) = plan.items_at(location, super::planner::Phase::Growth) else { continue };
         let cap = budget.physical_bytes.min(budget.logical_bytes);
         let breakdown = breakdown(budget.id.clone(), kind, cap, budget.headroom, &items);
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({format!("device.{}", budget.id): breakdown}));

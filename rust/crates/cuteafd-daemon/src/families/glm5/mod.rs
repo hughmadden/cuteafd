@@ -1315,6 +1315,17 @@ impl Opened {
             let layout = format!("snapshot/{}; draft/{:?}; context/{}; C{:?}; host-prefix/{}; replies/{:?}",
                 self.snapshot.display(), args.draft, args.max_context, serving.map(|(_, c)| c),
                 host_config.as_ref().map_or(0, |config| config.bytes), cuteafd_core::spark_reply::requested());
+            cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+                "memory_reconciliation_provenance": {
+                    "schema_version": 1, "family": "glm5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                    "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                    "native_sha256": native_hash, "programs_sha256": programs_hash,
+                    "layout": layout, "devices": inventory.gpus,
+                    "spark_world": spark_ranks, "onboard_layers": admitted.solved.decisions.onboard_layers,
+                    "prefill": admitted.solved.decisions.prefill,
+                    "graph_basis": "remote HQA SM120 nodes; uncalibrated local/TP2 byte fallback"
+                }
+            }));
             if let Some(recommendation) = admitted.census_recommendation(cuteafd_loader::placement::inventory::FigureIdentity {
                 declared_graphs: "", programs_sha256: &programs_hash, native_sha256: &native_hash,
                 toolchain: env!("CUTEAFD_BUILD_TOOLCHAIN"), gpu_class: &gpu_classes, driver: &drivers, layout: &layout,
@@ -1761,35 +1772,32 @@ impl Opened {
         }
         engine.prime_tp2()?;
         self.startup_probe(&devices, "glm/transport-before-graphs", None, false)?;
-        // Every decode graph shape serving replays, captured now (CUTEAFD_GLM_WARM_GRAPHS=0 skips it).
+        let graph_reserves = admitted.graphs.reserves().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
+            .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
+        engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
+        for rank in 0..admitted.graphs.ranks().len() {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
+                cuteafd_loader::placement::graph_reserve::glm_default().0,
+                cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE startup policy");
+        }
+        // Current startup shapes are a best-effort prewarm list. Admission keeps
+        // the entire graph reserve charged; measured warmup never shrinks it.
         if engine.weights.layers.len() == self.cfg.layers
             && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0")
             && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            let captures = engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))
-                .with_context(|| format!(
-                    "GLM startup graph capture (owner glm.graphs rank 0..{}) failed; free device memory \
-                     with GPU_MEMORY_CAP or GPU_RESERVE", engine.ranks()))?;
-            let declared = admitted.graphs.declared();
-            let measured = captures.iter().map(|capture|
-                cuteafd_loader::placement::inventory::CapturedGraphRank::measure(capture.rank as u8,
-                    &declared[capture.rank], &capture.keys, capture.before, capture.after)
-                    .map_err(anyhow::Error::msg)).collect::<Result<Vec<_>>>()?;
-            // A successful capture is never refused: an excess over the estimate
-            // is reported by the reconcile and serving continues (#1605).
-            let reconciled = cuteafd_loader::placement::planner::serving::reconcile_startup_graphs(
-                &mut admitted.solved, "glm.graphs", &admitted.graphs.set(),
-                admitted.graphs.fingerprints(), &measured).map_err(|error| anyhow::anyhow!(
-                    "{error}; the startup graph receipt does not match this plan"))?;
-            for (rank, (row, live)) in admitted.graphs.ranks().iter().zip(&reconciled.ranks).enumerate() {
-                tracing::info!(rank, executables = live.executables, measured = live.bytes,
-                    plan = row.bytes, "GLM startup graph capture reconciled");
-            }
-            if let Some(note) = admitted.graphs.capture_note(&reconciled) { tracing::warn!("{note}"); }
-            cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "glm5 captured");
+            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)))?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
+        for rank in 0..admitted.graphs.ranks().len() {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
+                cuteafd_loader::placement::graph_reserve::glm_default().0,
+                cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE Ready summary");
+        }
         engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);
         // Non-serving commands do not pass schedule's readiness boundary.

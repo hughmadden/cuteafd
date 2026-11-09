@@ -1736,6 +1736,7 @@ native_symbols! {
     cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
     cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
+    cuteafd_cuda_graph_end_capture_topology: unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut usize, *mut usize, *mut i32) -> CuteafdStatus,
     cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
     cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
     cuteafd_copy_h2d: CopyH2DFn,
@@ -2974,6 +2975,29 @@ impl NativeLibrary {
         Ok(cuda_graph_exec)
     }
 
+
+    /// # Safety
+    /// The stream is in capture mode and all captured storage remains live.
+    pub unsafe fn cuda_graph_end_capture_topology(&self, stream: *mut c_void)
+        -> Result<(*mut c_void, usize, usize, bool, Option<String>)> {
+        let _failure_boundary = memory_ledger::fault::boundary();
+        let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
+            .unwrap_or_else(|e| e.into_inner()));
+        let end = self.cuteafd_cuda_graph_end_capture_topology()?;
+        let (mut exec, mut nodes, mut width, mut spans) = (std::ptr::null_mut(), 0, 0, 0);
+        // SAFETY: outputs are valid and stream's capture is caller-owned.
+        let status = unsafe { end(stream, &mut exec, &mut nodes, &mut width, &mut spans) };
+        self.status_to_result("cuteafd_cuda_graph_end_capture_topology", status)?;
+        let inspection_error = (width == 0).then(|| self.last_error().unwrap_or_default());
+        if coordinator_gpu_budget().is_some() {
+            if let Err(error) = self.cuda_memory_info() {
+                // SAFETY: the executable has not launched and owns no queued work.
+                unsafe { self.cuda_graph_exec_destroy(exec)? };
+                return Err(error.context("graph executable exceeds coordinator GPU budget"));
+            }
+        }
+        Ok((exec, nodes, width, spans != 0, inspection_error))
+    }
 
     pub unsafe fn cuda_graph_launch(
         &self,

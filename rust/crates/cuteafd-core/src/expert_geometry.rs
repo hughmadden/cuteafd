@@ -172,7 +172,6 @@ pub struct SparkProcessSample {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SparkRuntimeDetail {
     /// Checkpoint-derived, layer-sequential load-only owners, absent for backends
     /// without a qualified load plan. Never added to the serving workspace.
@@ -183,6 +182,9 @@ pub struct SparkRuntimeDetail {
     /// state and must not become an offline context/modules calibration.
     pub runtime_sample_method: String,
     pub context_modules_qualified: bool,
+    /// Optional raw CUDA sample and provenance beside the GB10 admission sample.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_reconciliation: Option<serde_json::Value>,
 }
 
 /// Measurements made by the Spark owner, not coordinator-architecture estimates.
@@ -493,6 +495,22 @@ pub fn expert_geometry() -> ExpertGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_detail_accepts_old_missing_and_future_optional_fields() {
+        use super::SparkRuntimeDetail;
+        let mut older = serde_json::to_value(SparkRuntimeDetail::default()).unwrap();
+        older.as_object_mut().unwrap().remove("memory_reconciliation");
+        assert!(serde_json::from_value::<SparkRuntimeDetail>(older.clone()).unwrap().memory_reconciliation.is_none());
+        older["memory_reconciliation"] = serde_json::json!({"cuda_used_bytes": 10});
+        older["future_worker_detail"] = serde_json::json!({"version": 2});
+        assert!(serde_json::from_value::<SparkRuntimeDetail>(older.clone()).unwrap().memory_reconciliation.is_some());
+        // The supported release-pair schema tolerates a newer coordinator's
+        // optional detail when this same tolerant schema is the worker reader.
+        let decoded: SparkRuntimeDetail = serde_json::from_value(older).unwrap();
+        let roundtrip: SparkRuntimeDetail = serde_json::from_value(serde_json::to_value(decoded).unwrap()).unwrap();
+        assert_eq!(roundtrip.memory_reconciliation.unwrap()["cuda_used_bytes"], 10);
+    }
+
     #[test]
     fn execution_workspace_charges_scratch_once_and_retains_every_route_stage() {
         use super::*;

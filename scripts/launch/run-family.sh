@@ -421,6 +421,16 @@ spark_profile_wrapper_args=(${RELEASE_PROFILE_WRAPPER_DOCKER_ARGS[@]+"${RELEASE_
 }
 shared_graph_census_args() {
 graph_census_args=()
+if [[ "$family" == glm5 ]]; then
+  local graph_reserve graph_trace
+  graph_reserve="$(get GPU_GRAPH_RESERVE)"
+  graph_trace="$(get GRAPH_TRACE)"
+  [[ -z "$graph_reserve" ]] || graph_census_args+=(-e "CUTEAFD_GPU_GRAPH_RESERVE=$graph_reserve")
+  if [[ -n "$graph_trace" ]]; then
+    [[ "$graph_trace" == /* && -d "$(dirname "$graph_trace")" ]] || { printf '%s\n' 'GRAPH_TRACE needs an absolute path in an existing directory' >&2; exit 2; }
+    graph_census_args+=(-v "$(dirname "$graph_trace"):/run/cuteafd-graph-trace" -e "CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/$(basename "$graph_trace")")
+  fi
+fi
 if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]; then
   [[ -n "$wip_layout" ]] || { printf '%s\n' 'Graph census requires a WIP build' >&2; exit 2; }
   graph_census_args+=(-e CUTEAFD_GRAPH_CENSUS=1 -e 'RUST_LOG=info,cuteafd::graph_capture=debug')
@@ -1437,6 +1447,9 @@ if [[ "$family" == qwen4 ]]; then
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
+if [[ "$family" == glm5 && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
+  spark_worker_env+=" -e $(printf '%q' "CUTEAFD_SPARK_GRAPH_RESERVE=$(get SPARK_GRAPH_RESERVE)")"
+fi
 # Options only the Spark expert workers take.
 spark_worker_args=""
 # Snapshot of a model id (and optional revision) inside the containers.
@@ -2504,6 +2517,11 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
+  if [[ "$family" == glm5 ]]; then
+    for key in GPU_GRAPH_RESERVE SPARK_GRAPH_RESERVE; do
+      [[ -z "$(get "$key")" ]] || plan_profile_env+=(-e "CUTEAFD_$key=$(get "$key")")
+    done
+  fi
   release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
   plan_profile_mount=0
   for arg in ${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"}; do

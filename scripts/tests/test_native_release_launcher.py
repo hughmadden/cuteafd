@@ -560,8 +560,8 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
             self.assertIn('shared_graph_census_args', v41_source())
             for launcher in ['scripts/launch/run-family.sh']:
                 source = (ROOT / launcher).read_text()
-                suffix = source.split('graph_census_args=()\n', 1)[1]
-                block = 'graph_census_args=()\n' + suffix.split('\nfi', 1)[0] + '\nfi\n'
+                suffix = source.split('shared_graph_census_args() {\n', 1)[1]
+                block = 'shared_graph_census_args() {\n' + suffix.split('\n}\n', 1)[0] + '\n}\nshared_graph_census_args\n'
                 self.assertIn('"${graph_census_args[@]}"', source)
                 for value, wip, path, valid in [
                     (None, '', str(control), True), ('0', '', str(control), True),
@@ -576,7 +576,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
                         if value is not None:
                             env['CUTEAFD_GRAPH_CENSUS'] = value
                         env['CUTEAFD_GRAPH_CENSUS_CONTROL'] = path
-                        harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nwip_layout=$1\n'
+                        harness = 'set -euo pipefail\nrelease_die() { exit 2; }\nget() { :; }\nfamily=glm5\nwip_layout=$1\n'
                         result = subprocess.run(['bash', '-c', harness + block +
                             'printf "%s\\0" before "${graph_census_args[@]}" after', 'test', wip],
                             env=env, capture_output=True)

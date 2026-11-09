@@ -158,6 +158,15 @@ def parse_attention() -> dict[str, dict[str, str]]:
 ATTENTION = parse_attention()
 
 
+def test_graph_reserve_keys_are_separate_and_glm_only():
+    for family in FAMILIES.values():
+        keys = family_keys(family)
+        assert "GRAPH_RESERVE" not in keys
+        for key in ("GPU_GRAPH_RESERVE", "SPARK_GRAPH_RESERVE"):
+            assert (key in keys) == (family == "glm5")
+    assert "GRAPH_RESERVE" not in MATRIX
+
+
 def test_area_tables_cover_every_matrix_key():
     for key in MATRIX:
         # A grouped area row may abbreviate a family of keys with a trailing *.
