@@ -1768,7 +1768,7 @@ impl Opened {
         for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
             let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
                 row.bytes, cuteafd_loader::placement::graph_reserve::GLM_EXTRA).map_err(anyhow::Error::msg)?;
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM graph cache startup policy");
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE startup policy");
         }
         // Current startup shapes are a best-effort prewarm list. Admission keeps
         // the entire graph reserve charged; measured warmup never shrinks it.
@@ -1783,7 +1783,7 @@ impl Opened {
         for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
             let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
                 row.bytes, cuteafd_loader::placement::graph_reserve::GLM_EXTRA).map_err(anyhow::Error::msg)?;
-            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM graph cache Ready summary");
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM GPU_GRAPH_RESERVE Ready summary");
         }
         engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);

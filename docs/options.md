@@ -181,7 +181,8 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `GPU_RESERVE` | auto | size | Sets the total GPU reserve; built-in reserve components (including release padding) become 0, but physical driver page tables and the bounded graph-cache reserve stay charged. Still inside the cap. |
 | `SPARK_RESERVE` | auto | size | Replaces Spark reserve components, not arena driver metadata or actual ring/workspace/staging owners; these survive even a zero override. |
 | `MEMORY_PADDING` | `100MiB` | size | Explicit per-coordinator-GPU release padding, inside the cap; `0` disables only padding. `GPU_RESERVE` replaces it. Global flag: `--memory-padding`. |
-| `GRAPH_RESERVE` | measured GLM startup base + 64MiB | size or `gpuN=size,...,spark=size` | GLM bounded graph arena per device, charged before KV and independent of `GPU_RESERVE`. One size applies to each coordinator GPU, never divided among them. Per-device example: `gpu0=3GiB,gpu1=2GiB,spark=512MiB`. Defaults are per rank; unspecified devices retain their family default. Startup and Ready logs name the source. Zero runs eagerly. Other families await cache integration. |
+| `GPU_GRAPH_RESERVE` | measured GLM startup base + 64MiB | size or `gpuN=size,...` | GLM bounded graph arena per device, charged before KV and independent of `GPU_RESERVE`. One size applies to each coordinator GPU, never divided among them. Per-device example: `gpu0=3GiB,gpu1=2GiB`. Defaults are per rank; unspecified devices retain their family default. Startup and Ready logs name the source. Zero runs eagerly. Other families await cache integration. |
+| `SPARK_GRAPH_RESERVE` | worker family default | size | One graph reserve per Spark worker, matching the scalar `SPARK_RESERVE` convention. Forwarded to workers; bounded worker cache enforcement is pending the family rollout. |
 | `GRAPH_TRACE` | off | absolute path | GLM graph identity/count/first-seen snapshots, written as `<stem>.device-N.json`; parent directory must exist. For periodic prewarm regeneration. |
 | `GRAPH_NODE_PADDING` | `2.5%` | percentage, integer bytes per coefficient or `rtx=VALUE,spark=VALUE` | Added to both measured node and executable rates, packed once per device into 2 MiB chunks. Independent of `GPU_RESERVE`, `SPARK_RESERVE` and `MEMORY_PADDING`; included once in the graph owner, not a reserve. Global flag: `--graph-node-padding`. |
 | `FAMILY_RESERVE` | per-family constant (0 in every family) | size | A named per-GPU reserve added to the measured components; `GPU_RESERVE` overrides it. One key for coordinator GPUs only: no family keeps a per-family Spark margin (Sparks use `SPARK_RESERVE`). |
@@ -477,7 +478,8 @@ weights and F32 block-128 scales; `compact` selects parent K6 attention, while
 | `MEMORY_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `GRAPH_NODE_PADDING` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `SPARK_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `GRAPH_RESERVE` | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `GPU_GRAPH_RESERVE` | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+| `SPARK_GRAPH_RESERVE` | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `GRAPH_TRACE` | ✗ | ✗ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `FAMILY_RESERVE` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `KV_POOL_TOKENS` | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |

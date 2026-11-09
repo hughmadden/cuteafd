@@ -423,9 +423,9 @@ shared_graph_census_args() {
 graph_census_args=()
 if [[ "$family" == glm5 ]]; then
   local graph_reserve graph_trace
-  graph_reserve="$(get GRAPH_RESERVE)"
+  graph_reserve="$(get GPU_GRAPH_RESERVE)"
   graph_trace="$(get GRAPH_TRACE)"
-  [[ -z "$graph_reserve" ]] || graph_census_args+=(-e "CUTEAFD_GRAPH_RESERVE=$graph_reserve")
+  [[ -z "$graph_reserve" ]] || graph_census_args+=(-e "CUTEAFD_GPU_GRAPH_RESERVE=$graph_reserve")
   if [[ -n "$graph_trace" ]]; then
     [[ "$graph_trace" == /* && -d "$(dirname "$graph_trace")" ]] || { printf '%s\n' 'GRAPH_TRACE needs an absolute path in an existing directory' >&2; exit 2; }
     graph_census_args+=(-v "$(dirname "$graph_trace"):/run/cuteafd-graph-trace" -e "CUTEAFD_GRAPH_TRACE=/run/cuteafd-graph-trace/$(basename "$graph_trace")")
@@ -1447,6 +1447,9 @@ if [[ "$family" == qwen4 ]]; then
 fi
 # Docker options only the Spark expert workers take (their environment and mounts).
 spark_worker_env=""
+if [[ "$family" == glm5 && -n "$(get SPARK_GRAPH_RESERVE)" ]]; then
+  spark_worker_env+=" -e $(printf '%q' "CUTEAFD_SPARK_GRAPH_RESERVE=$(get SPARK_GRAPH_RESERVE)")"
+fi
 # Options only the Spark expert workers take.
 spark_worker_args=""
 # Snapshot of a model id (and optional revision) inside the containers.
