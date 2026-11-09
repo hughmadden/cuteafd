@@ -632,10 +632,12 @@ mod tests {
             for ranks in [1, 2] {
                 for (rows, waves) in [(2048, 4), (2752, 3), (4096, 2)] {
                     let mut options = options(ranks);
-                    for runtime in &mut options.ranks {
-                        runtime.workspaces[0].1.rows = rows;
-                        runtime.workspaces[0].1.waves = waves;
-                        runtime.workspaces[0].1.prefill_output = MimoPrefillOutput::LastRow;
+                    for (rank, runtime) in options.ranks.iter_mut().enumerate() {
+                        runtime.workspaces = super::super::admission::workspace_options(
+                            &cfg, ranks, rank, rows as usize, options.max_context_tokens as usize,
+                            waves as usize, true, super::super::MimoExpertInput::Fp8,
+                            options.kv_cache, 0, MimoPrefillOutput::LastRow, false,
+                            |_| Ok(16 << 20)).unwrap();
                     }
                     let mut resident = weights(ranks);
                     resident.checkpoint_tp = if pro { 8 } else { 1 };
