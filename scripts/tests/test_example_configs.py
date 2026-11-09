@@ -457,6 +457,59 @@ def test_published_matrix_pins_current_reports() -> None:
     assert "simulated-5090" not in json.dumps(matrix)
 
 
+def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
+    smoke = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    variants = json.loads((ROOT / "scripts/lib/attention-variants.json").read_text())
+    names, ports, cards = set(), set(), set()
+    comparisons = {}
+    for entry in smoke["entries"]:
+        name = entry["name"]
+        assert name not in names
+        names.add(name)
+        assert (ROOT / entry["config"]).is_file()
+        values = {**keys(ROOT / entry["config"]), **smoke["defaults"]["set"], **entry["set"]}
+        assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
+        for port in (values["ADDR"].rsplit(":", 1)[1], values["EXPERT_PORT"]):
+            assert port not in ports
+            ports.add(port)
+        assert len(entry["gpus"]) == int(values["RTX_GPUS"])
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
+        assert len(entry["sparks"]) == int(values["SPARK_COUNT"])
+        for rank, host in enumerate(entry["sparks"]):
+            assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
+        assert entry.get("baseline", True), "All cards retain baseline quick quality"
+        if name.endswith(("-hqa", "-fp8-compact")):
+            assert entry["family"] in variants
+            assert values["MODEL_ID"].endswith("-HQA"), "Comparison modes require the dual-view HQA checkpoint"
+            assert len(entry["gpus"]) == 2
+            assert values["ATTENTION_MODE"] in ("hqa", "fp8-compact")
+            comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
+            continue
+        assert "ATTENTION_MODE" not in values, "Regular cards use the checkpoint's default attention"
+        assert not values["MODEL_ID"].endswith("-HQA")
+        column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
+        identity = (entry["family"], values["MODEL_ID"], column)
+        assert identity not in cards
+        cards.add(identity)
+        if column == "5090":
+            assert values["GPU_MEMORY_CAP"] == "31.8GiB"
+            assert values["BENCH_HARDWARE_CLASS"] == values["BENCH_SIMULATED"] == "5090"
+            assert len(entry["sparks"]) == 4
+            assert entry["precheck"] == {
+                "argv": ["sh", "-c", "nvidia-smi --query-gpu=name --format=csv,noheader --id=1 | grep -q 'RTX PRO 6000'"],
+                "timeout_s": 30,
+                "required": True,
+            }
+    assert len(cards) == 39
+    assert len({(family, model) for family, model, _ in cards}) == 20
+    assert sum(column == "5090" for _, _, column in cards) == 7
+    assert set(comparisons) == set(variants)
+    for family, modes in comparisons.items():
+        assert modes == ({"hqa"} if family == "mistral_large4" else {"hqa", "fp8-compact"})
+    assert not names.intersection(entry["name"] for entry in smoke["retired"])
+
+
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
 def test_starting_config_has_no_private_detail_and_names_the_release_pair(path: Path) -> None:
     text = path.read_text()

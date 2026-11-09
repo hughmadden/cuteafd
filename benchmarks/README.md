@@ -8,6 +8,52 @@ agent/tool transcripts; the content change shifts prefill numbers, so these
 are not like-for-like historical comparisons. Decode and agentic-session
 workloads are unchanged.
 
+## v5 HQA Comparison
+
+The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) schedules 11
+additional max-only attention comparisons. Regular min/max cards retain the
+original checkpoint repositories and their default attention, with no mode
+flag. The regular max card is each comparison's compact arm. Separate `hqa`
+and `fp8-compact` arms pin the matching dual-view `-HQA` repository revision
+(Mistral Large 4: `hqa` only). Users choose the checkpoint; this comparison
+does not establish a shipping attention default.
+These experiments are separate from the main three-column release table.
+Results are pending; no new speed or quality measurement is claimed here.
+
+| Max card | Modes | Quick fidelity / quality | Warmed speed |
+| --- | --- | --- | --- |
+| GLM 5.3 EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
+| GLM Flash EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
+| Kimi K3 EXL3 K2 + Core K6 | hqa, compact, fp8-compact | pending | pending |
+| Step-5 EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
+| Muse Spark EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
+| Mistral Large 4 EXL3 K4 + Core K6 | hqa, compact | pending | pending |
+
+All modes retain the Release smoke baseline, including quick fidelity and
+quality. Publish those scores beside speed with equal prominence, the pinned
+original/HQA checkpoint revisions, and the report's thermal/power conditions; speed alone
+does not decide the attention mode. Mistral Large 4 refuses `fp8-compact`, so
+that unsupported arm is not scheduled. Variant names append `-hqa` or
+`-fp8-compact` to the regular `-max` name; `compact` means that regular max
+card itself, not another launch. GLM Flash keeps its existing
+`glm53f-exl3-k6-*` card/config names for the K4 + Core K6 checkpoint.
+
+### v5 Retirements
+
+The v5 launch matrix pins measured historical cards in its `retired` list:
+all NVFP4 cards, Step-5 FP8, GLM Flash tr3, and the previously retired layouts.
+The published `current-matrix.json` and root README retain measured v4 cards;
+update each v5 row and its retirements when its first smoke report exists.
+Entirely pending checkpoint rows currently block publication (issue #1723).
+New measured retirements are `v41-flash-reference-tp4`,
+`v4-flash-reference-tp4`, `glm53f-exl3-5090` (K3.25 + Core FP8),
+`glm53-exlr8-a8-max`, `qwen38-27b-bf16-min-nospec`, and
+`qwen38-27b-fp8-min-nospec`. The unmeasured `v41-flash-max-fp8-reply` and
+`v41-flash-max-nvfp4-reply` variants are also removed from the runnable v5
+matrix; they have no published report to pin as a measured retired card.
+Neither Step-5 FP8 nor Step-5 NVFP4 is scheduled. The v4 matrix remains the
+historical recipe; new release launches use the v5 matrix.
+
 <!-- reports:begin -->
 
 ## DeepSeek V4
