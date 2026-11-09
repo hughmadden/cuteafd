@@ -82,9 +82,11 @@ def test_sustained_heat_pins_nonminimum_geometry_and_reports_cost():
     result = MODULE.generate([data, data], "glm5", pin_report=report)
     assert [entry["rows"] for entry in result["entries"] if entry["pin"]] == [16]
     assert len(report) == 1
-    assert report[0]["permanent_bytes"] == 1000
+    assert report[0]["permanent_bytes"] is None
+    assert report[0]["observed_permanent_lower_bound_bytes"] == 1000
     assert report[0]["capture_bytes"] == 0
-    assert report[0]["reserve_fraction"] == 1000 / (16 << 20)
+    assert report[0]["reserve_fraction"] is None
+    assert report[0]["observed_reserve_fraction_lower_bound"] == 1000 / (16 << 20)
     assert report[0]["reasons"] == ["sustained_heat"]
 
 
@@ -134,5 +136,61 @@ def test_pin_cost_includes_startup_only_siblings_of_same_geometry():
     data["graphs"].append(sibling)
     report = []
     MODULE.generate([data, data], "glm5", pin_report=report)
-    assert report[0]["permanent_bytes"] == 2000
+    assert report[0]["observed_permanent_lower_bound_bytes"] == 2000
     assert report[0]["executables"] == 2
+
+
+def test_cost_keeps_distinct_key_ids_with_identical_display_shapes():
+    import copy
+    data = modern_trace()
+    graph = data["graphs"][0]
+    graph.update(key_id=1)
+    graph["hit_histogram"]["counts"] = [1] * 5
+    sibling = copy.deepcopy(graph)
+    sibling["key_id"] = 2
+    data["graphs"].append(sibling)
+    report = []
+    MODULE.generate([data], "glm5", pin_report=report)
+    assert report[0]["observed_permanent_lower_bound_bytes"] == 2000
+    assert report[0]["executables"] == 2
+
+
+def test_new_snapshot_forgets_omitted_identity_heat_and_cost():
+    import copy
+    old = modern_trace()
+    old["cache"]["sampled_at_ms"] = 40_000
+    old["graphs"][0]["hit_histogram"]["counts"] = [1, 1, 1, 1, 0]
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 700_000
+    new["graphs"] = new["graphs"][1:]
+    for graph in new["graphs"]:
+        graph["hit_histogram"].update(start_ms=110_000, counts=[0] * 60)
+    for inputs in ([old, new], [new, old]):
+        report = []
+        result = MODULE.generate(inputs, "glm5", pin_report=report)
+        assert not any(entry["pin"] for entry in result["entries"])
+        assert report == []
+
+
+def test_partial_geometry_inventory_is_only_a_cost_lower_bound():
+    data = modern_trace()
+    data["graphs"] = data["graphs"][:1]
+    data["graphs"][0]["hit_histogram"]["counts"] = [1] * 5
+    report = []
+    MODULE.generate([data], "glm5", pin_report=report)
+    assert report[0]["observed_permanent_lower_bound_bytes"] == 1000
+    assert report[0]["permanent_bytes"] is None
+    assert report[0]["reserve_fraction"] is None
+    assert report[0]["cost_basis"] == "observed_inventory_lower_bound_unknown_total"
+
+
+def test_latest_snapshot_row_wins_within_the_same_histogram_interval():
+    import copy
+    old = modern_trace()
+    old["cache"]["sampled_at_ms"] = 40_001
+    old["graphs"][0]["hit_histogram"]["counts"] = [1] * 5
+    new = copy.deepcopy(old)
+    new["cache"]["sampled_at_ms"] = 40_002
+    new["graphs"][0]["hit_histogram"]["counts"] = [0] * 5
+    for inputs in ([old, new], [new, old]):
+        assert not any(entry["pin"] for entry in MODULE.generate(inputs, "glm5")["entries"])

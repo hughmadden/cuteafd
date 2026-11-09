@@ -43,11 +43,32 @@ pub(crate) struct Site {
     pub spans_devices: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Identity {
     pub bank: u64,
     pub site: &'static str,
-    pub shape: String,
+    #[serde(rename = "key_id")]
+    pub key: u64,
+    #[serde(serialize_with = "serialize_shape")]
+    pub shape: Arc<str>,
+}
+
+fn serialize_shape<S: serde::Serializer>(shape: &Arc<str>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(shape)
+}
+
+// The bank interns typed keys with exact equality. Display text is diagnostic,
+// never an identity: distinct keys may deliberately have identical Debug output.
+impl PartialEq for Identity {
+    fn eq(&self, other: &Self) -> bool {
+        (self.bank, self.site, self.key) == (other.bank, other.site, other.key)
+    }
+}
+impl Eq for Identity {}
+impl std::hash::Hash for Identity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&(self.bank, self.site, self.key), state);
+    }
 }
 
 #[derive(Default, Clone, Copy, Debug, serde::Serialize)]
@@ -69,6 +90,7 @@ pub(crate) struct Snapshot {
     pub cycles: HashMap<Cycle, Counters>,
     pub pools: Pools,
     pub basis: Basis,
+    pub sampled_at_ms: u64,
     pub telemetry_bytes: usize,
     pub top_hits: Vec<TraceRow>,
     pub top_churn: Vec<TraceRow>,
@@ -263,6 +285,7 @@ pub(crate) struct DeviceCache {
     pending_bytes: u64,
     next_id: u64,
     next_bank: u64,
+    identity_generation: u64,
     recent_target: u64,
     records: HashMap<u64, Record>,
     identities: HashMap<Identity, u64>,
@@ -276,6 +299,7 @@ pub(crate) struct DeviceCache {
     pending_destroy: usize,
     counters: HashMap<Cycle, Counters>,
     started: Instant,
+    clock_ms: u64,
     last_report: Instant,
     interval_evictions: u64,
     trace: Option<std::path::PathBuf>,
@@ -284,18 +308,20 @@ pub(crate) struct DeviceCache {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0,
+        Self { device, reserve, charged: 0, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0,
-            counters: HashMap::new(), started: Instant::now(), last_report: Instant::now(),
+            counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").map(Into::into),
             last_trace: Instant::now() - Duration::from_secs(1) }
     }
 
     pub fn bank(&mut self) -> u64 { self.next_bank += 1; self.next_bank }
     pub fn reserve(&self) -> u64 { self.reserve }
+    pub fn identity_generation(&self) -> u64 { self.identity_generation }
+    pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
     pub fn needs_boundary(&self) -> bool {
         self.unmeasured || self.pending_destroy > 0
     }
@@ -331,7 +357,7 @@ impl DeviceCache {
 
     fn forget(&mut self, id: u64) {
         self.unlink(id);
-        if let Some(record) = self.records.remove(&id) { self.identities.remove(&record.identity); }
+        if let Some(record) = self.records.remove(&id) { self.identities.remove(&record.identity); self.identity_generation += 1; }
     }
 
     fn trim_ghosts(&mut self) {
@@ -350,8 +376,11 @@ impl DeviceCache {
         self.hit_cycle(id, record.cycle);
     }
 
+    /// One timestamp per cycle/boundary, not per executable replay.
+    pub fn sample_clock(&mut self) { self.clock_ms = self.started.elapsed().as_millis() as u64; }
+
     pub fn hit_cycle(&mut self, id: u64, cycle: Cycle) {
-        let now = self.started.elapsed().as_millis() as u64;
+        let now = self.clock_ms;
         let Some(record) = self.records.get_mut(&id) else { return };
         let (pinned, pending) = (record.pinned, record.pending_destroy);
         record.stats.hit(cycle, 1, now);
@@ -362,7 +391,7 @@ impl DeviceCache {
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
     pub fn pinned_hits(&mut self, id: u64, cycle: Cycle, count: u64) {
         if count == 0 { return }
-        let now = self.started.elapsed().as_millis() as u64;
+        let now = self.clock_ms;
         if let Some(record) = self.records.get_mut(&id) { record.stats.hit(cycle, count, now); }
         self.counters.entry(cycle).or_default().hits += count;
     }
@@ -646,6 +675,7 @@ impl DeviceCache {
     }
 
     pub fn boundary(&mut self) {
+        self.sample_clock();
         self.report_due(self.last_report.elapsed());
         if let Some(path) = &self.trace {
             // Trace mode counts every hit, but serializing thousands of keys
@@ -684,7 +714,7 @@ impl DeviceCache {
         Snapshot { device: self.device, reserve: self.reserve, charged: self.charged,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
-            telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: ranked(false), top_churn: ranked(true) }
+            sampled_at_ms: now, telemetry_bytes: self.records.len() * std::mem::size_of::<KeyStats>(), top_hits: ranked(false), top_churn: ranked(true) }
     }
 
     fn row(&self, record: &Record, now: u64) -> TraceRow {
@@ -717,7 +747,7 @@ impl DeviceCache {
 mod tests {
     use super::*;
     fn site(preference: Preference) -> Site { Site { name: "test", cycle: Cycle::Decode, preference, bootstrap: 10, basis: Basis::Bytes, spans_devices: false } }
-    fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", shape: n.to_string() } }
+    fn key(n: u64) -> Identity { Identity { bank: 1, site: "test", key: n, shape: n.to_string().into() } }
     fn capture(cache: &mut DeviceCache, n: u64, pinned: bool) -> u64 {
         let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, pinned) else { panic!("capture expected") };
         cache.measured_capture(10);
@@ -804,6 +834,37 @@ mod tests {
         assert_eq!(row.hits, 15);
         assert_eq!(row.last_hit_ms, Some(630_000));
         assert_eq!(row.hit_histogram.start_ms, 40_000);
+    }
+
+    #[test]
+    fn arc_hits_use_cycle_clock_without_per_replay_sampling() {
+        let mut cache = DeviceCache::new(-218, 100);
+        let id = capture(&mut cache, 1, false);
+        cache.clock_ms = 25_000;
+        cache.hit_cycle(id, Cycle::Verify);
+        cache.hit_cycle(id, Cycle::Verify);
+        let row = cache.row(&cache.records[&id], 30_000);
+        assert_eq!(row.last_hit_ms, Some(25_000));
+        assert_eq!(row.hit_histogram.counts, vec![0, 0, 2, 0]);
+        assert_eq!(row.cycles[&Cycle::Verify], 2);
+    }
+
+    #[test]
+    #[ignore = "CPU telemetry attribution microbenchmark; run explicitly with --nocapture"]
+    fn telemetry_nanoseconds() {
+        use std::hint::black_box;
+        let iterations = 1_000_000;
+        let origin = Instant::now();
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(origin.elapsed().as_millis() as u64); }
+        println!("timestamp: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
+        let mut stats = KeyStats::new(0);
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(&mut stats).event(Cycle::Verify, black_box(1)); }
+        println!("boxed_counters: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
+        let started = Instant::now();
+        for _ in 0..iterations { black_box(&mut stats).hit(Cycle::Verify, black_box(1), black_box(25_000)); }
+        println!("boxed_counters_and_ring: {:.1} ns/update", started.elapsed().as_nanos() as f64 / iterations as f64);
     }
 
     #[test]

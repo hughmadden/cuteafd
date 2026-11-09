@@ -23,7 +23,7 @@ def sustained(graph):
     counts = histogram.get("counts", [])
     interval_ms = int(histogram.get("interval_ms", 10_000))
     start_ms = int(histogram.get("start_ms", 0))
-    first = max(0, (int(graph.get("first_seen_ms", 0)) - start_ms) // interval_ms)
+    first = max(0, (int(graph.get("first_seen_ms", 0)) - start_ms + interval_ms - 1) // interval_ms)
     # The current (partial) interval cannot prove sustained heat.
     complete = counts[first:-1]
     return len(complete) >= 3 and sum(int(count) > 0 for count in complete) >= len(complete) * 0.6
@@ -39,9 +39,10 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
     reserves = {}
     largest = 0
     reasons = {}
-    # Max per identity across overlapping snapshots, not a sum of snapshots.
+    # Costs/heat use only the latest complete inventory per device.
     identities = {}
     legacy = set()
+    latest = {}
     for trace in traces:
         version = trace.get("schema_version")
         if version not in (1, 2):
@@ -50,6 +51,16 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
         device = int(cache["device"])
         arenas.append(int(cache["charged"]))
         reserves[device] = max(reserves.get(device, 0), int(cache.get("reserve", 0)))
+        # Snapshots enumerate the entire bounded cache. Missing identities in a
+        # newer snapshot have been forgotten; old heat/cost must not survive.
+        inferred_end = max((int(graph.get("hit_histogram", {}).get("start_ms", 0)) +
+                            len(graph.get("hit_histogram", {}).get("counts", [])) *
+                            int(graph.get("hit_histogram", {}).get("interval_ms", 0))
+                            for graph in trace["graphs"]), default=0)
+        snapshot_time = int(cache.get("sampled_at_ms", inferred_end))
+        if device not in latest or snapshot_time >= latest[device][0]:
+            latest[device] = (snapshot_time, trace)
+
         for site, values in trace.get("sites", {}).items():
             if site.startswith(family + "."):
                 largest = max(largest, int(values["largest_bytes"]))
@@ -70,26 +81,24 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
                 device_counts[key] = device_counts.get(key, 0) + count
                 if version == 1:
                     legacy.add(key)
-            identity = (device, graph["site"], graph.get("bank", 0), graph["shape"])
-            previous = identities.get(identity)
-            # Histograms age even with no new hits. Choose the latest rolling
-            # window, not the hottest historical snapshot of an idle key.
-            def freshness(row):
-                histogram = row.get("hit_histogram", {})
-                end = int(histogram.get("start_ms", 0)) + len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
-                return end, int(row.get("count", 0))
-            if previous is None or freshness(graph) >= freshness(previous[1]):
-                identities[identity] = (key, graph)
         for key, count in device_counts.items():
             counts[key] = max(counts.get(key, 0), count)
     if not counts:
         raise ValueError("trace contains no matching graph identities")
-    for key, graph in identities.values():
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if graph["site"].startswith(family + "."):
+                rows, width, _ = map(int, GEOMETRY.search(graph["shape"]).groups())
+                identity = (device, graph["site"], graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+                identities[identity] = ((rows, width), graph)
+    for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
             continue
         why = reasons.setdefault(key, set())
-        if sustained(graph):
+        histogram = graph.get("hit_histogram", {})
+        histogram_end = int(histogram.get("start_ms", 0)) + len(histogram.get("counts", [])) * int(histogram.get("interval_ms", 0))
+        if histogram_end >= latest[identity[0]][0] and sustained(graph):
             why.add("sustained_heat")
         if int(graph.get("evictions", 0)) >= 2 and int(graph.get("recaptures", 0)) >= 2:
             why.add("repeated_recapture")
@@ -122,14 +131,15 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None)
                 known = all("permanent_bytes" in graph for graph in graphs)
                 cost = sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None
                 pin_report.append({"device": device, "rows": key[0], "table_width": key[1],
-                                   "reasons": sorted(reasons[key]), "permanent_bytes": cost,
-                                   "reserve_bytes": reserves[device],
-                                   "reserve_fraction": cost / reserves[device] if cost is not None and reserves[device] else None,
+                                   "reasons": sorted(reasons[key]), "permanent_bytes": None,
+                                   "observed_permanent_lower_bound_bytes": cost,
+                                   "reserve_bytes": reserves[device], "reserve_fraction": None,
+                                   "observed_reserve_fraction_lower_bound": cost / reserves[device] if cost is not None and reserves[device] else None,
                                    "capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
                                    "nodes": sum(int(graph.get("nodes") or 0) for graph in graphs),
                                    "executables": sum(int(graph.get("executables", 1)) for graph in graphs),
                                    "basis": graphs[0].get("basis"),
-                                   "cost_basis": "unpacked_permanent_estimate" if known else "unknown_legacy_trace"})
+                                   "cost_basis": "observed_inventory_lower_bound_unknown_total" if known else "unknown_legacy_trace"})
     base = packed(max(arenas))
     extra = packed(largest)
     return {"schema_version": 1, "family": family,
