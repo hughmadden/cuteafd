@@ -27,7 +27,11 @@
 //! (used once, or only inside one sampling interval such as a single panel or
 //! the 32K context pass) is not an entry: it captures lazily inside the shared
 //! capture headroom. `reserve_extra_bytes` is the arena's 2 MiB allocation tail,
-//! and `bootstrap_bytes` is its largest measured capture.
+//! and `bootstrap_bytes` is its largest measured capture. Plain C1 and the
+//! layout's dominant verify geometry pin because they cost every step; elsewhere
+//! a pin follows the shared sustained-heat test, so a recurring or
+//! single-interval row is warmed into the ARC but stays evictable, and a
+//! workload that never revisits it lets ARC reclaim the space.
 //! `scripts/dev/graph-prewarm-from-trace.py` replaces one shape at a time and
 //! prints each heat class's keys and arena bytes; the consumer schema does not
 //! change.
@@ -178,11 +182,12 @@ pub fn v4_prewarm(gpus: usize, sparks: bool) -> Result<Vec<V4PrewarmEntry>, Stri
 
 /// The pinned geometries this shape keeps resident, as `(rows, table_width)`:
 /// a graph the trace shows as always hot is captured pinned, so churn elsewhere
-/// cannot evict it. V4's startup set is the replayed width-0 row classes; a
-/// verify geometry is pinned only where its own trace showed sustained heat.
-/// Only trace-derived entries may pin: a shape without a trace has no entries,
-/// so it warms nothing and pins nothing, and every graph it captures lives in
-/// the shared ARC like any other family's.
+/// cannot evict it. Plain C1 (`(1, 0)`) and the layout's dominant verify
+/// geometry pin whatever their heat class, and any other geometry pins only on
+/// sustained heat; a row hot in one interval, or merely recurring, is prewarmed
+/// into the ARC and stays evictable. Only trace-derived entries may pin: a
+/// shape without a trace has no entries, so it warms nothing and pins nothing,
+/// and every graph it captures lives in the shared ARC like any other family's.
 pub fn v4_pinned(gpus: usize, sparks: bool) -> Result<Vec<(usize, usize)>, String> {
     Ok(layout_entry(v4_layout(gpus, sparks)?).entries.into_iter()
         .filter(|entry| entry.pin)
@@ -279,12 +284,20 @@ mod tests {
     fn every_traced_shape_covers_its_working_set_at_reachable_rows() {
         for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
             let entries = v4_prewarm(gpus, sparks).unwrap();
-            // Every width-0 row class the trace replayed is the boot-warmed
-            // startup set, captured before serving, so it is pinned. A row
-            // captured once and never replayed is not.
+            // Every width-0 row class the trace replayed is warmed. Plain C1
+            // pins whatever its heat; beyond it, a pin is permanent residency,
+            // so only sustained heat earns one. A row replayed in a single
+            // interval stays prewarmed and evictable.
             let startup: Vec<_> = entries.iter().filter(|entry| entry.table_width == 0).collect();
             assert!(startup.len() >= 48);
-            assert!(startup.iter().all(|entry| entry.pin));
+            let pinned: Vec<_> = startup.iter().filter(|entry| entry.pin)
+                .map(|entry| entry.rows).collect();
+            let expected = match (gpus, sparks) {
+                (1, true) => vec![1, 48],
+                (2, true) => vec![1, 4, 5],
+                _ => vec![1, 5],
+            };
+            assert_eq!(pinned, expected);
             assert!(startup.iter().any(|entry| entry.rows == 1));
             assert!(startup.iter().any(|entry| entry.rows == 64));
             // No emitted geometry outruns the decode row capacity the traces ran.
@@ -295,16 +308,20 @@ mod tests {
     }
 
     #[test]
-    fn verify_geometries_are_prewarmed_unpinned_except_sustained_heat() {
-        // The verify geometries the traces show as recurring heat.
+    fn verify_geometries_pin_c1_dominant_and_sustained_heat() {
+        // The verify geometries cost every step at C1 (rows 1, width 1) and at
+        // the layout's dominant key; sustained heat pins its own rows.
         for (gpus, sparks) in [(1, true), (2, true), (2, false)] {
             let verify: Vec<_> = v4_prewarm(gpus, sparks).unwrap().into_iter()
                 .filter(|entry| entry.table_width > 0).collect();
             assert!(verify.len() >= 35, "{gpus}x{sparks}: {} verify geometries", verify.len());
-            // A pin is permanent residency, so only trace-proven heat earns one.
             let pinned: Vec<_> = verify.iter().filter(|entry| entry.pin)
                 .map(|entry| (entry.rows, entry.table_width)).collect();
-            let expected = if (gpus, sparks) == (1, true) { vec![(48, 128)] } else { vec![] };
+            let expected = if (gpus, sparks) == (1, true) {
+                vec![(1, 1), (48, 128)]
+            } else {
+                vec![(1, 1)]
+            };
             assert_eq!(pinned, expected);
         }
     }

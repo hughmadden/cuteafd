@@ -48,14 +48,19 @@ the emitted prewarm set's own measured captures (the trace's whole charged
 arena also holds lazy captures, which the shared reserve-extra policy covers),
 `reserve_extra_bytes` is the arena's 2 MiB allocation tail (the shared capture
 headroom is separate), and `bootstrap_bytes` is the largest measured capture
-unless the trace has none. Every verify geometry the trace observed becomes an entry unless it is rare -
+unless the trace has none.
+Every verify geometry the trace observed becomes an entry unless it is rare -
 used once, or only inside one sampling interval, such as one panel or the 32K
 context pass - which stays lazy under the shared capture headroom. A width-0
-startup row follows a stricter test: it is warmed and pinned only when the
-trace replayed it, so a row captured once and never looked up again stays
-lazy. A sustained geometry is pinned, a regular one prewarmed unpinned, and
-the heat report prints each class's keys and arena bytes. The engine warms the
-entries its pool can express and skips the rest.
+startup row follows a stricter test: it is warmed only when the trace replayed
+it, so a row captured once and never looked up again stays lazy. Pins follow
+sustained heat, plus two keys that cost every step: plain C1 (rows 1, width 0)
+and the layout's dominant verify geometry pin whatever their heat class. A row
+hot in one sampling interval, or merely recurring, is otherwise prewarmed but
+stays evictable for ARC. A sustained geometry is pinned, a
+regular one prewarmed unpinned, and the heat report prints each class's keys
+and arena bytes. The engine warms the entries its pool can express and skips
+the rest.
 """
 import argparse
 import json
@@ -254,15 +259,28 @@ def generate_deepseek_v4(traces, layout, existing, coverage=0.999, pin_frequency
     # one - captured once, or used only inside one sampling interval such
     # as the 32K context pass - stays lazy under the shared capture
     # headroom. A width-0 startup row is kept when the trace replayed it,
-    # and pinned because the engine captures the startup set before
-    # serving; one captured once and never replayed is neither warmed nor
-    # pinned. A thrashing key is kept even when rare, because the trace
-    # shows the churn rather than a single use.
+    # but it earns a pin only on sustained heat: a row hot in one interval,
+    # or merely recurring, lives in the prewarmed set and stays evictable
+    # so ARC can reclaim it if serving never revisits it. One captured once
+    # and never replayed is neither warmed nor pinned. A thrashing key is
+    # kept even when rare, because the trace shows the churn rather than a
+    # single use. Two keys are the cost of every step, so they pin whatever
+    # their heat class: plain C1 (rows 1, width 0) and the layout's
+    # dominant verify geometry, the width>0 key with the most lifetime hits
+    # in the latest device snapshots.
     selected = {key for key in counts
                 if classes.get(key, "rare") != "rare" or reasons.get(key)}
-    for key in selected:
-        if key[1] == 0:
-            reasons.setdefault(key, set()).add("startup_set")
+    if (1, 0) in counts:
+        selected.add((1, 0))
+        reasons.setdefault((1, 0), set()).add("c1_decode")
+    lifetime_hits = {}
+    for key, graph in identities.values():
+        if key[1] > 0:
+            lifetime_hits[key] = lifetime_hits.get(key, 0) + int(graph.get("hits", 0))
+    if lifetime_hits:
+        dominant = max(lifetime_hits, key=lambda key: (lifetime_hits[key], key))
+        selected.add(dominant)
+        reasons.setdefault(dominant, set()).add("dominant_verify")
     peak = max(counts.values())
     minimum = min(counts, key=lambda key: (key[0] * key[1], key))
     if minimum in legacy and counts[minimum] >= peak * pin_frequency:

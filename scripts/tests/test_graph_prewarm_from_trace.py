@@ -715,8 +715,8 @@ def test_v4_heat_split_pins_sustained_prewarms_regular_and_leaves_rare_lazy():
                             heat_report=heat)["layouts"]["rtx1-local"]
     entries = {(row["rows"], row["table_width"]): row["pin"] for row in entry["entries"]}
     assert entries[(8, 64)] is True, "sustained heat is pinned"
-    assert entries[(16, 512)] is False, "regular heat is prewarmed unpinned"
-    assert entries[(4, 0)] is True, "the startup set is pinned"
+    assert entries[(16, 512)] is True, "the dominant verify geometry always pins"
+    assert entries[(4, 0)] is False, "a recurring startup row is prewarmed, not pinned"
     assert (1, 16) not in entries, "a one-use geometry stays lazy"
     classes = {(row["device"], row["heat"]): (row["keys"], row["arena_bytes"], row["selected"])
                for row in heat}
@@ -729,7 +729,7 @@ def test_v4_heat_split_pins_sustained_prewarms_regular_and_leaves_rare_lazy():
     assert entry["reserve_base_bytes"] == [8 << 20]
 
 
-def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
+def test_v4_startup_rows_prewarm_and_only_sustained_heat_pins():
     trace = v4_trace(0, 5 << 20)
     trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
                             "shape": v4_shape(64, 0, "local-experts"), "count": 90,
@@ -740,12 +740,68 @@ def test_v4_startup_rows_pin_and_verify_geometries_stay_unpinned():
     entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list())
     entries = {(row["rows"], row["table_width"]): row["pin"]
                for row in entry["layouts"]["rtx1-local"]["entries"]}
-    # A width-0 row the trace replayed is a startup row, at every row count.
-    assert entries[(4, 0)] is True
+    # A width-0 row the trace replayed is a startup row at every row count;
+    # only the one whose own heat is sustained earns permanent residency.
+    assert entries[(4, 0)] is False
     assert entries[(64, 0)] is True
-    # A regular verify geometry is prewarmed unpinned; a rare one stays lazy.
-    assert entries[(16, 512)] is False
+    # The dominant verify geometry always pins; the other rare one stays lazy.
+    assert entries[(16, 512)] is True
     assert (1, 16) not in entries
+
+
+def test_v4_single_interval_startup_row_is_prewarmed_unpinned():
+    # A width-0 row replayed inside one sampling interval is reachable, so it
+    # is warmed; a pin otherwise needs sustained heat, and ARC must be able to
+    # reclaim a row serving never revisits (TJ, 2026-11-09).
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].append({"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+                            "shape": v4_shape(32, 0, "local-experts"), "count": 90,
+                            "key_id": (32, 0), "hits": 90, "cycles": {"decode": 90},
+                            "capture_bytes": 2 << 20,
+                            "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                                              "counts": [0, 0, 0, 0, 90, 0]}})
+    heat = []
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list(),
+                            heat_report=heat)["layouts"]["rtx1-local"]
+    entries = {(row["rows"], row["table_width"]): row["pin"] for row in entry["entries"]}
+    assert entries[(32, 0)] is False
+    assert ("startup", True) in {(row["heat"], row["selected"]) for row in heat}
+    # The rare one-use verify geometry stays lazy; the three warmed captures
+    # are the base.
+    assert entry["reserve_base_bytes"] == [6 << 20]
+
+
+def test_v4_c1_and_dominant_verify_pin_whatever_their_heat():
+    # Plain C1 (rows 1, width 0) and the layout's highest-lifetime-hit verify
+    # geometry cost every step, so they pin even when their heat is regular;
+    # the other regular verify geometry stays prewarmed and evictable.
+    trace = v4_trace(0, 5 << 20)
+    trace["graphs"].extend([
+        {"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+         "shape": v4_shape(1, 0, "local-experts"), "count": 60, "key_id": (1, 0),
+         "hits": 59, "cycles": {"decode": 60}, "capture_bytes": 2 << 20,
+         "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                           "counts": [1, 0, 0, 57, 0, 0]}},
+        {"device": 0, "site": "deepseek_v4.segment", "bank": 1,
+         "shape": v4_shape(12, 64), "count": 40, "key_id": (12, 64),
+         "hits": 39, "cycles": {"verify": 40}, "capture_bytes": 2 << 20,
+         "hit_histogram": {"interval_ms": 10_000, "start_ms": 0,
+                           "counts": [1, 0, 0, 38, 0, 0]}},
+    ])
+    report = []
+    entry = MODULE.generate([trace], "deepseek_v4", layout="rtx1-local", existing=v4_list(),
+                            pin_report=report)["layouts"]["rtx1-local"]
+    entries = {(row["rows"], row["table_width"]): row["pin"] for row in entry["entries"]}
+    assert entries[(1, 0)] is True, "plain C1 pins whatever its heat"
+    # (16, 512) has 99 lifetime hits against (12, 64)'s 39.
+    assert entries[(16, 512)] is True
+    assert entries[(12, 64)] is False
+    assert entries[(4, 0)] is False
+    reasons = {(row["rows"], row["table_width"]): row["reasons"] for row in report}
+    assert reasons[(1, 0)] == ["c1_decode"]
+    assert reasons[(16, 512)] == ["dominant_verify"]
+    assert (12, 64) not in reasons
+    assert entry["reserve_base_bytes"] == [8 << 20]
 
 
 def test_v4_startup_row_captured_once_is_not_warmed_or_pinned():
