@@ -1360,7 +1360,8 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
                 panic!("graphs are opaque, not physical allocations")
             };
             let (base, extra) = graphs.default_reserve();
-            assert_eq!(allowance.bytes, base + extra);
+            assert_eq!(allowance.bytes, crate::placement::graph_reserve::resolve(None, 0, false, base, extra).unwrap().bytes);
+            assert_eq!(allowance.bytes, 675_282_944);
             assert!(!allowance.assumed, "an estimated census does not change the configured budget");
             assert!(allowance.source.starts_with("graph reserve: "));
         }

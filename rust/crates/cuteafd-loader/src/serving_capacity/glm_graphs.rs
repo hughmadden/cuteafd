@@ -261,8 +261,8 @@ mod tests {
         assert_eq!(list.reserve_base_bytes % (2 << 20), 0);
         assert_eq!(list.reserve_extra_bytes % (2 << 20), 0);
         assert_eq!(list.reserve_base_bytes, 335_544_320);
-        assert_eq!(list.reserve_extra_bytes, 855_638_016);
-        assert_eq!(list.reserve_base_bytes + list.reserve_extra_bytes, 1_191_182_336);
+        assert_eq!(list.reserve_extra_bytes, 2_097_152);
+        assert_eq!(list.reserve_base_bytes + list.reserve_extra_bytes, 337_641_472);
         let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
         let allowed = glm_graph_shapes(4096, 32);
         for entry in glm_prewarm_shapes(GlmPrewarmFamily::Glm5, 1, 4096, 32) {

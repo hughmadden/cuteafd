@@ -37,6 +37,16 @@ function graphIdentity(k) {
     full: `${k.site} / ${shape}\nbank ${k.bank} / key ${k.key_id ?? 'unavailable'} / ${k.pinned ? 'pinned' : 'not pinned'}`
   };
 }
+function graphReservePolicy(g) {
+  const p = g.reserve_policy;
+  if (!p) return [];
+  return [
+    `Base ${bytes(p.base_bytes)} (${p.base_source ?? 'unavailable'})`,
+    `Extra ${bytes(p.extra_bytes)} requested / ${bytes(p.effective_extra_bytes)} effective (${p.extra_source ?? 'unavailable'})`,
+    `Cap ${p.cap_bytes === null ? 'none' : bytes(p.cap_bytes)} (${p.cap_source ?? 'unavailable'})`,
+    `Charged ${bytes(p.charged_bytes)} (${p.charged_source ?? 'unavailable'})`
+  ];
+}
 function stageRows(stats) {
   const r = stats.memory_reconciliation || {};
   const ready = arr(r.ready?.devices), first = arr(r.first_request?.devices);
@@ -166,7 +176,7 @@ class Rolling {
   }
   series(key) { return this.samples.map(s => ({time:s.time,value:s.values[key]})); }
 }
-const model = {normalize,segments,reservationView,segmentLabel,labelInk,weightPreference,rates,Rolling,bytes,exact,numeric,ownerLabel,graphIdentity};
+const model = {normalize,segments,reservationView,segmentLabel,labelInk,weightPreference,rates,Rolling,bytes,exact,numeric,ownerLabel,graphIdentity,graphReservePolicy};
 if (typeof module !== 'undefined' && module.exports) module.exports = model;
 if (!root.document) return;
 const $ = id => document.getElementById(id), UI = root.CuteUI, esc = UI.fmt.esc;
@@ -340,7 +350,7 @@ function renderGraphs(data,time) {
   if (!data.graphs.length) { $('graphs').innerHTML='<p>Unavailable: graph-cache controller not published by this family/build.</p>';return; }
   $('graphs').innerHTML=data.graphs.map(g=>{
     const before=previous?.graphs.find(p=>p.device===g.device), rate=rates(g.cycles,before?.cycles,(time-previousTime)/1000);
-    return `<article class="card"><h3>CUDA device ${esc(g.device)}</h3><p class="hint">Reserve ${bytes(g.reserve)} / arena ${bytes(g.charged)} / pinned ${bytes(g.pinned)} / pending ${bytes(g.pending_capture)}<br>${g.basis?.kind==='bytes'?'Estimator byte pool':'Node pool'} ${g.basis?.kind==='bytes'?bytes(g.pools?.live_nodes):number(g.pools?.live_nodes)} live / ${g.basis?.kind==='bytes'?bytes(g.pools?.node_high_water):number(g.pools?.node_high_water)} high-water. Executable pool ${number(g.pools?.live_execs)} live / ${number(g.pools?.exec_high_water)} high-water. Basis: ${esc(JSON.stringify(g.basis ?? 'unavailable'))}${g.basis?.kind==='bytes'?' (pool units are byte estimates, not CUDA node counts)':''}</p><div class="table-scroll"><table><caption>Per-second changes; unavailable until a second sample or after a counter reset.</caption><thead><tr><th>Cycle</th><th>Hits/s</th><th>Misses/s</th><th>Captures/s</th><th>Eager/s</th><th>Evictions/s</th></tr></thead><tbody>${Object.entries(rate).map(([cycle,c])=>`<tr><td>${esc(cycle)}</td>${['hits','misses','captures','eager_runs','evictions'].map(key=>`<td title="Lifetime: ${number(g.cycles[cycle][key])}">${number(c[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><details open><summary>Top 10 keys by hits</summary>${graphKeys(g.top_hits)}</details><details open><summary>Top 10 keys by churn</summary>${graphKeys(g.top_churn)}</details></article>`;
+    return `<article class="card"><h3>CUDA device ${esc(g.device)}</h3><p class="hint">Reserve ${bytes(g.reserve)} / arena ${bytes(g.charged)} / pinned ${bytes(g.pinned)} / pending ${bytes(g.pending_capture)}${graphReservePolicy(g).map(line=>`<br>${esc(line)}`).join('')}<br>${g.basis?.kind==='bytes'?'Estimator byte pool':'Node pool'} ${g.basis?.kind==='bytes'?bytes(g.pools?.live_nodes):number(g.pools?.live_nodes)} live / ${g.basis?.kind==='bytes'?bytes(g.pools?.node_high_water):number(g.pools?.node_high_water)} high-water. Executable pool ${number(g.pools?.live_execs)} live / ${number(g.pools?.exec_high_water)} high-water. Basis: ${esc(JSON.stringify(g.basis ?? 'unavailable'))}${g.basis?.kind==='bytes'?' (pool units are byte estimates, not CUDA node counts)':''}</p><div class="table-scroll"><table><caption>Per-second changes; unavailable until a second sample or after a counter reset.</caption><thead><tr><th>Cycle</th><th>Hits/s</th><th>Misses/s</th><th>Captures/s</th><th>Eager/s</th><th>Evictions/s</th></tr></thead><tbody>${Object.entries(rate).map(([cycle,c])=>`<tr><td>${esc(cycle)}</td>${['hits','misses','captures','eager_runs','evictions'].map(key=>`<td title="Lifetime: ${number(g.cycles[cycle][key])}">${number(c[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><details open><summary>Top 10 keys by hits</summary>${graphKeys(g.top_hits)}</details><details open><summary>Top 10 keys by churn</summary>${graphKeys(g.top_churn)}</details></article>`;
   }).join('');
   $('graphs').querySelectorAll('.heat i').forEach(el=>inspect(el,el.title));
   $('graphs').querySelectorAll('[data-key-identity]').forEach(el=>inspect(el,el.dataset.keyIdentity));

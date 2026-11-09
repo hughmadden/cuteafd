@@ -25,7 +25,7 @@ def test_frequency_and_low_parameter_pin_candidate():
     assert result["entries"] == [{"rows": 1, "table_width": 16, "pin": True},
                                  {"rows": 16, "table_width": 32, "pin": False}]
     assert result["reserve_base_bytes"] == 8 << 20
-    assert result["reserve_extra_bytes"] == 4 << 20
+    assert result["reserve_extra_bytes"] == 2 << 20
 
 
 def test_devices_are_not_added_and_repeated_snapshots_do_not_duplicate_shapes():
@@ -231,3 +231,44 @@ def test_odd_half_table_width_is_refused():
         "table_width: 8, table_stride: 8", "table_width: 9, table_stride: 9")
     with pytest.raises(ValueError):
         MODULE.generate([data], "mistral_large4", layout=2)
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
+def test_generator_prefix_matches_shared_engine_graph_site(family):
+    import re
+    engine = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5/engine.rs"
+    sites = re.findall(r'name:\s*"([^"]+)"', engine.read_text())
+    assert "glm5.segment" in sites
+    assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "deepseek_v41"])
+def test_native_family_schemas_are_not_advertised_as_glm_consumers(family):
+    assert family not in MODULE.SITE_PREFIX
+    with pytest.raises(ValueError, match="no checked-in shape-list consumer"):
+        MODULE.generate([trace()], family)
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
+def test_every_consumer_uses_fixed_allocation_tail_not_largest_graph(family):
+    data = trace()
+    for graph in data["graphs"]:
+        graph["site"] = MODULE.SITE_PREFIX[family] + "segment"
+    data["sites"] = {MODULE.SITE_PREFIX[family] + "segment": {"largest_bytes": 80 << 20}}
+    result = MODULE.generate([data], family, **({"layout": 1} if family == "mistral_large4" else {}))
+    assert result["reserve_base_bytes"] == 8 << 20
+    assert result["reserve_extra_bytes"] == 2 << 20
+
+
+@pytest.mark.parametrize("filename", ["glm_prewarm.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
+def test_regeneration_reproduces_checked_in_base_and_tail(filename):
+    import json
+    root = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity"
+    checked_in = json.loads((root / filename).read_text())
+    data = trace(charged=checked_in["reserve_base_bytes"])
+    # The measured arena, not a largest capture or the old reservation, is the base.
+    data["sites"]["glm5.segment"]["largest_bytes"] = 80 << 20
+    result = MODULE.generate([data], checked_in["family"],
+                             **({"layout": checked_in["layout"]} if checked_in.get("layout") else {}))
+    for key in ("reserve_base_bytes", "reserve_extra_bytes"):
+        assert result[key] == checked_in[key]
