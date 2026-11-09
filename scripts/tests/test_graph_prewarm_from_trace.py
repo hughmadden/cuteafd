@@ -1706,7 +1706,14 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     assert "GraphOwner" in graph and "struct Executable" not in graph
     assert "golden_decode_graphs" in graph
     assert "off_digest == on_digest" in graph
+    assert "off_digest == warm_digest" in graph
+    assert graph.index("let (_, warm_digest) = score(true)?") < graph.index("let before = replay_hits()")
+    assert graph.index("let before = replay_hits()") < graph.index("let (on, on_digest) = score(true)?")
     assert "after > before" in graph
+    golden = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/mod.rs").read_text()
+    assert "published_reference(golden, cfg.hidden, cfg.vocab)?" in golden
+    assert 'if compact { Vec::new() }' in golden
+    assert "external top-1024 quality is qualified separately" in golden
     verify = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/verify.rs").read_text()
     assert "if self.graphs.enabled && plan.stride > 0" in verify
     admission = (root / "rust/crates/cuteafd-loader/src/placement/families/qwen3_5/admission.rs").read_text()

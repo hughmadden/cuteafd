@@ -61,6 +61,16 @@ Golden's expert-layer hint must cover the planner-selected Spark layers under
 sent to workers and loaded. Golden receipts record the chosen coordinator count,
 Spark layer IDs and inactive hinted/loaded counts.
 
+`cuteafd qwen35-golden --golden DATASET --window ID` also accepts the pinned
+published compact fidelity dataset for graph qualification when decode graphs
+are enabled. It compares full decode logits byte-for-byte across graph-off,
+graph-on warm-up and graph-on measured passes, requires measured replays and
+identical NLL, and optionally runs `--verify-check` and `--prefix-check`. This
+same-engine oracle does not replace the standard card's external top-1024
+quality, strict lossless speculation or prefix-cache gates. Full-logits golden
+inputs retain their existing reference checks; compact graph mode does not
+support draft/MTP comparisons or `--save-logits`.
+
 ## Identity and instance
 
 | Key | Default | Values | Notes |

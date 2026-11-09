@@ -126,8 +126,10 @@ impl DenseEngine<'_> {
         use crate::shared::speculation::target::{VerifyRequest, VerifyRow};
         use sha2::{Digest, Sha256};
         if !self.graphs.enabled { return Ok(None); }
+        ensure!(chunk > 0, "dense graph golden requires a nonzero chunk");
         let ready = self.graphs.capture_ready.get();
-        let before = device::snapshots().iter().filter(|row| row.device == self.stream.device.id)
+        let id = self.stream.device.id;
+        let replay_hits = || device::snapshots().iter().filter(|row| row.device == id)
             .flat_map(|row| row.cycles.values()).map(|cycle| cycle.hits).sum::<u64>();
         let mut score = |capturing: bool| -> Result<(Vec<f32>, Vec<u8>)> {
             self.reset_slot(0)?;
@@ -149,19 +151,23 @@ impl DenseEngine<'_> {
             }
             Ok((selected, digest.finalize().to_vec()))
         };
-        let result: Result<(Vec<f32>, Vec<f32>)> = (|| {
+        let result: Result<(Vec<f32>, Vec<f32>, u64)> = (|| {
             let (off, off_digest) = score(false)?;
+            // A short window may touch each stride only once. Warm every shape
+            // before measuring so capture-only execution cannot pass this oracle.
+            let (_, warm_digest) = score(true)?;
+            ensure!(off_digest == warm_digest, "dense graph warm/off decode logits are not byte-identical");
+            let before = replay_hits();
             let (on, on_digest) = score(true)?;
+            let after = replay_hits();
             ensure!(off_digest == on_digest, "dense graph-on/off decode logits are not byte-identical");
-            Ok((off, on))
+            ensure!(after > before, "dense graph golden measured pass did not replay any executable");
+            Ok((off, on, after - before))
         })();
         self.graphs.capture_ready.set(ready);
-        let (off, on) = result?;
-        let after = device::snapshots().iter().filter(|row| row.device == self.stream.device.id)
-            .flat_map(|row| row.cycles.values()).map(|cycle| cycle.hits).sum::<u64>();
-        ensure!(after > before, "dense graph golden did not replay any executable");
-        println!("dense graph decode: byte-identical on/off logits over {} rows; {} replay hits",
-            tokens.len(), after - before);
+        let (off, on, replays) = result?;
+        println!("dense graph decode: byte-identical off/warm-on/measured-on logits over {} rows; {replays} measured replay hits",
+            tokens.len());
         self.reset_slot(0)?;
         Ok(Some((off, on)))
     }
