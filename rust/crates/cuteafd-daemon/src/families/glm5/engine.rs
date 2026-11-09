@@ -1464,6 +1464,10 @@ impl<'a> GlmEngine<'a> {
     fn verify_device_hooked(&self, sequences: &mut [(&mut GlmPlacement, usize)], tokens: &[u32],
         experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
+        use crate::shared::decode_graph::device::Cycle;
+        let cycle = if sequences.iter().any(|(_, count)| *count > 1) { Cycle::Verify } else { Cycle::Decode };
+        self.graphs.borrow_mut().cache_cycle(cycle);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(cycle); }
         let rows: usize = sequences.iter().map(|(_, n)| n).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         let mut needed = 1;
@@ -1533,6 +1537,9 @@ impl<'a> GlmEngine<'a> {
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "GLM startup graph inventory already captured");
         let shapes = glm_prewarm_shapes(self.max_context, self.pages);
+        use crate::shared::decode_graph::device::Cycle;
+        self.graphs.borrow_mut().cache_cycle(Cycle::Other);
+        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
         // Eager pass: each shape's first module, workspace and BLAS touch lands
         // outside executable residency, before the before-sample.
         let mut run = |warming: bool| -> Result<()> {
@@ -1591,7 +1598,9 @@ impl<'a> GlmEngine<'a> {
         use crate::shared::decode_graph::device::Basis;
         // #1612 rates cover this route only. One basis is selected for every
         // bank on the device; local/TP2 must not mix node and byte units.
-        if self.ranks() == 1 && !self.has_local()
+        let sm120 = self.library.cuda_get_device().and_then(|device| self.library.cuda_device_info(device))
+            .is_ok_and(|info| info.compute_capability_major == 12 && info.compute_capability_minor == 0);
+        if sm120 && self.ranks() == 1 && !self.has_local()
             && matches!(self.cfg.variant, cuteafd_loader::families::glm5::GlmVariant::Glm)
             && self.weights.layers.iter().all(|layer| !layer.attention_native.is_empty()) {
             let rate = cuteafd_loader::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES[0];

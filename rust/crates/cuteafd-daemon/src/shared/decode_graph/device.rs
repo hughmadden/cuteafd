@@ -136,6 +136,7 @@ struct TraceRow {
     identity: Identity,
     cycle: Cycle,
     count: u64,
+    cycles: HashMap<Cycle, u64>,
     first_seen_ms: u64,
     declared_capture_streams: usize,
     max_parallel_width: usize,
@@ -262,15 +263,22 @@ impl DeviceCache {
     fn trace(&mut self, identity: &Identity, cycle: Cycle) {
         if self.trace.is_none() { return }
         let row = self.trace_rows.entry(identity.clone()).or_insert_with(|| TraceRow {
-            device: self.device, identity: identity.clone(), cycle, count: 0,
+            device: self.device, identity: identity.clone(), cycle, count: 0, cycles: HashMap::new(),
             first_seen_ms: self.started.elapsed().as_millis() as u64, declared_capture_streams: 1,
             max_parallel_width: 0, spans_devices: false });
         row.count += 1;
+        *row.cycles.entry(cycle).or_default() += 1;
     }
 
+    #[cfg(test)]
     pub fn hit(&mut self, id: u64) {
         let Some(record) = self.records.get(&id) else { return };
-        let (cycle, pinned, pending) = (record.cycle, record.pinned, record.pending_destroy);
+        self.hit_cycle(id, record.cycle);
+    }
+
+    pub fn hit_cycle(&mut self, id: u64, cycle: Cycle) {
+        let Some(record) = self.records.get(&id) else { return };
+        let (pinned, pending) = (record.pinned, record.pending_destroy);
         if self.trace.is_some() { let identity = record.identity.clone(); self.trace(&identity, cycle); }
         self.counters.entry(cycle).or_default().hits += 1;
         if !pinned && !pending { self.push(id, List::Frequent); }
@@ -279,6 +287,11 @@ impl DeviceCache {
     /// Pinned hits accumulate in the bank, without a lock or ARC mutation.
     pub fn pinned_hits(&mut self, cycle: Cycle, count: u64) {
         self.counters.entry(cycle).or_default().hits += count;
+    }
+
+    #[cfg(test)]
+    pub fn cycle_hits(&self, cycle: Cycle) -> u64 {
+        self.counters.get(&cycle).map_or(0, |counters| counters.hits)
     }
 
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
@@ -733,9 +746,11 @@ mod tests {
         assert!(!cache.report_due(Duration::from_secs(30)));
         cache.trace = Some("unused".into());
         cache.trace(&key(1), Cycle::Decode);
-        cache.trace(&key(1), Cycle::Decode);
+        cache.trace(&key(1), Cycle::Verify);
         let row = serde_json::to_value(&cache.trace_rows[&key(1)]).unwrap();
         assert_eq!(row["site"], "test"); assert_eq!(row["count"], 2);
+        assert_eq!(row["cycles"]["decode"], 1);
+        assert_eq!(row["cycles"]["verify"], 1);
         assert!(row["first_seen_ms"].is_u64());
     }
 }

@@ -52,7 +52,11 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9):
             if rows <= 0 or width <= 0 or stride != width:
                 raise ValueError("unsupported prewarm geometry")
             key = (rows, width)
-            device_counts[key] = device_counts.get(key, 0) + int(graph["count"])
+            cycles = graph.get("cycles")
+            # Startup prewarm is attributed to Other, not request frequency.
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) if cycles is not None else int(graph["count"])
+            if count > 0:
+                device_counts[key] = device_counts.get(key, 0) + count
         for key, count in device_counts.items():
             counts[key] = max(counts.get(key, 0), count)
     if not counts:

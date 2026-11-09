@@ -2615,6 +2615,42 @@ void test_cuda_mla_kv_mxfp4_pack_roundtrip_matches_representable_values() {
   free_buffer(&dunpacked);
 }
 
+void test_cuda_graph_topology_chain_and_fork() {
+  auto buffer = device_buffer(2 * sizeof(uint32_t));
+  cudaStream_t lead = nullptr, peer = nullptr;
+  cudaEvent_t fork = nullptr, join = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&lead, cudaStreamNonBlocking), "topology lead");
+  require_cuda(cudaStreamCreateWithFlags(&peer, cudaStreamNonBlocking), "topology peer");
+  require_cuda(cudaEventCreateWithFlags(&fork, cudaEventDisableTiming), "topology fork event");
+  require_cuda(cudaEventCreateWithFlags(&join, cudaEventDisableTiming), "topology join event");
+  for (bool parallel : {false, true}) {
+    require_status(cuteafd_cuda_graph_begin_capture(lead), "topology begin capture");
+    require_cuda(cudaMemsetAsync(buffer.ptr, 0, sizeof(uint32_t), lead), "topology root");
+    if (parallel) {
+      require_cuda(cudaEventRecord(fork, lead), "topology fork record");
+      require_cuda(cudaStreamWaitEvent(peer, fork, 0), "topology fork wait");
+      require_cuda(cudaMemsetAsync(static_cast<uint32_t*>(buffer.ptr) + 1, 1, sizeof(uint32_t), peer), "topology peer node");
+      require_cuda(cudaEventRecord(join, peer), "topology join record");
+    }
+    require_cuda(cudaMemsetAsync(buffer.ptr, 2, sizeof(uint32_t), lead), "topology lead node");
+    if (parallel) require_cuda(cudaStreamWaitEvent(lead, join, 0), "topology join wait");
+    void* exec = nullptr;
+    size_t nodes = 0, width = 0;
+    int spans = -1;
+    require_status(cuteafd_cuda_graph_end_capture_topology(lead, &exec, &nodes, &width, &spans), "topology end capture");
+    assert(nodes >= 2 && spans == 0);
+    assert(parallel ? width > 1 : width == 1);
+    require_status(cuteafd_cuda_graph_launch(exec, lead), "topology launch");
+    require_cuda(cudaStreamSynchronize(lead), "topology complete");
+    require_status(cuteafd_cuda_graph_destroy(exec), "topology destroy");
+  }
+  require_cuda(cudaEventDestroy(join), "topology join destroy");
+  require_cuda(cudaEventDestroy(fork), "topology fork destroy");
+  require_cuda(cudaStreamDestroy(peer), "topology peer destroy");
+  require_cuda(cudaStreamDestroy(lead), "topology lead destroy");
+  free_buffer(&buffer);
+}
+
 void test_cuda_graph_replay_matches_uncaptured() {
   const int rows = 1;
   const int hidden = 8;
@@ -2860,6 +2896,11 @@ int main(int argc, char** argv) {
     std::cout << "test result: ok. 2 passed; 0 failed\n";
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--graph-topology-only") == 0) {
+    test_cuda_graph_topology_chain_and_fork();
+    std::cout << "test result: ok. 2 passed; 0 failed\n";
+    return 0;
+  }
   test_peer_copy_optional_query_failure_is_recoverable();
   if (argc == 2 && std::strcmp(argv[1], "--f32-to-bf16-only") == 0) {
     test_cuda_f32_to_bf16_rounds_nearest_even();
@@ -2908,6 +2949,7 @@ int main(int argc, char** argv) {
   test_cuda_mla_kv_prepare_bf16_matches_normalized_rotated_reference();
   test_cuda_mla_compressed_attention_reads_interleaved_cache_formats();
   test_cuda_mla_kv_mxfp4_pack_roundtrip_matches_representable_values();
+  test_cuda_graph_topology_chain_and_fork();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();

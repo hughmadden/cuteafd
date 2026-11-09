@@ -34,6 +34,16 @@ def test_devices_are_not_added_and_repeated_snapshots_do_not_duplicate_shapes():
     assert result["reserve_base_bytes"] == 12 << 20
 
 
+def test_startup_prewarm_counts_do_not_select_cold_shapes():
+    data = trace()
+    for graph in data["graphs"]:
+        graph["cycles"] = {"other": 100, "verify": graph["count"]}
+    data["graphs"][2]["cycles"] = {"other": 1000}
+    result = MODULE.generate([data], "glm5")
+    assert len(result["entries"]) == 2
+    assert all(entry["rows"] != 64 for entry in result["entries"])
+
+
 def test_cold_low_rank_shape_is_not_pinned():
     data = trace()
     data["graphs"][0]["count"] = 1

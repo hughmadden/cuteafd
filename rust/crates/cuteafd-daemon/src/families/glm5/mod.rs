@@ -1776,7 +1776,7 @@ impl Opened {
         let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
             .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
         engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
-        for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
+        for rank in 0..admitted.graphs.ranks().len() {
             let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
                 cuteafd_loader::placement::graph_reserve::glm_default().0,
                 cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;
@@ -1792,7 +1792,7 @@ impl Opened {
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
-        for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
+        for rank in 0..admitted.graphs.ranks().len() {
             let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
                 cuteafd_loader::placement::graph_reserve::glm_default().0,
                 cuteafd_loader::placement::graph_reserve::glm_default().1).map_err(anyhow::Error::msg)?;

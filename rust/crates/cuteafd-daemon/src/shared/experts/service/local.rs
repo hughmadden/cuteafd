@@ -214,8 +214,26 @@ fn retained_workspace(before_device: usize, after_device: usize, resident: u64,
     Ok((workspace, u64::try_from(pinned)?))
 }
 
+fn worker_reconciliation_provenance(config: &NativeExpertServiceConfig) -> serde_json::Value {
+    use sha2::{Digest, Sha256};
+    let hash = |path: &std::path::Path| -> Option<String> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest).ok()?;
+        Some(format!("{:x}", digest.finalize()))
+    };
+    let programs = config.library.parent().map(|path| path.join("../share/PROGRAMS.json"));
+    serde_json::json!({"native_sha256": hash(&config.library),
+        "programs_sha256": programs.as_deref().and_then(hash),
+        "snapshot": config.snapshot, "rank": config.rank, "world": config.world,
+        "capacity": config.capacity, "selected_layers": config.selected_layers,
+        "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+        "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN")})
+}
+
 fn measured_worker_runtime(library: &NativeLibrary,
-    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census)
+    baseline: &cuteafd_ffi::memory_ledger::Snapshot, resident: u64, census: &super::census::Census,
+    config: &NativeExpertServiceConfig)
     -> Result<cuteafd_core::SparkRuntimeInventory> {
     use cuteafd_ffi::memory_ledger::{self, Space};
     let device = library.cuda_get_device()?;
@@ -236,6 +254,7 @@ fn measured_worker_runtime(library: &NativeLibrary,
         "device": device, "arch": sample.arch, "driver": sample.driver,
         "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
         "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+        "provenance": worker_reconciliation_provenance(config),
         "graph_capture_sites": [], "graph_status": "live worker Execution::launch uses eager execution; no capture/replay call sites"
     }));
     Ok(cuteafd_core::SparkRuntimeInventory { detail, sample, workspace_bytes, pinned_workspace_bytes })
@@ -337,7 +356,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     library.release_sync_h2d_staging()?;
                     let baseline = cuteafd_ffi::memory_ledger::snapshot();
                     Some(cuteafd_core::ModelAdmissionResponse { rank: u32::try_from(config.rank)?,
-                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census)?,
+                        resident_bytes: 0, slices: vec![], runtime: measured_worker_runtime(&library, &baseline, 0, &census, &config)?,
                         mapped_ring_bytes: 0, host_exchange_bytes: 0, row_indices_bytes: 0 })
                 };
                 cuteafd_transport::worker_selection::InstalledModelAdmission::new(config.rank, selection, report)
@@ -494,7 +513,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 let model = selection.model().context("worker selection requires typed model admission")?;
                 weights.validate_ingress(&library, model)?;
                 let (resident_bytes, slices) = weights.loaded_residency(&library, config.compiled_capacity()?)?;
-                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census)?;
+                let mut runtime = measured_worker_runtime(&library, &baseline, resident_bytes, &census, &config)?;
                 runtime.detail.load_transient = weights.load_inventory();
                 runtime.detail.allocations.extend(weights.retained_host_inventory()?);
                 tracing::info!(target: "cuteafd::spark_memory", rank = config.rank,
@@ -590,6 +609,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
     // hand-written value; the role comes from the same selection the loader used.
+    let reconciliation_provenance = worker_reconciliation_provenance(&config);
     let role = if config.exlr8_manifest.is_some() {
         None
     } else if catalog.exl3().is_some() {
@@ -783,9 +803,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 Ok(processed) => {
                     progressed |= processed;
                     if processed && executed && pending_steady_log {
-                        let (free, total) = library.cuda_physical_memory_info()?;
-                        let (admission_free, admission_total) = library.cuda_allocatable_memory_info()?;
-                        let device = library.cuda_get_device()?;
+                        if let (Ok((free, total)), Ok((admission_free, admission_total)), Ok(device)) = (
+                            library.cuda_physical_memory_info(), library.cuda_allocatable_memory_info(), library.cuda_get_device()) {
                         let ledger = cuteafd_ffi::memory_ledger::snapshot();
                         let charged = ledger.total(cuteafd_ffi::memory_ledger::Space::Device, device)
                             + ledger.total(cuteafd_ffi::memory_ledger::Space::Managed, device);
@@ -798,10 +817,13 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                             "measured_minus_charged_bytes": i128::try_from(measured).unwrap() - i128::try_from(charged).unwrap(),
                             "charge_basis": "worker ledger backing owners only; planner charge available only at coordinator Ready",
                             "planner_measured_minus_charged_bytes": null,
-                            "source_commit": env!("CUTEAFD_BUILD_COMMIT"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                            "provenance": reconciliation_provenance,
                             "graph_status": "eager worker execution; no live capture/replay sites",
                             "method": "raw CUDA physical and admission allocatable samples side by side; no NVML"
                         }), "Spark first-request memory reconciliation");
+                        } else {
+                            tracing::warn!(rank = config.rank, "Spark first-request CUDA reconciliation sample unavailable");
+                        }
                         if census.enabled() {
                             library.cuda_device_synchronize()?;
                             census.sample("steady_after_first_expert_request", Some(&library))?;

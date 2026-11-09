@@ -131,13 +131,25 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         Ok(())
     }
 
+    /// Change attribution at a whole-cycle boundary, retaining the pinned-hit
+    /// fast path and flushing its previous cycle before switching.
+    pub fn cache_cycle(&mut self, cycle: super::device::Cycle) {
+        if let Some(binding) = &mut self.device {
+            if binding.site.cycle != cycle {
+                binding.cache.lock().unwrap_or_else(|p| p.into_inner())
+                    .pinned_hits(binding.site.cycle, std::mem::take(&mut binding.pinned_hits));
+                binding.site.cycle = cycle;
+            }
+        }
+    }
+
     pub fn cached_launch(&mut self, key: &K) -> Option<&E> {
         let entry = self.entries.get(key)?;
         if let (Some(binding), Some((id, pinned))) = (&mut self.device, entry.cached) {
             if pinned && !binding.trace {
                 binding.pinned_hits += 1;
             } else {
-                binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit(id);
+                binding.cache.lock().unwrap_or_else(|p| p.into_inner()).hit_cycle(id, binding.site.cycle);
             }
         }
         Some(&entry.exec)
@@ -707,6 +719,24 @@ mod device_tests {
         bank.cache_drain(|| { assert_eq!(drops.get(), 0); Ok(()) }, || {
             assert_eq!(drops.get(), 1); Ok(ReleaseMeasurement { released: 0 })
         }).unwrap();
+    }
+
+    #[test]
+    fn cached_graph_hits_follow_the_current_cycle_including_pinned_fast_path() {
+        let mut bank = GraphBank::new(None);
+        bank.attach_device(-303, 100, site()).unwrap();
+        for (key, pinned) in [(1, true), (2, false)] {
+            let Miss::Capture(id) = bank.cache_miss(&key, pinned, None) else { panic!() };
+            bank.cache_insert(key, key, id, pinned);
+            bank.cache_measured(10);
+        }
+        bank.cache_cycle(Cycle::Verify);
+        assert_eq!(bank.cached_launch(&1), Some(&1));
+        assert_eq!(bank.cached_launch(&2), Some(&2));
+        bank.cache_cycle(Cycle::Decode);
+        let cache = bank.device.as_ref().unwrap().cache.clone();
+        assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Verify), 2);
+        assert_eq!(cache.lock().unwrap().cycle_hits(Cycle::Decode), 0);
     }
 
     #[test]
