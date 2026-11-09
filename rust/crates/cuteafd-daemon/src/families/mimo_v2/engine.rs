@@ -2471,6 +2471,10 @@ impl<'a> MimoEngine<'a> {
             && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
             "MiMo startup graph inventory already captured");
         let layout = self.graph_layout.as_ref().context("MiMo decode graph layout was not admitted")?.clone();
+        if layout.reserves.iter().all(|&bytes| bytes == 0) {
+            tracing::info!("MiMo graph reserves are zero; decode segments run eagerly");
+            return Ok(0);
+        }
         // Startup captures are not request heat: attribute them to Other so the
         // trace never reads the provisional prewarm as decode demand.
         use crate::shared::decode_graph::device::Cycle;
