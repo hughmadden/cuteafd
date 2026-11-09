@@ -71,6 +71,19 @@ async fn cancel_requests(State(drain): State<Drain>, request: Request, next: Nex
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+/// Flush terminal events and complete the close handshake before dropping the TCP socket.
+/// Unread client frames at drop can otherwise reset the connection and hide the final event.
+pub async fn close_socket(socket: &mut axum::extract::ws::WebSocket) {
+    use futures::SinkExt;
+    let close = async {
+        let _ = socket.send(axum::extract::ws::Message::Close(None)).await;
+        while let Some(Ok(message)) = socket.next().await {
+            if matches!(message, axum::extract::ws::Message::Close(_)) { break; }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), close).await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

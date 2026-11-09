@@ -492,4 +492,7 @@ async fn websocket_loop(mut socket: WebSocket, gateway: Arc<Gateway>, tape: Tape
             }
         }
     }
+    if drain.as_ref().is_some_and(crate::shutdown::Drain::is_stopping) {
+        crate::shutdown::close_socket(&mut socket).await;
+    }
 }

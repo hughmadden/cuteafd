@@ -296,6 +296,9 @@ async fn serve(
             break;
         }
     }
+    if drain.as_ref().is_some_and(crate::shutdown::Drain::is_stopping) {
+        crate::shutdown::close_socket(&mut socket).await;
+    }
     // Retain the final partial contents for any shared holders before closing.
     c.finish(Some(StopReason::Cancelled), None).await;
     c.cancel.take();
