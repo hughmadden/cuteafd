@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Propose a family prewarm list from GRAPH_TRACE snapshots.
 
-Request frequency selects coverage. Schema 2 pins sustained rolling-window
-heat or repeated eviction/recapture, and reports permanent pin cost separately
-from measured step-boundary allocator growth. Review and qualify before use.
+Request frequency selects the traced working set. Schema 2 pins sustained
+rolling-window heat or repeated eviction/recapture. Qwen4's reserve base is
+the sum of the selected identities' measured `capture_bytes` per device,
+rounded once, with a fixed 2 MiB capture headroom; the trace's charged
+high-water is never used. Review and qualify before use.
 
 Examples:
   python3 scripts/dev/graph-prewarm-from-trace.py --family glm5 \
@@ -44,6 +46,7 @@ from pathlib import Path
 
 CHUNK = 2 << 20
 GLM5_FLASH_LAYOUTS = {"1", "1-sparks", "2", "2-sparks"}
+EXTRA_BYTES = 2 << 20
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
 SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
@@ -327,28 +330,15 @@ def qwen_geometry(graph):
             int(page_stride), int(pool_stride))
 
 
-def qwen_replay(graph):
-    """Replayed launches for one qwen4 graph identity (0 = captured, never used)."""
-    replay = graph.get("hits")
-    if replay is None:
-        cycles = graph.get("cycles")
-        replay = (sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify"))
-                  if cycles is not None else int(graph["count"])) - int(graph.get("misses", 0))
-    return int(replay)
-
-
-def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
+def generate_qwen(traces, shape, coverage=0.999, pin_report=None):
     """One `QwenShapePrewarm` object for a resolved capture shape.
 
-    Only identities with at least one replay can be selected: a capture is an
-    event, not demand, so a shape captured once and never replayed stays lazy
-    and its count and bytes are reported. The reserve base is the traced
-    working set's arena: each identity of a selected shape's measured
-    `capture_bytes` (every segment row, replayed or a startup-only sibling),
-    summed per device, deduplicated by identity, rounded once to the 2 MiB
-    chunk, and a selected identity without a measured share fails. The trace's
-    charged high-water is never the base; `reserve_extra_bytes` is the fixed
-    2 MiB capture headroom.
+    The reserve base is the traced working set's arena: each selected
+    identity's measured `capture_bytes`, summed per device, deduplicated by
+    identity, rounded once to the 2 MiB chunk. Startup-only siblings (captured
+    but never replayed) contribute too, and a selected identity without a
+    measured share fails. The trace's charged high-water is never the base;
+    `reserve_extra_bytes` is the fixed 2 MiB capture headroom.
     """
     if not 0 < coverage <= 1:
         raise ValueError("coverage must be in (0, 1]")
@@ -379,9 +369,6 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
         raise ValueError(f"{shape} needs {owners} device traces, found {devices}")
     # Frequency and heat use only each device's latest complete inventory:
     # identities missing from it have been forgotten and must not survive.
-    # Only replayed graphs rank the working set: a startup capture is an event
-    # (and a miss), never demand, so a zero-hit bootstrap shape can never be
-    # selected (#1652).
     for device, (_, trace) in latest.items():
         for graph in trace["graphs"]:
             if not graph["site"].startswith("qwen4."):
@@ -394,34 +381,21 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                                     and graph.get("capture_bytes") is not None):
                 identities[identity] = (geometry, graph)
             cycles = graph.get("cycles")
-            replay = qwen_replay(graph)
+            count = sum(int(cycles.get(cycle, 0)) for cycle in ("decode", "verify")) \
+                if cycles is not None else int(graph["count"])
+            if count <= 0:
+                continue
             # Every layer segment runs once per decode step: rank a shape by its
             # busiest segment rather than summing all of them.
-            if replay > 0:
-                counts[geometry] = max(counts.get(geometry, 0), replay)
+            counts[geometry] = max(counts.get(geometry, 0), count)
+            identity = (device, graph["site"], graph.get("bank", 0),
+                        graph.get("key_id", graph["shape"]))
+            previous = identities.get(identity)
+            if previous is None or (previous[1].get("capture_bytes") is None
+                                    and graph.get("capture_bytes") is not None):
+                identities[identity] = (geometry, graph)
     if not counts:
-        raise ValueError("trace records no replayed graph identities")
-    # A captured-but-never-replayed identity is first touch, not demand: it is
-    # never selected, and its count and bytes are reported rather than hidden.
-    zero_replay = [graph for (_, graph) in identities.values() if qwen_replay(graph) == 0]
-    zero_replay_bytes = sum(int(graph.get("capture_bytes") or 0) for graph in zero_replay)
-    if summary is not None:
-        summary["zero_replay_identities"] = len(zero_replay)
-        summary["zero_replay_bytes"] = zero_replay_bytes
-    # A completed capture boundary with no new physical growth is allocator
-    # reuse, not a free graph: the shared cache keeps such a record's estimate
-    # for exactly this case. Charge a selected identity whose measured share is
-    # zero the launch's measured mean capture on its device, so the traced
-    # working set's base is never undercounted by the proportional split.
-    measured = {}
-    for (device, _, _, _), (_, graph) in identities.items():
-        share = graph.get("capture_bytes")
-        if share is None:
-            continue
-        captures, total = measured.get(device, (0, 0))
-        measured[device] = (captures + max(int(graph.get("captures") or 0), 1),
-                            total + int(share))
-    mean = {device: total / captures for device, (captures, total) in measured.items()}
+        raise ValueError("trace contains no matching graph identities")
     for identity, (key, graph) in identities.items():
         cycles = graph.get("cycles", {})
         if not any(int(cycles.get(cycle, 0)) > 0 for cycle in ("decode", "verify")):
@@ -475,7 +449,6 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                                    "basis": graphs[0].get("basis"),
                                    "cost_basis": "observed_inventory_lower_bound_unknown_total" if cost is not None else "unknown_legacy_trace"})
     base = []
-    zero_share = []
     for device in devices:
         total = 0
         for selected_key in sorted(selected):
@@ -487,22 +460,11 @@ def generate_qwen(traces, shape, coverage=0.999, pin_report=None, summary=None):
                     raise ValueError(
                         f"{shape} device {device} selects {qwen_shape_text(selected_key)} "
                         f"without a measured capture share: {graph['shape']!r}")
-                share = int(share)
-                if share == 0:
-                    share = round(mean.get(device, 0.0))
-                    zero_share.append(identity)
-                total += share
+                total += int(share)
         base.append(packed(total))
-    zero_share_bytes = sum(round(mean.get(identity[0], 0.0)) for identity in zero_share)
-    if summary is not None:
-        summary["zero_share_identities"] = len(zero_share)
-        summary["zero_share_bytes"] = zero_share_bytes
     extra = [EXTRA_BYTES for _ in devices]
     provenance = (f"GRAPH_TRACE {len(traces)} snapshots at {shape}; devices {devices}; "
-                  f"{len(selected)} selected shapes; capture base {base} + {EXTRA_BYTES} extra bytes; "
-                  f"{len(zero_replay)} zero-replay identities ({zero_replay_bytes} bytes) stay lazy; "
-                  f"{len(zero_share)} zero-share selected identities ({zero_share_bytes} bytes) "
-                  f"charged at the device's measured mean capture")
+                  f"{len(selected)} selected shapes; capture base {base} + {EXTRA_BYTES} extra bytes")
     return {"shape": shape, "reserve_base_bytes": base,
             "reserve_extra_bytes": extra,
             "trace": {"provenance": provenance, "entries": entries}}

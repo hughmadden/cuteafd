@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "family": "qwen4",
-  "provenance": "bootstrap before the first GRAPH_TRACE, keyed by resolved capture shape (RTX owners, Sparks attached). No shape has a trace yet, so every shape uses the family's current startup set (682 reachable serving shapes) as its provisional prewarm, and each shape's reserve is that set over its own rank segment count: the single-owner base is the measured startup charge of the pre-migration set (33,418 executables = 682 shapes x 49 segments, 5,102,370,816 B on 1x RTX PRO 6000 SM120, 2026-11-08) rounded to 2 MiB; each dual-owner base is 682 x 26 / 25 x 152,684 B rounded to 2 MiB. Extra is one prewarm shape's whole segment chain in flight plus the controller's estimate/headroom pair. Spark attachment does not change the decode segment structure, but its trace may change which shapes capture; replace each shape's list and reserves after its own trace (0-Spark and Spark-attached, 1x and 2x RTX).",
+  "provenance": "bootstrap before the first GRAPH_TRACE, keyed by resolved capture shape (RTX owners, Sparks attached). No shape has a trace yet, so every shape uses the family's current startup set (682 reachable serving shapes) as its provisional prewarm. A shape's base is the per-device sum of its selected prewarm identities' measured capture bytes, rounded once to 2 MiB; until that shape is traced it stays the provisional measured startup charge: the single-owner base is the measured startup charge of the pre-migration set (33,418 executables = 682 shapes x 49 segments, 5,102,370,816 B on 1x RTX PRO 6000 SM120, 2026-11-08) rounded to 2 MiB; each dual-owner base is 682 x 26 / 25 x 152,684 B rounded to 2 MiB. Extra is the fixed 2 MiB capture headroom; the shared graph reserve extra adds room for runtime captures. Spark attachment does not change the decode segment structure, but its trace may change which shapes capture; replace each shape's list and reserves after its own trace (0-Spark and Spark-attached, 1x and 2x RTX).",
   "bootstrap": {
     "entries": [
       {
@@ -6151,7 +6151,7 @@
         5102370816
       ],
       "reserve_extra_bytes": [
-        8388608
+        2097152
       ],
       "trace": null
     },
@@ -6161,7 +6161,7 @@
         5102370816
       ],
       "reserve_extra_bytes": [
-        8388608
+        2097152
       ],
       "trace": null
     },
@@ -6172,8 +6172,8 @@
         2604662784
       ],
       "reserve_extra_bytes": [
-        6291456,
-        4194304
+        2097152,
+        2097152
       ],
       "trace": null
     },
@@ -6184,8 +6184,8 @@
         2604662784
       ],
       "reserve_extra_bytes": [
-        6291456,
-        4194304
+        2097152,
+        2097152
       ],
       "trace": null
     }

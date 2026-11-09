@@ -95,9 +95,12 @@ pub struct QwenTrace {
 #[derive(Debug, Clone, Deserialize)]
 pub struct QwenShapePrewarm {
     pub shape: QwenGraphShapeKey,
-    /// Per-device prewarm arena: the measured physical graph high-water.
+    /// Per-device prewarm arena: the selected shapes' measured capture bytes,
+    /// summed and rounded once to the 2 MiB chunk. Never the trace's charged
+    /// high-water.
     pub reserve_base_bytes: Vec<u64>,
-    /// Per-device room for one in-flight capture beside the prewarm set.
+    /// Per-device capture headroom, a fixed 2 MiB; the shared graph reserve
+    /// extra adds room for runtime captures.
     pub reserve_extra_bytes: Vec<u64>,
     /// The shape's own trace; `None` until one runs, which falls back to the
     /// bootstrap startup set with a warning.
@@ -301,10 +304,10 @@ mod owner_graph_tests {
         assert_eq!(QwenGraphShapeKey::resolve(2, false), QwenGraphShapeKey::Dual0Spark);
         assert_eq!(QwenGraphShapeKey::resolve(2, true), QwenGraphShapeKey::DualSparks);
         for (key, rank0, rank1) in [
-            (QwenGraphShapeKey::Single0Spark, (5_102_370_816, 8_388_608), None),
-            (QwenGraphShapeKey::SingleSparks, (5_102_370_816, 8_388_608), None),
-            (QwenGraphShapeKey::Dual0Spark, (2_707_423_232, 6_291_456), Some((2_604_662_784, 4_194_304))),
-            (QwenGraphShapeKey::DualSparks, (2_707_423_232, 6_291_456), Some((2_604_662_784, 4_194_304))),
+            (QwenGraphShapeKey::Single0Spark, (5_102_370_816, 2_097_152), None),
+            (QwenGraphShapeKey::SingleSparks, (5_102_370_816, 2_097_152), None),
+            (QwenGraphShapeKey::Dual0Spark, (2_707_423_232, 2_097_152), Some((2_604_662_784, 2_097_152))),
+            (QwenGraphShapeKey::DualSparks, (2_707_423_232, 2_097_152), Some((2_604_662_784, 2_097_152))),
         ] {
             assert_eq!(qwen_reserve(key, 0), Some(rank0), "{key:?}");
             assert_eq!(qwen_reserve(key, 1), rank1, "{key:?}");
