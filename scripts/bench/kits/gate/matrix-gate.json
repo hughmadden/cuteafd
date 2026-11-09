@@ -51,6 +51,24 @@
    }
   },
   {
+   "name": "mimo26-flash-min",
+   "family": "mimo_v2",
+   "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
+   "gpus": [1],
+   "sparks": ["ostrich", "dodo"],
+   "set": {
+    "ADDR": "0.0.0.0:8761",
+    "EXPERT_PORT": "19861",
+    "RTX_GPUS": "1",
+    "COORDINATOR_GPUS": "1",
+    "SPARK_COUNT": "2",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_1_LANE_A": "10.55.0.2"
+   }
+  },
+  {
    "name": "mimo26-flash-max",
    "family": "mimo_v2",
    "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
