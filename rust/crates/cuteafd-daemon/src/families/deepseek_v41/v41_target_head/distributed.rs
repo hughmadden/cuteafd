@@ -472,7 +472,13 @@ mod tests {
         fixture.extent_only(&lib)?;
         let weights = VocabularyShard::without_resident_weights_for_test();
         let mut rank = Rank::new(&lib, &weights, 1, Fp8Head::All)?;
-        rank.graphs[0].declare_startup(&[1])?;
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        // Capture now requires admission, just like the serving-reachable bank.
+        rank.graphs[0].attach_device(-8814, 64 << 20, Site {
+            name: "v41-vocabulary-error-fixture", cycle: Cycle::Other,
+            preference: Preference::Capture, bootstrap: 2 << 20,
+            basis: Basis::Bytes, spans_devices: false,
+        })?;
         fixture.configure_capture(&lib, 98)?;
         // SAFETY: the real enqueue guard rejects absent resident weights before launching;
         // the CPU fixture fails end_capture without publishing a graph or queued work.
