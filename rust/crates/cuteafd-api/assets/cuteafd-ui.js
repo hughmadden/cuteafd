@@ -54,6 +54,7 @@ const PAGES = [
   { id: 'console', href: '/', label: 'LIVE CONSOLE' },
   { id: 'usage', href: '/usage', label: 'USAGE' },
   { id: 'experts', href: '/experts', label: 'EXPERTS' },
+  { id: 'memory', href: '/memory', label: 'MEMORY' },
   { id: 'bench', href: '/bench', label: 'BENCHMARK', primary: true },
 ];
 function header(el, opts = {}) {

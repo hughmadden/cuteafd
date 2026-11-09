@@ -377,7 +377,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(b"", 304, "application/octet-stream", headers)
             snapshot = expert_snapshot(tick, getattr(self.server, "expert_geometry", None))
             return self.send(expert_binary(snapshot, window, phase), mime="application/octet-stream", headers=headers)
-        assets = {"/experts": "rust/crates/cuteafd-api/assets/experts.html",
+        if path == "/console/memory":
+            if not unlocked:
+                return self.send({"error": {"type": "console_locked"}}, 401)
+            fixture = ROOT / "scripts/tests/fixtures/memory-glm53-final-pair.json"
+            payload = json.loads(fixture.read_text())
+            if cookies.get("cuteafd_memory_fixture") and cookies["cuteafd_memory_fixture"].value == "pin-stats":
+                extension = json.loads((ROOT / "scripts/tests/fixtures/memory-pin-stats.json").read_text())
+                payload["stats"]["graph_cache"] = extension["graph_cache"]
+                payload["source"] += "; illustrative pin-stat schema extension (not measured)"
+            return self.send(payload)
+        assets = {"/memory": "rust/crates/cuteafd-api/assets/memory.html",
+                  "/assets/memory.js": "rust/crates/cuteafd-api/assets/memory.js",
+                  "/experts": "rust/crates/cuteafd-api/assets/experts.html",
                   "/usage": "rust/crates/cuteafd-usage/assets/usage.html",
                   "/": "rust/crates/cuteafd-api/assets/console.html",
                   "/bench": "rust/crates/cuteafd-bench/assets/bench.html",

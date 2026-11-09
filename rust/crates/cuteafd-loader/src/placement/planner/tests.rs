@@ -3685,3 +3685,47 @@ fn graph_cache_reserve_survives_gpu_reserve_override() {
     assert_eq!(overridden.facts.allowances[0].source, source);
     assert_eq!(overridden.facts.allowances[0].bytes, 500);
 }
+
+#[test]
+fn dashboard_reservations_include_deferred_host_prefix_and_match_assess() {
+    let mut p = plan(vec![]);
+    p.budgets[0].id = "host".into();
+    p.budgets[0].locations = vec![Location::HOST, Location::PINNED];
+    p.budgets[0].headroom = 17;
+    let prefix = Allocation::buffer("host.prefix", Location::PINNED, 1200,
+        Lifetime { first: Phase::Ready, last: Phase::Growth }, Category::Prefix,
+        "Kimi retained host-prefix quota");
+    let mut alias = prefix.clone();
+    alias.id = "host.prefix.alias".into();
+    alias.bytes = 100;
+    alias.view = Some(View { backing: prefix.id.clone(), offset: 0 });
+    p.facts.deferred = vec![prefix, alias];
+    p.facts.allocations.push(Allocation::buffer("host.scoring", Location::HOST, 200,
+        Lifetime::RESIDENT, Category::Workspace, "scoring"));
+    p.facts.reservations.push(Reservation { id: "load.pool".into(), location: Location::PINNED,
+        bytes: 300, lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
+        source: "bounded load pool".into() });
+    let temporary = |id, bytes| Allocation::buffer(id, Location::PINNED, bytes,
+        Lifetime { first: Phase::Load, last: Phase::Load }, Category::Staging, "load scratch");
+    p.facts.sequential.push(Sequential { id: "load.serial".into(),
+        members: vec![temporary("load.a", 50), temporary("load.b", 90)] });
+    let assessed = assess(&p.facts, &p.budgets).unwrap();
+    for row in assessed.rows {
+        let items: Vec<_> = p.budgets[0].locations.iter().flat_map(|&location|
+            p.reservation_items_at(location, row.phase).unwrap()).collect();
+        assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>(), row.owned + row.opaque,
+            "dashboard must match assessment at {:?}", row.phase);
+        if row.phase == Phase::Growth {
+            assert!(items.iter().any(|item| item.group == "deferred: Kimi retained host-prefix quota"
+                && item.bytes == 1200));
+            assert_eq!(items.iter().map(|item| item.bytes).sum::<u64>() + p.budgets[0].headroom, 1417);
+            assert!(!items.iter().any(|item| item.group.starts_with("sequential") || item.group.starts_with("reservation")));
+        }
+        if row.phase == Phase::Load {
+            assert!(items.iter().any(|item| item.group == "sequential peak: load.serial" && item.bytes == 90));
+            assert!(items.iter().any(|item| item.group == "reservation: load.pool" && item.bytes == 300));
+        }
+    }
+    // Existing readiness/admission projection semantics are intentionally unchanged.
+    assert!(p.items_at(Location::PINNED, Phase::Growth).unwrap().is_empty());
+}

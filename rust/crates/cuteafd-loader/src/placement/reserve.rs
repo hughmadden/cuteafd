@@ -234,7 +234,17 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
         .map(|budget| budget.physical_bytes).min().unwrap_or(u64::MAX);
     let Ok(kv) = policy.kv(smallest, plan.request.context.maximum) else { return };
     let pool = cuteafd_core::memory_policy::PoolBreakdown { kv, pool_tokens: plan.pool_tokens };
+    // Preserve the alias-free accepted owners across every physical domain,
+    // including host/pinned/managed locations sharing a GB10 budget.
+    let domains: Vec<_> = plan.budgets.iter().map(|budget| {
+        let items: Result<Vec<_>, _> = budget.locations.iter().map(|location|
+            plan.reservation_items_at(*location, super::planner::Phase::Growth)).collect();
+        serde_json::json!({"id": budget.id, "budget": budget,
+            "items": items.ok().map(|rows| rows.into_iter().flatten().collect::<Vec<_>>()),
+            "phase": "Growth"})
+    }).collect();
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_dashboard_plan": {"domains": domains},
         "kv_geometry": {"pages": plan.pool_tokens.checked_div(plan.pool_page_rows),
             "tokens_per_page": plan.pool_page_rows, "capacity_tokens": plan.pool_tokens,
             "status": "admitted planner geometry; live pool occupancy not captured"},

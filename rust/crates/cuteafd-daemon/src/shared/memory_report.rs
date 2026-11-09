@@ -137,6 +137,22 @@ fn report_snapshot(stage: &str, snapshot: &memory_ledger::Snapshot,
 }
 
 /// Logs a report from a helper thread (the caller's device selection is untouched).
+fn publish_dashboard(value: &Value) {
+    let inputs = memory_ledger::fault::inputs();
+    let admitted: Map<String, Value> = inputs.as_object().into_iter().flatten()
+        .filter(|(key, _)| key.starts_with("device."))
+        .map(|(key, value)| (key.clone(), value.clone())).collect();
+    cuteafd_api::openai::publish_memory_inventory(json!({
+        "sampled_unix_s": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .ok().map(|duration| duration.as_secs_f64()),
+        "refresh_seconds": 10, "stage": value["stage"],
+        "plan": inputs["memory_dashboard_plan"], "host_admission": inputs["host_admission"],
+        "admitted": admitted, "kv_geometry": inputs["kv_geometry"],
+        "devices": value["devices"], "pinned": value["pinned"],
+        "host_registered": value["host_registered"], "host": value["host"],
+    }));
+}
+
 pub(crate) fn log(stage: &str) {
     if stage == "ready" {
         memory_ledger::fault::ready();
@@ -149,6 +165,7 @@ pub(crate) fn log(stage: &str) {
         report(&stage)
     }).join();
     if let Ok(mut value) = value {
+        publish_dashboard(&value);
         // Bounded diagnostic boundary: the process-wide stream census and the
         // current device's CUDA pool retention. Both are queries: no
         // allocation, no synchronization, no device switch.
@@ -196,6 +213,7 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
         let mut sequence = 0u64;
         loop {
             let value = report(stage);
+            publish_dashboard(&value);
             if value["devices"].as_array().is_none_or(Vec::is_empty) && value["pinned"]["tracked"] == 0 {
                 std::thread::sleep(period);
                 continue;

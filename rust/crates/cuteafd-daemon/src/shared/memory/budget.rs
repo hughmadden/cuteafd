@@ -113,6 +113,7 @@ pub(crate) fn admit_host_memory_with_resident_formulas(cache: u64, tables: &[(&s
     append_table_reactor(&mut resident, usize::from(
         cuteafd_loader::formats::mapped_table::table_reactor_started()));
     let ledger = host_admission(memory, resident, cache, tables, deferred_logits, headroom)?;
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({"host_admission": ledger}));
     tracing::info!(host_budget_bytes = cache, host_ledger = %serde_json::to_string(&ledger)?,
         "coordinator host memory admitted");
     Ok(ledger)
