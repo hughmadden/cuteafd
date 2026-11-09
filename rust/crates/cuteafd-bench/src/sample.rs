@@ -72,7 +72,7 @@ pub fn report(failed: bool) -> Report {
                         timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0,
                     prompts: Some(if width == 1 { "code" } else { crate::panels::speed::DISTINCT_PROMPTS }.into()) })
                 .collect(),
-            prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
+            prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![], ..Default::default() }),
             warmup_s: Some(14.2), prompt_token_ratio: None,
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), max_tokens: None, kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),

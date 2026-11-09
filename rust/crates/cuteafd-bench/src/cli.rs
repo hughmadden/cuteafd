@@ -196,6 +196,14 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
+        if let Some(card) = report.baseline.as_ref().map(|b| &b.card) {
+            for (label, point) in [("8K prefill", &card.prefill), ("8K w/tail", &card.prefill_tail)] {
+                if let Some(point) = point {
+                    let shape = point.shape.as_ref().map(|s| format!("; {} x {} + {} rows", s.full_units, s.unit_rows, s.tail_rows)).unwrap_or_default();
+                    eprintln!("{label}: {} prompt tokens, {:.1} tok/s{shape}", point.prompt_tokens, point.tok_s);
+                }
+            }
+        }
         for path in &written {
             eprintln!("wrote {}", path.display());
         }

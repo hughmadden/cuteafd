@@ -120,6 +120,33 @@ impl Client {
             .cloned().context("served model is no longer advertised")
     }
 
+    /// Single-user benchmark bodies map identically to Messages, including
+    /// thinking. Reject other shapes rather than losing template fields.
+    pub fn count_chat_tokens(&self, body: &Value) -> Result<u64> {
+        crate::request::validate(&self.configuration, body)?;
+        let messages = body["messages"].as_array().context("count requires messages")?;
+        anyhow::ensure!(messages.len() == 1 && messages[0]["role"] == "user"
+            && messages[0]["content"].is_string(), "exact count only supports a single text user message");
+        anyhow::ensure!(body.as_object().context("chat body")?.keys().all(|k|
+            matches!(k.as_str(), "messages" | "thinking" | "max_tokens" | "temperature")),
+            "exact count cannot translate this chat template's fields");
+        // The Messages default differs from Chat's; always send the switch.
+        let count = json!({"model": self.model, "messages": messages, "max_tokens": 1,
+            "thinking": body.get("thinking").cloned().unwrap_or(json!({"type":"enabled"}))});
+        let mut request = self.authorize(self.agent.post(&format!("{}/v1/messages/count_tokens", self.base)));
+        if let Some(token) = &self.token { request = request.set(BENCH_HEADER, token); }
+        self.check()?;
+        let reply: Value = request.send_json(count).context("exact count endpoint /v1/messages/count_tokens")?
+            .into_json()?;
+        reply["input_tokens"].as_u64().context("count endpoint omitted input_tokens")
+    }
+
+    pub fn prefill_unit_rows(&self) -> Result<u64> {
+        let status = self.get("/v1/bench/status").context("prefill unit metadata")?;
+        let settings: Vec<crate::report::Setting> = serde_json::from_value(status["settings"].clone())?;
+        crate::prefill::unit_rows(&settings)
+    }
+
     /// HTTP media probes bypass the older in-process ProbeSpec registration shape.
     pub fn media_probe(&self, mut body: Value, spec: Value) -> Result<Value> {
         self.check()?;

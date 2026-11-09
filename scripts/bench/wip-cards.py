@@ -83,7 +83,7 @@ ANSI = re.compile(r'\x1b\[[0-9;]*m')
 METRICS = ('C1', 'C8', '8K', 'kl', 'top1', 'pool', 'readiness_s')
 # Before -> after table: baseline card metrics, then the client sweep's levels
 # (sweep C<n>) and post-load C1, which are separate measurements.
-SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', 'kl', 'top1', 'pool', 'readiness_s')
+SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 'post-load C1', '8K', '8K w/tail', 'kl', 'top1', 'pool', 'readiness_s')
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
@@ -1886,7 +1886,7 @@ def summarize_job(job, exit_code):
         quality = baseline.get('quality') or {}
         checks = quality.get('checks', [])
         fidelity = next((c for c in checks if c['id'] == 'fidelity'), {})
-        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=next((c['aggregate_tok_s'] for c in card.get('concurrency', []) if c['width'] == 8), None), **{'8K': (card.get('prefill') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
+        row.update(C1=next((d['tok_s'] for d in card.get('decode', []) if d['content'] == 'code'), None), C8=next((c['aggregate_tok_s'] for c in card.get('concurrency', []) if c['width'] == 8), None), **{'8K': (card.get('prefill') or {}).get('tok_s'), '8K w/tail': (card.get('prefill_tail') or {}).get('tok_s')}, kl=fidelity.get('metrics', {}).get('kl'), top1=fidelity.get('metrics', {}).get('top1'), cache=next((c for c in checks if c['id'] in ('cache_exact', 'cache')), None), spec=next((c for c in checks if 'spec' in c['id']), None), pool=(card.get('capacity') or {}).get('kv_tokens'), readiness_s=report.get('server', {}).get('readiness_s'), report=str(reports[0]), quality=quality.get('status'))
         # Report/panel statuses serialize as 'failed'; Rust CheckStatus as 'fail'.
         failed = {'fail', 'failed'}
         bad = [c['id'] + (': ' + c['summary'] if c.get('summary') else '') for c in checks if c.get('status') in failed]
@@ -1958,6 +1958,8 @@ def summarize_job(job, exit_code):
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
                 row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
+                if point.get('label') == '8K w/tail':
+                    row['8K w/tail'] = point['tok_s']
             row['mapped_tables'] = {**{f"prefill {p['length']}": p['mapped_tables'] for p in sweep.get('prefill', [])
                                        if p.get('mapped_tables')},
                                     **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])

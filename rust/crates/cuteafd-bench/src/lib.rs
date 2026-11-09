@@ -20,6 +20,7 @@ pub mod fidelity_rows;
 pub mod http;
 pub mod panels;
 pub mod profiles;
+pub mod prefill;
 pub mod publish;
 pub mod quality;
 pub mod reference;

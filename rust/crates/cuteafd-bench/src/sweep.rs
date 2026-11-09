@@ -64,6 +64,10 @@ pub struct Point {
 pub struct PrefillPoint {
     /// Requested prompt tokens.
     pub length: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<crate::report::PrefillShape>,
     pub prompt_tokens: u64,
     pub tok_s: f64,
     pub ttft_s: f64,
@@ -252,7 +256,8 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
 }
 
 /// Cold prefill at each length: fit tokens per reference token from two short
-/// requests, then per length one untimed warm request and one measured request
+/// requests as an initial estimate, then size exactly through the served tokenizer.
+/// Per length one untimed warm request and one measured request
 /// with a fresh prefix (it must reuse no cached tokens). With `options.repeat`
 /// the measured request re-sends the warm-up's corpus behind a fresh nonce;
 /// with `options.purge` the purge runs before the warm-up and again before the
@@ -269,19 +274,28 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
     let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
     let purge = || options.purge.map_or(Ok(()), |purge| purge());
     let mut points = Vec::new();
-    for &length in lengths {
-        let target = length.min(max_context.saturating_sub(64)) as f64;
-        let words = ((target - intercept) / slope).max(64.0) as usize;
+    let unit = client.prefill_unit_rows()?;
+    let tail = crate::prefill::tail_tokens(unit)?;
+    let mut requested = lengths.to_vec();
+    if requested.contains(&crate::prefill::CARD_TOKENS) && !requested.contains(&tail) { requested.push(tail); }
+    for length in requested {
+        anyhow::ensure!(length <= max_context.saturating_sub(64),
+            "exact {length}-token prefill exceeds max context {max_context} with output headroom");
+        let words = ((length as f64 - intercept) / slope).max(64.0) as usize;
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
+        let warm_text = crate::prefill::prompt(client, warm_seed, words, length, "Summarize in one word.")?;
+        let timed_text = crate::prefill::prompt(client, timed_seed, words, length, "Summarize in one word.")?;
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
-        ask(words, warm_seed).with_context(|| format!("{length}-token prefill warm-up"))?;
+        let warm = client.chat(plain(client, &warm_text, 1), None)
+            .with_context(|| format!("{length}-token prefill warm-up"))?;
+        crate::prefill::validate(length, warm.timing.prompt_tokens)?;
         if !idle.is_zero() { std::thread::sleep(idle); }
         timed(on_timed)?;
         purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
         let counters = phase_counters(client);
-        let chat = ask(words, timed_seed).with_context(|| format!("{length}-token prefill"))?;
+        let chat = client.chat(plain(client, &timed_text, 1), None).with_context(|| format!("{length}-token prefill"))?;
         let after = phase_counters(client);
         let mapped_tables = mapped_interval(&counters.mapped_tables, &after.mapped_tables);
         let expert_usage = expert_usage_interval(counters.expert_usage.as_ref(), after.expert_usage.as_ref());
@@ -289,7 +303,9 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
-        points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
+        crate::prefill::validate(length, t.prompt_tokens)?;
+        points.push(PrefillPoint { length, label: (length == tail).then(|| "8K w/tail".into()),
+            shape: Some(crate::prefill::shape(t.prompt_tokens, unit)), prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
             idle_seconds: options.idle_seconds, thermal, fabric, mapped_tables, expert_usage });
     }
     Ok(points)

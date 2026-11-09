@@ -597,6 +597,9 @@ pub struct BasicCard {
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Development-only 3 execution units + 40 rows; never rendered on cards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_tail: Option<PrefillRate>,
     /// Server tokens per reference token from the corpus warm-up fit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_token_ratio: Option<f64>,
@@ -800,12 +803,23 @@ pub struct ConcurrentTiming {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PrefillRate {
+    #[serde(default)]
+    pub requested_tokens: u64,
     pub prompt_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<PrefillShape>,
     /// Median prompt tokens per second of time to first token.
     pub tok_s: f64,
     pub ttft_s: f64,
     #[serde(default)]
     pub runs: Vec<StreamTiming>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PrefillShape {
+    pub unit_rows: u64,
+    pub full_units: u64,
+    pub tail_rows: u64,
 }
 
 /// One streamed request as the client saw it.
