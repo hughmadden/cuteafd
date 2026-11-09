@@ -63,6 +63,85 @@ def test_invalid_trace_fails(change):
         MODULE.generate([data], "glm5")
 
 
+def v41_trace(counts=(32, 32, 1), prefill=False):
+    graphs = [{"device": 0, "site": "deepseek_v41.lane_row", "bank": 1,
+               "shape": f"(7, {rows})", "count": count} for rows, count in zip((1, 16, 128), counts)]
+    if prefill:
+        graphs.append({"device": 0, "site": "deepseek_v41.lane_prefill", "bank": 1,
+                       "shape": "(7, 2752)", "count": 3})
+    return {"schema_version": 1, "cache": {"device": 0, "charged": 5 << 20},
+            "sites": {"deepseek_v41.lane_row": {"largest_bytes": 2 << 20}}, "graphs": graphs}
+
+
+def test_v41_rows_pin_the_hot_decode_width_and_keep_replay():
+    result = MODULE.generate([v41_trace()], "deepseek_v41", coverage=0.99)
+    assert result["family"] == "deepseek_v41"
+    # 1 and 16 are the hot widths; 128 is retained for the decoder replay.
+    assert [entry["rows"] for entry in result["entries"]] == [1, 16]
+    assert [entry["pin"] for entry in result["entries"]] == [True, False]
+    assert "table_width" not in result["entries"][0]
+    assert result["reserve_base_bytes"] == 6 << 20
+    assert result["reserve_extra_bytes"] == 2 << 20
+
+
+def test_v41_prefill_chunk_is_admitted_only_when_declared():
+    with pytest.raises(ValueError):
+        MODULE.generate([v41_trace(prefill=True)], "deepseek_v41")
+    result = MODULE.generate([v41_trace(prefill=True)], "deepseek_v41", prefill_rows=2752)
+    assert result["prefill_entries"] == [{"rows": 128, "pin": True}, {"rows": 2752, "pin": True}]
+    assert all(entry["rows"] <= 64 for entry in result["entries"])
+
+
+@pytest.mark.parametrize("site,shape,expected", [
+    ("window", "(16, 987654321)", ("row", 16, 0)),
+    ("compressor", "(1, 998)", ("row", 1, 0)),
+    ("index_selection", "[7, 16, 100, 200, 300, 1, 500, 512, 0, 1]", ("row", 16, 0)),
+    ("sparse_attention", "(7, [7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("sparse_attention", "(7, [18446744073709551615, 7, 16, 100, 200, 300])", ("row", 16, 0)),
+    ("dual_attention_tail", "(7, [100, 200, 300, 16, 500])", ("row", 16, 0)),
+    ("target_head", "112", ("row", 112, 0)),
+    ("dspark_chain", "(16, 7)", ("draft", 16, 7)),
+    ("dspark_distributed_terminal", "(5, 1, 16)", ("draft", 16, 5)),
+    ("dspark_cache", "()", None),
+])
+def test_v41_native_site_axes(site, shape, expected):
+    assert MODULE.v41_geometry(shape, set(range(1, 65)) | {128}, "deepseek_v41." + site) == expected
+
+
+@pytest.mark.parametrize("site,shape", [
+    ("dspark_chain", "(5, 16)"),
+    ("dspark_distributed_terminal", "(7, 2, 16)"),
+    ("window", "(987654321, 16)"),
+    ("index_selection", "[7, 16]"),
+    ("sparse_attention", "(7, [1, 2, 3])"),
+    ("unknown", "16"),
+])
+def test_v41_unknown_or_invalid_axes_fail(site, shape):
+    with pytest.raises(ValueError):
+        MODULE.v41_geometry(shape, set(range(1, 65)), "deepseek_v41." + site)
+
+
+def test_v41_draft_preferences_keep_count_and_width_separate():
+    data = v41_trace()
+    data["graphs"] = [
+        {"site": "deepseek_v41.dspark_chain", "shape": "(1, 5)", "cycles": {"verify": 20, "other": 500}},
+        {"site": "deepseek_v41.dspark_distributed_terminal", "shape": "(7, 1, 16)", "cycles": {"verify": 19}},
+        {"site": "deepseek_v41.dspark_cache", "shape": "()", "cycles": {"verify": 20}},
+    ]
+    result = MODULE.generate([data, data], "deepseek_v41")
+    assert result["entries"] == []
+    assert result["draft_entries"] == [{"requests": 1, "width": 5, "pin": True},
+                                        {"requests": 16, "width": 7, "pin": False}]
+
+
+def test_v41_selection_vector_key_needs_a_site_rule():
+    data = v41_trace()
+    data["graphs"].append({"device": 0, "site": "deepseek_v41.sparse", "bank": 1,
+                           "shape": "(7, [1, 2, 3])", "count": 9})
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "deepseek_v41")
+
+
 def flash_graph(rows, spec, long, width, stride, pool_stride, count, segment=0,
                 site="glm5_flash.decode", capture_bytes=1 << 20):
     return {"device": 0, "site": site, "bank": 1,
@@ -360,6 +439,53 @@ def test_latest_snapshot_row_wins_within_the_same_histogram_interval():
     new["graphs"][0]["hit_histogram"]["counts"] = [0] * 5
     for inputs in ([old, new], [new, old]):
         assert not any(entry["pin"] for entry in MODULE.generate(inputs, "glm5")["entries"])
+
+
+@pytest.mark.parametrize("width", [5, 7])
+def test_every_skipped_flattened_draft_head_row_has_an_emitted_owner(width):
+    data = v41_trace()
+    data["schema_version"] = 2
+    data["graphs"] = []
+    for requests in range(1, 65):
+        data["graphs"].extend([
+            {"site": "deepseek_v41.dspark_chain", "shape": str((requests, width)), "cycles": {"verify": 1}},
+            {"site": "deepseek_v41.target_head", "shape": str(requests * width), "cycles": {"verify": 1000}},
+        ])
+    result = MODULE.generate([data], "deepseek_v41", coverage=0.01)
+    owners = {entry["requests"] * entry["width"] for entry in result["draft_entries"]}
+    assert {requests * width for requests in range(1, 65) if requests * width > 64} <= owners
+    assert all(entry["rows"] <= 64 for entry in result["entries"])
+
+
+def test_flattened_draft_head_without_an_observed_owner_fails():
+    data = v41_trace()
+    data["graphs"].append({"site": "deepseek_v41.target_head", "shape": "112", "cycles": {"verify": 10}})
+    with pytest.raises(ValueError, match="lack an observed"):
+        MODULE.generate([data], "deepseek_v41")
+
+
+def test_prefill_cycles_keep_exact_pins_and_do_not_double_charge_reserve():
+    data = v41_trace(prefill=True)
+    data["schema_version"] = 2
+    for graph in data["graphs"]:
+        graph["cycles"] = {"prefill": graph.pop("count")}
+        graph["capture_bytes"] = 1234
+    report = []
+    result = MODULE.generate([data, data], "deepseek_v41", coverage=0.01, prefill_rows=2752, pin_report=report)
+    assert result["prefill_entries"] == [{"rows": 128, "pin": True}, {"rows": 2752, "pin": True}]
+    assert result["reserve_base_bytes"] == 6 << 20
+    assert report == [{"device": 0, "prefill_capture_bytes": 4 * 1234,
+                       "cost_basis": "measured step growth, split by estimate within shared steps"}]
+
+
+def test_v41_startup_only_snapshot_keeps_existing_prefill_pins_not_decode_heat():
+    data = v41_trace(prefill=True)
+    for graph in data["graphs"]:
+        graph["cycles"] = {"other": graph.pop("count")}
+    result = MODULE.generate([data], "deepseek_v41", prefill_rows=2752)
+    assert result["entries"] == []
+    assert result["draft_entries"] == []
+    assert result["prefill_entries"] == [{"rows": 128, "pin": True}, {"rows": 2752, "pin": True}]
 
 
 def context_trace(device=0):
