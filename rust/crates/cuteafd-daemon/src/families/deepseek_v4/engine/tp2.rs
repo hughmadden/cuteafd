@@ -428,7 +428,8 @@ impl<'a> Engine<'a> {
 
     fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
-        if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
+        // A warmed step runs a synthetic placement: its routes are no diagnostic.
+        if !tp2.checking.get() || self.capture_only.get() || self.graph_warming.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
@@ -462,7 +463,8 @@ impl<'a> Engine<'a> {
 
     pub(super) fn count_route_fallback(&self, layer: usize) {
         if let Some(tp2) = self.tp2.as_ref().filter(|t| t.layers.contains(&layer)
-            && t.source.get() == RouteSource::Broadcast && !self.capture_only.get()) {
+            && t.source.get() == RouteSource::Broadcast && !self.graph_warming.get()
+            && !self.capture_only.get()) {
             // Count host-enqueued units, including graph replays (not graph construction).
             tp2.fallbacks.set(tp2.fallbacks.get() + 1);
         }

@@ -821,6 +821,9 @@ pub(crate) fn with_engine<T>(
         }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
+        // The traced verify geometries, after the route check settles the
+        // exchange policy its keys bake in and before the first request.
+        engine.warm_verify_graphs(&mut transports, &runtime)?;
         let (graphs0, graphs1, captures) = engine.graph_inventory();
         tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
             classes = metadata::c4_width_classes(engine.shape.units).len(), "V4 decode graph inventory");
