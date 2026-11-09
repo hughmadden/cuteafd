@@ -726,7 +726,7 @@ void record_graph_census(cudaGraph_t graph, cudaGraphExec_t exec,
   if (captures == nullptr) {
     std::fprintf(stderr, "CUTEAFD_GRAPH_CENSUS {\"event\":\"capture_write_failed\",\"id\":%llu}\n",
         static_cast<unsigned long long>(id));
-      return;
+    return;
   }
   flockfile(captures);
   const int written = std::fprintf(captures,

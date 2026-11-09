@@ -2691,6 +2691,13 @@ void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
   require_cuda(cuteafd::inspect_graph_topology(graph, &nodes, &width, &spans), "programmatic inspect");
   if (nodes != 2 || width != 1 || spans != 0) std::abort();
 
+  auto full = +[](cudaGraph_t, cudaGraphNode_t*, cudaGraphNode_t*,
+                  cudaGraphEdgeData*, size_t*) -> cudaError_t { return cudaSuccess; };
+  const auto capped = cuteafd::inspect_graph_topology(graph, &nodes, &width, &spans, full);
+  if (capped != cudaErrorNotSupported || width != 0) {
+    std::cerr << "topology capacity limit did not become unknown\n";
+    std::abort();
+  }
   cudaGraphExec_t exec = nullptr;
   require_cuda(cudaGraphInstantiate(&exec, graph, 0), "programmatic instantiate");
   // Reproduce the exact CUDA 402 from the failed GLM trace, not a fabricated

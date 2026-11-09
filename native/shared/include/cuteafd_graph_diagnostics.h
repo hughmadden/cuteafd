@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -24,18 +25,22 @@ inline cudaError_t inspect_graph_topology(cudaGraph_t graph, size_t* count,
   std::vector<cudaGraphNode_t> nodes(*count);
   status = diagnostic_cuda(cudaGraphGetNodes(graph, nodes.data(), count));
   if (status != cudaSuccess) return status;
-  // CUDA 13 requires endpoints whenever edgeData is supplied, even for a
-  // zero-capacity count query. Null edgeData rejects programmatic dependencies.
-  size_t edges = 0;
-  cudaGraphNode_t dummy_from = nullptr, dummy_to = nullptr;
-  cudaGraphEdgeData dummy_data{};
-  status = diagnostic_cuda(query_edges(graph, &dummy_from, &dummy_to, &dummy_data, &edges));
-  if (status != cudaSuccess) return status;
-  std::vector<cudaGraphNode_t> from(edges), to(edges);
-  std::vector<cudaGraphEdgeData> data(edges);
-  if (edges) {
+  // Count-only null-endpoint queries cannot preserve programmatic edge data.
+  // Grow a real metadata buffer, bounded so diagnostics cannot consume an
+  // unbounded amount of host memory. A full buffer at the cap is unknown.
+  if (*count > std::numeric_limits<size_t>::max() / 64) return cudaErrorInvalidValue;
+  const size_t cap = std::max(size_t(1), *count) * 64;
+  size_t capacity = std::max(size_t(1), *count), edges = 0;
+  std::vector<cudaGraphNode_t> from, to;
+  std::vector<cudaGraphEdgeData> data;
+  for (;;) {
+    from.resize(capacity); to.resize(capacity); data.resize(capacity);
+    edges = capacity;
     status = diagnostic_cuda(query_edges(graph, from.data(), to.data(), data.data(), &edges));
     if (status != cudaSuccess) return status;
+    if (edges < capacity) break;
+    if (capacity == cap) return cudaErrorNotSupported;
+    capacity = std::min(cap, capacity * 2);
   }
   std::unordered_map<cudaGraphNode_t, size_t> index;
   for (size_t n = 0; n < *count; ++n) index[nodes[n]] = n;
