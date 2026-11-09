@@ -198,7 +198,7 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     assert!(tails.iter().any(|(source, _)| source.starts_with("dense.runtime.tail")));
     assert!(memory.devices[0].items.iter().any(|item| item.group == "exact retained prefix marks"
         && item.bytes == buffers.prefix as u64));
-    assert!(memory.notes.iter().any(|note| note.contains("no captured graphs")));
+    assert!(memory.notes.iter().any(|note| note.contains("bounded decode/verify graph reserve")));
     for ranks in 1..=8 {
         let spark_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks }, ..options.clone() };
         let refused = plan::plan(dir.path(), &spark_options).unwrap();

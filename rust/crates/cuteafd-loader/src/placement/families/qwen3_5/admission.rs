@@ -29,6 +29,8 @@ impl ServingFacts {
 #[derive(Clone)]
 pub struct DenseFacts<'a> {
     pub cfg: &'a Qwen35Config,
+    pub graph_variant: String,
+    pub graphs_enabled: bool,
     pub weights: &'a NativeWeights,
     pub target_arena: &'a crate::serving_capacity::WeightArenaLayout,
     pub buffers: &'a NativeBuffers,
@@ -53,7 +55,7 @@ pub fn forecast_budgets(physical: &ArchContext, capacity: u64, module_bytes: u64
     }
     Ok(vec![
         Budget {
-            id: "coordinator.0".into(),
+            id: "rtx0".into(),
             locations: vec![Location::coordinator(0)],
             physical_bytes: if physical.total_bytes == 0 { 32 << 30 } else { physical.total_bytes },
             logical_bytes: capacity,
@@ -88,7 +90,7 @@ pub fn sampled_budgets(free: u64, total: u64, logical: Option<u64>, host: (u64, 
     Ok(budgets)
 }
 
-pub fn admit(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
+pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
     -> Result<ResolvedPlan, Refusal> {
     if matches!(request.onboard, Pin::Exact(layers) if layers > 0) {
         return Err(Refusal::InvalidPin("model has 0 routed-expert layers"));
@@ -108,7 +110,31 @@ pub fn admit(request: Request, budgets: Vec<Budget>, facts: DenseFacts<'_>)
         return Err(Refusal::InvalidFact(
             "dense geometry or operation differs from allocation recipe".into()));
     }
-    solve(request, budgets, &facts)
+    let mut contract = facts.prepare(&request)?;
+    for budget in &mut budgets {
+        if budget.locations != [Location::coordinator(0)] { continue; }
+        let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
+        let occupied = budget.physical_bytes.checked_sub(*free)
+            .ok_or_else(|| Refusal::InvalidFact("dense Qwen sample exceeds physical capacity".into()))?;
+        if occupied > 0 {
+            contract.components.push(Component { activation: Activation::always(),
+                bytes: ByteCurve::fixed(occupied, contract.maximum_pages),
+                kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+                    bytes: occupied, lifetime: Lifetime::RESIDENT, assumed: false,
+                    source: crate::placement::sampled_baseline::source(&format!(
+                        "Dense Qwen context and selected modules; {occupied} B occupied at the \
+                        {free} B free sample of {} B; {source}", budget.physical_bytes)) }) });
+        }
+        // Move the same sampled bytes into a named owner, never charge both.
+        budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
+            source: "physical capacity; pre-weight occupancy charged once in recipe".into() };
+    }
+    solve(request, budgets, &PreparedDense(contract))
+}
+
+struct PreparedDense(Contract);
+impl Recipe for PreparedDense {
+    fn prepare(&self, _: &Request) -> Result<Contract, Refusal> { Ok(self.0.clone()) }
 }
 
 impl Recipe for DenseFacts<'_> {
@@ -367,6 +393,12 @@ impl DenseFacts<'_> {
         // The dense loader keeps one packed operand read in host memory at a
         // time; every device byte is a named owner above.
         let mut allowances = vec![
+            Allowance { location: gpu,
+                bytes: crate::serving_capacity::qwen35_graphs::configured_reserve(&self.graph_variant, self.graphs_enabled)
+                    .map_err(|error| Refusal::InvalidFact(error.to_string()))?.bytes,
+                lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },
+                source: crate::placement::graph_reserve::source("qwen3_5.graphs.0"),
+                assumed: false },
             Allowance { location: Location::HOST, bytes: step,
                 lifetime: Lifetime { first: Phase::Load, last: Phase::Load },
                 source: "estimated: one packed operand read and Vec capacity; read_exact_at, no shard buffer".into(),

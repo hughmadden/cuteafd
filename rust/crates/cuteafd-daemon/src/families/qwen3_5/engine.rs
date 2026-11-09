@@ -21,6 +21,8 @@ const PREFIX: &str = "model.language_model.";
 mod verify;
 #[path = "rows.rs"]
 mod rows;
+#[path = "graphs.rs"]
+mod graphs;
 #[path = "mtp.rs"]
 pub(crate) mod mtp;
 #[path = "prefix.rs"]
@@ -31,6 +33,7 @@ pub(crate) use qwen3_5::DrafterBytes;
 pub(crate) struct DenseEngine<'a> {
     // Drain queued work before fields retaining buffers/weights begin dropping.
     stream: Stream<'a>,
+    graphs: graphs::Graphs<'a>,
     pub(crate) cfg: Qwen35Config,
     pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     programs: &'a Programs<'a>,
@@ -181,8 +184,9 @@ impl<'a> DenseEngine<'a> {
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena, page_owners: Default::default() },
             cfg.max_context, concurrency)).transpose()?.flatten();
         let solve_started = std::time::Instant::now();
+        let graph_variant = cuteafd_loader::serving_capacity::qwen35_graphs::variant(&cfg, format.fp8(), kv_format);
         let admitted_plan = qwen3_5::admit(request, budgets, DenseFacts { cfg: &cfg,
-            weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
+            graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
@@ -193,6 +197,17 @@ impl<'a> DenseEngine<'a> {
             ledger = %serde_json::to_string(&cuteafd_loader::plan::SolvedPhaseLedger::from(&admitted_plan))?,
             "dense Qwen admitted phase ledger");
         cuteafd_loader::placement::reserve::log_plan(&admitted_plan, "qwen3_5");
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {
+                "schema_version": 1, "family": "qwen3_5",
+                "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+                "source_dirty": env!("CUTEAFD_BUILD_DIRTY"),
+                "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+                "layout": graph_variant, "devices": [{"device": device.id}],
+                "graph_basis": "uncalibrated bytes, single RTX"
+            }
+        }));
+        let graphs = graphs::Graphs::new(device, graph_variant)?;
         let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks, full_prefill_logits,
             head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),
@@ -264,7 +279,7 @@ impl<'a> DenseEngine<'a> {
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
         cfg.max_context = usize::try_from(admitted_plan.served_context())?;
-        Ok(Self { stream, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
+        Ok(Self { stream, graphs, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, verification })
@@ -397,6 +412,7 @@ impl<'a> DenseEngine<'a> {
             "dense prefill outside admitted slot/row capacity");
         ensure!(logit_rows <= self.head_rows.min(tokens.len()), "dense prefill head rows outside admission");
         ensure!(self.healthy && self.verification.pending.is_none(), "dense prefill requires committed healthy state");
+        self.graphs.prefill();
         self.embedding.check(tokens)?;
         let state = &self.slots[slot];
         let end = state.position.checked_add(tokens.len()).context("dense prefill position overflow")?;
@@ -452,6 +468,7 @@ impl<'a> DenseEngine<'a> {
         mut hook: impl FnMut(usize, CuteafdDeviceBuffer, usize) -> Result<()>)
         -> Result<Vec<crate::shared::prefill_packing::Segment>> {
         ensure!(self.healthy && self.verification.pending.is_none(), "dense packed prefill requires committed healthy state");
+        self.graphs.prefill();
         let chunks = sequences.iter().map(|&(slot, tokens)| {
             let state = self.slots.get(slot).context("dense packed slot outside admission")?;
             self.embedding.check(tokens)?;

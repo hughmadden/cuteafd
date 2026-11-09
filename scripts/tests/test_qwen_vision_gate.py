@@ -399,9 +399,9 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
     census = launcher[launcher.index("shared_graph_census_args() {"):
                       launcher.index('if [[ "${CUTEAFD_GRAPH_CENSUS:-}" == 1 ]]')]
-    # Every bounded family uses the shared census without excluding Qwen.
-    condition = census.split('if [[', 1)[1].split(']]; then', 1)[0]
-    for family in ("glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "kimi_k3"):
+    # Match the shared reserve guard, not preceding family-specific toggles.
+    condition = next(line for line in census.splitlines() if line.startswith('if [[ "$family" == mimo_v2 ||'))
+    for family in ("mimo_v2", "kimi_k3", "glm5", "glm5_flash", "qwen4", "deepseek_v4", "deepseek_v41", "qwen3_5"):
         assert f'"$family" == {family}' in condition
     assert 'for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do' in census
     assert 'graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")' in census

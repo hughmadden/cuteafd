@@ -27,8 +27,78 @@ fn request() -> Request {
 
 fn facts<'a>(cfg: &'a Qwen35Config, weights: &'a NativeWeights, buffers: &'a NativeBuffers,
     target_arena: &'a crate::serving_capacity::WeightArenaLayout) -> DenseFacts<'a> {
-    DenseFacts { cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
+    DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg, weights, target_arena, buffers, slots: 4, record_bytes: 4096, drafter: None, blas_head: serving::BlasHead::TensorLt, serving: None,
         host_prefix: serving::HostPrefixOwners { quota_bytes: 0, chunk_bytes: 0 }, verify_check: false }
+}
+
+#[test]
+fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
+    let (cfg, weights, buffers, arena) = fixture();
+    let occupied = 682_885_120;
+    for logical in [96 << 30, 80 << 30] {
+        for sampled in [0, occupied] {
+            let input = facts(&cfg, &weights, &buffers, &arena);
+            let live = sampled_budgets((96 << 30) - sampled, 96 << 30, Some(logical),
+                (128 << 30, 128 << 30)).unwrap();
+            let previous = solve(request(), live.clone(), &input).unwrap();
+            let plan = admit(request(), live, input).unwrap();
+            assert_eq!(plan.pool_tokens, previous.pool_tokens);
+            assert_eq!(plan.decisions, previous.decisions);
+            assert_eq!(plan.budgets[0].logical_bytes, logical);
+            assert!(matches!(plan.budgets[0].baseline, Baseline::Forecast { occupied: 0, .. }));
+            assert_eq!(plan.budgets[1], previous.budgets[1], "host sample is not moved");
+            for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                let items = plan.items_at(Location::coordinator(0), phase).unwrap();
+                let owners = items.iter().filter(|item|
+                    crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
+                assert_eq!(owners.len(), usize::from(sampled > 0));
+                assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), sampled);
+                let breakdown = crate::placement::reserve::breakdown("rtx0",
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30,
+                    plan.budgets[0].headroom, &items);
+                assert_eq!(breakdown.reserve.iter().filter(|owner|
+                    owner.name == "sampled baseline")
+                    .map(|owner| owner.bytes).sum::<u64>(), sampled);
+                let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                assert_eq!(now.available - now.owned - now.opaque,
+                    before.available - before.owned - before.opaque);
+            }
+        }
+    }
+    let offline = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    assert!(!offline.facts.allowances.iter().any(|owner|
+        crate::placement::sampled_baseline::is_source(&owner.source)));
+    assert!(sampled_budgets((96 << 30) + 1, 96 << 30, None,
+        (128 << 30, 128 << 30)).is_err());
+}
+
+#[test]
+fn sampled_preweight_owner_survives_gpu_reserve_override_without_changing_capacity() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    let (cfg, weights, buffers, arena) = fixture();
+    let occupied = 682_885_120;
+    for reserve in [0, 200 << 20] {
+        MemoryPolicy { gpu_reserve: Some(reserve), ..Default::default() }.scoped(|| {
+            let live = sampled_budgets((96 << 30) - occupied, 96 << 30, Some(80 << 30),
+                (128 << 30, 128 << 30)).unwrap();
+            let previous = solve(request(), live.clone(), &facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            let plan = admit(request(), live, facts(&cfg, &weights, &buffers, &arena)).unwrap();
+            assert_eq!(plan.pool_tokens, previous.pool_tokens);
+            assert_eq!(plan.decisions, previous.decisions);
+            assert_eq!(plan.budgets[0].headroom, reserve);
+            let owners = plan.facts.allowances.iter().filter(|owner|
+                crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, occupied);
+            for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
+                assert_eq!(now.available - now.owned - now.opaque,
+                    before.available - before.owned - before.opaque);
+            }
+        });
+    }
 }
 
 #[test]
@@ -229,7 +299,7 @@ fn exact_pools_report_typed_refusals_instead_of_shrinking_the_context() {
         match expected {
             "below context" => assert!(matches!(&refusal, Refusal::PoolBelowContext { .. }), "{refusal}"),
             "misaligned" => assert!(matches!(&refusal, Refusal::MisalignedPool { .. }), "{refusal}"),
-            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "coordinator.0"),
+            _ => assert!(matches!(&refusal, Refusal::Capacity { budget, .. } if budget == "rtx0"),
                 "{refusal}"),
         }
     }
@@ -377,8 +447,9 @@ fn solved_allowances_are_the_only_estimates_in_the_ready_ledger() {
     assert!(ready.iter().any(|item| item.basis == cuteafd_core::memory_layout::Basis::Estimated));
     let calibrated = plan.facts.allowances.iter().filter(|allowance| !allowance.assumed).collect::<Vec<_>>();
     assert!(!calibrated.is_empty());
-    assert!(calibrated.iter().all(|allowance| allowance.source.starts_with("BLAS device initialization")));
-    // Exact items are physical owners; calibrated BLAS residency is an allowance.
+    assert!(calibrated.iter().all(|allowance| allowance.source.starts_with("BLAS device initialization")
+        || crate::placement::graph_reserve::is_source(&allowance.source)));
+    // Exact items are physical owners; BLAS residency and graph capacity are allowances.
     let exact: u64 = ready.iter().filter(|item| item.basis == cuteafd_core::memory_layout::Basis::Exact)
         .map(|item| item.bytes).sum();
     let declared: u64 = plan.facts.allocations.iter()
@@ -413,4 +484,24 @@ fn host_chunks_and_diagnostic_staging_are_physical_owners_not_allowances() {
     let plain = admit(request(), budgets(), input).unwrap();
     assert!(!plain.facts.allocations.iter().any(|owner|
         owner.id.starts_with("host.prefix.") || owner.group == "diagnostic GDN reset staging"));
+}
+
+#[test]
+fn graph_reserve_is_one_canonical_owner_before_pool_sizing() {
+    let (cfg, weights, buffers, arena) = fixture();
+    let plan = admit(request(), budgets(), facts(&cfg, &weights, &buffers, &arena)).unwrap();
+    let items = plan.reservation_items_at(Location::coordinator(0), Phase::Growth).unwrap();
+    let breakdown = crate::placement::reserve::breakdown("rtx0",
+        cuteafd_core::memory_policy::DeviceKind::Gpu, 96 << 30, 0, &items);
+    let graphs = breakdown.reserve.iter().filter(|row| row.name.contains("graph")).collect::<Vec<_>>();
+    assert_eq!(graphs.len(), 1);
+    assert_eq!(graphs[0].name, "graph reserve");
+    assert_eq!(graphs[0].bytes, crate::serving_capacity::qwen35_graphs::reserve("fixture").unwrap().bytes);
+    assert!(graphs[0].bytes > 0);
+    let mut disabled = facts(&cfg, &weights, &buffers, &arena);
+    disabled.graphs_enabled = false;
+    let off = admit(request(), budgets(), disabled).unwrap();
+    assert!(!off.facts.allowances.iter().any(|allowance|
+        crate::placement::graph_reserve::is_source(&allowance.source)));
+    assert!(off.pool_tokens >= plan.pool_tokens);
 }

@@ -1738,3 +1738,120 @@ def test_kimi_zero_share_is_valid_and_missing_rank_fails():
     assert row["entries"][0]["capture_bytes"] == [0]
     with pytest.raises(ValueError, match="missing a physical rank"):
         MODULE.generate_kimi([data], 2, "max")
+
+
+def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
+    def graph(segment, rows, stride, spec, hits, cost=1024):
+        return {"site": "qwen3_5.segment", "bank": 1, "key_id": segment * 100 + rows,
+                "shape": f"Key {{ segment: {segment}, rows: {rows}, table_stride: {stride}, spec: {str(spec).lower()} }}",
+                "hits": hits, "nodes": 8, "capture_bytes": cost}
+    data = {"schema_version": 2, "cache": {"device": 1}, "graphs": [
+        graph(0, 1, 16, False, 10), graph(1, 1, 16, False, 0),
+        graph(0, 4, 32, True, 100), graph(1, 4, 32, True, 50),
+        graph(0, 64, 128, True, 0, 10 << 20)]}
+    summary = {}
+    result = MODULE.generate_qwen35([data], "h5120-l64-fp8-kvfp8-rtx1", summary)
+    assert summary["zero_replay_identities"] == 1
+    assert summary["zero_replay_bytes"] == 10 << 20
+    assert summary["selected_zero_hit_siblings"] == 1
+    assert summary["selected_zero_hit_sibling_bytes"] == 1024
+    assert summary["always_zero_hit_segments"] == []
+    assert summary["zero_share_identities"] == 0
+    layout = result["layouts"][0]
+    assert layout["entries"] == [
+        {"rows": 4, "table_stride": 32, "spec": True, "pin": False},
+        {"rows": 1, "table_stride": 16, "spec": False, "pin": False}]
+    assert layout["reserve_base_bytes"] == 2 << 20
+    assert layout["reserve_extra_bytes"] == 2 << 20
+    # Every selected sibling is charged, including the zero-hit sibling.
+    data["graphs"][1]["capture_bytes"] = 3 << 20
+    assert MODULE.generate_qwen35([data], layout["variant"])["layouts"][0]["reserve_base_bytes"] == 4 << 20
+    cold = graph(0, 16, 64, True, 0)
+    cold.update(nodes=None, capture_bytes=None, captures=0)
+    data["graphs"].append(cold)
+    assert MODULE.generate_qwen35([data], layout["variant"]) == MODULE.generate_qwen35(
+        [{**data, "graphs": data["graphs"][:-1]}], layout["variant"])
+    data["graphs"][0]["nodes"] = 1
+    with pytest.raises(ValueError, match="singleton"):
+        MODULE.generate_qwen35([data], layout["variant"])
+
+
+def test_dense_qwen_launcher_defaults_graphs_on_for_plan_and_serve():
+    launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
+    for section in ("shared_graph_census_args()", "plan_profile_env=()"):
+        dense = launcher.split(section, 1)[1].split('if [[ "$family" == qwen3_5 ]]; then', 1)[1].split("esac", 1)[0]
+        assert 'case "$(get DECODE_GRAPHS on)" in' in dense
+        assert "CUTEAFD_QWEN35_GRAPHS=1" in dense
+        assert "CUTEAFD_QWEN35_GRAPHS=0" in dense
+
+
+def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
+    root = SCRIPT.parents[2]
+    engine = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/engine.rs").read_text()
+    graph = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/graphs.rs").read_text()
+    scheduler = (root / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
+    assert engine.index("stream: Stream") < engine.index("graphs: graphs::Graphs") < engine.index("weights: DenseWeights")
+    assert '"memory_reconciliation_provenance"' in engine
+    assert '"devices": [{"device": device.id}]' in engine
+    assert 'capture("first_request")' in scheduler
+    assert "nodes < 2" in graph
+    assert "spans_devices: false" in graph
+    assert graph.count("device::observe_completed(") == 1
+    assert "cache_ticket" in graph and "cache_commit" in graph
+    assert "GraphOwner" in graph and "struct Executable" not in graph
+    assert "golden_decode_graphs" in graph
+    assert "off_digest == on_digest" in graph
+    assert "off_digest == warm_digest" in graph
+    assert graph.index("let (_, warm_digest) = score(true)?") < graph.index("let before = replay_hits()")
+    assert graph.index("let before = replay_hits()") < graph.index("let (on, on_digest) = score(true)?")
+    assert "after > before" in graph
+    golden = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/mod.rs").read_text()
+    assert "published_reference(golden, cfg.hidden, cfg.vocab)?" in golden
+    assert 'if compact { Vec::new() }' in golden
+    assert "external top-1024 quality is qualified separately" in golden
+    verify = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/verify.rs").read_text()
+    assert "if self.graphs.enabled && plan.stride > 0" in verify
+    admission = (root / "rust/crates/cuteafd-loader/src/placement/families/qwen3_5/admission.rs").read_text()
+    assert 'id: "rtx0".into()' in admission
+    assert "graph_capture_stats" not in graph
+
+
+def test_dense_qwen_trimmed_trace_reproduces_checked_in_bytes():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/qwen35-prewarm-trace.json.gz"
+    trace = json.loads(gzip.decompress(fixture.read_bytes()))
+    summary = {}
+    generated = MODULE.generate_qwen35([trace], "h5120-l64-bf16-kvfp8-rtx1", summary)
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/qwen35_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    layout = generated["layouts"][0]
+    assert layout["traced"]
+    assert layout["reserve_extra_bytes"] == MODULE.CHUNK
+    assert len(layout["entries"]) == 67
+    assert not any(entry["pin"] for entry in layout["entries"])
+    assert layout["reserve_base_bytes"] == 599_785_472
+    assert summary["zero_replay_identities"] == 896
+    assert summary["always_zero_hit_segments"] == []
+    assert {int(MODULE.DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+            for graph in trace["graphs"]} == set(range(64))
+    assert all(graph["nodes"] == 13 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
+
+
+def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
+    root = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families/qwen3_5"
+    graph = (root / "graphs.rs").read_text()
+    serve = (root / "serve.rs").read_text()
+    golden = (root / "mod.rs").read_text()
+    diagnostic = serve.split("    fn verify_device_ungraphed(", 1)[1].split("    fn verify_bucket_rows(", 1)[0]
+    assert diagnostic.index("let _bypass = self.engine.borrow().bypass_graphs()") < diagnostic.index("self.verify_device(")
+    assert "impl Drop for GraphBypass" in graph
+    assert "self.ready.set(self.previous)" in graph
+    assert "Rc<Cell<bool>>" in graph
+    assert "diagnostic_bypass_restores_on_error_nested_calls_and_unwind" in graph
+    assert "if !self.graphs.enabled || !self.graphs.capture_ready.get() { return segment(); }" in graph
+    assert "ensure!(counters() == before" in serve
+    assert "(true, scheduler::UngraphedKind::Decode)" in serve
+    assert "(false, scheduler::UngraphedKind::Scoring)" in serve
+    assert "check_diagnostic_graph_bypass(&tokens)?" in golden

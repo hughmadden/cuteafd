@@ -71,6 +71,32 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
         Ok(census)
     }
 
+    pub(crate) fn check_diagnostic_graph_bypass(&self, tokens: &[u32]) -> Result<()> {
+        ensure!(tokens.len() >= 2, "dense diagnostic graph check needs two tokens");
+        let device = self.library.cuda_get_device()?;
+        let counters = || crate::shared::decode_graph::device::snapshots().iter()
+            .filter(|row| row.device == device)
+            .flat_map(|row| row.cycles.values()).fold((0, 0), |(captures, hits), cycle|
+                (captures + cycle.captures, hits + cycle.hits));
+        let before = counters();
+        let pool = cuteafd_engine::prefix::RefPagePool::new(self.engine.borrow().pool_tokens / 64, 64);
+        for (speculative, kind) in [(false, scheduler::UngraphedKind::Decode),
+            (true, scheduler::UngraphedKind::Decode), (false, scheduler::UngraphedKind::Scoring)] {
+            self.engine.borrow_mut().reset_slot(0)?;
+            let mut placement = Placement { units: vec![0], slot: 0, len: 0, state_len: 0 };
+            for _ in 0..2 {
+                self.verify_device_ungraphed(&mut [(&mut placement, &tokens[..2])], speculative,
+                    kind, &pool)?.context("diagnostic needs logits")?
+                    .to_host(self.library)?;
+                if let Some(mark) = self.pending.borrow_mut().take() { self.engine.borrow_mut().restore(&mark)?; }
+            }
+        }
+        self.engine.borrow_mut().reset_slot(0)?;
+        ensure!(counters() == before, "dense diagnostic verify captured or replayed a graph");
+        println!("dense diagnostic verify: zero captures and zero replays (plain and speculative)");
+        Ok(())
+    }
+
     pub fn new(engine: &'e RefCell<DenseEngine<'a>>, library: &'a NativeLibrary) -> Self {
         Self { engine, library, drafter: None, mtp: None, selector: RefCell::new(None),
             profile: RefCell::new([0.0; 2]), pending: RefCell::new(None),
@@ -347,7 +373,12 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         let rows = sequences.iter().flat_map(|(placement, tokens)|
             tokens.iter().enumerate().map(|(offset, _)| (placement.slot, placement.len + offset))).collect::<Vec<_>>();
-        let output = self.verify_device(sequences, speculative, pool)?;
+        let output = {
+            // The shared Qwen scheduler submits this single lane synchronously;
+            // the engine-local override never changes the shared device cache.
+            let _bypass = self.engine.borrow().bypass_graphs();
+            self.verify_device(sequences, speculative, pool)?
+        };
         if kind == scheduler::UngraphedKind::Scoring {
             ensure!(!speculative, "dense scoring cannot leave speculative state");
             if let Some(mtp) = &self.mtp {
@@ -613,6 +644,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits,
                 Some((&engine_args.prefix, lanes,
                     engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false)?);
+            engine.borrow_mut().warm_decode_graphs()?;
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
             let drafts = if let Some(snapshot) = &engine_args.draft {
@@ -630,6 +662,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                     crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
                 scheduler::Drafts::Neural { depth: usize::from(engine_args.mtp) }
             } else { scheduler::Drafts::None };
+            resolved_prefill_settings(backend.geometry().prefill_rows).publish();
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, engine_args.draft_length, eos, engine_args.decode_share, &engine_args.prefix,
                 engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
@@ -666,6 +699,11 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     Ok(())
 }
 
+fn resolved_prefill_settings(rows: usize) -> cuteafd_bench::context::ResolvedSettings {
+    cuteafd_bench::context::ResolvedSettings::default()
+        .value("prefill-rows", rows).value("prefill-units", rows)
+}
+
 fn console_layout(args: &ServeArgs, model: &str) -> Result<crate::shared::console::Layout> {
     use crate::shared::console;
     let mut layout = console::Layout::new("qwen3_5", model.into(), args.snapshot.clone());
@@ -695,6 +733,62 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         serve: ServeArgs,
+    }
+
+    #[test]
+    fn prefill_configuration_reports_the_resolved_native_chunk() {
+        for rows in [TAP_ROWS, 4096] {
+            let settings = super::resolved_prefill_settings(rows);
+            settings.assert_resolved();
+            assert_eq!(settings.0, vec![("prefill-rows".into(), rows.to_string()),
+                ("prefill-units".into(), rows.to_string())]);
+        }
+    }
+
+    #[test]
+    fn reconciliation_reads_dense_admitted_owner_rows() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_DENSE_RECONCILIATION_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Admission inputs and reconciliation snapshots are process-global.
+            let status = std::process::Command::new(std::env::current_exe()?)
+                .args(["--exact", "families::qwen3_5::serve::tests::reconciliation_reads_dense_admitted_owner_rows",
+                    "--nocapture"])
+                .env(CHILD, "1").status()?;
+            ensure!(status.success(), "isolated dense reconciliation test failed");
+            return Ok(());
+        }
+        use cuteafd_loader::placement::{families::qwen3_5, planner};
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        let budgets = qwen3_5::sampled_budgets(80 << 30, 96 << 30, None,
+            (128 << 30, 128 << 30))?;
+        let gpu = &budgets[0];
+        assert_eq!(gpu.id, "rtx0");
+        assert_eq!(gpu.locations, vec![planner::Location::coordinator(0)]);
+        let owners = cuteafd_loader::placement::reserve::breakdown(gpu.id.clone(),
+            cuteafd_core::memory_policy::DeviceKind::Gpu, gpu.physical_bytes, gpu.headroom,
+            &[Item::new(Category::Weights, "dense target arena", "", 8 << 30, Basis::Exact),
+                Item::new(Category::Reserved, "graph reserve", "graph reserve: qwen3_5.graphs.0",
+                    128 << 20, Basis::Exact)]);
+        cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+            "memory_reconciliation_provenance": {"family": "qwen3_5", "devices": [{"device": 0}]},
+            format!("device.{}", gpu.id): owners
+        }));
+        use crate::shared::memory_report::reconcile;
+        for stage in ["ready", "first_request"] {
+            reconcile::capture(stage);
+            let snapshot = reconcile::snapshot();
+            let rows = snapshot[stage]["devices"].as_array().expect("reconciled rows");
+            assert_eq!(rows.len(), 1, "exactly one physical GPU, no alias rows");
+            let row = &rows[0];
+            assert_eq!(row["device"], "rtx0");
+            assert_eq!(row["owners"]["weights_bytes"].as_u64(), Some(8 << 30));
+            assert_eq!(row["graph_reserve_bytes"].as_u64(), Some(128 << 20));
+            assert!(row["charged_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+            assert_eq!(row["provenance"]["family"], "qwen3_5");
+            assert!(row.get("delta_vs_measured").is_some());
+            assert!(row.get("graph_reserve_slack").is_some());
+        }
+        Ok(())
     }
 
     #[test]
@@ -739,7 +833,7 @@ mod tests {
                 resident_weight_limit: None, spark_reply_formats: Default::default() },
                 qwen3_5::forecast_budgets(cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30),
                     96 << 30, 0, (128 << 30, 128 << 30))?,
-                DenseFacts { cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
+                DenseFacts { graph_variant: "fixture".into(), graphs_enabled: true, cfg: &cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots: 4,
                     record_bytes: 4096, drafter: None,
                     blas_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt, serving: None, host_prefix: owner, verify_check: false })?;
             assert_eq!(admitted.request.context, requested_context);

@@ -219,7 +219,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         else { geometry.resolve(options.host_cache_bytes, cfg.max_context as u64,
             options.resolved_concurrency("qwen3_5"), host.0, chunk)
             .context("dense host prefix quota")? };
-    let facts = DenseFacts { cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
+    let facts = DenseFacts { graph_variant: crate::serving_capacity::qwen35_graphs::variant(cfg, fp8, options.dense_qwen_kv), graphs_enabled: crate::serving_capacity::qwen35_graphs::enabled(), cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
         blas_head: options.bf16_target_head,
         // The shared scheduler's one selector holds `decode_rows` rows and
         // selects on the device by default.
@@ -232,7 +232,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&plan));
     report.host_budget_bytes = quota;
     let mut notes = vec![
-        format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
+        format!("Native dense admission: {} KV, exact GDN state, bounded decode/verify graph reserve; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
         format!("shared planner: pool {pool_tokens} tokens ({} pages of {} rows), {} prefill row unit, {} lanes, {} resident weight bytes, {} physical owners",
             pool_tokens / qwen3_5::PAGE_ROWS, qwen3_5::PAGE_ROWS, prefill.unit_rows, prefill.waves,
             plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(),

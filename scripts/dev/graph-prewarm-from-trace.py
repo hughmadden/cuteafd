@@ -1587,10 +1587,85 @@ def generate_layouts(groups, family, coverage=0.999, pin_frequency=0.9, pin_repo
     return {"schema_version": 3, "family": family, "layouts": layouts}
 
 
+DENSE_QWEN_GEOMETRY = re.compile(
+    r"Key \{ segment: (\d+), rows: (\d+), table_stride: (\d+), spec: (true|false) \}")
+
+
+def generate_qwen35(traces, variant, summary=None):
+    """Every replayed complete-layer geometry, heat ordered, single RTX only."""
+    if not variant or not variant.endswith("-rtx1"):
+        raise ValueError("dense Qwen needs --variant ending in -rtx1")
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") != 2:
+            raise ValueError("dense Qwen requires trace schema 2")
+        device = int(trace["cache"]["device"])
+        time = int(trace["cache"].get("sampled_at_ms", 0))
+        if device not in latest or time >= latest[device][0]:
+            latest[device] = (time, trace)
+    if len(latest) != 1:
+        raise ValueError("dense Qwen supports exactly one RTX")
+    identities = {}
+    counts = {}
+    pins = set()
+    for _, trace in latest.values():
+        for graph in trace["graphs"]:
+            if graph["site"] != "qwen3_5.segment":
+                continue
+            match = DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])
+            if match is None:
+                raise ValueError(f"unknown dense Qwen key: {graph['shape']}")
+            _, rows, stride, spec = match.groups()
+            key = (int(rows), int(stride), spec == "true")
+            if not 1 <= key[0] <= 64 or key[1] < 1 or key[1] & (key[1] - 1):
+                raise ValueError(f"invalid dense Qwen geometry: {key}")
+            if graph.get("nodes") is None and not graph.get("captures", 0) and not graph.get("hits", 0):
+                continue  # A denied cold miss has no executable topology or capture share.
+            if graph.get("nodes") is None or int(graph["nodes"]) < 2:
+                raise ValueError("dense Qwen must not retain singleton/unknown graphs")
+            identity = (graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+            identities[identity] = (key, graph)
+            hits = int(graph.get("hits", 0))
+            if hits > 0:
+                counts[key] = max(counts.get(key, 0), hits)
+                if sustained(graph):
+                    pins.add(key)
+    if not counts:
+        raise ValueError("dense Qwen trace has no replayed geometry")
+    selected = [(key, graph) for key, graph in identities.values() if key in counts]
+    if any(graph.get("capture_bytes") is None for _, graph in selected):
+        raise ValueError("selected dense Qwen geometry has no measured capture share")
+    measured = [int(graph["capture_bytes"]) for _, graph in identities.values()
+                if graph.get("capture_bytes") is not None and int(graph["capture_bytes"]) > 0]
+    mean = math.ceil(sum(measured) / len(measured)) if measured else 0
+    base = packed(sum(int(graph["capture_bytes"]) or mean for _, graph in selected))
+    if summary is not None:
+        lazy = [graph for key, graph in identities.values() if key not in counts]
+        siblings = [graph for _, graph in selected if not int(graph.get("hits", 0))]
+        zero_share = [graph for _, graph in selected if not int(graph["capture_bytes"])]
+        segments = {int(DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+                    for _, graph in selected}
+        replayed_segments = {int(DENSE_QWEN_GEOMETRY.fullmatch(graph["shape"])[1])
+                             for _, graph in selected if int(graph.get("hits", 0)) > 0}
+        summary.update(
+            zero_replay_identities=len(lazy),
+            zero_replay_bytes=sum(int(graph.get("capture_bytes") or 0) for graph in lazy),
+            selected_zero_hit_siblings=len(siblings),
+            selected_zero_hit_sibling_bytes=sum(int(graph["capture_bytes"]) or mean for graph in siblings),
+            zero_share_identities=len(zero_share), zero_share_bytes=len(zero_share) * mean,
+            always_zero_hit_segments=sorted(segments - replayed_segments))
+    keys = sorted(counts, key=lambda key: (key not in pins, -counts[key], key))
+    return {"schema_version": 1, "family": "qwen3_5", "layouts": [{
+        "variant": variant, "traced": True, "reserve_base_bytes": base,
+        "reserve_extra_bytes": EXTRA_BYTES,
+        "entries": [{"rows": rows, "table_stride": stride, "spec": spec,
+                     "pin": (rows, stride, spec) in pins} for rows, stride, spec in keys]}]}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5")))
     parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (mistral_large4), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1637,7 +1712,9 @@ def main():
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
-        if args.family == "mimo_v2":
+        if args.family == "qwen3_5":
+            result = generate_qwen35([json.loads(Path(path).read_text()) for path in args.trace], args.variant, summary)
+        elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,
                               ranks=args.ranks, variant=args.variant,
@@ -1694,9 +1771,11 @@ def main():
         for pin in report:
             print("pin " + json.dumps(pin, sort_keys=True))
         return
-    if args.family == "mimo_v2":
+    if args.family in ("mimo_v2", "qwen3_5"):
+        if args.family == "qwen3_5":
+            print("selection " + json.dumps(summary, sort_keys=True))
         for layout in result["layouts"]:
-            print(f"{len(layout['entries'])} shapes; ranks={layout['ranks']} "
+            print(f"{len(layout['entries'])} shapes; ranks={layout.get('ranks', 1)} "
                   f"base={layout['reserve_base_bytes']} extra={layout['reserve_extra_bytes']} bytes; "
                   f"pinned={sum(entry['pin'] for entry in layout['entries'])}")
         for arena in arenas:
