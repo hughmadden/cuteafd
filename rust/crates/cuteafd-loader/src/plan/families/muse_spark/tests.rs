@@ -33,6 +33,42 @@ fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions 
 }
 
 #[test]
+fn graph_reserve_matches_the_chosen_onboarding_candidate() {
+    const CHILD: &str = "CUTEAFD_MUSE_GRAPH_RESERVE_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["graph_reserve_matches_the_chosen_onboarding_candidate", "--nocapture"])
+            .env(CHILD, "1").env("CUTEAFD_GPU_GRAPH_RESERVE", "gpu0=128MiB,gpu1=192MiB")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA").env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP")
+            .output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr));
+        return;
+    }
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let package = tempfile::tempdir().unwrap();
+    for gpus in [1, 2] {
+        for sparks in [4, 6] {
+            let report = input.plan(&with_package(gpus, sparks, package.path())).unwrap();
+            let placement = report.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", report.hints));
+            assert!(report.fits);
+            assert_eq!(report.onboard_layers, Some(placement.onboard_layers));
+            for gpu in 0..gpus {
+                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu).unwrap();
+                let breakdown = crate::placement::reserve::breakdown(format!("gpu{gpu}"),
+                    cuteafd_core::memory_policy::DeviceKind::Gpu, crate::placement::inventory::PRO_TOTAL_BYTES,
+                    0, &placement.items[gpu]);
+                let owners = breakdown.reserve.iter().filter(|owner| owner.name == "graph reserve").collect::<Vec<_>>();
+                assert_eq!(owners.len(), 1, "{gpus} RTX/{sparks} Sparks, onboard {}", placement.onboard_layers);
+                assert_eq!(owners[0].bytes, policy.bytes);
+                assert_eq!(policy.bytes, [128 << 20, 192 << 20][gpu]);
+            }
+        }
+    }
+}
+
+#[test]
 fn zero_spark_is_a_typed_planner_result_not_a_launcher_restriction() {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();

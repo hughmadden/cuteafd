@@ -420,13 +420,6 @@ impl<'a> ProductionInput<'a> {
                 lifetime: Lifetime::RESIDENT, source: HOST_RUNTIME.evidence.into(), assumed: true }) });
         for gpu in 0..gpus {
             let location = Location::coordinator(gpu as u8);
-            let graph = crate::serving_capacity::muse_graphs::policy(gpus, spark_ranks > 0, gpu)
-                .map_err(|error| anyhow_refusal(error.into()))?;
-            components.push(Component { activation: Activation::always(),
-                bytes: ByteCurve::fixed(graph.bytes, maximum_pages),
-                kind: ComponentKind::Allowance(Allowance { location, bytes: graph.bytes,
-                    lifetime: Lifetime::RESIDENT, assumed: false,
-                    source: crate::placement::graph_reserve::source(&format!("muse_spark.graphs.{gpu}")) }) });
             // Driver stream slabs survive delivery-stream retirement and are
             // driver-allocated, not a cudaMalloc request, so they receive no
             // allocation-tail charge of their own.
@@ -569,6 +562,15 @@ impl<'a> ProductionInput<'a> {
             }
             let mut components = Vec::new();
             for gpu in 0..gpus {
+                // Price the captured FFN set within this onboarding candidate,
+                // not after the solve whose available KV it changes.
+                let graph = crate::serving_capacity::muse_graphs::policy(gpus, count, gpu)
+                    .map_err(|error| anyhow_refusal(error.into()))?;
+                components.push(Component { activation: Activation::always(),
+                    bytes: ByteCurve::fixed(graph.bytes, maximum_pages),
+                    kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(gpu as u8), bytes: graph.bytes,
+                        lifetime: Lifetime::RESIDENT, assumed: false,
+                        source: crate::placement::graph_reserve::source(&format!("muse_spark.graphs.{gpu}")) }) });
                 // The executor workspace opens with the first onboarded layer:
                 // a zero-layer case carries no coordinator expert demand.
                 let bytes = if count == 0 { 0 }

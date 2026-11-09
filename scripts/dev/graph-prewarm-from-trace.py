@@ -1322,10 +1322,10 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
 MUSE_GEOMETRY = re.compile(r"Key \{ layer: \d+, rows: (\d+), stride: \d+, section: (\w+) \}")
 
 
-def generate_muse(traces, ranks, sparks):
+def generate_muse(traces, ranks, onboard_layers):
     """Select every replayed row geometry and price all its captured siblings."""
-    if ranks not in (1, 2) or sparks is None:
-        raise ValueError("Muse needs --ranks 1|2 and --sparks yes|no")
+    if ranks not in (1, 2) or type(onboard_layers) is not int or not 0 <= onboard_layers <= 62:
+        raise ValueError("Muse needs --ranks 1|2 and --onboard-layers 0..62")
     latest = {}
     for trace in traces:
         if trace.get("schema_version") not in (1, 2):
@@ -1377,7 +1377,7 @@ def generate_muse(traces, ranks, sparks):
         raise ValueError("Muse selected geometry has no measured capture cost on a rank")
     entries = [{"rows": rows, "pin": rows in pins, "capture_bytes": costs[rows]}
                for rows in sorted(selected, key=lambda rows: (rows not in pins, -counts[rows], rows))]
-    return {"ranks": ranks, "sparks": sparks,
+    return {"ranks": ranks, "onboard_layers": onboard_layers,
             "provenance": f"GRAPH_TRACE latest inventories on devices {devices}; every replayed row geometry; "
                           f"{zero_siblings} zero-replay siblings included; {zero_lazy} zero-replay identities stay lazy",
             "reserve_base_bytes": [packed(sum(cost[rank] for cost in costs.values())) for rank in range(ranks)],
@@ -1747,6 +1747,7 @@ def main():
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
     parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
     parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
+    parser.add_argument("--onboard-layers", type=int, help="Muse resolved onboarded layer prefix")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
     report = []
@@ -1779,7 +1780,7 @@ def main():
             result = generate_qwen35([json.loads(Path(path).read_text()) for path in args.trace], args.variant, summary)
         elif args.family == "muse_spark":
             result = generate_muse([json.loads(Path(path).read_text()) for path in args.trace],
-                                   args.ranks, None if args.sparks is None else args.sparks == "yes")
+                                   args.ranks, args.onboard_layers)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,

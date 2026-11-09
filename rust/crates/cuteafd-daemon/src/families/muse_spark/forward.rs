@@ -161,7 +161,7 @@ mod tests {
             let graph = owners.reserve.iter().filter(|row| row.name == "graph reserve").collect::<Vec<_>>();
             // The untraced bootstrap is empty; an explicit policy may charge a
             // nonzero reserve, but never a second family-named owner or tail.
-            let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, true, rank)?;
+            let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, report.onboard_layers.unwrap_or(0), rank)?;
             assert_eq!(graph.iter().map(|row| row.bytes).sum::<u64>(), policy.bytes);
             assert!(graph.len() <= 1);
             assert!(!owners.reserve.iter().any(|row| row.name != "graph reserve" && row.name.contains("graph")));

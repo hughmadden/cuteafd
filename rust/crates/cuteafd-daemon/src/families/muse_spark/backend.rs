@@ -129,6 +129,7 @@ pub(crate) struct MuseBackend<'r, 'a> {
     profile: RefCell<[f64; 2]>,
     graphs: Vec<super::graphs::Graphs<'a>>,
     graph_enabled: std::cell::Cell<bool>,
+    graph_warming: std::cell::Cell<bool>,
     media_binding: super::media::Binding,
     /// Prefill units: rows and waves in flight; the sequence slots, context, pool pages.
     pub(crate) unit_rows: usize,
@@ -181,40 +182,54 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             (Some(0), reason)
         } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, context, host_prefix_bytes, pages, ring_rows,
             local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
-    pub(crate) fn configure_graphs(&mut self, enabled: bool, sparks: bool) -> Result<()> {
+    pub(crate) fn configure_graphs(&mut self, enabled: bool, onboard_layers: usize) -> Result<()> {
         if enabled {
             for ((local, rank), &stream) in self.local.borrow_mut().iter_mut().zip(self.ranks).zip(&self.streams) {
                 rank.device.run(|| local.epilogue.initialize_identity(stream))?;
             }
             self.graphs = self.ranks.iter().enumerate().map(|(rank, resources)|
-                super::graphs::Graphs::new(resources.device, rank, self.ranks.len(), sparks)).collect::<Result<_>>()?;
+                super::graphs::Graphs::new(resources.device, rank, self.ranks.len(), onboard_layers)).collect::<Result<_>>()?;
         }
         self.graph_enabled.set(enabled);
         if !enabled { return Ok(()); }
-        let Some(layout) = cuteafd_loader::serving_capacity::muse_graphs::layout(self.ranks.len(), sparks) else {
-            tracing::warn!(ranks = self.ranks.len(), sparks,
+        let Some(layout) = cuteafd_loader::serving_capacity::muse_graphs::layout(self.ranks.len(), onboard_layers) else {
+            tracing::warn!(ranks = self.ranks.len(), onboard_layers,
                 "Muse layout has no graph trace; bootstrap is empty and unpinned");
             return Ok(());
         };
         let bases = (0..self.ranks.len()).map(|rank|
-            cuteafd_loader::serving_capacity::muse_graphs::policy(self.ranks.len(), sparks, rank)
+            cuteafd_loader::serving_capacity::muse_graphs::policy(self.ranks.len(), onboard_layers, rank)
                 .map(|policy| policy.base_bytes)).collect::<Result<Vec<_>, _>>()?;
         // Before the scheduler exists, page 0 and ring slot 0 are scratch. No
         // prefix, request or drafter context owns them; live admission overwrites
         // every visible row before reading it. The table pitch is fixed already.
-        for entry in cuteafd_loader::serving_capacity::muse_graphs::selected(layout, &bases) {
-            if entry.rows > self.unit_rows || entry.rows > HEAD_ROWS { continue; }
-            if entry.pin { for bank in &self.graphs { bank.pin_rows(entry.rows); } }
-            let tokens = vec![1; entry.rows];
-            let mut placement = Placement { slot: 0, pages: vec![0], len: 0, media: None };
-            self.step(&[(&mut placement, &tokens)], cuteafd_transport::ExpertV2SourceKind::Decode)?;
-            self.diagnostic_sync()?;
-        }
-        Ok(())
+        self.graph_warming.set(true);
+        let warmed = (|| -> Result<()> {
+            for entry in cuteafd_loader::serving_capacity::muse_graphs::selected(layout, &bases) {
+                if entry.rows > self.unit_rows || entry.rows > HEAD_ROWS { continue; }
+                let tokens = vec![1; entry.rows];
+                let mut placement = Placement { slot: 0, pages: vec![0], len: 0, media: None };
+                // Initialize shape-specific lazy native state before observing graph growth.
+                self.graph_enabled.set(false);
+                let touched = self.step(&[(&mut placement, &tokens)], cuteafd_transport::ExpertV2SourceKind::Decode);
+                self.graph_enabled.set(true);
+                touched?;
+                self.diagnostic_sync()?;
+                for rank in self.ranks {
+                    crate::shared::decode_graph::device::observe_device(self.library, rank.device.id)?;
+                }
+                if entry.pin { for bank in &self.graphs { bank.pin_rows(entry.rows); } }
+                self.step(&[(&mut placement, &tokens)], cuteafd_transport::ExpertV2SourceKind::Decode)?;
+                self.diagnostic_sync()?;
+            }
+            Ok(())
+        })();
+        self.graph_warming.set(false);
+        warmed
     }
 
     fn graph_completed(&self) -> Result<()> {
@@ -308,7 +323,9 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
             let mut experts = self.experts.borrow_mut();
             let mut probe = self.probe.borrow_mut();
-            let cycle = if kind == cuteafd_transport::ExpertV2SourceKind::MtpVerify {
+            let cycle = if self.graph_warming.get() {
+                crate::shared::decode_graph::device::Cycle::Other
+            } else if kind == cuteafd_transport::ExpertV2SourceKind::MtpVerify {
                 crate::shared::decode_graph::device::Cycle::Verify
             } else { crate::shared::decode_graph::device::Cycle::Decode };
             for bank in &self.graphs { bank.cycle(cycle); }

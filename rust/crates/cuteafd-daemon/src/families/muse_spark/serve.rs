@@ -264,7 +264,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             Ok(format!("{:x}", digest.finalize()))
         };
         let policies = (0..gpus).map(|rank|
-            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, args.peers.len() > 0, rank)).collect::<Result<Vec<_>, _>>()?;
+            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, rank)).collect::<Result<Vec<_>, _>>()?;
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
             "memory_reconciliation_provenance": {
                 "schema_version": 1, "family": "muse_spark",
@@ -420,7 +420,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     let mut backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing, super::media::Binding::from_view(&view, cfg.vocab_size)?, args.prefill_packing, built.host.prefix_bytes)?;
-    backend.configure_graphs(args.decode_graphs, args.peers.len() > 0)?;
+    backend.configure_graphs(args.decode_graphs, placement.onboard_layers)?;
     let weight_census = if crate::shared::inventory::startup_probe_enabled() {
         use cuteafd_loader::placement::planner::{CoordinatorDevices, Lifetime, PhaseOrder};
         use crate::shared::memory::receipts::{Census, Inventory};

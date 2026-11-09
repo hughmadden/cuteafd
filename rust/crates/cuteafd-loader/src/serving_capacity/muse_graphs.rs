@@ -15,7 +15,7 @@ pub struct Entry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Layout {
     pub ranks: usize,
-    pub sparks: bool,
+    pub onboard_layers: usize,
     pub provenance: String,
     pub reserve_base_bytes: Vec<u64>,
     pub reserve_extra_bytes: Vec<u64>,
@@ -29,14 +29,17 @@ struct List {
     layouts: Vec<Layout>,
 }
 
-pub fn layout(ranks: usize, sparks: bool) -> Option<&'static Layout> {
+pub fn layout(ranks: usize, onboard_layers: usize) -> Option<&'static Layout> {
     static LIST: OnceLock<List> = OnceLock::new();
     let list = LIST.get_or_init(|| {
         let list: List = serde_json::from_str(include_str!("muse_prewarm.json")).expect("Muse prewarm JSON");
         assert_eq!(list.schema_version, 1);
         assert_eq!(list.family, "muse_spark");
+        let mut keys = std::collections::HashSet::new();
         for layout in &list.layouts {
             assert!(matches!(layout.ranks, 1 | 2));
+            assert!(layout.onboard_layers <= 62);
+            assert!(keys.insert((layout.ranks, layout.onboard_layers)), "duplicate Muse capture layout");
             assert_eq!(layout.reserve_base_bytes.len(), layout.ranks);
             assert_eq!(layout.reserve_extra_bytes, vec![2 << 20; layout.ranks]);
             assert!(layout.entries.iter().all(|entry| (1..=64).contains(&entry.rows)
@@ -44,12 +47,12 @@ pub fn layout(ranks: usize, sparks: bool) -> Option<&'static Layout> {
         }
         list
     });
-    list.layouts.iter().find(|layout| layout.ranks == ranks && layout.sparks == sparks)
+    list.layouts.iter().find(|layout| layout.ranks == ranks && layout.onboard_layers == onboard_layers)
 }
 
-pub fn policy(ranks: usize, sparks: bool, rank: usize) -> Result<crate::placement::graph_reserve::Resolved,
+pub fn policy(ranks: usize, onboard_layers: usize, rank: usize) -> Result<crate::placement::graph_reserve::Resolved,
     crate::placement::graph_reserve::Error> {
-    let (base, tail) = layout(ranks, sparks).map_or((0, 0), |layout|
+    let (base, tail) = layout(ranks, onboard_layers).map_or((0, 0), |layout|
         (layout.reserve_base_bytes[rank], layout.reserve_extra_bytes[rank]));
     crate::placement::graph_reserve::current(rank, false, base, tail)
 }
@@ -72,13 +75,13 @@ mod tests {
     #[test]
     fn untraced_layout_borrows_no_inventory_and_pins_nothing() {
         // This family had no startup graphs before this implementation.
-        assert!(layout(3, true).is_none());
+        assert!(layout(3, 0).is_none());
         for ranks in [1, 2] {
-            for sparks in [false, true] {
-                if let Some(layout) = layout(ranks, sparks) {
+            for onboard_layers in [0, 2, 62] {
+                if let Some(layout) = layout(ranks, onboard_layers) {
                     assert_eq!(layout.reserve_base_bytes.len(), ranks);
                 } else {
-                    assert!(layout(ranks, sparks).is_none());
+                    assert!(layout(ranks, onboard_layers).is_none());
                 }
             }
         }
@@ -86,7 +89,7 @@ mod tests {
 
     #[test]
     fn smaller_base_fits_pins_as_a_set_then_a_heat_ordered_prefix() {
-        let list = Layout { ranks: 1, sparks: true, provenance: "fixture".into(),
+        let list = Layout { ranks: 1, onboard_layers: 2, provenance: "fixture".into(),
             reserve_base_bytes: vec![8 << 20], reserve_extra_bytes: vec![2 << 20],
             entries: vec![Entry { rows: 1, pin: true, capture_bytes: vec![2 << 20] },
                 Entry { rows: 4, pin: false, capture_bytes: vec![4 << 20] },
