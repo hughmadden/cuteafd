@@ -284,6 +284,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<()> {
         ensure!(self.decode && !self.window.is_windowed() && self.cold.is_none(),
             "sparse startup requires an idle full decode owner");
+        self.storage.stream.require_complete()?;
         let key = self.startup_key(layer, rows, sink, selected, aligned,
             tail.as_ref().map(|tail| &**tail as &dyn AttentionGraphTail))?;
         if self.graphs.contains(&key) { return Ok(()); }
