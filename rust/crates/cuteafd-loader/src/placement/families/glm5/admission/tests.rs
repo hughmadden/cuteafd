@@ -1359,7 +1359,7 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
             let ComponentKind::Allowance(allowance) = &component.kind else {
                 panic!("graphs are opaque, not physical allocations")
             };
-            let (base, extra) = crate::placement::graph_reserve::glm_default();
+            let (base, extra) = graphs.default_reserve();
             assert_eq!(allowance.bytes, base + extra);
             assert!(!allowance.assumed, "an estimated census does not change the configured budget");
             assert!(allowance.source.starts_with("graph reserve: "));

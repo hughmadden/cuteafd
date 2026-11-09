@@ -194,3 +194,40 @@ def test_latest_snapshot_row_wins_within_the_same_histogram_interval():
     new["graphs"][0]["hit_histogram"]["counts"] = [0] * 5
     for inputs in ([old, new], [new, old]):
         assert not any(entry["pin"] for entry in MODULE.generate(inputs, "glm5")["entries"])
+
+
+def context_trace(device=0):
+    """A two-rank trace: the context placement records each rank's half table."""
+    data = trace(device=device)
+    for graph in data["graphs"]:
+        rows, width, _ = map(int, MODULE.GEOMETRY.search(graph["shape"]).groups())
+        graph["shape"] = graph["shape"].replace(
+            f"table_width: {width}, table_stride: {width}",
+            f"table_width: {width // 2}, table_stride: {width // 2}")
+    return data
+
+
+def test_mistral_large4_selects_its_site_prefix_and_layout():
+    one = MODULE.generate([trace()], "mistral_large4", coverage=0.99, layout=1)
+    assert one["family"] == "mistral_large4" and one["layout"] == 1
+    assert [(entry["rows"], entry["table_width"]) for entry in one["entries"]] == [(1, 16), (16, 32)]
+    # Checked-in entries hold the width a step is built with, not the rank's half.
+    two = MODULE.generate([context_trace()], "mistral_large4", coverage=0.99, layout=2)
+    assert two["layout"] == 2
+    assert [(entry["rows"], entry["table_width"]) for entry in two["entries"]] == [(1, 16), (16, 32)]
+    assert two["reserve_base_bytes"] == one["reserve_base_bytes"]
+
+
+def test_layout_is_required_for_mistral_large4_and_reserved_for_it():
+    with pytest.raises(ValueError):
+        MODULE.generate([trace()], "mistral_large4")
+    with pytest.raises(ValueError):
+        MODULE.generate([trace()], "glm5", layout=1)
+
+
+def test_odd_half_table_width_is_refused():
+    data = context_trace()
+    data["graphs"][0]["shape"] = data["graphs"][0]["shape"].replace(
+        "table_width: 8, table_stride: 8", "table_width: 9, table_stride: 9")
+    with pytest.raises(ValueError):
+        MODULE.generate([data], "mistral_large4", layout=2)
