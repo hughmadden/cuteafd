@@ -107,8 +107,8 @@ type Dev<'a> = DeviceAllocation<'a>;
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Decode/verify steps run padded to one of these row counts, and their page
 /// tables to a power-of-two width of at least 16 pages (or the
-/// whole context): a bounded set of decode graph shapes, all captured at
-/// startup ([`GlmEngine::warm_decode_graphs`]), so serving never captures.
+/// whole context). Startup prewarms selected shapes; the shared cache captures
+/// or runs unlisted serving shapes eagerly within the per-device reserve.
 /// Exact up to 16 rows (one sequence's verify step: no padding at C1), then
 /// in steps of 4 / 8 (padding a batched step costs ~1% per row on the GPU).
 pub(crate) const ROW_BUCKETS: [usize; 24] = GLM_SHORT_ROW_BUCKETS;

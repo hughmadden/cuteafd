@@ -5,11 +5,14 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cassert>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -2654,6 +2657,151 @@ void test_cuda_graph_topology_chain_and_fork() {
   free_buffer(&buffer);
 }
 
+void test_cuda_graph_peer_attribution() {
+  int devices = 0;
+  require_cuda(cudaGetDeviceCount(&devices), "peer graph device count");
+  if (devices != 2) {
+    std::cerr << "peer graph sample requires exactly two visible devices\n";
+    std::abort();
+  }
+  for (int device : {0, 1}) {
+    require_cuda(cudaSetDevice(device), "peer graph select");
+    require_cuda(cudaFree(nullptr), "peer graph context");
+    auto enabled = cudaDeviceEnablePeerAccess(1 - device, 0);
+    if (enabled == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+    else require_cuda(enabled, "peer graph enable");
+    require_cuda(static_cast<cudaError_t>(cuteafd_peer_copy_initialize()), "peer graph kernel initialization");
+  }
+  constexpr size_t capacity = 1 << 20;
+  require_cuda(cudaSetDevice(0), "peer graph source device");
+  auto source = device_buffer(capacity);
+  require_cuda(cudaMemset(source.ptr, 0x5a, capacity), "peer graph source data");
+  cudaStream_t stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "peer graph stream");
+  require_cuda(cudaSetDevice(1), "peer graph destination device");
+  auto destination = device_buffer(capacity);
+  require_cuda(cudaMemset(destination.ptr, 0, capacity), "peer graph destination data");
+  require_cuda(cudaSetDevice(0), "peer graph issuing device");
+  auto enqueue = [&](bool kernel, size_t bytes) {
+    if (kernel) require_cuda(static_cast<cudaError_t>(cuteafd_peer_copy_async(
+        destination.ptr, source.ptr, bytes, stream)), "peer graph kernel");
+    else require_status(cuteafd_copy_d2d_async(destination, source, bytes, stream), "peer graph memcpy");
+  };
+  // Eager first-use work stays outside all graph allocation windows.
+  enqueue(false, capacity);
+  enqueue(true, capacity);
+  require_cuda(cudaStreamSynchronize(stream), "peer graph eager warmup");
+  require_cuda(cudaSetDevice(1), "peer graph clear warmup device");
+  require_cuda(cudaMemset(destination.ptr, 0, capacity), "peer graph clear warmup output");
+  require_cuda(cudaSetDevice(0), "peer graph restore warmup device");
+  auto sample = [&]() {
+    std::array<size_t, 2> free{};
+    for (int device : {0, 1}) {
+      require_cuda(cudaSetDevice(device), "peer graph sample select");
+      require_cuda(cudaDeviceSynchronize(), "peer graph completed phase");
+      size_t total = 0;
+      require_cuda(cudaMemGetInfo(&free[device], &total), "peer graph physical sample");
+    }
+    require_cuda(cudaSetDevice(0), "peer graph restore issuer");
+    return free;
+  };
+  for (bool kernel : {false, true}) for (size_t bytes : {size_t(4096), size_t(65536), capacity})
+      for (size_t count : {size_t(1), size_t(64), size_t(1024)}) {
+    const auto baseline = sample();
+    auto previous = baseline;
+    auto emit = [&](const char* phase) {
+      const auto now = sample();
+      std::cout << "{\"sample\":\"graph_peer\",\"route\":\"" << (kernel ? "kernel" : "memcpy")
+                << "\",\"phase\":\"" << phase << "\",\"bytes\":" << bytes
+                << ",\"nodes\":" << count << ",\"issuer\":0,\"source_device\":0,\"destination_device\":1"
+                << ",\"free_bytes\":[" << now[0] << "," << now[1] << "]"
+                << ",\"phase_used_delta\":[" << static_cast<int64_t>(previous[0]) - static_cast<int64_t>(now[0])
+                << "," << static_cast<int64_t>(previous[1]) - static_cast<int64_t>(now[1]) << "]"
+                << ",\"total_used_delta\":[" << static_cast<int64_t>(baseline[0]) - static_cast<int64_t>(now[0])
+                << "," << static_cast<int64_t>(baseline[1]) - static_cast<int64_t>(now[1]) << "]}\n";
+      previous = now;
+    };
+    cudaGraph_t graph = nullptr;
+    require_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "peer graph begin");
+    for (size_t n = 0; n < count; ++n) enqueue(kernel, bytes);
+    require_cuda(cudaStreamEndCapture(stream, &graph), "peer graph end");
+    emit("capture");
+    size_t nodes = 0, edges = 0;
+    require_cuda(cudaGraphGetNodes(graph, nullptr, &nodes), "peer graph nodes");
+    require_cuda(cudaGraphGetEdges(graph, nullptr, nullptr, nullptr, &edges), "peer graph edges");
+    if (nodes != count || edges + 1 != nodes) {
+      std::cerr << "peer graph is not the expected chain\n";
+      std::abort();
+    }
+    std::vector<cudaGraphNode_t> handles(nodes);
+    require_cuda(cudaGraphGetNodes(graph, handles.data(), &nodes), "peer graph node handles");
+    std::unordered_map<cudaGraphNode_t, size_t> index;
+    for (size_t n = 0; n < nodes; ++n) index.emplace(handles[n], n);
+    std::vector<cudaGraphNode_t> from(edges), to(edges);
+    if (edges != 0) require_cuda(cudaGraphGetEdges(graph, from.data(), to.data(), nullptr, &edges), "peer graph edge handles");
+    std::vector<size_t> incoming(nodes, 0);
+    std::vector<std::vector<size_t>> outgoing(nodes);
+    for (size_t e = 0; e < edges; ++e) {
+      outgoing[index.at(from[e])].push_back(index.at(to[e]));
+      ++incoming[index.at(to[e])];
+    }
+    std::vector<size_t> ready;
+    for (size_t n = 0; n < nodes; ++n) if (incoming[n] == 0) ready.push_back(n);
+    size_t width = ready.size();
+    for (size_t n = 0; n < ready.size(); ++n) {
+      for (auto next : outgoing[ready[n]]) if (--incoming[next] == 0) ready.push_back(next);
+      width = std::max(width, ready.size() - n - 1);
+    }
+    if (width != 1 || ready.size() != nodes) {
+      std::cerr << "peer graph topology not chain width one\n";
+      std::abort();
+    }
+    size_t peer_endpoints = 0;
+    for (auto node : handles) {
+      cudaGraphNodeType type{};
+      require_cuda(cudaGraphNodeGetType(node, &type), "peer graph node type");
+      if (type != cudaGraphNodeTypeMemcpy) continue;
+      cudaMemcpy3DParms params{};
+      require_cuda(cudaGraphMemcpyNodeGetParams(node, &params), "peer graph memcpy params");
+      cudaPointerAttributes src{}, dst{};
+      require_cuda(cudaPointerGetAttributes(&src, params.srcPtr.ptr), "peer graph src attributes");
+      require_cuda(cudaPointerGetAttributes(&dst, params.dstPtr.ptr), "peer graph dst attributes");
+      if (src.device == 0 && dst.device == 1) ++peer_endpoints;
+    }
+    if (!kernel && peer_endpoints != count) {
+      std::cerr << "peer graph memcpy endpoints do not match declared devices\n";
+      std::abort();
+    }
+    std::cout << "{\"sample\":\"graph_peer_topology\",\"route\":\"" << (kernel ? "kernel" : "memcpy")
+              << "\",\"bytes\":" << bytes << ",\"nodes\":" << nodes << ",\"edges\":" << edges
+              << ",\"width\":" << width << ",\"spans_devices\":true,\"memcpy_peer_endpoints\":" << peer_endpoints
+              << ",\"kernel_endpoints\":\"declared source=0 destination=1; opaque to CUDA graph inspection\"}\n";
+    cudaGraphExec_t exec = nullptr;
+    require_cuda(cudaGraphInstantiate(&exec, graph, 0), "peer graph instantiate");
+    emit("instantiate");
+    require_cuda(cudaGraphLaunch(exec, stream), "peer graph launch");
+    emit("launch");
+    require_cuda(cudaGraphExecDestroy(exec), "peer graph exec destroy");
+    emit("exec_destroy");
+    require_cuda(cudaGraphDestroy(graph), "peer graph source destroy");
+    emit("source_destroy");
+    require_cuda(cudaSetDevice(1), "peer graph verify device");
+    std::vector<uint8_t> result(bytes);
+    require_cuda(cudaMemcpy(result.data(), destination.ptr, bytes, cudaMemcpyDeviceToHost), "peer graph verify data");
+    if (!std::all_of(result.begin(), result.end(), [](uint8_t value) { return value == 0x5a; })) {
+      std::cerr << "peer graph output mismatch\n";
+      std::abort();
+    }
+    require_cuda(cudaMemset(destination.ptr, 0, capacity), "peer graph clear destination");
+    require_cuda(cudaSetDevice(0), "peer graph restore device");
+  }
+  require_cuda(cudaStreamDestroy(stream), "peer graph stream destroy");
+  free_buffer(&source);
+  require_cuda(cudaSetDevice(1), "peer graph free destination device");
+  free_buffer(&destination);
+  require_cuda(cudaSetDevice(0), "peer graph final device");
+  std::cout << "test result: ok. 18 passed; 0 failed\n";
+}
 void test_cuda_graph_replay_matches_uncaptured() {
   const int rows = 1;
   const int hidden = 8;
@@ -2897,6 +3045,10 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--peer-query-only") == 0) {
     test_peer_copy_optional_query_failure_is_recoverable();
     std::cout << "test result: ok. 2 passed; 0 failed\n";
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graph-peer-only") == 0) {
+    test_cuda_graph_peer_attribution();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-topology-only") == 0) {

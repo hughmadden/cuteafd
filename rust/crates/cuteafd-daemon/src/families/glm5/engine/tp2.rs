@@ -612,7 +612,7 @@ mod whole_tests {
         assert!(decode.contains("layer.dense || self.local_layer(index) => Previous::Delta"));
         assert!(prefill.contains("self.engine.local_ffn(layer, slot"));
         let warm = engine.split("pub fn warm_decode_graphs(").nth(1).unwrap().split("fn step(").next().unwrap();
-        assert!(warm.contains("glm_graph_shapes(self.max_context, self.pages)"));
+        assert!(warm.contains("glm_prewarm_shapes(self.max_context, self.pages)"));
         assert!(warm.contains("for shape in &shapes"));
         assert!(warm.contains("run(false)?"));
         assert!(warm.contains("let before = self.graph_memory_samples()?"));
