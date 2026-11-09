@@ -82,7 +82,7 @@ def generate(traces, family, coverage=0.999, pin_frequency=0.9, pin_report=None,
         return generate_glm5_flash(traces, coverage, pin_frequency)
     prefix = SITE_PREFIX.get(family)
     if prefix is None:
-        raise ValueError(f"no checked-in shape-list consumer for {family}")
+        raise ValueError(f"no checked-in shape-list consumer for {family}; qwen4 is keyed by --shape")
     if family == "mistral_large4":
         if layout not in (1, 2):
             raise ValueError("mistral_large4 keys its list by layout: pass --layout 1 or 2")
