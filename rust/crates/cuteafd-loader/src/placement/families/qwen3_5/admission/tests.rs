@@ -61,7 +61,8 @@ fn sampled_preweight_occupancy_is_one_capacity_neutral_named_owner() {
                     .map(|owner| owner.bytes).sum::<u64>(), sampled);
                 let now = plan.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
                 let before = previous.phases.iter().find(|row| row.budget == "rtx0" && row.phase == phase).unwrap();
-                assert_eq!(now.available - now.owned, before.available - before.owned);
+                assert_eq!(now.available - now.owned - now.opaque,
+                    before.available - before.owned - before.opaque);
             }
         }
     }
