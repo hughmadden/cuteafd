@@ -13,8 +13,7 @@ from pathlib import Path
 CHUNK = 2 << 20
 GEOMETRY = re.compile(r"rows: (\d+), table_width: (\d+), table_stride: (\d+)")
 # Families sharing one engine share its site names.
-SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5.",
-               "glm5_flash": "glmf.", "deepseek_v41": "v41."}
+SITE_PREFIX = {"glm5": "glm5.", "mistral_large4": "glm5."}
 
 
 def packed(value):

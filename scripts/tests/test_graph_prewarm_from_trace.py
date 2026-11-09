@@ -233,7 +233,23 @@ def test_odd_half_table_width_is_refused():
         MODULE.generate([data], "mistral_large4", layout=2)
 
 
-@pytest.mark.parametrize("family", ["glm5", "mistral_large4", "glm5_flash", "deepseek_v41"])
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
+def test_generator_prefix_matches_shared_engine_graph_site(family):
+    import re
+    engine = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5/engine.rs"
+    sites = re.findall(r'name:\s*"([^"]+)"', engine.read_text())
+    assert "glm5.segment" in sites
+    assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
+
+
+@pytest.mark.parametrize("family", ["glm5_flash", "deepseek_v41"])
+def test_native_family_schemas_are_not_advertised_as_glm_consumers(family):
+    assert family not in MODULE.SITE_PREFIX
+    with pytest.raises(ValueError, match="no checked-in shape-list consumer"):
+        MODULE.generate([trace()], family)
+
+
+@pytest.mark.parametrize("family", ["glm5", "mistral_large4"])
 def test_every_consumer_uses_fixed_allocation_tail_not_largest_graph(family):
     data = trace()
     for graph in data["graphs"]:
