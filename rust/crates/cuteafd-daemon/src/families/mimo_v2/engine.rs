@@ -2561,7 +2561,10 @@ impl<'a> MimoEngine<'a> {
         })();
         self.graphs_first_touch.set(false);
         if let Err(error) = first_touch { self.graphs_warming.set(false); return Err(error); }
-        let samples_before = self.graph_memory_samples()?;
+        let samples_before = match self.graph_memory_samples() {
+            Ok(samples) => samples,
+            Err(error) => { self.graphs_warming.set(false); return Err(error); }
+        };
         let before = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         self.graphs_warming.set(true);
         let captured = (|| -> Result<()> {
@@ -3363,7 +3366,7 @@ mod tests {
         let helper = source.split_once("fn graph_prewarm_tables(").unwrap().1
             .split_once("/// A sequence's full-attention pages").unwrap().0;
         assert!(!helper.contains("Pool") && !helper.contains("prefix"));
-        let native = include_str!("../../../../../../../third_party/sparkinfer/b12x/integration/cuteafd/_mimo_kernels.py");
+        let native = include_str!("../../../../../../third_party/sparkinfer/b12x/integration/cuteafd/_mimo_kernels.py");
         assert!(native.contains("slot = Int64(slots[token])"));
         assert!(native.contains("if slot >= Int64(0):"));
         assert!(native.contains("& (slot >= Int64(0))"));
@@ -3380,6 +3383,13 @@ mod tests {
         let startup = source.split_once("pub fn capture_decode_graphs(").unwrap().1
             .split_once("/// Queues rank 1's share").unwrap().0;
         assert!(startup.contains("self.submit(||"));
+        let launch = startup.find("self.decode_layers(").unwrap();
+        for upload in ["self.put_step_inputs(", "self.put(&workspace.slots,",
+            "self.put(&workspace.ring_slots,", "self.put(&workspace.seq_first,",
+            "self.put(&workspace.page_table,", "self.put(&workspace.ids,"] {
+            assert!(startup.find(upload).unwrap() < launch, "{upload} must precede the first launch");
+        }
+        assert!(startup.find("for (rank, workspace)").unwrap() < launch);
         let eager = startup.find("self.graphs_first_touch.set(true)").unwrap();
         let measured = startup.find("let samples_before =").unwrap();
         assert!(eager < measured);

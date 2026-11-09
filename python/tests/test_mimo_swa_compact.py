@@ -50,20 +50,98 @@ def unpack(g, records, fmt):
 
 
 @lru_cache(None)
-def post(model, ranks, fmt):
+def post(model, ranks, fmt, kind="swa"):
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     from b12x.integration.cuteafd._mimo_kernels import MimoQkvRope
     from b12x.integration.cuteafd.mimo_attention import KV_GROUPS
     g = geometry(model, ranks)
-    launch = MimoQkvRope(heads=g.heads, kv_heads=g.swa_kv_heads, v_scale=g.v_scale,
+    launch = MimoQkvRope(heads=g.heads, kv_heads=g.swa_kv_heads if kind == "swa" else g.full_kv_heads, v_scale=g.v_scale,
                          k_stride=g.qkv_k_stride, kv8={"bf16": None, "fp8": "e4m3", "int8": "s8"}[fmt],
                          kv_group=KV_GROUPS.get(fmt, 64))
-    return compile_program(launch, name="mimo_swa_post_probe", operands=(
+    return compile_program(launch, name=f"mimo_{kind}_post_probe", operands=(
         Operand("qkv", torch.bfloat16, "[rows,W]"), Operand("positions", torch.int64, "[rows]", align=8),
         Operand("cos_sin", torch.float32, "[P,64]", align=4),
         Operand("slots", torch.int64, "[rows]", align=8), Operand("query", torch.bfloat16, "[rows,N,D]", "out"),
         Operand("cache", torch.bfloat16 if fmt == "bf16" else torch.uint8, "[records,R]", "inout")),
-        scalars=(Scalar("rows"),), key=(model, ranks, fmt))
+        scalars=(Scalar("rows"),), key=(model, ranks, fmt, kind))
+
+
+@pytest.mark.parametrize("model,ranks", [("flash", 1), ("flash", 2), ("pro", 2)])
+@pytest.mark.parametrize("fmt", ["bf16", "int8", "fp8"])
+@pytest.mark.parametrize("kind", ["full", "swa"])
+def test_prewarm_masked_capture_replays_real_kv_slots(model, ranks, fmt, kind):
+    from b12x.integration.cuteafd.mimo_attention import record_bytes
+    g, rows = geometry(model, ranks), 2
+    torch.manual_seed(731)
+    qkv = torch.randn(rows, g.qkv_width(kind), device="cuda").bfloat16()
+    positions = torch.zeros(rows, device="cuda", dtype=torch.int64)
+    angles = torch.randn(4, 32, device="cuda")
+    rope = torch.cat((angles.cos(), angles.sin()), 1)
+    slots = torch.full((rows,), -1, device="cuda", dtype=torch.int64)
+    dtype = torch.bfloat16 if fmt == "bf16" else torch.uint8
+    width = g.record_elems(kind) if fmt == "bf16" else record_bytes(g, kind, fmt)
+    cache = torch.full((8, width), 17, device="cuda", dtype=dtype)
+    query = torch.empty(rows, g.heads, 192, device="cuda", dtype=torch.bfloat16)
+    program = post(model, ranks, fmt, kind)
+
+    def run(out, records):
+        program.launch(qkv, positions, rope, slots, out, records, scalars=[rows])
+
+    run(query, cache)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(query, cache)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(cache == 17), "masked startup replay wrote persistent KV"
+
+    # Only device-table contents change. Neither pointer nor graph is rebuilt.
+    slots.copy_(torch.tensor([3, 6], device="cuda", dtype=torch.int64))
+    positions.copy_(torch.tensor([1, 3], device="cuda", dtype=torch.int64))
+    expected_cache, expected_query = cache.clone(), query.clone()
+    run(expected_query, expected_cache)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(cache, expected_cache)
+    assert torch.equal(query, expected_query), "positions were baked into capture"
+    assert torch.any(cache[3] != 17) and torch.any(cache[6] != 17), "real replay did not append KV"
+    assert torch.all(cache[[0, 1, 2, 4, 5, 7]] == 17)
+
+
+@pytest.mark.parametrize("fmt", ["bf16", "int8", "fp8"])
+def test_prewarm_masked_capture_replays_real_ring_slots(fmt):
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.integration.cuteafd._mimo_kernels import MimoRingCommit
+    from b12x.integration.cuteafd.mimo_attention import record_bytes
+    g, rows = geometry("flash", 1), 2
+    width = g.record_elems("swa") * 2 if fmt == "bf16" else record_bytes(g, "swa", fmt)
+    step = torch.randint(0, 255, (rows, width), device="cuda", dtype=torch.uint8)
+    ring = torch.full((8, width), 17, device="cuda", dtype=torch.uint8)
+    slots = torch.full((rows,), -1, device="cuda", dtype=torch.int64)
+    firsts = torch.arange(rows, device="cuda", dtype=torch.int32)
+    program = compile_program(MimoRingCommit(record=g.record_elems("swa"), ring_rows=g.ring_rows,
+        record_bytes=width), name="mimo_masked_commit_probe", operands=(
+        Operand("step", torch.uint8, "[rows,R]"), Operand("ring", torch.uint8, "[slots,R]", "inout"),
+        Operand("slots", torch.int64, "[rows]", align=8),
+        Operand("firsts", torch.int32, "[rows]", align=4)), scalars=(Scalar("rows"),), key=(fmt,))
+
+    def run():
+        program.launch(step, ring, slots, firsts, scalars=[rows])
+
+    run()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.all(ring == 17), "masked startup replay changed SWA history"
+    slots.copy_(torch.tensor([3, 6], device="cuda", dtype=torch.int64))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(ring[3], step[0]) and torch.equal(ring[6], step[1])
+    assert torch.all(ring[[0, 1, 2, 4, 5, 7]] == 17)
 
 
 @pytest.mark.parametrize("model,ranks", [("flash", 1), ("flash", 2), ("pro", 1), ("pro", 2)])

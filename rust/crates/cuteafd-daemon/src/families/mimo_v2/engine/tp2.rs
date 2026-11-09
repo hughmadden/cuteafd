@@ -148,6 +148,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     pub(super) fn prepare_tp2_route_step(&self, rows: &[usize]) -> Result<()> {
+        if self.graphs_warming.get() { return Ok(()); }
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         let step = tp2.steps.get() + 1;
         tp2.steps.set(step);
@@ -169,6 +170,7 @@ impl<'a> MimoEngine<'a> {
 
     fn collect_tp2_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize,
         w: &Workspace<'_>) -> Result<()> {
+        if self.graphs_warming.get() { return Ok(()); }
         let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
         if !tp2.checking.get() { return Ok(()); }
         let checks = tp2.checks.borrow();
@@ -190,6 +192,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     pub(super) fn finish_tp2_route_step(&self) -> Result<()> {
+        if self.graphs_warming.get() { return Ok(()); }
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         if !tp2.checking.replace(false) { return Ok(()); }
         for rank in 0..2 {
