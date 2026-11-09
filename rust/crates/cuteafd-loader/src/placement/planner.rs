@@ -670,6 +670,27 @@ impl ResolvedPlan {
         }
         Ok(items)
     }
+    /// Complete physical reservation projection for the dashboard only. Unlike
+    /// readiness items, this includes future owners and startup pool/peak forms.
+    /// Keep items_at unchanged: admission/log/receipt callers rely on its scope.
+    pub fn reservation_items_at(&self, location: Location, phase: Phase) -> Result<Vec<Item>, Refusal> {
+        let mut items = self.items_at(location, phase)?;
+        items.extend(self.facts.deferred.iter().filter(|owner|
+            owner.location == location && owner.view.is_none()
+                && owner.lifetime.contains(phase, self.facts.phase_order))
+            .map(|owner| Item::new(owner.category, format!("deferred: {}", owner.group),
+                &owner.dtype, owner.bytes, Basis::Exact)));
+        items.extend(self.facts.reservations.iter().filter(|owner|
+            owner.location == location && owner.lifetime.contains(phase, self.facts.phase_order))
+            .map(|owner| Item::new(Category::Workspace, format!("reservation: {}", owner.id),
+                &owner.source, owner.bytes, Basis::Formula)));
+        items.extend(self.facts.sequential.iter().filter(|group|
+            group.members.first().is_some_and(|owner| owner.location == location
+                && owner.lifetime.contains(phase, self.facts.phase_order)))
+            .map(|group| Item::new(Category::Workspace, format!("sequential peak: {}", group.id),
+                "maximum member, not sum", group.peak(), Basis::Exact)));
+        Ok(items)
+    }
     pub fn remaining(&self, budget: &str, phase: Phase) -> Option<u64> {
         self.phases
             .iter()

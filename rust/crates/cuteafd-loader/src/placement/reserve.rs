@@ -238,7 +238,7 @@ pub fn log_plan(plan: &super::planner::ResolvedPlan, family: &str) {
     // including host/pinned/managed locations sharing a GB10 budget.
     let domains: Vec<_> = plan.budgets.iter().map(|budget| {
         let items: Result<Vec<_>, _> = budget.locations.iter().map(|location|
-            plan.items_at(*location, super::planner::Phase::Growth)).collect();
+            plan.reservation_items_at(*location, super::planner::Phase::Growth)).collect();
         serde_json::json!({"id": budget.id, "budget": budget,
             "items": items.ok().map(|rows| rows.into_iter().flatten().collect::<Vec<_>>()),
             "phase": "Growth"})

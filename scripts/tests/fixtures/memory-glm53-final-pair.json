@@ -270,7 +270,97 @@
             },
             "unavailable_reason": null,
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 0,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": 101761773568,
             "baseline_allocatable_free_bytes": 120867258368,
@@ -316,7 +406,97 @@
             },
             "unavailable_reason": null,
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 1,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": 102749532160,
             "baseline_allocatable_free_bytes": 120021340160,
@@ -362,7 +542,97 @@
             },
             "unavailable_reason": null,
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 2,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": 104950575104,
             "baseline_allocatable_free_bytes": 119710310400,
@@ -408,7 +678,97 @@
             },
             "unavailable_reason": null,
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 3,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": 102618898432,
             "baseline_allocatable_free_bytes": 120612970496,
@@ -549,7 +909,97 @@
             },
             "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 0,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": null,
             "baseline_allocatable_free_bytes": 120867258368,
@@ -595,7 +1045,97 @@
             },
             "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 1,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": null,
             "baseline_allocatable_free_bytes": 120021340160,
@@ -641,7 +1181,97 @@
             },
             "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 2,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": null,
             "baseline_allocatable_free_bytes": 119710310400,
@@ -687,7 +1317,97 @@
             },
             "unavailable_reason": "post-request Spark control-plane telemetry unavailable; see #1631; worker logs its own samples",
             "provenance": {
-              "device_sample": null
+              "device_sample": null,
+              "owner_ledger": {
+                "rank": 3,
+                "resident_bytes": 89711968256,
+                "mapped_ring_bytes": 547356672,
+                "host_exchange_bytes": 33992704,
+                "row_indices_bytes": 11008,
+                "runtime": {
+                  "workspace_bytes": 450652136,
+                  "pinned_workspace_bytes": 536576,
+                  "detail": {
+                    "allocations": [
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 12288
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 28672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/weights",
+                        "bytes": 89711968256
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 2328
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 5432
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 24983956
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 405213188
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 1191936
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 405504
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 17436672
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/decode",
+                        "bytes": 4096
+                      },
+                      {
+                        "space": "device",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 176128
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/route_staging",
+                        "bytes": 532480
+                      },
+                      {
+                        "space": "pinned",
+                        "scope": "experts/workspace/prefill",
+                        "bytes": 4096
+                      }
+                    ]
+                  }
+                }
+              }
             },
             "absolute_allocatable_used_bytes": null,
             "baseline_allocatable_free_bytes": 120612970496,

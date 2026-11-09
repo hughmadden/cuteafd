@@ -25,6 +25,35 @@ async fn page() -> impl IntoResponse {
 async fn script() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store"), (header::CONTENT_TYPE, "text/javascript; charset=utf-8")], include_str!("../../assets/memory.js"))
 }
+// Keep the physical-device mapping and numeric worker ownership required by the
+// UI, not checkpoint paths, slices, environment arguments or process samples.
+fn reconciliation_view(mut value: Value) -> Value {
+    for stage in ["ready", "first_request"] {
+        if let Some(rows) = value[stage]["devices"].as_array_mut() {
+            for row in rows {
+                let provenance = &row["provenance"];
+                let ledger = &provenance["owner_ledger"];
+                let allocations: Vec<_> = ledger["runtime"]["detail"]["allocations"].as_array()
+                    .into_iter().flatten().map(|owner| json!({"space": owner["space"],
+                        "scope": owner["scope"], "bytes": owner["bytes"]})).collect();
+                let worker = if ledger.is_object() { json!({
+                    "rank": ledger["rank"], "resident_bytes": ledger["resident_bytes"],
+                    "mapped_ring_bytes": ledger["mapped_ring_bytes"],
+                    "host_exchange_bytes": ledger["host_exchange_bytes"],
+                    "row_indices_bytes": ledger["row_indices_bytes"],
+                    "runtime": {"workspace_bytes": ledger["runtime"]["workspace_bytes"],
+                        "pinned_workspace_bytes": ledger["runtime"]["pinned_workspace_bytes"],
+                        "detail": {"allocations": allocations}}
+                }) } else { Value::Null };
+                let mapping = json!({"device_sample": {"device": provenance["device_sample"]["device"]},
+                    "owner_ledger": worker});
+                row["provenance"] = mapping;
+            }
+        }
+    }
+    value
+}
+
 async fn snapshot(State(state): State<Dashboard>, headers: HeaderMap) -> Response {
     let cache = [(header::CACHE_CONTROL, "no-store")];
     if !state.console.admin_unlocked(&headers) {
@@ -34,7 +63,8 @@ async fn snapshot(State(state): State<Dashboard>, headers: HeaderMap) -> Respons
     // No arbitrary stats, checkpoint paths, prompts or provenance arguments.
     let mut selected = serde_json::Map::new();
     for key in ["prefix_cache", "kv_reserve", "graph_cache", "memory_reconciliation"] {
-        selected.insert(key.into(), stats.get(key).cloned().unwrap_or(Value::Null));
+        let value = stats.get(key).cloned().unwrap_or(Value::Null);
+        selected.insert(key.into(), if key == "memory_reconciliation" { reconciliation_view(value) } else { value });
     }
     drop(stats);
     selected.insert("host_heap".into(), super::HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
@@ -73,6 +103,24 @@ mod tests {
         assert_eq!(value["stats"]["prefix_cache"]["pages"], 20);
         assert!(value["stats"].get("secret").is_none());
         assert!(value["stats"]["graph_cache"].is_null());
+    }
+
+    #[test]
+    fn slim_reconciliation_retains_physical_mapping_and_worker_owners_without_paths() {
+        let value = reconciliation_view(json!({"ready": {"devices": [{"device": "rtx0",
+            "measured_bytes": null, "provenance": {"device_sample": {"device": 1},
+                "layout": "/private/checkpoint", "owner_ledger": {"rank": 0,
+                    "resident_bytes": 123, "mapped_ring_bytes": 44,
+                    "runtime": {"workspace_bytes": 55, "pinned_workspace_bytes": 66,
+                        "detail": {"process_samples": [{"path": "/private/process"}],
+                            "allocations": [{"space": "host", "scope": "exchange", "bytes": 77,
+                                "method": "/private/method"}]}}}}}]}}));
+        let row = &value["ready"]["devices"][0];
+        assert_eq!(row["provenance"]["device_sample"]["device"], 1);
+        assert_eq!(row["provenance"]["owner_ledger"]["runtime"]["workspace_bytes"], 55);
+        assert_eq!(row["provenance"]["owner_ledger"]["runtime"]["detail"]["allocations"][0]["bytes"], 77);
+        assert!(row["measured_bytes"].is_null());
+        assert!(!value.to_string().contains("/private"));
     }
 
     #[tokio::test]

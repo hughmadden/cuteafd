@@ -8,7 +8,17 @@ const bytes = n => !numeric(n) ? 'unavailable' : `${n < 0 ? '-' : ''}${(Math.abs
 const exact = n => numeric(n) ? `${n.toLocaleString('en-US')} B` : 'unavailable';
 const number = n => numeric(n) ? n.toLocaleString('en-US', {maximumFractionDigits: 2}) : 'unavailable';
 const CATEGORIES = ['weights','embedding','experts','drafter','kv','prefix','workspace','transport','staging','tables','runtime','reserved','unnamed','other-small'];
-// Composite encoding: three validated hues with five stable, unique textures.
+const GROUPS = ['weights','kv','graph','workspace','runtime','transport','padding'];
+const groupIndex = name => Math.max(0,GROUPS.indexOf(name));
+function ownerGroup(i) {
+  if (/graph/i.test(i.name)) return 'graph';
+  if (['weights','embedding','experts','tables'].includes(i.category)) return 'weights';
+  if (['kv','prefix'].includes(i.category)) return 'kv';
+  if (['workspace','drafter'].includes(i.category)) return 'workspace';
+  if (['transport','staging'].includes(i.category)) return 'transport';
+  if (i.category === 'reserved') return 'padding';
+  return 'runtime';
+}
 const categoryIndex = name => Math.max(0, CATEGORIES.indexOf(name));
 const categoryName = name => name === 'other-small' ? 'Other small' : name === 'unnamed' ? 'Unnamed owner' : name;
 const owner = (category, name, value) => ({category, name, bytes: value});
@@ -25,7 +35,7 @@ function stageRows(stats) {
 function breakdownItems(b) {
   return [owner('weights','weights (aggregate)',b.weights_bytes), owner('workspace','workspace (aggregate)',b.workspace_bytes),
     owner('kv','KV + prefix (aggregate)',b.kv_bytes), owner('unnamed','unnamed other_bytes',b.other_bytes),
-    ...arr(b.reserve).map(r => owner(r.name === 'release padding' ? 'reserved' : 'runtime',r.name,r.bytes))].filter(i => numeric(i.bytes) && i.bytes > 0);
+    ...arr(b.reserve).map(r => owner(['release padding','family reserve','GPU_RESERVE','SPARK_RESERVE'].includes(r.name) ? 'reserved' : 'runtime',r.name,r.bytes))].filter(i => numeric(i.bytes) && i.bytes > 0);
 }
 function normalize(payload) {
   const stats = payload.stats || payload, inventory = payload.inventory || {}, stages = stageRows(stats);
@@ -50,8 +60,27 @@ function normalize(payload) {
     const id = key.replace(/^device\./,'');
     if (!domains.some(d => d.id === id)) domains.push({id,cap:b.cap_bytes,items:breakdownItems(b),source:'admitted aggregate breakdown'});
   }
-  for (const row of stages) if (row.owners && !domains.some(d => d.id === row.device)) {
-    domains.push({id:row.device,cap:row.owners.cap_bytes,items:breakdownItems(row.owners),source:'stage admission breakdown'});
+  for (const row of stages) {
+    const ledger = row.provenance?.owner_ledger;
+    if (row.device.startsWith('spark') && ledger) {
+      const allocations = arr(ledger.runtime?.detail?.allocations);
+      const future = numeric(row.admitted_future_ring_bytes) && row.admitted_future_ring_bytes > 0;
+      const items = [owner('experts','resident expert weights',ledger.resident_bytes),
+        owner('workspace','device workspace',ledger.runtime?.workspace_bytes),
+        owner('workspace','pinned workspace (UMA)',ledger.runtime?.pinned_workspace_bytes),
+        owner('transport',future?'future endpoint mapped rings':'mapped endpoint rings',ledger.mapped_ring_bytes),
+        owner('transport','host exchange (UMA)',ledger.host_exchange_bytes),
+        owner('transport','row indices (UMA)',ledger.row_indices_bytes),
+        ...allocations.filter(i=>i.space==='host').map(i=>owner('workspace',`host: ${i.scope}`,i.bytes))
+      ].filter(i=>numeric(i.bytes)&&i.bytes>0);
+      // Device/pinned detail allocations alias the aggregate fields above.
+      const existing = domains.find(d=>d.id===row.device);
+      const domain = {id:row.device,cap:existing?.cap || row.owners?.cap_bytes,items,
+        source:'worker admitted owners (includes future rings; not ready occupancy)'};
+      if(existing) domains.splice(domains.indexOf(existing),1,domain); else domains.push(domain);
+    } else if (row.owners && !domains.some(d => d.id === row.device)) {
+      domains.push({id:row.device,cap:row.owners.cap_bytes,items:breakdownItems(row.owners),source:'stage admission breakdown'});
+    }
   }
   if (!domains.some(d => d.id === 'host')) {
     const h = inventory.host_admission;
@@ -64,16 +93,20 @@ function normalize(payload) {
   return {stats,inventory,stages,domains,graphs:arr(stats.graph_cache)};
 }
 function segments(domain) {
-  const big = [], small = [];
-  for (const i of domain.items) (numeric(domain.cap) && i.bytes < domain.cap * .01 ? small : big).push(i);
-  const by = new Map();
-  for (const item of big) {
-    if (!by.has(item.category)) by.set(item.category,[]);
-    by.get(item.category).push(item);
+  const named = new Map(), small = [];
+  for (const i of domain.items) {
+    const required = /graph|draft|workspace|transport|intake|ring|exchange|indices|page table|BLAS|padding/i.test(i.name);
+    if (!required && numeric(domain.cap) && i.bytes < domain.cap * .01) { small.push(i);continue; }
+    const key = `${i.category}:${i.name}`;
+    if (!named.has(key)) named.set(key,{key,name:i.name,category:i.category,group:ownerGroup(i),members:[],bytes:0});
+    const s=named.get(key);s.members.push(i);s.bytes+=i.bytes;
   }
-  const result = [...by].map(([category,members]) => ({category,members,bytes:members.reduce((s,i)=>s+i.bytes,0)}));
-  if (small.length) result.push({category:'other-small',members:small,bytes:small.reduce((s,i)=>s+i.bytes,0)});
-  return result.sort((a,b) => categoryIndex(a.category)-categoryIndex(b.category));
+  const result=[...named.values()];
+  if(small.length) result.push({key:'other-small',name:'Other small',category:'other-small',group:'runtime',members:small,bytes:small.reduce((s,i)=>s+i.bytes,0)});
+  result.sort((a,b)=>groupIndex(a.group)-groupIndex(b.group)||a.name.localeCompare(b.name));
+  // Stable name-derived shade; unrelated domains never repaint an owner.
+  result.forEach((s,i)=>{s.variant=[...s.key].reduce((n,c)=>(n*31+c.charCodeAt(0))>>>0,0)%3;s.pattern=i>0&&result[i-1].group===s.group;});
+  return result;
 }
 function rates(current, previous, elapsed) {
   const out = {};
@@ -117,45 +150,68 @@ function inspect(el,text,highlight) {
   el.addEventListener('focus',e=>show(null)); el.addEventListener('pointerleave',leave); el.addEventListener('blur',leave);
   el.addEventListener('click',show); el.addEventListener('keydown',e=>{if(e.key === 'Escape')leave();});
 }
-function highlightCategory(category,on) {
-  document.querySelectorAll('[data-category]').forEach(el => {
-    el.classList.toggle('active',on && el.dataset.category === category);
-    el.classList.toggle('dim',on && el.dataset.category !== category);
+function highlightOwner(key,on) {
+  document.querySelectorAll('[data-owner]').forEach(el => {
+    el.classList.toggle('active',on && el.dataset.owner === key);
+    el.classList.toggle('dim',on && el.dataset.owner !== key);
   });
 }
-function pattern(category,id) {
-  const n = categoryIndex(category), color = ['var(--mem-blue)','var(--mem-orange)','var(--mem-aqua)'][n % 3];
-  const texture = Math.floor(n/3);
-  const paths = ['', '<path d="M-2 2L2-2M0 8L8 0M6 10L10 6"/>', '<path d="M0 4H8"/>', '<path d="M4 0V8M0 4H8"/>', '<circle cx="4" cy="4" r="1.5"/>'];
-  return `<pattern id="${id}" width="8" height="8" patternUnits="userSpaceOnUse"><rect width="8" height="8" fill="${color}"/><g stroke="var(--panel)" stroke-width="1.5" fill="var(--panel)">${paths[texture]}</g></pattern>`;
+function ownerPaint(s,id,variant) {
+  const color = `var(--mem-group-${groupIndex(s.group)})`;
+  // Related shades keep owner identity stable. Texture is reserved for adjacent
+  // siblings whose shades alone cannot reliably separate a nominal owner.
+  const shade = variant % 3 === 1 ? '#fff' : '#000';
+  const opacity = variant % 3 === 0 ? 0 : .10;
+  return `<pattern id="${id}" width="10" height="10" patternUnits="userSpaceOnUse"><rect width="10" height="10" fill="${color}"/><rect width="10" height="10" fill="${shade}" opacity="${opacity}"/>${s.pattern ? '<path d="M-2 2L2-2M0 10L10 0M8 12L12 8" stroke="var(--panel)" stroke-opacity=".24" fill="none"/>' : ''}</pattern>`;
 }
 function reservationText(domain,s) {
-  return `${domain.id} / ${categoryName(s.category)}\n${exact(s.bytes)} (${bytes(s.bytes)})\n${s.members.map(i=>`${i.name}: ${exact(i.bytes)} [${i.category}]`).join('\n')}`;
+  return `${domain.id} / ${s.name}\n${exact(s.bytes)} (${bytes(s.bytes)})\n${s.members.map(i=>`${i.name}: ${exact(i.bytes)} [${i.category}]`).join('\n')}`;
+}
+let selectedDomain = null, reservationData = null;
+function renderDetail() {
+  const d = reservationData.domains.find(d=>d.id === selectedDomain);
+  if (!d) return;
+  const parts = segments(d).filter(s=>!['weights','kv'].includes(s.group)).sort((a,b)=>b.bytes-a.bytes);
+  const total = parts.reduce((n,s)=>n+s.bytes,0);
+  $('detail-summary').textContent = d.reason ? `Unavailable: ${d.reason}` : `${d.id}: ${bytes(total)} outside target weights / KV. Each mini-bar is scaled to this subtotal, not device capacity. Drafter owners stay visible.`;
+  $('owner-detail').innerHTML = parts.map((s,i)=>`<button class="owner-detail" data-owner="${esc(s.key)}" type="button"><span>${esc(s.name)}</span><strong>${exact(s.bytes)}</strong><svg viewBox="0 0 600 12" preserveAspectRatio="none" aria-hidden="true"><defs>${ownerPaint(s,`detail${i}`,s.variant)}</defs><rect width="600" height="12" fill="var(--well)"/><rect width="${total?s.bytes/total*600:0}" height="12" fill="url(#detail${i})"/></svg></button>`).join('') || '<p class="hint">No non-weight/non-KV owners published.</p>';
+  $('owner-detail').querySelectorAll('button').forEach((el,i)=>inspect(el,reservationText(d,parts[i]),on=>highlightOwner(parts[i].key,on)));
 }
 function renderReservations(data) {
-  const categoryMembers = new Map();
-  const rows = [];
+  reservationData = data;
+  if (!data.domains.some(d=>d.id === selectedDomain)) selectedDomain = data.domains.find(d=>d.id.startsWith('rtx'))?.id || data.domains[0]?.id;
+  const owners = new Map(), rows = [];
   $('reservations').innerHTML = data.domains.map((d,index) => {
     const parts = segments(d), total = d.items.reduce((s,i)=>s+i.bytes,0), scale = Math.max(d.cap || 0,total,1);
-    let y = 218;
-    const defs = parts.map(s=>pattern(s.category,`p${index}-${categoryIndex(s.category)}`)).join('');
-    const marks = parts.map(s => {
-      const h = s.bytes/scale*205; y -= h;
-      const key = `s${index}-${categoryIndex(s.category)}`;
-      if (!categoryMembers.has(s.category)) categoryMembers.set(s.category,[]);
-      categoryMembers.get(s.category).push(reservationText(d,s));
-      return `<rect class="segment" id="${key}" data-category="${esc(s.category)}" x="24" y="${y}" width="76" height="${h}" fill="url(#p${index}-${categoryIndex(s.category)})" tabindex="0" role="img" aria-label="${esc(reservationText(d,s))}"/>`;
+    let y = 428;
+    const defs = parts.map((s,n)=>ownerPaint(s,`p${index}-${n}`,s.variant)).join('');
+    const marks = parts.map((s,n) => {
+      const h = s.bytes/scale*410; y -= h;
+      if (!owners.has(s.key)) owners.set(s.key,{...s,texts:[]});
+      owners.get(s.key).texts.push(reservationText(d,s));
+      return `<rect class="segment" id="s${index}-${n}" data-owner="${esc(s.key)}" x="24" y="${y}" width="76" height="${h}" fill="url(#p${index}-${n})" tabindex="0" role="img" aria-label="${esc(reservationText(d,s))}"/>`;
     }).join('');
     rows.push(...d.items.map(i=>`<tr><td>${esc(d.id)} / ${esc(i.name)}</td><td>${esc(i.category)}</td><td>${exact(i.bytes)}</td></tr>`));
-    return `<article class="domain"><h3>${esc(d.id)}</h3><span class="capacity">${bytes(d.cap)} capacity</span><svg viewBox="0 0 125 240" aria-label="${esc(d.id)} reservations"><defs>${defs}</defs><rect x="24" y="13" width="76" height="205" fill="var(--well)" stroke="var(--line-2)"/>${marks}<text x="62" y="236" text-anchor="middle" fill="currentColor" font-size="10">${esc(bytes(total))} planned</text></svg><p class="hint">${esc(d.reason ? `Unavailable: ${d.reason}` : d.source)}</p>${numeric(d.cap)&&total>d.cap?'<p>Owners exceed capacity</p>':''}</article>`;
+    return `<article class="domain"><button class="domain-select" data-domain="${esc(d.id)}" type="button" aria-label="Inspect ${esc(d.id)} non-weight and non-KV owners">${esc(d.id)}</button><span class="capacity">${bytes(d.cap)} capacity</span><svg viewBox="0 0 125 455" aria-label="${esc(d.id)} reservations"><defs>${defs}</defs><rect x="24" y="18" width="76" height="410" fill="var(--well)"/>${marks}<text x="62" y="450" text-anchor="middle" fill="currentColor" font-size="9">${esc(d.reason?'unavailable':bytes(total)+' planned')}</text></svg><p class="hint">${esc(d.reason ? `Unavailable: ${d.reason}` : d.source)}</p>${numeric(d.cap)&&total>d.cap?'<p>Owners exceed capacity</p>':''}</article>`;
   }).join('');
   $('owners').innerHTML = rows.join('');
-  $('legend').innerHTML = [...categoryMembers].sort((a,b)=>categoryIndex(a[0])-categoryIndex(b[0])).map(([category]) =>
-    `<button type="button" data-category="${esc(category)}"><svg class="swatch" viewBox="0 0 20 20" aria-hidden="true"><defs>${pattern(category,`l${categoryIndex(category)}`)}</defs><rect width="20" height="20" fill="url(#l${categoryIndex(category)})"/></svg>${esc(categoryName(category))}</button>`).join('');
-  for (const [index,d] of data.domains.entries()) for (const s of segments(d)) {
-    inspect($(`s${index}-${categoryIndex(s.category)}`),reservationText(d,s),on=>highlightCategory(s.category,on));
+  $('legend').innerHTML = GROUPS.map(group=>{
+    const entries=[...owners.values()].filter(s=>s.group===group);
+    return entries.length?`<div class="legend-group"><h3>${esc(group)}</h3>${entries.map(s=>{
+      const id=`l${[...owners.keys()].indexOf(s.key)}`;
+      return `<button type="button" data-owner="${esc(s.key)}"><svg class="swatch" viewBox="0 0 20 20" aria-hidden="true"><defs>${ownerPaint(s,id,s.variant)}</defs><rect width="20" height="20" fill="url(#${id})"/></svg>${esc(s.name)}</button>`;
+    }).join('')}</div>`:'';
+  }).join('');
+  for (const [index,d] of data.domains.entries()) for (const [n,s] of segments(d).entries()) {
+    inspect($(`s${index}-${n}`),reservationText(d,s),on=>highlightOwner(s.key,on));
+    $(`s${index}-${n}`).addEventListener('click',()=>select(d.id));
   }
-  $('legend').querySelectorAll('button').forEach(el=>inspect(el,categoryMembers.get(el.dataset.category).join('\n\n'),on=>highlightCategory(el.dataset.category,on)));
+  $('legend').querySelectorAll('button').forEach(el=>inspect(el,owners.get(el.dataset.owner).texts.join('\n\n'),on=>highlightOwner(el.dataset.owner,on)));
+  $('detail-domain').innerHTML=data.domains.map(d=>`<option value="${esc(d.id)}">${esc(d.id)}</option>`).join('');
+  function select(id) { selectedDomain=id;$('detail-domain').value=id;renderDetail(); }
+  $('reservations').querySelectorAll('.domain-select').forEach(el=>el.addEventListener('click',()=>select(el.dataset.domain)));
+  $('detail-domain').onchange=()=>select($('detail-domain').value);
+  select(selectedDomain);
 }
 function metric(label,value,limit,unit,key,reason) {
   return {label,value:numeric(value)?value:null,limit:numeric(limit)?limit:null,unit,key,reason};
@@ -178,9 +234,9 @@ function liveMetrics(data) {
   for (const d of data.domains.filter(d=>d.id !== 'host')) {
     const row = data.stages.find(r=>r.device === d.id), spark = d.id.startsWith('spark');
     const physical = row?.provenance?.device_sample?.device;
-    const graph = data.graphs.find(g=>g.device === (numeric(physical)?physical:Number(d.id.replace('rtx',''))));
+    const graph = !spark && numeric(physical) ? data.graphs.find(g=>g.device === physical) : null;
     const kvPages = p.pages_used_by_gpu?.[Number(d.id.replace('rtx',''))];
-    groups.push({id:d.id,note:spark?'Launch-relative diagnostic only (#1568). Post-request sampling unavailable (#1631).':`Reconciliation stage: ${row?.sample_stage || 'unavailable'}. Stage values are not live.`,metrics:[
+    groups.push({id:d.id,spark,note:spark?'Launch-relative diagnostic only (#1568); ready values are not live.':`Reconciliation stage: ${row?.sample_stage || 'unavailable'}. Stage values are not live.`,metrics:[
       ...(!spark?[metric('KV pages used (device)',kvPages,p.pages,'pages',`${d.id}-pages`,'per-GPU KV counters unavailable'),
         metric('Graph arena',graph?.charged,graph?.reserve,'bytes',`${d.id}-arena`,'graph controller unavailable')]:[]),
       metric('Measured occupancy (stage)',row?.measured_bytes,null,'bytes',`${d.id}-measured`,row?.unavailable_reason || 'reconciliation sample unavailable'),
@@ -207,7 +263,7 @@ function sparkline(m) {
 function renderLive(data,time) {
   const groups = liveMetrics(data), values = {};
   groups.flatMap(g=>g.metrics).forEach(m=>{values[m.key]=m.value;}); history.push(time,values);
-  $('live').innerHTML = groups.map(g=>`<article class="card"><h3>${esc(g.id)}</h3><p class="hint">${esc(g.note)}</p>${g.metrics.map(m=>`<div class="metric"><div class="metric-head"><span>${esc(m.label)}</span><strong>${esc(formatMetric(m,m.value))}${numeric(m.limit)?` / ${esc(formatMetric(m,m.limit))}`:''}</strong></div>${m.value === null?`<p class="hint">Unavailable: ${esc(m.reason)}</p>`:sparkline(m)}</div>`).join('')}</article>`).join('');
+  $('live').innerHTML = groups.map(g=>`<article class="card"><h3>${esc(g.id)}</h3><p class="hint">${esc(g.note)}</p>${g.metrics.filter(m=>!g.spark||m.value!==null).map(m=>`<div class="metric"><div class="metric-head"><span>${esc(m.label)}</span><strong>${esc(formatMetric(m,m.value))}${numeric(m.limit)?` / ${esc(formatMetric(m,m.limit))}`:''}</strong></div>${m.value === null?`<p class="hint">Unavailable: ${esc(m.reason)}</p>`:sparkline(m)}</div>`).join('')}${g.spark&&g.metrics.some(m=>m.value===null)?'<p class="hint">Unavailable: post-request telemetry, #1631.</p>':''}</article>`).join('');
   const by = new Map(groups.flatMap(g=>g.metrics).map(m=>[m.key,m]));
   $('live').querySelectorAll('svg[data-metric]').forEach(svg=>{
     const m = by.get(svg.dataset.metric), samples = history.series(m.key);
@@ -235,12 +291,13 @@ function renderGraphs(data,time) {
   if (!data.graphs.length) { $('graphs').innerHTML='<p>Unavailable: graph-cache controller not published by this family/build.</p>';return; }
   $('graphs').innerHTML=data.graphs.map(g=>{
     const before=previous?.graphs.find(p=>p.device===g.device), rate=rates(g.cycles,before?.cycles,(time-previousTime)/1000);
-    return `<article class="card"><h3>CUDA device ${esc(g.device)}</h3><p class="hint">Reserve ${bytes(g.reserve)} / arena ${bytes(g.charged)} / pinned ${bytes(g.pinned)} / pending ${bytes(g.pending_capture)}<br>Node pool ${number(g.pools?.live_nodes)} live / ${number(g.pools?.node_high_water)} high-water. Executable pool ${number(g.pools?.live_execs)} live / ${number(g.pools?.exec_high_water)} high-water. Basis: ${esc(JSON.stringify(g.basis ?? 'unavailable'))}</p><div class="table-scroll"><table><caption>Per-second changes; unavailable until a second sample or after a counter reset.</caption><thead><tr><th>Cycle</th><th>Hits/s</th><th>Misses/s</th><th>Captures/s</th><th>Eager/s</th><th>Evictions/s</th></tr></thead><tbody>${Object.entries(rate).map(([cycle,c])=>`<tr><td>${esc(cycle)}</td>${['hits','misses','captures','eager_runs','evictions'].map(key=>`<td title="Lifetime: ${number(g.cycles[cycle][key])}">${number(c[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><details open><summary>Top 10 keys by hits</summary>${graphKeys(g.top_hits)}</details><details open><summary>Top 10 keys by churn</summary>${graphKeys(g.top_churn)}</details></article>`;
+    return `<article class="card"><h3>CUDA device ${esc(g.device)}</h3><p class="hint">Reserve ${bytes(g.reserve)} / arena ${bytes(g.charged)} / pinned ${bytes(g.pinned)} / pending ${bytes(g.pending_capture)}<br>${g.basis?.kind==='bytes'?'Estimator byte pool':'Node pool'} ${g.basis?.kind==='bytes'?bytes(g.pools?.live_nodes):number(g.pools?.live_nodes)} live / ${g.basis?.kind==='bytes'?bytes(g.pools?.node_high_water):number(g.pools?.node_high_water)} high-water. Executable pool ${number(g.pools?.live_execs)} live / ${number(g.pools?.exec_high_water)} high-water. Basis: ${esc(JSON.stringify(g.basis ?? 'unavailable'))}${g.basis?.kind==='bytes'?' (pool units are byte estimates, not CUDA node counts)':''}</p><div class="table-scroll"><table><caption>Per-second changes; unavailable until a second sample or after a counter reset.</caption><thead><tr><th>Cycle</th><th>Hits/s</th><th>Misses/s</th><th>Captures/s</th><th>Eager/s</th><th>Evictions/s</th></tr></thead><tbody>${Object.entries(rate).map(([cycle,c])=>`<tr><td>${esc(cycle)}</td>${['hits','misses','captures','eager_runs','evictions'].map(key=>`<td title="Lifetime: ${number(g.cycles[cycle][key])}">${number(c[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><details open><summary>Top 10 keys by hits</summary>${graphKeys(g.top_hits)}</details><details open><summary>Top 10 keys by churn</summary>${graphKeys(g.top_churn)}</details></article>`;
   }).join('');
   $('graphs').querySelectorAll('.heat i').forEach(el=>inspect(el,el.title));
 }
 function render(payload) {
   const time=Date.now(), data=normalize(payload);
+  if(payload.source?.includes('illustrative')) $('fixture-note').textContent='Illustrative accepted-plan / pin-stat extension; underlying GLM stats are a real final-pair sample.';
   const signature=JSON.stringify(data.domains);
   if(signature!==reservationSignature) { renderReservations(data);reservationSignature=signature; }
   // Preserve a focused inspection while samples accumulate; update its table
