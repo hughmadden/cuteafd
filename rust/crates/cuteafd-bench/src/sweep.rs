@@ -137,6 +137,8 @@ pub struct Sweep {
     pub points: Vec<Point>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefill: Vec<PrefillPoint>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_prefill: Vec<crate::report::SkippedPrefill>,
     /// GPU throttle report per phase (`prefill`, `decode`), warm-ups included: the
     /// sustained heat each phase built up, next to the timed points' own windows.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
@@ -262,7 +264,8 @@ fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
 /// the measured request re-sends the warm-up's corpus behind a fresh nonce;
 /// with `options.purge` the purge runs before the warm-up and again before the
 /// measured request, so both start from the same cold state.
-fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed)
+fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed,
+    skipped: &mut Vec<crate::report::SkippedPrefill>)
     -> Result<Vec<PrefillPoint>> {
     let idle = options.idle_duration()?;
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
@@ -279,12 +282,19 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &Prefill
     let mut requested = lengths.to_vec();
     if requested.contains(&crate::prefill::CARD_TOKENS) && !requested.contains(&tail) { requested.push(tail); }
     for length in requested {
-        anyhow::ensure!(length <= max_context.saturating_sub(64),
-            "exact {length}-token prefill exceeds max context {max_context} with output headroom");
         let words = ((length as f64 - intercept) / slope).max(64.0) as usize;
         let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
-        let warm_text = crate::prefill::prompt(client, warm_seed, words, length, "Summarize in one word.")?;
-        let timed_text = crate::prefill::prompt(client, timed_seed, words, length, "Summarize in one word.")?;
+        let sized = crate::prefill::prompts(client, (warm_seed, timed_seed), words, length,
+            max_context, "Summarize in one word.");
+        let (warm_text, timed_text) = match sized {
+            Ok(prompts) => prompts,
+            Err(error) if length == tail && !lengths.contains(&length) => {
+                skipped.push(crate::report::SkippedPrefill { requested_tokens: length,
+                    label: "8K w/tail".into(), reason: format!("{error:#}"), });
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
         let warm = client.chat(plain(client, &warm_text, 1), None)
             .with_context(|| format!("{length}-token prefill warm-up"))?;
@@ -374,7 +384,7 @@ fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();
-        sweep.prefill = prefill(&client, prefill_lengths, max_context, prefill_options, &mut on_timed)?;
+        sweep.prefill = prefill(&client, prefill_lengths, max_context, prefill_options, &mut on_timed, &mut sweep.skipped_prefill)?;
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("prefill".into(), window); }
     }
     let mark = client.thermal_mark();
@@ -496,7 +506,9 @@ mod tests {
         use serde_json::json;
         use std::sync::atomic::Ordering;
 
-        for mismatch_at in [3, 4] {
+        // No mismatch exercises an unreachable diagnostic without losing the
+        // successful strict 8K point, then checks an explicit tail stays strict.
+        for mismatch_at in [Some(3), Some(4), None] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
@@ -529,7 +541,11 @@ mod tests {
                     let body: Value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
                     let count = || 17 + body["messages"][0]["content"].as_str().unwrap().chars().count() as u64 / 3;
                     let (kind, reply) = match path.as_str() {
-                        "/v1/messages/count_tokens" => ("application/json", json!({"input_tokens": count()}).to_string()),
+                        "/v1/messages/count_tokens" => {
+                            let n = count();
+                            let n = if mismatch_at.is_none() && n >= 8296 { n + 1 } else { n };
+                            ("application/json", json!({"input_tokens": n}).to_string())
+                        },
                         "/v1/bench/status" => ("application/json", json!({"settings":[{
                             "name":"prefill-units", "value":"2752", "source":"resolved"
                         }]}).to_string()),
@@ -537,8 +553,8 @@ mod tests {
                             chats += 1;
                             assert_eq!(body["stream"], true);
                             let actual = count();
-                            if chats >= 3 { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
-                            let reported = if chats == mismatch_at { 8310 } else { actual };
+                            if (3..=4).contains(&chats) { assert_eq!(actual, crate::prefill::CARD_TOKENS); }
+                            let reported = if Some(chats) == mismatch_at { 8310 } else { actual };
                             let event = json!({"choices":[{"delta":{"content":"OK"}, "finish_reason":"stop"}],
                                 "usage":{"prompt_tokens":reported, "completion_tokens":1}});
                             ("text/event-stream", format!("data: {event}\n\ndata: [DONE]\n\n"))
@@ -552,11 +568,31 @@ mod tests {
             });
             let client = Client::new(&format!("http://{address}"), None, Default::default());
             let mut hook: OnTimed = None;
-            let result = prefill(&client, &[crate::prefill::CARD_TOKENS], 32768, &PrefillOptions::default(), &mut hook);
-            done.store(true, Ordering::Relaxed);
-            assert_eq!(server.join().unwrap(), mismatch_at);
-            let error = result.unwrap_err().to_string();
-            assert!(error.contains("requested 8192 prompt tokens but server reported 8310"), "{error}");
+            let mut skipped = Vec::new();
+            let result = prefill(&client, &[crate::prefill::CARD_TOKENS], 32768,
+                &PrefillOptions::default(), &mut hook, &mut skipped);
+            if let Some(mismatch_at) = mismatch_at {
+                done.store(true, Ordering::Relaxed);
+                assert_eq!(server.join().unwrap(), mismatch_at);
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("requested 8192 prompt tokens but server reported 8310"), "{error}");
+                assert!(skipped.is_empty());
+            } else {
+                let points = result.unwrap();
+                assert_eq!(points.len(), 1);
+                assert_eq!(points[0].prompt_tokens, crate::prefill::CARD_TOKENS);
+                assert_eq!(skipped.len(), 1);
+                let sweep = Sweep { prefill: points, skipped_prefill: skipped, ..Default::default() };
+                let json = serde_json::to_value(&sweep).unwrap();
+                assert_eq!(json["skipped_prefill"][0]["requested_tokens"], 8296);
+                assert!(json["skipped_prefill"][0]["reason"].as_str().unwrap().contains("16 deterministic corpus variants"));
+                // Explicit user-requested lengths remain strict, even at the diagnostic length.
+                let error = prefill(&client, &[8296], 32768, &PrefillOptions::default(), &mut hook,
+                    &mut Vec::new()).unwrap_err().to_string();
+                assert!(error.contains("16 deterministic corpus variants"), "{error}");
+                done.store(true, Ordering::Relaxed);
+                assert_eq!(server.join().unwrap(), 6);
+            }
         }
     }
 

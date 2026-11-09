@@ -211,15 +211,16 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let unit = crate::prefill::unit_rows(&info.configuration.settings)?;
     for (label, target, tail) in [("8K prefill", PREFILL_TOKENS, false),
         ("8K w/tail", crate::prefill::tail_tokens(unit)?, true)] {
-        anyhow::ensure!(target <= max_context.saturating_sub(64),
-            "{label} requires exactly {target} prompt tokens plus output headroom; max context is {max_context}");
         run.step(if tail { 0.45 } else { 0.40 }, label);
         let estimate = ((target as f64 - intercept) / slope).max(64.0) as usize;
         let instruction = "Reply with the single word OK.";
-        let warm = crate::prefill::prompt(client, 98, estimate, target, instruction)?;
+        let sized = crate::prefill::prompts(client, (98, 99), estimate, target, max_context, instruction);
+        let Some((warm, text)) = card_prefill_prompts(&mut run.baseline.card, target, tail, sized)? else {
+            run.publish();
+            continue;
+        };
         let chat = client.chat(plain(client, &warm, 1), None).with_context(|| format!("{label} warm-up"))?;
         crate::prefill::validate(target, chat.timing.prompt_tokens)?;
-        let text = crate::prefill::prompt(client, 99, estimate, target, instruction)?;
         // A cold probe primes this exact route without retaining the prefix.
         let warm = client.chat(plain(client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
             .with_context(|| format!("{label} route warm-up"))?;
@@ -255,6 +256,20 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     run.step(1.0, "baseline done");
     run.publish();
     Ok(run.baseline)
+}
+
+fn card_prefill_prompts(card: &mut crate::report::BasicCard, target: u64, diagnostic: bool,
+    sized: Result<(String, String)>) -> Result<Option<(String, String)>> {
+    match sized {
+        Ok(prompts) => Ok(Some(prompts)),
+        Err(error) if diagnostic => {
+            card.skipped_prefill.push(crate::report::SkippedPrefill {
+                label: "8K w/tail".into(), requested_tokens: target, reason: format!("{error:#}"),
+            });
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
@@ -1035,6 +1050,20 @@ pub fn describe(timing: &StreamTiming) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_tail_sizing_failure_is_recorded_but_card_8k_stays_strict() {
+        let mut card = crate::report::BasicCard::default();
+        let error = || Err(anyhow::anyhow!("no exact 8296-token prefill after 16 variants"));
+        assert!(super::card_prefill_prompts(&mut card, 8296, true, error()).unwrap().is_none());
+        assert!(card.prefill_tail.is_none());
+        let json = serde_json::to_value(&card).unwrap();
+        assert_eq!(json["skipped_prefill"][0]["requested_tokens"], 8296);
+        assert_eq!(json["skipped_prefill"][0]["label"], "8K w/tail");
+        assert!(json["skipped_prefill"][0]["reason"].as_str().unwrap().contains("16 variants"));
+        assert!(super::card_prefill_prompts(&mut card, 8192, false, error()).is_err());
+        assert_eq!(card.skipped_prefill.len(), 1);
+    }
+
     use super::*;
     use crate::report::Check;
 
