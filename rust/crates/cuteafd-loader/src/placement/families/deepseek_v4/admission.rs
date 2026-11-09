@@ -967,7 +967,7 @@ impl Recipe for PreparedV4<'_> {
                     vec![window.checked_mul(sequences).ok_or(Refusal::Overflow("V4 window ring"))?],
                     Category::Kv, "window rings", Activation::always())?;
                 // Records are pool-affine: a layer's units grow with the pool.
-                // Each is its own cudaMalloc (`Engine::pool_layer_for` takes one
+                // Each is its own allocation (`Engine::pool_layer_for` takes one
                 // per layer for the C4 records and one for the index units, one
                 // for C128 records), so each carries its own curve and its own
                 // 2 MiB SM120 rounding. One pooled owner cannot express this:

@@ -504,7 +504,7 @@ mod default_tests {
 
     /// The engine allocates one window ring per cached layer plus one per
     /// dSpark stage, and the lead GPU holds every stage's ring. Each layer's
-    /// cache records are their own cudaMalloc (C4 records and index units,
+    /// cache records are their own allocations (C4 records and index units,
     /// C128 records), so each is charged its own curve and 2 MiB rounding.
     #[test]
     fn cache_stages_ring_on_the_lead_gpu_and_records_charge_per_layer() {
