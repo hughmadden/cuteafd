@@ -105,6 +105,12 @@ fn is_bootstrap_shape(shape: &(usize, bool, GraphGeometry)) -> bool {
 /// their graphs instead of capturing on latency. Provenance lives in the
 /// checked-in document (`glmf_prewarm.json`); pinning is explicit, never
 /// inferred from order, and a new trace replaces the set.
+///
+/// The entries are the same for every quant of the checkpoint: a shape is a
+/// pure function of the launch geometry, and one decode site captures it
+/// whatever the expert format. The price is not: a captured graph's
+/// executable memory follows its kernels' node structure, so a layout traced
+/// on more than one quant charges the costlier quant's measured arena.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmLayout {
@@ -131,7 +137,9 @@ impl GlmfPrewarmLayout {
 
 /// The checked-in document: one traced set per resolved card shape, keyed
 /// `<devices>[-sparks]`. A key the document does not hold warms the bootstrap
-/// set instead of borrowing another shape's list.
+/// set instead of borrowing another shape's list. A layout traced on more than
+/// one quant of the checkpoint holds one entry set (the shapes are
+/// quant-independent) priced at the costlier quant measured on that layout.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GlmfPrewarmList {

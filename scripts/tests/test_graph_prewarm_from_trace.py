@@ -373,6 +373,29 @@ def test_flash_shapes_are_priced_separately_by_resolved_shape(tmp_path):
     assert result["layouts"]["1-sparks"]["entries"] == result["layouts"]["2"]["entries"]
 
 
+def test_flash_prices_a_layout_from_the_costlier_quant(tmp_path):
+    # One layout traced twice, as an EXL3 and an FP8 checkpoint would be. The
+    # entries are the same request shapes either way; the price is the costlier
+    # quant's measured arena and largest capture, taken as that trace's own
+    # (bytes, executables) pair, never a mix of the two.
+    cheap = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0),
+                         flash_graph(4, "false", "false", 0, 64, 0, 90, segment=1)], charged=16 << 20)
+    dear = flash_trace([flash_graph(4, "false", "false", 0, 64, 0, 100, segment=0),
+                        flash_graph(4, "false", "false", 0, 64, 0, 90, segment=1)], charged=20 << 20)
+    dear["cache"]["pools"] = {"live_execs": 1}
+    dear["sites"]["glm5_flash.decode"]["largest_bytes"] = 5 << 20
+    paths = []
+    for name, data in (("exl3.json", cheap), ("fp8.json", dear)):
+        path = tmp_path / name
+        path.write_text(json.dumps(data))
+        paths.append(path)
+    groups = MODULE.layout_groups([f"1-sparks={path}" for path in paths], "glm5_flash")
+    layout = MODULE.generate_layouts(groups, "glm5_flash")["layouts"]["1-sparks"]
+    assert (layout["measured_bytes"], layout["measured_executables"]) == (20 << 20, 1)
+    assert layout["reserve_extra_bytes"] == 6 << 20
+    assert [(entry["rows"], entry["spec"]) for entry in layout["entries"]] == [(4, False)]
+
+
 def test_flash_accepts_a_subset_of_traced_shapes_and_no_unknown_keys(tmp_path):
     path = flash_trace_path(tmp_path, "trace.json", 16 << 20)
     # An untraced shape falls back to the engine's bootstrap set, so a partial

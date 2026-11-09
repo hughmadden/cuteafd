@@ -18,7 +18,10 @@ must have both dominant frequency and the lowest row/table parameter rank.
 Reserve suggestions use the maximum per-device arena, never a sum of ranks.
 GLM Flash keys its list by resolved card shape, `<devices>[-sparks]`: onboarding
 and TP2 each add captured segments, so each shape's own capture demand prices
-its own reserve and a launch reads only its own entry. A shape with no trace
+its own reserve and a launch reads only its own entry. A shape's entries are
+the same for every quant of the checkpoint (a shape is a pure function of the
+launch geometry); when a shape is traced on more than one quant, the costlier
+quant's measured arena and largest capture price it. A shape with no trace
 warms the engine's bootstrap set, never another shape's list.
 """
 import argparse
