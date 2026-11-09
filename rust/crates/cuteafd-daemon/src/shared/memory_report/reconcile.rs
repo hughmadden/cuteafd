@@ -60,6 +60,7 @@ fn row(device: &str, measured: Option<i128>, owners: &cuteafd_core::memory_polic
         "delta_vs_measured": delta_vs_measured, "graph_reserve_slack": slack,
         "graph_reserve_bytes": graph_reserve, "graph_arena_high_water_bytes": graph_arena,
         "beyond_half_padding": delta_vs_measured.map(|delta| delta.abs() * 2 > i128::from(padding)),
+        "drift_flag_eligible": true, "drift_flag_unavailable_reason": null,
         "graph_measurement_unavailable_reason": graph_arena.is_none().then_some("no measured graph arena high-water for admitted graph reserve"),
         "measurement_method": "raw CUDA physical total minus free; device-wide, not process attribution",
         "charge_basis": "admitted named owners excluding release padding", "owners": owners,
@@ -118,7 +119,10 @@ fn spark_row(id: &str, stage: &str, worker: Option<&Value>,
     record["admitted_future_ring_bytes"] = json!(future_rings);
     record["raw_used_bytes"] = json!(raw);
     record["raw_measurement_method"] = "global GB10 CUDA occupancy including page cache; diagnostic only, never a drift-flag input; see #1568".into();
-    record["drift_measurement_basis"] = "launch-relative allocatable consumption only; raw and absolute occupancy are diagnostic".into();
+    record["drift_measurement_basis"] = "launch-relative allocatable consumption is diagnostic, not drift-flagged until #1568 resolves ownership and system-witness residuals".into();
+    record["drift_flag_eligible"] = false.into();
+    record["drift_flag_unavailable_reason"] = "Spark launch-relative ownership/system-witness residuals unresolved; see #1568".into();
+    record["beyond_half_padding"] = Value::Null;
     record["charge_basis"] = "post-baseline resident/workspace and UMA host owners; no media baseline, no detail aliases, no not-yet-allocated endpoint rings".into();
     if owners.is_none() {
         for field in ["charged_bytes", "delta_vs_admitted", "delta_vs_measured", "beyond_half_padding"] {
@@ -188,7 +192,14 @@ mod tests {
         assert_eq!(sample["charged_bytes"], 700);
         assert_eq!(sample["admitted_future_ring_bytes"], 50);
         assert_eq!(sample["delta_vs_measured"], 0);
-        assert_eq!(sample["beyond_half_padding"], false);
+        assert!(sample["beyond_half_padding"].is_null());
+        assert_eq!(sample["drift_flag_eligible"], false);
+        assert!(sample["drift_flag_unavailable_reason"].as_str().unwrap().contains("#1568"));
+        worker["admission_sample"]["free_bytes"] = json!(18_000);
+        let unresolved = spark_row("spark0", "ready", Some(&worker), &owners, &json!({}));
+        assert_eq!(unresolved["delta_vs_measured"], 1_300);
+        assert!(unresolved["beyond_half_padding"].is_null());
+        assert_eq!(unresolved["drift_flag_eligible"], false);
         worker["admission_sample"]["free_bytes"] = json!(20_100);
         let reclaimed = spark_row("spark0", "ready", Some(&worker), &owners, &json!({}));
         assert_eq!(reclaimed["measured_bytes"], -100);

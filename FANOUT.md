@@ -82,10 +82,16 @@ family rather than pretending its keys are GLM keys.
 The GLM reference list comes from the trace6 ordinary EXL3 K4 1-RTX/4-Spark
 baseline plus C1/2/4/8/16 sweep: 28 geometries cover every one of 151,522
 request-cycle graph events (startup Other excluded), with 1x16 pinned. The
-measured base is 1,189,085,184 bytes and one-capture headroom is 2,097,152 bytes.
-All 7,742 inspected executables were width-one and single-device. A final
-fixed-DRAFT_LENGTH=4 dev/candidate C1/C16 relaunch must qualify this list and
-reserve before acceptance; the trace is a sizing receipt, not that final gate.
+provisional 96-geometry arena was 1,189,085,184 bytes. All 7,742 inspected
+executables were width-one and single-device. The final fixed-DRAFT_LENGTH=4,
+1M-pool dev/candidate C1/C16 relaunch qualified the 28-shape list: its measured
+prewarm arena is 335,544,320 bytes, with 855,638,016 bytes retained for runtime
+lazy captures under ARC (including wider long-context tables). The total stays
+1,191,182,336 bytes. There were no runtime captures, eager runs, evictions,
+refusals or OOMs. C1/C16 ratios were 0.988/0.997 with identical verify widths
+and no recorded throttling; KL/top-1 and byte-exact prefix/speculation checks
+passed. The measured route used the byte fallback because it onboarded local
+experts; this is not a qualification of the remote-only node-rate route.
 
 ## Delete the old family policy
 
@@ -113,8 +119,8 @@ measurement_method and unavailable_reason, plus three signed byte fields:
   admitted graph budget with actual measured high-water. This is the
   accounting-error signal, not the admitted-owner delta.
 
-`beyond_half_padding` is true only when abs(delta_vs_measured) exceeds half
-padding_bytes. A negative admitted delta exactly equal to unused graph reserve
+For RTX, `drift_flag_eligible` is true and `beyond_half_padding` is true only
+when abs(delta_vs_measured) exceeds half padding_bytes. A negative admitted delta exactly equal to unused graph reserve
 is not drift. Missing physical samples yield null deltas/drift. Missing arena
 telemetry for a nonzero graph owner yields null measured delta/slack/drift and
 an explicit graph_measurement_unavailable_reason, never an assumed zero.
@@ -138,6 +144,12 @@ The admission snapshot precedes endpoint-ring creation: admitted future ring byt
 are reported separately and excluded from this snapshot's charge. Missing baseline
 or Ready samples yield null deltas/drift with a reason, never an absolute fallback.
 Raw CUDA used and absolute allocatable used remain diagnostic fields only (#1568).
+Launch-relative Spark residuals also remain diagnostic until #1568 resolves
+ownership and the system witness: the final four ranks measured +1.84, +1.98,
++3.87 and +2.44 GB. Spark rows set `drift_flag_eligible=false`,
+`beyond_half_padding=null` and `drift_flag_unavailable_reason` linking #1568;
+retain signed deltas but do not drift-flag them in recorders. This does not
+change Spark graph behavior or substitute absolute occupancy for a missing baseline.
 Baseline phase and sample provenance live in the optional memory_reconciliation
 object. New coordinators accept missing and unknown optional detail fields;
 coordinator and Spark release images are a compatible

@@ -180,6 +180,9 @@ mod tests {
         assert!(list.entries.iter().any(|entry| entry.pin && entry.shape == GlmGraphShape { rows: 1, table_width: 16 }));
         assert_eq!(list.reserve_base_bytes % (2 << 20), 0);
         assert_eq!(list.reserve_extra_bytes % (2 << 20), 0);
+        assert_eq!(list.reserve_base_bytes, 335_544_320);
+        assert_eq!(list.reserve_extra_bytes, 855_638_016);
+        assert_eq!(list.reserve_base_bytes + list.reserve_extra_bytes, 1_191_182_336);
         let _: GlmPrewarmList = serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
         let allowed = glm_graph_shapes(4096, 32);
         for entry in glm_prewarm_shapes(4096, 32) { assert!(allowed.contains(&entry.shape)); }
