@@ -545,6 +545,7 @@ mod default_tests {
     fn sampled_context_survives_zero_gpu_reserve() {
         cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
             let mut input = plan_inputs(&context_cfg());
+            input.attention = Some(AttentionPlacement::Heads);
             for (capacity, baseline) in &mut input.gpus {
                 *baseline = Baseline::Measured { free_bytes: *capacity - 686_424_064 };
             }
