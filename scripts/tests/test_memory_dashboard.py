@@ -75,6 +75,16 @@ assert.equal(host.items.reduce((s,i)=>s+i.bytes,0),400);
 // New graph-pin fields remain intact, old builds need not supply them.
 const pins = m.normalize({graph_cache:[{device:3,top_hits:[{hit_histogram:{counts:[0,3],interval_ms:10000},permanent_bytes:123}]}]});
 assert.equal(pins.graphs[0].top_hits[0].permanent_bytes,123);
+assert.equal(m.ownerLabel('GLM process ordinary RSS steady: Estimated { derivation: "long" }'), 'GLM process ordinary RSS');
+assert.equal(m.ownerLabel('glm.decode: Spark intake transport envelope; long provenance'), 'glm.decode Spark intake');
+assert.equal(m.ownerLabel('graph reserve: glm.graphs.0'), 'graph reserve');
+const key={site:'glm5.segment',bank:1,key_id:3,shape:'GlmGraphKey { layer: 0, rows: 16, table_width: 16, table_stride: 16, previous: Full, head: false }'};
+assert.equal(m.graphIdentity(key).label,'L0 r16 w16 prev-full');
+assert.equal(m.graphIdentity(key).geometry,m.graphIdentity({...key,shape:key.shape.replace('layer: 0','layer: 8')}).geometry);
+assert.ok(m.graphIdentity(key).full.includes(key.shape));
+assert.equal(m.graphIdentity({...key,shape:key.shape.replace('Full','Planes(4)')}).label,'L0 r16 w16 prev-planes4');
+const provenance=m.segments({cap:1000,items:[{category:'runtime',name:'module touch: measured graphs-before-serving delta',bytes:500}]});
+assert.equal(provenance[0].group,'runtime');
 console.log('memory model: real-card fixture and edge cases pass');
 """, str(JS), str(FIXTURE)], check=True, timeout=20)
 

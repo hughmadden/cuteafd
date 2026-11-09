@@ -11,7 +11,7 @@ const CATEGORIES = ['weights','embedding','experts','drafter','kv','prefix','wor
 const GROUPS = ['weights','kv','graph','workspace','runtime','transport','padding'];
 const groupIndex = name => Math.max(0,GROUPS.indexOf(name));
 function ownerGroup(i) {
-  if (/graph/i.test(i.name)) return 'graph';
+  if (/^graph(?:\s|[.:_-])/i.test(i.name)) return 'graph';
   if (['weights','embedding','experts','tables'].includes(i.category)) return 'weights';
   if (['kv','prefix'].includes(i.category)) return 'kv';
   if (['workspace','drafter'].includes(i.category)) return 'workspace';
@@ -22,6 +22,21 @@ function ownerGroup(i) {
 const categoryIndex = name => Math.max(0, CATEGORIES.indexOf(name));
 const categoryName = name => name === 'other-small' ? 'Other small' : name === 'unnamed' ? 'Unnamed owner' : name;
 const owner = (category, name, value) => ({category, name, bytes: value});
+// Provenance stays in owner identity/tooltips; only the visible caption is terse.
+function ownerLabel(name) {
+  if (/^glm\.(decode|prefill): Spark intake/.test(name)) return name.replace(/:.*/, ' Spark intake');
+  return name.split(/: | \(/)[0].replace(/ ordinary RSS steady$/, ' ordinary RSS');
+}
+function graphIdentity(k) {
+  const shape = String(k.shape ?? ''), field = name => shape.match(new RegExp(`\\b${name}: ([^,}]+)`))?.[1]?.trim();
+  const rows = field('rows'), width = field('table_width'), stride = field('table_stride');
+  const previous = field('previous')?.replace(/^First$/, 'first').replace(/^Delta$/, 'delta').replace(/^Full$/, 'full').replace(/^Planes\((\d+)\)$/, 'planes$1');
+  return {
+    label: rows ? `${field('layer') ? `L${field('layer')} ` : ''}r${rows}${width ? ` w${width}` : ''}${previous ? ` prev-${previous}` : ''}${field('head') === 'true' ? ' head' : ''}` : shape.length > 64 ? shape.slice(0,61)+'...' : shape,
+    geometry: `${k.site} / ${rows ? `r${rows}${width ? ` w${width}` : ''}${stride ? ` s${stride}` : ''}${previous ? ` prev-${previous}` : ''}${field('head') ? ` head-${field('head')}` : ''}` : 'other geometry'} / bank ${k.bank}`,
+    full: `${k.site} / ${shape}\nbank ${k.bank} / key ${k.key_id ?? 'unavailable'} / ${k.pinned ? 'pinned' : 'not pinned'}`
+  };
+}
 function stageRows(stats) {
   const r = stats.memory_reconciliation || {};
   const ready = arr(r.ready?.devices), first = arr(r.first_request?.devices);
@@ -128,7 +143,7 @@ class Rolling {
   }
   series(key) { return this.samples.map(s => ({time:s.time,value:s.values[key]})); }
 }
-const model = {normalize,segments,rates,Rolling,bytes,exact,numeric};
+const model = {normalize,segments,rates,Rolling,bytes,exact,numeric,ownerLabel,graphIdentity};
 if (typeof module !== 'undefined' && module.exports) module.exports = model;
 if (!root.document) return;
 const $ = id => document.getElementById(id), UI = root.CuteUI, esc = UI.fmt.esc;
@@ -175,7 +190,7 @@ function renderDetail() {
   const parts = segments(d, false).filter(s=>!['weights','kv'].includes(s.group)).sort((a,b)=>b.bytes-a.bytes);
   const total = parts.reduce((n,s)=>n+s.bytes,0);
   $('detail-summary').textContent = d.reason ? `Unavailable: ${d.reason}` : `${d.id}: ${bytes(total)} outside target weights / KV. Each mini-bar is scaled to this subtotal, not device capacity. Drafter owners stay visible.`;
-  $('owner-detail').innerHTML = parts.map((s,i)=>`<button class="owner-detail" data-owner="${esc(s.key)}" type="button"><span>${esc(s.name)}</span><strong>${exact(s.bytes)}</strong><svg viewBox="0 0 600 12" preserveAspectRatio="none" aria-hidden="true"><defs>${ownerPaint(s,`detail${i}`,s.variant)}</defs><rect width="600" height="12" fill="var(--well)"/><rect width="${total?s.bytes/total*600:0}" height="12" fill="url(#detail${i})"/></svg></button>`).join('') || '<p class="hint">No non-weight/non-KV owners published.</p>';
+  $('owner-detail').innerHTML = parts.map((s,i)=>`<button class="owner-detail" data-owner="${esc(s.key)}" type="button"><span>${esc(ownerLabel(s.name))}</span><strong>${exact(s.bytes)}</strong><svg viewBox="0 0 600 12" preserveAspectRatio="none" aria-hidden="true"><defs>${ownerPaint(s,`detail${i}`,s.variant)}</defs><rect width="600" height="12" fill="var(--well)"/><rect width="${total?s.bytes/total*600:0}" height="12" fill="url(#detail${i})"/></svg></button>`).join('') || '<p class="hint">No non-weight/non-KV owners published.</p>';
   $('owner-detail').querySelectorAll('button').forEach((el,i)=>inspect(el,reservationText(d,parts[i]),on=>highlightOwner(parts[i].key,on)));
 }
 function renderReservations(data) {
@@ -200,7 +215,7 @@ function renderReservations(data) {
     const entries=[...owners.values()].filter(s=>s.group===group);
     return entries.length?`<div class="legend-group"><h3>${esc(group)}</h3>${entries.map(s=>{
       const id=`l${[...owners.keys()].indexOf(s.key)}`;
-      return `<button type="button" data-owner="${esc(s.key)}"><svg class="swatch" viewBox="0 0 20 20" aria-hidden="true"><defs>${ownerPaint(s,id,s.variant)}</defs><rect width="20" height="20" fill="url(#${id})"/></svg>${esc(s.name)}</button>`;
+      return `<button type="button" data-owner="${esc(s.key)}"><svg class="swatch" viewBox="0 0 20 20" aria-hidden="true"><defs>${ownerPaint(s,id,s.variant)}</defs><rect width="20" height="20" fill="url(#${id})"/></svg>${esc(ownerLabel(s.name))}</button>`;
     }).join('')}</div>`:'';
   }).join('');
   for (const [index,d] of data.domains.entries()) for (const [n,s] of segments(d).entries()) {
@@ -283,10 +298,16 @@ function renderLive(data,time) {
 function graphKeys(rows) {
   if (!Array.isArray(rows)) return '<p class="hint">Unavailable: per-key pin telemetry not published by this build.</p>';
   if (!rows.length) return '<p class="hint">No recorded keys in this top list.</p>';
-  return `<div class="table-scroll"><table><thead><tr><th>Key</th><th>Hits</th><th>Churn (capture / evict / recapture)</th><th>Cost</th><th>Heat</th></tr></thead><tbody>${rows.slice(0,10).map(k=>{
-    const counts = arr(k.hit_histogram?.counts), maximum = Math.max(1,...counts);
-    return `<tr><td class="key">${esc(k.site)} / ${esc(k.shape)}<br><span class="hint">bank ${esc(k.bank)} / ${k.pinned?'pinned':'not pinned'}</span></td><td>${number(k.hits)}</td><td>${number(k.captures)} / ${number(k.evictions)} / ${number(k.recaptures)}</td><td>${bytes(k.permanent_bytes)}<br><span class="hint">capture ${bytes(k.capture_bytes)}; ${number(k.nodes)} nodes</span></td><td><div class="heat" role="img" aria-label="Hits by interval">${counts.map((n,i)=>`<i tabindex="0" title="${esc(`${number(n)} hits; ${(k.hit_histogram.interval_ms || 0)/1000}s interval ${i+1}`)}" style="height:${Math.max(1,n/maximum*30)}px"></i>`).join('')}</div><span class="hint">${counts.length?`${counts.length} x ${number(k.hit_histogram.interval_ms/1000)}s`:'unavailable histogram'}</span></td></tr>`;
-  }).join('')}</tbody></table></div>`;
+  const groups = new Map();
+  for (const k of rows.slice(0,10)) {
+    const geometry = graphIdentity(k).geometry;
+    if (!groups.has(geometry)) groups.set(geometry,[]);
+    groups.get(geometry).push(k);
+  }
+  return `<div class="table-scroll"><table><thead><tr><th>Key</th><th>Hits</th><th>Churn (capture / evict / recapture)</th><th>Cost</th><th>Heat</th></tr></thead><tbody>${[...groups].map(([geometry, keys])=>`<tr><th colspan="5" style="text-align:left">${esc(geometry)}</th></tr>${keys.map(k=>{
+    const counts = arr(k.hit_histogram?.counts), maximum = Math.max(1,...counts), identity=graphIdentity(k);
+    return `<tr><td class="key" tabindex="0" data-key-identity="${esc(identity.full)}">${esc(identity.label)}<br><span class="hint">${k.pinned?'pinned':'not pinned'}</span></td><td>${number(k.hits)}</td><td>${number(k.captures)} / ${number(k.evictions)} / ${number(k.recaptures)}</td><td>${bytes(k.permanent_bytes)}<br><span class="hint">capture ${bytes(k.capture_bytes)}; ${number(k.nodes)} nodes</span></td><td><div class="heat" role="img" aria-label="Hits by interval">${counts.map((n,i)=>`<i tabindex="0" title="${esc(`${number(n)} hits; ${(k.hit_histogram.interval_ms || 0)/1000}s interval ${i+1}`)}" style="height:${Math.max(1,n/maximum*30)}px"></i>`).join('')}</div><span class="hint">${counts.length?`${counts.length} x ${number(k.hit_histogram.interval_ms/1000)}s`:'unavailable histogram'}</span></td></tr>`;
+  }).join('')}`).join('')}</tbody></table></div>`;
 }
 function renderGraphs(data,time) {
   if (!data.graphs.length) { $('graphs').innerHTML='<p>Unavailable: graph-cache controller not published by this family/build.</p>';return; }
@@ -295,6 +316,7 @@ function renderGraphs(data,time) {
     return `<article class="card"><h3>CUDA device ${esc(g.device)}</h3><p class="hint">Reserve ${bytes(g.reserve)} / arena ${bytes(g.charged)} / pinned ${bytes(g.pinned)} / pending ${bytes(g.pending_capture)}<br>${g.basis?.kind==='bytes'?'Estimator byte pool':'Node pool'} ${g.basis?.kind==='bytes'?bytes(g.pools?.live_nodes):number(g.pools?.live_nodes)} live / ${g.basis?.kind==='bytes'?bytes(g.pools?.node_high_water):number(g.pools?.node_high_water)} high-water. Executable pool ${number(g.pools?.live_execs)} live / ${number(g.pools?.exec_high_water)} high-water. Basis: ${esc(JSON.stringify(g.basis ?? 'unavailable'))}${g.basis?.kind==='bytes'?' (pool units are byte estimates, not CUDA node counts)':''}</p><div class="table-scroll"><table><caption>Per-second changes; unavailable until a second sample or after a counter reset.</caption><thead><tr><th>Cycle</th><th>Hits/s</th><th>Misses/s</th><th>Captures/s</th><th>Eager/s</th><th>Evictions/s</th></tr></thead><tbody>${Object.entries(rate).map(([cycle,c])=>`<tr><td>${esc(cycle)}</td>${['hits','misses','captures','eager_runs','evictions'].map(key=>`<td title="Lifetime: ${number(g.cycles[cycle][key])}">${number(c[key])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><details open><summary>Top 10 keys by hits</summary>${graphKeys(g.top_hits)}</details><details open><summary>Top 10 keys by churn</summary>${graphKeys(g.top_churn)}</details></article>`;
   }).join('');
   $('graphs').querySelectorAll('.heat i').forEach(el=>inspect(el,el.title));
+  $('graphs').querySelectorAll('[data-key-identity]').forEach(el=>inspect(el,el.dataset.keyIdentity));
 }
 function render(payload) {
   const time=Date.now(), data=normalize(payload);
