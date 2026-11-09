@@ -37,6 +37,9 @@ pub struct Owner {
     pub bytes: u64,
     pub resident: u64,
     pub deferred: bool,
+    /// Already inside the availability sample: a sequential load peak stated
+    /// above that sample excludes it, so it is not subtracted from the peak.
+    pub pre_sample: bool,
     pub lifetime: Lifetime,
     /// An immutable weight arena: `bytes` and `resident` are its physical
     /// extent B, charged once with its single SM120 tail (no per-tensor payload).
@@ -64,9 +67,17 @@ impl Owner {
             bytes,
             resident: 0,
             deferred: false,
+            pre_sample: false,
             lifetime: Lifetime::RESIDENT,
             arena: None,
         }
+    }
+
+    /// A component of the runtime base the availability sample already holds
+    /// (CUDA context, module images).
+    pub fn pre_sample(mut self) -> Self {
+        self.pre_sample = true;
+        self
     }
 
     /// An owner already resident in the serving sample: ledger only.
@@ -105,6 +116,7 @@ impl Owner {
             bytes: demand.bytes,
             resident: demand.resident_weights.0,
             deferred: demand.lifetime == ItemLifetime::PostReadyReserve,
+            pre_sample: false,
             lifetime: match demand.lifetime {
                 ItemLifetime::ReadyResident => Lifetime::RESIDENT,
                 ItemLifetime::PostReadyReserve => Lifetime { first: Phase::Ready, last: Phase::Growth },
@@ -149,6 +161,70 @@ pub fn growth_allowances(total: u64, ranks: usize, gpu: u8) -> Vec<Opaque> {
         });
     }
     out
+}
+
+/// The runtime base the pre-weight availability sample already holds, named
+/// component by component instead of taken as the leftover of a free sample:
+/// the CUDA context on an otherwise empty device and the images of the
+/// family's selected native modules.
+///
+/// cuBLAS handles, BLAS device initialization and driver page tables are
+/// already named owners of their own (`planner::serving::blas_components` and
+/// the plan's page-table mapping), so they are not repeated here. The AOT
+/// coordinator programs the family resolves lazily add further module storage
+/// after this sample; that class has no exported size to predict from, so it
+/// stays measured (`runtime_base_check`) and reported.
+pub const CONTEXT_OWNER: &str = "CUDA context";
+pub const MODULE_OWNER: &str = "module images";
+pub const RUNTIME_OWNERS: [&str; 2] = [CONTEXT_OWNER, MODULE_OWNER];
+
+/// The two predicted runtime-base owners of one coordinator GPU. The context
+/// figure is the calibrated `ArchContext` probe; the module figure is the
+/// selected native program set's estimate (the same pair `plan --layout`
+/// declares), never a free-memory remainder.
+pub fn runtime_base(gpu: u8, arch: &crate::placement::ArchContext, module_bytes: u64) -> Vec<Owner> {
+    [(CONTEXT_OWNER, arch.context_bytes), (MODULE_OWNER, module_bytes)]
+        .into_iter()
+        .filter(|&(_, bytes)| bytes > 0)
+        .map(|(group, bytes)| Owner::charged(gpu, Category::Runtime, group, bytes).pre_sample())
+        .collect()
+}
+
+/// Whether a whole-GPU reserve (`GPU_RESERVE`) is in force. It replaces the
+/// family's named runtime owners in `apply_reserve_override`, so the predicted
+/// runtime base cannot be charged beside the budget in that mode: the measured
+/// pre-weight sample stays the budget's sampled baseline instead.
+pub fn whole_gpu_reserve() -> bool {
+    cuteafd_core::memory_policy::MemoryPolicy::current()
+        .reserve_override(cuteafd_core::memory_policy::DeviceKind::Gpu)
+        .is_some()
+}
+
+/// The predicted runtime base and the device's measured occupancy at Ready:
+/// `(predicted, measured)`. `measured` is what the device holds once every
+/// other Ready-resident owner (weights, workspaces, KV, transports, BLAS
+/// handles, page tables and arena tails) is priced, so
+/// `measured - predicted` is the prediction-only residual this plan carries.
+/// Post-Ready reserves are not occupancy and are not subtracted.
+pub fn runtime_base_check(facts: &Facts, gpu: u8, used: u64)
+    -> Result<(u64, u64), Refusal> {
+    let location = Location::coordinator(gpu);
+    let (mut predicted, mut others) = (0u64, 0u64);
+    for allocation in &facts.allocations {
+        if allocation.location != location || allocation.view.is_some()
+            || !allocation.lifetime.contains(Phase::Ready, facts.phase_order) {
+            continue;
+        }
+        let bucket = if RUNTIME_OWNERS.contains(&allocation.group.as_str()) { &mut predicted } else { &mut others };
+        *bucket = bucket.checked_add(allocation.bytes).ok_or(Refusal::Overflow("V4.1 runtime base check"))?;
+    }
+    for mapping in facts.driver_page_tables.iter().filter(|mapping| mapping.location == location) {
+        others = others.checked_add(mapping.bytes()).ok_or(Refusal::Overflow("V4.1 page-table check"))?;
+    }
+    for owner in facts.allocation_granularity.iter().filter(|owner| owner.location == location) {
+        others = others.checked_add(owner.bytes()?).ok_or(Refusal::Overflow("V4.1 arena-tail check"))?;
+    }
+    Ok((predicted, used.saturating_sub(others)))
 }
 
 fn byte_component(template: Allocation, curve: ByteCurve, maximum: u64) -> Result<Component, Refusal> {
@@ -638,6 +714,28 @@ pub fn live_budgets(
     cards: &[(u64, u64, u64)],
     spark_bytes: &[u64],
 ) -> Result<Vec<Budget>, Refusal> {
+    live(cards, spark_bytes, None)
+}
+
+/// Live admission for a caller that charges the device's pre-weight occupancy
+/// itself: every card's cap starts whole and its sampled free bytes are not a
+/// baseline, because the predicted runtime base (`runtime_base`) is beside it
+/// as named owners. Never used with a whole-GPU reserve, which replaces those
+/// owners and therefore needs the sample (`live_budgets`).
+pub fn live_budgets_charged(
+    cards: &[(u64, u64, u64)],
+    spark_bytes: &[u64],
+) -> Result<Vec<Budget>, Refusal> {
+    live(cards, spark_bytes, Some(
+        "full cap; the CUDA context and selected module images are charged as predicted owners",
+    ))
+}
+
+fn live(
+    cards: &[(u64, u64, u64)],
+    spark_bytes: &[u64],
+    charged: Option<&str>,
+) -> Result<Vec<Budget>, Refusal> {
     if !(1..=2).contains(&cards.len())
         || cards.iter().any(|&(total, ceiling, free)| total == 0 || ceiling > total || free > total)
     {
@@ -651,10 +749,13 @@ pub fn live_budgets(
             locations: vec![Location::coordinator(rank as u8)],
             physical_bytes: total,
             logical_bytes: ceiling,
-            baseline: Baseline::Sampled {
-                free,
-                phase: Phase::Load,
-                source: "measured free bytes before the whole-process recipe".into(),
+            baseline: match charged {
+                Some(source) => Baseline::Forecast { occupied: 0, source: source.into(), assumed: false },
+                None => Baseline::Sampled {
+                    free,
+                    phase: Phase::Load,
+                    source: "measured free bytes before the whole-process recipe".into(),
+                },
             },
             headroom: crate::placement::reserve::gpu("deepseek_v41"),
         })
@@ -1084,10 +1185,12 @@ impl<'a> ProductionInput<'a> {
         // Sequential load peaks are absolute above the sample; charge each as
         // the part not already covered by the owners that are live at load,
         // including the drafter's retained weights the peak already contains.
+        // Owners the sample itself already holds (the predicted runtime base)
+        // are not in those peaks.
         let mut base = vec![0u64; self.gpus];
         for owner in self.owners.iter().chain(draft_demands.iter().flatten()) {
             if let Device::Coordinator(rank) = owner.location.device {
-                if !owner.deferred && owner.lifetime.first == Phase::Load {
+                if !owner.deferred && !owner.pre_sample && owner.lifetime.first == Phase::Load {
                     base[usize::from(rank)] = base[usize::from(rank)]
                         .checked_add(owner.bytes)
                         .ok_or(Refusal::Overflow("V4.1 load base"))?;
@@ -1554,5 +1657,94 @@ mod explicit_budget_tests {
                     || reserve.source.contains("runtime")));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_base_tests {
+    use super::*;
+    use crate::placement::planner::{DriverPageTable, DriverPageTableModel, PhaseOrder, View};
+
+    fn facts(allocations: Vec<Allocation>) -> Facts {
+        Facts {
+            phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+            resident_weights: Vec::new(),
+            allocations,
+            deferred: Vec::new(),
+            sequential: Vec::new(),
+            reservations: Vec::new(),
+            allowances: Vec::new(),
+            driver_page_tables: Vec::new(),
+            allocation_granularity: Vec::new(),
+        }
+    }
+
+    fn ready(id: &str, gpu: u8, bytes: u64, category: Category, group: &str) -> Allocation {
+        Allocation::buffer(id, Location::coordinator(gpu), bytes, Lifetime::RESIDENT, category, group)
+    }
+
+    #[test]
+    fn runtime_base_is_the_calibrated_context_plus_the_selected_modules() {
+        let arch = crate::placement::ArchContext::coordinator(
+            crate::placement::inventory::PRO_TOTAL_BYTES, None);
+        let context_only = runtime_base(0, &arch, 0);
+        assert_eq!(context_only.len(), 1, "zero module bytes are not a charge");
+        assert_eq!((context_only[0].group.as_str(), context_only[0].bytes),
+            (CONTEXT_OWNER, arch.context_bytes));
+        let owners = runtime_base(1, &arch, 40 << 20);
+        let named = owners.iter().map(|owner| (owner.group.as_str(), owner.bytes)).collect::<Vec<_>>();
+        assert_eq!(named, [(CONTEXT_OWNER, arch.context_bytes), (MODULE_OWNER, 40 << 20)]);
+        // Both parts are already inside the pre-weight sample: never load-phase.
+        assert!(owners.iter().all(|owner| owner.pre_sample && owner.resident == 0
+            && owner.location == Location::coordinator(1) && owner.category == Category::Runtime));
+    }
+
+    #[test]
+    fn charged_budgets_start_from_the_whole_cap_and_keep_the_operator_reserve() {
+        let cards = [(96u64 << 30, 96 << 30, 40 << 30)];
+        let sampled = live_budgets(&cards, &[]).unwrap();
+        let charged = live_budgets_charged(&cards, &[]).unwrap();
+        assert!(matches!(sampled[0].baseline,
+            Baseline::Sampled { free, phase: Phase::Load, .. } if free == 40 << 30));
+        assert!(matches!(charged[0].baseline,
+            Baseline::Forecast { occupied: 0, assumed: false, .. }));
+        assert_eq!(charged[0].physical_bytes, sampled[0].physical_bytes);
+        assert_eq!(charged[0].headroom, sampled[0].headroom);
+    }
+
+    #[test]
+    fn ready_check_prices_every_other_ready_owner_before_measuring_the_base() {
+        let arch = crate::placement::ArchContext::coordinator(
+            crate::placement::inventory::PRO_TOTAL_BYTES, None);
+        let mut allocations = vec![
+            ready("v41.arena", 0, 6 << 30, Category::Weights, "weight arena"),
+            // A view lives inside its arena, never a second allocation.
+            Allocation { view: Some(View { backing: "v41.arena".into(), offset: 0 }),
+                ..ready("v41.view", 0, 1 << 20, Category::Weights, "weight arena") },
+        ];
+        allocations.push(ready("v41.context", 0, arch.context_bytes, Category::Runtime, CONTEXT_OWNER));
+        allocations.push(ready("v41.modules", 0, 40 << 20, Category::Runtime, MODULE_OWNER));
+        let mut facts = facts(allocations);
+        // A post-ready reserve is headroom the operator keeps free, never occupancy
+        // at Ready: it rides in facts.reservations, which the check ignores.
+        facts.reservations.push(Reservation {
+            id: "v41.reserve".into(),
+            location: Location::coordinator(0),
+            bytes: 1 << 30,
+            lifetime: Lifetime { first: Phase::Ready, last: Phase::Growth },
+            source: "lazy graphs".into(),
+        });
+        facts.driver_page_tables.push(DriverPageTable {
+            model: DriverPageTableModel::Sm120Portable,
+            location: Location::coordinator(0),
+            lifetime: Lifetime::RESIDENT,
+            backing: "v41.arena".into(),
+            mapped_bytes: 6 << 30,
+        });
+        let tables = DriverPageTableModel::Sm120Portable.bytes(6 << 30);
+        let used = (6 << 30) + arch.context_bytes + (40 << 20) + tables + 1234;
+        let (predicted, measured) = runtime_base_check(&facts, 0, used).unwrap();
+        assert_eq!(predicted, arch.context_bytes + (40 << 20));
+        assert_eq!(measured, arch.context_bytes + (40 << 20) + 1234);
     }
 }

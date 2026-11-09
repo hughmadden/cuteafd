@@ -159,12 +159,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // and the routed-expert arenas are separate contract components.
     let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
     let mut reserves = Vec::new();
-    let draft_rows = dspark.then(|| {
-        let lanes = if shape.concurrency == 1 { 1 } else { 2 };
-        let live = shape.concurrency.div_ceil(lanes) * if options.v41_draft_width > 5 { 7 } else { 5 };
-        [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
-            cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter().find(|&rows| rows >= live).unwrap()
-    });
+    let draft_rows = dspark.then(|| v41::owners::draft_rows(shape.concurrency, options.v41_draft_width));
     let modules = programs.modules(v41::owners::DECODE_LANE_ROWS, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {

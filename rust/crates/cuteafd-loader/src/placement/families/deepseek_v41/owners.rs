@@ -246,6 +246,19 @@ pub fn blas_owners(ranks: usize, head: crate::placement::planner::serving::BlasH
     Ok(owners)
 }
 
+/// Draft-row bucket a concurrency and draft width resolve to: the smallest
+/// compiled draft shape the lanes' live rows fit. Offline layout and serving
+/// admission both select modules with it, so the predicted module set and the
+/// one the drafter loads are the same.
+pub fn draft_rows(concurrency: u64, width: u8) -> u64 {
+    let lanes = if concurrency == 1 { 1 } else { 2 };
+    let live = concurrency.div_ceil(lanes) * if width > 5 { 7u64 } else { 5u64 };
+    [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
+        cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter()
+        .find(|&rows| rows >= live)
+        .unwrap_or(cuteafd_core::V41_DRAFT_WIDE_ROWS as u64)
+}
+
 pub struct NativePrograms<'a> {
     manifest: &'a Value,
     sms: u32,
