@@ -735,7 +735,7 @@ pub(crate) mod tests {
 
     /// Every coordinator device charges the launch's whole graph reserve as
     /// one fixed opaque owner, before KV sizing, with the launch's own
-    /// prewarm price behind it (#1636: 2,313,158,656 B on one RTX PRO 6000).
+    /// prewarm price behind it (`glmf_prewarm.json`'s measured 166,079 B/graph).
     #[test]
     fn contract_graph_reserve_is_one_fixed_opaque_owner_per_device() {
         let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
@@ -750,7 +750,10 @@ pub(crate) mod tests {
                 input.sequences.min(input.decode_rows) as usize, input.speculation, input.layers,
                 ranks, input.decode_rows as usize, 188);
             assert_eq!(admitted.graphs.reserves, expected.reserves);
-            assert_eq!(admitted.graphs.charged, expected.reserves, "no override in the gate");
+            // One owner per device: the pinned arena plus its capture headroom.
+            let whole: Vec<u64> = expected.reserves.iter()
+                .map(|base| base + expected.extra).collect();
+            assert_eq!(admitted.graphs.charged, whole, "no override in the gate");
             assert_eq!(admitted.graphs.executables, expected.executables);
             assert_eq!(admitted.graphs.bootstraps, expected.bootstraps);
             for gpu in 0..ranks {
@@ -935,9 +938,10 @@ pub(crate) mod tests {
         assert!(spec.shapes.iter().any(|shape| shape.1) && plain.shapes.iter().all(|shape| !shape.1));
         // Rank 0 adds its head segment; the peer splits the same shapes.
         assert_eq!(spec.executables[0] - spec.executables[1], spec.shapes.len() as u64);
-        // A shorter served context keys a subset of the same geometries.
+        // A shorter served context keeps the pinned short shapes and can only
+        // drop longer geometries.
         let short = glmf_graphs::glmf_graph_reserve(65_536, 65_536, cfg.dense_context(), 8, true, 45, 2, 64, 188);
-        assert!(short.shapes.len() < spec.shapes.len());
+        assert!(short.shapes.len() <= spec.shapes.len());
         for shape in &short.shapes { assert!(spec.shapes.contains(shape)); }
     }
 

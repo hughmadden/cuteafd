@@ -1,5 +1,6 @@
 """Trace-derived startup lists preserve hot shapes and per-device ownership."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -300,8 +301,9 @@ def test_flash_shapes_aggregate_segments_and_pin_the_hot_ones():
     assert result["measured_bytes"] == 16 << 20
     assert result["measured_executables"] == 4
     # The pinned shape holds two of the four demanded graphs (8 MiB); the
-    # headroom is the rest of the request demand the lazy captures need.
-    assert result["reserve_extra_bytes"] == 8 << 20
+    # headroom is the rest of the request demand the lazy captures need, plus
+    # one largest measured capture (3 MiB, packed to 4 MiB).
+    assert result["reserve_extra_bytes"] == 12 << 20
     # 99% coverage keeps the two hot shapes (190 and 30 hits); only the peak is pinned.
     assert result["entries"] == [
         {"rows": 4, "spec": False, "long": False, "pool_width": 0,
@@ -347,3 +349,42 @@ def test_flash_invalid_trace_fails(change):
     change(data)
     with pytest.raises(ValueError):
         MODULE.generate([data], "glm5_flash")
+
+
+def flash_trace_path(tmp_path, name, charged):
+    path = tmp_path / name
+    path.write_text(json.dumps(flash_trace(charged=charged)))
+    return path
+
+
+def test_flash_layouts_are_priced_separately(tmp_path):
+    min_path = flash_trace_path(tmp_path, "min.json", 16 << 20)
+    max_path = flash_trace_path(tmp_path, "max.json", 32 << 20)
+    groups = MODULE.layout_groups([f"min={min_path}", f"max={max_path}"], "glm5_flash")
+    result = MODULE.generate_layouts(groups, "glm5_flash")
+    assert result["schema_version"] == 2
+    assert result["family"] == "glm5_flash"
+    assert set(result["layouts"]) == {"min", "max"}
+    assert result["layouts"]["min"]["measured_bytes"] == 16 << 20
+    assert result["layouts"]["max"]["measured_bytes"] == 32 << 20
+    # A layout entry carries only its own trace's prices, never the document's
+    # schema or another layout's shapes.
+    assert "schema_version" not in result["layouts"]["min"]
+    assert result["layouts"]["min"]["entries"] == result["layouts"]["max"]["entries"]
+
+
+def test_flash_requires_every_card_layout_and_no_others(tmp_path):
+    path = flash_trace_path(tmp_path, "trace.json", 16 << 20)
+    with pytest.raises(ValueError, match="every layout"):
+        MODULE.layout_groups([f"min={path}"], "glm5_flash")
+    with pytest.raises(ValueError, match="unknown GLM Flash layout"):
+        MODULE.layout_groups([f"min={path}", f"max={path}", f"mid={path}"], "glm5_flash")
+
+
+def test_single_layout_families_keep_the_flat_document(tmp_path):
+    data = trace()
+    path = tmp_path / "glm5.json"
+    path.write_text(json.dumps(data))
+    result = MODULE.generate_layouts(MODULE.layout_groups([str(path)], "glm5"), "glm5")
+    assert "layouts" not in result
+    assert result["family"] == "glm5"

@@ -1523,7 +1523,7 @@ pub(crate) struct Fp8Prefill {
 // and do not enlarge the startup graph set. Counters still count every capture.
 use crate::shared::decode_graph::{check_bucket_thresholds, masked_row, ProjectionThreshold};
 
-pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, decode_strides, glmf_prewarm_shapes, glmf_prewarm_list};
+pub(crate) use cuteafd_loader::serving_capacity::glmf_graphs::{DecodeBuckets, GraphGeometry, GlmfLayout, decode_strides, glmf_prewarm_shapes, glmf_prewarm_list};
 #[allow(unused_imports)]
 use cuteafd_loader::serving_capacity::glmf_graphs::{graph_geometries, MIN_PAGE_STRIDE, PLAIN_DECODE_BUCKETS, SPEC_DECODE_BUCKETS};
 // Inclusive arithmetic crossovers audited against the pinned AOT exporter: an FP8 decode
@@ -1820,8 +1820,9 @@ impl<'a> GlmfEngine<'a> {
         check_decode_thresholds(&self.buckets, sequences, speculation)?;
         tracing::info!(plain_rows = ?self.buckets.plain, spec_rows = ?self.buckets.spec, decode_rows = self.decode_rows,
             verify_rows = self.verify_rows, "GLM Flash decode buckets pass the projection thresholds");
+        let layout = GlmfLayout::for_gpus(self.ranks());
         let shapes = glmf_prewarm_shapes(self.max_context, self.pages * PAGE_ROWS, self.cfg.dense_context(),
-            sequences.min(self.decode_rows), speculation, &self.buckets);
+            sequences.min(self.decode_rows), speculation, &self.buckets, layout);
         ensure!(self.peer.as_ref().is_none_or(|peer| peer.layers.len() == self.weights.layers.len()),
             "prewarm peer layer inventory differs from planner");
         ensure!(!self.graphs_warmed.get() && (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().len() == 0),
@@ -1853,7 +1854,7 @@ impl<'a> GlmfEngine<'a> {
         self.graphs_warmed.set(true);
         let after = self.graph_memory_samples()?;
         let held: usize = (0..self.ranks()).map(|rank| self.graphs_of(rank).borrow().len()).sum();
-        tracing::info!(graphs = held,
+        tracing::info!(graphs = held, layout = layout.name(),
             free = ?(0..self.ranks()).map(|rank| (before[rank].free, after[rank].free)).collect::<Vec<_>>(),
             shapes = shapes.len(), elapsed_ms = started.elapsed().as_millis() as u64,
             "GLM Flash decode graphs warmed at startup");
@@ -1883,12 +1884,10 @@ impl<'a> GlmfEngine<'a> {
         crate::shared::decode_graph::device::Basis::Bytes
     }
 
-    /// Whether the checked-in prewarm list pins this shape: only what the trace (or the
-    /// provisional startup set) shows is always hot.
+    /// Whether this launch's layout's checked-in prewarm list pins this shape:
+    /// only what that layout's trace shows is always hot.
     fn graph_pinned(&self, key: &GraphKey) -> bool {
-        static PREWARM: std::sync::OnceLock<cuteafd_loader::serving_capacity::glmf_graphs::GlmfPrewarmList>
-            = std::sync::OnceLock::new();
-        PREWARM.get_or_init(glmf_prewarm_list).entries.iter().any(|entry| entry.pin
+        glmf_prewarm_list().layout(GlmfLayout::for_gpus(self.ranks())).entries.iter().any(|entry| entry.pin
             && entry.rows == key.rows && entry.spec == key.spec && entry.long == key.long
             && entry.pool_width == key.pool_width && entry.page_stride == key.page_stride
             && entry.pool_stride == key.pool_stride)
@@ -5956,9 +5955,9 @@ mod prefill_lane_tests {
             }
             let wide = glmf_graph_reserve(1_048_576, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
             let narrow = glmf_graph_reserve(131_072, 2_097_152, 2051, 16, true, 45, 1, verify, 188);
-            // The reserved prewarm is the trace's pin, one shape at every context;
-            // the other geometries capture on first use out of the capture headroom.
-            assert_eq!(wide.executables[0], 46);
+            // The reserved prewarm is the trace's pins, the same three shapes at
+            // every context; other geometries capture lazily out of the headroom.
+            assert_eq!(wide.executables[0], 138);
             assert_eq!(wide.shapes, narrow.shapes);
             assert_eq!(wide.reserves, narrow.reserves);
         }
@@ -6024,18 +6023,18 @@ mod prefill_lane_tests {
         assert_eq!(super::decode_bucket(9, false), 16);
         assert_eq!(super::decode_bucket(17, false), 32);
         let buckets = super::DecodeBuckets::new(super::DECODE_ROWS);
-        use cuteafd_loader::serving_capacity::glmf_graphs::{glmf_graph_reserve, glmf_prewarm_list, serving_graph_shapes};
+        use cuteafd_loader::serving_capacity::glmf_graphs::{GlmfLayout, glmf_graph_reserve, glmf_prewarm_list, serving_graph_shapes};
         for sequences in [8, 16] {
             let shapes = serving_graph_shapes(32768, 32768, 2051, sequences, true, &buckets);
             assert_eq!(shapes.len() * 46, 6440);
             // The reserved prewarm is the trace's pin at every capacity: rank 0
             // carries the head segment, rank 1 the 45 layer segments.
             let plan = glmf_graph_reserve(32768, 2_097_152, 2051, sequences, true, 45, 2, 64, 188);
-            assert_eq!(plan.executables, [46, 45]);
-            let list = glmf_prewarm_list();
+            assert_eq!(plan.executables, [138, 135]);
+            let list = glmf_prewarm_list().layout(GlmfLayout::Max);
             let packed = |count: u64| list.arena_bytes(count).div_ceil(2 << 20) * (2 << 20);
-            assert_eq!(plan.reserves, [packed(46), packed(45)]);
-            assert_eq!(plan.extra, 65_011_712);
+            assert_eq!(plan.reserves, [packed(138), packed(135)]);
+            assert_eq!(plan.extra, list.reserve_extra_bytes.div_ceil(2 << 20) * (2 << 20));
             assert_eq!(serving_graph_shapes(32768, 32768, 2051, sequences, false, &buckets).len() * 46, 2576);
         }
         assert_eq!(serving_graph_shapes(32768, 32768, 2051, 32, true, &buckets).len() * 46, 7084);
@@ -6284,10 +6283,10 @@ mod wide_decode_tests {
                 serving_graph_shapes(context, pages, 2051, 16, false, &narrow));
         }
         // A wider verify budget adds shapes the prewarm does not reserve, so the
-        // pinned prewarm and its reserve stay the trace's one shape.
+        // pinned prewarm and its reserve stay the trace's three shapes.
         let reserve = |decode_rows: usize| glmf_graph_reserve(8_192, 2_097_152, 2051, 16, true, 45, 1,
             decode_rows, 188);
-        assert_eq!(reserve(DECODE_ROWS).executables[0], 46);
+        assert_eq!(reserve(DECODE_ROWS).executables[0], 138);
         assert_eq!(reserve(DECODE_ROWS), reserve(127));
     }
 

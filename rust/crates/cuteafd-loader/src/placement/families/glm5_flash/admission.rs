@@ -417,11 +417,10 @@ fn invalid(error: impl std::fmt::Display) -> p::Refusal {
 }
 
 /// The launch's graph reserve, one fixed owner per coordinator device. The
-/// measured prewarm arena and the list's capture headroom are provisional
-/// (#1636: 2,313,158,656 B for the former 13,800-executable startup capture
-/// at a 1M pool); a trace replaces the list, never the accounting: admission
-/// charges the whole reserve once, before KV sizing, and a warm-up never
-/// shrinks it.
+/// measured prewarm arena and the list's capture headroom come from a device
+/// graph trace of the traffic (`glmf_prewarm.json`, 166,079 B/graph measured);
+/// a new trace replaces the list, never the accounting: admission charges the
+/// whole reserve once, before KV sizing, and a warm-up never shrinks it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlmfGraphs {
     /// Prewarm shapes this launch can request.
@@ -1196,7 +1195,7 @@ impl PreparedGlmf<'_> {
         }
         let encoder = solved.decisions.encoder.map(|index| self.encoders[index].clone());
         tracing::debug!(target: "cuteafd::planner", complete_solve_us = self.started.elapsed().as_micros() as u64,
-            graph_reserve = ?graphs.charged, prewarm_shapes = graphs.shapes,
+            graph_reserve = ?graphs.charged, prewarm_shapes = graphs.shapes, layout = prepared.layout.name(),
             "Flash recipe preparation, search and exact reconciliation completed");
         Ok(AdmittedGlmf { placement, graphs, working, solved,
             native_load: self.native_load, mount_load: self.mount_load, push_host: self.push_host, encoder })
