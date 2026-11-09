@@ -404,6 +404,7 @@ Don't move all work to maxq.
   `--working-directory`, so it can silently run the main checkout's copy.
   Pass `cpu-gate --source <worktree>` too, and check that the receipt's
   HEAD is your commit.
+- **Don't nest hardware locks.** `wip-cards` takes every lock its cards need in one fair turn, so run it bare. If you wrap it in `hwlock.py`, the outer call must request the full union of locks (for example sparks,gpu0,gpu1,rhea,moa); a partial outer lock makes `wip-cards` queue a second, newer ticket that deadlocks behind the locks you already hold (#1679).
 - Keep systemd's stop defaults on those units (KillMode=control-group,
   TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
   `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
