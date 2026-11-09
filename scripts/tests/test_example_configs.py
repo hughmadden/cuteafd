@@ -478,19 +478,16 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
         for rank, host in enumerate(entry["sparks"]):
             assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
-        if values.get("ATTENTION_MODE"):
-            assert entry["family"] in variants
-            assert values["MODEL_ID"].endswith("-HQA"), "Attention modes require the dual-view HQA checkpoint"
-        if values["MODEL_ID"].endswith("-HQA"):
-            assert values.get("ATTENTION_MODE", "hqa") in ("hqa", "compact", "fp8-compact")
-        if values.get("ATTENTION_MODE"):
-            if len(entry["gpus"]) == 2:
-                comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
         assert entry.get("baseline", True), "All cards retain baseline quick quality"
-        if name.endswith("compact"):
+        if name.endswith(("-hqa", "-fp8-compact")):
+            assert entry["family"] in variants
+            assert values["MODEL_ID"].endswith("-HQA"), "Comparison modes require the dual-view HQA checkpoint"
             assert len(entry["gpus"]) == 2
-            assert values["ATTENTION_MODE"] in ("compact", "fp8-compact")
+            assert values["ATTENTION_MODE"] in ("hqa", "fp8-compact")
+            comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
             continue
+        assert "ATTENTION_MODE" not in values, "Regular cards use the checkpoint's default attention"
+        assert not values["MODEL_ID"].endswith("-HQA")
         column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
         identity = (entry["family"], values["MODEL_ID"], column)
         assert identity not in cards
@@ -509,8 +506,7 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
     assert sum(column == "5090" for _, _, column in cards) == 7
     assert set(comparisons) == set(variants)
     for family, modes in comparisons.items():
-        assert modes == ({"hqa", "compact"} if family == "mistral_large4"
-                         else {"hqa", "compact", "fp8-compact"})
+        assert modes == ({"hqa"} if family == "mistral_large4" else {"hqa", "fp8-compact"})
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
 

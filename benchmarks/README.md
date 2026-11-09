@@ -10,12 +10,13 @@ workloads are unchanged.
 
 ## v5 HQA Comparison
 
-The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) schedules the
-regular max cards in `hqa` mode and 11 additional max-only attention variants.
-All six families' cards explicitly pin their `-HQA` repository revision,
-which bundles both HQA and compact views; original Core-K6 repositories do
-not supply that comparison. The example configs remain unchanged here;
-the v5 matrix overrides their checkpoint IDs and revisions.
+The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) schedules 11
+additional max-only attention comparisons. Regular min/max cards retain the
+original checkpoint repositories and their default attention, with no mode
+flag. The regular max card is each comparison's compact arm. Separate `hqa`
+and `fp8-compact` arms pin the matching dual-view `-HQA` repository revision
+(Mistral Large 4: `hqa` only). Users choose the checkpoint; this comparison
+does not establish a shipping attention default.
 These experiments are separate from the main three-column release table.
 Results are pending; no new speed or quality measurement is claimed here.
 
@@ -29,11 +30,12 @@ Results are pending; no new speed or quality measurement is claimed here.
 | Mistral Large 4 EXL3 K4 + Core K6 | hqa, compact | pending | pending |
 
 All modes retain the Release smoke baseline, including quick fidelity and
-quality. Publish those scores beside speed with equal prominence, the same
-checkpoint revision, and the report's thermal/power conditions; speed alone
+quality. Publish those scores beside speed with equal prominence, the pinned
+original/HQA checkpoint revisions, and the report's thermal/power conditions; speed alone
 does not decide the attention mode. Mistral Large 4 refuses `fp8-compact`, so
-that unsupported arm is not scheduled. Variant names append `-compact` or
-`-fp8-compact` to the regular `-max` name. GLM Flash keeps its existing
+that unsupported arm is not scheduled. Variant names append `-hqa` or
+`-fp8-compact` to the regular `-max` name; `compact` means that regular max
+card itself, not another launch. GLM Flash keeps its existing
 `glm53f-exl3-k6-*` card/config names for the K4 + Core K6 checkpoint.
 
 ### v5 Retirements
