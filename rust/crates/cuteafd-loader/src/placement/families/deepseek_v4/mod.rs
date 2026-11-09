@@ -243,9 +243,9 @@ pub fn steps_requests(inputs: &V4Inputs, rank: usize) -> Result<Option<Vec<u64>>
 }
 
 /// Fixed V4 demands plus each GPU's reserve, the ones both sides previously
-/// computed apart. Every pool-owned term (the packed per-device records backing,
-/// lane page tables) is a separate exact owner in `Recipe::prepare`, so nothing
-/// here scales with the pool.
+/// computed apart. Every pool-owned term (window rings, the per-layer cache
+/// records, lane page tables) is a separate exact owner in `Recipe::prepare`,
+/// so nothing here scales with the pool.
 pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), PlacementError> {
     let gpus = inputs.gpus.len();
     let geometry = deepseek_v4_cache_geometry(&inputs.cfg, gpus, inputs.prefill_rows, inputs.cache_stages)
@@ -261,9 +261,9 @@ pub fn fixed_demands(inputs: &V4Inputs) -> Result<(Vec<Demand>, Vec<u64>), Place
         let gpu = rank as u8;
         let role = if gpus == 1 { 0 } else if rank == 0 { 1 } else { 2 };
         let mul = |a: u64, b: u64, what| a.checked_mul(b).ok_or(PlacementError::Overflow(what));
-        // Window rings, compressor carry and the per-device packed records
-        // backing are exact owners in `Recipe::prepare`; this keeps the
-        // pool-independent replay and lane-table state.
+        // Window rings and the per-layer cache records are exact owners in
+        // `Recipe::prepare`; this keeps the pool-independent replay and
+        // lane-table state.
         let state = cache.fixed_state_bytes + cache.speculative_replay_bytes
             + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
@@ -503,11 +503,11 @@ mod default_tests {
     }
 
     /// The engine allocates one window ring per cached layer plus one per
-    /// dSpark stage, and the lead GPU holds every stage's ring. The compressed
-    /// records are one packed backing per device, so their 2 MiB SM120
-    /// granularity is charged once instead of once per layer.
+    /// dSpark stage, and the lead GPU holds every stage's ring. Each layer's
+    /// cache records are their own cudaMalloc (C4 records and index units,
+    /// C128 records), so each is charged its own curve and 2 MiB rounding.
     #[test]
-    fn cache_stages_ring_on_the_lead_gpu_and_records_pack_per_device() {
+    fn cache_stages_ring_on_the_lead_gpu_and_records_charge_per_layer() {
         use crate::placement::planner::Location;
         let mut cfg = context_cfg();
         cfg.n_mtp_layers = 3;
@@ -523,14 +523,19 @@ mod default_tests {
             let stages = if gpu == 0 { 3 } else { 0 };
             assert_eq!(owners(gpu, "window rings").len(), 43 + stages,
                 "rtx{gpu} charges 43 cached layers plus its {stages} dSpark stages");
-            assert_eq!(owners(gpu, "records"), vec![format!("v4.cache.{gpu}.records")],
-                "rtx{gpu} prices the packed records as one backing");
+            let records = owners(gpu, "records");
+            assert_eq!(records.len(), 21 + 21 + 20,
+                "rtx{gpu} charges 21 C4 records, 21 C4 index units and 20 C128 records apart");
+            assert_eq!(records.iter().filter(|id| id.ends_with(".index")).count(), 21);
+            assert_eq!(records.iter().filter(|id| id.ends_with(".records")).count(), 41);
         }
         // A stage ring is the same request as a layer's, so the lead GPU's
         // three extra owners are exactly the draft stages the engine puts there.
-        let records = |gpu: u8| solved.facts.allocations.iter().find(|allocation|
-            allocation.id == format!("v4.cache.{gpu}.records")).unwrap().bytes;
-        assert!(records(0) > 0 && records(1) > 0);
+        let record_bytes = |gpu: u8| solved.facts.allocations.iter()
+            .filter(|allocation| allocation.id.starts_with(&format!("v4.cache.{gpu}."))
+                && allocation.id.ends_with(".records"))
+            .map(|allocation| allocation.bytes).sum::<u64>();
+        assert!(record_bytes(0) > 0 && record_bytes(1) > 0);
     }
 
     /// The pre-weight base and the code still to load are named Runtime owners
