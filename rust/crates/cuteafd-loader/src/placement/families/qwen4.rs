@@ -163,9 +163,9 @@ fn measured_occupancy_owner(source: &str, baseline: &Baseline, physical_bytes: u
     let occupied = measured_occupancy(baseline, physical_bytes, mapped)?;
     if occupied == 0 { return Ok(None); }
     let free = physical_bytes.saturating_sub(occupied).saturating_sub(mapped);
-    Ok(Some(allowance(&format!("{source}: {occupied} B occupied at the {free} B free sample of \
+    Ok(Some(allowance(&crate::placement::sampled_baseline::source(&format!("{source}: {occupied} B occupied at the {free} B free sample of \
         {physical_bytes} B ({mapped} B embedding mapping charged separately by driver page tables); \
-        CUDA context, selected modules, resident dense weights and the PLE table"),
+        CUDA context, selected modules, resident dense weights and the PLE table")),
         location, occupied, PlanLifetime::RESIDENT, maximum)))
 }
 
@@ -1716,6 +1716,22 @@ mod tests {
     }
 
     #[test]
+    fn sampled_context_survives_zero_gpu_reserve() {
+        cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+            let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
+            let occupied = 686_424_064;
+            let inputs = single_inputs(&cfg, Baseline::Measured { free_bytes: (96 << 30) - occupied },
+                1, Some(131072), ResidentWeights(0), None);
+            let solved = admitted(&inputs).unwrap().1;
+            let owners: Vec<_> = solved.facts.allowances.iter().filter(|owner|
+                crate::placement::sampled_baseline::is_source(&owner.source)).collect();
+            assert_eq!(owners.len(), 1);
+            assert_eq!(owners[0].bytes, occupied);
+            assert_eq!(solved.budgets[0].headroom, 0);
+        });
+    }
+
+    #[test]
     fn single_host_embedding_mapping_is_charged_once_after_post_load_sample() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(4)).unwrap();
         let capacity = 96u64 << 30;
@@ -1738,7 +1754,7 @@ mod tests {
                 assert_eq!(embedded.budgets[0].available().unwrap(),
                     if measured { capacity } else { capacity - occupied });
                 let owners = embedded.items(Location::coordinator(0)).unwrap().into_iter()
-                    .filter(|item| item.group.starts_with("Qwen context and selected modules"))
+                    .filter(|item| item.group.starts_with("sampled baseline: Qwen context and selected modules"))
                     .map(|item| item.bytes).collect::<Vec<_>>();
                 assert_eq!(owners, if measured { vec![occupied] } else { vec![] },
                     "the measured occupancy is one named owner at its sampled bytes");

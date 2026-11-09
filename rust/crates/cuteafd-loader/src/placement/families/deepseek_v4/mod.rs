@@ -542,6 +542,21 @@ mod default_tests {
     /// on every coordinator GPU, lead and peer alike: the planned allowance
     /// offline, the measured sample's occupancy in serve (#1614).
     #[test]
+    fn sampled_context_survives_zero_gpu_reserve() {
+        cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: Some(0), ..Default::default() }.scoped(|| {
+            let mut input = plan_inputs(&context_cfg());
+            for (capacity, baseline) in &mut input.gpus {
+                *baseline = Baseline::Measured { free_bytes: *capacity - 686_424_064 };
+            }
+            let admitted = prepare(&input).unwrap().admit(production_request(&input)).unwrap();
+            let owners: Vec<_> = admitted.solved.facts.allowances.iter().filter(|owner|
+                crate::placement::sampled_baseline::is_source(&owner.source)).collect();
+            assert_eq!(owners.len(), input.gpus.len());
+            assert!(owners.iter().all(|owner| owner.bytes == 686_424_064));
+        });
+    }
+
+    #[test]
     fn runtime_base_is_a_named_owner_on_every_coordinator_gpu() {
         use cuteafd_core::memory_layout::ItemLifetime;
         let group = |items: &[Demand], rank: u8, name: &str| -> u64 {

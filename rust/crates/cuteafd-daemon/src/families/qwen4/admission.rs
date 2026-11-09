@@ -1010,7 +1010,7 @@ mod tests {
                 let planned = layout.devices[rank].items.iter().filter(|item| item.group != "context+modules")
                     .cloned().collect::<Vec<_>>();
                 let mut actual = runtime.items[rank].clone();
-                let index = actual.iter().position(|item| item.group.starts_with("Qwen context and selected modules"))
+                let index = actual.iter().position(|item| item.group.starts_with("sampled baseline: Qwen context and selected modules"))
                     .unwrap_or_else(|| panic!("rank {rank}: no measured-occupancy owner in {actual:?}"));
                 let owner = actual.remove(index);
                 assert_eq!(owner.bytes, sampled,
@@ -1097,7 +1097,7 @@ mod tests {
                 // runtime item is the plan's own item.
                 let mut measured = Vec::new();
                 for item in &placement.items[0] {
-                    if item.group.starts_with("Qwen context and selected modules") {
+                    if item.group.starts_with("sampled baseline: Qwen context and selected modules") {
                         measured.push(item);
                     } else {
                         assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
