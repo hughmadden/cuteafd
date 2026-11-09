@@ -2085,6 +2085,9 @@ impl<'a> MimoEngine<'a> {
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         gather: bool, head: bool) -> Result<()> {
         let layers = &self.weights.layers;
+        // Classifying Spark epilogues reads the decode transport. Finish those
+        // reads before the exchange holds its mutable borrow for this step.
+        let previous_segments: Vec<_> = (0..=layers.len()).map(|index| self.previous(index)).collect();
         // The decode link has one return slot: every decode wave lands in its
         // planes, which the replayed segments bake in.
         let mut link = match &self.experts {
@@ -2103,8 +2106,7 @@ impl<'a> MimoEngine<'a> {
         // The previous layer's wave: landed (a device wait) before the segment
         // that reduces its planes, consumed after it.
         let mut pending: Option<crate::shared::spark_waves::WaveTicket> = None;
-        for index in 0..=layers.len() {
-            let previous = self.previous(index);
+        for (index, previous) in previous_segments.into_iter().enumerate() {
             let last = index == layers.len();
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
             let landed = match (pending.take(), link.as_mut()) {
@@ -3398,6 +3400,29 @@ mod tests {
         assert!(startup.contains("cuda_zero_bytes(drafter.taps.buffer"));
         assert!(!startup.contains("mtp_tap("));
         assert!(!startup.contains("prefix"));
+    }
+
+    #[test]
+    fn decode_classifies_spark_epilogues_before_borrowing_the_exchange() {
+        let source = include_str!("engine.rs");
+        let layers = source.split_once("fn decode_layers(").unwrap().1
+            .split_once("/// Rank 0's decode segment").unwrap().0;
+        let borrowed = layers.find("transport.borrow_mut()").unwrap();
+        assert!(layers.find("self.previous(index)").unwrap() < borrowed);
+        assert!(!layers[borrowed..].contains("self.previous("));
+        assert_eq!(layers.matches("transport.borrow").count(), 1);
+        assert!(layers.contains("previous_segments.into_iter().enumerate()"));
+        // Peer segments and both RTX expert halves run while that borrow is
+        // held, but own separate RefCells and must not reborrow the transport.
+        for (start, end) in [("fn decode_segment(", "/// Rank 1's decode segment"),
+            ("fn peer_segment(", "/// Classifies this step's graph hits")] {
+            let segment = source.split_once(start).unwrap().1.split_once(end).unwrap().0;
+            assert!(!segment.contains("transport.borrow"));
+            assert!(!segment.contains("self.previous("));
+        }
+        let tp2 = include_str!("engine/tp2.rs");
+        assert!(!tp2.contains("transport.borrow"));
+        assert!(!tp2.contains("self.experts"));
     }
 
     #[test]
