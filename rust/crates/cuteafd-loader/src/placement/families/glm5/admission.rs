@@ -1772,9 +1772,9 @@ impl StartupGraphs {
     }
 
     pub fn reserves(&self) -> Result<Vec<u64>, Refusal> {
-        self.ranks.iter().map(|graph| crate::placement::graph_reserve::current(
-            "sm120", "coordinator", graph.bytes, crate::placement::graph_reserve::GLM_EXTRA)
-            .map_err(Refusal::InvalidFact)).collect()
+        self.ranks.iter().enumerate().map(|(rank, graph)| crate::placement::graph_reserve::current(
+            rank, false, graph.bytes, crate::placement::graph_reserve::GLM_EXTRA)
+            .map(|reserve| reserve.bytes).map_err(Refusal::InvalidFact)).collect()
     }
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {

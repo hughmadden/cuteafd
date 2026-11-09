@@ -1765,6 +1765,11 @@ impl Opened {
         let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
             .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
         engine.configure_graph_cache(&graph_reserves, &graph_bootstraps)?;
+        for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
+                row.bytes, cuteafd_loader::placement::graph_reserve::GLM_EXTRA).map_err(anyhow::Error::msg)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM graph cache startup policy");
+        }
         // Current startup shapes are a best-effort prewarm list. Admission keeps
         // the entire graph reserve charged; measured warmup never shrinks it.
         if engine.weights.layers.len() == self.cfg.layers
@@ -1775,6 +1780,11 @@ impl Opened {
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
+        for (rank, row) in admitted.graphs.ranks().iter().enumerate() {
+            let reserve = cuteafd_loader::placement::graph_reserve::current(rank, false,
+                row.bytes, cuteafd_loader::placement::graph_reserve::GLM_EXTRA).map_err(anyhow::Error::msg)?;
+            tracing::info!(rank, reserve = reserve.bytes, source = reserve.source, "GLM graph cache Ready summary");
+        }
         engine.usage_active.set(true);
         let result = body(&engine, transport.as_mut(), &runtime);
         // Non-serving commands do not pass schedule's readiness boundary.

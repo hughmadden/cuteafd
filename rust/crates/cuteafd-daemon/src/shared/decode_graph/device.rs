@@ -544,6 +544,19 @@ mod tests {
         assert_eq!(cache.pools.exec_high_water, 1);
     }
     #[test]
+    fn devices_only_charge_their_own_measured_growth() {
+        let mut a = DeviceCache::new(-206, 100);
+        let mut b = DeviceCache::new(-207, 100);
+        assert!(matches!(a.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(_)));
+        a.measured_capture(10);
+        b.measured_capture(0);
+        assert_eq!((a.charged, b.charged), (10, 0));
+        // A peer allocation observed on B is charged to B, not inferred from A.
+        b.measured_capture(5);
+        assert_eq!((a.charged, b.charged), (10, 5));
+    }
+
+    #[test]
     fn node_and_exec_pools_have_independent_peaks() {
         let mut cache = DeviceCache::new(-205, 64 << 20);
         let estimate = |nodes| Some(Estimate { bytes: nodes * 2560 + 65536,
