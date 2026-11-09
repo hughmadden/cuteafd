@@ -701,4 +701,5 @@ admission and controller attachment together when enabling capture
 - Per-round `graph_capture_stats` scans/serializes model-sized inventories: leave it to request-time diagnostics (#1697).
 - Trace-enabled speed includes observer overhead even with bounded background writers; use traces only for inventory and trace-free adaptive cards for decisions (#1694, #1696, #1660).
 - Boundary observation still samples CUDA, walks the allocation ledger and visits banks: do not multiply per-step observer calls; optimization is pending #1706.
-- High-water can permanently credit a transient capture peak; do not label it current resident graph memory (pending #1702).
+- A graphs-on speed loss with equal GPU step time is host bookkeeping (stats snapshot, observer), not replay: measure per-round wall minus step before blaming graphs (#1697, #1706).
+- High-water can retain transient capture peaks, and untracked driver memory (e.g. pinned host mapping page tables) can land in the graph residual: do not label it current resident graph memory (pending #1702).
