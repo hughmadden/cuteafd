@@ -1869,7 +1869,7 @@ impl<'a> GlmfEngine<'a> {
         }
         for rank in 0..self.ranks() {
             let device = if rank == 0 { self.device } else { self.peer()?.device };
-            self.graphs_of(rank).borrow_mut().attach_device(device, charged[rank], Site {
+            self.graphs_of(rank).borrow_mut().attach_device(self.library, device, charged[rank], Site {
                 name: "glm5_flash.decode", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank], basis,
                 spans_devices: self.ranks() > 1 || self.peer.is_some(),
