@@ -27,13 +27,19 @@ Results are pending; no new speed or quality measurement is claimed here.
 | Kimi K3 EXL3 K2 + Core K6 | hqa, compact, fp8-compact | pending | pending |
 | Step-5 EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
 | Muse Spark EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| Mistral Large 4 EXL3 K4 + Core K6 | hqa, compact | pending | pending |
+| Mistral Large 4 EXL3 K4 + Core K6 | hqa (= native FP8, fp8-compact equivalent), compact | pending | pending |
 
 All modes retain the Release smoke baseline, including quick fidelity and
 quality. Publish those scores beside speed with equal prominence, the pinned
 original/HQA checkpoint revisions, and the report's thermal/power conditions; speed alone
-does not decide the attention mode. Mistral Large 4 refuses `fp8-compact`, so
-that unsupported arm is not scheduled. Variant names append `-hqa` or
+does not decide the attention mode. Mistral Large 4's `hqa` arm restores its
+original FP8 E4M3 wq/wo and is the native-FP8, fp8-compact-equivalent arm;
+its regular max card is the compact K6 view, so no extra arm is needed
+([#1750](https://github.com/tpurtell/cuteafd/issues/1750)).
+GLM Flash's `fp8-compact` uses FP8 weights + FP8 prefill activations (W8A8);
+it is not directly comparable to other families' W8A16 `fp8-compact`
+([#1751](https://github.com/tpurtell/cuteafd/issues/1751)).
+Variant names append `-hqa` or
 `-fp8-compact` to the regular `-max` name; `compact` means that regular max
 card itself, not another launch. GLM Flash keeps its existing
 `glm53f-exl3-k6-*` card/config names for the K4 + Core K6 checkpoint.
