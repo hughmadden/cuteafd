@@ -88,12 +88,14 @@ pub(crate) struct Counters {
     pub captures: u64,
     pub eager_runs: u64,
     pub evictions: u64,
+    pub physical_floor_skips: u64,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Snapshot {
     pub device: i32,
     pub reserve: u64,
+    pub physical_floor: u64,
     pub reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     pub charged: u64,
     /// Current untracked level relative to the attach seed. Unlike `charged`
@@ -285,6 +287,18 @@ pub(crate) type SharedCache = Arc<Mutex<DeviceCache>>;
 // Banks and capture tickets own the controller, not the process registry.
 // After teardown the next serving lifetime must sample a fresh baseline.
 static DEVICES: OnceLock<Mutex<HashMap<i32, std::sync::Weak<Mutex<DeviceCache>>>>> = OnceLock::new();
+static PHYSICAL_FLOOR: OnceLock<Option<String>> = OnceLock::new();
+
+pub(crate) fn set_physical_floor(text: Option<String>) -> anyhow::Result<()> {
+    cuteafd_loader::placement::graph_reserve::physical_floor(text.as_deref(), 0, 0)?;
+    install_physical_floor(&PHYSICAL_FLOOR, text)
+}
+
+fn install_physical_floor(policy: &OnceLock<Option<String>>, text: Option<String>) -> anyhow::Result<()> {
+    let installed = policy.get_or_init(|| text.clone());
+    anyhow::ensure!(*installed == text, "graph physical floor was already installed with a different value");
+    Ok(())
+}
 
 pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
     reserve: u64, basis: Basis) -> anyhow::Result<SharedCache> {
@@ -328,11 +342,19 @@ pub(super) fn device_cache_sampled(device: i32, reserve: u64, basis: Basis,
         return Ok(cache);
     }
     let mut controller = DeviceCache::new(device, reserve);
+    // Synthetic ordinals in CPU policy fixtures have no physical GPU.
+    if device >= 0 {
+        let padding = cuteafd_core::memory_policy::MemoryPolicy::current().memory_padding
+            .unwrap_or(cuteafd_core::memory_policy::DEFAULT_MEMORY_PADDING);
+        controller.physical_floor = cuteafd_loader::placement::graph_reserve::physical_floor(
+            PHYSICAL_FLOOR.get().and_then(|text| text.as_deref()), device as usize, padding)?;
+    }
     controller.basis = basis;
     // Seed before the first attached bank can capture. Reattachment must not
     // consume growth from an earlier bank or overwrite an explicit baseline.
     let (free, total, tracked, rounding, unclaimed) = sample()?;
     controller.level = Some(controller.observer.observe(free, total, tracked, rounding, unclaimed).1);
+    controller.sample_physical(free, tracked);
     let cache = Arc::new(Mutex::new(controller));
     devices.insert(device, Arc::downgrade(&cache));
     Ok(cache)
@@ -410,6 +432,14 @@ fn existing_cache(device: i32) -> Option<SharedCache> {
         .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
+/// Reuse a periodic report's physical sample; older asynchronous reports may
+/// not replace a newer boundary sample. No CUDA query or graph-level mutation.
+pub(crate) fn monitor_physical(device: i32, sampled_at: Instant, free: u64, tracked: u64) {
+    if let Some(cache) = existing_cache(device) {
+        cache.lock().unwrap_or_else(|p| p.into_inner()).monitor_physical(sampled_at, free, tracked);
+    }
+}
+
 /// Observe once per physical device, even when several banks or lanes completed.
 /// Call only at a completed submission boundary, never within a peer segment.
 pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
@@ -424,6 +454,7 @@ fn observe_device_sampled(device: i32,
         let (free, total, tracked, rounding, unclaimed) = sample()?;
         let (growth, level) = cache.observer.observe(free, total, tracked, rounding, unclaimed);
         cache.level = Some(level);
+        cache.sample_physical(free, tracked);
         if cache.unmeasured { cache.measured_capture(growth); }
     }
     cache.boundary();
@@ -453,6 +484,7 @@ fn refreshed_arena_sampled(device: i32,
     let raw = cache.observer.current(free, total, tracked, rounding, unclaimed);
     let level = raw.min(cache.charged);
     cache.level = Some(level);
+    cache.sample_physical(free, tracked);
     tracing::info!(target: "cuteafd::memory", device, free, total, tracked, unclaimed,
         raw, level, charged = cache.charged, "graph level refresh");
     Some((level, cache.charged))
@@ -482,6 +514,11 @@ pub(crate) struct DeviceCache {
     reserve_policy: Option<cuteafd_loader::placement::graph_reserve::Resolved>,
     charged: u64,
     level: Option<u64>,
+    physical_floor: u64,
+    physical_sample: Option<(Instant, u64, u64)>,
+    physical_floor_warned: bool,
+    floor_resample_pending: bool,
+    floor_resample_used: bool,
     pending_bytes: u64,
     next_id: u64,
     next_bank: u64,
@@ -514,6 +551,8 @@ pub(crate) struct DeviceCache {
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
         Self { device, reserve, reserve_policy: None, charged: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
+            physical_floor: 0, physical_sample: None, physical_floor_warned: false,
+            floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
@@ -532,10 +571,56 @@ impl DeviceCache {
     pub fn identity_generation(&self) -> u64 { self.identity_generation }
     pub fn retains_identity(&self, identity: &Identity) -> bool { self.identities.contains_key(identity) }
     pub fn needs_boundary(&self) -> bool {
-        self.unmeasured || self.pending_destroy > 0
+        self.unmeasured || self.pending_destroy > 0 || self.floor_resample_pending
     }
     pub fn has_pending_victims(&self) -> bool { self.pending_destroy > 0 }
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
+
+    fn sample_physical(&mut self, free: u64, tracked: u64) {
+        self.physical_sample = Some((Instant::now(), free, tracked));
+        self.floor_resample_pending = false;
+    }
+
+    fn monitor_physical(&mut self, sampled_at: Instant, free: u64, tracked: u64) {
+        if self.physical_sample.is_none_or(|(previous, _, _)| sampled_at > previous) {
+            // An asynchronous report updates physical admission only, never the
+            // graph observer, charge, pending tickets or retry state.
+            self.physical_sample = Some((sampled_at, free, tracked));
+        }
+    }
+
+    fn floor_skip(&mut self, old: Option<u64>, cycle: Cycle) -> Miss {
+        if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            record.stats.event(cycle, 1);
+            record.stats.misses += 1;
+        }
+        let counters = self.counters.entry(cycle).or_default();
+        counters.eager_runs += 1;
+        counters.physical_floor_skips += 1;
+        Miss::Eager
+    }
+
+    fn physical_room(&mut self, estimate: u64, headroom: u64) -> bool {
+        if self.physical_floor == 0 { return true }
+        let Some((_, free, tracked)) = self.physical_sample else { return true };
+        let current = cuteafd_ffi::memory_ledger::current_bytes(
+            cuteafd_ffi::memory_ledger::Space::Device, self.device) as u64;
+        let free = free.saturating_sub(current.saturating_sub(tracked))
+            .saturating_sub(self.pending_growth);
+        let required = estimate.saturating_add(headroom).saturating_add(self.physical_floor);
+        if free >= required { return true }
+        if !self.physical_floor_warned {
+            tracing::warn!(device = self.device, free, estimate, headroom, floor = self.physical_floor,
+                reserve = self.reserve, charged = self.charged,
+                "physical graph headroom below floor while graph reserve has slack; memory accounting probably has a missing owner; running eagerly");
+            self.physical_floor_warned = true;
+        }
+        if !self.floor_resample_used {
+            self.floor_resample_pending = true;
+            self.floor_resample_used = true;
+        }
+        false
+    }
 
     fn unlink(&mut self, id: u64) {
         let record = &self.records[&id];
@@ -653,6 +738,7 @@ impl DeviceCache {
         let (free, total, tracked, rounding, unclaimed) = sample()?;
         let (_, level) = self.observer.observe(free, total, tracked, rounding, unclaimed);
         self.level = Some(level);
+        self.sample_physical(free, tracked);
         self.captured_since_observation = true;
         Ok(())
     }
@@ -722,6 +808,10 @@ impl DeviceCache {
         let room = may_capture(site.preference, growth, headroom, self.reserve,
             self.charged, self.pending_growth, self.pending_bytes, reuse);
         if allowed && room && old.is_none_or(|id| !self.records[&id].pending_destroy && !self.records[&id].pending_capture) {
+            // No CUDA query or ticket for a planned physical-headroom miss.
+            if !self.physical_room(estimate, headroom) {
+                return self.floor_skip(old, site.cycle);
+            }
             if !self.captured_since_observation {
                 if let Some(query) = &self.memory_query {
                     let sample = query.sample(self.device).map(|(free, total)| {
@@ -734,6 +824,12 @@ impl DeviceCache {
                         return Miss::Eager;
                     }
                 }
+            }
+            // The existing baseline query can reveal lower free memory than
+            // the boundary precheck. Honor that sample without another query.
+            if !self.physical_room(estimate, headroom) {
+                if !self.unmeasured { self.captured_since_observation = false; }
+                return self.floor_skip(old, site.cycle);
             }
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
@@ -765,6 +861,7 @@ impl DeviceCache {
             // A returning ghost enters frequency, a cold key enters recency.
             if !pinned { self.push(id, if ghost.is_some() { List::Frequent } else { List::Recent }); }
             self.pending_bytes = self.pending_bytes.saturating_add(estimate);
+            self.floor_resample_used = false;
 
             return Miss::Capture(id);
         }
@@ -906,6 +1003,7 @@ impl DeviceCache {
     }
 
     pub fn destroyed(&mut self, ids: &[u64], measurement: ReleaseMeasurement) {
+        if ids.iter().any(|id| self.records.contains_key(id)) { self.floor_resample_used = false; }
         // Observed free deltas remain available to alternate accounting adapters;
         // the default driver-arena model never credits physical release.
         let _ = measurement.released;
@@ -951,6 +1049,7 @@ impl DeviceCache {
 
     /// Forget destroyed owners, never crediting physical driver-arena release.
     pub fn remove_drained(&mut self, ids: &[u64]) {
+        if ids.iter().any(|id| self.records.contains_key(id)) { self.floor_resample_used = false; }
         if ids.iter().any(|id| self.records.get(id).is_some_and(|record|
             record.pinned || record.pending_destroy || matches!(record.list, Some(List::Recent | List::Frequent)))) {
             self.recovery_generation += 1;
@@ -991,7 +1090,7 @@ impl DeviceCache {
 
     fn trace_snapshot(&self) -> TraceSnapshot {
         let records = self.records.values().map(RawRecord::copy).collect();
-        TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve,
+        TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
             reserve_policy: self.reserve_policy, charged: self.charged, level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(),
@@ -1025,7 +1124,7 @@ impl DeviceCache {
             });
             records.into_iter().take(16).map(|record| self.row(record, now)).collect()
         };
-        Snapshot { device: self.device, reserve: self.reserve, reserve_policy: self.reserve_policy, charged: self.charged,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged,
             level: self.level,
             pinned: self.records.values().filter(|r| r.pinned).map(|r| r.bytes).sum(),
             pending_capture: self.pending_bytes, cycles: self.counters.clone(), pools: self.pools.clone(), basis: self.basis,
@@ -1889,6 +1988,152 @@ mod observer_tests {
         pending(&cache);
         observe_device_sampled(-99109, || Ok((675, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 50);
+    }
+
+    #[test]
+    fn physical_floor_policy_reinstall_is_idempotent() {
+        let policy = OnceLock::new();
+        install_physical_floor(&policy, Some("50MiB".into())).unwrap();
+        install_physical_floor(&policy, Some("50MiB".into())).unwrap();
+        assert!(install_physical_floor(&policy, Some("0".into())).is_err());
+    }
+
+    #[test]
+    fn monitor_sample_recovers_stuck_floor_and_ignores_older_reports() {
+        let device = -99125;
+        let cache = device_cache_sampled(device, 1000, Basis::Bytes,
+            || Ok((5, 1000, 0, 0, 0))).unwrap();
+        cache.lock().unwrap().physical_floor = 50;
+        let site = Site { name: "floor-monitor-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+        let stale = Instant::now();
+        observe_device_sampled(device, || Ok((5, 1000, 0, 0, 0))).unwrap();
+        monitor_physical(device, stale, 1000, 0);
+        assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+        assert!(!cache.lock().unwrap().needs_boundary());
+        let (level, charged) = { let cache = cache.lock().unwrap(); (cache.level, cache.charged) };
+        monitor_physical(device, Instant::now(), 1000, 0);
+        let mut cache = cache.lock().unwrap();
+        assert_eq!((cache.level, cache.charged), (level, charged));
+        assert!(cache.floor_resample_used, "monitor must not reset bounded refresh or OOM state");
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn refreshed_capture_baseline_must_also_honor_the_floor() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 1000, 995)?;
+        let mut cache = DeviceCache::new(6, 1000);
+        cache.physical_floor = 50;
+        cache.sample_physical(1000, 0);
+        cache.memory_query = Some(library.physical_memory_query()?);
+        let site = Site { name: "floor-refresh-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        let before = fixture.memory_queries(&library)?;
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Eager));
+        assert_eq!(fixture.memory_queries(&library)?, before + 1);
+        assert_eq!((cache.next_id, cache.pending_bytes, cache.pending_growth), (0, 0, 0));
+        assert!(!cache.unmeasured);
+        assert!(!cache.captured_since_observation);
+        Ok(())
+    }
+
+    #[test]
+    fn physical_floor_skips_without_ticket_query_or_cooldown() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 1000, 995)?;
+        let mut cache = DeviceCache::new(6, 1000);
+        cache.physical_floor = 50;
+        cache.sample_physical(5, 0);
+        cache.memory_query = Some(library.physical_memory_query()?);
+        let site = Site { name: "floor-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: true };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        let before = fixture.memory_queries(&library)?;
+        for _ in 0..4 {
+            assert!(matches!(cache.miss(key.clone(), site, None, false), Miss::Eager));
+        }
+        assert_eq!(fixture.memory_queries(&library)?, before);
+        assert_eq!((cache.next_id, cache.pending_bytes, cache.pending_growth), (0, 0, 0));
+        assert!(cache.records.is_empty());
+        assert!(!cache.unmeasured);
+        assert!(cache.floor_resample_pending);
+        let stats = serde_json::to_value(cache.snapshot())?;
+        assert_eq!(stats["cycles"]["decode"]["physical_floor_skips"], 4);
+        assert_eq!(stats["cycles"]["decode"]["eager_runs"], 4);
+        // Adequate headroom permits the same key immediately: no OOM cooldown.
+        fixture.configure_memory_usage(&library, 6, 1000, 100)?;
+        cache.sample_physical(900, 0);
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
+        assert_eq!(fixture.memory_queries(&library)?, before + 1, "only the existing baseline query");
+        Ok(())
+    }
+
+    #[test]
+    fn physical_floor_honors_estimate_headroom_pending_growth_and_disable() {
+        let site = Site { name: "floor-size-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: true };
+        let key = |key| Identity { bank: 1, site: site.name, key, shape: "floor".into() };
+        let mut cache = DeviceCache::new(-99122, 10_000);
+        cache.physical_floor = 50;
+        cache.sample_physical(250, 0);
+        let large = Estimate { bytes: 101, nodes: None, node_rate: 1, graph_rate: 0, parallel_width: 1 };
+        assert!(matches!(cache.miss(key(1), site, Some(large), false), Miss::Eager));
+        assert!(matches!(cache.miss(key(1), site, None, false), Miss::Capture(_)));
+        assert_eq!(cache.pending_growth, 10);
+        cache.sample_physical(79, 0);
+        assert!(matches!(cache.miss(key(2), site, None, false), Miss::Eager));
+        cache.physical_floor = 0;
+        cache.sample_physical(0, 0);
+        assert!(matches!(cache.miss(key(2), site, None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn physical_floor_subtracts_ledger_growth_without_crediting_frees() {
+        use cuteafd_ffi::memory_ledger::{self, MemoryKind, Space};
+        let device = -99123;
+        let mut cache = DeviceCache::new(device, 1000);
+        cache.physical_floor = 50;
+        cache.sample_physical(100, 0);
+        let tag = memory_ledger::tag(MemoryKind::Workspace, "physical-floor-test");
+        let ptr = 0x173100;
+        memory_ledger::record_tagged(Space::Device, device, ptr, 40, tag);
+        assert!(!cache.physical_room(10, 10));
+        memory_ledger::record_released(ptr);
+        assert!(cache.physical_room(10, 10));
+        cache.sample_physical(60, 40);
+        assert!(!cache.physical_room(10, 10), "unobserved frees cannot inflate physical free");
+    }
+
+    #[test]
+    fn physical_floor_requests_only_one_boundary_sample_until_state_changes() {
+        let device = -99124;
+        let cache = device_cache_sampled(device, 1000, Basis::Bytes,
+            || Ok((5, 1000, 0, 0, 0))).unwrap();
+        cache.lock().unwrap().physical_floor = 50;
+        let site = Site { name: "floor-boundary-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = |key| Identity { bank: 1, site: site.name, key, shape: "floor".into() };
+        assert!(matches!(cache.lock().unwrap().miss(key(1), site, None, false), Miss::Eager));
+        observe_device_sampled(device, || Ok((5, 1000, 0, 0, 0))).unwrap();
+        for _ in 0..4 {
+            assert!(matches!(cache.lock().unwrap().miss(key(1), site, None, false), Miss::Eager));
+            observe_device_sampled(device, || panic!("stuck floor must not sample each step")).unwrap();
+        }
+        cache.lock().unwrap().sample_physical(1000, 0);
+        let Miss::Capture(id) = cache.lock().unwrap().miss(key(1), site, None, false) else { panic!() };
+        observe_device_sampled(device, || Ok((5, 1000, 0, 0, 0))).unwrap();
+        assert!(matches!(cache.lock().unwrap().miss(key(2), site, None, false), Miss::Eager));
+        assert!(cache.lock().unwrap().needs_boundary(), "new capture resets the resample allowance");
+        observe_device_sampled(device, || Ok((5, 1000, 0, 0, 0))).unwrap();
+        cache.lock().unwrap().destroyed(&[id], ReleaseMeasurement { released: 0 });
+        assert!(matches!(cache.lock().unwrap().miss(key(2), site, None, false), Miss::Eager));
+        assert!(cache.lock().unwrap().needs_boundary(), "retirement resets the allowance");
     }
 
     #[test]

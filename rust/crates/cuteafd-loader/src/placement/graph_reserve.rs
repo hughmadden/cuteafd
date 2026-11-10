@@ -151,6 +151,12 @@ pub fn resolve(text: Option<&str>, rank: usize, spark: bool, base: u64, tail: u6
     resolve_with_extra(text, None, None, rank, spark, base, tail)
 }
 
+/// Physical capture floor, independent of graph ownership and GPU_RESERVE.
+pub fn physical_floor(text: Option<&str>, rank: usize, memory_padding: u64) -> Result<u64, Error> {
+    let key = "GRAPH_DISABLE_LOW_MEM";
+    select(text, rank, false, key, false)?.map_or(Ok(memory_padding / 2), |value| value.bytes(key, 0))
+}
+
 pub fn current(rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
     let read = |key: &'static str| match std::env::var(key) {
         Ok(value) => Ok(Some(value)),
@@ -181,6 +187,19 @@ pub fn prewarm_selection(pinned: &[bool], bases: &[u64],
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn physical_floor_defaults_selectors_and_disable() {
+        assert_eq!(physical_floor(None, 0, 100 << 20).unwrap(), 50 << 20);
+        assert_eq!(physical_floor(None, 0, 0).unwrap(), 0);
+        assert_eq!(physical_floor(Some("75MB"), 1, 100).unwrap(), 75_000_000);
+        assert_eq!(physical_floor(Some("gpu0=0,gpu1=25MiB"), 0, 100).unwrap(), 0);
+        assert_eq!(physical_floor(Some("gpu0=0,gpu1=25MiB"), 1, 100).unwrap(), 25 << 20);
+        assert_eq!(physical_floor(Some("gpu0=0,gpu1=25MiB"), 2, 100).unwrap(), 50);
+        for invalid in ["10%", "gpu0=1,gpu0=2", "gpu1=no", "spark=1", "gpu01=1"] {
+            assert!(physical_floor(Some(invalid), 0, 100).is_err(), "{invalid}");
+        }
+    }
+
     #[test]
     fn defaults_bound_shared_headroom_by_the_trace_base() {
         for (base, charged) in [(109_000_000, 218_000_000), (5_100_000_000, 5_600_000_000)] {

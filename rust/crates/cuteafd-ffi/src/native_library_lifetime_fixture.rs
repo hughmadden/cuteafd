@@ -350,6 +350,14 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn memory_queries(&self, library: &NativeLibrary) -> Result<usize> {
+        // SAFETY: this export reads a counter from this CPU-only fixture DSO.
+        unsafe {
+            let queries: Symbol<unsafe extern "C" fn() -> usize> = library.lib.get(b"fixture_memory_queries")?;
+            Ok(queries())
+        }
+    }
+
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
         self.configure_memory_usage(library, device, total, 0)
     }

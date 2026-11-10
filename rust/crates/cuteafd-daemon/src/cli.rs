@@ -121,6 +121,9 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
+    #[arg(long, global = true)]
+    pub(crate) graph_disable_low_mem: Option<String>,
     /// Spark prefill expert replies. Explicit selections apply even to small units.
     /// Omission keeps BF16 combined replies and Muse's split NVFP4 partial replies.
     #[arg(long, global = true, env = "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT")]
@@ -858,6 +861,16 @@ mod tests {
         let outer = super::MemoryArgs { gpu_memory_cap: Some(1), family_reserve: Some(2), ..Default::default() };
         let inner = super::MemoryArgs { gpu_memory_cap: Some(3), ..Default::default() };
         assert_eq!((inner.or(outer).gpu_memory_cap, inner.or(outer).family_reserve), (Some(3), Some(2)));
+    }
+
+    #[test]
+    fn graph_physical_floor_is_a_global_size_or_device_selection() {
+        use clap::Parser;
+        for argv in [vec!["cuteafd", "--graph-disable-low-mem", "gpu0=0,gpu1=50MiB", "plan", "/model"],
+            vec!["cuteafd", "plan", "/model", "--graph-disable-low-mem", "gpu0=0,gpu1=50MiB"]] {
+            let cli = super::Cli::try_parse_from(argv).unwrap();
+            assert_eq!(cli.graph_disable_low_mem.as_deref(), Some("gpu0=0,gpu1=50MiB"));
+        }
     }
 
     #[test]
