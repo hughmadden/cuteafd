@@ -1981,12 +1981,9 @@ impl Opened {
         let staging_bytes = vocabulary_plan.staging_bytes() as u64;
         admitted.validate_vocabulary(staging_bytes)?;
         let vocabulary = NativeVocabulary::load_prepared_with(&self.library, programs,
-            vocabulary_plan, staging_bytes, devices[0], |name, bytes| {
-                let (table, suffix) = name.split_once('.').context("native vocabulary plane key")?;
-                let suffix = match suffix { "payload" => "fp8", "scales" => "scale",
-                    _ => anyhow::bail!("unexpected native vocabulary plane {name}") };
-                loader.allocate_owner(&format!("vocabulary.{table}.{suffix}"), bytes)
-            })?.context("rank 0 owns the native vocabulary")?;
+            vocabulary_plan, staging_bytes, devices[0], |name, bytes|
+                loader.allocate_owner(&format!("vocabulary.{name}"), bytes))?
+            .context("rank 0 owns the native vocabulary")?;
         let vocabulary = std::rc::Rc::new(vocabulary);
         let source = self.native_embed_source()?;
         let embedding = crate::shared::token_io::TokenEmbedding::row_fp8_with(&self.library, source,
