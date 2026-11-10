@@ -1,6 +1,6 @@
 //! Kimi K3 prewarm shapes and per-layout graph reserve.
 //!
-//! Each coordinator layout (rank count) captures a different inventory: TP2
+//! Each core format and coordinator layout captures a different inventory: TP2
 //! peer segments and RTX expert onboarding change which sites exist, so the
 //! checked-in list carries one row per layout and admission reserves that
 //! row's arena on every physical device.
@@ -17,6 +17,17 @@
 //! runs eagerly inside a row window: its keys never replay and are not prewarmed (#1646).
 
 use std::sync::OnceLock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KimiCoreFormat { Bf16, K6 }
+
+impl KimiCoreFormat {
+    /// Header-native trellis inventory, not a repository name or HQA mode.
+    pub fn from_inventory(core: &crate::families::kimi_k3::core::CoreInventory) -> Self {
+        if core.projections.is_empty() { Self::Bf16 } else { Self::K6 }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -39,6 +50,7 @@ pub struct KimiPrewarmEntry {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KimiPrewarmLayout {
+    pub core: KimiCoreFormat,
     /// Coordinator ranks this row was measured on.
     pub ranks: usize,
     pub layout: String,
@@ -61,7 +73,9 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
             .expect("checked-in Kimi K3 prewarm list");
         assert_eq!(list.schema_version, 1);
         assert_eq!(list.family, "kimi_k3");
+        let mut keys = std::collections::HashSet::new();
         for layout in &list.layouts {
+            assert!(keys.insert((layout.core, layout.ranks)), "duplicate Kimi prewarm key");
             assert_eq!(layout.reserve_base_bytes.len(), layout.ranks, "Kimi per-rank graph bases");
         }
         list
@@ -70,18 +84,21 @@ fn kimi_prewarm_list() -> &'static KimiPrewarmList {
 
 /// An untraced layout prewarms unpinned bootstrap geometry, never another
 /// layout's geometries or pins.
-pub fn kimi_layout(ranks: usize) -> &'static KimiPrewarmLayout {
+pub fn kimi_layout(core: KimiCoreFormat, ranks: usize) -> &'static KimiPrewarmLayout {
     let list = kimi_prewarm_list();
-    list.layouts.iter().find(|layout| layout.ranks == ranks)
+    list.layouts.iter().find(|layout| layout.core == core && layout.ranks == ranks)
         .unwrap_or_else(|| {
-            tracing::warn!(ranks, "Kimi graph prewarm trace missing for layout; using bootstrap startup set");
-            kimi_bootstrap_layout()
+            tracing::warn!(?core, ranks, "Kimi graph prewarm trace missing for core/layout; using bootstrap startup set");
+            kimi_bootstrap_layout(core)
         })
 }
 
-fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
-    static BOOTSTRAP: OnceLock<KimiPrewarmLayout> = OnceLock::new();
-    BOOTSTRAP.get_or_init(|| KimiPrewarmLayout {
+fn kimi_bootstrap_layout(core: KimiCoreFormat) -> &'static KimiPrewarmLayout {
+    static BF16: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    static K6: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6 };
+    bootstrap.get_or_init(|| KimiPrewarmLayout {
+        core,
         ranks: 0,
         layout: "bootstrap startup set (untraced)".into(),
         reserve_base_bytes: vec![],
@@ -94,9 +111,9 @@ fn kimi_bootstrap_layout() -> &'static KimiPrewarmLayout {
 }
 
 /// Per-device measured prewarm base and allocation tail.
-pub fn kimi_reserve(ranks: usize, rank: usize) -> (u64, u64) {
+pub fn kimi_reserve(core: KimiCoreFormat, ranks: usize, rank: usize) -> (u64, u64) {
     assert!(rank < ranks, "Kimi graph reserve rank");
-    let layout = kimi_layout(ranks);
+    let layout = kimi_layout(core, ranks);
     let base = if layout.ranks == 0 {
         crate::families::kimi_k3::allocation::graph_census(ranks, rank).0
     } else {
@@ -135,7 +152,7 @@ mod tests {
     #[test]
     fn every_layout_names_its_shapes_and_reserves_each_physical_rank() {
         let list = kimi_prewarm_list();
-        assert_eq!(list.layouts.len(), 2);
+        assert!(list.layouts.len() >= 2);
         for layout in &list.layouts {
             assert!(layout.ranks >= 1 && !layout.layout.is_empty());
             assert_eq!(layout.reserve_base_bytes.len(), layout.ranks);
@@ -145,19 +162,31 @@ mod tests {
         }
         for layout in &list.layouts {
             for rank in 0..layout.ranks {
-                assert_eq!(kimi_reserve(layout.ranks, rank).0, layout.reserve_base_bytes[rank]);
+                assert_eq!(kimi_reserve(layout.core, layout.ranks, rank).0, layout.reserve_base_bytes[rank]);
             }
         }
-        assert_eq!(kimi_layout(9).ranks, 0, "untraced layouts use bootstrap, not another row");
-        assert_eq!(kimi_reserve(9, 0).0,
+        assert_eq!(kimi_layout(KimiCoreFormat::K6, 9).ranks, 0, "untraced layouts use bootstrap, not another row");
+        assert_eq!(kimi_reserve(KimiCoreFormat::K6, 9, 0).0,
             crate::families::kimi_k3::allocation::graph_census(9, 0).0);
-        assert_eq!(kimi_reserve(1, 0).1, 2 << 20);
-        assert_eq!(kimi_reserve(2, 1).1, 2 << 20);
+        assert_eq!(kimi_reserve(KimiCoreFormat::K6, 1, 0).1, 2 << 20);
+        assert_eq!(kimi_reserve(KimiCoreFormat::K6, 2, 1).1, 2 << 20);
+    }
+
+    #[test]
+    fn untraced_core_never_borrows_the_k6_rank_inventory_or_base() {
+        let layout = kimi_layout(KimiCoreFormat::Bf16, 1);
+        assert_eq!(layout.core, KimiCoreFormat::Bf16);
+        assert_eq!(layout.ranks, 0);
+        assert!(layout.entries.iter().all(|entry| !entry.pin && entry.capture_bytes.is_empty()));
+        assert_eq!(kimi_reserve(KimiCoreFormat::Bf16, 1, 0).0,
+            crate::families::kimi_k3::allocation::graph_census(1, 0).0);
+        assert_ne!(kimi_reserve(KimiCoreFormat::Bf16, 1, 0), kimi_reserve(KimiCoreFormat::K6, 1, 0));
+        assert_eq!(KimiCoreFormat::from_inventory(&Default::default()), KimiCoreFormat::Bf16);
     }
 
     #[test]
     fn bootstrap_only_contains_replayable_rows() {
-        let layout = kimi_bootstrap_layout();
+        let layout = kimi_bootstrap_layout(KimiCoreFormat::Bf16);
         for entry in &layout.entries {
             assert!((1..=64).contains(&entry.rows));
         }
@@ -168,7 +197,7 @@ mod tests {
 
     #[test]
     fn untraced_layout_prewarms_bootstrap_without_pinning() {
-        let layout = kimi_layout(9);
+        let layout = kimi_layout(KimiCoreFormat::K6, 9);
         assert_eq!(layout.ranks, 0);
         assert!(!layout.entries.is_empty());
         assert!(layout.entries.iter().all(|entry| !entry.pin));
@@ -183,7 +212,7 @@ mod tests {
 
     #[test]
     fn selection_stays_within_the_layout_operation_and_verify_variant() {
-        let layout = KimiPrewarmLayout { ranks: 1, layout: "test".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "test".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
                 op: Some(KimiPrewarmOp::Attention), capture_bytes: vec![] }] };
@@ -196,7 +225,7 @@ mod tests {
 
     #[test]
     fn context_entry_selects_only_its_exact_context_variant() {
-        let layout = KimiPrewarmLayout { ranks: 2, layout: "context".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 2, layout: "context".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 16, speculative: false, pin: true,
                 op: Some(KimiPrewarmOp::Context), capture_bytes: vec![] }] };
@@ -209,7 +238,7 @@ mod tests {
 
     #[test]
     fn ffn_entries_select_only_their_own_operation_class() {
-        let layout = KimiPrewarmLayout { ranks: 1, layout: "ffn".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "ffn".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![KimiPrewarmEntry { rows: 20, speculative: false, pin: false,
                 op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] }] };

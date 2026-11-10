@@ -243,6 +243,13 @@ pub(crate) struct NativePrograms<'a> {
     wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
 }
 
+impl NativePrograms<'_> {
+    pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
+        use cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat;
+        if self.core.is_some() { KimiCoreFormat::K6 } else { KimiCoreFormat::Bf16 }
+    }
+}
+
 pub(crate) struct MlaPrograms<'a> {
     pub decode: super::mla::Mla<'a>,
     pub verify: super::mla::Mla<'a>,
@@ -824,6 +831,10 @@ impl<'a> LocalLane<'a> {
         self.kda.zero_startup_state()
     }
 
+    pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
+        self.programs.graph_core()
+    }
+
     /// Attach this lane to its device's bounded cache and prewarm the pinned
     /// geometry. Returns how many executables were captured; a refusal only
     /// leaves that geometry lazy.
@@ -834,7 +845,7 @@ impl<'a> LocalLane<'a> {
         let staged = self.attention.take();
         let mut graphs = super::graphs::Graphs::new();
         let result = graphs.attach(stream.device.library, stream.device.id, self.programs.ranks, rank, reserve)
-            .and_then(|()| graphs.prewarm(&stream, self.programs.ranks, keys,
+            .and_then(|()| graphs.prewarm(&stream, self.programs.graph_core(), self.programs.ranks, keys,
                 |key| self.submit_startup_graph(key)));
         self.attention = staged;
         let captured = result?;
@@ -926,7 +937,7 @@ impl<'a> LocalLane<'a> {
         let Some(mut graphs) = self.graphs.take() else { return body(self) };
         let stream = self.stream().clone();
         let key = super::graphs::Key { lane: self.lane_index, rank: self.rank, rows, op };
-        let pinned = super::graphs::pinned(self.programs.ranks, key);
+        let pinned = super::graphs::pinned(self.programs.graph_core(), self.programs.ranks, key);
         // A golden capture records its own sites inside the body; a recorded
         // stream cannot contain those reads.
         let allow_capture = self.capture.is_none();

@@ -115,6 +115,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     ensure!(spark_ranks <= cuteafd_core::MAX_SPARK_WORLD, "Kimi Spark peer inventory exceeds eight");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
+    let graph_core = cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(&core);
     if RANKS == 2 {
         ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
             == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
@@ -224,7 +225,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     // One configured arena per physical device: admission owns it, and the
     // startup capture boundary measures inside it.
     let reserve_demands = if graph_set.is_some() {
-        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(RANKS)?
+        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(graph_core, RANKS)?
     } else { Vec::new() };
     let reserves: [u64; RANKS] = std::array::from_fn(|rank|
         reserve_demands.get(rank).map_or(0, |demand| demand.bytes));
@@ -367,16 +368,16 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         // Prewarm reachable decode/verify geometry only; row-window prefill
         // stays eager and unselected replayable geometry can capture lazily.
         let prewarm = super::graphs::prewarm_keys(cfg, &set.keys,
-            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), options.slots, unit);
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), options.slots, unit);
         let policies = (0..RANKS).map(|rank| {
-            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(RANKS, rank);
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(graph_core, RANKS, rank);
             cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)
         }).collect::<std::result::Result<Vec<_>, _>>()?;
         let bases = policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
         let bootstraps = (0..RANKS).map(|rank|
             cuteafd_loader::serving_capacity::kimi_prewarm::kimi_bootstrap(RANKS, rank)).collect::<Vec<_>>();
         let prewarm = super::graphs::fit_prewarm(prewarm,
-            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(RANKS), &bases, &bootstraps);
+            cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), &bases, &bootstraps);
         tracing::info!(entries = prewarm.len(), attention_entries = prewarm.iter()
             .filter(|key| matches!(key.op, super::graphs::Op::Attention { .. })).count(),
             "Kimi selected startup prewarm keys");

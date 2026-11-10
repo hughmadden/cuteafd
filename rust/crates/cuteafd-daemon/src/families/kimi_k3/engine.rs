@@ -581,7 +581,7 @@ impl<'a> Engine<'a> {
         for (rank, stream) in self.exchange_streams.iter().enumerate() {
             controllers.push(crate::shared::decode_graph::device::device_cache(stream.device.library,
                 stream.device.id, reserves[rank], crate::shared::decode_graph::device::Basis::Bytes)?);
-            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(reserves.len(), rank);
+            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(lanes.local[0][0].graph_core(), reserves.len(), rank);
             let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
             crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policy)?;
             crate::shared::decode_graph::device::observe_device(stream.device.library, stream.device.id)?;

@@ -244,9 +244,11 @@ def kimi_lifetime_pins(identities):
     return reasons
 
 
-def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
+def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None, *, core):
     """One layout row: lifetime-hot and rolling/churn pins plus unpinned request
     coverage. Prefill rows stay eager and never replay (#1646)."""
+    if core not in ("bf16", "k6"):
+        raise ValueError("kimi_k3 needs --variant bf16 or k6 for the checkpoint core key")
     if ranks < 1 or not layout:
         raise ValueError("kimi_k3 needs a coordinator rank count and layout name")
     if not 0 < coverage <= 1:
@@ -371,21 +373,22 @@ def generate_kimi(traces, ranks, layout, coverage=0.999, pin_report=None):
                                        sum(int(graph["permanent_bytes"]) for graph in graphs) if known else None,
                                    "observed_capture_bytes": sum(int(graph.get("capture_bytes") or 0) for graph in graphs),
                                    "full_geometry_cost_bytes": None})
-    return {"ranks": ranks, "layout": layout,
+    return {"core": core, "ranks": ranks, "layout": layout,
             "reserve_base_bytes": bases, "reserve_extra_bytes": CHUNK,
             "entries": entries}
 
 
 
 def merge_kimi_layout(path, row):
-    """Replace one layout row so a min and a max trace update one list."""
+    """Replace one core/layout row, preserving every other key's evidence."""
     data = {"schema_version": 1, "family": "kimi_k3", "layouts": []}
     if path.exists():
         data = json.loads(path.read_text())
         if data.get("family") != "kimi_k3" or data.get("schema_version") != 1:
             raise ValueError(f"{path} is not a Kimi K3 prewarm list")
-    layouts = [layout for layout in data["layouts"] if int(layout["ranks"]) != row["ranks"]] + [row]
-    data["layouts"] = sorted(layouts, key=lambda layout: int(layout["ranks"]))
+    layouts = [layout for layout in data["layouts"]
+               if (layout["core"], int(layout["ranks"])) != (row["core"], row["ranks"])] + [row]
+    data["layouts"] = sorted(layouts, key=lambda layout: (layout["core"], int(layout["ranks"])))
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
@@ -1825,7 +1828,7 @@ def main():
     parser.add_argument("--coverage", type=float, default=0.999)
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
     parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
-    parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
+    parser.add_argument("--variant", help="checkpoint variant: MiMo program/layers (mimof-48), Kimi core (bf16 or k6)")
     parser.add_argument("--onboard-layers", type=int, help="Muse resolved onboarded layer prefix")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
@@ -1875,7 +1878,7 @@ def main():
             if args.ranks is None or args.layout is None:
                 raise ValueError("kimi_k3 needs --ranks and --layout")
             result = generate_kimi([json.loads(Path(path).read_text()) for path in args.trace],
-                                   args.ranks, args.layout, args.coverage, report)
+                                   args.ranks, args.layout, args.coverage, report, core=args.variant)
         elif args.family == "qwen4":
             traces = [json.loads(Path(spec).read_text()) for spec in args.trace]
             result = generate_qwen(traces, args.shape, args.coverage, report, summary)
@@ -1938,7 +1941,8 @@ def main():
         for pin in report:
             print("pin " + json.dumps(pin, sort_keys=True))
         return
-    values = result["layouts"].values() if "layouts" in result else result.get("ranks", [result])
+    values = (result["layouts"].values() if "layouts" in result else
+              [result] if args.family == "kimi_k3" else result.get("ranks", [result]))
     for values in values:
         pinned = sum(entry["pin"] for entry in values["entries"])
         if "measured_bytes" in values:

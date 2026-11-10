@@ -19,10 +19,10 @@ pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
         .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
 }
 
-/// Kimi K3 selects its arena by coordinator layout (rank count): TP2 captures a
+/// Kimi K3 selects its arena by checkpoint core format and coordinator rank count: TP2 captures a
 /// different inventory than a single coordinator.
-pub fn kimi_default(ranks: usize, rank: usize) -> (u64, u64) {
-    crate::serving_capacity::kimi_prewarm::kimi_reserve(ranks, rank)
+pub fn kimi_default(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize, rank: usize) -> (u64, u64) {
+    crate::serving_capacity::kimi_prewarm::kimi_reserve(core, ranks, rank)
 }
 pub fn source(id: &str) -> String { format!("graph reserve: {id}") }
 pub fn is_source(source: &str) -> bool { source.starts_with("graph reserve: ") || source.starts_with("startup graphs: ") }
