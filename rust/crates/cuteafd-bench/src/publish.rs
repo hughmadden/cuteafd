@@ -34,6 +34,7 @@ pub fn family_title(family: &str) -> &str {
         "mistral_large4" => "Mistral Large 4",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
+        "muse_spark" => "Muse Spark",
         "qwen4" => "Qwen 3.8",
         "qwen3_5" => "Qwen 3.5 / 3.8 dense",
         "kimi_k3" => "Kimi K3",
@@ -333,12 +334,65 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 ///
 /// A re-render that fails is the publisher's error, not a run without that
 /// export: publishing stops rather than leave the stale image in place.
-/// The committed copy of a placed `report.json`: per-row fidelity and probe rows and
-/// the baseline's duplicate fabric counters are measurement scratch (several MB
-/// per report). The verdict is set once, when the report is published from its
-/// full rows (`slim_placed`); a slimmed report keeps it (`quality::bar_met`).
-/// Run directories keep the full report for paired fidelity comparisons.
+/// The committed copy of a placed `report.json` keeps rendered measurements and
+/// audit summaries, not request payloads, pool snapshots or raw NIC counters.
+/// The verdict is set once from the full rows (`slim_placed`); a slimmed report
+/// keeps it (`quality::bar_met`). Run directories retain the full report.
 pub fn slim(report: &mut Value) {
+    fn fabric(phase: &mut Value) {
+        if let Some(ports) = phase.get_mut("ports").and_then(Value::as_array_mut) {
+            for port in ports {
+                // Keep the field for old readers; rates, health and peer attribution
+                // are already computed and are what the SVG and dashboard consume.
+                if let Some(counters) = port.get_mut("counters") {
+                    *counters = serde_json::json!({});
+                }
+            }
+        }
+    }
+    fn record(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(record),
+            Value::Object(object) => {
+                for key in ["requests", "warm_requests", "cold_response", "completed_response",
+                    "retained_prewarm", "attempted_assistant", "assistant_replay",
+                    "pool_before", "pool_samples", "pool_after"] {
+                    object.remove(key);
+                }
+                if let Some(phase) = object.get_mut("fabric") {
+                    fabric(phase);
+                }
+                object.values_mut().for_each(record);
+            }
+            _ => {}
+        }
+    }
+    if let Some(phases) = report.get_mut("fabric").and_then(Value::as_array_mut) {
+        phases.iter_mut().for_each(fabric);
+    }
+    if let Some(panels) = report.get_mut("panels").and_then(Value::as_array_mut) {
+        for panel in panels {
+            let info = matches!(panel["id"].as_str(), Some("hardware" | "configuration"));
+            for key in ["passes", "history", "partial"] {
+                if let Some(records) = panel.get_mut(key) {
+                    record(records);
+                    if info {
+                        let strip = |value: &mut Value| {
+                            if let Some(object) = value.as_object_mut() {
+                                for key in ["hardware", "configuration", "build", "model", "family", "revision"] {
+                                    object.remove(key);
+                                }
+                            }
+                        };
+                        match records {
+                            Value::Array(values) => values.iter_mut().for_each(strip),
+                            value => strip(value),
+                        }
+                    }
+                }
+            }
+        }
+    }
     if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
         baseline.remove("fabric");
         if let Some(checks) = baseline.get_mut("quality").and_then(|q| q.get_mut("checks")).and_then(Value::as_array_mut) {
@@ -438,7 +492,8 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 7] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4", "mimo_v2", "qwen4"];
+const FAMILIES: [&str; 11] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
+    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -904,6 +959,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn release_smoke_families_have_named_publication_pages() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let smoke: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+        let families: BTreeSet<_> = smoke["entries"].as_array().unwrap().iter()
+            .map(|entry| entry["family"].as_str().unwrap()).collect();
+        assert!(!families.is_empty());
+        for family in families {
+            assert!(FAMILIES.contains(&family), "{family} is missing from FAMILIES");
+            assert_ne!(family_title(family), family, "{family} needs a display title");
+            assert!(root.join("docs/models").join(format!("{family}.md")).is_file(),
+                "{family} needs its publication page");
+        }
+        assert_eq!(family_title("muse_spark"), "Muse Spark");
+    }
 
     /// A publication marker: cell selection reads report data, never a directory name.
     fn marker(p: &mut Placed, name: &str, value: &str) {
@@ -1798,15 +1870,106 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
 
+    fn assert_slim_exports_identical(full: Value) -> Value {
+        let before: Report = serde_json::from_value(full.clone()).unwrap();
+        let mut slimmed = full;
+        slim(&mut slimmed);
+        let after: Report = serde_json::from_value(slimmed.clone()).unwrap();
+        let placed = |report| vec![Placed { dir: PathBuf::from("benchmarks/deepseek_v41/rc1"), report }];
+        let full = placed(before.clone());
+        let slimmed_placed = placed(after.clone());
+        let matrix = one_row_of(&full[0]);
+        assert_eq!(results(&full, &matrix).unwrap(), results(&slimmed_placed, &matrix).unwrap());
+        assert_eq!(index(&full), index(&slimmed_placed));
+        let published = BTreeSet::from([full[0].dir.clone()]);
+        assert_eq!(family_cards(&select(&full, &matrix).unwrap(), &published, "deepseek_v41"),
+            family_cards(&select(&slimmed_placed, &matrix).unwrap(), &published, "deepseek_v41"));
+        let mut exports = vec!["card.svg".to_string(), "report.svg".to_string()];
+        exports.extend(crate::render::report::shown(&before).iter().map(|id| format!("panel-{id}.svg")));
+        for name in exports {
+            assert_eq!(crate::http::export(&before, &name).unwrap(),
+                crate::http::export(&after, &name).unwrap(), "{name}");
+        }
+        assert!(serde_json::to_vec(&slimmed).unwrap().len() < 2_000_000);
+        slimmed
+    }
+
     #[test]
-    fn slim_drops_per_row_records_and_baseline_fabric_only() {
+    fn slim_rc1_shaped_report_preserves_all_publication_exports() {
+        let mut full = serde_json::to_value(crate::sample::full_report()).unwrap();
+        let raw = serde_json::json!({"content": "payload".repeat(100_000)});
+        let point = serde_json::json!({"kind": "cached follow-up", "c": 4, "status": "ok",
+            "aggregate_tok_s": 123.0, "per_request_tok_s": 30.75, "ttft_s": 0.1,
+            "end_to_end_s": 2.0, "requests": [raw.clone()], "pool_samples": [raw.clone()]});
+        full["panels"].as_array_mut().unwrap().push(serde_json::json!({
+            "id": "shared_prefix", "title": "Shared-prefix release guard", "status": "done",
+            "passes": [{"points": [point.clone()], "identical": [point.clone()],
+                "retained": {"bases": [{"cold_response": raw}], "points": [point]},
+                "thermal": {"seconds": 2.0}}]
+        }));
+        assert!(serde_json::to_vec(&full).unwrap().len() > 2_000_000);
+        assert_slim_exports_identical(full);
+    }
+
+    /// Run with CUTEAFD_TEST_SLIM_REPORT pointing at an unmodified run report.
+    #[test]
+    #[ignore = "requires an external full Release smoke report"]
+    fn slim_real_rc1_report_preserves_all_publication_exports() {
+        let path = std::env::var_os("CUTEAFD_TEST_SLIM_REPORT").expect("CUTEAFD_TEST_SLIM_REPORT");
+        let text = std::fs::read_to_string(path).unwrap();
+        let full = serde_json::from_str(&text).unwrap();
+        let slimmed = assert_slim_exports_identical(full);
+        let encoded = serde_json::to_vec(&slimmed).unwrap();
+        eprintln!("RC1 full {} B -> slim {} B; all publication exports byte-identical", text.len(), encoded.len());
+        if let Some(path) = std::env::var_os("CUTEAFD_TEST_SLIM_OUTPUT") {
+            std::fs::write(path, encoded).unwrap();
+        }
+    }
+
+    #[test]
+    fn slim_drops_scratch_but_keeps_measurements_and_audit_summaries() {
         let mut report = serde_json::json!({
             "fabric": [{"name": "decode/code/c1"}],
             "baseline": {"fabric": [{"name": "decode/code/c1"}], "quality": {"status": "pass", "checks": [
                 {"id": "fidelity", "metrics": {"kl": 0.01, "probe": {"rows": [{"position": 0}], "cold": true},
                     "run": {"score": {"kl": 0.01, "records": [{"position": 0}]}}}},
                 {"id": "cache", "metrics": {"restored": 2}}]}}});
+        let scratch = serde_json::json!({
+            "requests": [{"content": "payload"}], "warm_requests": [{}],
+            "cold_response": {}, "completed_response": {}, "retained_prewarm": {},
+            "attempted_assistant": {}, "assistant_replay": {},
+            "pool_before": {}, "pool_samples": [{}], "pool_after": {},
+            "aggregate_tok_s": 123.0, "thermal": {"seconds": 10},
+            "cache_exact": {"status": "pass"}, "expert_usage": {"rows": [1]},
+            "mapped_tables": {"bytes": 12},
+            "fabric": {"ports": [{"counters": {"port_xmit_data": 99}, "sent_bytes": 99,
+                "peers": [{"peer": "spark", "sent_bytes": 90}], "health": {"verdict": "ok"}}]}
+        });
+        report["fabric"][0]["ports"] = scratch["fabric"]["ports"].clone();
+        report["panels"] = serde_json::json!([
+            {"id": "shared_prefix", "passes": [{"points": [scratch.clone()],
+                "retained": {"points": [scratch.clone()]}}], "partial": scratch.clone(), "history": [scratch.clone()]},
+            {"id": "configuration", "passes": [{"configuration": {"settings": []}, "build": {},
+                "model": "duplicate", "thermal": {"seconds": 10}}]},
+            {"id": "hardware", "passes": [{"hardware": {}, "readiness_s": 5}]}
+        ]);
         super::slim(&mut report);
+        let mut expected = scratch;
+        for key in ["requests", "warm_requests", "cold_response", "completed_response", "retained_prewarm",
+            "attempted_assistant", "assistant_replay", "pool_before", "pool_samples", "pool_after"] {
+            expected.as_object_mut().unwrap().remove(key);
+        }
+        expected["fabric"]["ports"][0]["counters"] = serde_json::json!({});
+        for path in ["/panels/0/passes/0/points/0", "/panels/0/passes/0/retained/points/0",
+            "/panels/0/partial", "/panels/0/history/0"] {
+            assert_eq!(report.pointer(path).unwrap(), &expected, "{path}");
+        }
+        assert_eq!(report["fabric"][0]["ports"], expected["fabric"]["ports"]);
+        assert_eq!(report["panels"][1]["passes"][0], serde_json::json!({"thermal": {"seconds": 10}}));
+        assert_eq!(report["panels"][2]["passes"][0], serde_json::json!({"readiness_s": 5}));
+        let before = report.clone();
+        super::slim(&mut report);
+        assert_eq!(report, before, "slimming is idempotent");
         assert!(report["baseline"].get("fabric").is_none());
         assert_eq!(report["fabric"][0]["name"], "decode/code/c1");
         assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["records"], serde_json::json!([]));
