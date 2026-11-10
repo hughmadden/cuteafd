@@ -286,7 +286,7 @@ orchestrator's to use; TJ isn't using these subscriptions.
 | CLI | Model | Launch flags | Expected strengths |
 |---|---|---|---|
 | `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
-| `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
+| `agy` (Google Antigravity) | `gemini-4-carbon-high` (default, TJ 2026-11-11), `gemini-4-carbon-medium`/`-low`, `gemini-4-argon-*`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
 
@@ -476,7 +476,7 @@ For a second opinion on a risky branch, have a different model review it
 than the one that wrote it (Opus or Astra reviewing Sol), given the diff and
 the gates, not the author's conclusion.
 
-Every big integration, port or shared-mechanism change gets a Gemini 4 Argon
+Every big integration, port or shared-mechanism change gets a Gemini 4 Carbon
 review before merge, as a standing step (TJ, 2026-10-28). Run it read-only on
 pinned SHAs, give it the problem classes seen so far as examples rather than
 limits, and run it alongside the A/B cards, not after them. It always runs

@@ -22,6 +22,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Claude Opus 5.5 (orchestrator) | design, review, merges, decisions | fast cross-task diagnosis (#191 Spark regression, stale CMake cache) | pushed a red commit once (61256a22); held agents for an answer while GPUs idled; wrong guesses before evidence (masked-V, cold-start) | this session |
 | Grok 4.7 (xAI, CLI `grok`) | bounded fixes, tests, races; design analysis with precise citations | found a real race behind a "flaky test"; challenged a wrong brief premise (#180 named V4.1/MiMo, but only GLM 5.3 uses the lane path); exact file:line citations (14/14 verified); caught a latent copies_pending bug | context fills fast (72% of 256K on a design task; needed a wrap-up nudge) | 6 tasks (1 kernel duel, lost) |
 | Gemini 4 Argon (Antigravity, CLI `agy`) | debugging kernels from symptoms; root-cause reasoning; design | finds hardware-level root causes and proves them with gdb/sanitizer evidence; creative reuse of the working sibling kernel | overstates its own result ("within ~1%" when 1.014–1.044x); one transient 503 on first call | 6 tasks: strong designs with exact numerics and API citations; creative reuse of existing code; usually 20–40 min, can grind on one sub-problem without a timebox; #499 V3 hang root-caused and fixed |
+| Gemini 4 Carbon High (Antigravity, CLI `agy`) | default Gemini since 2026-11-11: reviews, duels, research | — | — | none yet |
 
 ## Log
 

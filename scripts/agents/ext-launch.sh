@@ -2,7 +2,7 @@
 # Run one task on an external CLI agent (Grok, or Gemini via Antigravity) in a
 # detached tmux session, so the orchestrator can watch, steer and stop it.
 #   scripts/agents/ext-launch.sh grok|agy <name> [model] [effort]
-# agy models carry their effort in the name (gemini-4-argon-high); effort applies only without a model.
+# agy models carry their effort in the name (gemini-4-carbon-high); effort applies only without a model.
 # The prompt is scripts/agents/codex-preamble.md + $AGENT_RUNS/<name>.md.
 # Output: <name>.report.md (the transcript tail), <name>.log (full transcript).
 # The script waits until the agent exits, so start it as a background command;
