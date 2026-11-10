@@ -204,6 +204,7 @@ def derive(repo, matrix, scope='all', environ=None):
 
 
 def requirements(repo, matrix, scope):
+    packages = spark_packages_module()
     result = []
     for entry in entries_for(repo, matrix, scope):
         family, values, scopes = entry_scopes(repo, entry)
@@ -245,7 +246,7 @@ def requirements(repo, matrix, scope):
             tag, kind = item.split(':')
             if tag in ('dsv4f', 'dsv4p') and kind.startswith('spark'):
                 world = 4 if kind == 'spark' else int(kind.removeprefix('spark_tp'))
-                artifacts = spark_packages_module().native_spark_artifacts(tag)[world]
+                artifacts = packages.native_spark_artifacts(tag)[world]
                 native_spark_symbols[item] = [artifact.prefix(tag) + 'launch' for artifact in artifacts]
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=spark_experts, spark_layouts=spark_layouts,
