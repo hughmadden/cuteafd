@@ -107,6 +107,8 @@ historical recipe; new release launches use the v5 matrix.
 
 ## DeepSeek V4.1
 
+- 2026-11-10 · Release smoke · wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark · build v5.0.0-rc1 · [report](deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-stridedple-1rtx-4spark-v41-flash-strided-5090/report.svg)
+- 2026-11-10 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark · build v5.0.0-rc1 · [report](deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-5090/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE · 1× RTX PRO 6000 @ gpu-powerd 450 W (450–600) + 3× DGX Spark · build v5.0.0-rc1 · [report](deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-stridedple-1rtx-3spark-v41-flash-strided-min/report.svg)
 - 2026-11-10 · Release smoke · deepseek-ai/DeepSeek-V4.1-Flash-1017 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 3× DGX Spark · build v5.0.0-rc1 · [report](deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-min/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE · 2× RTX PRO 6000 @ gpu-powerd 460/435 W (300–565) + 6× DGX Spark · build v5.0.0-rc1 · [report](deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-stridedple-2rtx-6spark-v41-flash-strided-max/report.svg)

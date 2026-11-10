@@ -6,7 +6,7 @@
       "checkpoint": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
       "5090": {
         "status": "current",
-        "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-1rtx-3spark-v41-flash-5090"
+        "report": "benchmarks/deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-5090"
       },
       "1rtx": {
         "status": "current",
@@ -21,8 +21,8 @@
       "family": "deepseek_v41",
       "checkpoint": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
       "5090": {
-        "status": "na",
-        "reason": "\u2014"
+        "status": "current",
+        "report": "benchmarks/deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-stridedple-1rtx-4spark-v41-flash-strided-5090"
       },
       "1rtx": {
         "status": "current",
