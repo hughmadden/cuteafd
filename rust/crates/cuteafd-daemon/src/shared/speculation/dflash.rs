@@ -3305,7 +3305,7 @@ mod checkpoint_header_tests {
         assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
         let fixture = native_head_snapshot(4);
         let error = check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap_err().to_string();
-        assert!(error.contains("requires K6") && error.contains("found K4"), "{error}");
+        assert!(error.contains("unsupported dense core width K4") && error.contains("shipping widths [6]"), "{error}");
     }
 
     #[test]

@@ -104,7 +104,8 @@ fn contract_names_recipe_drift() {
     assert!(attention.rejections[0].reason.contains("expected BF16 [12288, 512]"), "{:?}", attention.rejections);
     let shared = component(&report, Component::SharedExpert);
     assert_eq!(shared.rejected, 1);
-    assert!(shared.rejections[0].reason.contains("K6 MCG core or the official E4M3"), "{:?}", shared.rejections);
+    assert!(shared.rejections[0].reason.contains("unsupported dense core width K5")
+        && shared.rejections[0].reason.contains("trellis_linear exporter program and family dispatch"), "{:?}", shared.rejections);
 }
 
 #[test]
