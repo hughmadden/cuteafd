@@ -94,7 +94,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max"
+        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max"
       }
     },
     {

@@ -151,6 +151,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## GLM 5.3
 
+- 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max/report.svg)
 - 2026-10-31 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 1× RTX PRO 6000 @ gpu-powerd 460 W (450–565) + 4× DGX Spark · build v4.1.0-rc1 · [report](glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-1rtx-4spark-glm53-exl3-min/report.svg)
 - 2026-10-31 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–545) + 6× DGX Spark · build v4.1.0-rc1 · [report](glm5/2026-10-31-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg)
 - 2026-10-31 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v4.1.0-rc1 · [report](glm5/2026-10-31-smoke-glm-5-3-exl3-k4-v1-2rtx-6spark-glm53-exl3-max/report.svg)
