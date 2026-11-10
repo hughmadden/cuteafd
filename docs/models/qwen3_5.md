@@ -16,3 +16,9 @@ Starting configs: [Qwen 3.5 9B BF16](../../examples/configs/qwen35-9b-bf16-min.c
 [<img src="../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg" width="360" alt="Qwen 3.5 9B BF16">](../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/report.svg)
 [<img src="../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg" width="360" alt="Qwen 3.8 27B BF16">](../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/report.svg)
 [<img src="../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg" width="360" alt="Qwen 3.8 27B FP8">](../../benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/report.svg)
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/report.svg"><img src="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg" width="360" alt="Qwen3.5-9B (1× RTX)"></a> <a href="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/report.svg"><img src="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg" width="360" alt="Qwen3.8-27B (1× RTX)"></a> <a href="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/report.svg"><img src="../../benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg" width="360" alt="Qwen3.8-27B-FP8 (1× RTX)"></a> |
