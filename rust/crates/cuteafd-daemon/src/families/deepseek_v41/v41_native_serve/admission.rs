@@ -250,17 +250,13 @@ fn validate_owner_modes(args: &crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
-/// `modules` is each coordinator GPU's measured module-image extent: the
-/// free-memory drop across the pre-weight preload window
-/// (`RuntimeInventory::measure`, `InventoryPhase::PreWeight`). That measurement
-/// is the predicted runtime base's module half, in place of the offline
-/// layout's generic program-count estimate. Empty means no predicted base is
-/// charged and the sampled pre-weight availability stays the budget baseline.
+/// `preweight_context` is each rank's sampled context plus selected modules,
+/// excluding ledger-tracked allocations. Module bytes are a subset, not additive.
 pub(super) fn admit_startup(
     lib: &cuteafd_ffi::NativeLibrary,
     catalog: &cuteafd_loader::OfficialV41Catalog,
     args: &crate::cli::NativeServeArgs,
-    modules: &[u64],
+    preweight_context: &[u64],
 ) -> Result<Admitted> {
     use super::*;
     validate_owner_modes(args)?;
@@ -349,7 +345,7 @@ pub(super) fn admit_startup(
     }
     lib.cuda_set_device(0)?;
     let pool = resolve_with_owners(args, &memory, experts, workspace, &vec![0; ranks], usize::from(ranks == 2),
-        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), modules)
+        &fixed_demands, &weight_arenas, &startup, draft.as_ref(), preweight_context)
         .with_context(|| format!("V4.1 startup refused before weights: fixed owners {fixed}"))?;
     tracing::info!(fixed_owner_bytes=fixed, admitted_cache_bytes=?pool.cache_bytes,
         host_ledger=?pool.host_ledger, "V4.1 single allocation-owner startup admission before weight loads");
@@ -519,9 +515,8 @@ pub(super) fn resolve(
 
 /// `startup` contains full sequential peaks above `memory`, never staging-only
 /// deltas. Draft owners supplied separately must not also appear in `owners`.
-/// `modules` is the predicted module-image extent of each coordinator GPU's
-/// selected native program set; empty keeps the measured pre-weight sample as
-/// the budget's baseline instead of charging a predicted runtime base.
+/// `preweight_context` holds the measured pre-weight occupancy per rank.
+/// Empty uses the supplied availability sample, also as one named owner.
 ///
 /// One typed request over the sampled owners: the same component contract the
 /// offline planner admits decides the pool and the local expert prefix, and
@@ -537,7 +532,7 @@ pub(super) fn resolve_with_owners(
     weight_arenas: &[cuteafd_loader::serving_capacity::WeightArenaLayout],
     startup: &[Demand],
     draft: Option<&families::deepseek_v41::DraftInventory>,
-    modules: &[u64],
+    preweight_context: &[u64],
 ) -> Result<Admitted> {
     use families::deepseek_v41::admission::{
         self, live_budgets, production_request, Owner, ProductionInput,
@@ -548,13 +543,9 @@ pub(super) fn resolve_with_owners(
     let ranks = memory.len();
     ensure!(
         matches!(ranks, 1 | 2) && deferred.len() == ranks && minimum <= experts.len()
-            && (modules.is_empty() || modules.len() == ranks),
+            && (preweight_context.is_empty() || preweight_context.len() == ranks),
         "invalid V4.1 admission inventory"
     );
-    // A whole-GPU reserve drops the family's Runtime owners in the planner's
-    // override, so the predicted runtime base and the whole-cap baseline go
-    // together: with a reserve the measured sample stays the baseline.
-    let charged = !modules.is_empty() && !admission::whole_gpu_reserve();
     ensure!(
         (0..=1_048_576).contains(&args.max_context_tokens),
         "invalid V4.1 context limit"
@@ -573,7 +564,10 @@ pub(super) fn resolve_with_owners(
     for (gpu, &(free, total)) in memory.iter().enumerate() {
         ensure!(total > 0 && free <= total, "invalid GPU {gpu} memory sample");
         ceilings.push(total);
-        cards.push((total as u64, total as u64, free as u64));
+        let free = if let Some(&context) = preweight_context.get(gpu) {
+            (total as u64).checked_sub(context).context("V4.1 context sample exceeds physical capacity")?
+        } else { free as u64 };
+        cards.push((total as u64, total as u64, free));
     }
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(args.snapshot.join("config.json"))?)?;
     let maximum = cuteafd_loader::serving_capacity::checkpoint_context_limit(&config)?
@@ -623,16 +617,6 @@ pub(super) fn resolve_with_owners(
         allowances.push(admission::graph_allowance(memory.len(), gpu)?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
-    if charged {
-        // The runtime base the pre-weight sample holds, named component by
-        // component: the calibrated CUDA context and the selected native
-        // program images. Both are already inside the sample (marked
-        // `pre_sample`), so the sequential load peaks do not price them again.
-        for (gpu, &bytes) in modules.iter().enumerate() {
-            let arch = cuteafd_loader::placement::ArchContext::coordinator(totals[gpu], None);
-            retained.extend(admission::runtime_base(gpu as u8, &arch, bytes));
-        }
-    }
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
         retained.push(Owner::charged(
             gpu as u8,
@@ -684,11 +668,7 @@ pub(super) fn resolve_with_owners(
     }
     retained.extend(host.owners.clone());
     allowances.extend(host.estimates.clone());
-    let mut budgets = if charged {
-        admission::live_budgets_charged(&cards, &sparks)?
-    } else {
-        live_budgets(&cards, &sparks)?
-    };
+    let mut budgets = live_budgets(&cards, &sparks)?;
     budgets.extend(admission::production_budgets(&cards.iter().map(|&(total, ceiling, _)| (total, ceiling)).collect::<Vec<_>>(),
         0, Some(host_memory), 0, &[])?.into_iter().filter(|budget| budget.locations.contains(&cuteafd_loader::placement::planner::Location::HOST)));
     let mut blas = families::deepseek_v41::owners::blas_owners(ranks,
@@ -854,16 +834,11 @@ pub(super) fn expert_demands(
 /// within this of the device at Ready needs no further attribution.
 const RUNTIME_BASE_RESIDUAL_BAR: u64 = 50 << 20;
 
-/// Report the predicted runtime base against the device at Ready, component by
-/// component: the calibrated CUDA context and the measured module-image extent,
-/// read back from the owners admission charged. Verification only: the pool
-/// already exists, so a residual never changes placement; it reports the part
-/// of the device's runtime base the two predicted owners do not name.
+/// Compare the admitted pre-weight sample (including selected modules) with
+/// the device at Ready. Verification only: the pool already exists, so a
+/// residual reports later runtime growth without changing placement.
 pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admitted) -> Result<()> {
-    use families::deepseek_v41::admission::{runtime_base_check, runtime_base_components, whole_gpu_reserve};
-    // With a whole-GPU reserve the sample is the budget's baseline and no
-    // predicted owner exists to verify.
-    if whole_gpu_reserve() { return Ok(()); }
+    use families::deepseek_v41::admission::{runtime_base_check, runtime_base_components};
     let ranks = admitted.placement.items.len();
     let current = lib.cuda_get_device()?;
     for gpu in 0..ranks {
@@ -910,8 +885,8 @@ pub(super) fn adopt_measured_pool(
 ) -> Result<u32> {
     use cuteafd_ffi::memory_ledger::{Space, snapshot};
     use families::deepseek_v41::admission::{MeasuredOccupancy, adopt_measured, untracked_ready_owners, whole_gpu_reserve};
-    // A whole-GPU reserve replaces the named runtime owners with the budget's
-    // sampled baseline, so there is no prediction to reconcile.
+    // Explicit reserve overrides retain the sampled base but replace the
+    // optional runtime-growth owners, so do not reintroduce them here.
     if whole_gpu_reserve() { return Ok(admitted.served_context); }
     let gpus = admitted.placement.items.len();
     let current = lib.cuda_get_device()?;
@@ -1309,13 +1284,9 @@ mod admission_tests {
         Ok(())
     }
 
-    /// The predicted runtime base is the calibrated context plus the selected
-    /// module images, charged once per coordinator GPU, and only when the
-    /// caller names the extent it loaded after the pre-weight sample.
     #[test]
-    fn predicted_module_images_charge_the_runtime_base_once() -> Result<()> {
-        use cuteafd_core::memory_layout::Category;
-        use cuteafd_loader::placement::ArchContext;
+    fn sampled_preweight_base_replaces_context_and_module_predictions() -> Result<()> {
+        use cuteafd_core::memory_policy::MemoryPolicy;
         use families::deepseek_v41::admission::{CONTEXT_OWNER, MODULE_OWNER};
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), include_str!(concat!(
@@ -1325,22 +1296,28 @@ mod admission_tests {
         let mut args = args(dir.path());
         args.rtx_gpus = 2;
         args.rtx_expert_layers = LocalLayers::Count(0);
-        let memory = vec![(80usize << 30, 96usize << 30); 2];
-        let modules = [40u64 << 20, 56 << 20];
-        let sample = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; 2], 0,
-            &[], &[], &[], None, &[])?;
-        assert!(sample.placement.items.iter().flatten()
-            .all(|item| item.group != CONTEXT_OWNER && item.group != MODULE_OWNER));
-        let charged = resolve_with_owners(&args, &memory, no_experts(), 0, &vec![0; 2], 0,
-            &[], &[], &[], None, &modules)?;
-        for gpu in 0..2usize {
-            let arch = ArchContext::coordinator(96u64 << 30, None);
-            let named = |group: &str| charged.placement.items[gpu].iter()
-                .filter(|item| item.group == group)
-                .map(|item| (item.bytes, item.category))
-                .collect::<Vec<_>>();
-            assert_eq!(named(CONTEXT_OWNER), [(arch.context_bytes, Category::Runtime)]);
-            assert_eq!(named(MODULE_OWNER), [(modules[gpu], Category::Runtime)]);
+        let occupied = [682_885_120, 691_273_728];
+        let memory = occupied.map(|bytes| (((96u64 << 30) - bytes) as usize, 96usize << 30));
+        for reserve in [None, Some(0), Some(200 << 20)] {
+            MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| -> Result<()> {
+                let sampled = resolve_with_owners(&args, &memory, no_experts(), 0, &[0; 2], 0,
+                    &[], &[], &[], None, &[])?;
+                let named = resolve_with_owners(&args, &memory, no_experts(), 0, &[0; 2], 0,
+                    &[], &[], &[], None, &occupied)?;
+                assert_eq!(sampled.solved.pool_tokens, named.solved.pool_tokens);
+                assert_eq!(sampled.solved.decisions, named.solved.decisions);
+                for gpu in 0..2usize {
+                    let facts = &named.solved.facts;
+                    assert!(facts.allocations.iter().all(|owner| owner.group != CONTEXT_OWNER && owner.group != MODULE_OWNER));
+                    let owners = facts.allowances.iter().filter(|owner|
+                        owner.location == cuteafd_loader::placement::planner::Location::coordinator(gpu as u8)
+                            && cuteafd_loader::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, occupied[gpu]);
+                    assert_eq!(families::deepseek_v41::admission::runtime_base_components(facts, gpu as u8).total(), occupied[gpu]);
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }

@@ -566,6 +566,27 @@ pub fn placed_attention(attention: GlmfAttention, placed: &Placement) -> GlmfAtt
 pub(crate) mod tests {
     use super::*;
 
+    fn assert_sampled_parity(planned: &Placement, sampled: &Placement) {
+        let mut planned = planned.clone();
+        let mut sampled = sampled.clone();
+        for (offline, live) in planned.items.iter_mut().zip(&mut sampled.items) {
+            let base = offline.iter().filter(|item| item.group == "context+modules").collect::<Vec<_>>();
+            let measured = live.iter().filter(|item|
+                crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
+            assert_eq!(base.len(), 1);
+            assert_eq!(measured.len(), 1);
+            assert_eq!(base[0].bytes, measured[0].bytes);
+            assert_eq!(base[0].category, measured[0].category);
+            assert_eq!(base[0].lifetime, measured[0].lifetime);
+            // Only runtime-base provenance differs; compare every other owner
+            // and placement decision without normalization.
+            offline.retain(|item| item.group != "context+modules");
+            live.retain(|item| !crate::placement::sampled_baseline::is_source(&item.group));
+        }
+        assert_eq!(planned, sampled);
+    }
+
+
     #[test]
     fn mismatched_card_recipes_resolve_auto_to_layers_but_keep_heads_explicit() {
         let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap();
@@ -655,7 +676,7 @@ pub(crate) mod tests {
             assert_eq!(offline.movables, [(MovableId::Drafter, 0)]);
             assert_eq!(offline.movables, serving.movables);
             assert_eq!(offline.pool_tokens, serving.pool_tokens);
-            assert_eq!(offline.items, serving.items);
+            assert_sampled_parity(&offline, &serving);
         }
     }
 
@@ -1004,7 +1025,27 @@ pub(crate) mod tests {
             let r = contract(&sampled(&planned)).unwrap();
             assert_eq!(p.solved.pool_tokens, r.solved.pool_tokens);
             assert_eq!(p.solved.decisions, r.solved.decisions);
-            assert_eq!(p.solved.facts.allocations, r.solved.facts.allocations);
+            assert_sampled_parity(&p.placement, &r.placement);
+            let mut offline = p.solved.facts.clone();
+            let mut live = r.solved.facts.clone();
+            for rank in 0..ranks {
+                let location = planner::Location::coordinator(rank as u8);
+                let base = offline.allocations.iter().filter(|owner|
+                    owner.location == location && owner.group == "context+modules").collect::<Vec<_>>();
+                let measured = live.allowances.iter().filter(|owner|
+                    owner.location == location && crate::placement::sampled_baseline::is_source(&owner.source))
+                    .collect::<Vec<_>>();
+                assert_eq!(base.len(), 1);
+                assert_eq!(measured.len(), 1);
+                assert_eq!(base[0].bytes, measured[0].bytes);
+                assert_eq!(base[0].lifetime, measured[0].lifetime);
+                assert!(!measured[0].assumed);
+                offline.allocations.retain(|owner|
+                    owner.location != location || owner.group != "context+modules");
+                live.allowances.retain(|owner|
+                    owner.location != location || !crate::placement::sampled_baseline::is_source(&owner.source));
+            }
+            assert_eq!(offline, live);
             assert_eq!(p.graphs, r.graphs);
             assert_eq!(p.working, r.working);
         }
@@ -1163,7 +1204,7 @@ pub(crate) mod tests {
         let (plan, pg, pw) = admitted_case(&planned, true, 188, true, None).unwrap();
         let (live, lg, lw) = admitted_case(&runtime, true, 188, true, None).unwrap();
         assert_eq!(plan.pool_tokens, live.pool_tokens);
-        assert_eq!(plan.items, live.items);
+        assert_sampled_parity(&plan, &live);
         assert_eq!(plan.layers, live.layers);
         assert_eq!(pg, lg);
         assert_eq!(pw, lw);
@@ -1741,7 +1782,7 @@ pub(crate) mod tests {
                 // its own driver granule; the unit-index metadata is one linear allocation.
                 assert_eq!(pool_bytes, cost(units));
                 let runtime = contract(&sampled(&input)).unwrap().placement;
-                assert_eq!(placed.items, runtime.items);
+                assert_sampled_parity(&placed, &runtime);
                 assert_eq!(placed.layers, runtime.layers);
                 assert_eq!(placed.pool_tokens, runtime.pool_tokens);
             }
@@ -1786,7 +1827,7 @@ pub(crate) mod tests {
                 *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
             }
             let runtime = admitted_case(&measured_input, false, 188, true, Some(&alternate.resident)).unwrap();
-            assert_eq!(selected.0, runtime.0);
+            assert_sampled_parity(&selected.0, &runtime.0);
             let resident = if expected == 0 { &input.resident } else { &alternate.resident };
             for rank in 0..2 {
                 let bytes: u64 = selected.0.items[rank].iter().filter(|i| i.group == "weight arena")
@@ -1830,7 +1871,7 @@ pub(crate) mod tests {
                     *baseline = Baseline::Measured { free_bytes: *capacity - context_bytes - loaded_bytes };
                 }
                 let (runtime, _, _) = admitted_case(&sampled, false, 188, true, None).unwrap();
-                assert_eq!(runtime, planned);
+                assert_sampled_parity(&planned, &runtime);
                 input.resident[0].embedding = 0;
                 let host = admitted_case(&input, false, 188, true, None).unwrap().0;
                 assert_eq!(embedding_home(&host), 0);
@@ -1914,7 +1955,7 @@ pub(crate) mod tests {
                     "routers are part of target weights, never an extra demand");
             }
             let admitted = contract(&sampled(&input)).unwrap().placement;
-            assert_eq!(placed.items, admitted.items);
+            assert_sampled_parity(&placed, &admitted);
             assert_eq!(placed.layers, admitted.layers);
             assert_eq!(placed.pool_tokens, admitted.pool_tokens);
             // Removing only router headers from the inventory changes each rank's

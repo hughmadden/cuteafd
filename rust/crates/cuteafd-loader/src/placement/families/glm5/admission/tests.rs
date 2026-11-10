@@ -2269,3 +2269,87 @@ fn expert_usage_recipe_is_canonical_fixed_and_off_or_skip_has_no_owners() {
         matches!(&component.kind, ComponentKind::Allocation { template, .. }
             if template.id.starts_with("expert-usage.") || template.id.starts_with("glm.usage."))));
 }
+
+#[test]
+fn sampled_preweight_replaces_census_context_once_and_preserves_capacity() {
+    use cuteafd_core::memory_policy::MemoryPolicy;
+    for cfg in [cfg(), GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap()] {
+    let samples = [682_885_120, 691_273_728];
+    for gpus in [1, 2] {
+        for reserve in [None, Some(0), Some(200 << 20)] {
+            MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| {
+                let make = || production_input(&cfg, gpus, 4, PrefillShape { rows: 128, waves: 3 });
+                let mut live = make();
+                for (rank, budget) in live.budgets.iter_mut().take(gpus).enumerate() {
+                    budget.baseline = Baseline::Sampled { free: budget.physical_bytes - samples[rank],
+                        phase: Phase::Load, source: "preweight fixture".into() };
+                }
+                let mut reference = make().prepare().unwrap();
+                // Correct sampled-baseline reference: remove only the offline
+                // context slice, retain startup stream growth and all stages.
+                for case in &mut reference.recipe.owners {
+                    case.value.retain(|component| !matches!(&component.kind,
+                        ComponentKind::Allowance(owner) if owner.source.starts_with("GLM context and selected modules:")));
+                }
+                for (rank, budget) in reference.budgets.iter_mut().take(gpus).enumerate() {
+                    budget.baseline = Baseline::Sampled { free: budget.physical_bytes - samples[rank],
+                        phase: Phase::Load, source: "preweight fixture".into() };
+                }
+                let mut req = request(); req.pool = Pin::Auto;
+                let before = reference.admit(req.clone()).unwrap().solved;
+                let plan = live.prepare().unwrap().admit(req).unwrap().solved;
+                assert_eq!(plan.pool_tokens, before.pool_tokens);
+                assert_eq!(plan.decisions, before.decisions);
+                for rank in 0..gpus {
+                    let location = Location::coordinator(rank as u8);
+                    let owners = plan.facts.allowances.iter().filter(|owner| owner.location == location
+                        && crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].bytes, samples[rank]);
+                    assert!(!plan.facts.allowances.iter().any(|owner| owner.location == location
+                        && owner.source.starts_with("GLM context and selected modules:")));
+                    for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                        let now = plan.phases.iter().find(|row| row.budget == plan.budgets[rank].id && row.phase == phase).unwrap();
+                        let old = before.phases.iter().find(|row| row.budget == before.budgets[rank].id && row.phase == phase).unwrap();
+                        assert_eq!(now.available - now.owned - now.opaque, old.available - old.owned - old.opaque);
+                    }
+                }
+            });
+        }
+        let offline = make_offline_figures(gpus);
+        assert_eq!(offline, if gpus == 1 { vec![GLM_MIN_CONTEXT.bytes] }
+            else { GLM_MAX_CONTEXT.iter().map(|figure| figure.bytes).collect() });
+    }
+    }
+    fn make_offline_figures(gpus: usize) -> Vec<u64> {
+        let figures = DeviceFigures::new(gpus, true, false).unwrap();
+        let components = figures.components(32).unwrap();
+        assert!(!components.iter().any(|component| matches!(&component.kind,
+            ComponentKind::Allowance(owner) if crate::placement::sampled_baseline::is_source(&owner.source))));
+        (0..gpus).map(|rank| components[..2 * gpus].iter().filter_map(|component| match &component.kind {
+            ComponentKind::Allowance(owner) if owner.location == Location::coordinator(rank as u8) => Some(owner.bytes),
+            _ => None,
+        }).sum()).collect()
+    }
+}
+
+#[test]
+fn sampled_preweight_correction_changes_only_context_bytes() {
+    let samples = [682_885_120, 691_273_728];
+    let mut live = DeviceFigures::new(2, true, false).unwrap();
+    let offline = live.components(32).unwrap();
+    let mut budgets = production_budgets(&[(96 << 30, 96 << 30); 2], 0,
+        (512 << 30, 512 << 30), 0, &[]).unwrap();
+    for rank in 0..2 {
+        budgets[rank].baseline = Baseline::Sampled { free: (96 << 30) - samples[rank],
+            phase: Phase::Load, source: "preweight".into() };
+    }
+    live.sample_baselines(&mut budgets).unwrap();
+    let corrected = live.components(32).unwrap();
+    assert_eq!(offline.len(), corrected.len());
+    for rank in 0..2 {
+        assert_eq!(corrected[rank].bytes.at(1).unwrap() - offline[rank].bytes.at(1).unwrap(),
+            samples[rank] - GLM_MAX_CONTEXT[rank].bytes + live.slabs()[rank]);
+    }
+    assert_eq!(format!("{:?}", &offline[2..]), format!("{:?}", &corrected[2..]));
+}
