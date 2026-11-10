@@ -4,6 +4,11 @@ Every user-facing launch key and CLI option, grouped by area, with defaults and
 the values each launch path accepts. The family columns in the last section are
 tested against the launcher (`scripts/tests/test_options_doc.py`).
 
+Release builds (`./build.sh`) and publication share the shipping matrix reported
+by `scripts/build/release-scope.py default-matrix`. `CUTEAFD_RELEASE_MATRIX`
+overrides that default; `--scope` selects families or cards for development builds,
+while publication requires `all` and complete image inventories.
+
 ## How options are set
 
 A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):

@@ -1346,10 +1346,20 @@ python3 "$repo_root/scripts/build/select-dev-image.py" merge \
   --coordinator "$release_dev_reuse_manifest" --spark "$release_leg_log_dir/spark-dev-image.json" \
   --output "$repo_root/dist/DEV_IMAGE_REUSE.json"
 dist_source_manifest+=(DEV_IMAGE_REUSE.json)
-install -m 0644 "$artifact_dir/EXPORT_CACHE_STATS.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl"
-release_sync "$seed_host:$remote_dir/.cuteafd-release-image/EXPORT_CACHE_STATS.jsonl" \
-  "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"
-dist_source_manifest+=(EXPORT_CACHE_STATS.coordinator.jsonl EXPORT_CACHE_STATS.spark.jsonl)
+# Receipts are informational: never retain a stale prior build's stats.
+rm -f "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"
+if install -m 0644 "$artifact_dir/EXPORT_CACHE_STATS.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl"; then
+  dist_source_manifest+=(EXPORT_CACHE_STATS.coordinator.jsonl)
+else
+  echo "WARNING: coordinator export cache receipt unavailable" >&2
+fi
+if release_sync "$seed_host:$remote_dir/.cuteafd-release-image/EXPORT_CACHE_STATS.jsonl" \
+  "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"; then
+  dist_source_manifest+=(EXPORT_CACHE_STATS.spark.jsonl)
+else
+  rm -f "$repo_root/dist/EXPORT_CACHE_STATS.spark.jsonl"
+  echo "WARNING: Spark export cache receipt unavailable" >&2
+fi
 if [[ -n "$source_manifest" ]]; then
   install -m 0644 "$source_manifest" "$repo_root/dist/SOURCE_SHA256SUMS"
   dist_source_manifest+=(SOURCE_SHA256SUMS)
@@ -1552,7 +1562,11 @@ echo "  spark:       $SPARK_EXPERT_DOCKER_INFERENCE"
 echo "  artifacts:   $repo_root/dist"
 for leg in coordinator spark; do
   echo "  $leg export cache (hits, misses, bypassed; invocation and program layers):"
-  python3 "$repo_root/scripts/build/export-cache.py" stats "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl"
+  if [[ -f "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl" ]]; then
+    python3 "$repo_root/scripts/build/export-cache.py" stats "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl"
+  else
+    echo "WARNING: $leg export cache receipt unavailable" >&2
+  fi
 done
 
 # Publish the requested local tags only after both inventories and identity gates pass.

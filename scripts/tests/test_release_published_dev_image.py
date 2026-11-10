@@ -284,7 +284,7 @@ def test_release_artifacts_refuse_missing_image_before_compilation(tmp_path):
     output = tmp_path/'output'
     result = subprocess.run(['bash', str(ROOT/'scripts/build/build-release-artifacts.sh'),
                              str(ROOT), 'coordinator', '120', str(output)],
-                            env={**os.environ, 'CUTEAFD_EXPORT_IMAGE_ID': '',
+                            env={**os.environ, 'CUTEAFD_EXPORT_IMAGE_ID': '', 'CUTEAFD_EXPORT_CACHE': str(tmp_path/'store'),
                                  'CUTEAFD_EXPORT_CACHE_STATS': str(output/'EXPORT_CACHE_STATS.jsonl')},
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 2
@@ -296,5 +296,37 @@ def test_release_cache_receipts_survive_staging_and_are_checksummed():
     text = (ROOT/'build.sh').read_text()
     assert '"$artifact_dir/EXPORT_CACHE_STATS.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl"' in text
     assert '$seed_host:$remote_dir/.cuteafd-release-image/EXPORT_CACHE_STATS.jsonl' in text
-    assert 'dist_source_manifest+=(EXPORT_CACHE_STATS.coordinator.jsonl EXPORT_CACHE_STATS.spark.jsonl)' in text
+    for leg in ('coordinator', 'spark'):
+        assert f'dist_source_manifest+=(EXPORT_CACHE_STATS.{leg}.jsonl)' in text
     assert 'stats "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl"' in text
+
+
+@pytest.mark.parametrize('store', ['', 'off'])
+def test_release_cache_disabled_does_not_require_image(tmp_path, store):
+    text = (ROOT/'scripts/build/build-release-artifacts.sh').read_text()
+    admission = text[text.index('mkdir -p "$output_dir"'):text.index('# Where the writable build root')]
+    output = tmp_path/'output'
+    result = subprocess.run(['bash', '-euc', 'output_dir="$1"; ' + admission, 'test', str(output)],
+                            env={**os.environ, 'CUTEAFD_EXPORT_CACHE': store, 'CUTEAFD_EXPORT_IMAGE_ID': '',
+                                 'CUTEAFD_EXPORT_CACHE_STATS': str(output/'EXPORT_CACHE_STATS.jsonl')},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((output/'EXPORT_CACHE_STATS.jsonl').read_text())['reason'] == 'cache disabled'
+
+
+def test_missing_release_cache_receipts_warn_without_failing(tmp_path):
+    text = (ROOT/'build.sh').read_text()
+    collection = text[text.index('# Receipts are informational:'):text.index('if [[ -n "$source_manifest" ]]; then',
+                                                                          text.index('# Receipts are informational:'))]
+    (tmp_path/'dist').mkdir()
+    for leg in ('coordinator', 'spark'):
+        (tmp_path/f'dist/EXPORT_CACHE_STATS.{leg}.jsonl').write_text('stale')
+    result = subprocess.run(['bash', '-euc', 'repo_root="$1"; artifact_dir="$1/missing"; '
+                             'seed_host=seed; remote_dir=/missing; dist_source_manifest=(); '
+                             'release_sync() { return 1; }; ' + collection +
+                             '\n[[ ${#dist_source_manifest[@]} == 0 ]]', 'test', str(tmp_path)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'WARNING: coordinator export cache receipt unavailable' in result.stderr
+    assert 'WARNING: Spark export cache receipt unavailable' in result.stderr
+    assert not list((tmp_path/'dist').iterdir())

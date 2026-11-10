@@ -14,7 +14,9 @@ output_dir="$(realpath -m "$4")"
 mkdir -p "$output_dir"
 export CUTEAFD_EXPORT_CACHE_STATS="${CUTEAFD_EXPORT_CACHE_STATS:-$output_dir/EXPORT_CACHE_STATS.jsonl}"
 : >"$CUTEAFD_EXPORT_CACHE_STATS"
-if [[ "${CUTEAFD_EXPORT_IMAGE_ID:-}" != sha256:* ]]; then
+if [[ -z "${CUTEAFD_EXPORT_CACHE:-}" || "$CUTEAFD_EXPORT_CACHE" == off ]]; then
+  printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"cache disabled"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
+elif [[ "${CUTEAFD_EXPORT_IMAGE_ID:-}" != sha256:* ]]; then
   printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"missing or invalid CUTEAFD_EXPORT_IMAGE_ID"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
   echo "release export cache requires the admitted compiler image ID (CUTEAFD_EXPORT_IMAGE_ID)" >&2
   exit 2
