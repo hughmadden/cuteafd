@@ -996,7 +996,7 @@ mod device_tests {
         bank.cache_clear_drained();
         // Neither a different native status nor matching text is an allocation failure.
         for error in [anyhow::Error::new(cuteafd_ffi::NativeStatusError {
-            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_INTERNAL_ERROR,
+            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_CUDA_UNAVAILABLE,
             detail: "cudaGraphInstantiate out of memory".into(),
         }), anyhow::anyhow!("cudaGraphInstantiate out of memory")] {
             let Miss::Capture(id) = bank.cache_miss(&Key(1), false, None) else { panic!() };
