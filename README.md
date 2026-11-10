@@ -205,6 +205,12 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg"><img src="benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min/card.svg" alt="wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 on 1× RTX PRO 6000 @ gpu-powerd 455 W (450–590) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg"><img src="benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" alt="wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>kindlingai/glm-5.3-flash-exlr8-k2-k3-k4</sub><br><sub></sub></td>
+<td width="27%" valign="top">pending<br><sub>Release smoke measurement pending</sub></td>
+<td width="27%" valign="top">pending<br><sub>Release smoke measurement pending</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg" alt="kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 on 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550)"></a><br><sub>2× RTX</sub></td>
+</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).

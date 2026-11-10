@@ -304,6 +304,22 @@
         "status": "current",
         "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max"
       }
+    },
+    {
+      "family": "glm5_flash",
+      "checkpoint": "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "5090": {
+        "status": "pending",
+        "reason": "Release smoke measurement pending"
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "Release smoke measurement pending"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max"
+      }
     }
   ],
   "retired": [
