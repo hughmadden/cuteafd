@@ -2142,6 +2142,10 @@ def test_capture_ticket_native_failures_always_report_backoff():
         ("glm5_flash", "engine.rs", "cache_capture_failed"),
     ]:
         source = (families / family / file).read_text()
-        for warning in re.finditer(r'tracing::warn!\([^;]*"[^";]*(?:capture|instantiat)[^";]*(?:eager|fallback)[^";]*"', source):
+        warnings = [warning for warning in re.finditer(r'tracing::warn!\([^\n]*\);', source)
+                    if "unavailable" in warning.group()
+                    and ("eager" in warning.group() or "fallback" in warning.group())]
+        assert len(warnings) == 2, (family, "begin and end capture failure warnings")
+        for warning in warnings:
             prefix = source[max(0, warning.start() - 180):warning.start()]
             assert api + "(ticket, &error)" in prefix, (family, warning.group())

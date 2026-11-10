@@ -250,11 +250,11 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
                 cycle: Cycle::Other, preference: Preference::Capture, bootstrap: 2 << 20,
                 basis: Basis::Bytes, spans_devices: false })?;
             let ticket = wave.graphs.cache_ticket(&(0, vec![]), false, None).expect("test reserve fits");
-            let plan=ColdSparse { layer:0,rows:4,sink:sink.buffer,launches:vec![],selected:None,
+            let mut plan=ColdSparse { layer:0,rows:4,sink:sink.buffer,launches:vec![],selected:None,
                 batch:Some(batch),fingerprint:vec![],needed:0,tail_identity:None,ticket };
             unsafe { wave.enqueue(plan.sink,&plan.launches,None,plan.batch.as_ref())?; }
             wave.synchronize()?;
-            let graph=unsafe { wave.capture_plan(&plan,&mut None)? };
+            let graph=unsafe { wave.capture_plan(&mut plan,&mut None)? };
             wave.insert_graph((0,vec![]),graph.0,plan.ticket,graph.1,graph.2,graph.3)?;
             let graph = graph.0;
             for replay in 0..2 {
