@@ -224,6 +224,7 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
             // boundary always wins over this asynchronous physical sample.
             let sampled_at = std::time::Instant::now();
             let ledger = memory_ledger::snapshot();
+            // Ledger-before-CUDA skew can double-subtract concurrent growth: conservative, choosing eager rather than over-admitting.
             let value = report_snapshot(stage, &ledger, &|device| {
                 let sample = memory_ledger::fault::device_memory(device);
                 if let Some((free, _)) = sample {
