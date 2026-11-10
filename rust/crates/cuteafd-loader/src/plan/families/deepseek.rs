@@ -15,17 +15,26 @@ pub struct DeepSeek {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    decode_lanes: crate::plan::decode_lanes::LaneSupport,
+    /// Rows one decode/verify step sends a Spark (V4.1: `V41_VERIFY_ROWS`).
+    decode_rows: u32,
 }
 
 pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
+    decode_lanes: crate::plan::decode_lanes::LaneSupport::FixedTwo,
+    decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
     id: "deepseek_v4",
     architecture: "DeepseekV4ForCausalLM",
     runtime: RuntimeStatus::Serving,
+    decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
+        reason: "the second lane is not wired yet: V4 Flash, the closest shape to V4.1, is the OneOrTwo candidate awaiting its A/B on its own decode endpoint (#744)" },
+    // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
+    decode_rows: 64,
 };
 
 fn usize_list(config: &Value, key: &str) -> Vec<usize> {
@@ -37,6 +46,18 @@ fn usize_list(config: &Value, key: &str) -> Vec<usize> {
 }
 
 impl Family for DeepSeek {
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        crate::serving_capacity::prefill_waves::PrefillLimits {
+            min_unit_rows: if self.id == "deepseek_v41" {
+                u64::from(cuteafd_core::coordinator_programs::V41_LIVE_MIN_ROWS)
+            } else { 64 },
+            ..Default::default()
+        }
+    }
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
+    }
     fn id(&self) -> &'static str {
         self.id
     }
@@ -57,7 +78,14 @@ impl Family for DeepSeek {
             Some(DeepseekV4Config::read(&checkpoint.snapshot, dspark_stages(checkpoint))
                 .map_err(ConfigError::from_anyhow)?)
         } else { None };
-        Ok(Box::new(DeepSeekModel { id: self.id, spec, v4_config, config: checkpoint.config.clone() }))
+        let mut strided_parts: std::collections::BTreeMap<String, Vec<(String, usize)>> = Default::default();
+        for tensor in &checkpoint.tensors {
+            let (stem, suffix) = crate::plan::format::split_stem(&tensor.meta.name);
+            if suffix.starts_with("strided_") && tensor.meta.shape.len() == 2 {
+                strided_parts.entry(stem.into()).or_default().push((tensor.meta.name.clone(), tensor.meta.shape[0]));
+            }
+        }
+        Ok(Box::new(DeepSeekModel { strided_parts, id: self.id, spec, v4_config, config: checkpoint.config.clone() }))
     }
 
     fn classify(&self, _spec: &ModelSpec, name: &str) -> Option<TensorRole> {
@@ -130,7 +158,7 @@ impl Family for DeepSeek {
             return Some(Hint {
                 what: "DeepSeek V4 routed experts in NVFP4".into(),
                 how: "Spark expertd-native serves native MXFP4 and EXL3 K2-K4 experts at the checkpoint \
-                      geometry (ExpertGeometry, read_expert_catalog; EXL3 packages exl3-dsv4f|dsv4p-k<tiers> \
+                      geometry (ExpertGeometry, read_expert_catalog; V4 Pro EXL3 packages exl3-dsv4p-k<tiers> \
                       from CUTEAFD_EXPERT_FAMILIES=dsv4p:exl3-k23). ModelOpt NVFP4 needs the V4.1 NVFP4 \
                       contract (loader v41_nvfp4) generalized the same way.".into(),
             });
@@ -325,6 +353,7 @@ struct DeepSeekModel {
     spec: ModelSpec,
     v4_config: Option<DeepseekV4Config>,
     config: Value,
+    strided_parts: std::collections::BTreeMap<String, Vec<(String, usize)>>,
 }
 
 /// The routed projection shape `[N, K]` a stem names: w1/w3 (gate/up) are
@@ -354,6 +383,9 @@ impl DeepSeekModel {
         let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
         let geometry = self.geometry().ok_or_else(|| format!("no expert kernels at hidden {} / intermediate {} / {} \
             experts / top-{} (cuteafd_core::ExpertGeometry)", self.spec.hidden, moe.intermediate, moe.experts, moe.top_k))?;
+        if operand.exl3_bits().is_some() && matches!(geometry, "v41" | "dsv4f") {
+            return Err("unsupported: EXL3 for DeepSeek V4/V4.1 Flash".into());
+        }
         let shape = routed_shape(stem, self.spec.hidden, moe.intermediate)
             .ok_or_else(|| format!("not a routed projection (w1/w2/w3 or gate/up/down_proj)"))?;
         require(operand.logical == shape, || format!("{geometry} experts are {shape:?}, found {}", describe(operand)))?;
@@ -384,8 +416,13 @@ impl FamilyModel for DeepSeekModel {
         &self.spec
     }
 
+    /// V4.1's Engram pipeline preloads both layers' tables.
+    fn mapped_table_preload(&self) -> bool {
+        self.id == "deepseek_v41"
+    }
+
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         match self.id {
             "deepseek_v4" => Some(Ok(crate::plan::layout::deepseek_v4::layout(report, self, input, options))),
@@ -412,15 +449,28 @@ impl FamilyModel for DeepSeekModel {
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         match (self.id, role.component) {
             (_, Component::RoutedExpert) => self.routed(stem, operand),
-            ("deepseek_v4", Component::Speculator | Component::SpeculatorExpert) => {
-                Err("serve-dsv4 does not run the dSpark drafter".into())
-            }
             ("deepseek_v4", Component::Vision) => Err("serve-dsv4 takes no images".into()),
             (_, Component::SpeculatorExpert) => self.routed(stem, operand),
-            (_, Component::MappedTable) => require(
-                operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) || operand.is_nvfp4(),
-                || format!("engram rows are E4M3 with UE8M0 1x32 scales or NVFP4; found {}", describe(operand)),
-            ),
+            (_, Component::MappedTable) => {
+                let strided = operand.companions.iter().any(|s| s == "strided");
+                if strided {
+                    require(self.id == "deepseek_v41", || "strided engram requires V4.1".into())?;
+                    let storage = self.config.get("engram_storage")
+                        .ok_or_else(|| "strided engram requires the checkpoint's fp8_row_interleaved_v1 declaration".to_string())?;
+                    let storage = crate::families::deepseek_v41::v41_config::EngramStorage::parse(storage)
+                        .map_err(|error| format!("strided engram: {error:#}"))?;
+                    let layer = role.layer.ok_or_else(|| "strided engram has no layer".to_string())?;
+                    let parts = storage.parts.get(&layer.to_string())
+                        .ok_or_else(|| "strided engram declared at unsupported layer".to_string())?;
+                    require(parts.iter().map(|part| part.rows).sum::<usize>() == operand.logical[0]
+                        && self.strided_parts.get(stem) == Some(&parts.iter().map(|p| (p.tensor.clone(), p.rows)).collect()),
+                        || "strided engram config/header part rows differ".into())?;
+                }
+                require(self.config.get("engram_storage").is_none() || strided,
+                    || "declared strided engram has a paired tensor layout".into())?;
+                require(operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) || operand.is_nvfp4(),
+                    || format!("engram rows are E4M3 with UE8M0 1x32 scales or NVFP4; found {}", describe(operand)))
+            },
             _ => self.coordinator(operand),
         }
     }
@@ -439,8 +489,7 @@ impl FamilyModel for DeepSeekModel {
             block: 128,
             // Native packages remain bounded independently of transport capacity.
             spark_worlds: crate::plan::experts::spark_worlds(&format!("{geometry}:{format}"), self.spec().moe.as_ref()?.intermediate),
-            local: Err(format!("{serve} runs routed experts on 2, 3, 4 or 6 Spark ranks (its local expert layers \
-                supplement them)")),
+            local: Err(format!("{serve} requires a checkpoint-qualified Spark expert recipe; local expert layers only supplement remote ranks")),
         })
     }
 }

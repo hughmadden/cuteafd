@@ -27,6 +27,9 @@ impl RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub schema: String,
+    /// Absent in historical reports that used synthetic prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_content: Option<String>,
     pub id: String,
     /// RFC 3339 UTC.
     pub created: String,
@@ -99,6 +102,9 @@ mod checkpoint_tests {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerInfo {
     pub model: String,
+    /// The serve command, distinct from the checkpoint's canonical family.
+    #[serde(default)]
+    pub executor: Option<String>,
     #[serde(default)]
     pub family: Option<String>,
     #[serde(default)]
@@ -447,6 +453,9 @@ pub struct FabricPort {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Configuration {
+    /// Renderer capability; absent preserves requests to older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_thinking_off: Option<bool>,
     #[serde(default)]
     pub snapshot: Option<String>,
     /// Storage formats per tensor group (from `cuteafd plan`).
@@ -465,6 +474,12 @@ pub struct Configuration {
 }
 
 impl Configuration {
+    pub fn supports_thinking_off(&self) -> bool { self.supports_thinking_off != Some(false) }
+
+    pub fn thinking_label(&self) -> &'static str {
+        if self.supports_thinking_off() { "thinking off" } else { "thinking always on (template)" }
+    }
+
     /// Options whose value differs from the default (the chips).
     pub fn non_default(&self) -> impl Iterator<Item = &Setting> {
         self.settings.iter().filter(|s| s.differs())
@@ -551,13 +566,20 @@ pub struct Baseline {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BasicCard {
+    /// Actual request mode; always-thinking templates must not be compared as off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
     /// C1 decode per content type, thinking off.
     pub decode: Vec<ContentRate>,
-    /// Code decode sweep, thinking off; aggregate over each batch's decode interval.
+    /// Decode sweep, thinking off; aggregate over each batch's decode interval.
+    /// Each point names its prompt set ([`ConcurrentRate::prompts`]).
     #[serde(default)]
     pub concurrency: Vec<ConcurrentRate>,
     #[serde(default)]
     pub prefill: Option<PrefillRate>,
+    /// Server tokens per reference token from the corpus warm-up fit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_token_ratio: Option<f64>,
     /// Seconds of the untimed warm-up requests (first-use loads, graphs, tables).
     #[serde(default)]
     pub warmup_s: Option<f64>,
@@ -571,6 +593,9 @@ pub struct BasicCard {
 pub struct Capacity {
     #[serde(default)]
     pub kv_tokens: Option<u64>,
+    /// Pool ceiling without RTX-onboarded experts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     #[serde(default)]
     pub kv_pages: Option<u64>,
     #[serde(default)]
@@ -617,6 +642,7 @@ impl Capacity {
         let number = |names: &[&str]| get(names).and_then(|v| v.parse::<u64>().ok());
         Self {
             kv_tokens: number(&["pool-tokens"]),
+            max_tokens: None,
             kv_pages: None,
             kv_format: None,
             max_requests: number(&["concurrency", "max-sequences"]),
@@ -629,8 +655,12 @@ impl Capacity {
     /// `KV 412K tok · int8 full · 16 req max · 128K ctx · host cache 64 GiB`.
     pub fn line(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(tokens) = self.kv_tokens {
-            parts.push(format!("KV {} tok", short_tokens(tokens)));
+        if let Some(tokens) = self.kv_tokens.filter(|&tokens| tokens > 0) {
+            let mut kv = format!("KV {} tok", short_tokens(tokens));
+            if let Some(max) = self.max_tokens.filter(|&max| max > tokens) {
+                kv.push_str(&format!(" (max {})", short_tokens(max)));
+            }
+            parts.push(kv);
         }
         if let Some(format) = &self.kv_format {
             parts.push(format.clone());
@@ -662,6 +692,27 @@ impl Capacity {
 }
 
 impl Report {
+    /// Resolved onboard count belongs beside capacity, not among tuning chips.
+    /// Hardware-only cards have no onboarding trade-off, including dense models.
+    pub fn capacity_line(&self) -> String {
+        let mut capacity = self.capacity();
+        let placement = if self.server.hardware.sparks.is_empty() {
+            capacity.max_tokens = None;
+            Some("all RTX".to_string())
+        } else {
+            self.server.configuration.settings.iter()
+                .find(|s| s.name == "rtx-expert-layers" && s.source == "resolved")
+                .and_then(|s| s.value.as_ref()?.parse::<usize>().ok())
+                .map(|count| format!("{count} RTX expert layers"))
+        };
+        let line = capacity.line();
+        let Some(placement) = placement else { return line };
+        let mut parts: Vec<_> = line.split(" · ").filter(|part| !part.is_empty()).map(str::to_owned).collect();
+        // Keep placement visible even if a verbose KV format needs truncating.
+        parts.insert(usize::from(capacity.kv_tokens.is_some_and(|tokens| tokens > 0)), placement);
+        parts.join(" · ")
+    }
+
     /// The capacity of the baseline, else what the options say.
     pub fn capacity(&self) -> Capacity {
         self.baseline.as_ref().and_then(|b| b.card.capacity.clone())
@@ -701,6 +752,23 @@ pub struct ConcurrentRate {
     pub runs: Vec<ConcurrentTiming>,
     /// Wall seconds of the untimed batch at the same width.
     pub warmup_s: f64,
+    /// The prompts behind the point: `code` (the C1 code decode) or a versioned
+    /// distinct set (`distinct-v1`: each stream its own style and topic).
+    /// Absent on earlier reports, whose waves sent the code prompt to every
+    /// stream; those share experts and drafts and are not comparable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<String>,
+}
+
+impl ConcurrentRate {
+    /// How the point's streams were prompted, for captions and tables.
+    pub fn prompt_label(&self) -> &str {
+        match self.prompts.as_deref() {
+            None => "one code prompt",
+            Some("code") => "code",
+            Some(_) => "distinct prompts",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

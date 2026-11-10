@@ -76,12 +76,13 @@ impl<'library> DsparkWeights<'library> {
             graph: BindingGraphs::new(library)?,
             ready: None,
             pending_writes: None,
-            commit_descriptors: [DeviceAllocation::new(library, 384)?, DeviceAllocation::new(library, 384)?, DeviceAllocation::new(library, 384)?],
-            commit_staging: HostAllocation::new(library, capacity as usize*8 + 1152)?,
+            commit_descriptors: [DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?],
+            commit_staging: HostAllocation::new(library, capacity as usize*8 + 3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
         })
     }
 }
 impl DsparkMainContext<'_, '_> {
+    pub(crate) fn capacity(&self) -> usize { self.capacity as usize }
     /// Extra storage beyond the main projection already in the wave plan;
     /// committed and private-draft KV use separate projection workspaces.
     pub fn additional_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
@@ -89,7 +90,7 @@ impl DsparkMainContext<'_, '_> {
             (1..=4096).contains(&capacity),
             "invalid main context capacity"
         );
-        Ok(1152 + capacity as usize * (10240 + 256 + 8 + 3 * 1024)
+        Ok(3 * cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES + capacity as usize * (10240 + 256 + 8 + 3 * 1024)
             + 3 * DsparkProjection::external_input_bytes(library, ProjectionKind::Kv(0), capacity)?)
     }
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {

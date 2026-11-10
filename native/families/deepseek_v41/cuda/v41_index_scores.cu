@@ -1,3 +1,4 @@
+#include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <cuda_bf16.h>
@@ -106,7 +107,7 @@ extern "C" int32_t cuteafd_v41_index_scores(const uint8_t* q,const uint8_t* qs,c
     const uint8_t* keys,const uint8_t* ks,const uint32_t* pages,const uint64_t* lengths,
     const uint64_t* metadata,const uint64_t* positions,float* output,
     int32_t queries,int32_t candidates,int32_t slots,int32_t stride,uint64_t capacity,void* stream) {
-  if(queries<1 || queries>4096 || candidates<1 || candidates>16384 || slots<1 || slots>16 ||
+  if(queries<1 || queries>4096 || candidates<1 || candidates>16384 || slots<1 || slots>CUTEAFD_V41_MAX_REQUESTS ||
       stride<1 || stride>4096 || capacity<1 || capacity>67108864ull)return cudaErrorInvalidValue;
   const uint64_t rows=queries,count=rows*candidates,out=count*4;
   if(!valid(output,out,4))return cudaErrorInvalidValue;
@@ -127,7 +128,7 @@ extern "C" int32_t cuteafd_v41_index_scores_overlay(const uint8_t* q,const uint8
     const uint8_t* proposals,const uint8_t* proposal_scales,
     int32_t queries,int32_t candidates,int32_t slots,int32_t stride,uint64_t capacity,
     uint64_t proposal_capacity,void* stream) {
-  if(queries<1 || queries>4096 || candidates<1 || candidates>16384 || slots<1 || slots>16 ||
+  if(queries<1 || queries>4096 || candidates<1 || candidates>16384 || slots<1 || slots>CUTEAFD_V41_MAX_REQUESTS ||
       stride<1 || stride>4096 || capacity<1 || capacity>67108864ull ||
       proposal_capacity<1 || proposal_capacity>4096)return cudaErrorInvalidValue;
   const uint64_t rows=queries,count=rows*candidates,out=count*4;

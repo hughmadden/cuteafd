@@ -124,12 +124,28 @@ pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], 
     Ok(chosen.is_none_or(|action| action == 1))
 }
 
-/// Fixed diagnostic counts still share the verifier budget, anchors included.
+/// Fallbacks without confidence discard younger requests' tails first.
 pub(crate) fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
+    trim_budget_with_priors(lengths, budget, &[] as &[&[f64]], |i| i as u64)
+}
+
+/// Preserve every anchor and proposal prefix. Discard the least likely surviving
+/// tail first; equal or missing evidence favors older requests, never equal quotas.
+pub(crate) fn trim_budget_with_priors<P: AsRef<[f64]>>(lengths: &mut [usize], budget: usize,
+    priors: &[P], request_id: impl Fn(usize) -> u64) -> bool {
     let mut rows = lengths.len() + lengths.iter().sum::<usize>();
     let trimmed = rows > budget;
+    if !trimmed { return false; }
+    let survival: Vec<Vec<f64>> = priors.iter().map(|prior| {
+        let mut product = 1.;
+        prior.as_ref().iter().map(|&p| { product *= p; product }).collect()
+    }).collect();
     while rows > budget {
-        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
+        let survival = |i: usize| {
+            survival.get(i).and_then(|p| p.get(lengths[i] - 1)).copied().unwrap_or(0.)
+        };
+        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).min_by(|&a, &b|
+            survival(a).total_cmp(&survival(b)).then_with(|| request_id(b).cmp(&request_id(a)))) else { break };
         lengths[index] -= 1;
         rows -= 1;
     }
@@ -148,6 +164,22 @@ pub(crate) enum LayerHome {
     Dense,
     Local { slice_bytes: f64 },
     Remote { slice_bytes: f64 },
+}
+
+/// Price actual placement using checkpoint-native EXL3 extents or the installed
+/// FP8-family descriptor. The descriptor is deliberately never queried for EXL3.
+pub(crate) fn layer_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
+    exl3: Option<&cuteafd_loader::V41Exl3Manifest>,
+    read_bytes: impl Fn(usize) -> Result<usize>) -> Result<Vec<LayerHome>> {
+    layers.into_iter().enumerate().map(|(layer, (dense, local, tp))| {
+        if dense { return Ok(LayerHome::Dense); }
+        ensure!(tp > 0, "layer {layer} has no installed expert ranks");
+        let slice_bytes = match exl3 {
+            Some(manifest) => exl3_slice_bytes(manifest, layer, tp)?,
+            None => read_bytes(layer)? as f64,
+        };
+        Ok(if local { LayerHome::Local { slice_bytes } } else { LayerHome::Remote { slice_bytes } })
+    }).collect()
 }
 
 /// GLM Flash's policy geometry from each layer's home, the router's expert
@@ -211,13 +243,19 @@ pub(crate) fn worker_group_rows_for_input(reports: &[cuteafd_transport::worker_s
     Ok(group)
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("installed worker read-byte report missing layer {layer}")]
+pub(crate) struct MissingWorkerReadBytes {
+    pub layer: usize,
+}
+
 /// Price the busiest actual installed worker slice, which may differ by rank.
 pub(crate) fn worker_weight_read_bytes(reports: &[cuteafd_transport::worker_selection::InstalledExpertGrouping],
     layer: usize) -> Result<usize> {
     let bytes = reports.iter().filter(|report| report.layers().iter()
         .any(|range| (range.first as usize..range.end as usize).contains(&layer)))
-        .map(|report| report.weight_read_bytes()).collect::<Result<Vec<_>>>()?;
-    bytes.into_iter().max().with_context(|| format!("installed worker read-byte report missing layer {layer}"))
+        .map(|report| report.weight_read_bytes()).collect::<std::result::Result<Vec<_>, _>>()?;
+    bytes.into_iter().max().ok_or_else(|| MissingWorkerReadBytes { layer }.into())
 }
 
 /// Per-device bytes of one expert of `layer` from an EXL3 manifest at `tp`
@@ -344,7 +382,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         // The simple rule owns every length: no cold floor, no lone-request reference.
         let mut lengths = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests).ok().flatten()
             .map_or_else(|| vec![0; cores.len()], |selection| selection.lengths);
-        fit_budget(&mut lengths, max_rows);
+        trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id);
         binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
         return Selection { lengths, predicted: None };
     }
@@ -376,7 +414,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
             predicted = None;
         }
     }
-    if fit_budget(&mut lengths, max_rows) { predicted = None; }
+    if trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id) { predicted = None; }
     binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
 }
@@ -431,20 +469,6 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
         "platt": policy.calibration(candidates.len()),
         "position_reached": policy.stats().position_reached,
         "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
-}
-
-/// Trims the longest drafts one row at a time until every request's anchor
-/// and drafts fit `max_rows`; true when it trimmed.
-fn fit_budget(lengths: &mut [usize], max_rows: usize) -> bool {
-    let mut rows: usize = lengths.len() + lengths.iter().sum::<usize>();
-    let trimmed = rows > max_rows;
-    while rows > max_rows {
-        let Some(longest) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| (lengths[i], usize::MAX - i))
-            else { break };
-        lengths[longest] -= 1;
-        rows -= 1;
-    }
-    trimmed
 }
 
 /// One verified request of a GLM Flash round.
@@ -577,6 +601,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_only_candidates_do_not_inherit_selector_cold_floor() {
+        let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+        let prior = [0.; 7];
+        let token_only = Candidate { id: 1, prior: &prior, limit: 7, selector: false, cold: true };
+        let without = select_drafted(&mut policy, &[token_only], 3, 64, 1);
+        let selector = Candidate { id: 1, prior: &prior, limit: 7, selector: true, cold: true };
+        let with = select_drafted(&mut policy, &[selector], 3, 64, 1);
+        assert!(without.lengths[0] < START_DRAFTS);
+        assert_eq!(with.lengths[0], START_DRAFTS);
+    }
+
+    #[test]
     fn matches_frozen_glmrt_calibration() {
         let actual = crate::shared::draft_confidence::SelectorFit::default().confidence(&[0.75, 0.6, 0.8, 0.4, 0.9, 0.5, 0.7], &[
             [0.0, 0.0625, 2.765625, 0.0], [1.0, 0.5, 1.0, 2.0], [4.0, 0.96875, 0.25, 0.0], [0.125, 0.25, 1.5, 4.0],
@@ -630,6 +666,56 @@ mod tests {
     }
 
     #[test]
+    fn every_family_high_concurrency_uses_one_confidence_ranked_row_budget() {
+        // GLM/GLMF/MiMo call this cap after draft generation (including fixed
+        // and run_draft cold shortcuts); Qwen/Kimi/Step cap before generation.
+        // V4's selected lengths pass through the same policy fallback.
+        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4", "muse_spark", "mistral_large4"] {
+            for count in [17, 32, 64] {
+                let sure = vec![0.99; 7];
+                let poor = vec![0.; 7];
+                let priors: Vec<_> = (0..count).map(|i| if i == 0 { sure.clone() } else { poor.clone() }).collect();
+                let check = |lengths: &[usize]| {
+                    assert!(count + lengths.iter().sum::<usize>() <= 64, "{family} C{count}: {lengths:?}");
+                    if count < 64 {
+                        assert!(lengths[0] > 64 / count - 1, "{family} C{count}: {lengths:?}");
+                        assert_eq!(lengths[count - 1], 0, "{family} C{count}: {lengths:?}");
+                    } else {
+                        // All 64 rows are anchors: a nonzero draft is impossible.
+                        assert!(lengths.iter().all(|&n| n == 0));
+                    }
+                };
+                // Fixed widths bypass policy selection; an unprimed/no-spec
+                // member has no proposals but still consumes its anchor.
+                let mut fixed = vec![7; count];
+                fixed[count - 1] = 0;
+                trim_budget_with_priors(&mut fixed, 64, &priors, |i| i as u64);
+                check(&fixed);
+                for mode in [cuteafd_core::DraftMode::Shared, cuteafd_core::DraftMode::Simple] {
+                    let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+                    policy.set_draft_mode(mode);
+                    let candidates: Vec<_> = priors.iter().enumerate().map(|(i, prior)| Candidate {
+                        id: i as u64, prior, limit: if i == count - 1 { 0 } else { 64 - count },
+                        selector: true, cold: true }).collect();
+                    let selected = select_drafted(&mut policy, &candidates, 7, 64, count - 1);
+                    check(&selected.lengths);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_cap_removes_low_survival_tails_then_younger_requests() {
+        let mut lengths = [3, 3, 3];
+        let priors = [vec![0.99; 3], vec![0.1; 3], vec![0.99; 3]];
+        trim_budget_with_priors(&mut lengths, 9, &priors, |i| [10, 20, 30][i]);
+        assert_eq!(lengths, [3, 0, 3]);
+        let mut unknown = [7, 7, 7];
+        trim_budget_with_priors(&mut unknown, 10, &[] as &[&[f64]], |i| [30, 10, 20][i]);
+        assert_eq!(unknown, [0, 7, 0]);
+    }
+
+    #[test]
     fn lane_budget_preserves_anchors_and_prefixes_with_full_tails() {
         for count in 1..=8 {
             let mut lengths = vec![7 + COPY_EXTENSION; count];
@@ -674,7 +760,7 @@ mod tests {
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
@@ -707,7 +793,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3]).unwrap();
         let report = |rank, bf16_group| {
@@ -740,7 +826,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 6, "topology": [6, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 6, "topology": [6, 1], "ownership_wire": false,
         })).unwrap();
         let report = |rank, layers: &[usize], bytes| {
             let loaded = WorkerSelection::new(identity.clone(), layers).unwrap();
@@ -760,6 +846,57 @@ mod tests {
         reports[1] = InstalledExpertGrouping::new(loaded, 5, 80, ExpertGroupingSelector::Fp8Nearest,
             vec![variant]).unwrap();
         assert!(worker_weight_read_bytes(&reports, 3).is_err());
+    }
+
+    #[test]
+    fn glm_and_qwen_layer_prices_remain_bit_identical() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for family in ["glm", "qwen"] {
+            let fixture = tempfile::tempdir()?;
+            let (config, tensors, first, layers, hidden, intermediate, experts) = if family == "glm" {
+                let mut config = testing::glm5_config();
+                config["quantization_config"] = testing::exl3_compact(4);
+                let mut tensors = Vec::new();
+                for expert in 0..256 {
+                    for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
+                        ("down_proj", 6144, 2048)] {
+                        tensors.extend(testing::exl3(&format!("model.layers.1.mlp.experts.{expert}.{projection}"), n, k, 4));
+                    }
+                }
+                (config, tensors, 1, 2, 6144, 2048, 256)
+            } else {
+                let (tensors, _) = testing::qwen4_exl3(2, 4);
+                (testing::qwen4_config(2), tensors, 0, 2, 2560, 640, 512)
+            };
+            testing::write_snapshot(fixture.path(), &config, &tensors, None);
+            let catalog = cuteafd_loader::read_expert_catalog(fixture.path())?;
+            for tp in [1, 2, 3, 6] {
+                for local in [false, true] {
+                    let homes = layer_homes((0..layers).map(|layer| (layer < first, local, tp)),
+                        catalog.exl3(), |_| panic!("EXL3 must not query installed FP8 descriptors"))?;
+                    let width = (intermediate / 128usize).div_ceil(tp) * 128;
+                    let bytes = (3 * (hidden * width * 4 / 8 + hidden * 2 + width * 2)) as f64;
+                    for (layer, home) in homes.iter().enumerate() {
+                        let previous = if layer < first { LayerHome::Dense }
+                            else if local { LayerHome::Local { slice_bytes: bytes } }
+                            else { LayerHome::Remote { slice_bytes: bytes } };
+                        assert_eq!(*home, previous, "{family} TP{tp}");
+                    }
+                    for bytes in [12_288_024usize, 6_291_456, 7_077_900] {
+                        let native = layer_homes((0..layers).map(|layer| (layer < first, local, tp)), None, |_| Ok(bytes))?;
+                        let previous = (0..layers).map(|layer| if layer < first { LayerHome::Dense }
+                            else if local { LayerHome::Local { slice_bytes: bytes as f64 } }
+                            else { LayerHome::Remote { slice_bytes: bytes as f64 } }).collect::<Vec<_>>();
+                        assert_eq!(native, previous, "{family} native TP{tp}");
+                        let geometry = |homes: &[_]| geometry_with_grouping(homes, experts, 8, 64, 3, 0, |_, _| Ok(48));
+                        assert_eq!(geometry(&native)?, geometry(&previous)?, "{family} native TP{tp}");
+                    }
+                }
+            }
+        }
+        assert!(layer_homes([(false, false, 0)], None, |_| Ok(1)).is_err());
+        assert_eq!(layer_homes([(true, false, 0)], None, |_| panic!("dense descriptor"))?, [LayerHome::Dense]);
+        Ok(())
     }
 
     #[test]
@@ -980,10 +1117,10 @@ mod tests {
         // Survival, not a fixed count: one probe draft for the hopeless block,
         // the confident one up to the cold drafts.
         assert_eq!((selection.lengths, selection.predicted), (vec![1, COLD_DRAFTS, 5], None));
-        // Eight rows: three anchors and five drafts, trimmed from the longest.
+        // Preserve the policy's asymmetric allocation, trimming only the cold floor.
         let tight = select(&mut policy, &candidates, 7, 8);
         assert_eq!(tight.lengths.iter().sum::<usize>() + 3, 8, "{:?}", tight.lengths);
-        assert!(tight.lengths.iter().max().unwrap() - tight.lengths.iter().min().unwrap() <= 1);
+        assert_eq!(tight.lengths, [1, 4, 0]);
     }
 
     /// #222: GLM 5.3's first long C1 decode spent up to 40 rounds before the

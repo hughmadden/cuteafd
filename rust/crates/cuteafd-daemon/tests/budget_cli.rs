@@ -1,4 +1,4 @@
-//! CPU-only end-to-end budget parsing and deprecation diagnostics.
+//! CPU-only end-to-end budget parsing and deployment/launcher contracts.
 use std::process::Command;
 
 #[test]
@@ -29,6 +29,46 @@ fn plan_accepts_global_budget_and_warns_once_for_each_alias() {
 }
 
 #[test]
+fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_input() {
+    for family in ["serve-glmf", "serve-glm", "serve-mimo"] {
+        for gib in [30u64, 32, 96] {
+            let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
+            for explicit in [None, Some(expected), Some(4)] {
+                let mut command = Command::new(env!("CARGO_BIN_EXE_cuteafd"));
+                command.args([family, "--snapshot", "/direct-cli-missing-snapshot", "--native-lib", "/unused",
+                    "--coordinator-gpu-budget-gib", &gib.to_string(), "--vision", "off", "--audio", "off"]);
+                if let Some(value) = explicit { command.args(["--max-sequences", &value.to_string()]); }
+                let output = command.env("RUST_LOG", "info")
+                    .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+                assert!(!output.status.success());
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let resolved = stderr.lines().find(|line| line.contains("resolved boot-time serving concurrency"))
+                    .unwrap_or_else(|| panic!("{family} at {gib} GiB: {stderr}"));
+                assert!(resolved.contains(&format!("concurrency={}", explicit.unwrap_or(expected))), "{resolved}");
+                assert!(!stderr.contains("/unused"), "explicit logical budget must not load CUDA: {stderr}");
+            }
+        }
+    }
+}
+
+#[test]
+fn plan_json_keeps_info_tracing_on_stderr() {
+    let snapshot = tempfile::tempdir().unwrap();
+    std::fs::write(snapshot.path().join("config.json"), br#"{"model_type":"unknown"}"#).unwrap();
+    std::fs::write(snapshot.path().join("model.safetensors.index.json"), br#"{"weight_map":{}}"#).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        .arg("plan").arg(snapshot.path()).arg("--json")
+        .env("RUST_LOG", "info").env("HF_HOME", snapshot.path())
+        .output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("invalid JSON: {error}: {}", String::from_utf8_lossy(&output.stdout)));
+    assert_eq!(report["fits"], false);
+    assert!(stderr.contains("planner phase durations"), "{stderr}");
+}
+
+#[test]
 fn deployment_rejects_conflicting_modes_and_incomplete_topology() {
     for flags in [
         vec!["--deployment", "--files"],
@@ -56,4 +96,608 @@ fn deployment_validates_admission_before_checkpoint_access() {
         assert!(!stderr.contains("unexpected argument"), "{stderr}");
         assert!(!stderr.contains("missing config.json"), "{stderr}");
     }
+}
+
+fn release_accepts_prefill(deployment: &[u8]) -> serde_json::Value {
+    let value: serde_json::Value = serde_json::from_slice(deployment).unwrap();
+    for field in ["prefill_unit_rows", "prefill_waves"] {
+        assert!(value[field].as_u64().is_some_and(|n| n > 0), "{field}: {value}");
+    }
+    assert!(value.get("prefill_slots").is_none(), "{value}");
+    // Exercise the launcher's actual consumer, not a copied jq predicate or a
+    // fabricated plan. Sourcing the whole launcher would start containers.
+    let source = include_str!("../../../../scripts/launch/run-family.sh");
+    let function = |name: &str| {
+        let start = source.find(&format!("{name}() {{\n")).unwrap();
+        let end = source[start..].find("\n}\n").unwrap() + start + 3;
+        &source[start..end]
+    };
+    let script = format!("set -euo pipefail\nrelease_die() {{ echo \"$*\" >&2; exit 1; }}\n{}\n{}\nrelease_prefill_shape \"$(cat \"$1\")\" \"$2\"\nprintf '%s %s\\n' \"$PREFILL_ROWS\" \"$PREFILL_WAVES\"",
+        function("family_prefill_mode"), function("release_prefill_shape"));
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), deployment).unwrap();
+    let result = Command::new("bash").args(["-c", &script, "prefill-contract"])
+        .arg(file.path()).arg(value["family"].as_str().unwrap()).output().unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(String::from_utf8_lossy(&result.stdout).ends_with(&format!("{} {}\n",
+        value["prefill_unit_rows"], value["prefill_waves"])));
+    value
+}
+
+#[test]
+fn mimo_pro_max_plan_deployment_is_accepted_by_release_prefill_shape() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_snapshot(snapshot.path(), &testing::mimo_pro_config(),
+        &testing::mimo_pro_tensors(), Some(8));
+    let manifest = snapshot.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, br#"{"capacities":{"prefill_rows":4096}}"#).unwrap();
+    use cuteafd_loader::plan::{deployment::{DeploymentOptions, DeploymentSpec},
+        layout::LayoutOptions, MediaMode, PlanInput, PlanOptions};
+    let example = include_str!("../../../../examples/configs/mimo-v26-pro-mxfp4-max.config");
+    let config = example.lines().filter_map(|line| line.split_once('=')).collect::<std::collections::BTreeMap<_, _>>();
+    let gpus = config["RTX_GPUS"].parse::<usize>().unwrap();
+    let ranks = config["SPARK_COUNT"].parse::<usize>().unwrap();
+    let options = PlanOptions {
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; gpus],
+            prefill_rows: 2752, workspace_manifest: Some(manifest), ..Default::default()
+        }), ..Default::default()
+    };
+    let report = PlanInput::open(snapshot.path()).unwrap().plan_spark_count(&options, ranks, Some(ranks)).unwrap();
+    let launch = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
+    let deployment = release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&report, &launch).unwrap()).unwrap());
+    assert_eq!(deployment["family"], "mimo_v2");
+    assert_eq!(deployment["rtx_gpus"], 2);
+    assert_eq!(deployment["spark_ranks"], 6);
+    assert_eq!(deployment["prefill_unit_rows"], 2752);
+    assert_eq!(deployment["prefill_waves"], 3);
+    assert!(deployment.get("prefill_slots").is_none());
+}
+
+#[test]
+fn glm53_max_deployment_runs_three_2752_row_units() {
+    use cuteafd_loader::plan::testing;
+    let snapshot = tempfile::tempdir().unwrap();
+    testing::write_snapshot(snapshot.path(), &testing::glm5_config(),
+        &testing::glm5_tensors(|name, n, k| testing::fp8(name, n, k, None)), None);
+    let manifest = snapshot.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, testing::glm5_native_programs().to_string()).unwrap();
+    use cuteafd_loader::plan::{deployment::{DeploymentOptions, DeploymentSpec},
+        layout::LayoutOptions, MediaMode, PlanInput, PlanOptions};
+    let input = PlanInput::open(snapshot.path()).unwrap();
+    let mut options = PlanOptions {
+        vision: MediaMode::Off, audio: MediaMode::Off,
+        layout: Some(LayoutOptions {
+            // Shape contracts must not depend on the test runner's live cgroup.
+            host_memory: Some((128 << 30, 128 << 30)),
+            rtx_bytes: vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2],
+            head_split: true, workspace_manifest: Some(manifest), ..Default::default()
+        }), ..Default::default()
+    };
+    let launch = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
+    let report = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
+    let deployment = release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&report, &launch).unwrap()).unwrap());
+    // The fixed depth: three units of the 8192-row reserve.
+    assert_eq!(deployment["prefill_unit_rows"], 2752);
+    assert_eq!(deployment["prefill_waves"], 3);
+    assert_eq!(deployment["prefill_span_rows"], 8256);
+
+    options.layout.as_mut().unwrap().host_memory = Some((20 << 30, 15 << 30));
+    let capped = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert!(capped.executable(), "{}", cuteafd_loader::plan::render(&capped));
+    assert_eq!(capped.prefill_waves, Some(3));
+    assert!(capped.prefill_unit_rows.is_some_and(|rows| rows > 0 && rows < 2752));
+    assert!(capped.prefill_reserve_rows.is_some_and(|rows| rows > 0 && rows < 8192));
+    let host = capped.host_ledger.as_ref().unwrap();
+    assert_eq!((host.total_bytes, host.available_bytes), (20 << 30, 15 << 30));
+    assert_eq!(host.shortfall_bytes, 0);
+    release_accepts_prefill(&serde_json::to_vec(
+        &DeploymentSpec::from_report(&capped, &launch).unwrap()).unwrap());
+
+    options.layout.as_mut().unwrap().prefill_rows = 2752;
+    let refused = input.plan_spark_count(&options, 6, Some(6)).unwrap();
+    assert_eq!(refused.prefill_unit_rows, Some(2752));
+    assert!(!refused.executable());
+    assert!(refused.host_ledger.as_ref().unwrap().shortfall_bytes > 0);
+    assert!(refused.hints.iter().any(|hint| hint.what.contains("coordinator host memory shortfall")));
+}
+
+fn installed_example_snapshot(model_id: &str, revision: Option<&str>, hf_home: &std::path::Path)
+    -> Option<std::path::PathBuf> {
+    let snapshots = cuteafd_loader::model_cache_dir(hf_home, model_id).join("snapshots");
+    if !snapshots.is_dir() || revision.is_some_and(|revision| !snapshots.join(revision).is_dir()) {
+        return None;
+    }
+    cuteafd_loader::resolve_snapshot_at_revision(model_id, Some(hf_home), revision)
+        .unwrap_or_else(|error| panic!("{model_id}: {error:#}")).snapshot_path
+}
+
+#[test]
+fn installed_example_inventory_skips_only_absent_checkpoints_and_revisions() {
+    let home = tempfile::tempdir().unwrap();
+    let model = "test/installed";
+    assert!(installed_example_snapshot(model, None, home.path()).is_none());
+    assert!(installed_example_snapshot(model, Some("missing"), home.path()).is_none());
+    let cache = cuteafd_loader::model_cache_dir(home.path(), model);
+    let snapshot = cache.join("snapshots/present");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    std::fs::create_dir_all(cache.join("refs")).unwrap();
+    std::fs::write(cache.join("refs/main"), "present\n").unwrap();
+    assert_eq!(installed_example_snapshot(model, None, home.path()), Some(snapshot.clone()));
+    assert_eq!(installed_example_snapshot(model, Some("present"), home.path()), Some(snapshot));
+    assert!(installed_example_snapshot(model, Some("missing"), home.path()).is_none());
+    std::fs::write(cache.join("refs/main"), "missing\n").unwrap();
+    assert!(std::panic::catch_unwind(|| installed_example_snapshot(model, None, home.path())).is_err(),
+        "a broken installed main ref is not an absent-checkpoint skip");
+}
+
+fn installed_example_programs(override_path: Option<std::path::PathBuf>, home: &std::path::Path,
+    image_manifest: &std::path::Path) -> Option<std::path::PathBuf> {
+    // Keep explicit overrides, even if broken. The final default is also used
+    // by the live V4 placement fixtures; never pick an arbitrary WIP export.
+    override_path.or_else(|| [
+        image_manifest.to_path_buf(),
+        home.join(".local/share/cuteafd/PROGRAMS.json"),
+        home.join(".cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json"),
+    ].into_iter().find(|path| path.exists()))
+}
+
+fn missing_programs_input(manifest: &std::path::Path, stderr: &str) -> bool {
+    // Match the loader's JSON-file ENOENT, not a generic planning refusal.
+    matches!(manifest.try_exists(), Ok(false)) && stderr.contains(&format!(
+        "reading JSON {}: No such file or directory (os error 2)", manifest.display()))
+}
+
+#[test]
+fn installed_example_programs_discovery_preserves_overrides_and_planner_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let image = home.path().join("image/PROGRAMS.json");
+    let host = home.path().join(".local/share/cuteafd/PROGRAMS.json");
+    let live = home.path().join(".cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json");
+    assert!(installed_example_programs(None, home.path(), &image).is_none());
+    for path in [&live, &host, &image] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, br#"{"schema":1,"programs":[]}"#).unwrap();
+        assert_eq!(installed_example_programs(None, home.path(), &image).as_ref(), Some(path));
+    }
+    let absent = home.path().join("absent/PROGRAMS.json");
+    assert_eq!(installed_example_programs(Some(absent.clone()), home.path(), &image), Some(absent.clone()));
+    let missing = |path: &std::path::Path| format!(
+        "Error: reading JSON {}: No such file or directory (os error 2)", path.display());
+    assert!(missing_programs_input(&absent, &missing(&absent)));
+    assert!(!missing_programs_input(&image, &missing(&image)), "present inputs must fail");
+    assert!(!missing_programs_input(&absent, &missing(&home.path().join("config.json"))));
+    for error in ["capacity exceeded", "parsing JSON", "Permission denied", "timed out"] {
+        assert!(!missing_programs_input(&absent, error), "{error}");
+    }
+    std::fs::write(&image, "not JSON").unwrap();
+    assert_eq!(installed_example_programs(None, home.path(), &image), Some(image.clone()));
+    assert!(!missing_programs_input(&image, "parsing JSON: invalid manifest"));
+}
+
+fn require_installed_hf_home(test_name: &str, hf_home: Option<std::ffi::OsString>) -> std::path::PathBuf {
+    let Some(hf_home) = hf_home.filter(|value| !value.is_empty()).map(std::path::PathBuf::from) else {
+        panic!("{test_name}: CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required (skip via cpu-gate when absent)");
+    };
+    assert!(hf_home.is_dir(), "{test_name}: CUTEAFD_DEPLOYMENT_TEST_HF_HOME is not a directory: {}",
+        hf_home.display());
+    hf_home
+}
+
+fn require_installed_snapshot(scope: &str, model_id: &str, revision: Option<&str>,
+    hf_home: &std::path::Path) -> std::path::PathBuf {
+    installed_example_snapshot(model_id, revision, hf_home).unwrap_or_else(|| panic!(
+        "{scope}: required checkpoint not installed in {}: {model_id}@{}",
+        hf_home.display(), revision.unwrap_or("main")))
+}
+
+fn assert_programs_input_present(scope: &str, programs: Option<&std::path::Path>,
+    default_programs: &std::path::Path, stderr: &str) {
+    let manifest = programs.unwrap_or(default_programs);
+    assert!(!missing_programs_input(manifest, stderr),
+        "{scope}: required PROGRAMS manifest not installed: {}", manifest.display());
+}
+
+fn run_installed_glm_exlr8_worker_budget(hf_home: Option<std::ffi::OsString>,
+    programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
+    default_programs: &std::path::Path, root: &std::path::Path) {
+    let hf_home = require_installed_hf_home(
+        "installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget", hf_home);
+    let programs = installed_example_programs(programs_override, home, default_programs);
+    let mut tested = 0;
+    for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
+        let example = root.join(format!("examples/configs/glm53-exlr8-{name}.config"));
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let config = raw.lines().filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let snapshot = require_installed_snapshot(
+            name, config["MODEL_ID"], Some(config["MODEL_REVISION"]), &hf_home);
+        for explicit in [None, Some("104")] {
+            let mut command = Command::new("timeout");
+            command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+                .arg(&snapshot).args(["--deployment", "--config"]).arg(&example)
+                .args(["--rtx", gpus, "--spark-ranks", &ranks.to_string(),
+                    "--vision", "off", "--audio", "off", "--speculator", "off",
+                    "--exlr8-manifest", config["EXLR8_MANIFEST"]])
+                .env_remove("COORDINATOR_GPU_BUDGET_GIB");
+            if let Some(programs) = &programs { command.arg("--workspace-manifest").arg(programs); }
+            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_programs_input_present(name, programs.as_deref(), default_programs, &stderr);
+            assert!(output.status.success(), "{name}, budget={explicit:?}: {stderr}");
+            let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(deployment["spark_ranks"], ranks);
+            let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
+                .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
+            assert_eq!(devices.len(), ranks as usize);
+            let expected = explicit.map_or(108u64, |_| 104) << 30;
+            for (rank, device) in devices.iter().enumerate() {
+                assert_eq!(device["index"], rank);
+                assert_eq!(device["worker_budget_bytes"], expected);
+                assert_eq!(device["capacity_bytes"], expected);
+                assert_eq!(device["items"][0]["bytes"],
+                    deployment["spark_requirements"]["resident_bytes_per_rank"][rank]);
+            }
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("deployment.json");
+            std::fs::write(&path, &output.stdout).unwrap();
+            let python = Command::new("python3").args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_native_exlr8_launch
+capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
+"#]).arg(root).arg(&snapshot).arg(&path).arg(temporary.path()).output().unwrap();
+            assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+            tested += 1;
+        }
+    }
+    assert_eq!(tested, 4);
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_capabilities() {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
+        .expect("explicit Flash snapshot required"));
+    let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("explicit current exporter manifest required"));
+    assert!(snapshot.join("config.json").is_file() && programs.is_file());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for (name, gpus, ranks) in [("bounded-1rtx-4spark", "1", 4), ("bounded-2rtx-6spark", "2", 6)] {
+        for explicit in [None, Some("104")] {
+            let mut command = Command::new("timeout");
+            command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"]).arg(&snapshot)
+                // Keep a Spark suffix for this wire-budget proof; automatic TP2 can onboard every layer.
+                .args(["--deployment", "--rtx", gpus, "--spark-ranks", &ranks.to_string(),
+                    "--rtx-expert-layers", "1", "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+                    "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB");
+            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{name}, budget={explicit:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(deployment["family"], "glm5_flash");
+            assert_eq!(deployment["exlr8"]["manifest"], "k4");
+            assert_eq!(deployment["wip_launchable"], true);
+            assert_eq!(deployment["report"]["runtime"], "serving");
+            assert_eq!(deployment["report"]["placement_supported"], true);
+            assert_eq!(deployment["spark_ranks"], ranks);
+            let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
+                .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
+            assert_eq!(devices.len(), ranks as usize);
+            let expected = explicit.map_or(108u64, |_| 104) << 30;
+            for (rank, device) in devices.iter().enumerate() {
+                assert_eq!(device["index"], rank);
+                assert_eq!(device["worker_budget_bytes"], expected);
+                assert_eq!(device["capacity_bytes"], expected);
+                assert_eq!(device["items"][0]["bytes"], deployment["spark_requirements"]["resident_bytes_per_rank"][rank]);
+            }
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("flash-deployment.json");
+            std::fs::write(&path, &output.stdout).unwrap();
+            let python = Command::new("python3").args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_native_exlr8_capability_deployment
+capture_native_exlr8_capability_deployment(Path(sys.argv[2]))
+"#]).arg(&root).arg(&path).output().unwrap();
+            assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+        }
+    }
+}
+
+fn installed_flash_exlr8_automatic_tp2_plan(ranks: &str) -> serde_json::Value {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
+        .expect("explicit Flash snapshot required"));
+    let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("explicit current exporter manifest required"));
+    assert!(snapshot.join("config.json").is_file() && programs.is_file());
+    let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
+            "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+            "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB")
+        .output().unwrap();
+    assert!(output.status.success(), "requested ranks={ranks}: {}", String::from_utf8_lossy(&output.stderr));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_automatic_zero_spark_pool_stops_at_2m() {
+    let deployment = installed_flash_exlr8_automatic_tp2_plan("0");
+    let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 2);
+    for device in devices {
+        assert_eq!(device["kv_tokens"], 2_097_152,
+            "automatic zero-Spark pool must stop at its 2M target when capacity permits");
+    }
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_launchable() {
+    // A requested Spark ceiling must not attach idle workers when all routed layers fit locally.
+    for ranks in ["0", "6"] {
+        let deployment = installed_flash_exlr8_automatic_tp2_plan(ranks);
+        assert_eq!(deployment["family"], "glm5_flash");
+        assert_eq!(deployment["exlr8"]["manifest"], "k4");
+        assert_eq!(deployment["spark_ranks"], 0);
+        assert_eq!(deployment["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([]));
+        assert_eq!(deployment["report"]["fits"], true);
+        assert_eq!(deployment["report"]["runtime"], "serving");
+        assert_eq!(deployment["report"]["placement_supported"], true);
+        assert_eq!(deployment["executable"], true);
+        assert_eq!(deployment["wip_launchable"], true);
+        let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        for (rank, device) in devices.iter().enumerate() {
+            assert_eq!(device["kind"], "rtx");
+            assert_eq!(device["index"], rank);
+            assert_eq!(device["kv_tokens"], 2_097_152);
+            let items = device["items"].as_array().unwrap();
+            let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
+                .expect("all 42 routed layer halves must be resident on each RTX");
+            assert!(routed["bytes"].as_u64().unwrap() > 70u64 << 30);
+            let resident = items.iter().map(|item| item["bytes"].as_u64().unwrap()).sum::<u64>();
+            assert!(resident <= device["capacity_bytes"].as_u64().unwrap());
+        }
+    }
+}
+
+#[test]
+fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    run_installed_glm_exlr8_worker_budget(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
+        &root);
+}
+
+fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
+    programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
+    default_programs: &std::path::Path, root: &std::path::Path) {
+    let hf_home = require_installed_hf_home(
+        "installed_example_deployments_publish_executable_prefill_shapes", hf_home);
+    let programs = installed_example_programs(programs_override, home, default_programs);
+    eprintln!("installed example PROGRAMS: {}", programs.as_deref().unwrap_or(default_programs).display());
+    let mut examples = std::fs::read_dir(root.join("examples/configs")).unwrap()
+        .map(|entry| entry.unwrap().path()).filter(|path|
+            path.extension().is_some_and(|extension| extension == "config"))
+        .collect::<Vec<_>>();
+    examples.sort();
+    assert!(!examples.is_empty(), "no example configs found");
+    let total = examples.len();
+    let mut tested = 0;
+    let mut families = std::collections::BTreeSet::new();
+    for example in examples {
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let config = raw.lines().filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let name = example.file_name().unwrap().to_str().unwrap();
+        let revision = config.get("MODEL_REVISION").copied();
+        let _snapshot = require_installed_snapshot(name, config["MODEL_ID"], revision, &hf_home);
+        let mut command = Command::new("timeout");
+        command.args(["180", env!("CARGO_BIN_EXE_cuteafd"), "plan", config["MODEL_ID"],
+            "--deployment", "--config"]).arg(&example)
+            .args(["--rtx", config["RTX_GPUS"], "--vision", "off", "--audio", "off",
+                "--speculator", "off", "--hf-home"]).arg(&hf_home)
+            .env("HF_HOME", &hf_home).env_remove("COORDINATOR_GPU_BUDGET_GIB");
+        if let Some(revision) = config.get("MODEL_REVISION") {
+            command.args(["--revision", revision]);
+        }
+        for (key, flag) in [("SPARK_TP", "--spark-tp"), ("SPARK_EP", "--spark-ep"),
+            ("PREFILL_ROWS", "--prefill-rows"), ("PREFILL_BATCH_TOKENS", "--prefill-rows"),
+            ("PREFILL_WAVES", "--prefill-waves"), ("PREFILL_SPAN_ROWS", "--prefill-span-rows"),
+            ("EXLR8_MANIFEST", "--exlr8-manifest")] {
+            if let Some(value) = config.get(key) { command.args([flag, value]); }
+        }
+        if let Some(manifest) = &programs {
+            command.arg("--workspace-manifest").arg(manifest);
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() == Some(1) {
+            assert_programs_input_present(name, programs.as_deref(), default_programs, &stderr);
+        }
+        assert!(output.status.success(), "{name}: {stderr}");
+        let deployment = release_accepts_prefill(&output.stdout);
+        tested += 1;
+        families.insert(deployment["family"].as_str().unwrap().to_owned());
+        eprintln!("{name}: {} unit_rows={} waves={} slots={} span_rows={}", deployment["family"],
+            deployment["prefill_unit_rows"], deployment["prefill_waves"], deployment["prefill_slots"],
+            deployment["prefill_span_rows"]);
+    }
+    assert_eq!(tested, total);
+    eprintln!("installed example deployments: {tested} tested, {total} configs, families={families:?}");
+}
+
+#[test]
+fn installed_example_deployments_publish_executable_prefill_shapes() {
+    // cpu-gate --full enables the installed inventory; sparse fixtures always run.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    run_installed_example_deployments(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"),
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into),
+        &std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME")),
+        std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"),
+        &root);
+}
+
+fn run_installed_release_v4_matrix_recipes(hf_home: Option<std::ffi::OsString>,
+    root: &std::path::Path, matrix: &serde_json::Value) {
+    let hf_home = require_installed_hf_home(
+        "installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers", hf_home);
+    let entries = matrix["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "no release-smoke-v4 matrix entries found");
+    let mut tested = 0;
+    for entry in entries {
+        let entry_name = entry["name"].as_str().unwrap();
+        let example = root.join(entry["config"].as_str().unwrap());
+        let raw = std::fs::read_to_string(&example).unwrap();
+        let mut config = raw.lines().filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned())).collect::<std::collections::BTreeMap<_, _>>();
+        if let Some(overrides) = entry["set"].as_object() {
+            for (key, value) in overrides { if let Some(value) = value.as_str() {
+                config.insert(key.clone(), value.to_owned());
+            } }
+        }
+        let revision = config.get("MODEL_REVISION").map(String::as_str);
+        let snapshot = require_installed_snapshot(entry_name, &config["MODEL_ID"], revision, &hf_home);
+        let ranks = entry["sparks"].as_array().map_or(0, Vec::len);
+        use cuteafd_loader::plan::{family, format, spec::Component, Checkpoint};
+        // Exercise production recipe construction from real tensor headers without
+        // running the unrelated memory-placement search for every matrix entry.
+        let checkpoint = Checkpoint::open(&snapshot).unwrap();
+        let family = family::detect(&checkpoint).unwrap();
+        let model = family.open(&checkpoint).unwrap();
+        tested += 1;
+        let Some(moe) = model.spec().moe.as_ref() else { continue; };
+        let tensors = checkpoint.tensors.iter().filter(|tensor|
+            family.classify(model.spec(), &tensor.meta.name)
+                .is_some_and(|role| role.component == Component::RoutedExpert))
+            .cloned().collect::<Vec<_>>();
+        let mut packages = std::collections::BTreeSet::new();
+        for members in format::group_by_stem(&tensors).values() {
+            let operand = format::detect(members).unwrap();
+            if let Some(contract) = model.experts(&operand) { packages.insert(contract.package); }
+        }
+        if config.contains_key("EXLR8_MANIFEST") {
+            // EXLR8 is admitted by exlr8_native_plan, not spark_recipe.
+            assert!(packages.is_empty(), "{entry_name}: EXLR8 unexpectedly selected a generic package");
+            continue;
+        }
+        assert!(!packages.is_empty(), "{entry_name}: missing routed recipe");
+        for package in packages {
+            // Local-only coordinators need no Spark TP1 package, but their IDs
+            // must parse against a registered Spark world.
+            let world = if ranks == 0 {
+                *cuteafd_loader::plan::experts::spark_worlds(&package, moe.intermediate).first()
+                    .unwrap_or_else(|| panic!("{entry_name}: unrecognized recipe {package}"))
+            } else { ranks };
+            cuteafd_loader::plan::experts::spark_recipe(&package, moe.intermediate, world)
+                .unwrap_or_else(|error| panic!("{entry_name}: {package}: {error}"));
+        }
+    }
+    assert_eq!(tested, entries.len());
+}
+
+#[test]
+fn installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let matrix: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../scripts/bench/release-smoke-v4.json")).unwrap();
+    run_installed_release_v4_matrix_recipes(
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"), &root, &matrix);
+}
+
+#[test]
+fn installed_checkpoint_runners_fail_on_missing_hf_home_checkpoints_or_programs() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let absent_programs = temp.path().join("absent/PROGRAMS.json");
+    let matrix = serde_json::json!({
+        "entries": [{
+            "name": "v41-flash-min",
+            "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+            "sparks": ["s1", "s2", "s3", "s4"]
+        }]
+    });
+    for missing_hf in [None, Some( std::ffi::OsString::from("") ),
+        Some(temp.path().join("missing-hf").into_os_string())] {
+        assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
+            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+        assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
+            missing_hf.clone(), None, temp.path(), &absent_programs, &root)).is_err());
+        assert!(std::panic::catch_unwind(|| run_installed_release_v4_matrix_recipes(
+            missing_hf.clone(), &root, &matrix)).is_err());
+    }
+    let hf_home = temp.path().join("hf");
+    std::fs::create_dir_all(&hf_home).unwrap();
+    assert!(std::panic::catch_unwind(|| run_installed_glm_exlr8_worker_budget(
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+    assert!(std::panic::catch_unwind(|| run_installed_example_deployments(
+        Some(hf_home.clone().into_os_string()), None, temp.path(), &absent_programs, &root)).is_err());
+    assert!(std::panic::catch_unwind(|| run_installed_release_v4_matrix_recipes(
+        Some(hf_home.clone().into_os_string()), &root, &matrix)).is_err());
+    let missing_err = format!(
+        "Error: reading JSON {}: No such file or directory (os error 2)", absent_programs.display());
+    assert!(std::panic::catch_unwind(|| assert_programs_input_present(
+        "min", None, &absent_programs, &missing_err)).is_err());
+}
+
+#[test]
+fn bench_panels_json_cli_matches_fixture_and_selectable_panel_ids() {
+    let output = Command::new(env!("CARGO_BIN_EXE_cuteafd"))
+        .args(["bench", "panels", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let actual: Vec<String> = serde_json::from_slice(&output.stdout).unwrap();
+    let fixture: Vec<String> = serde_json::from_str(
+        include_str!("../../../../scripts/bench/fixtures/bench-panels-v1.json")).unwrap();
+    assert_eq!(actual, fixture);
+    assert!(actual.iter().any(|id| id == "shared_prefix"));
+}
+
+#[test]
+#[ignore = "requires real CUTEAFD_KIMI_SNAPSHOT, CUTEAFD_KIMI_DRAFTER and CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
+    let required = |key| std::env::var_os(key).unwrap_or_else(|| panic!("{key} required"));
+    let start = std::time::Instant::now();
+    let output = Command::new("timeout")
+        .args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+        .arg(required("CUTEAFD_KIMI_SNAPSHOT"))
+        .args(["--deployment", "--rtx", "1", "--spark-ranks", "6", "--spark-budget-gib", "110",
+            "--speculator", "dflash2", "--drafter-snapshot"])
+        .arg(required("CUTEAFD_KIMI_DRAFTER"))
+        .args(["--vision", "off", "--audio", "off", "--workspace-manifest"])
+        .arg(required("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"))
+        .env_remove("COORDINATOR_GPU_BUDGET_GIB").output().unwrap();
+    let elapsed = start.elapsed();
+    assert!(output.status.success(), "{elapsed:?}: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(elapsed <= std::time::Duration::from_secs(10), "TP1 plan took {elapsed:?}");
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["rtx_gpus"], 1);
+    assert_eq!(plan["spark_ranks"], 6);
+    assert_eq!(plan["speculator"], "dflash2");
+    assert_eq!(plan["executable"], true, "{plan}");
+    let placement = &plan["estimated_placement"];
+    assert_eq!(placement["items"].as_array().unwrap().len(), 1);
+    assert!(placement["hops"].as_array().unwrap().is_empty());
+    for layer in placement["layers"].as_array().unwrap() {
+        assert_eq!(layer["mode"]["mode"], "whole");
+        assert_eq!(layer["mode"]["gpu"], 0);
+        assert_eq!(layer["mode"]["ffn"], "owner");
+    }
+    eprintln!("real K6 TP1 automatic plan: {elapsed:?}");
 }

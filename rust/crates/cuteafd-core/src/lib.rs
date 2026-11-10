@@ -1,10 +1,21 @@
+/// Physical Spark world ceiling shared by planning, protocols and rank storage.
+pub const MAX_SPARK_WORLD: usize = 8;
+// WaveReceipt uses one bit per physical rank.
+const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
+
 pub mod tp_units;
+pub mod mxfp4_layouts;
 pub mod dense_attention;
 pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;
 pub mod coordinator_programs;
 pub mod expert_geometry;
-pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy,
+pub mod spark_executions;
+pub mod spark_reply;
+pub use spark_reply::SparkReplyFormat;
+pub use spark_executions::{covering_export, DecodeExecution, ExecutionAdmissionError, ExecutionOwner,
+    OwnerBytes, OwnerExtent, PrefillExecution, SparkExecutions, MAX_BUFFERED_PREFILL_UNITS, MAX_SPARK_DECODE_LANES};
+pub use expert_geometry::{expert_geometry, set_expert_geometry, ExpertGeometry, Exl3RowPolicy, EXL3_CAPACITIES,
     ModelAdmissionResponse, RuntimeSample, SparkEndpoint, SparkIngress, SparkRings, SparkRuntimeInventory, SparkSlice};
 mod draft_policy;
 pub use draft_policy::{
@@ -17,15 +28,19 @@ mod dspark_rng;
 pub use dspark_rng::{DsparkRng, DsparkRngReservation};
 mod target_sampling;
 pub use target_sampling::{
+    allocations as target_sampler_allocations, device_bytes as target_sampler_device_bytes, SamplerAllocation,
     TargetSamplingError, TargetSamplingParams, GREEDY_TEMPERATURE_EPS, MAX_TARGET_TEMPERATURE,
 };
 mod dspark_verify;
-pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS};
+pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, GreedyVerification, MAX_DSPARK_PROPOSALS, V41_VERIFY_ROWS, V41_DECODE_CAPACITIES, V41_TARGET_CAPACITIES, V41_DRAFT_LEGACY_ROWS, V41_DRAFT_WIDE_ROWS, V41_MAX_REQUESTS, V41_MAX_LANE_MEMBERS, V41_VOCAB_ROWS, V41_WRITE_DESCRIPTOR_BYTES, V41_READ_DESCRIPTOR_BYTES};
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
+pub mod concurrency;
 pub mod thermal;
+pub mod push_outcome;
 pub mod memory_layout;
+pub mod packed_head;
 pub mod media;
 pub use media::{AudioKey, ImageKey, MediaKey, MediaSpan};
 pub use engram::{EngramBatch, EngramError, EngramHashes, EngramHistory, EngramPrefillCursor, ENGRAM_LAYERS, ENGRAM_ROWS, ENGRAM_COMPRESSED_VOCAB};
@@ -93,7 +108,7 @@ pub use ids::{LayerId, PlacementVersion, PositionId, Priority, RequestId};
 pub use kv_cache::{
     KvBackedBlock, KvCacheAllocator, KvCacheBackingStore, KvCacheConfig, KvCacheDType,
     KvCacheSnapshot, KvLayout, KvReservation, KvReservationState, KvWriteRecord, KvWriteState,
-    MlaKvCacheRepresentation,
+    MlaCacheFormat, MlaKvCacheRepresentation,
 };
 pub use layerwave::{
     admit_layerwaves_for_iteration, plan_prefill_chunks, plan_prefill_chunks_with_model,
@@ -104,13 +119,14 @@ pub use layerwave::{
 pub use model::{
     AttentionKind, DType, ModelFacts, ModelVariant, TensorCatalog, TensorInfo, TensorRole,
 };
-pub use node::NodeRole;
+pub use node::{GpuArch, NodeRole};
 pub use placement::{
     owner_for_expert, ExpertOwnerLookup, LoadPlan, PlacementPolicy, TensorAssignment,
 };
 pub use replicated_expert_schedule::{
-    replicated_expert_tie_seed, replicated_expert_tie_seed_for, ReplicatedExpertCostModel,
-    ReplicatedExpertGroupId, ReplicatedExpertGroupLoad, ReplicatedExpertGroupPlan,
+    replicated_expert_tie_seed, replicated_expert_tie_seed_for, ExpertResidencySet,
+    ReplicatedExpertCostModel, ReplicatedExpertGroupId, ReplicatedExpertGroupLoad,
+    ReplicatedExpertGroupPlan, ReplicatedExpertGroupSpec, ReplicatedExpertResidency,
     ReplicatedExpertScheduleConfig, ReplicatedExpertScheduler, ReplicatedExpertTieSeedMode,
     INACTIVE_REPLICATED_EXPERT_GROUP, MAX_REPLICATED_EXPERT_GROUPS, TIE_SEED_FIXED_REQUEST_ID,
 };

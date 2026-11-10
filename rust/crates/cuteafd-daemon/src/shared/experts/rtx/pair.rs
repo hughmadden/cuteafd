@@ -2,7 +2,7 @@
 use crate::shared::experts::exl3::execution::Exl3Modules;
 use super::{
     ExchangeDtype, ExpertInput, FusedCombine, PartialDtype, RouteCheck, RouteIdentity, RouteSource,
-    Routes, RtxExpertLayer, RtxShard,
+    Routes, RtxExpertLayer, RtxShard, routes::SlotRouteChecks,
 };
 use crate::shared::{
     memory::HostAllocation,
@@ -21,7 +21,7 @@ use std::{
 /// A failed drain may return only if the caller retains every queued owner;
 /// callers without quarantine ownership must terminate in shutdown instead.
 #[derive(Debug, thiserror::Error)]
-#[error("submission failed permanently: {cause}; {drain}")]
+#[error("submission failed permanently: {cause:#}; {drain}")]
 pub(crate) struct TerminalStepError {
     #[source]
     cause: anyhow::Error,
@@ -174,6 +174,9 @@ pub(crate) fn submit_scoped<T>(
             Ok(value)
         }
         Err(cause) => {
+            // Teardown may abort to retain unsafe-to-release owners. Preserve
+            // the submission error before that fail-safe can hide its cause.
+            tracing::error!(error = %format!("{cause:#}"), "submission failed; draining queued owners");
             let drain = match guard.shutdown() {
                 Ok(()) => "queued streams drained; engine cannot be reused".to_string(),
                 Err(error) => format!("queued owners retained: {error:#}"),
@@ -190,6 +193,10 @@ pub(crate) struct PackedRoutes {
     pub bytes: usize,
 }
 impl PackedRoutes {
+    pub(crate) fn with_input_bytes(rows: usize, topk: usize, input_row_bytes: usize) -> usize {
+        Self::new(rows, topk).bytes + rows * input_row_bytes
+    }
+
     pub(crate) fn new(rows: usize, topk: usize) -> Self {
         let section = rows * topk * 4;
         let weights = section.next_multiple_of(16);
@@ -201,14 +208,31 @@ impl PackedRoutes {
     }
 }
 
+/// Who publishes a layer's canonical routes (and, for a source-only router,
+/// its FP8 K32 wire rows) to the peer.
+#[derive(Debug, Clone, Copy)]
+struct Broadcast {
+    source: usize,
+    wire: bool,
+}
+
 pub(crate) struct Pair<'a> {
     pub layers: Vec<usize>,
+    /// Input bytes per row a source broadcast carries (the backends' input
+    /// dtype: FP8 K32 wire or BF16 rows); 0 when routes only.
+    wire_row_bytes: usize,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     pub combine: FusedCombine<'a>,
     pub routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
-    checks: RefCell<BTreeMap<(usize, usize), (usize, [HostAllocation<'a>; 2])>>,
+    /// Per-slot max-row pinned route copies per layer, allocated before a
+    /// call's first peer wait and retained (never replaced) across units.
+    checks: RefCell<Option<SlotRouteChecks<BTreeMap<usize, [HostAllocation<'a>; 2]>>>>,
+    /// The unit each slot's live diagnostics belong to (`enqueue` knows only the slot).
+    active: RefCell<Vec<Option<usize>>>,
     checking: Cell<bool>,
+    lanes: usize,
+    max_rows: usize,
     interval: usize,
     steps: Cell<usize>,
     library: &'a NativeLibrary,
@@ -218,6 +242,7 @@ pub(crate) struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         library: &'a NativeLibrary,
         devices: [RankDevice; 2],
@@ -225,9 +250,33 @@ impl<'a> Pair<'a> {
         hidden: usize,
         topk: usize,
         max_rows: usize,
+        decode_rows: usize,
         lanes: usize,
         exchange: ExchangeDtype,
     ) -> Result<Self> {
+        Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, decode_rows, lanes, exchange, false)
+    }
+
+    /// As [`Self::new`]; with `wire`, each route slot also holds `max_rows`
+    /// input rows in the backends' input dtype (FP8 K32 wire or BF16), so a
+    /// layer whose router lives on one rank can publish its routes and input
+    /// to the peer ([`Self::enqueue_from`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_wire(
+        library: &'a NativeLibrary,
+        devices: [RankDevice; 2],
+        ranks: [Box<dyn RtxExpertLayer + 'a>; 2],
+        hidden: usize,
+        topk: usize,
+        max_rows: usize,
+        decode_rows: usize,
+        lanes: usize,
+        exchange: ExchangeDtype,
+        wire: bool,
+    ) -> Result<Self> {
+        ensure!((1..=max_rows).contains(&decode_rows), "TP2 decode rows outside admission");
+        let fp8 = ranks[0].uses_fp8_input();
+        let wire_row_bytes = match (wire, fp8) { (false, _) => 0, (true, true) => hidden + hidden / 32, (true, false) => hidden * 2 };
         let layers = ranks[0].layers().to_vec();
         ensure!(
             !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
@@ -239,6 +288,7 @@ impl<'a> Pair<'a> {
                 backend.shard() == RtxShard::Tp2 { rank: rank as u8 }
                     && backend.device() == devices[rank].device
                     && backend.partial() == ranks[0].partial()
+                    && backend.uses_fp8_input() == ranks[0].uses_fp8_input()
                     && (1..=max_rows).all(|rows| backend
                         .partial_layout(rows)
                         .is_ok_and(|layout| layout == super::PartialLayout::Tokens)),
@@ -253,7 +303,8 @@ impl<'a> Pair<'a> {
             library,
             devices,
             2 * lanes,
-            PackedRoutes::new(max_rows, topk).bytes,
+            PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes,
+            PackedRoutes::with_input_bytes(decode_rows, topk, wire_row_bytes),
         )?;
         for (rank, producer) in devices.into_iter().enumerate() {
             routes.require_cooperative_producer_stream(rank, producer)?;
@@ -266,12 +317,16 @@ impl<'a> Pair<'a> {
             .unwrap_or(0);
         Ok(Self {
             layers,
+            wire_row_bytes,
             ranks: ranks.map(RefCell::new),
             combine: FusedCombine::new(library, exchange)?,
             routes,
             source: Cell::new(RouteSource::Replicated),
-            checks: RefCell::new(BTreeMap::new()),
+            checks: RefCell::new(None),
+            active: RefCell::new(vec![None; lanes]),
             checking: Cell::new(false),
+            lanes,
+            max_rows,
             interval,
             steps: Cell::new(0),
             library,
@@ -283,6 +338,10 @@ impl<'a> Pair<'a> {
 
     pub(crate) fn partial(&self) -> PartialDtype {
         self.ranks[0].borrow().partial()
+    }
+
+    pub(crate) fn uses_fp8_input(&self) -> bool {
+        self.ranks[0].borrow().uses_fp8_input()
     }
 
     pub(crate) fn group_rows(&self, rows: usize) -> Result<usize> {
@@ -303,34 +362,79 @@ impl<'a> Pair<'a> {
         Ok(*bytes.iter().max().context("installed TP2 ranks missing")?)
     }
 
-    pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
+    /// Starts a call's route diagnostics: whether this call checks (`force` or
+    /// the CUTEAFD_ROUTE_CHECK interval). When it does, every slot's max-row
+    /// pinned storage exists before the caller queues any peer wait; strict
+    /// (forced) checks fail on a mismatch, interval checks fall back to broadcast.
+    pub(crate) fn start_checks(&self, force: bool) -> Result<bool> {
         let steps = self.steps.get() + 1;
         self.steps.set(steps);
         let check = force || (self.interval > 0 && steps % self.interval == 0);
         self.checking.set(check);
-        if !check {
-            return Ok(());
-        }
+        if !check { return Ok(false); }
         let mut checks = self.checks.borrow_mut();
-        ensure!(checks.is_empty(), "undrained TP2 route diagnostics");
-        for &layer in &self.layers {
-            for (lane, &rows) in rows.iter().enumerate() {
-                let hosts = (0..2)
-                    .map(|rank| {
-                        self.routes.on(rank, || {
-                            HostAllocation::new(self.library, rows * self.topk * 8)
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                checks.insert(
-                    (layer, lane),
-                    (
-                        rows,
-                        hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?,
-                    ),
-                );
+        // The previous span finished (drained) or failed terminally (the
+        // submission teardown drained it), so its storage is released here,
+        // before this call queues anything.
+        ensure!(self.active.borrow().iter().all(Option::is_none), "undrained TP2 route diagnostics");
+        let storage = (0..self.lanes).map(|_| self.layers.iter().map(|&layer| {
+            let hosts = (0..2).map(|rank| self.routes.on(rank, ||
+                HostAllocation::new(self.library, self.max_rows * self.topk * 8))).collect::<Result<Vec<_>>>()?;
+            Ok((layer, hosts.try_into().map_err(|_| anyhow::anyhow!("two ranks"))?))
+        }).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
+        *checks = Some(SlotRouteChecks::new(storage, force)?);
+        Ok(true)
+    }
+
+    /// One unit's diagnostics on `slot` (its rows of every TP2 layer).
+    pub(crate) fn begin_unit(&self, slot: usize, unit: usize, rows: usize) -> Result<()> {
+        if !self.checking.get() { return Ok(()); }
+        ensure!(rows <= self.max_rows, "route diagnostic rows {rows} exceed {}", self.max_rows);
+        let mut checks = self.checks.borrow_mut();
+        checks.as_mut().context("route diagnostics not started")?.begin(slot, unit, rows, true)?;
+        *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = Some(unit);
+        Ok(())
+    }
+
+    /// Drains both producer streams, then compares the unit's routes trimmed
+    /// to its rows. A mismatch switches to broadcast (strict: an error).
+    pub(crate) fn finish_unit(&self, slot: usize, unit: usize) -> Result<()> {
+        if !self.checking.get() { return Ok(()); }
+        let mut checks = self.checks.borrow_mut();
+        let checks = checks.as_mut().context("route diagnostics not started")?;
+        let topk = self.topk;
+        let identity = checks.finish(slot, unit, |storage, rows| {
+            for rank in 0..2 {
+                // SAFETY: every producer of this unit's copies is already queued.
+                self.routes.on(rank, || unsafe {
+                    self.library.cuda_stream_synchronize(self.devices[rank].stream)
+                })?;
             }
-        }
+            let section = rows * topk * 4;
+            let full = self.max_rows * topk * 4;
+            Ok(storage.iter().map(|(&layer, hosts)| RouteCheck { layer, rows, topk,
+                ranks: hosts.each_ref().map(|h| {
+                    let bytes = h.bytes();
+                    [&bytes[..section], &bytes[full..full + section]].concat()
+                }) }).collect())
+        })?;
+        *self.active.borrow_mut().get_mut(slot).context("route diagnostic slot")? = None;
+        if let Some(identity) = identity { self.publish_identity(&identity); }
+        Ok(())
+    }
+
+    /// Ends a call's diagnostics; always called, also before propagating an
+    /// executor error (strict checks reject a unit that never finished).
+    pub(crate) fn finish_span(&self) -> Result<()> {
+        if !self.checking.replace(false) { return Ok(()); }
+        let checks = self.checks.borrow();
+        checks.as_ref().context("route diagnostics not started")?.finish_span()
+    }
+
+    /// A single-pass call: each lane is one unit on its own slot.
+    pub(crate) fn begin_checks(&self, rows: &[usize], force: bool) -> Result<()> {
+        if !self.start_checks(force)? { return Ok(()); }
+        for (lane, &rows) in rows.iter().enumerate() { self.begin_unit(lane, lane, rows)?; }
         Ok(())
     }
 
@@ -338,27 +442,17 @@ impl<'a> Pair<'a> {
         self.checking.get()
     }
 
+    /// Completes a single-pass call's lanes, then its span.
     pub(crate) fn finish_checks(&self) -> Result<()> {
-        if !self.checking.replace(false) {
-            return Ok(());
-        }
-        for rank in 0..2 {
-            // SAFETY: every producer/wait for the completed step is already queued.
-            self.routes.on(rank, || unsafe {
-                self.library
-                    .cuda_stream_synchronize(self.devices[rank].stream)
-            })?;
-        }
-        let checks = std::mem::take(&mut *self.checks.borrow_mut())
-            .into_iter()
-            .map(|((layer, _), (rows, hosts))| RouteCheck {
-                layer,
-                rows,
-                topk: self.topk,
-                ranks: hosts.map(|h| h.bytes().to_vec()),
-            })
-            .collect::<Vec<_>>();
-        let identity = RouteIdentity::check(&checks);
+        if !self.checking.get() { return Ok(()); }
+        let live = self.active.borrow().iter().enumerate()
+            .filter_map(|(slot, unit)| unit.map(|unit| (slot, unit))).collect::<Vec<_>>();
+        let result = live.into_iter().try_for_each(|(slot, unit)| self.finish_unit(slot, unit));
+        let span = self.finish_span();
+        result.and(span)
+    }
+
+    fn publish_identity(&self, identity: &RouteIdentity) {
         if identity.source() == RouteSource::Broadcast {
             self.source.set(RouteSource::Broadcast);
         }
@@ -372,7 +466,6 @@ impl<'a> Pair<'a> {
                 "replicated"
             },
         );
-        Ok(())
     }
 
     /// Resolve all lazy backend capacities before either rank queues a peer wait.
@@ -453,10 +546,60 @@ impl<'a> Pair<'a> {
         lane: usize,
         rows: usize,
         input: ExpertInput,
+        routes: Routes,
+        scratch: CuteafdDeviceBuffer,
+        shared: *const u16,
+        out: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()> {
+        let broadcast = (self.source.get() == RouteSource::Broadcast).then_some(Broadcast { source: 0, wire: false });
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.enqueue_with(rank, layer, lane, rows, input, routes, scratch, shared, out, broadcast, abort) }
+    }
+
+    /// As [`Self::enqueue`], for a layer whose router, routes and input rows
+    /// exist only on `source`: the source packs routes and input into its
+    /// `scratch` and pushes them over the peer exchange (device-driven, no host
+    /// hop); the peer waits, then runs its half on the received rows.
+    /// # Safety
+    /// As [`Self::enqueue`]. On the peer, `input` and `routes` are ignored; on
+    /// the source, `input` is in the backends' input dtype and `scratch` holds
+    /// `PackedRoutes` plus the input rows. Requires a pair built with
+    /// [`Self::new_with_wire`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue_from(
+        &self,
+        rank: usize,
+        source: usize,
+        layer: usize,
+        lane: usize,
+        rows: usize,
+        input: ExpertInput,
+        routes: Routes,
+        scratch: CuteafdDeviceBuffer,
+        shared: *const u16,
+        out: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()> {
+        ensure!(source < 2 && self.wire_row_bytes > 0, "source broadcast needs a wire-capable pair");
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.enqueue_with(rank, layer, lane, rows, input, routes, scratch, shared, out,
+            Some(Broadcast { source, wire: true }), abort) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn enqueue_with(
+        &self,
+        rank: usize,
+        layer: usize,
+        lane: usize,
+        rows: usize,
+        mut input: ExpertInput,
         mut routes: Routes,
         scratch: CuteafdDeviceBuffer,
         shared: *const u16,
         out: *mut c_void,
+        broadcast: Option<Broadcast>,
         abort: &mut dyn FnMut(),
     ) -> Result<()> {
         let mut aborted = false;
@@ -469,14 +612,18 @@ impl<'a> Pair<'a> {
         let result = self.routes.on(rank, || {
             let stream = self.devices[rank].stream;
             let packed = PackedRoutes::new(rows, self.topk);
-            if self.checking.get() {
-                let checks = self.checks.borrow();
-                let (expected, hosts) = checks
-                    .get(&(layer, lane))
-                    .context("route diagnostics not prepared")?;
-                ensure!(*expected == rows, "route diagnostic row count changed");
-                let host = hosts[rank].buffer;
-                // SAFETY: prepared pinned storage stays live through finish_checks' stream drains.
+            // A source broadcast's peer has no routes of its own to check.
+            let receives = broadcast.is_some_and(|b| b.wire && b.source != rank);
+            let unit = if self.checking.get() && !receives { self.active.borrow().get(lane).copied().flatten() } else { None };
+            if let Some(unit) = unit {
+                let mut checks = self.checks.borrow_mut();
+                let storage = checks.as_mut().context("route diagnostics not started")?
+                    .storage(lane, unit)?.context("route diagnostics disabled for a live unit")?;
+                let host = storage.get(&layer).context("route diagnostics omit a TP2 layer")?[rank].buffer;
+                ensure!(rows <= self.max_rows, "route diagnostic row count exceeds its storage");
+                let full = self.max_rows * self.topk * 4;
+                // SAFETY: the slot's pinned storage is retained (never replaced)
+                // until finish_unit drains both producer streams.
                 unsafe {
                     self.library.copy_d2h_host_buffer_async(
                         host,
@@ -488,9 +635,10 @@ impl<'a> Pair<'a> {
                         packed.section,
                         stream,
                     )?;
+                    // Weights at the fixed max-row offset; finish trims both sections.
                     self.library.copy_d2h_host_buffer_async(
                         CuteafdHostBuffer {
-                            ptr: host.ptr.cast::<u8>().add(packed.section).cast(),
+                            ptr: host.ptr.cast::<u8>().add(full).cast(),
                             bytes: packed.section,
                             ..host
                         },
@@ -504,11 +652,13 @@ impl<'a> Pair<'a> {
                     )?;
                 }
             }
-            if self.source.get() == RouteSource::Broadcast {
+            if let Some(Broadcast { source, wire }) = broadcast {
                 let at = 2 * lane + layer % 2;
-                if rank == 0 {
+                let wire_bytes = if wire { rows * self.wire_row_bytes } else { 0 };
+                let extent = packed.bytes + wire_bytes;
+                if rank == source {
                     ensure!(
-                        packed.bytes <= scratch.bytes,
+                        extent <= scratch.bytes,
                         "router scratch cannot pack canonical routes"
                     );
                     // SAFETY: logits are consumed; aligned canonical sections fit this rank's scratch.
@@ -539,16 +689,39 @@ impl<'a> Pair<'a> {
                             packed.section,
                             stream,
                         )?;
+                        if wire {
+                            let rows_ptr = match input {
+                                ExpertInput::Fp8K32(rows) | ExpertInput::Bf16(rows) => rows,
+                            };
+                            ensure!(matches!(input, ExpertInput::Fp8K32(_)) == self.uses_fp8_input(),
+                                "source broadcast input differs from the backends' input dtype");
+                            self.library.copy_d2d_async(
+                                CuteafdDeviceBuffer {
+                                    ptr: scratch.ptr.cast::<u8>().add(packed.bytes).cast(),
+                                    bytes: wire_bytes,
+                                    ..scratch
+                                },
+                                CuteafdDeviceBuffer { ptr: rows_ptr, bytes: wire_bytes, ..scratch },
+                                wire_bytes,
+                                stream,
+                            )?;
+                        }
                     }
-                    self.routes.push(0, at, scratch.ptr, packed.bytes)?;
+                    self.routes.push(source, at, scratch.ptr, extent)?;
                 } else {
-                    self.routes.wait(1, at)?;
-                    let received = self.routes.recv(1, at)?;
-                    // SAFETY: rank0 published the packed canonical sections before this stream's wait.
+                    self.routes.wait(rank, at)?;
+                    let received = self.routes.recv(rank, at)?;
+                    // SAFETY: the source published the packed canonical sections (and
+                    // wire rows) before this stream's wait.
                     routes = Routes {
                         ids: received,
                         weights: unsafe { received.cast::<u8>().add(packed.weights).cast() },
                     };
+                    if wire {
+                        // SAFETY: as above; the input rows follow the packed routes.
+                        let rows = unsafe { received.cast::<u8>().add(packed.bytes).cast() };
+                        input = if self.uses_fp8_input() { ExpertInput::Fp8K32(rows) } else { ExpertInput::Bf16(rows) };
+                    }
                 }
             }
             let mut backend = self.ranks[rank].borrow_mut();
@@ -557,14 +730,14 @@ impl<'a> Pair<'a> {
                 backend.enqueue(layer, rows, input, routes, stream, &mut abort_once)?;
                 self.combine_output(&**backend, shared, out, rows, stream)?;
             }
-            if self.source.get() == RouteSource::Broadcast {
+            if let Some(Broadcast { source, .. }) = broadcast {
                 let at = 2 * lane + layer % 2;
-                // A publication is not consumption: rank0 must not overwrite
-                // canonical rows until rank1's backend has finished reading them.
-                if rank == 0 {
-                    self.routes.wait(0, at)?;
+                // A publication is not consumption: the source must not overwrite
+                // canonical rows until the peer's backend has finished reading them.
+                if rank == source {
+                    self.routes.wait(source, at)?;
                 } else {
-                    self.routes.signal(1, at)?;
+                    self.routes.signal(rank, at)?;
                 }
             }
             Ok(())
@@ -604,6 +777,14 @@ impl<'a> OwnerWeights<'a> {
             Self::Native(w) => w.max_rows(),
             Self::Exl3(w) => w.max_rows(),
         }
+    }
+    /// The same resident weights admitted at `max_rows` (one load serves the
+    /// prefill arena at the unit cap and the decode lanes at their width).
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        Ok(match self {
+            Self::Native(w) => Self::Native(w.with_max_rows(max_rows)?),
+            Self::Exl3(w) => Self::Exl3(w.with_max_rows(max_rows)?),
+        })
     }
     fn execution(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<OwnerExecution<'a>> {
         Ok(match self {
@@ -662,6 +843,37 @@ struct OwnerRank<'a> {
     execution: OwnerExecution<'a>,
 }
 
+/// The loader and admission share the same arithmetic/output selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerPolicy<'p> {
+    Native {
+        selection: super::RtxSelectionPolicy,
+        output: super::native::NativeOutputPolicy,
+        nvfp4: bool,
+    },
+    Exl3 {
+        package: &'p std::path::Path,
+        selection: super::RtxSelectionPolicy,
+    },
+}
+impl<'p> OwnerPolicy<'p> {
+    pub(crate) fn native(library: &NativeLibrary, nvfp4: bool) -> Result<Self> {
+        Ok(Self::native_for(nvfp4, library.v41_tp2_expert_reducer()?.supports_route_sums()))
+    }
+    fn native_for(nvfp4: bool, route_sums: bool) -> Self {
+        Self::Native {
+            selection: if nvfp4 { super::RtxSelectionPolicy::FirstCapacity }
+                else { super::RtxSelectionPolicy::CanonicalDecode },
+            output: if nvfp4 || !route_sums { super::native::NativeOutputPolicy::KernelPlanes }
+                else { super::native::NativeOutputPolicy::TokenSums },
+            nvfp4,
+        }
+    }
+    pub(crate) fn exl3(package: &'p std::path::Path) -> Self {
+        Self::Exl3 { package, selection: super::RtxSelectionPolicy::CanonicalDecode }
+    }
+}
+
 pub(crate) struct OwnerPair<'a> {
     reductions: [super::combine::OwnerReduce<'a>; 2],
     ranks: [OwnerRank<'a>; 2],
@@ -670,47 +882,25 @@ pub(crate) struct OwnerPair<'a> {
     geometry: cuteafd_core::ExpertGeometry,
 }
 impl<'a> OwnerPair<'a> {
-    pub(crate) fn device_bytes(
-        library: &NativeLibrary,
-        capacity: u32,
-        nvfp4: bool,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::native::NativeTp2::workspace_bytes_for_format(
-            library,
-            capacity as usize,
-            if nvfp4 {
-                super::RtxSelectionPolicy::FirstCapacity
-            } else {
-                super::RtxSelectionPolicy::CanonicalDecode
-            },
-            super::native::NativeOutputPolicy::KernelPlanes,
-            nvfp4,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner expert workspace overflow")
+    /// Exact per-GPU arena requests for the policy used to load the weights.
+    pub(crate) fn device_bytes_for(library: &NativeLibrary, capacity: u32,
+        geometry: cuteafd_core::ExpertGeometry, policy: OwnerPolicy<'_>) -> Result<usize> {
+        let backend = match policy {
+            OwnerPolicy::Native { selection, output, nvfp4 } =>
+                super::native::NativeTp2::allocation_sizes_for_format(library,
+                    capacity as usize, selection, output, nvfp4)?,
+            OwnerPolicy::Exl3 { package, selection } =>
+                super::exl3::Exl3Tp2::allocation_sizes_for_selection(package,
+                    geometry.hidden as usize, capacity as usize,
+                    cuteafd_core::Exl3RowPolicy::for_geometry(geometry), selection)?,
+        };
+        Self::allocation_sizes(backend, capacity, geometry)?.into_iter()
+            .try_fold(0usize, |sum, n| sum.checked_add(n).context("owner arena overflow"))
     }
-
-    pub(crate) fn exl3_device_bytes(
-        package: &std::path::Path,
-        capacity: u32,
-        geometry: cuteafd_core::ExpertGeometry,
-    ) -> Result<usize> {
-        cuteafd_ffi::V41Tp2ExpertReducer::require_owner_geometry(geometry)?;
-        super::exl3::Exl3Tp2::workspace_bytes_for_selection(
-            package,
-            geometry.hidden as usize,
-            capacity as usize,
-            cuteafd_core::Exl3RowPolicy::for_geometry(geometry),
-            super::RtxSelectionPolicy::FirstCapacity,
-        )?
-        .checked_add(super::combine::OwnerReduce::workspace_bytes(
-            capacity, geometry,
-        )?)
-        .context("owner EXL3 workspace overflow")
+    fn allocation_sizes(backend: [usize; 2], capacity: u32,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<[usize; 4]> {
+        let reduce = super::combine::OwnerReduce::allocation_sizes(capacity, geometry)?;
+        Ok([backend[0], backend[1], reduce[0], reduce[1]])
     }
 
     pub(crate) fn new(
@@ -792,9 +982,26 @@ impl<'a> OwnerPair<'a> {
         self.bf16_input
     }
 
+    /// Device-ordered passes push each remote partial to its owner
+    /// ([`super::combine::OwnerReduce::enable_push`]). For a pair private to
+    /// one decode lane only.
+    pub(crate) fn enable_push(&mut self, decode_lane_bytes: usize) -> Result<()> {
+        for reduction in &mut self.reductions { reduction.enable_push(decode_lane_bytes)?; }
+        Ok(())
+    }
+
+    /// Bytes per row of the widest partial a reduction moves.
+    pub(crate) fn partial_row_bytes(&self) -> usize {
+        self.reductions[0].partial_row_bytes()
+    }
+
     #[cfg(test)]
     pub(crate) fn rank_output(&self, rank: usize) -> CuteafdDeviceBuffer {
         self.ranks[rank].execution.allocation().buffer
+    }
+    #[cfg(test)]
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        &self.ranks[rank].stream
     }
 
     /// # Safety
@@ -807,6 +1014,26 @@ impl<'a> OwnerPair<'a> {
         rows: u32,
         owner: usize,
         inputs: [OwnerInputs<'_, 'a>; 2],
+    ) -> Result<CuteafdDeviceBuffer> {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.execute_into(layer, rows, owner, inputs, None).await }
+    }
+
+    /// [`Self::execute`] with the reduced result written into `into` (on the
+    /// `owner` GPU, holding the BF16 result) when `Some`, instead of the owner
+    /// reduction's own output: a plane of the caller's, which the pair's next
+    /// execution does not overwrite.
+    ///
+    /// # Safety
+    /// As [`Self::execute`]; nothing else reads or writes `into` until the
+    /// reduction completes.
+    pub(crate) async unsafe fn execute_into(
+        &mut self,
+        layer: usize,
+        rows: u32,
+        owner: usize,
+        inputs: [OwnerInputs<'_, 'a>; 2],
+        into: Option<CuteafdDeviceBuffer>,
     ) -> Result<CuteafdDeviceBuffer> {
         ensure!(
             owner < 2 && (1..=self.max_rows).contains(&rows),
@@ -903,7 +1130,7 @@ impl<'a> OwnerPair<'a> {
         // SAFETY: rank outputs and streams remain borrowed through reduction drainage.
         let output = unsafe {
             self.reductions[owner]
-                .reduce(
+                .reduce_into(
                     local.execution.allocation(),
                     remote.execution.allocation(),
                     &local.stream,
@@ -911,6 +1138,7 @@ impl<'a> OwnerPair<'a> {
                     rows,
                     dtype,
                     layout,
+                    into,
                 )
                 .await?
         };
@@ -1013,6 +1241,53 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// GLM's legacy pair keeps its exact behavior: rank 0 publishes routes only
+    /// when the route check selected broadcast, slots carry no wire, and the
+    /// generalized source broadcast reduces to the same push, wait and signal.
+    #[test]
+    fn legacy_enqueue_is_the_rank0_routes_only_source_broadcast() {
+        let source = include_str!("pair.rs");
+        let body = |name: &str| source.split(name).nth(1).unwrap().split("\n    }\n").next().unwrap().to_string();
+        let enqueue = body("    pub(crate) unsafe fn enqueue(\n");
+        assert!(enqueue.contains("(self.source.get() == RouteSource::Broadcast).then_some(Broadcast { source: 0, wire: false })"));
+        let new = body("    pub(crate) fn new(\n");
+        assert!(new.contains("Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, decode_rows, lanes, exchange, false)"));
+        let with = source.split("    pub(crate) fn new_with_wire(").nth(1).unwrap();
+        assert!(with.contains("let wire_row_bytes = match (wire, fp8) { (false, _) => 0,"));
+        assert!(with.contains("PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes"));
+        let core = source.split("    unsafe fn enqueue_with(").nth(1).unwrap();
+        assert!(core.contains("let wire_bytes = if wire { rows * self.wire_row_bytes } else { 0 };"));
+        assert!(core.contains("self.routes.push(source, at, scratch.ptr, extent)?;"));
+        assert!(core.contains("self.routes.wait(rank, at)?;"));
+        assert!(core.contains("self.routes.wait(source, at)?;") && core.contains("self.routes.signal(rank, at)?;"));
+    }
+
+    #[test]
+    fn owner_policy_bytes_equal_native_and_reducer_allocation_requests() -> anyhow::Result<()> {
+        use super::{OwnerPair, OwnerPolicy};
+        use crate::shared::experts::rtx::{native::{NativeTp2, NativeOutputPolicy}, RtxSelectionPolicy};
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
+        for unit in [4096, 2752, 2048] {
+            for (nvfp4, sums) in [(false, false), (false, true), (true, false), (true, true)] {
+                let OwnerPolicy::Native { selection, output, .. } = OwnerPolicy::native_for(nvfp4, sums)
+                    else { unreachable!() };
+                assert_eq!(selection, if nvfp4 { RtxSelectionPolicy::FirstCapacity }
+                    else { RtxSelectionPolicy::CanonicalDecode });
+                assert_eq!(output, if nvfp4 || !sums { NativeOutputPolicy::KernelPlanes }
+                    else { NativeOutputPolicy::TokenSums });
+                let partial = unit as usize * 5120 * if nvfp4 { 12 } else if sums { 4 } else { 24 };
+                let native = NativeTp2::allocation_sizes(12345, geometry, unit as usize, output, nvfp4)?;
+                let requests = OwnerPair::allocation_sizes(native, unit, geometry)?;
+                assert_eq!(requests, [12345, partial, unit as usize * 5120 * 6 * 4, unit as usize * 5120 * 2]);
+                assert_eq!(requests.into_iter().sum::<usize>(), 12345 + partial + unit as usize * 133120);
+            }
+            let exl3 = OwnerPolicy::exl3(std::path::Path::new("fixture"));
+            assert!(matches!(exl3, OwnerPolicy::Exl3 { selection: RtxSelectionPolicy::CanonicalDecode, .. }));
+            let requests = OwnerPair::allocation_sizes([67890, unit as usize * 5120 * 4], unit, geometry)?;
+            assert_eq!(requests.into_iter().sum::<usize>(), 67890 + unit as usize * 153600);
+        }
+        Ok(())
+    }
     use super::*;
     #[test]
     fn failed_lane_quiescence_retains_endpoint_mr_and_intake_before_copies() {
@@ -1075,6 +1350,32 @@ mod tests {
     }
 
     #[test]
+    fn original_submission_error_is_logged_before_shutdown() {
+        #[derive(Clone)]
+        struct Writer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = Writer(bytes.clone());
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let result: Result<()> = submit_scoped(|| Ok(()), || {
+                let logged = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+                assert!(logged.contains("submission failed; draining queued owners"), "{logged}");
+                assert!(logged.contains("short-prompt prefill: injected original cause"), "{logged}");
+                Ok(())
+            }, |_| Err(anyhow::anyhow!("injected original cause").context("short-prompt prefill")));
+            assert!(result.unwrap_err().downcast_ref::<TerminalStepError>().is_some());
+        });
+    }
+
+    #[test]
     fn dropped_submission_body_runs_the_real_teardown() {
         let owners = RefCell::new(TestSubmission::new(None));
         let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1102,7 +1403,9 @@ mod tests {
     }
 
     #[test]
-    fn v4_unabortable_device_proxy_is_refused_before_rank_drainage() {
+    fn v4_exchange_waits_are_released_before_rank_drainage() {
+        // Rank streams may hold queued Spark exchange waits: the abort stops
+        // every link's exchange (releasing them) before the ranks drain.
         let source = include_str!("../../../families/deepseek_v4/engine/tp2.rs");
         let start = source.find("pub(crate) fn shutdown_submission(").unwrap();
         let source = &source[start..];
@@ -1110,9 +1413,9 @@ mod tests {
         let publication = source
             .find("home.run(|| self.publish_tp2_abort())?;")
             .unwrap();
-        let refusal = source.find("ensure!(self.device_link.is_none()").unwrap();
+        let release = source.find("link.terminal_quiesce()?; }").unwrap();
         let ranks = source.find("ranks: ||").unwrap();
-        assert!(abort < publication && publication < refusal && refusal < ranks);
+        assert!(abort < publication && publication < release && release < ranks);
     }
 
     #[test]
@@ -1177,12 +1480,12 @@ mod tests {
             ),
             (
                 include_str!("../../../families/glm5_flash/engine.rs"),
-                "step",
+                "decode_primitive",
                 "replay_on",
             ),
             (
                 include_str!("../../../families/glm5_flash/engine.rs"),
-                "step_lanes",
+                "step_units_with",
                 "replay_on",
             ),
             (
@@ -1202,11 +1505,14 @@ mod tests {
             ),
         ] {
             let start = source.find(&format!("    fn {step}(")).unwrap();
-            let end = source[start..]
-                .find(&format!("    fn {step}_inner("))
-                .unwrap()
-                + start;
+            // The Flash executor body lives in units.rs, not beside its wrapper.
+            let end = source[start..].find("\n    }").unwrap() + start;
             let wrapper = &source[start..end];
+            if step == "step_units_with" {
+                let units = include_str!("../../../families/glm5_flash/engine/units.rs");
+                assert!(wrapper.contains("self.step_units_inner(scope,"));
+                assert!(units.contains("pub(super) fn step_units_inner(&self, _scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>"));
+            }
             assert!(
                 shared_submission_entrypoint(wrapper),
                 "{step} bypasses the shared boundary"

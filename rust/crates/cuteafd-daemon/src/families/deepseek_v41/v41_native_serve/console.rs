@@ -17,20 +17,20 @@ const LAYERS: usize = 40;
 /// The per-round counts every path needs, captured before emission consumes
 /// the token vectors. Updates the lifetime totals.
 pub(crate) struct Tally {
-    drafted: [u8; 8],
-    verified: [u8; 8],
-    accepted: [u8; 8],
-    emitted: [u8; 8],
+    drafted: Vec<u8>,
+    verified: Vec<u8>,
+    accepted: Vec<u8>,
+    emitted: Vec<u8>,
     proposal: Vec<Vec<u32>>,
     emissions: Vec<Vec<u32>>,
 }
 
 /// The proposal of each member before truncation, captured right after drafting.
-pub(crate) struct Proposal { drafted: [u8; 8], tokens: Vec<Vec<u32>> }
+pub(crate) struct Proposal { drafted: Vec<u8>, tokens: Vec<Vec<u32>> }
 impl Proposal {
     #[inline]
     pub fn capture(inputs: &[Vec<u32>], live: Option<Live>) -> Self {
-        let mut drafted = [0u8; 8];
+        let mut drafted = vec![0u8; inputs.len()];
         for (slot, input) in drafted.iter_mut().zip(inputs) { *slot = input.len().saturating_sub(1) as u8; }
         let tokens = if live.is_some_and(Live::text) {
             inputs.iter().map(|input| input.get(1..).unwrap_or_default().to_vec()).collect()
@@ -42,20 +42,26 @@ impl Proposal {
 impl Tally {
     pub fn new(proposal: Proposal, inputs: &[Vec<u32>], accepted_inputs: &[u32],
         emissions: &[Vec<u32>], live: Option<Live>) -> Self {
-        let mut tally = Self { drafted: proposal.drafted, verified: [0; 8], accepted: [0; 8], emitted: [0; 8],
+        let mut tally = Self { drafted: proposal.drafted, verified: vec![0; inputs.len()], accepted: vec![0; inputs.len()], emitted: vec![0; inputs.len()],
             proposal: proposal.tokens, emissions: Vec::new() };
-        for (index, input) in inputs.iter().enumerate().take(8) {
+        for (index, input) in inputs.iter().enumerate() {
             tally.verified[index] = input.len().saturating_sub(1) as u8;
-            tally.accepted[index] = accepted_inputs.get(index).map_or(0, |&a| a.saturating_sub(1)) as u8;
             tally.emitted[index] = emissions.get(index).map_or(0, Vec::len) as u8;
+            // A loop abort truncates the round's emissions after the drafts were
+            // accepted, so cap the accepted count at what was actually emitted
+            // (the first emitted token is the target's own, not a draft).
+            tally.accepted[index] = usize::try_from(
+                accepted_inputs.get(index).map_or(0, |&a| a.saturating_sub(1)))
+                .unwrap_or(usize::MAX)
+                .min(usize::from(tally.emitted[index]).saturating_sub(1)) as u8;
         }
-        let sum = |values: &[u8; 8]| values.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let sum = |values: &[u8]| values.iter().map(|&v| u64::from(v)).sum::<u64>();
         totals::round(sum(&tally.drafted), sum(&tally.verified), sum(&tally.accepted), sum(&tally.emitted));
         if live.is_some_and(Live::text) { tally.emissions = emissions.to_vec(); }
         tally
     }
     pub fn usage<'a>(&self, handles: impl Iterator<Item = Option<&'a cuteafd_api::usage::UsageHandle>>) {
-        for (index, handle) in handles.enumerate().take(8) {
+        for (index, handle) in handles.enumerate() {
             if let Some(handle) = handle { handle.round(self.drafted[index].into(), self.accepted[index].into()); }
         }
     }
@@ -142,8 +148,8 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.extra = json!({
         "prefill_chunk_rows": args.prefill_batch_tokens,
         "max_context_tokens": args.max_context_tokens,
-        "prefix_cache_entries": args.prefix_cache_entries,
-        "lane_capacity": 8,
+        "prefix_cache_entries": args.resolved_prefix_entries(),
+        "lane_capacity": (args.concurrency as usize).div_ceil(2),
     });
     let dspark = args.dspark;
     layout.dynamic = Some(Box::new(move || dynamic(&super::speculative::policy_snapshot(), dspark)));
@@ -194,7 +200,7 @@ mod tests {
     fn tally_derives_counts_from_round_shapes() {
         // Two requests: 5 drafted, 4 verified, 2 accepted; and an anchor-only row.
         let inputs = vec![vec![10, 11, 12, 13, 14], vec![20]];
-        let proposal = Proposal { drafted: [5, 0, 0, 0, 0, 0, 0, 0], tokens: Vec::new() };
+        let proposal = Proposal { drafted: vec![5, 0], tokens: Vec::new() };
         let tally = Tally::new(proposal, &inputs, &[3, 1], &[vec![11, 12, 99], vec![21]], None);
         assert_eq!(&tally.verified[..2], &[4, 0]);
         assert_eq!(&tally.accepted[..2], &[2, 0]);
@@ -208,6 +214,34 @@ mod tests {
         assert!(round.layer_us[0].is_nan() && round.layer_us[1] == 5.0);
         let stage = |key: &str| round.stages.iter().find(|(k, _)| *k == key).map(|&(_, v)| v);
         assert_eq!((stage("draft"), stage("rcollect"), stage("lroute")), (Some(1.0), Some(5.0), None));
+    }
+
+    #[test]
+    fn tally_records_all_members_through_concurrency_64() {
+        for concurrency in [1usize, 4, 16, 17, 32, 64] {
+            let count = concurrency.div_ceil(2);
+            let inputs = vec![vec![10, 11, 12]; count];
+            let tally = Tally::new(Proposal::capture(&inputs, None), &inputs,
+                &vec![2; count], &vec![vec![11, 99]; count], None);
+            assert_eq!(tally.drafted, vec![2; count]);
+            assert_eq!(tally.accepted, vec![1; count]);
+            let Event::Round(round) = tally.round(0, false, Instant::now(), 0, 0, 0, &[],
+                FfnSplit::default(), (0..count).map(|id| (id as u64, false, false))) else { panic!() };
+            assert_eq!(round.requests.len(), count);
+            assert_eq!(round.requests.last().unwrap().emitted, 2);
+        }
+    }
+
+    #[test]
+    fn tally_caps_accepted_at_emitted_after_a_loop_abort() {
+        // A loop abort accepts the drafts but truncates the emissions: the
+        // console must not report more accepted tokens than were emitted.
+        let inputs = vec![vec![10, 11, 12, 13, 14]];
+        let proposal = Proposal { drafted: vec![4], tokens: Vec::new() };
+        let tally = Tally::new(proposal, &inputs, &[5], &[vec![11]], None);
+        assert_eq!(&tally.verified[..1], &[4]);
+        assert_eq!(&tally.emitted[..1], &[1]);
+        assert_eq!(&tally.accepted[..1], &[0], "accepted must not exceed emitted - 1");
     }
 
     #[test]

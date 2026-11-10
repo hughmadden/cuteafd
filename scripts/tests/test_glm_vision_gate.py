@@ -17,14 +17,14 @@ def load_gate():
     return module
 
 
-def test_glm_abi_preserves_mimo_prefix():
+def test_glm_pointer_count_abi_matches_rust():
     gate = load_gate()
     assert ctypes.sizeof(gate.Block) == 96
-    assert gate.Spec.blocks.offset == 64
-    assert gate.Spec.hidden.offset == 2752
-    assert gate.Spec.patch_bias.offset == 2792
-    assert gate.Spec.norm1_bias.offset == 2896
-    assert ctypes.sizeof(gate.Spec) == 3792
+    assert gate.Spec.blocks.offset == 72
+    assert gate.Spec.hidden.offset == 80
+    assert gate.Spec.patch_bias.offset == 120
+    assert gate.Spec.norm1_bias.offset == 224
+    assert ctypes.sizeof(gate.Spec) == 256
 
 
 def test_glm_patch_order_duplicates_temporal_axis_and_keeps_merge_units():
@@ -137,27 +137,10 @@ def test_blas_handle_diagnostics_log_only_after_successful_creation():
     assert "configured_workspace=runtime-default configured_workspace_bytes=unknown" in logging
     assert "cuda" not in logging and "cublas" not in logging
     blas = source.split("cuteafd_status_t cublas_handle(", 1)[1].split("\n}", 1)[0]
-    lt = source.split("cublasLtHandle_t cublaslt_handle()", 1)[1].split("\n}", 1)[0]
     assert blas.index("cublasCreate(&handle)") < blas.index("return status_from_cublas(status)") < blas.index('log_blas_handle_created("cublas")')
-    assert lt.index("cublasLtCreate(&handle)") < lt.index("return nullptr") < lt.index('log_blas_handle_created("cublasLt")')
-    assert "static thread_local" in blas and "static thread_local" in lt
-    assert "cublasSetWorkspace" not in blas + lt
+    assert "static thread_local" in blas
+    assert "cublasSetWorkspace" not in blas
 
-
-def test_blas_plan_workspace_log_names_successful_allocation_and_shape_cache():
-    source = (ROOT / "native/shared/cuda/linear.cu").read_text()
-    plan = source.split("CublasLtM1ParityBatchedPlan* create_cublaslt_m1_parity_plan(", 1)[1].split("\n}", 1)[0]
-    allocated = plan.split("  char thread_name[16]", 1)[1]
-    assert plan.index("cudaMalloc(&plan->workspace, plan->workspace_bytes)") < plan.index("  char thread_name[16]")
-    assert "pthread_getname_np" in allocated
-    assert "rows=%zu input_dim=%zu output_dim=%zu workspace_bytes=%zu" in allocated
-    assert "scope=device-shape-cache allocator=cudaMalloc" in allocated
-    assert "thread_name, rows, input_dim, output_dim, plan->workspace_bytes" in allocated
-    assert "cudaGetDevice" not in allocated and "cudaMemGetInfo" not in allocated
-    assert "cudaMalloc(" not in allocated and "cudaFree(" not in allocated
-    cache = source.split("CublasLtM1ParityBatchedPlan* cublaslt_m1_parity_plan(", 1)[1].split("\n}", 1)[0]
-    for key in ("std::to_string(device)", "std::to_string(rows)", "std::to_string(input_dim)", "std::to_string(output_dim)"):
-        assert key in cache
 
 
 def test_glm_text_cold_replay_uses_serving_decode_not_eager_scoring():
@@ -182,16 +165,16 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     temporaries = source.split("fn temporaries(", 1)[1].split("fn lane(", 1)[0]
     assert "glmf_temporary_bytes(" in temporaries and "self.alloc(bytes.scratch)" in temporaries
     lane = source.split("fn lane(", 1)[1].split("/// ModelOpt NVFP4 dense MLPs", 1)[0]
-    assert "glmf_lane_bytes(" in lane and "self.alloc(bytes.streams)" in lane
+    assert "glmf_lane_bytes(" in lane and "streams: [alloc(bytes.streams)?" in lane
     reserve = source.split("pub(crate) fn workspace_reserve(", 1)[1].split("/// The prefill lanes a serving engine", 1)[0]
     assert "plan.workspace_bytes(" in reserve and "workspace_reserve_bytes(" in reserve
     prepare = source.split("pub fn prepare_serving_workspaces(", 1)[1].split("/// Capture the complete", 1)[0]
-    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_lane_count",
-                     "self.prefill_lanes_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
+    for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
+                     "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
     # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
     scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
-    assert "self.prefill_lanes_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
+    assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
     # The per-workspace runtime allowance is the loader's shared definition; where the measured
     # loaded code covers it (`placement::inventory::LOADED_CODE`) the reserve charges that instead.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
@@ -217,18 +200,18 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert opening.index("engine.prepare_scoring_prefill()") < startup
     assert startup < opening.index("|| body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
-    # GLM full also prepares the shared drafter after admission, before publishing it.
-    full = (root / "glm5/mod.rs").read_text().split("pub fn with_engine", 1)[1]
-    admitted = full.index("glm::solve_working_set(")
-    loaded = full.index("dflash::GlmDrafter::load(")
-    prepared = full.index("drafter.prepare_workspace()?")
-    pool = full.index("engine::GlmEngine::new(")
-    assert admitted < loaded < prepared < pool < full.index("engine.drafter = drafter")
-    drafter = (root / "glm5/dflash.rs").read_text()
+    drafter = (root / "../shared/speculation/dflash.rs").read_text()
     prepare = drafter.split("pub(crate) fn prepare_workspace(", 1)[1].split("pub(crate) fn prime_remote(", 1)[0]
-    assert "self.workspace(self.max_sequences)" in prepare
+    assert "self.prime_remote()" in prepare
     prime, existing = drafter.split("pub(crate) fn prime_remote(", 1)[1].split("fn workspace(", 1)
-    assert "self.prepare_workspace()?" in prime
+    assert "self.workspace(self.max_sequences)" in prime
+    assert "if self.startup_primed.get() { return Ok(()); }" in prime
+    assert "self.prime_metadata()?" in prime
+    assert "self.reset_context(0, 0)?" in prime
+    assert "self.reset_context(slot, TAP_ROWS)?" in prime
+    assert "self.discard_context(slot)?" in prime
+    assert prime.index("self.prime_metadata()?") < prime.index("self.update(") < prime.index("self.draft_device_with(")
+    assert prime.index("self.discard_context(slot)?") < prime.index("self.startup_primed.set(true)")
     assert "prepare_workspace()" not in existing
     assert "prepare_workspace()" not in drafter.split("pub(crate) fn prepare_workspace(", 1)[0]
     assert 'if let Some(dspark::Drafter::RemoteDflash(draft))' in opening

@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 """One CPU gate for a checkout: cargo workspace tests and the script suite.
 
-  scripts/dev/cpu-gate --task NAME [--jobs N] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV] [--keep]
+  scripts/dev/cpu-gate --task NAME [--jobs N] [--full] [--slow] [--cargo] [--scripts] [--benches] [--skip-live-planners] [--base REV] [--keep]
 
 --jobs is the total worker budget: split evenly between Cargo and pytest when
-both run, otherwise given entirely to the requested suite. --slow adds the
-explicit CPU slow tier and is required at release cuts. Install cargo-nextest
+both run, otherwise given entirely to the requested suite. Default excludes
+15 measured full-plan/cache tests; --full restores them and is required for
+dev merges and releases. This includes the installed-example deployment-to-
+release_prefill_shape sweep: HF_HOME (or ~/.cache/huggingface) is the default
+inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing checkpoints skip.
+The sweep discovers PROGRAMS.json in /opt/cuteafd/share, ~/.local/share/cuteafd,
+or the live V4 fixture's ~/.cache/cuteafd/builds/v3-p4/c1/artifacts (in that order).
+CUTEAFD_DEPLOYMENT_TEST_PROGRAMS overrides discovery, retaining adjacent capacity
+manifests. Configs requiring an absent PROGRAMS file skip with an explicit counted
+reason; planner failures with present inputs still fail.
+Receipts name every exclusion. --slow separately
+adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
 The gate finds it on PATH or there automatically; cargo test remains the fallback.
+When cargo or rustc is not on PATH (a systemd user unit), the gate prepends the
+existing standard Cargo bin directories ($CARGO_HOME/bin, ~/.cargo/bin, the
+persistent architecture Cargo home, Homebrew's bin, and the toolchain rustup
+resolves when /opt/rustup exists) for itself and every child before refusing.
 
 With none of --cargo, --scripts, --benches the first two run. --benches runs
 the release host-cost bounds (BENCHES: the draft policy's select median at the
@@ -59,19 +73,56 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
                  'families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4_missing_tp2_package')
+INSTALLED_PLANNERS = (
+    'installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget',
+    'installed_example_deployments_publish_executable_prefill_shapes',
+    'installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers',
+)
+# Actual >60s IDs from the 081a00072 full gate, plus installed-checkpoint planners.
+FULL_TESTS = (
+    'families::kimi_k3::admission::tests::installed_max_planner_and_runtime_remaining_kv_match_per_gpu',
+    'plan::families::step5::tests::adaptive_prefill_selection_preserves_overrides_and_never_retries_on_capacity',
+    'families::step5::admission::tests::public_nvfp4_min_card_planner_equals_measured_daemon_before_allocation',
+    'fidelity_dataset::tests::cached_published_qualifications_and_manifests_load',
+    'families::kimi_k3::admission::tests::planner_equals_runtime_context_extent_at_256k_512k_and_1m',
+    'families::step5::admission::tests::public_max_card_planner_equals_measured_daemon_before_allocation',
+    'plan::families::step5::tests::native_prefill_refuses_every_unqualified_spark_count',
+    'plan::families::step5::tests::full_context_mtp_forecast_charges_private_predictors_before_allocation',
+    'plan::layout::draft_prefix_tests::kimi_host_snapshots_use_serve_context_and_selected_draft_record',
+    'plan::families::step5::tests::nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only',
+    'families::kimi_k3::serve::tests::shared_prefill_policy_matches_planner_and_runtime_admission',
+    'plan::families::kimi::tests::planner_resolves_every_spark_count_before_recipe_refusal',
+    'plan::families::kimi::tests::direct_layout_uses_shared_host_mark_rule_and_preserves_overrides',
+    'plan::tests::v41_32gib_counts_share_pool_and_local_layer_admission',
+    *INSTALLED_PLANNERS,
+)
 SLOW_TESTS = (('cuteafd-hostcache', 'soak_has_no_leak_and_balances_the_counters'),
               ('cuteafd-hostcache', 'soak_in_bank_order_has_no_leak_and_balances_the_counters'),
               ('cuteafd-loader', 'mounted_mimo_audio_inventory_is_independently_admitted'))
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
+TOOLCHAIN = ('cargo', 'rustc')
+HOMEBREW_BIN = Path('/home/linuxbrew/.linuxbrew/bin')
+RUSTUP_HOME = Path('/opt/rustup')
 CARGO_RESULT = re.compile(r'^test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored', re.M)
 CARGO_FAIL = re.compile(r'^test (\S+) \.\.\. FAILED$', re.M)
 CARGO_PANIC_ID = re.compile(r"^---- (\S+) stdout ----$", re.M)
 PYTEST_SUMMARY = re.compile(r'^=*\s*(.*?\b(?:passed|failed|error|errors|no tests ran)\b.*?) in [\d.]+s', re.M)
 PYTEST_FAIL = re.compile(r'^(?:FAILED|ERROR) (\S+)', re.M)
+# pytest-subtests prints each failing subtest on its own SUBFAILED(label) line and
+# counts it among the summary's failures; name it by test id and label.
+PYTEST_SUBFAIL = re.compile(r'^SUBFAILED(\(.*?\))? (\S+)', re.M)
+
+
+def pytest_failing(text):
+    return sorted(set(PYTEST_FAIL.findall(text))
+                  | {f'{node} {label}'.rstrip() for label, node in PYTEST_SUBFAIL.findall(text)})
 # Release benches with a bound: (crate, test target, environment).
 BENCHES = (('cuteafd-core', 'draft_policy_bench', {'CUTEAFD_POLICY_BENCH_MAX_US': '1200'}),)
 BENCH_MEDIANS = re.compile(r'medians: (.*?)(?:, total|$)', re.M)
 BENCH_VALUE = re.compile(r'(\w+) ([\d.]+) us')
+CMAKE_LAUNCHER_ENV = re.compile(r'CMAKE_.*_COMPILER_LAUNCHER\Z')
+SCRUBBED_ENV_PREFIXES = ('CUTEAFD_KACHE', 'KACHE_', 'CUTEAFD_SCCACHE', 'SCCACHE_')
+SCRUBBED_ENV_NAMES = ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')
 # Per-run scratch under head/ and base/, deleted on exit unless --keep.
 SCRATCH = ('tmp', 'target-cpu-gate', 'target-cpu-gate-release')
 SCRATCH_TOP = 10
@@ -103,7 +154,35 @@ def python_for(source):
     raise SystemExit('cpu-gate: no .venv here or in the main checkout (uv venv --python 3.12 .venv; see AGENTS.md)')
 
 
-def prepare(source, root, owned=False):
+def update_submodules(source, local=None):
+    """Check out every submodule at the commit HEAD records. A --base worktree can
+    pin commits its upstreams don't have (an unpushed SparkInfer pin is "not our
+    ref"): when that update fails, fetch each submodule from the same path in
+    `local`, the checkout being gated, then restore the upstream URLs."""
+    update = ['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive']
+    try:
+        checked(update, timeout=1800)
+        return
+    except SystemExit:
+        if local is None:
+            raise
+    log(f'submodule pins missing upstream; fetching them from {local}')
+    paths = checked(['git', '-C', str(source), 'config', '-f', '.gitmodules', '--get-regexp', r'^submodule\..*\.path$'])
+    for line in paths.splitlines():
+        key, path = line.split(maxsplit=1)
+        name, copy = key[len('submodule.'):-len('.path')], local / path
+        if not (copy / '.git').exists():
+            continue
+        checked(['git', '-C', str(source), 'config', f'submodule.{name}.url', str(copy)])
+        if (source / path / '.git').exists():
+            checked(['git', '-C', str(source / path), 'remote', 'set-url', 'origin', str(copy)])
+    try:
+        checked(['git', '-C', str(source), '-c', 'protocol.file.allow=always', *update[3:]], timeout=1800)
+    finally:
+        checked(['git', '-C', str(source), 'submodule', 'sync', '--recursive'])
+
+
+def prepare(source, root, owned=False, local=None):
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(root)])
     for path in (root / 'tmp', root / 'logs'):
         path.mkdir(parents=True, exist_ok=True)
@@ -116,7 +195,7 @@ def prepare(source, root, owned=False):
     if moved:
         raise SystemExit('cpu-gate: submodule pins differ from HEAD (commit the bump first): ' + ', '.join(moved))
     log(f'submodules at their pinned commits ({source})')
-    checked(['git', '-C', str(source), 'submodule', 'update', '--init', '--recursive'], timeout=1800)
+    update_submodules(source, local if owned else None)
     checked([sys.executable, str(source / 'scripts/build/verify-sparkinfer-source.py'), '--source',
              str(source / 'third_party/sparkinfer'), '--lock', str(source / 'third_party/sparkinfer.lock.json')])
 
@@ -246,50 +325,220 @@ def clean_scratch(root):
     return removed
 
 
+def persistent_cargo_home(env=None):
+    """The architecture Cargo home where tools are installed without root (see AGENTS.md)."""
+    home = Path((os.environ if env is None else env).get('HOME') or Path.home())
+    return home / '.cache/cuteafd/cargo-home' / platform.machine()
+
+
 def nextest_for(env):
     found = shutil.which('cargo-nextest', path=env.get('PATH'))
     if found:
         return found
-    persistent = Path.home() / '.cache/cuteafd/cargo-home' / platform.machine() / 'bin/cargo-nextest'
+    persistent = persistent_cargo_home() / 'bin/cargo-nextest'
     return str(persistent) if persistent.is_file() and os.access(persistent, os.X_OK) else None
+
+
+def toolchain_path(env):
+    """PATH that finds cargo and rustc for this process and every child.
+
+    A systemd user unit starts without ~/.cargo/bin on PATH, which used to reject the
+    gate before any work. When either tool is missing, prepend the standard Cargo bin
+    directories that exist, in precedence order (see toolchain_bins). Returns
+    (path, directory) where directory is the one that supplied the missing tools, or
+    None when PATH already worked or no candidate supplies them (the caller then
+    errors)."""
+    path = env.get('PATH') or ''
+    missing = [tool for tool in TOOLCHAIN if not shutil.which(tool, path=path)]
+    if not missing:
+        return path, None
+    added = [str(directory) for directory in toolchain_bins(env) if directory.is_dir()]
+    combined = os.pathsep.join([*added, path]) if path else os.pathsep.join(added)
+    if not added or any(not shutil.which(tool, path=combined) for tool in missing):
+        return path, None
+    used = next((directory for directory in added
+                 if all(shutil.which(tool, path=os.pathsep.join([directory, path])) for tool in missing)), added[0])
+    return combined, used
+
+
+def toolchain_bins(env):
+    """Bin directories that may hold cargo/rustc, in precedence order: the Cargo
+    homes' bin/, Homebrew's prefix, then the toolchain rustup resolves (only when
+    its /opt/rustup home exists)."""
+    bins = [home / 'bin' for home in cargo_homes(env)]
+    bins.append(HOMEBREW_BIN)
+    resolved = rustup_toolchain_bin(env=env)
+    if resolved is not None:
+        bins.append(resolved)
+    return bins
+
+
+def cargo_homes(env):
+    """Candidate Cargo homes in precedence order: $CARGO_HOME, ~/.cargo, then the
+    persistent architecture one nextest_for falls back to."""
+    homes = [Path(env['CARGO_HOME'])] if env.get('CARGO_HOME') else []
+    homes.append(Path(env.get('HOME') or Path.home()) / '.cargo')
+    homes.append(persistent_cargo_home(env))
+    return homes
+
+
+def rustup_toolchain_bin(root=RUSTUP_HOME, env=None):
+    """Bin directory of the cargo rustup resolves from its home at root, or None.
+
+    Ask rustup rather than guessing the toolchain directory name; a missing home or
+    a rustup that cannot answer leaves the caller on the other candidates."""
+    if not root.is_dir():
+        return None
+    env = dict(os.environ if env is None else env, RUSTUP_HOME=str(root))
+    rustup = root / 'bin/rustup'
+    if not (rustup.is_file() and os.access(rustup, os.X_OK)):
+        found = shutil.which('rustup', path=env.get('PATH'))
+        if not found:
+            return None
+        rustup = Path(found)
+    try:
+        result = subprocess.run([str(rustup), 'which', 'cargo'], capture_output=True, text=True,
+                                timeout=10, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    resolved = Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
+    return resolved.parent if resolved is not None and resolved.is_file() else None
+
+
+def cargo_build_succeeded(path):
+    """Require Cargo's completion event even if an enclosing shell masks its exit."""
+    finished = []
+    errors = False
+    for line in path.read_text(errors='replace').splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get('reason') == 'build-finished':
+            finished.append(event.get('success'))
+        if event.get('reason') == 'compiler-message':
+            errors |= event.get('message', {}).get('level') == 'error'
+    return finished == [True] and not errors
+
+
+def _config_kv(path):
+    return dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
+
+
+def _snapshot_installed(hf_home, model_id, revision=None):
+    if hf_home is None or not hf_home.is_dir():
+        return False
+    snapshots = hf_home / 'hub' / f"models--{model_id.replace('/', '--')}" / 'snapshots'
+    if not snapshots.is_dir():
+        return False
+    return (snapshots / revision).is_dir() if revision else any(snapshots.iterdir())
+
+
+def _programs_installed(env):
+    override = env.get('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS')
+    if override is not None:
+        return bool(override) and Path(override).exists()
+    home = Path(env.get('HOME') or Path.home())
+    return any(path.exists() for path in (
+        Path('/opt/cuteafd/share/PROGRAMS.json'),
+        home / '.local/share/cuteafd/PROGRAMS.json',
+        home / '.cache/cuteafd/builds/v3-p4/c1/artifacts/PROGRAMS.json',
+    ))
+
+
+def installed_planner_skips(source, env):
+    """Installed-checkpoint tests in budget_cli.rs whose required HF_HOME, PROGRAMS.json
+    or checkpoint snapshots are absent."""
+    root = source if (source / 'examples/configs').is_dir() else REPO
+    raw_hf = env.get('CUTEAFD_DEPLOYMENT_TEST_HF_HOME')
+    hf_home = Path(raw_hf) if raw_hf else None
+    has_programs = _programs_installed(env)
+    skipped = []
+    exlr8_configs = [_config_kv(root / f'examples/configs/glm53-exlr8-{name}.config') for name in ('min', 'max')]
+    if not has_programs or not all(_snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION'))
+                                   for cfg in exlr8_configs):
+        skipped.append('installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget')
+    example_configs = [_config_kv(path) for path in sorted((root / 'examples/configs').glob('*.config'))]
+    if not has_programs or not example_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in example_configs):
+        skipped.append('installed_example_deployments_publish_executable_prefill_shapes')
+    matrix = json.loads((root / 'scripts/bench/release-smoke-v4.json').read_text()).get('entries', [])
+    matrix_configs = []
+    for entry in matrix:
+        cfg = _config_kv(root / entry['config'])
+        for key, value in (entry.get('set') or {}).items():
+            if isinstance(value, str):
+                cfg[key] = value
+        matrix_configs.append(cfg)
+    if not matrix_configs or not all(
+            _snapshot_installed(hf_home, cfg['MODEL_ID'], cfg.get('MODEL_REVISION')) for cfg in matrix_configs):
+        skipped.append('installed_release_v4_matrix_recipe_ids_parse_from_checkpoint_headers')
+    return skipped
+
+
+def scrub_compiler_cache_env(env):
+    """Remove inherited compiler-launcher and cache variables so Cargo and script suites
+    never share read-only kache outputs or inherit ambient launcher overrides."""
+    cleaned = dict(env)
+    scrubbed = sorted(key for key in list(cleaned)
+                      if key in SCRUBBED_ENV_NAMES or key.startswith(SCRUBBED_ENV_PREFIXES)
+                      or CMAKE_LAUNCHER_ENV.fullmatch(key))
+    for key in scrubbed:
+        cleaned.pop(key, None)
+    return cleaned, scrubbed
 
 
 def cargo(source, root, args, env):
     target = root / 'target-cpu-gate'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16)),
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)  # Plain rustc: never share a target with kache's read-only outputs.
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
-                                '--no-run'], build_log, env, source / 'rust', args.cargo_build_timeout)
-    result = dict(suite='cargo', build_exit=code, build_s=round(build_s), build_log=str(build_log))
-    if code:
+                                '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
+    complete = cargo_build_succeeded(build_log)
+    result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
+                  scrubbed_env=scrubbed_env)
+    if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
-        return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or f'exit {code}')}
-    skips = []
-    if args.skip_live_planners:
-        for name in LIVE_PLANNERS:
-            skips += ['--skip', name]
+        return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
+                f'exit {code}; missing or unsuccessful build-finished event')}
+    full = getattr(args, 'full', False)
+    if full:
+        env.setdefault('CUTEAFD_DEPLOYMENT_TEST_HF_HOME',
+                       env.get('HF_HOME') or str(Path(env.get('HOME', str(Path.home()))) / '.cache/huggingface'))
+    skipped_full = [] if full else list(FULL_TESTS)
+    skipped_live = list(LIVE_PLANNERS) if args.skip_live_planners else []
+    if full:
+        skipped_live.extend(list(INSTALLED_PLANNERS) if args.skip_live_planners else installed_planner_skips(source, env))
+    skipped = skipped_full + skipped_live
+    skips = [flag for name in skipped for flag in ('--skip', name)]
     test_args = ['nice', '-n', '19', 'cargo', 'test', '--workspace', '--locked', '--no-fail-fast', '--', *skips]
     if skips:
         test_args.append('--exact')
     nextest = nextest_for(env)
     # nextest's store is workspace-relative, independent of CARGO_TARGET_DIR.
-    report = root / 'logs/nextest/cpu-gate/junit.xml'
+    profile_name = 'cpu-gate-full' if full else 'cpu-gate'
+    report = root / f'logs/nextest/{profile_name}/junit.xml'
     if nextest:
         config = root / 'nextest.toml'
         profile = source / 'rust/.config/nextest.toml'
         if not profile.is_file():  # --base may predate nextest support.
             profile = REPO / 'rust/.config/nextest.toml'
-        config.write_text('[store]\ndir = ' + json.dumps(str(root / 'logs/nextest')) + '\n' + profile.read_text())
+        profile_text = profile.read_text()
+        if full and '[profile.cpu-gate-full]' not in profile_text:
+            full_profile = (REPO / 'rust/.config/nextest.toml').read_text().split('[profile.cpu-gate-full]', 1)[1]
+            profile_text += '\n[profile.cpu-gate-full]' + full_profile
+        config.write_text('[store]\ndir = ' + json.dumps(str(root / 'logs/nextest')) + '\n' + profile_text)
         test_args = ['nice', '-n', '19', nextest, 'nextest', 'run', '--workspace', '--locked',
-                     '--config-file', str(config), '--profile', 'cpu-gate', '--no-fail-fast', '--test-threads',
+                     '--config-file', str(config), '--profile', profile_name, '--no-fail-fast', '--test-threads',
                      env['RUST_TEST_THREADS']]
-        if args.skip_live_planners:
-            test_args += ['-E', ' & '.join(f'not test(={name})' for name in LIVE_PLANNERS)]
+        if skipped:
+            test_args += ['-E', ' & '.join(f'not test(={name})' for name in skipped)]
     if nextest:
         report.unlink(missing_ok=True)
     log(f"cargo: running tests ({'nextest' if nextest else 'cargo test'}, {env['RUST_TEST_THREADS']} workers, no build slot)")
@@ -330,7 +579,8 @@ def cargo(source, root, args, env):
             code = code or slow_code or (0 if sum(t[0] + t[1] for t in slow_totals) == 1 else 1)
             test_s += seconds
     result.update(exit=code, test_s=round(test_s), log=str(test_log), passed=passed, failed=failed, ignored=ignored,
-                  binaries=len(totals), failing=ids, skipped_live_planners=list(LIVE_PLANNERS) if skips else [])
+                  binaries=len(totals), failing=ids, full=full,
+                  skipped_full_tests=skipped_full, skipped_live_planners=skipped_live)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.cargo_timeout} s')
     elif passed == 0:
@@ -364,19 +614,18 @@ def benches(source, root, args, env):
     """Release-mode bound checks: each bench passes only when its test ran and passed."""
     target = root / 'target-cpu-gate-release'
     checked([sys.executable, str(source / 'scripts/build/assert-build-filesystem.py'), str(target)])
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     env = {**env, 'CARGO_TARGET_DIR': str(target), 'CARGO_BUILD_JOBS': str(getattr(args, 'cargo_jobs', 16))}
-    for key in ('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER'):
-        env.pop(key, None)
-    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[])
+    result = dict(suite='benches', passed=0, failed=0, failing=[], medians={}, logs=[], scrubbed_env=scrubbed_env)
     build_s = test_s = 0.
     for crate, test, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
         build_log = root / f'logs/bench-{test}-build.log'
         code, seconds = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--release', '--locked',
-                                    '-p', crate, '--test', test, '--no-run'], build_log, env, source / 'rust',
+                                    '-p', crate, '--test', test, '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust',
                                    args.cargo_build_timeout)
         build_s += seconds
-        if code:
+        if code or not cargo_build_succeeded(build_log):
             result['failed'] += 1
             result['failing'].append(test)
             result.setdefault('errors', []).append(f'{test}: compile exit {code}')
@@ -408,6 +657,7 @@ def benches(source, root, args, env):
 
 
 def scripts(source, root, args, env):
+    env, scrubbed_env = scrub_compiler_cache_env(env)
     python = python_for(source)
     test_log = root / 'logs/pytest.log'
     log(f"scripts: pytest ({python}, {getattr(args, 'pytest_jobs', 16)} workers)")
@@ -418,10 +668,11 @@ def scripts(source, root, args, env):
     text = test_log.read_text(errors='replace')
     summary = PYTEST_SUMMARY.findall(text)
     counts = {key: int(value) for value, key in re.findall(r'(\d+) (passed|failed|errors?|skipped)', summary[-1] if summary else '')}
-    ids = sorted(set(PYTEST_FAIL.findall(text)))
+    ids = pytest_failing(text)
     result = dict(suite='scripts', exit=code, test_s=round(seconds), log=str(test_log), python=str(python),
                   passed=counts.get('passed', 0), failed=counts.get('failed', 0) + counts.get('error', 0) + counts.get('errors', 0),
-                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None)
+                  skipped=counts.get('skipped', 0), failing=ids, summary=summary[-1] if summary else None,
+                  scrubbed_env=scrubbed_env)
     if code == 124:
         result.update(status='failed', error=f'timed out after {args.scripts_timeout} s')
     elif not summary or result['passed'] == 0:
@@ -433,12 +684,12 @@ def scripts(source, root, args, env):
     return result
 
 
-def gate(source, root, args, owned=False):
-    prepare(source, root, owned)
+def gate(source, root, args, owned=False, local=None):
+    prepare(source, root, owned, **({'local': local} if local is not None else {}))
     # Record the gated commit before running: a checkout that moves during the
     # gate would otherwise be credited with tests that ran against older source.
     head = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip()
-    env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    env, scrubbed_env = scrub_compiler_cache_env({**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
     requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
                                          (args.benches, benches)) if enabled]
     # Cargo and its release benches share compiler resources; only pytest overlaps them.
@@ -450,13 +701,15 @@ def gate(source, root, args, owned=False):
         suites = rust.result()
         if python is not None:
             suites.append(python.result())
+    for suite in suites:
+        suite['scrubbed_env'] = sorted(set(suite.get('scrubbed_env', [])) | set(scrubbed_env))
     suites.sort(key=lambda suite: ('cargo', 'scripts', 'benches').index(suite['suite']))
     scratch = scratch_usage(root / 'tmp')
     moved = checked(['git', '-C', str(source), 'rev-parse', 'HEAD']).strip() != head
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
     return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites, scratch=scratch,
-                status='pass' if passed else 'failed')
+                scrubbed_env=scrubbed_env, status='pass' if passed else 'failed')
 
 
 def render(record):
@@ -469,6 +722,10 @@ def render(record):
         note = suite.get('error', '')
         if suite.get('skipped_live_planners'):
             note = (note + '; ' if note else '') + 'live V4 planner tests skipped (--skip-live-planners)'
+        if suite.get('skipped_full_tests'):
+            note = (note + '; ' if note else '') + f"default tier: {len(suite['skipped_full_tests'])} full tests excluded; not a merge/release gate"
+        elif suite.get('full'):
+            note = (note + '; ' if note else '') + 'full tier'
         for test, values in suite.get('medians', {}).items():
             note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
@@ -489,7 +746,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--jobs', type=int, default=os.environ.get('CUTEAFD_TEST_JOBS', max(1, (os.cpu_count() or 2) // 2)),
                         help='total CPU worker budget (default: CUTEAFD_TEST_JOBS or half logical CPUs)')
-    parser.add_argument('--slow', action='store_true', help='also run the explicit slow CPU tier (required at release cuts; never enables GPU tests)')
+    parser.add_argument('--full', action='store_true', help='include measured full-plan/cache tests (required for dev merges and releases)')
+    parser.add_argument('--slow', action='store_true', help='also run explicit ignored CPU soaks (required at release cuts; never enables GPU tests)')
     parser.add_argument('--task', required=True, help='build directory name under ~/.cache/cuteafd/builds')
     parser.add_argument('--cargo', action='store_true')
     parser.add_argument('--scripts', action='store_true')
@@ -508,7 +766,18 @@ def main():
         args.cargo = args.scripts = True
     if args.jobs < 1:
         parser.error('--jobs must be positive')
-    concurrent = args.scripts and (args.cargo or args.benches)
+    # A systemd unit without ~/.cargo/bin on PATH otherwise burns a whole gate
+    # (cargo exit 127 plus the scripts that shell out to rustc). Recover from the
+    # standard Cargo locations before refusing: PATH here reaches every child.
+    path, used = toolchain_path(os.environ)
+    if used:
+        os.environ['PATH'] = path
+        log(f'PATH: {used} supplies cargo/rustc (added to PATH)')
+    missing = [tool for tool in TOOLCHAIN if not shutil.which(tool)]
+    if missing and (args.cargo or args.benches or args.scripts):
+        parser.error(f'{", ".join(missing)} not on PATH; pass PATH including ~/.cargo/bin '
+                     '(systemd-run --setenv=PATH=...)')
+    concurrent =args.scripts and (args.cargo or args.benches)
     args.cargo_jobs = max(1, args.jobs // 2) if concurrent else args.jobs
     args.pytest_jobs = max(1, args.jobs - args.cargo_jobs) if concurrent else args.jobs
     root = BUILDS / args.task
@@ -530,6 +799,7 @@ def main():
 
 def run_gate(args, root):
     record = {'task': args.task, 'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+              'full': getattr(args, 'full', False),
               'skip_live_planners': args.skip_live_planners, **gate(args.source.resolve(), root / 'head', args)}
     if args.base:
         base_source = root / 'base-src'
@@ -537,13 +807,23 @@ def run_gate(args, root):
             checked(['git', '-C', str(base_source), 'checkout', '-q', '--detach', args.base])
         else:
             checked(['git', '-C', str(args.source), 'worktree', 'add', '-q', '--detach', str(base_source), args.base])
-        record['base'] = gate(base_source, root / 'base', args, owned=True)
+        record['base'] = gate(base_source, root / 'base', args, owned=True, local=args.source.resolve())
         record['new_failing'] = {}
         for suite in record['suites']:
             before = next((s for s in record['base']['suites'] if s['suite'] == suite['suite']), {})
             record['new_failing'][suite['suite']] = sorted(set(suite.get('failing', [])) - set(before.get('failing', [])))
-        ran = all(s.get('passed', 0) > 0 for s in record['suites'])
-        record['verdict'] = 'pass' if ran and not any(record['new_failing'].values()) else 'failed'
+        # A shared named test failure may be tolerated; a timeout, moved HEAD,
+        # missing build/report, or unexplained failure must never become green
+        # just because both failing-id sets happen to be empty.
+        comparable = all(not side.get('moved') and all(
+            suite.get('passed', 0) > 0 and (suite['status'] == 'pass' or (
+                suite.get('failed', 0) > 0
+                and suite['failed'] == len(suite.get('failing', []))
+                and suite.get('exit', 0) != 124
+                and suite.get('build_exit', 0) == 0
+                and suite.get('build_complete', True)))
+            for suite in side['suites']) for side in (record, record['base']))
+        record['verdict'] = 'pass' if comparable and not any(record['new_failing'].values()) else 'failed'
     else:
         record['verdict'] = record['status']
     (root / 'cpu-gate.json').write_text(json.dumps(record, indent=2) + '\n')

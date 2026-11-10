@@ -23,9 +23,10 @@ fn capacities(capacity: u32) -> Result<Vec<u32>> {
     // The plan bounds live rows independently of the AOT kernel's maximum.
     // Kernel scratch remains fully sized; callers may size input/output storage
     // to live capacity because launches validate and predicate on actual rows.
-    let compiled = [1, 16, 80, 256, 1024, 4096].into_iter()
+    let covers = if capacity == 40 || capacity == cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32 { [1, 16, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32, cuteafd_core::V41_DRAFT_WIDE_ROWS as u32, 1024, 4096] } else { cuteafd_core::V41_TARGET_CAPACITIES.map(|n| n as u32) };
+    let compiled = covers.into_iter()
         .find(|&n| n >= capacity).context("FP8 capacity has no compiled kernel")?;
-    let mut result: Vec<_> = [1, 16, 80].into_iter().filter(|&n| n < compiled).collect();
+    let mut result: Vec<_> = covers[..3].iter().copied().filter(|&n| n < compiled).collect();
     result.push(compiled);
     Ok(result)
 }
@@ -255,14 +256,14 @@ mod tests {
             ]
         );
         assert_eq!(info.scratch_bytes, (1u64 << 31) + 1792);
-        assert_eq!(capacities(4096).unwrap(), [1, 16, 80, 4096]);
+        assert_eq!(capacities(4096).unwrap(), [1, 16, 64, 4096]);
         assert_eq!(capacities(16).unwrap(), [1, 16]);
         assert_eq!(capacities(40).unwrap(), [1, 16, 80]);
         assert_eq!(capacities(1).unwrap(), [1]);
         assert!(capacities(0).is_err());
-        assert_eq!(capacities(2048).unwrap(), [1, 16, 80, 4096]);
-        assert_eq!(capacities(128).unwrap(), [1, 16, 80, 256]);
-        assert_eq!(capacities(257).unwrap(), [1, 16, 80, 1024]);
+        assert_eq!(capacities(2048).unwrap(), [1, 16, 64, 4096]);
+        assert_eq!(capacities(128).unwrap(), [1, 16, 64, 256]);
+        assert_eq!(capacities(257).unwrap(), [1, 16, 64, 1024]);
         assert!(capacities(4097).is_err());
         let mut invalid = infos;
         invalid[0].scratch_bytes = u64::MAX;

@@ -15,16 +15,19 @@ use cuteafd_core::DType;
 #[derive(Debug, Clone)]
 pub struct CoordinatorContract {
     pub weights: NativeDenseLayout,
+    /// Header-native EXL3 dense projections (empty for FP8/NVFP4 releases).
+    pub core: super::exl3::CoreInventory,
     pub norm_weight: NormWeight,
     pub norms: TargetNormEps,
     pub rope_tables: crate::plan::rope::Tables,
     pub router: SigmoidRouter,
     pub layers: Vec<LayerContract>,
+    mtp_declarations: Vec<(String, Vec<usize>, DType)>,
 }
 
 /// Official target norms all receive config.rms_norm_eps, including the
 /// indexer LayerNorm (whose fused kernel's default is not the model value).
-/// Extra MTP enorm/hnorm/shared-head norms remain unqualified and unbound.
+/// MTP enorm/hnorm and each private head norm use the same checkpoint epsilon.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TargetNormEps {
     pub input: f32,
@@ -65,57 +68,64 @@ pub struct LayerContract {
     pub sliding: Option<SlidingWindow>,
 }
 
+impl LayerContract {
+    /// Target and predictor blocks share checkpoint geometry, not layer counts.
+    pub fn from_config(cfg: &Config, layer: usize) -> Result<Self> {
+        ensure!(layer < cfg.layers + cfg.mtp, "Step-5 layer contract out of range");
+        Ok(Self {
+            layer,
+            dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
+            shared_activation: cfg.moe[layer].then_some(cfg.shared_activation[layer]),
+            geometry: GqaGeometry {
+                query_heads: cfg.heads,
+                kv_heads: cfg.groups,
+                qk_dim: cfg.dim,
+                value_dim: cfg.dim,
+                rotary_dim: cfg.rotary[layer],
+            }.validate()?,
+            theta: cfg.theta[layer],
+            rope: cfg.rope_recipe(layer, false)?,
+            indexer_rope: cfg.full[layer].then(|| cfg.rope_recipe(layer, true)).transpose()?,
+            rotary_arithmetic: RotaryArithmetic::FusedImaginary,
+            sliding: (!cfg.full[layer]).then_some(SlidingWindow { window: cfg.window as u64 }),
+        })
+    }
+}
+
 impl CoordinatorContract {
     /// Requires every selected native target header. Routed experts, vision
     /// and independently owned MTP stages are not charged as target weights.
     /// Full tensors are conservatively replicated; no unimplemented TP packing
     /// or BF16-to-FP8 conversion is credited as a memory saving.
     pub fn from_checkpoint(checkpoint: &Checkpoint) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_coordinator_contract_construction").entered();
         let model = Model::open(checkpoint)?;
         let cfg: &Config = &model.cfg;
         let declarations = model
             .tensors
             .iter()
-            .filter(|(_, t)| {
+            .filter(|(name, t)| {
                 !matches!(
                     t.role.component,
                     Component::RoutedExpert | Component::Vision | Component::Speculator
-                )
+                ) && !is_exl3_member(name)
             })
             .map(|(name, t)| (name.clone(), t.shape.clone(), t.dtype.clone()));
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
         let layers = (0..cfg.layers)
-            .map(|layer| {
-                Ok(LayerContract {
-                    layer,
-                    dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
-                    shared_activation: cfg.moe[layer].then_some(cfg.shared_activation[layer]),
-                    geometry: GqaGeometry {
-                        query_heads: cfg.heads,
-                        kv_heads: cfg.groups,
-                        qk_dim: cfg.dim,
-                        value_dim: cfg.dim,
-                        rotary_dim: cfg.rotary[layer],
-                    }
-                    .validate()?,
-                    theta: cfg.theta[layer],
-                    rope: cfg.rope_recipe(layer, false)?,
-                    indexer_rope: cfg.full[layer]
-                        .then(|| cfg.rope_recipe(layer, true))
-                        .transpose()?,
-                    rotary_arithmetic: RotaryArithmetic::FusedImaginary,
-                    sliding: (!cfg.full[layer]).then_some(SlidingWindow {
-                        window: cfg.window as u64,
-                    }),
-                })
-            })
+            .map(|layer| LayerContract::from_config(cfg, layer))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             layers.len() == 92,
             "target coordinator must exclude MTP stages"
         );
+        let mtp_declarations = model.tensors.iter().filter(|(name, tensor)|
+            !is_exl3_member(name) && tensor.role.component == Component::Speculator)
+            .map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone())).collect();
         Ok(Self {
             weights,
+            mtp_declarations,
+            core: model.core.clone(),
             norm_weight: NormWeight::ZeroCentered,
             norms: TargetNormEps::from_config(cfg),
             rope_tables: cfg.rope_tables()?,
@@ -154,7 +164,14 @@ pub struct RankWeightLayout {
     pub rank: usize,
     pub ranks: usize,
     pub operands: Vec<WeightOperand>,
+    /// Compressed native trellis owners by `.weight` operand name; gate and up
+    /// stay separate, independently calibrated projections.
+    pub core: std::collections::BTreeMap<String, crate::formats::trellis_core::CoreWeightLayout>,
     pub resident_bytes: u64,
+}
+
+fn is_exl3_member(name: &str) -> bool {
+    matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg")
 }
 
 impl RankWeightLayout {
@@ -170,22 +187,130 @@ impl RankWeightLayout {
         Self::build(checkpoint, rank, ownership.ranks(), Some(ownership))
     }
 
+    /// MTP stages stay whole on their admitted owner. Matching head shapes
+    /// do not establish tied checkpoint storage or identical weights.
+    pub fn for_mtp(checkpoint: &Checkpoint, depth: usize) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_from_contract(checkpoint, &contract, depth)
+    }
+
+    pub fn mtp_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        depth: usize) -> Result<Self> {
+        let cfg = Config::parse(checkpoint)?;
+        ensure!(depth <= cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
+        if depth == 0 {
+            return Ok(Self { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 });
+        }
+        let declarations = contract.mtp_declarations.iter().filter(|(name, _, _)|
+            (0..depth).any(|stage| name.starts_with(&format!("model.layers.{}.", cfg.layers + stage))))
+            .cloned();
+        let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
+        let mut layout = Self::from_native(&weights, 0, 1, None)?;
+        for operand in &mut layout.operands { operand.slice = WeightSlice::Replicated; }
+        layout.attach_core(&cfg, &contract.core, None, |layer| layer >= cfg.layers && layer < cfg.layers + depth)?;
+        Ok(layout)
+    }
+
+    /// One whole predictor owner, with no target or earlier-stage operands.
+    pub fn for_mtp_stage(checkpoint: &Checkpoint, stage: usize) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::mtp_stage_from_contract(checkpoint, &contract, stage)
+    }
+
+    pub fn mtp_stage_from_contract(checkpoint: &Checkpoint, contract: &CoordinatorContract,
+        stage: usize) -> Result<Self> {
+        let cfg = Config::parse(checkpoint)?;
+        ensure!(stage < cfg.mtp, "Step-5 predictor stage outside checkpoint");
+        let prefix = format!("model.layers.{}.", cfg.layers + stage);
+        let mut layout = Self::mtp_from_contract(checkpoint, contract, stage + 1)?;
+        layout.operands.retain(|operand| operand.name.starts_with(&prefix));
+        layout.core.retain(|name, _| name.starts_with(&prefix));
+        layout.resident_bytes = layout.operands.iter().map(|operand| operand.allocation_bytes)
+            .chain(layout.core.values().map(|core| core.bytes as u64))
+            .try_fold(0u64, |sum, bytes| sum.checked_add(bytes))
+            .ok_or_else(|| anyhow::anyhow!("Step-5 stage weight size overflow"))?;
+        // 16 operands, with BF16 gate/up packed as one; native gate and up stay separate.
+        let native = layout.core.len() - usize::from(layout.core.keys().any(|n| n.ends_with(".mlp.up_proj.weight")));
+        ensure!(layout.operands.len() + native == 16, "Step-5 predictor operand inventory");
+        Ok(layout)
+    }
+
     fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
+        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::from_contract(&contract, &cfg, rank, ranks, ownership)
+    }
+
+    pub fn from_contract(contract: &CoordinatorContract, cfg: &Config,
+        rank: usize, ranks: usize, ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_rank_layout_construction", rank).entered();
+        if let Some(ownership) = ownership { ownership.validate_config(cfg)?; }
+        let mut layout = Self::from_native(&contract.weights, rank, ranks, ownership)?;
+        layout.attach_core(cfg, &contract.core, ownership, |layer| layer < cfg.layers)?;
+        Ok(layout)
+    }
+
+    /// Native trellis owners follow the same ownership as their BF16 operands:
+    /// head-split ranks slice q/k/v by output rows and o_proj by input columns;
+    /// FFNs and heads stay whole on their owner. Admission counts their bytes.
+    fn attach_core(&mut self, cfg: &Config, core: &super::exl3::CoreInventory,
+        ownership: Option<&super::ownership::ExecutionOwnership>, layers: impl Fn(usize) -> bool) -> Result<()> {
+        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+        for (stem, projection) in &core.projections {
+            let name = format!("{stem}.weight");
+            let (layer, leaf) = match stem.strip_prefix("model.layers.").and_then(|r| r.split_once('.')) {
+                Some((layer, leaf)) => (Some(layer.parse::<usize>()?), leaf),
+                None => (None, stem.as_str()),
+            };
+            let (world, side) = match (layer, ownership) {
+                (Some(layer), _) if !layers(layer) => continue,
+                (None, _) if layers(cfg.layers) => continue,
+                (None, Some(ownership)) => {
+                    if self.rank != usize::from(ownership.execution().spec().head_gpu) { continue; }
+                    (1, TrellisSide::Output)
+                }
+                (None, None) if self.rank != 0 => continue,
+                (None, None) => (1, TrellisSide::Output),
+                (Some(layer), Some(ownership)) => {
+                    let local = ownership.layer(layer, self.rank)?;
+                    let attention = leaf.starts_with("self_attn.");
+                    if (attention && local.query_heads == 0) || (!attention && !local.ffn) { continue; }
+                    match (attention && local.query_heads == 32, leaf) {
+                        (true, "self_attn.o_proj") => (2, TrellisSide::Input),
+                        (true, _) => (2, TrellisSide::Output),
+                        _ => (1, TrellisSide::Output),
+                    }
+                }
+                (Some(_), None) if self.ranks == 1 => (1, TrellisSide::Output),
+                (Some(_), None) => match leaf {
+                    "self_attn.q_proj" | "self_attn.k_proj" | "self_attn.v_proj" => (2, TrellisSide::Output),
+                    "self_attn.o_proj" => (2, TrellisSide::Input),
+                    _ => (1, TrellisSide::Output),
+                },
+            };
+            let layout = CoreWeightLayout::new(projection, side, if world == 1 { 0 } else { self.rank }, world)?;
+            self.resident_bytes = self.resident_bytes.checked_add(layout.bytes as u64)
+                .ok_or_else(|| anyhow::anyhow!("Step-5 native core size overflow"))?;
+            self.core.insert(name, layout);
+        }
+        Ok(())
+    }
+
+    fn from_native(weights: &NativeDenseLayout, rank: usize, ranks: usize,
         ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         ensure!(
             matches!(ranks, 1 | 2) && rank < ranks,
             "Step-5 coordinator rank geometry"
         );
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let sources: std::collections::BTreeMap<_, _> = contract
-            .weights
+        let sources: std::collections::BTreeMap<_, _> = weights
             .tensors
             .iter()
             .map(|t| (t.meta.name.as_str(), t))
             .collect();
         let mut operands = Vec::new();
         let mut resident_bytes = 0u64;
-        for source in &contract.weights.tensors {
+        for source in &weights.tensors {
             let name = &source.meta.name;
             let mut split_ranks = ranks;
             if let Some(ownership) = ownership {
@@ -290,6 +415,7 @@ impl RankWeightLayout {
             rank,
             ranks,
             operands,
+            core: Default::default(),
             resident_bytes,
         })
     }
@@ -413,6 +539,29 @@ mod tests {
                 .resident_bytes,
             exact
         );
+    }
+
+    #[test]
+    fn predictor_layer_geometry_is_native_without_extending_the_target() {
+        for quant in ["fp8", "nvfp4"] {
+            let dir = snapshot(quant);
+            let cp = Checkpoint::open(dir.path()).unwrap();
+            let cfg = Config::parse(&cp).unwrap();
+            assert_eq!(CoordinatorContract::from_checkpoint(&cp).unwrap().layers.len(), 92);
+            for layer in 92..95 {
+                let contract = LayerContract::from_config(&cfg, layer).unwrap();
+                assert_eq!(contract.layer, layer);
+                assert_eq!(contract.geometry.query_heads, 64);
+                assert_eq!(contract.geometry.kv_heads, 4);
+                assert_eq!(contract.geometry.rotary_dim, 192);
+                assert_eq!(contract.sliding.unwrap().window, 512);
+                assert!(contract.indexer_rope.is_none());
+                assert!(contract.shared_activation.is_none());
+                assert_eq!(contract.dense_activation, Some(
+                    cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }));
+            }
+            assert!(LayerContract::from_config(&cfg, 95).is_err());
+        }
     }
 
     #[test]
@@ -577,6 +726,60 @@ mod tests {
         );
         for (rank, ranks) in [(0, 0), (0, 3), (2, 2), (1, 1)] {
             assert!(RankWeightLayout::from_checkpoint(&cp, rank, ranks).is_err());
+        }
+    }
+
+    #[test]
+    fn mtp_residency_charges_each_native_stage_and_head() {
+        for format in ["fp8", "nvfp4"] {
+            let dir = snapshot(format);
+            let cp = Checkpoint::open(dir.path()).unwrap();
+            let zero = RankWeightLayout::for_mtp(&cp, 0).unwrap();
+            assert!(zero.operands.is_empty());
+            assert_eq!(zero.resident_bytes, 0);
+            for depth in 1..=3 {
+                let layout = RankWeightLayout::for_mtp(&cp, depth).unwrap();
+                assert_eq!(layout.operands.len(), 16 * depth);
+                assert_eq!(layout.resident_bytes, 1_677_280_768 * depth as u64);
+                assert!(layout.operands.iter().all(|operand| operand.slice == WeightSlice::Replicated));
+                for stage in 92..92 + depth {
+                    let base = format!("model.layers.{stage}");
+                    for norm in ["enorm", "hnorm", "transformer.shared_head.norm"] {
+                        let norm = layout.operands.iter().find(|operand|
+                            operand.name == format!("{base}.{norm}.weight")).unwrap();
+                        assert_eq!(norm.dtype, DType::F32);
+                        assert_eq!(norm.shape, [4096]);
+                    }
+                    let head = layout.operands.iter().find(|operand|
+                        operand.name == format!("{base}.transformer.shared_head.output.weight")).unwrap();
+                    assert_eq!(head.shape, [128896, 4096]);
+                    assert_eq!(head.allocation_bytes, 128896 * 4096 * 2);
+                    let concat = layout.operands.iter().find(|operand|
+                        operand.name == format!("{base}.eh_proj.weight")).unwrap();
+                    assert_eq!(concat.shape, [4096, 8192]);
+                }
+                let exact = layout.resident_bytes;
+                assert_eq!(layout.check_budget(exact + 12, &[5, 7]).unwrap(), exact + 12);
+                assert!(layout.check_budget(exact + 11, &[5, 7]).is_err());
+            }
+            let mut stage_total = 0;
+            for stage in 0..3 {
+                let layout = RankWeightLayout::for_mtp_stage(&cp, stage).unwrap();
+                let prefix = format!("model.layers.{}.", 92 + stage);
+                assert_eq!(layout.resident_bytes, 1_677_280_768);
+                assert!(layout.operands.iter().all(|operand| operand.name.starts_with(&prefix)
+                    && operand.sources.iter().all(|source| source.meta.name.starts_with(&prefix))
+                    && operand.slice == WeightSlice::Replicated));
+                stage_total += layout.resident_bytes;
+            }
+            assert_eq!(stage_total, RankWeightLayout::for_mtp(&cp, 3).unwrap().resident_bytes);
+            assert!(RankWeightLayout::for_mtp_stage(&cp, 3).is_err());
+            assert!(RankWeightLayout::for_mtp_stage(&cp, usize::MAX).is_err());
+            assert!(RankWeightLayout::for_mtp(&cp, 4).is_err());
+            let mut bad = Checkpoint::open(dir.path()).unwrap();
+            bad.tensors.iter_mut().find(|tensor|
+                tensor.meta.name == "model.layers.94.eh_proj.weight").unwrap().meta.byte_length -= 1;
+            assert!(RankWeightLayout::for_mtp(&bad, 3).is_err());
         }
     }
 

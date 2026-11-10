@@ -5,3 +5,12 @@ fail-fast = false
 [profile.cpu-gate.junit]
 path = "junit.xml"
 report-skipped = "all"
+
+# cpu-gate owns identical default/full selections for nextest and cargo-test fallback.
+[profile.cpu-gate-full]
+retries = 0
+fail-fast = false
+
+[profile.cpu-gate-full.junit]
+path = "junit.xml"
+report-skipped = "all"

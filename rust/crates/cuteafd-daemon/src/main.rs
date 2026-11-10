@@ -1,7 +1,15 @@
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
+use std::io::IsTerminal;
 use std::process::Command;
+
+// Optional allocator instrumentation (2026-10-26): `--features jemalloc`
+// replaces glibc so the coordinator's host heap can be measured with jemalloc's
+// stats (live vs active vs mapped).  The default build keeps glibc + malloc_tune.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod cli;
 mod commands;
@@ -34,6 +42,57 @@ fn resolve_qwen_vision(
     family.or(initial).unwrap_or(cuteafd_loader::plan::MediaMode::Auto)
 }
 
+/// Borrow each media-capable command's options once; resolution and assignment
+/// must not diverge between the global API policy and the serving owner.
+struct ServeMedia<'a> {
+    snapshot: &'a std::path::Path,
+    vision: &'a mut cuteafd_loader::plan::MediaMode,
+    audio: Option<&'a mut cuteafd_loader::plan::MediaMode>,
+}
+
+fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
+    match command {
+        Commands::ServeMimo(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
+            vision: &mut args.vision, audio: Some(&mut args.audio) }),
+        Commands::ServeMuse(args) => Some(ServeMedia { snapshot: &args.snapshot,
+            vision: &mut args.vision, audio: Some(&mut args.audio) }),
+        Commands::ServeQwen4(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
+            vision: &mut args.vision, audio: None }),
+        Commands::ServeGlm(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
+            vision: &mut args.vision, audio: None }),
+        Commands::ServeGlmf(args) => Some(ServeMedia { snapshot: &args.engine.snapshot,
+            vision: &mut args.vision, audio: None }),
+        _ => None,
+    }
+}
+
+fn resolve_serve_media(command: &mut Commands, vision: cuteafd_loader::plan::MediaMode,
+    audio: cuteafd_loader::plan::MediaMode) -> Result<(cuteafd_loader::plan::MediaMode, cuteafd_loader::plan::MediaMode)> {
+    use cuteafd_loader::plan::MediaMode;
+    let Some(options) = serve_media(command) else {
+        anyhow::ensure!(matches!(audio, MediaMode::Auto | MediaMode::Off),
+            "explicit audio placement requires a media-capable serve command");
+        return Ok((vision, MediaMode::Off));
+    };
+    let vision = if vision == MediaMode::Off { vision } else {
+        let config: serde_json::Value = cuteafd_loader::read_json_file(&options.snapshot.join("config.json"))?;
+        match config.get("vision_config").filter(|value| !value.is_null()) {
+            Some(config) => {
+                anyhow::ensure!(config.is_object(), "vision_config must be an object");
+                vision
+            }
+            None if vision == MediaMode::Auto => MediaMode::Off,
+            None => anyhow::bail!("checkpoint has no bundled vision tower"),
+        }
+    };
+    let audio = cuteafd_loader::plan::resolve_audio(audio, options.snapshot)?;
+    anyhow::ensure!(options.audio.is_some() || audio == MediaMode::Off,
+        "this serve command has no bundled audio execution owner");
+    *options.vision = vision;
+    if let Some(target) = options.audio { *target = audio; }
+    Ok((vision, audio))
+}
+
 #[cfg(test)]
 mod media_defaults_tests {
     use super::{resolve_qwen_vision, resolve_vision};
@@ -47,6 +106,26 @@ mod media_defaults_tests {
                 "cuteafd", "--table-backend", backend, "plan", "/model",
             ]).unwrap_err();
             assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn native_flash_serving_cli_accepts_a16_and_refuses_a8() {
+        use clap::Parser;
+        use super::cli::{Cli, Commands};
+        use cuteafd_loader::plan::exlr8::PrefillActivations;
+        let base = ["cuteafd", "serve-glmf", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--exlr8-manifest", "k4"];
+        for extra in [vec![], vec!["--exlr8-prefill-activations", "a16"]] {
+            let cli = Cli::try_parse_from(base.into_iter().chain(extra)).unwrap();
+            let Commands::ServeGlmf(args) = cli.command else { panic!("expected Flash serving"); };
+            assert_eq!(args.engine.exlr8_prefill_activations, PrefillActivations::A16);
+        }
+        for value in ["a8", "auto", "unknown"] {
+            let error = Cli::try_parse_from(base.into_iter()
+                .chain(["--exlr8-prefill-activations", value])).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("native Flash EXLR8 prefill is A16"), "{error}");
         }
     }
 
@@ -82,6 +161,74 @@ mod media_defaults_tests {
         assert_eq!(resolve_qwen_vision(off.vision, None), MediaMode::Off);
     }
 
+    fn media_command(name: &str, snapshot: &std::path::Path) -> super::Commands {
+        use clap::Parser;
+        super::cli::Cli::try_parse_from(["cuteafd", name, "--snapshot", snapshot.to_str().unwrap(),
+            "--native-lib", "/native.so"]).unwrap().command
+    }
+
+    #[test]
+    fn checkpoint_media_resolution_is_uniform_for_mimo_muse_and_text_only_qwen() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::{testing, resolve_audio};
+        let bundled = tempfile::tempdir()?;
+        testing::write_muse_media_snapshot(bundled.path(), &[]);
+        let text = tempfile::tempdir()?;
+        std::fs::write(text.path().join("config.json"), r#"{"model_type":"qwen4_exp"}"#)?;
+        for name in ["serve-mimo", "serve-muse", "serve-qwen4", "serve-glmf"] {
+            for (snapshot, present) in [(bundled.path(), true), (text.path(), false)] {
+                for mode in [MediaMode::Auto, MediaMode::Rtx(Some(0)), MediaMode::Spark(Some(0)), MediaMode::Off] {
+                    let mut command = media_command(name, snapshot);
+                    let result = super::resolve_serve_media(&mut command, mode, mode);
+                    let owns_audio = super::serve_media(&mut command).unwrap().audio.is_some();
+                    if (present && owns_audio) || mode == MediaMode::Off || (!present && mode == MediaMode::Auto) {
+                        let expected = if present { mode } else { MediaMode::Off };
+                        assert_eq!(result?, (expected, expected), "{name}: {mode:?}");
+                        let options = super::serve_media(&mut command).unwrap();
+                        assert_eq!(*options.vision, expected);
+                        if let Some(audio) = options.audio { assert_eq!(*audio, expected); }
+                    } else {
+                        assert!(result.is_err(), "{name}: {mode:?} must not silently disable explicit media");
+                    }
+                }
+                // A vision-only command can still serve its bundled image tower.
+                let mut command = media_command(name, snapshot);
+                let expected = if present { MediaMode::Auto } else { MediaMode::Off };
+                assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Off)?,
+                    (expected, MediaMode::Off));
+                if owns_audio_command(name) {
+                    assert_eq!(resolve_audio(MediaMode::Auto, snapshot)?,
+                        super::resolve_serve_media(&mut command, MediaMode::Off, MediaMode::Auto)?.1);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn owns_audio_command(name: &str) -> bool { matches!(name, "serve-mimo" | "serve-muse") }
+
+    #[test]
+    fn declared_mimo_rvq_errors_and_off_bypass_match_shared_resolver() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        for audio_config in [serde_json::json!({"audio_channels":20}),
+            serde_json::json!({"model_type":"unknown_audio"})] {
+            std::fs::write(dir.path().join("config.json"),
+                serde_json::json!({"model_type":"mimo_v2", "hidden_size":4096,
+                    "vision_config":{}, "audio_config":audio_config}).to_string())?;
+            for mode in [MediaMode::Auto, MediaMode::Rtx(Some(0)), MediaMode::Spark(Some(0))] {
+                let expected = cuteafd_loader::plan::resolve_audio(mode, dir.path()).unwrap_err().to_string();
+                for name in ["serve-mimo", "serve-muse"] {
+                    let mut command = media_command(name, dir.path());
+                    let actual = super::resolve_serve_media(&mut command, MediaMode::Off, mode).unwrap_err();
+                    assert_eq!(actual.to_string(), expected);
+                }
+            }
+            let mut command = media_command("serve-mimo", dir.path());
+            assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Off, MediaMode::Off)?,
+                (MediaMode::Off, MediaMode::Off));
+        }
+        Ok(())
+    }
+
     #[test]
     fn qualified_vision_defaults_auto_and_preserves_explicit_off() {
         assert_eq!(resolve_vision(None, None), MediaMode::Auto);
@@ -95,27 +242,40 @@ fn main() -> Result<()> {
     // Before any thread, tracing or CUDA: exec the AVX-512 build when this host
     // has AVX-512 and the image carries it (cuteafd_ffi::host_isa).
     let host_isa = cuteafd_ffi::host_isa::startup()?;
+    // Before any worker thread: pin glibc's mmap threshold so a request's multi-megabyte
+    // transients go back to the kernel on free instead of fragmenting the arenas
+    // (shared::malloc_tune; CUTEAFD_MALLOC_TUNE=off keeps glibc's dynamic threshold).
+    // Apply unconditionally: under the jemalloc build this still tunes glibc, which the
+    // prebuilt native library (libcuteafd_native.so) uses.
+    let malloc = shared::malloc_tune::apply_from_env().to_string();
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stderr().is_terminal())
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
     tracing::info!("{host_isa}");
+    tracing::info!("{malloc}");
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
 
 async fn run() -> Result<()> {
 
     let parse = |matches: clap::ArgMatches| {
+
         match Cli::from_arg_matches(&matches) {
-            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch),
+            Ok(cli) => (cli.command, matches, cli.coordinator_gpu_budget_gib, cli.vision, cli.audio, cli.max_image_tokens, cli.image_url_fetch,
+                cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
+                    idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cli.spark_reply_format),
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch) = parse(Cli::command().get_matches());
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply) =
+        parse(Cli::command().get_matches());
     for replacement in cli::deprecated_budget_flags(std::env::args()) {
         eprintln!("warning: deprecated coordinator budget flag; use {replacement}");
     }
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply) = match command {
         Commands::Serve(args) => match commands::family::argv(commands::family::Kind::Serve, args)? {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
@@ -124,8 +284,12 @@ async fn run() -> Result<()> {
             Some(argv) => parse(Cli::command().get_matches_from(argv)),
             None => return Ok(()),
         },
-        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch),
+        command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
+            initial_wait, initial_reply),
     };
+    cuteafd_core::spark_reply::set_requested(family_reply.or(initial_reply)).map_err(anyhow::Error::msg)?;
+    // Read by the coordinator and every Spark worker from the same key.
+    cuteafd_transport::wait_policy::set_wait_policy(wait_policy)?;
     if let Some((_, options)) = matches.subcommand() {
         if let Ok(Some(path)) = options.try_get_one::<std::path::PathBuf>("native_lib") {
             cuteafd_transport::set_verbs_host_native_library_path(path.clone())?;
@@ -148,20 +312,13 @@ async fn run() -> Result<()> {
         _ => vision,
     };
     let requested_audio = family_audio.or(initial_audio).unwrap_or(cuteafd_loader::plan::MediaMode::Auto);
-    let audio = match &command {
-        Commands::Plan(_) => requested_audio,
-        Commands::ServeMimo(args) => cuteafd_loader::plan::resolve_audio(requested_audio, &args.engine.snapshot)?,
-        _ => match requested_audio {
-            cuteafd_loader::plan::MediaMode::Auto | cuteafd_loader::plan::MediaMode::Off => cuteafd_loader::plan::MediaMode::Off,
-            _ => anyhow::bail!("explicit audio placement requires a qualified MiMo audio checkpoint"),
-        },
-    };
-    if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
-    if let Commands::ServeMimo(args) = &mut command { args.vision = vision; args.audio = audio; }
-    if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
-    if let Commands::ServeQwen4(args) = &mut command {
+    let (vision, audio) = if let Commands::Plan(args) = &mut command {
         args.vision = vision;
-    }
+        args.audio = requested_audio;
+        (vision, requested_audio)
+    } else {
+        resolve_serve_media(&mut command, vision, requested_audio)?
+    };
     cuteafd_api::openai::set_media_input_policy(vision != cuteafd_loader::plan::MediaMode::Off,
         audio != cuteafd_loader::plan::MediaMode::Off);
     cuteafd_api::openai::media::set_preparation_policy(
@@ -172,9 +329,9 @@ async fn run() -> Result<()> {
         args.coordinator_gpu_budget_gib = coordinator_budget_gib;
     } else if let Some(gib) = coordinator_budget_gib {
         anyhow::ensure!(matches!(&command, Commands::ServeNative(_) | Commands::ServeMimo(_)
-            | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
+            | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_) | Commands::ServeGlm(_)
             | Commands::ServeDsv4(_) | Commands::V41Golden(_) | Commands::Dsv4Golden(_) | Commands::GlmGolden(_)
-            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_)),
+            | Commands::MimoGolden(_) | Commands::GlmfGolden(_) | Commands::Qwen4Golden(_) | Commands::Qwen35Golden(_) | Commands::Step5Golden(_) | Commands::KimiGolden(_)),
             "--coordinator-gpu-budget-gib applies only to coordinator serve/golden and plan commands");
         let budget = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib)?;
         cuteafd_ffi::set_coordinator_gpu_budget(budget.0)?;
@@ -188,8 +345,9 @@ async fn run() -> Result<()> {
             shared::memory_report::monitor("expertd", std::time::Duration::from_secs(10));
             shared::thermal::monitor("expertd");
         }
-        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeGlmf(_)
+        Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeMuse(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
+            shared::host_heap::start();
             tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
             shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
             shared::thermal::monitor("coordinator");
@@ -203,6 +361,7 @@ async fn run() -> Result<()> {
         Commands::Doctor(args) => run_doctor(args),
         Commands::Plan(args) => run_plan(args),
         Commands::ProgramsCheck(args) => commands::programs_check::run(args),
+        Commands::TierCache(args) => commands::tier_cache::run(args),
         Commands::V41Golden(args) => families::deepseek_v41::v41_golden::run_golden(args).await,
         Commands::Dsv4Golden(args) => families::deepseek_v4::run_golden(args).await,
         Commands::GlmGolden(args) => families::glm5::run_golden(args).await,
@@ -211,7 +370,11 @@ async fn run() -> Result<()> {
         Commands::GlmfGolden(args) => families::glm5_flash::run_golden(args).await,
         Commands::Qwen4Golden(args) => families::qwen4::run_golden(args).await,
         Commands::Qwen35Golden(args) => families::qwen3_5::run_golden(args).await,
-        Commands::Step5Golden(args) => families::step5::golden::run(args),
+        Commands::Step5Golden(args) => families::step5::golden::run_golden(args).await,
+        Commands::KimiGolden(args) => families::kimi_k3::golden::run_golden(args).await,
+        Commands::ServeKimi(args) => families::kimi_k3::serve::run(args).await,
+        Commands::ServeStep5(args) => families::step5::serve::run_serve(args).await,
+        Commands::ServeMuse(args) => families::muse_spark::serve::run(args).await,
         Commands::ServeQwen35(args) => families::qwen3_5::serve::run_serve(args).await,
         Commands::ServeQwen4(args) => families::qwen4::serve::run_serve(args).await,
         Commands::ServeGlmf(args) => families::glm5_flash::serve::run_serve(args).await,
@@ -220,7 +383,7 @@ async fn run() -> Result<()> {
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
             let landings = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device,
-                args.landing_warmup, args.landing_repeats);
+                args.landing_warmup, args.landing_repeats, args.landing_peer);
             let landing = &landings[0];
             let p2p = args.p2p.then(|| shared::peer_probe::run(args.native_lib.as_deref(), &args.p2p_devices,
                 &args.p2p_bytes));

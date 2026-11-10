@@ -82,7 +82,7 @@ impl V41DsparkAttention<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=16).contains(&requests) && (1..=16).contains(&slots),
+            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests) && (1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&slots),
             "invalid dSpark attention geometry"
         );
         for (value, bytes) in [

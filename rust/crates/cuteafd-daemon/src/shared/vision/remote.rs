@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 const MAGIC: &[u8; 8] = b"CAFDVI01";
+/// Merge-2 towers that also emit marker rows (Mistral's `[IMG_BREAK]`/`[IMG_END]`):
+/// the CAFDVI01 fields plus the marker rows after each merged row.
+const MAGIC_ROW_MARKERS: &[u8; 8] = b"CAFDVI02";
 const MAX_PATCHES: u32 = 16_384;
 const MAX_WIDTH: u32 = 16_384;
 const MAX_ERROR: usize = 1024;
@@ -30,6 +33,9 @@ pub struct EncoderHandshake {
     pub output_width: u32,
     pub patch_size: u32,
     pub merge_size: u32,
+    /// Marker rows the encoder writes after each merged row of image rows (0, or 1 for
+    /// a span-writing tower: Mistral's `[IMG_BREAK]`/`[IMG_END]`); merge 2 only.
+    pub row_markers: u32,
     /// The placement contract, shared by coordinator and every replica.
     pub plan_hash: [u8; 32],
 }
@@ -42,6 +48,7 @@ impl EncoderHandshake {
             || ![14, 16].contains(&self.patch_size)
             || ![2, 3].contains(&self.merge_size)
             || (self.merge_size == 3 && (self.patch_size != 14 || self.output_width != 5120))
+            || self.row_markers > 1 || (self.row_markers == 1 && self.merge_size != 2)
         {
             return Err(error("invalid encoder capacity/geometry"));
         }
@@ -55,6 +62,7 @@ impl EncoderHandshake {
             || self.output_width != expected.output_width
             || self.patch_size != expected.patch_size
             || self.merge_size != expected.merge_size
+            || self.row_markers != expected.row_markers
             || self.max_patches < expected.max_patches
         {
             return Err(error("vision encoder identity/placement/capacity mismatch"));
@@ -62,7 +70,8 @@ impl EncoderHandshake {
         Ok(())
     }
     fn write(&self, stream: &mut Wire) -> Result<()> {
-        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else { MAGIC }).map_err(error)?;
+        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else if self.row_markers > 0 { MAGIC_ROW_MARKERS }
+            else { MAGIC }).map_err(error)?;
         stream.write_all(&self.encoder_id.0).map_err(error)?;
         stream.write_all(&self.plan_hash).map_err(error)?;
         for value in [
@@ -73,11 +82,13 @@ impl EncoderHandshake {
         ] {
             put_u32(stream, value)?;
         }
+        if self.row_markers > 0 { put_u32(stream, self.row_markers)?; }
         Ok(())
     }
     fn tokens(&self, h: u32, w: u32) -> u64 {
         if self.merge_size == 3 { u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2 }
-        else { u64::from(h) * u64::from(w) / 4 }
+        else { cuteafd_core::media::ImageTokenGeometry { merge: self.merge_size, row_markers: self.row_markers }
+            .extent([1, h, w]).map_or(0, |(_, _, rows)| rows as u64) }
     }
     fn input_bytes(&self, patches: u64) -> u64 {
         patches.saturating_mul(u64::from(self.patch_size).pow(2)).saturating_mul(3)
@@ -108,6 +119,7 @@ pub struct AudioHandshake {
     pub plan_hash: [u8; 32],
     pub max_samples: u32,
     pub output_width: u32,
+    pub geometry: cuteafd_core::media::AudioTokenGeometry,
 }
 #[derive(Clone)]
 enum Handshake {
@@ -129,11 +141,16 @@ impl Handshake {
         match self {
             Self::Image(value) => value.validate(),
             Self::Audio(value) => {
-                cuteafd_loader::media::audio::AudioGeometry::for_samples(
-                    value.max_samples as usize,
+                cuteafd_loader::media::audio::AudioGeometry::for_policy(
+                    value.max_samples as usize, value.geometry,
                 )
                 .map_err(error)?;
-                if ![4096, 6144].contains(&value.output_width) {
+                let valid_width = match value.geometry {
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => [4096, 6144].contains(&value.output_width),
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 } => value.output_width == 8192,
+                    _ => false,
+                };
+                if !valid_width {
                     return Err(error("invalid audio output width"));
                 }
                 Ok(())
@@ -149,6 +166,7 @@ impl Handshake {
                 if actual.encoder_id == expected.encoder_id
                     && actual.plan_hash == expected.plan_hash
                     && actual.output_width == expected.output_width
+                    && actual.geometry == expected.geometry
                     && actual.max_samples >= expected.max_samples =>
             {
                 Ok(())
@@ -165,7 +183,11 @@ impl Handshake {
                 stream.write_all(b"CAFDAU01").map_err(error)?;
                 stream.write_all(&value.encoder_id.0).map_err(error)?;
                 stream.write_all(&value.plan_hash).map_err(error)?;
-                for n in [value.max_samples, value.output_width, 24000, 4] {
+                let policy = match value.geometry {
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => 4,
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token } => samples_per_token as u32,
+                };
+                for n in [value.max_samples, value.output_width, 24000, policy] {
                     put_u32(stream, n)?;
                 }
                 Ok(())
@@ -174,7 +196,7 @@ impl Handshake {
     }
     fn read(stream: &mut Wire) -> Result<Self> {
         let magic = read_array::<8>(stream)?;
-        if &magic != MAGIC && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
+        if &magic != MAGIC && &magic != MAGIC_ROW_MARKERS && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
             return Err(error("unsupported encoder wire version"));
         }
         let encoder_id = EncoderId(read_array(stream)?);
@@ -185,7 +207,12 @@ impl Handshake {
             get_u32(stream)?,
             get_u32(stream)?,
         ];
-        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3) {
+        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3)
+            || (&magic == MAGIC_ROW_MARKERS && merge == 2) {
+            let row_markers = if &magic == MAGIC_ROW_MARKERS { get_u32(stream)? } else { 0 };
+            if &magic == MAGIC_ROW_MARKERS && row_markers == 0 {
+                return Err(error("row-marker wire without marker rows"));
+            }
             Self::Image(EncoderHandshake {
                 encoder_id,
                 plan_hash,
@@ -193,13 +220,16 @@ impl Handshake {
                 output_width,
                 patch_size: patch,
                 merge_size: merge,
+                row_markers,
             })
-        } else if &magic == b"CAFDAU01" && patch == 24000 && merge == 4 {
+        } else if &magic == b"CAFDAU01" && patch == 24000 && [4, 1920].contains(&merge) {
             Self::Audio(AudioHandshake {
                 encoder_id,
                 plan_hash,
                 max_samples: capacity,
                 output_width,
+                geometry: if merge == 4 { cuteafd_core::media::AudioTokenGeometry::MimoRvq }
+                    else { cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: merge as usize } },
             })
         } else {
             return Err(error("unsupported encoder wire version/geometry"));
@@ -211,12 +241,13 @@ impl Handshake {
         match self {
             Self::Image(value) => value.validate_job(job),
             Self::Audio(value) => {
-                let cuteafd_engine::media::EncodeInput::Audio { pcm } = &job.input else {
+                let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(pcm.len())
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(pcm.len(), value.geometry)
                     .map_err(error)?;
-                if !job.key.is_audio()
+                if !matches!(&job.input, cuteafd_engine::media::EncodeInput::Audio { geometry, .. } if *geometry == value.geometry)
+                    || !job.key.is_audio()
                     || pcm.len() > value.max_samples as usize
                     || pcm.iter().any(|v| !v.is_finite())
                     || job.tokens != geometry.tokens
@@ -351,8 +382,8 @@ impl RemoteEncoder {
         timeout: Duration,
     ) -> Result<Self> {
         expected.validate()?;
-        if addresses.is_empty() || addresses.len() > 6 {
-            return Err(error("vision needs 1..6 replicas"));
+        if addresses.is_empty() || addresses.len() > 8 {
+            return Err(error("vision needs 1..8 replicas"));
         }
         let mut this = Self {
             healthy: Arc::new(AtomicBool::new(true)),
@@ -520,7 +551,7 @@ fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
             put_u64(s, rgb8.len() as u64)?;
             s.write_all(rgb8).map_err(error)?;
         }
-        cuteafd_engine::media::EncodeInput::Audio { pcm } => {
+        cuteafd_engine::media::EncodeInput::Audio { pcm, .. } => {
             put_u32(s, 2)?;
             s.write_all(job.key.bytes()).map_err(error)?;
             put_u32(s, pcm.len() as u32)?;
@@ -586,7 +617,6 @@ impl EncoderServer {
             timeout,
             move || health.healthy(),
             move |job| {
-                let started = Instant::now();
                 let (grid, rgb8) = job.image_input()?;
                 let ticket = service
                     .submit(NativeJob {
@@ -611,7 +641,7 @@ impl EncoderServer {
                 Ok(EncodeOutput {
                     key: job.key,
                     features: bytes.into(),
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    elapsed_ms: ticket.encode_ms(),
                 })
             },
         )
@@ -633,8 +663,7 @@ impl EncoderServer {
             timeout,
             move || health.healthy(),
             move |job| {
-                let started = Instant::now();
-                let cuteafd_engine::media::EncodeInput::Audio { pcm } = &job.input else {
+                let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
                 let rows = job.tokens * job.hidden_width;
@@ -642,7 +671,7 @@ impl EncoderServer {
                     .submit_audio(super::audio::AudioEncodeJob {
                         pcm: pcm.clone(),
                         output: vec![0; rows],
-                        fp32_scratch: vec![0.0; rows],
+                        fp32_scratch: if service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; rows] } else { Vec::new() },
                     })
                     .map_err(error)?;
                 let output = loop {
@@ -658,7 +687,7 @@ impl EncoderServer {
                 Ok(EncodeOutput {
                     key: job.key,
                     features: bytes.into(),
-                    elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                    elapsed_ms: ticket.encode_ms(),
                 })
             },
         )
@@ -811,7 +840,7 @@ where
                 let samples = get_u32(s)? as usize;
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(samples)
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(samples, handshake.geometry)
                     .map_err(error)?;
                 if samples > handshake.max_samples as usize
                     || tokens != geometry.tokens as u64
@@ -825,11 +854,12 @@ where
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect::<Vec<_>>();
-                EncodeJob::audio(
+                EncodeJob::audio_with_geometry(
                     key,
                     pcm.into(),
                     tokens as usize,
                     handshake.output_width as usize,
+                    handshake.geometry,
                 )
             }
             _ => return Err(error("encoder peer refuses job modality")),
@@ -910,6 +940,33 @@ mod tests {
             exchange(&mut wire, &job).unwrap(); owner.join().unwrap();
         }
     }
+    /// Mistral's Pixtral span: (h/2) x (w/2 + 1) rows on its own wire tag; existing towers keep
+    /// CAFDVI01 byte for byte, and a client of the other geometry is refused.
+    #[test]
+    fn row_marker_spans_count_their_breaks_on_their_own_wire_tag() {
+        let mut h = handshake(); h.patch_size = 14; h.output_width = 6144; h.max_patches = 12_100; h.row_markers = 1;
+        h.validate().unwrap();
+        assert_eq!(h.tokens(110, 110), 55 * 56);
+        assert_eq!(h.tokens(6, 4), 3 * 3);
+        let job = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 9, 6144);
+        assert_eq!(h.validate_job(&job).unwrap(), 9 * 6144 * 2);
+        let merged_only = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 6, 6144);
+        assert!(h.validate_job(&merged_only).is_err());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut writer = Wire::new(socket, Duration::from_secs(2)).unwrap();
+        let mut reader = Wire::new(peer, Duration::from_secs(2)).unwrap();
+        h.write(&mut writer).unwrap();
+        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back == h));
+        let plain = handshake();
+        plain.write(&mut writer).unwrap();
+        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back.row_markers == 0));
+        assert!(plain.compatible(&h).is_err() && h.compatible(&plain).is_err());
+        let mut bad = h.clone(); bad.merge_size = 3; bad.output_width = 5120;
+        assert!(bad.validate().is_err());
+    }
+
     #[test]
     fn v41_bf16_patch_frames_count_complete_spans_and_refuse_1058() {
         let mut h = handshake(); h.merge_size=3; h.patch_size=14; h.output_width=5120; h.max_patches=9216;
@@ -935,6 +992,7 @@ mod tests {
             output_width: 4096,
             patch_size: 16,
             merge_size: 2,
+            row_markers: 0,
             plan_hash: [9; 32],
         }
     }
@@ -1005,6 +1063,7 @@ mod tests {
     }
     fn audio_handshake() -> AudioHandshake {
         AudioHandshake {
+            geometry: cuteafd_core::media::AudioTokenGeometry::MimoRvq,
             encoder_id: EncoderId([3; 32]),
             plan_hash: [9; 32],
             max_samples: 7200000,
@@ -1013,6 +1072,25 @@ mod tests {
     }
     fn audio_job() -> EncodeJob {
         EncodeJob::audio(AudioKey([4; 32]), vec![0.25; 24000].into(), 7, 4096)
+    }
+    #[test]
+    fn pcm_audio_loopback_preserves_policy_and_exact_rows() {
+        use cuteafd_core::media::AudioTokenGeometry;
+        let geometry = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let handshake = AudioHandshake { geometry, output_width: 8192, ..audio_handshake() };
+        let server = EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake.clone().into(),
+            Duration::from_secs(2), || true, |job| Ok(EncodeOutput {
+                key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0,
+            })).unwrap();
+        let mut client = RemoteEncoder::connect_audio(vec![server.address], handshake, Duration::from_secs(2)).unwrap();
+        assert!(client.submit(audio_job()).is_err());
+        for samples in [1usize, 1919, 1920, 1921, 30721] {
+            let job = EncodeJob::audio_with_geometry(AudioKey([samples as u8; 32]), vec![0.25; samples].into(),
+                samples.div_ceil(1920), 8192, geometry);
+            let expected = FakeEncoder::features(&job).unwrap();
+            let id = client.submit(job).unwrap();
+            assert_eq!(wait(&mut client, id).unwrap().features, expected);
+        }
     }
     #[test]
     fn audio_loopback_is_byte_exact_bounded_and_modality_checked() {
@@ -1041,7 +1119,7 @@ mod tests {
         invalid.tokens += 1;
         assert!(client.submit(invalid).is_err());
         let mut invalid = audio_job();
-        if let cuteafd_engine::media::EncodeInput::Audio { pcm } = &mut invalid.input {
+        if let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &mut invalid.input {
             *pcm = vec![f32::NAN; 24000].into();
         }
         assert!(client.submit(invalid).is_err());

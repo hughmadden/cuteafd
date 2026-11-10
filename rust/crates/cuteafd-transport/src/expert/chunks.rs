@@ -1,5 +1,6 @@
 //! Bounded chunks carry request-selected rank partials in token order.
-use super::{BackboneRequest, SparkTopology, V41_NATIVE_GROUP_REQUEST_FLAG, V41Tp4Planes};
+use super::{BackboneRequest, SparkTopology, V41_NATIVE_COORDINATOR_REQUEST_FLAG, V41_NATIVE_GROUP_REQUEST_FLAG,
+    V41Tp4Planes};
 use crate::{
     EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM, EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS,
     EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN,
@@ -18,6 +19,7 @@ impl BackboneRequest<'_> {
     }
     /// Maximum token rows per indexed frame, including header and row-index overhead.
     pub fn response_chunk_rows(&self, max_frame_bytes: usize) -> Result<u32> {
+        ensure!(!self.view.partial_replies(), "per-expert partial regions cannot be chunked");
         let payload = max_frame_bytes
             .checked_sub(self.response_header_bytes())
             .context("response frame cannot fit header")?;
@@ -74,7 +76,7 @@ impl BackboneRequest<'_> {
                 output_row_stride_bytes: self.output_row_bytes()?,
                 output_payload_bytes: partials.len() as u64,
                 status: ExpertProtocolV2Status::Ok,
-                flags: (request.flags & !V41_NATIVE_GROUP_REQUEST_FLAG)
+                flags: (request.flags & !(V41_NATIVE_GROUP_REQUEST_FLAG | V41_NATIVE_COORDINATOR_REQUEST_FLAG))
                     | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
                     | if end < self.rows() {
                         EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS
@@ -82,6 +84,7 @@ impl BackboneRequest<'_> {
                         0
                     },
                 executor_id,
+                pace: None,
             },
             row_indices: Some(&row_indices[..rows as usize]),
             partial_output_payload: partials,
@@ -101,8 +104,8 @@ impl BackboneRequest<'_> {
 /// As with complete responses, request IDs must identify unique in-flight waves.
 pub struct V41Tp4ChunkReceiver {
     identity: V41Tp4Planes<'static>,
-    received: [u32; 8],
-    finished: [bool; 8],
+    received: [u32; cuteafd_core::MAX_SPARK_WORLD],
+    finished: [bool; cuteafd_core::MAX_SPARK_WORLD],
     max_frame_bytes: usize,
 }
 impl V41Tp4ChunkReceiver {
@@ -121,7 +124,7 @@ impl V41Tp4ChunkReceiver {
     ) -> Result<Self> {
         Self::new_ranks(request, &executors, max_frame_bytes)
     }
-    /// Generic constructor for the validated physical rank counts 1..=6.
+    /// Generic constructor for the validated physical rank counts 1..=8.
     ///
     /// A request admitted under the native replicated-group contract must match
     /// its topology's world size.
@@ -131,8 +134,8 @@ impl V41Tp4ChunkReceiver {
         max_frame_bytes: usize,
     ) -> Result<Self> {
         ensure!(
-            (1..=6).contains(&executors.len()),
-            "native TP/EP requires 1..=6 executors"
+            (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&executors.len()),
+            "native TP/EP requires 1..=8 executors"
         );
         if let Some(topology) = request.native_topology() {
             ensure!(
@@ -140,11 +143,12 @@ impl V41Tp4ChunkReceiver {
                 "native group executor count does not match its topology"
             );
         }
-        request.response_chunk_rows(max_frame_bytes)?;
+        let identity = V41Tp4Planes::new_ranks(request, executors)?;
+        identity.check_frame_budget(max_frame_bytes, request.response_header_bytes())?;
         Ok(Self {
-            identity: V41Tp4Planes::from_header_ranks(&request.view.header, executors)?,
-            received: [0; 8],
-            finished: [false; 8],
+            identity,
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }
@@ -179,15 +183,13 @@ impl V41Tp4ChunkReceiver {
         } else {
             EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN
         };
-        let identity = V41Tp4Planes::from_header_ranks(&request.header, executors)?;
-        ensure!(
-            max_frame_bytes >= header_bytes + identity.output_row_bytes as usize + 4,
-            "response frame cannot fit one native token row"
-        );
+        let mut identity = V41Tp4Planes::from_header_ranks(&request.header, executors)?;
+        identity.set_partial_plan(request.partial.as_ref())?;
+        identity.check_frame_budget(max_frame_bytes, header_bytes)?;
         Ok(Self {
             identity,
-            received: [0; 8],
-            finished: [false; 8],
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }
@@ -227,8 +229,8 @@ impl V41Tp4ChunkReceiver {
         );
         Ok(Self {
             identity: V41Tp4Planes::from_header_ranks(&request.header, executors)?,
-            received: [0; 8],
-            finished: [false; 8],
+            received: [0; cuteafd_core::MAX_SPARK_WORLD],
+            finished: [false; cuteafd_core::MAX_SPARK_WORLD],
             max_frame_bytes,
         })
     }
@@ -307,8 +309,8 @@ impl V41Tp4ChunkReceiver {
             "GPU-landed response must contain the entire plane"
         );
         ensure!(
-            h.output_payload_bytes
-                == u64::from(h.row_count) * u64::from(self.identity.output_row_bytes),
+            h.output_payload_bytes == self.identity.partial_payload_bytes
+                .unwrap_or(u64::from(h.row_count) * u64::from(self.identity.output_row_bytes)),
             "native payload size mismatch"
         );
         self.received[rank] = h.row_count;

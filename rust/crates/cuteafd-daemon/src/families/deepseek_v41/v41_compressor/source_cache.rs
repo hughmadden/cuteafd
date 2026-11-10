@@ -1,9 +1,10 @@
 //! Paired index/FP4 KV pages of one compressed source. The prefix engine owns the pages
 //! (`cuteafd_engine::prefix::RefPagePool`, one 512-token unit = one page of each ratio-two source
-//! and two of the ratio-one source); a request slot's page table is bound once, at admission, to
-//! the units of its whole lifetime (`bind`), so appends only publish rows inside bound pages:
-//! no allocation, copy-on-write or reservation happens on the decode path. Rows past a slot's
-//! committed length are its own; shared pages hold only rows below every sharer's length.
+//! and two of the ratio-one source); a request slot's page table is bound at admission to the
+//! units of its reservation and extended at drained boundaries when decode tops it up (`bind`),
+//! so appends only publish rows inside bound pages: no allocation, copy-on-write or reservation
+//! happens inside a decode round. Rows past a slot's committed length are its own; shared pages
+//! hold only rows below every sharer's length.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Kv};
@@ -40,11 +41,13 @@ pub(crate) struct SourceCache<'a> {
     page_table: DeviceAllocation<'a>,
     lengths: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: the previous upload of `staging` ran.
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     stride: usize,
     /// Physical pages bound to each slot, in row order; rows below `rows` are initialized.
-    pages: [Vec<u32>; 16],
-    rows: [usize; 16],
-    writing: Rc<std::cell::Cell<u16>>,
+    pages: [Vec<u32>; cuteafd_core::V41_MAX_REQUESTS],
+    rows: [usize; cuteafd_core::V41_MAX_REQUESTS],
+    writing: Rc<std::cell::Cell<u64>>,
     pub(super) replica: Option<replica::SourceCacheReplica<'a>>,
 }
 /// An append transaction over bound pages: the new committed length of each participating
@@ -54,8 +57,8 @@ pub(super) struct IndexPlan {
     guard: Option<WriteGuard>,
 }
 struct WriteGuard {
-    flags: Rc<std::cell::Cell<u16>>,
-    mask: u16,
+    flags: Rc<std::cell::Cell<u64>>,
+    mask: u64,
 }
 impl Drop for WriteGuard {
     fn drop(&mut self) {
@@ -94,7 +97,7 @@ impl<'a> SourceCache<'a> {
             (1..=262144).contains(&pages),
             "invalid index pool page count"
         );
-        ensure!((1..=16).contains(&slots), "invalid index slot count");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots), "invalid index slot count");
         Ok(pages * PAGE_ROWS * SOURCE_ROW_BYTES + slots * (pages.min(4096) * 4 + 8))
     }
     pub fn new(library: &'a NativeLibrary, pages: usize, slots: usize) -> Result<Self> {
@@ -105,6 +108,7 @@ impl<'a> SourceCache<'a> {
             page_table: DeviceAllocation::new(library, slots * pages.min(4096) * 4)?,
             lengths,
             staging: HostAllocation::new(library, slots * 8)?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 compressor source lengths", 1),
             stride: pages.min(4096),
             packed: DeviceAllocation::new(library, pages * PAGE_ROWS * 64)?,
             scales: DeviceAllocation::new(library, pages * PAGE_ROWS * 4)?,
@@ -112,7 +116,7 @@ impl<'a> SourceCache<'a> {
             kv_scales: DeviceAllocation::attention_plane(library, pages * PAGE_ROWS, KV_SCALES, "compressed cache scales")?,
             capacity: pages * PAGE_ROWS,
             pages: std::array::from_fn(|_| vec![]),
-            rows: [0; 16],
+            rows: [0; cuteafd_core::V41_MAX_REQUESTS],
             writing: Default::default(),
             replica: None,
         })
@@ -199,15 +203,6 @@ impl<'a> SourceCache<'a> {
         self.rows[slot] = rows;
         Ok(())
     }
-    /// Drop the unwritten tail of a slot's binding: `pages` is a prefix of its pages that still
-    /// holds its committed `rows`. Device page-table entries past it are never read again.
-    pub fn shrink(&mut self, slot: usize, pages: &[u32], rows: usize) -> Result<()> {
-        self.ensure_idle(slot)?;
-        ensure!(self.pages[slot].starts_with(pages) && rows == self.rows[slot] && rows <= pages.len() * PAGE_ROWS,
-            "shrunk source binding must keep the slot's committed rows");
-        self.pages[slot].truncate(pages.len());
-        Ok(())
-    }
     /// Pages bound to `slot` and its initialized rows.
     pub fn binding(&self, slot: usize) -> (&[u32], usize) {
         (&self.pages[slot], self.rows[slot])
@@ -252,7 +247,11 @@ impl<'a> SourceCache<'a> {
     pub unsafe fn upload(&mut self, plan: &IndexPlan, stream: *mut c_void) -> Result<()> {
         self.validate_plan(plan)?;
         let (library, lengths) = (self.lengths.library, self.lengths.buffer);
-        unsafe { upload_lengths(library, lengths, plan, self.staging.bytes_mut(), stream) }
+        self.staging_check.before_write(0)?;
+        unsafe {
+            upload_lengths(library, lengths, plan, self.staging.bytes_mut(), stream)?;
+            self.staging_check.uploaded(0, stream)
+        }
     }
     /// # Safety
     /// Same publication ordering as upload. Staging belongs to the producer and
@@ -273,7 +272,7 @@ impl<'a> SourceCache<'a> {
     pub fn reserve(&self, appends: &[(usize, usize, usize)]) -> Result<IndexPlan> {
         let slots = self.slots();
         let mut plan = plan_appends(&self.pages[..slots], &self.rows[..slots], self.writing.get(), appends)?;
-        let mask = appends.iter().fold(0u16, |mask, &(slot, _, _)| mask | 1 << slot);
+        let mask = appends.iter().fold(0u64, |mask, &(slot, _, _)| mask | 1 << slot);
         self.writing.set(self.writing.get() | mask);
         plan.guard = Some(WriteGuard { flags: self.writing.clone(), mask });
         Ok(plan)
@@ -298,10 +297,10 @@ impl<'a> SourceCache<'a> {
 
 /// Validate `appends` (`(slot, old rows, new rows)`) against the bound `tables`: an append
 /// writes only rows past the slot's committed length and inside its bound pages.
-fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u16, appends: &[(usize, usize, usize)])
+fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u64, appends: &[(usize, usize, usize)])
     -> Result<IndexPlan> {
     let mut plan = IndexPlan { lengths: vec![], guard: None };
-    let mut seen = [false; 16];
+    let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
     for (position, &(slot, old, new)) in appends.iter().enumerate() {
         ensure!(
             slot < tables.len() && !seen[slot],
@@ -318,14 +317,27 @@ fn plan_appends(tables: &[Vec<u32>], rows: &[usize], writing: u16, appends: &[(u
     Ok(plan)
 }
 
+pub(super) fn commit_staging_bytes(unit: usize) -> usize {
+    unit * 4 + cuteafd_core::V41_MAX_REQUESTS * 8
+}
+
+fn stage_lengths(plan: &IndexPlan, staging: &mut [u8]) -> Result<()> {
+    ensure!(plan.lengths.len() <= cuteafd_core::V41_MAX_REQUESTS
+        && plan.lengths.iter().all(|&(slot, _)| slot < cuteafd_core::V41_MAX_REQUESTS),
+        "invalid source metadata request count");
+    ensure!(staging.len() >= plan.lengths.len() * 8, "source metadata staging too small");
+    for (dst, &(_, rows)) in staging.chunks_exact_mut(8).zip(&plan.lengths) {
+        dst.copy_from_slice(&rows.to_ne_bytes());
+    }
+    Ok(())
+}
+
 unsafe fn upload_lengths(library: &NativeLibrary, lengths: CuteafdDeviceBuffer, plan: &IndexPlan,
     staging: &mut [u8], stream: *mut c_void) -> Result<()> {
-    ensure!(staging.len() >= plan.lengths.len() * 8, "source metadata staging too small");
-    for (i, &(slot, rows)) in plan.lengths.iter().enumerate() {
-        let staging = &mut staging[i * 8..i * 8 + 8];
-        staging.copy_from_slice(&rows.to_ne_bytes());
+    stage_lengths(plan, staging)?;
+    for (i, &(slot, _)) in plan.lengths.iter().enumerate() {
         unsafe {
-            library.copy_h2d_async(slice(lengths, slot * 8, 8), staging, stream)?;
+            library.copy_h2d_async(slice(lengths, slot * 8, 8), &staging[i * 8..i * 8 + 8], stream)?;
         }
     }
     Ok(())
@@ -400,6 +412,29 @@ mod tests {
     }
 
     #[test]
+    fn source_metadata_staging_covers_c64_and_short_units() -> Result<()> {
+        for count in [1, 16, 33, 64] {
+            let tables = vec![vec![0]; count];
+            let rows = vec![0; count];
+            let appends: Vec<_> = (0..count).map(|slot| (slot, 0, slot + 1)).collect();
+            let plan = plan_appends(&tables, &rows, 0, &appends)?;
+            for unit in [count, 2752] {
+                let capacity = commit_staging_bytes(unit);
+                let mut bytes = vec![0xa5; capacity + 16];
+                stage_lengths(&plan, &mut bytes[..capacity])?;
+                let expected: Vec<_> = (1..=count as u64).flat_map(u64::to_ne_bytes).collect();
+                assert_eq!(&bytes[..count * 8], &expected);
+                assert!(bytes[count * 8..].iter().all(|&b| b == 0xa5));
+            }
+            let mut short = vec![0xa5; count * 8 - 1];
+            assert!(stage_lengths(&plan, &mut short).is_err());
+            assert!(short.iter().all(|&b| b == 0xa5));
+        }
+        let invalid = IndexPlan { lengths: vec![(64, 1)], guard: None };
+        assert!(stage_lengths(&invalid, &mut [0; 512]).is_err());
+        Ok(())
+    }
+    #[test]
     fn appends_stay_inside_bound_pages_and_never_overlap() {
         let tables = [vec![3, 7], vec![3, 9]];
         let plan = plan_appends(&tables, &[300, 256], 0, &[(0, 300, 512), (1, 256, 400)]).unwrap();
@@ -452,4 +487,13 @@ mod tests {
         assert_eq!(cache.binding(1), (&[][..], 0));
         Ok(())
     }
+}
+
+#[cfg(test)]
+#[test]
+fn source_append_reservation_covers_slot_63() {
+    let tables = vec![vec![0]; cuteafd_core::V41_MAX_REQUESTS];
+    let rows = vec![0; cuteafd_core::V41_MAX_REQUESTS];
+    assert!(plan_appends(&tables, &rows, 0, &[(63, 0, 1)]).is_ok());
+    assert!(plan_appends(&tables, &rows, 1u64 << 63, &[(63, 0, 1)]).is_err());
 }

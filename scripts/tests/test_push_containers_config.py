@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from launcher_sandbox import copy_launcher_shared_inputs
+
 REPO = Path(__file__).resolve().parents[2]
 PUSH = REPO / "push-containers.sh"
 DEFAULT_CONFIG = REPO / "cuteafd.config"
@@ -146,10 +148,11 @@ def harness(tmp_path):
     revision_repo = tmp_path / "revision"
     (revision_repo / "scripts/bench").mkdir(parents=True)
     shutil.copytree(REPO / "scripts/lib", revision_repo / "scripts/lib", ignore=shutil.ignore_patterns('__pycache__'))
+    copy_launcher_shared_inputs(REPO, revision_repo)
     (revision_repo / "examples/configs").mkdir(parents=True)
     shutil.copyfile(config, revision_repo / "examples/configs/fixture.config")
     shutil.copyfile(config, revision_repo / "cuteafd.config")
-    shutil.copyfile(matrix, revision_repo / "scripts/bench/release-smoke-v3.json")
+    shutil.copyfile(matrix, revision_repo / "scripts/bench/release-smoke-v4.json")
     subprocess.run(["git", "init", "-q", str(revision_repo)], check=True)
     subprocess.run(["git", "-C", str(revision_repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(revision_repo), "-c", "user.name=Fixture", "-c",

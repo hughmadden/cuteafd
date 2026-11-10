@@ -21,6 +21,7 @@ pub(crate) mod v41_index_selection;
 pub(crate) mod graph_policy;
 pub(crate) mod v41_native_serve;
 pub(crate) mod v41_golden;
+pub(crate) mod v41_peer_push;
 pub(crate) mod v41_projection_tp2;
 pub(crate) mod v41_requests;
 pub(crate) mod v41_shared_ffn;
@@ -32,3 +33,8 @@ pub(crate) mod v41_tensors;
 pub(crate) mod v41_vision;
 pub(crate) mod v41_vision_encoder;
 pub(crate) mod v41_window;
+#[cfg(test)]
+#[path = "coordinator_golden_tests.rs"]
+mod coordinator_golden_tests;
+#[cfg(test)]
+mod scale_code_golden_tests;

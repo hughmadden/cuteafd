@@ -10,59 +10,60 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::checkpoint::read_json;
+use super::Family;
 use super::format::{
     BlockScale, Encoding, RowTiling, ScaleDirection, ScaleEncoding, TrellisCodebook,
 };
 
 pub mod residency;
+pub mod dense;
+pub mod native;
+mod workspace;
+pub use workspace::{execution_workspace, routed_workspace, shared_workspace, ExecutionVariant, ExecutionWorkspace};
 
 /// Native selection is distinct from the ordinary GLM launch description.
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeSelection {
     pub manifest: String,
     pub set_id: String,
-    pub dense_from: String,
+}
+
+/// Native EXLR8 trellis prefill activations: BF16 (A16, default) or MXFP8 with
+/// per-row per-K32 E8M0 scales (A8, ABI version 2 lane records). Decode and
+/// verify always keep A16. Shared by the engine launch flag and `cuteafd plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillActivations {
+    #[default]
+    A16,
+    A8,
+}
+
+impl PrefillActivations {
+    pub const fn label(self) -> &'static str {
+        match self { Self::A16 => "a16", Self::A8 => "a8" }
+    }
+}
+
+impl std::fmt::Display for PrefillActivations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported EXLR8 prefill activations {0:?}: expected a16 or a8")]
+pub struct PrefillActivationsError(String);
+
+impl std::str::FromStr for PrefillActivations {
+    type Err = PrefillActivationsError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value { "a16" => Ok(Self::A16), "a8" => Ok(Self::A8), _ => Err(PrefillActivationsError(value.into())) }
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct SparkRequirements {
     pub resident_bytes_per_rank: Vec<u64>,
     pub k1_workspace: &'static str,
-}
-
-/// Metadata-only execution arena; allocation uses the same checked layout helper.
-pub fn shared_workspace(manifest: &Value) -> Result<u64> {
-    let programs = manifest["programs"].as_array().context("PROGRAMS.json programs must be an array")?;
-    let entry = |name: &str| -> Result<&Value> {
-        let matches = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
-        ensure!(matches.len() == 1, "PROGRAMS.json requires one {name}");
-        Ok(matches[0])
-    };
-    let group = entry("exlr8_shared_group")?;
-    ensure!(group["geometry"]["abi_version"] == 2 && group["capacity_rows"] == 64
-        && group["geometry"]["experts"] == 1 && group["geometry"]["top_k"] == 1
-        && group["geometry"]["max_groups"] == 4
-        && group["geometry"]["hidden"] == 6144
-        && group["geometry"]["input_format"] == "bf16"
-        && group["geometry"]["input_row_bytes"] == 12288
-        && group["geometry"]["ctas_per_sm"] == 4
-        && group["geometry"]["ingress_warps"] == 8, "EXLR8 shared grouping geometry differs");
-    let spec = entry("exlr8_shared_a16_serving")?;
-    ensure!(spec["geometry"]["abi_version"] == 3 && spec["capacity_rows"].as_u64() == Some(64),
-        "EXLR8 shared workspace requires ABI v3 and 64-row capacity");
-    let n = |group: &str, key: &str| -> Result<usize> {
-        usize::try_from(spec[group][key].as_u64().with_context(|| format!("EXLR8 missing {group}.{key}"))?)
-            .context("EXLR8 metadata exceeds address space")
-    };
-    ensure!(n("geometry", "hidden")? == 6144 && n("geometry", "top_k")? == 1
-        && n("geometry", "units")? == 16 && n("geometry", "max_groups")? == 4,
-        "EXLR8 shared geometry must be hidden6144/top1/units16/groups4");
-    let scratch = [n("scratch_bytes_at_capacity", "fc1")?,
-        n("scratch_bytes_at_capacity", "intermediate")?, n("scratch_bytes_at_capacity", "fc2")?];
-    ensure!(scratch == [6_291_456, 262_144, 1_572_864],
-        "EXLR8 shared scratch capacities differ from the native ABI");
-    Ok(residency::execution_workspace_layout(64, 64, 16, n("geometry", "hidden")?, n("geometry", "top_k")?,
-        n("geometry", "max_groups")?, scratch[0], scratch[1], scratch[2], residency::ExpertSet::Shared)?.1 as u64)
 }
 
 pub struct NativePlan {
@@ -72,95 +73,262 @@ pub struct NativePlan {
 }
 
 /// Full-forward native admission, deliberately narrower than format inventory.
-pub fn native_plan(snapshot: &Path, selected: &str, dense: &Path,
+pub fn native_plan(snapshot: &Path, selected: &str,
+    options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
+    native_request(selected, options, speculator)?;
+    super::PlanInput::open(snapshot)?.exlr8_native_plan(selected, options, speculator)
+}
+
+fn native_request(selected: &str, options: &super::PlanOptions, speculator: &str)
+    -> Result<(usize, usize, super::layout::LayoutOptions)> {
+    use super::ExpertPlacement;
+    ensure!(!selected.is_empty() && selected.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+        "EXLR8 manifest must be a published name, not a path");
+    let world = match options.placement {
+        ExpertPlacement::Sparks { ranks } if (1..=8).contains(&ranks) => ranks,
+        ExpertPlacement::Local => 0,
+        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=8 ranks or local experts"),
+    };
+    ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
+    let mut layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
+    // Both native families have the same explicit capacity; defaults resolve after detection.
+    if layout.concurrency != 0 { cuteafd_core::concurrency::validate("EXLR8", layout.concurrency)?; }
+    let gpu_count = layout.rtx_bytes.len();
+    ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
+    ensure!(!layout.host_embedding, "EXLR8 requires GPU embedding");
+    layout.force_gpu_embedding = true;
+    Ok((world, gpu_count, layout))
+}
+
+fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str, family: &str)
+    -> Result<(usize, usize, crate::placement::AttentionPlacement, super::layout::LayoutOptions)> {
+    let (world, gpu_count, mut layout) = native_request(selected, options, speculator)?;
+    ensure!(matches!(family, "glm5" | "glm5_flash"), "unsupported EXLR8 native family {family}");
+    let concurrency = layout.resolved_concurrency(family);
+    cuteafd_core::concurrency::validate(family, concurrency)?;
+    if layout.mimo_prefix_entries == u64::MAX {
+        layout.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
+    }
+    layout.glm5_drafter_disabled = speculator == "off";
+    layout.glmf_drafter_disabled = speculator == "off";
+    let default_attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
+        else { crate::placement::AttentionPlacement::Heads };
+    let attention = options.attention_placement.unwrap_or(default_attention);
+    if family == "glm5" {
+        ensure!(world > 0, "GLM EXLR8 native deployment requires canonical Sparks with 1..=8 ranks");
+        ensure!(attention == default_attention,
+            "EXLR8 native deployment with {gpu_count} RTX GPUs requires {default_attention} attention");
+    } else {
+        ensure!(gpu_count == 2 || attention == crate::placement::AttentionPlacement::Heads,
+            "Flash EXLR8 {attention} attention requires two RTX GPUs");
+    }
+    Ok((world, gpu_count, attention, layout))
+}
+
+pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     options: &super::PlanOptions, speculator: &str) -> Result<NativePlan> {
     use super::{ExpertPlacement, Status, RuntimeStatus, spec::Component};
-    ensure!(matches!(selected, "up1" | "bit325"), "EXLR8 native manifest must be up1 or bit325");
-    let world = match options.placement {
-        ExpertPlacement::Sparks { ranks } if (1..=6).contains(&ranks) => ranks,
-        _ => anyhow::bail!("EXLR8 native deployment requires canonical Sparks with 1..=6 ranks"),
-    };
-    ensure!(speculator == "off", "EXLR8 native deployment requires --speculator off");
-    ensure!(matches!(options.attention_placement, None | Some(crate::placement::AttentionPlacement::Context)),
-        "EXLR8 native deployment requires context attention");
-    let layout = options.layout.as_ref().context("EXLR8 native deployment requires --layout")?;
-    ensure!(layout.rtx_bytes.len() == 2, "EXLR8 native deployment requires two RTX GPUs");
-    ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
-        && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
-        "EXLR8 native deployment cannot onboard routed experts");
-    ensure!(!layout.host_embedding && layout.drafter_bytes == 0, "EXLR8 requires GPU embedding and no drafter");
-    validate_dense_source(snapshot, dense)?;
-    let checkpoint = super::Checkpoint::coordinator(dense, false, false)?;
-    ensure!(checkpoint.config["quantization_config"]["quant_method"] == "fp8"
-        && checkpoint.config["quantization_config"]["weight_block_size"] == serde_json::json!([128,128]),
-        "EXLR8 dense source requires official compatible GLM-5.3 block-FP8 [128,128]");
-    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
-    ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
-        "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
-    let (_, set_id) = manifest_identity(snapshot, selected)?;
-    let mut shared = vec![0u64; 2];
-    let mut residents = vec![0u64; world];
-    for layer in cfg.first_moe_layer..cfg.layers {
-        for (rank, resident) in shared.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, 2, rank, residency::ExpertSet::Shared)?;
-            *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 shared residency overflow")?;
-        }
-        for (rank, resident) in residents.iter_mut().enumerate() {
-            let plan = residency::Residency::plan(snapshot, selected, layer, world, rank, residency::ExpertSet::Routed)?;
-            *resident = resident.checked_add(plan.resident_bytes as u64).context("EXLR8 routed residency overflow")?;
-        }
+    let checkpoint = input.checkpoint();
+    let family = super::family::detect(checkpoint).context("EXLR8 family is not recognized")?;
+    let (world, gpu_count, attention, mut resolved_layout) = native_options(selected, options, speculator, family.id())?;
+    let model = family.open(checkpoint)?;
+    let (layers, first_moe_layer, kernels) = native::family_geometry(&checkpoint.config)?;
+    let snapshot = &checkpoint.snapshot;
+    let mut report = super::empty_report(input, options)?;
+    report.family = Some(family.id().into());
+    report.spec = Some(model.spec().clone());
+    report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    if family.id() == "glm5" {
+        super::layout::resolve_prefill(input, &mut report, &mut resolved_layout, world, family.prefill_limits())?;
     }
-    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
-        "EXLR8 routed resident bytes exceed Spark budget before live workspace admission");
-    let programs = read_json(layout.workspace_manifest.as_deref()
+    let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
+    let metadata = residency::MetadataInput::open(snapshot, selected)?;
+    let set_id = metadata.identity.clone();
+    let shared = shared_expert_resident(&metadata, &(first_moe_layer..layers).collect::<Vec<_>>(), gpu_count)?;
+    let programs = read_json(resolved_layout.workspace_manifest.as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/share/PROGRAMS.json")))?;
-    let workspace = shared_workspace(&programs)?;
-    let (memory, placement) = super::layout::glm5::native_layout(&checkpoint, layout, &shared, workspace, world, &programs)?;
-    let mut dense_options = options.clone();
-    dense_options.layout = None;
-    // This pass classifies dense operands only; native_layout already admitted context TP2.
-    dense_options.attention_placement = None;
-    dense_options.draft_ownership = Some(super::spec::DraftOwnership::selected("glm5", "off"));
-    let mut report = super::plan(dense, &dense_options)?;
-    ensure!(report.config_error.is_none() && report.unclassified.is_empty()
-        && report.missing_shards.is_empty(), "EXLR8 dense source is not fully recognized: {:?}", report.hints);
-    for component in &mut report.components {
-        if matches!(component.component, Component::RoutedExpert | Component::SharedExpert) {
-            component.status = Status::Planned;
-            component.rejected = 0;
-            component.rejections.clear();
-            component.bytes = if component.component == Component::SharedExpert { shared.iter().sum() } else { residents.iter().sum() };
-            component.formats = BTreeMap::from([("exlr8".into(), component.tensors)]);
+    let records = dense::DenseRecord::inventory(snapshot)?;
+    let selection = dense::DenseSelection::from_hf(&checkpoint.config)?;
+    let backbone = selection.backbone(&records, layers)?;
+    let plans = (0..gpu_count).map(|rank| dense::DensePlan::for_rank(&backbone, gpu_count, rank))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let activations = dense::programs::resolve_activations(&programs, &checkpoint.config, &records,
+        layers, &plans, resolved_layout.exlr8_prefill_pin, resolved_layout.exlr8_prefill_activations)?;
+    ensure!(activations == resolved_layout.exlr8_prefill_activations,
+        "EXLR8 resolved activation differs from requested layout charge");
+    let workspace = shared_workspace(&programs, kernels)?;
+    let facts = native::DenseFacts::new(records, selection, layers, shared)?;
+    drop(catalog_timer);
+    let (memory, placement) = {
+        let _timer = super::PhaseTimer::new(&input.phases.layout, &[]);
+        if family.id() == "glm5_flash" {
+            let memory = super::layout::glm5_flash::native_layout(&mut report, model.as_ref(), input,
+                &mut resolved_layout, &facts, &metadata)?;
+            let placement = report.solver_placement.clone().context("Flash EXLR8 native placement was refused")?;
+            (memory, placement)
+        } else {
+            super::layout::glm5::native_layout_with_metadata(checkpoint, &resolved_layout, &facts.shared_bytes,
+                workspace, world, &programs, Some(selected), Some(&metadata))?
+        }
+    };
+    let layout = &resolved_layout;
+    let catalog_timer = super::PhaseTimer::new(&input.phases.catalog, &[]);
+    let first_spark = first_moe_layer + placement.onboard_layers;
+    let selected_world = if first_spark == layers { 0 } else { world };
+    let residents = spark_resident_bytes_of(&metadata, &(first_spark..layers).collect::<Vec<_>>(), selected_world)?;
+    ensure!(residents.iter().all(|&bytes| bytes <= options.spark_budget()),
+        "EXLR8 selected Spark suffix exceeds Spark budget before live workspace admission");
+    let mut local_routed = 0u64;
+    for layer in first_moe_layer..first_spark {
+        for rank in 0..gpu_count {
+            local_routed = local_routed.checked_add(metadata.plan(
+                layer, gpu_count, rank, residency::ExpertSet::Routed)?.resident_bytes as u64)
+                .context("EXLR8 local routed residency overflow")?;
         }
     }
-    ensure!(report.components.iter().filter(|c| !matches!(c.component, Component::RoutedExpert | Component::SharedExpert))
-        .all(|c| matches!(c.status, Status::Ready | Status::Unused | Status::Disabled)),
-        "EXLR8 dense source has unsupported coordinator operands");
+    drop(catalog_timer);
+    report.family = Some(family.id().into());
+    report.exlr8_prefill_activations = Some(resolved_layout.exlr8_prefill_activations);
+    report.spec = Some(model.spec().clone());
+    report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    if let Some(cache) = report.cache_requirements.as_mut() {
+        let concurrency = layout.resolved_concurrency(family.id());
+        cache.concurrency = u32::try_from(concurrency)?;
+        cache.state_slots = u32::try_from(layout.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
+    }
+    let mut components = BTreeMap::<Component, (usize, u64)>::new();
+    for record in &facts.records {
+        let role = family.classify(model.spec(), &record.tensor)
+            .with_context(|| format!("unclassified EXLR8 dense operand {}", record.tensor))?;
+        let entry = components.entry(role.component).or_default();
+        entry.0 += 1;
+        entry.1 = entry.1.checked_add(record.components.iter().map(|c| c.source.bytes as u64).sum())
+            .context("EXLR8 dense component bytes overflow")?;
+    }
+    for (component, bytes) in [(Component::SharedExpert, facts.shared_bytes.iter().sum()),
+        (Component::RoutedExpert, residents.iter().sum::<u64>())] {
+        let count = if component == Component::RoutedExpert { layers - first_spark }
+            else { layers - first_moe_layer };
+        components.insert(component, (count, bytes));
+    }
+    report.components = components.into_iter().map(|(component, (tensors, bytes))| super::ComponentPlan {
+        component, owner: if component == Component::RoutedExpert { super::Owner::SparkSliced }
+            else { super::Owner::Rtx }, tensors, bytes, formats: BTreeMap::from([("exlr8".into(), tensors)]),
+        status: Status::Ready, rejected: 0, rejections: Vec::new(),
+    }).collect();
+    if placement.onboard_layers > 0 {
+        report.components.push(super::ComponentPlan { component: Component::RoutedExpert,
+            owner: super::Owner::Rtx, tensors: placement.onboard_layers, bytes: local_routed,
+            formats: BTreeMap::from([("exlr8".into(), placement.onboard_layers)]),
+            status: Status::Ready, rejected: 0, rejections: Vec::new() });
+    }
     report.snapshot = snapshot.display().to_string();
-    report.runtime = Some(RuntimeStatus::Planned);
-    report.native_serving_admitted = true;
-    report.placement_supported = true;
-    report.fits = true;
-    report.attention_placement = crate::placement::AttentionPlacement::Context;
-    report.prefill_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
-    report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
-        spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
-    report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
-        how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() }];
-    report.min_spark_ranks = Some(world);
-    report.spark_ranks = world;
+    let execution = family.exlr8_execution().check(gpu_count, placement.onboard_layers > 0);
+    let adapter_ready = execution.is_ok();
+    report.runtime = Some(if adapter_ready { RuntimeStatus::Serving } else { RuntimeStatus::Planned });
+    report.native_serving_admitted = adapter_ready;
+    report.placement_supported &= adapter_ready;
+    report.attention_placement = attention;
+    let package = if family.id() == "glm5_flash" { "glmf:exlr8" } else { "glm:exlr8" };
+    report.experts = Some(super::family::ExpertContract { package: package.into(), block: 128,
+        spark_worlds: (1..=8).collect(), local: Ok(format!("{package} coordinator native experts")) });
+    if adapter_ready {
+        report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
+            how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
+    } else if let Err(error) = execution { report.hints.push(error.hint()); }
+    report.placement = if selected_world == 0 { ExpertPlacement::Local }
+        else { ExpertPlacement::Sparks { ranks: selected_world } };
+    report.min_spark_ranks = Some(selected_world);
+    report.spark_ranks = selected_world;
     report.spark_rank_share = residents.iter().copied().max().unwrap_or(0) as f64
         / residents.iter().sum::<u64>().max(1) as f64;
-    report.bytes_by_owner = BTreeMap::from([(format!("spark x{world}"), residents.iter().sum()),
+    report.bytes_by_owner = BTreeMap::from([(format!("spark x{selected_world}"), residents.iter().sum()),
         ("rtx".into(), memory.devices.iter().flat_map(|d| &d.items)
             .filter(|i| matches!(i.category, cuteafd_core::memory_layout::Category::Weights
-                | cuteafd_core::memory_layout::Category::Embedding)).map(|i| i.bytes).sum())]);
+                | cuteafd_core::memory_layout::Category::Embedding | cuteafd_core::memory_layout::Category::Experts)).map(|i| i.bytes).sum())]);
+    let mut memory = memory;
+    append_spark_devices(&mut memory, layout, &residents);
     report.memory_layout = Some(memory);
     report.solver_placement = Some(placement);
-    super::layout::charge_host(&mut report, layout, &checkpoint, true)?;
-    Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id,
-        dense_from: dense.display().to_string() }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
+    {
+        let _timer = super::PhaseTimer::new(&input.phases.admission, &[]);
+        super::layout::charge_host(&mut report, layout, input, true)?;
+    }
+    Ok(NativePlan { report, selection: NativeSelection { manifest: selected.into(), set_id }, sparks: SparkRequirements { resident_bytes_per_rank: residents,
         k1_workspace: "checked_by_worker_live_admission" } })
+}
+
+fn append_spark_devices(memory: &mut cuteafd_core::memory_layout::MemoryLayout,
+    layout: &super::layout::LayoutOptions, residents: &[u64]) {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
+    memory.devices.extend(residents.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {
+        kind: DeviceKind::Spark, index: rank as u32,
+        capacity_bytes: layout.spark_bytes, worker_budget_bytes: layout.spark_bytes,
+        items: vec![Item::new(Category::Experts, "routed_expert", "exlr8", bytes, Basis::Exact)],
+        kv_tokens: 0,
+    }));
+}
+
+fn served_routed_layers(input: &residency::MetadataInput, layers: &[usize]) -> Result<()> {
+    let config = input.config.get("text_config").unwrap_or(&input.config);
+    let first = number(config, "first_k_dense_replace")?;
+    let end = number(config, "num_hidden_layers")?;
+    ensure!(layers.iter().all(|&layer| (first..end).contains(&layer))
+        && layers.windows(2).all(|pair| pair[0] < pair[1]),
+        "EXLR8 target routed layers must be ordered backbone layers, excluding MTP");
+    Ok(())
+}
+
+/// Format-level native costs. Router ownership is a family fact, not part of an expert arena.
+pub fn routed_expert_costs(input: &residency::MetadataInput, layers: &[usize])
+    -> Result<Vec<crate::placement::ExpertCost>> {
+    use crate::placement::{Bytes2, ExpertCost};
+    use residency::ExpertSet;
+    served_routed_layers(input, layers)?;
+    layers.iter().map(|&layer| {
+        let resident = |world, rank| -> Result<Bytes2> {
+            Ok(Bytes2 { resident: u64::try_from(input.plan(layer, world, rank, ExpertSet::Routed)?.resident_bytes)?,
+                staging: 0 })
+        };
+        Ok(ExpertCost { whole: resident(1, 0)?, half: [resident(2, 0)?, resident(2, 1)?],
+            tp2: true, spark_ok: true })
+    }).collect()
+}
+
+/// Shared-expert arenas summed once per admitted target rank; never include native MTP.
+pub fn shared_expert_resident(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    served_routed_layers(input, layers)?;
+    ensure!(matches!(world, 1 | 2), "EXLR8 shared experts require one/two target ranks");
+    (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
+        let bytes = u64::try_from(input.plan(layer, world, rank, residency::ExpertSet::Shared)?.resident_bytes)?;
+        sum.checked_add(bytes).context("EXLR8 shared residency overflow")
+    })).collect()
+}
+
+/// Physical native residency for precisely the admitted Spark suffix.
+pub fn spark_resident_bytes(snapshot: &Path, selected: &str, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    if layers.is_empty() {
+        ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
+        return Ok(Vec::new());
+    }
+    spark_resident_bytes_of(&residency::MetadataInput::open(snapshot, selected)?, layers, world)
+}
+
+fn spark_resident_bytes_of(input: &residency::MetadataInput, layers: &[usize], world: usize) -> Result<Vec<u64>> {
+    if layers.is_empty() {
+        ensure!(world == 0, "EXLR8 empty Spark suffix must select zero ranks");
+        return Ok(Vec::new());
+    }
+    let config = input.config.get("text_config").unwrap_or(&input.config);
+    let extent = usize::try_from(config["num_hidden_layers"].as_u64().context("EXLR8 layer extent missing")?)?;
+    let first = usize::try_from(config["first_k_dense_replace"].as_u64().context("EXLR8 routed layer start missing")?)?;
+    ensure!((1..=8).contains(&world) && layers.first().is_some_and(|&layer| layer >= first)
+        && layers.last().copied() == extent.checked_sub(1)
+        && layers.windows(2).all(|pair| pair[0] + 1 == pair[1]), "EXLR8 selected Spark suffix/rank geometry");
+    (0..world).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
+        let bytes = input.plan(layer, world, rank, residency::ExpertSet::Routed)?.resident_bytes as u64;
+        sum.checked_add(bytes).context("EXLR8 Spark suffix residency overflow")
+    })).collect()
 }
 
 const FORMAT: &str = "exlr8-v2";
@@ -251,16 +419,17 @@ pub fn recognizes(snapshot: &Path) -> Result<bool> {
 
 /// Native header sources; payload shards are deliberately not scanned.
 pub(crate) fn catalog_headers(snapshot: &Path) -> Result<Vec<PathBuf>> {
-    let mut headers = files(snapshot, "dense")?;
+    let mut headers = dense::inventory_headers(snapshot)?.into_iter()
+        .map(|(path, _, _)| path).collect::<Vec<_>>();
     ensure!(!headers.is_empty(), "EXLR8 dense inventory is empty");
     let indices = files(snapshot, "experts")?.into_iter().filter(|path|
         path.file_name().and_then(|name| name.to_str()).is_some_and(|name|
             name.starts_with("exlr8-layer-") && name.ends_with(".index.safetensors")))
         .collect::<Vec<_>>();
     ensure!(!indices.is_empty(), "EXLR8 expert index inventory is empty");
+    for path in &indices { Header::open(path)?.validate()?; }
     headers.extend(indices);
     headers.sort();
-    for path in &headers { Header::open(path)?.validate()?; }
     Ok(headers)
 }
 
@@ -273,10 +442,11 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
     for path in catalog_headers(snapshot)? {
         let shard = path.strip_prefix(snapshot)?.to_str().context("non-UTF8 native shard")?.to_owned();
         shard_bytes = shard_bytes.checked_add(path.metadata()?.len()).context("native inventory overflow")?;
+        let native = Header::open(&path)?.value["__metadata__"]["format"] == FORMAT;
         for mut meta in crate::read_safetensors_metadata(&path)? {
-            // Local native names repeat across shards. Preserve their physical
-            // namespace instead of pretending these are HF weight tensors.
-            let name = format!("{shard}::{}", meta.name);
+            // Local native names repeat across shards; bundled plain vision
+            // keeps its qualified HF names for the shared encoder loader.
+            let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
             weight_map.insert(name.clone(), shard.clone());
             if needed(&name) {
                 meta.name = name;
@@ -291,6 +461,7 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
 
 /// Bundled draft layers come from native index headers, not HF name inference.
 pub(crate) fn draft_layers(snapshot: &Path, config: &Value) -> Result<Vec<usize>> {
+    let config = config.get("text_config").unwrap_or(config);
     let backbone = number(config, "num_hidden_layers")?;
     let stages = usize::try_from(config["num_nextn_predict_layers"].as_u64().unwrap_or(0))?;
     let first = number(config, "first_k_dense_replace")?;
@@ -423,6 +594,53 @@ impl Exlr8Plan {
     }
 }
 
+/// Expert geometry from the family's typed HF configuration reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertGeometry {
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub experts: usize,
+    /// Served backbone extent; MTP is validated separately, not charged to DFlash2.
+    pub layers: usize,
+    pub first: usize,
+    pub mtp_layers: usize,
+}
+
+impl ExpertGeometry {
+    pub fn from_hf(config: &Value) -> Result<Self> {
+        match architecture(config)? {
+            "glm5" => {
+                let cfg = crate::families::glm5::GlmDsaConfig::from_hf(config)?;
+                Ok(Self { hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
+                    experts: cfg.experts, layers: cfg.layers, first: cfg.first_moe_layer,
+                    mtp_layers: cfg.mtp_layers })
+            }
+            _ => {
+                let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(config)?;
+                let first = cfg.dense.iter().position(|&dense| !dense)
+                    .context("EXLR8 requires routed layers")?;
+                ensure!(cfg.dense[first..].iter().all(|&dense| !dense),
+                    "EXLR8 routed layers must follow the dense prefix");
+                let text = config.get("text_config").unwrap_or(config);
+                let mtp_layers = text.get("num_nextn_predict_layers")
+                    .map(|_| number(text, "num_nextn_predict_layers")).transpose()?.unwrap_or(0);
+                Ok(Self { hidden: cfg.hidden, intermediate: cfg.moe_intermediate,
+                    experts: cfg.experts, layers: cfg.layers, first, mtp_layers })
+            }
+        }
+    }
+}
+
+fn architecture(config: &Value) -> Result<&'static str> {
+    match config["architectures"].as_array().and_then(|a| {
+        (a.len() == 1).then(|| a[0].as_str()).flatten()
+    }) {
+        Some("GlmMoeDsaForCausalLM") => Ok("glm5"),
+        Some("Glm5NextForConditionalGeneration") => Ok("glm5_flash"),
+        _ => bail!("unsupported EXLR8 architecture {}", config["architectures"]),
+    }
+}
+
 fn number(config: &Value, key: &str) -> Result<usize> {
     usize::try_from(
         config[key]
@@ -439,6 +657,30 @@ fn files(snapshot: &Path, directory: &str) -> Result<Vec<PathBuf>> {
     files.retain(|path| path.extension().is_some_and(|ext| ext == "safetensors"));
     files.sort();
     Ok(files)
+}
+
+fn source_names(metadata: &Value) -> Result<Option<BTreeMap<String, String>>> {
+    metadata.get("source_names").map(|names| {
+        let names: BTreeMap<String, String> = serde_json::from_str(
+            names.as_str().context("EXLR8 source_names must be JSON text")?)?;
+        ensure!(names.values().all(|name| !name.is_empty()), "empty EXLR8 source name");
+        Ok(names)
+    }).transpose()
+}
+
+fn logical_name(metadata: &Value, sources: Option<&BTreeMap<String, String>>,
+    layer: Option<usize>, stem: &str, weight: bool) -> Result<String> {
+    if let Some(sources) = sources {
+        return sources.get(stem).cloned()
+            .with_context(|| format!("EXLR8 source_names lacks {stem}"));
+    }
+    let tail = if weight { format!("{stem}.weight") } else { stem.into() };
+    if tail.starts_with("model.") || tail == "lm_head.weight" { return Ok(tail); }
+    Ok(match layer {
+        Some(layer) => format!("{}{layer}.{tail}",
+            metadata["tensor_prefix"].as_str().unwrap_or("model.layers.")),
+        None => format!("model.{tail}"),
+    })
 }
 
 fn dense_operands(snapshot: &Path, layers: usize) -> Result<Vec<DenseOperand>> {
@@ -458,9 +700,7 @@ fn dense_operands(snapshot: &Path, layers: usize) -> Result<Vec<DenseOperand>> {
             .value
             .as_object()
             .context("header must be an object")?;
-        let prefix = metadata["tensor_prefix"]
-            .as_str()
-            .unwrap_or("model.layers.");
+        let sources = source_names(metadata)?;
         let rotations = metadata["rotations"]
             .as_str()
             .unwrap_or("attn_in,q_resid,mlp_in")
@@ -547,16 +787,7 @@ fn dense_operands(snapshot: &Path, layers: usize) -> Result<Vec<DenseOperand>> {
             } else {
                 None
             };
-            let tensor = layer.map_or_else(
-                || {
-                    if stem == "lm_head" {
-                        format!("{stem}.weight")
-                    } else {
-                        format!("model.{stem}.weight")
-                    }
-                },
-                |l| format!("{prefix}{l}.{stem}.weight"),
-            );
+            let tensor = logical_name(metadata, sources.as_ref(), layer, stem, true)?;
             operands.push(DenseOperand {
                 tensor,
                 shard: path.strip_prefix(snapshot)?.display().to_string(),
@@ -586,10 +817,7 @@ fn dense_operands(snapshot: &Path, layers: usize) -> Result<Vec<DenseOperand>> {
                 Some("F16") => Encoding::F16,
                 other => bail!("unsupported unrecorded dense tensor {name}: {other:?}"),
             };
-            let tensor = layer.map_or_else(
-                || format!("model.{name}"),
-                |l| format!("{prefix}{l}.{name}"),
-            );
+            let tensor = logical_name(metadata, sources.as_ref(), layer, name, false)?;
             let shape = serde_json::from_value(value["shape"].clone())?;
             operands.push(DenseOperand {
                 tensor,
@@ -622,6 +850,22 @@ struct Layer {
     widths: BTreeSet<usize>,
     shared_widths: BTreeSet<usize>,
 }
+/// Discover published manifest names; widths and TP1..8 byte inventory come from `inspect`.
+pub fn manifest_names(snapshot: &Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(snapshot.join("manifests"))? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str().and_then(|name| name.strip_prefix("exlr8-manifest-"))
+            .and_then(|name| name.strip_suffix(".json")) else { continue; };
+        manifest_identity(snapshot, name)?;
+        names.push(name.to_owned());
+    }
+    names.sort();
+    ensure!(!names.is_empty(), "EXLR8 checkpoint has no published manifests");
+    Ok(names)
+}
+
 pub(crate) fn manifest_identity(snapshot: &Path, name: &str) -> Result<(Value, String)> {
     use sha2::{Digest, Sha256};
     ensure!(!name.is_empty() && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
@@ -655,7 +899,7 @@ fn manifest(
         set_id.len() == 64 && set_id.bytes().all(|c| c.is_ascii_hexdigit()),
         "invalid EXLR8 set_id"
     );
-    let mut ranks = (1..=7)
+    let mut ranks = (1..=8)
         .map(|n| (n, vec![RankBytes::empty(); n]))
         .collect::<BTreeMap<_, _>>();
     let mut widths = BTreeMap::new();
@@ -767,27 +1011,20 @@ fn geometry(
         let header = Header::open(&path)?;
         header.validate()?;
         let metadata = &header.value["__metadata__"];
-        for (key, default) in [
-            ("hidden_size", 6144),
-            ("moe_intermediate_size", 2048),
-            ("n_routed_experts", 256),
-            ("num_hidden_layers", 78),
-            ("first_moe_layer", 3),
+        let text = config.get("text_config").unwrap_or(config);
+        for (key, expected) in [
+            ("hidden_size", hidden),
+            ("moe_intermediate_size", units * 128),
+            ("n_routed_experts", experts),
+            ("num_hidden_layers", number(text, "num_hidden_layers")?),
+            ("first_moe_layer", first),
         ] {
-            let expected = if key == "first_moe_layer" {
-                first
-            } else {
-                number(config, key)?
-            };
-            let declared = metadata[key]
-                .as_str()
-                .map(str::parse::<usize>)
-                .transpose()?
-                .unwrap_or(default);
-            ensure!(
-                declared == expected,
-                "EXLR8 geometry {key}: metadata {declared} != config {expected}"
-            );
+            if let Some(declared) = metadata.get(key) {
+                let declared = declared.as_str().context("EXLR8 geometry metadata must be a string")?
+                    .parse::<usize>()?;
+                ensure!(declared == expected,
+                    "EXLR8 geometry {key}: metadata {declared} != config {expected}");
+            }
         }
         ensure!(
             header.value["signs.in"]["shape"] == serde_json::json!([hidden])
@@ -874,90 +1111,21 @@ fn geometry(
     Ok(layers)
 }
 
-fn dense_source_members<'a>(
-    group: &BTreeMap<String, &'a super::checkpoint::CheckpointTensor>,
-    suffix: &str,
-) -> Result<BTreeMap<String, &'a super::checkpoint::CheckpointTensor>> {
-    ensure!(
-        group.contains_key(suffix),
-        "missing source tensor suffix {suffix}"
-    );
-    // Bias vectors have their own inventory rows; do not count them with weights
-    // or accidentally decode a sibling weight when replacing the bias row.
-    Ok(group
-        .iter()
-        .filter(|(key, _)| {
-            if suffix == "bias" {
-                key.as_str() == "bias"
-            } else {
-                key.as_str() != "bias"
-            }
-        })
-        .map(|(key, tensor)| (key.clone(), *tensor))
-        .collect())
-}
-
-/// Validate official dense replacement headers without running layout estimates or
-/// reading any expert payload. Serving and inspection share this exact contract.
-pub fn validate_dense_source(snapshot: &Path, source: &Path) -> Result<()> {
-    let config = read_json(&snapshot.join("config.json"))?;
-    let dense = dense_operands(snapshot, number(&config, "num_hidden_layers")?)?;
-    replacement_dense(&config, &dense, &super::Checkpoint::coordinator(source, false, false)?)?;
-    Ok(())
-}
-
-fn replacement_dense(config: &Value, dense: &[DenseOperand], original: &super::Checkpoint)
-    -> Result<Vec<DenseOperand>> {
-    // Identity/serialization metadata may differ; architecture equality alone is insufficient.
-    for (key, value) in config.as_object().context("config must be an object")? {
-        if key.starts_with('_') || ["quantization_config", "torch_dtype", "dtype",
-            "transformers_version", "base_model", "base_model_name_or_path"].contains(&key.as_str()) {
-            continue;
-        }
-        ensure!(original.config.get(key) == Some(value), "dense source architecture mismatch at {key}");
-    }
-    let groups = super::format::group_by_stem(&original.tensors);
-    dense.iter().map(|item| {
-        let (stem, suffix) = super::format::split_stem(&item.tensor);
-        let group = groups.get(stem).with_context(|| format!("dense source missing {stem}"))?;
-        let members = dense_source_members(group, suffix)
-            .with_context(|| format!("dense source missing {}", item.tensor))?;
-        let operand = super::format::detect(&members)?;
-        ensure!(operand.logical == item.shape, "dense source shape mismatch for {stem}");
-        Ok(DenseOperand {
-            tensor: item.tensor.clone(), shard: members.values().next().unwrap().shard.clone(),
-            encoding: operand.encoding, scale: operand.scale, shape: operand.logical,
-            bytes: members.values().map(|m| m.meta.byte_length).sum(),
-            sharded_side: item.sharded_side, channels_per_shard: item.channels_per_shard,
-            rotation: None, kernel: None,
-        })
-    }).collect()
-}
-
 pub fn inspect(
     snapshot: &Path,
     selected: &str,
-    dense_from: Option<&Path>,
     sparks: usize,
     rtx: usize,
     spark_budget: u64,
     coordinator_budget: u64,
 ) -> Result<Exlr8Plan> {
     ensure!(
-        (1..=2).contains(&rtx) && sparks <= 7,
-        "EXLR8 layout needs 1-2 RTX and 0-7 Sparks"
+        (1..=2).contains(&rtx) && sparks <= 8,
+        "EXLR8 layout needs 1-2 RTX and 0-8 Sparks"
     );
     let config = read_json(&snapshot.join("config.json"))?;
-    ensure!(
-        config["architectures"] == serde_json::json!(["GlmMoeDsaForCausalLM"]),
-        "unsupported EXLR8 architecture {}",
-        config["architectures"]
-    );
-    let hidden = number(&config, "hidden_size")?;
-    let intermediate = number(&config, "moe_intermediate_size")?;
-    let experts = number(&config, "n_routed_experts")?;
-    let count = number(&config, "num_hidden_layers")?;
-    let first = number(&config, "first_k_dense_replace")?;
+    let cfg = ExpertGeometry::from_hf(&config)?;
+    let ExpertGeometry { hidden, intermediate, experts, layers: count, first, .. } = cfg;
     ensure!(
         hidden > 0
             && hidden % 128 == 0
@@ -973,20 +1141,18 @@ pub fn inspect(
         hidden,
         intermediate / 128,
         experts,
-        count,
+        count.checked_add(cfg.mtp_layers).context("EXLR8 layer extent overflow")?,
         first,
     )?;
-    let mut dense = dense_operands(snapshot, count)?;
-    let dense_source = if let Some(source) = dense_from {
-        let original = super::Checkpoint::open(source)?;
-        dense = replacement_dense(&config, &dense, &original)?;
-        "official checkpoint config/headers (architecture matched)".to_owned()
-    } else {
-        "checkpoint native EXLR8 records (no BF16 conversion)".to_owned()
-    };
-    let mut names = BTreeSet::from([selected.to_string(), "bit325".into(), "up1".into()]);
+    // Validate checkpoint MTP records, but retain backbone-only serving fit bytes.
+    let layers = layers.into_iter().filter(|layer| layer.id < count).collect::<Vec<_>>();
+    let dense = dense_operands(snapshot, count)?;
+    let dense_source = "checkpoint native EXLR8 records (no BF16 conversion)".to_owned();
+    let names = manifest_names(snapshot)?;
+    ensure!(names.iter().any(|name| name == selected),
+        "EXLR8 selected manifest {selected:?} is absent; published manifests: {}", names.join(", "));
     let mut manifests = Vec::new();
-    for name in std::mem::take(&mut names) {
+    for name in names {
         manifests.push(manifest(
             snapshot,
             &name,
@@ -1004,7 +1170,7 @@ pub fn inspect(
     let mut fit = Vec::new();
     for manifest in &manifests {
         for rtx in 1..=2 {
-            for sparks in 0..=7 {
+            for sparks in 0..=8 {
                 let coordinator_bytes = dense_bytes + manifest.shared_bytes;
                 let rank_bytes = if sparks == 0 {
                     vec![]
@@ -1045,13 +1211,13 @@ pub fn inspect(
         }
     }
     Ok(Exlr8Plan { format:FORMAT.into(), scheme:SCHEME.into(), selected_manifest:selected.into(),
-        manifest_choice:"bit325 is the 3.25-bpw evaluation choice: checkpoint held-out KL 0.147 vs home 0.149; golden pending. up1 is the 4.0-bpw arm.".into(),
+        manifest_choice:"Published checkpoint manifests are independent width selections; no alias or synthesized mixed-width profile is applied.".into(),
         dense_source, dense, dense_bytes, manifests, fit, selected_weights_fit,
         missing_kernels:missing.into_iter().collect(), supported:false,
-        notes:vec!["Layer 78 MTP is unused (GLM DFlash2); shared experts remain on coordinator.".into(),
+        notes:vec![format!("{count} backbone layers and {} checkpoint MTP layers inventoried; DFlash2 serving does not execute MTP. Shared experts remain on coordinator.", cfg.mtp_layers),
             "Rank bytes = selected unit payloads + selected channel vectors + deduplicated projection/width block scales + signs. Index/checksum/error-table staging is not resident weight storage.".into(),
             "Fit is weight-only, not serving admission: no kernels, descriptors, KV, workspaces, graphs or drafter charged. Two-RTX coordinator bound replicates dense and splits shared experts.".into(),
-            "TP7 is an inventory-only format capability; current expert transport supports at most six Spark ranks.".into()] })
+            "TP1..8 inventory is supported; serving admission additionally requires native family adapters and published kernels.".into()] })
 }
 
 #[cfg(test)]
@@ -1059,6 +1225,38 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+
+    #[test]
+    fn native_min_max_worker_devices_preserve_residents_and_rtx_layout() {
+        use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            for budget in [108u64 << 30, 104u64 << 30] {
+                let layout = super::super::layout::LayoutOptions { spark_bytes: budget, ..Default::default() };
+                let mut memory = MemoryLayout { devices: (0..gpus).map(|index| DeviceLayout {
+                    kind: DeviceKind::Rtx, index, capacity_bytes: 96 << 30, worker_budget_bytes: 0,
+                    items: Vec::new(), kv_tokens: 262144,
+                }).collect(), pool_tokens: 262144, waste: Vec::new(), notes: Vec::new() };
+                let rtx = memory.devices.clone();
+                let residents = (0..ranks).map(|rank| (80 << 30) + rank as u64).collect::<Vec<_>>();
+                append_spark_devices(&mut memory, &layout, &residents);
+                assert_eq!(&memory.devices[..gpus as usize], rtx.as_slice());
+                assert_eq!(memory.pool_tokens, 262144);
+                for (rank, device) in memory.devices[gpus as usize..].iter().enumerate() {
+                    assert_eq!(device.index, rank as u32);
+                    assert_eq!(device.worker_budget_bytes, budget);
+                    assert_eq!(device.capacity_bytes, budget);
+                    assert_eq!(device.items.len(), 1);
+                    assert_eq!(device.items[0].bytes, residents[rank]);
+                }
+                let with_sparks = memory.clone();
+                append_spark_devices(&mut memory, &layout, &[]);
+                assert_eq!(memory, with_sparks);
+            }
+        }
+        let body = include_str!("exlr8.rs").split("pub(super) fn native_plan_of(").nth(1).unwrap()
+            .split("fn append_spark_devices(").next().unwrap();
+        assert!(body.contains("append_spark_devices(&mut memory, layout, &residents)"));
+    }
 
     fn write(path: &Path, metadata: Value, tensors: Vec<(&str, &str, Vec<usize>, Vec<u8>)>) {
         let mut header = serde_json::Map::new();
@@ -1084,64 +1282,51 @@ mod tests {
     }
 
     #[test]
-    fn native_shared_workspace_uses_published_scratch_and_checked_arena() {
-        let entry = json!({"name":"exlr8_shared_a16_serving", "capacity_rows":64,
-            "geometry":{"abi_version":3,"hidden":6144,"top_k":1,"units":16,"max_groups":4},
-            "scratch_bytes_at_capacity":{"fc1":6291456,"intermediate":262144,"fc2":1572864}});
-        let mut manifest = json!({"programs":[entry,
-            {"name":"exlr8_shared_group","capacity_rows":64,
-                "geometry":{"abi_version":2,"experts":1,"top_k":1,"max_groups":4,
-                    "hidden":6144,"input_format":"bf16","input_row_bytes":12288,
-                    "ctas_per_sm":4,"ingress_warps":8}}]});
-        let bytes = shared_workspace(&manifest).unwrap();
-        for missing in 0..2 {
-            let mut invalid = manifest.clone();
-            invalid["programs"].as_array_mut().unwrap().remove(missing);
-            assert!(shared_workspace(&invalid).is_err());
-        }
-        assert_eq!(bytes, residency::execution_workspace_layout(64,64,16,6144,1,4,
-            6291456,262144,1572864,residency::ExpertSet::Shared).unwrap().1 as u64);
-        for (field, value) in [("abi_version", 1), ("hidden", 128), ("top_k", 8), ("units", 0), ("max_groups", 512)] {
-            let mut invalid = manifest.clone();
-            invalid["programs"][0]["geometry"][field] = json!(value);
-            assert!(shared_workspace(&invalid).is_err(), "{field}");
-        }
-        for bytes in [0, 1_572_863, u64::MAX] {
-            manifest["programs"][0]["scratch_bytes_at_capacity"]["fc2"] = json!(bytes);
-            assert!(shared_workspace(&manifest).is_err());
-        }
-        assert!(shared_workspace(&json!({"programs":[]})).is_err());
-    }
-
-    #[test]
     fn native_refuses_unqualified_combinations_before_checkpoint_reads() {
-        let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks:4 },
-            layout: Some(super::super::layout::LayoutOptions { rtx_bytes: vec![96 << 30;2], ..Default::default() }),
-            ..Default::default() };
+        let mut options = super::super::PlanOptions { placement: super::super::ExpertPlacement::Sparks { ranks: 4 },
+            layout: Some(super::super::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                rtx_bytes: vec![96 << 30; 2], ..Default::default() }), ..Default::default() };
         let missing = Path::new("/no-native-checkpoint");
-        let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, missing, o, draft)
+        let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
             .err().unwrap().to_string();
-        assert!(!error(&options,"up1","off").contains("rotation"));
-        assert!(error(&options,"other","off").contains("manifest"));
-        assert!(error(&options,"up1","dflash2").contains("speculator off"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:6 };
-        assert!(!error(&options,"up1","off").contains("canonical Sparks"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:7 };
-        assert!(error(&options,"up1","off").contains("1..=6"));
-        options.placement = super::super::ExpertPlacement::Sparks { ranks:4 };
-        options.layout.as_mut().unwrap().rtx_bytes.truncate(1);
-        assert!(error(&options,"up1","off").contains("two RTX"));
-        options.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
-        for lanes in 1..=4 {
-            options.layout.as_mut().unwrap().prefill_lanes = lanes;
-            assert!(!error(&options,"up1","off").contains("serial"));
+        for concurrency in [1, 4, 16, 17, 32, 64, 65, 128] {
+            options.layout.as_mut().unwrap().concurrency = concurrency;
+            if concurrency <= 64 {
+                for family in ["glm5", "glm5_flash"] {
+                    let (_, _, _, layout) = native_options("up1", &options, "off", family).unwrap();
+                    assert_eq!(layout.mimo_prefix_entries, cuteafd_core::concurrency::prefix_entries(concurrency));
+                }
+            } else {
+                assert!(error(&options, "up1", "off").contains("capacity 64"));
+            }
         }
-        options.layout.as_mut().unwrap().prefill_lanes = 1;
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(1));
-        assert!(error(&options,"up1","off").contains("onboard"));
-        options.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
-        options.attention_placement = Some(crate::placement::AttentionPlacement::Heads);
-        assert!(error(&options,"up1","off").contains("context"));
+        options.layout.as_mut().unwrap().concurrency = 0;
+        assert!(!error(&options, "k4", "off").contains("published name"));
+        assert!(error(&options, "../bad", "off").contains("manifest"));
+        assert!(error(&options, "up1", "mtp").contains("off or dflash2"));
+        for gpus in 0..=3 {
+            options.layout.as_mut().unwrap().rtx_bytes = vec![96 << 30; gpus];
+            assert_eq!(error(&options, "up1", "off").contains("1..=2 RTX"), !(1..=2).contains(&gpus));
+            if !(1..=2).contains(&gpus) { continue; }
+            for attention in [None, Some(crate::placement::AttentionPlacement::Heads),
+                Some(crate::placement::AttentionPlacement::Context), Some(crate::placement::AttentionPlacement::Layers)] {
+                options.attention_placement = attention;
+                let expected = if gpus == 2 { crate::placement::AttentionPlacement::Context }
+                    else { crate::placement::AttentionPlacement::Heads };
+                // Family-specific attention refusal follows detection, not a hardcoded GLM default.
+                assert_eq!(native_options("up1", &options, "off", "glm5").is_ok(),
+                    attention.is_none_or(|a| a == expected));
+                assert_eq!(native_options("k4", &options, "off", "glm5_flash").is_ok(),
+                    gpus == 2 || attention.is_none_or(|a| a == crate::placement::AttentionPlacement::Heads));
+            }
+            options.attention_placement = None;
+        }
+        options.layout.as_mut().unwrap().rtx_bytes = vec![32 << 30; 2];
+        options.placement = super::super::ExpertPlacement::Local;
+        assert!(native_options("up1", &options, "off", "glm5").is_err());
+        let (world, _, _, flash) = native_options("k4", &options, "dflash2", "glm5_flash").unwrap();
+        assert_eq!(world, 0);
+        assert!(flash.force_gpu_embedding && !flash.glmf_drafter_disabled);
     }
 
     #[test]
@@ -1277,59 +1462,47 @@ mod tests {
     }
 
     #[test]
-    fn official_dense_weight_and_bias_are_independent_native_operands() {
-        use super::super::testing::{t, write_snapshot};
-        let temp = tempfile::tempdir().unwrap();
-        write_snapshot(
-            temp.path(),
-            &json!({}),
-            &[
-                t("norm.weight", "BF16", &[128]),
-                t("norm.bias", "F32", &[128]),
-                t("proj.weight", "F8_E4M3", &[128, 128]),
-                t("proj.weight_scale_inv", "F32", &[1, 1]),
-                t("proj.bias", "BF16", &[128]),
-            ],
-            None,
-        );
-        let source = super::super::Checkpoint::open(temp.path()).unwrap();
-        let groups = super::super::format::group_by_stem(&source.tensors);
-        for (name, encoding, bytes) in [
-            ("norm.weight", Encoding::Bf16, 256),
-            ("norm.bias", Encoding::F32, 512),
-            ("proj.weight", Encoding::E4m3, 16388),
-            ("proj.bias", Encoding::Bf16, 256),
-        ] {
-            let (stem, suffix) = super::super::format::split_stem(name);
-            let members = dense_source_members(&groups[stem], suffix).unwrap();
-            let operand = super::super::format::detect(&members).unwrap();
-            assert_eq!(operand.encoding, encoding);
-            assert_eq!(
-                members.values().map(|m| m.meta.byte_length).sum::<u64>(),
-                bytes
-            );
-            assert!(operand.companions.is_empty() || suffix == "bias");
-        }
-        assert!(dense_source_members(&groups["norm"], "scale").is_err());
+    fn family_geometry_uses_nested_flash_reader_and_mtp_extent() {
+        let mut config = super::super::testing::glm5_flash_config(4);
+        config["text_config"]["num_nextn_predict_layers"] = json!(1);
+        let cfg = ExpertGeometry::from_hf(&config).unwrap();
+        assert_eq!((cfg.hidden, cfg.intermediate, cfg.experts, cfg.layers, cfg.first, cfg.mtp_layers),
+            (4096, 2048, 288, 4, 1, 1));
+        config["text_config"]["layer_types"] = json!([]);
+        assert!(ExpertGeometry::from_hf(&config).is_err());
+        let glm = super::super::testing::glm5_config();
+        let cfg = ExpertGeometry::from_hf(&glm).unwrap();
+        assert_eq!(cfg.hidden, 6144);
     }
 
     #[test]
-    fn replacement_dense_checks_architecture_and_logical_shape() {
-        use super::super::testing::{t, write_snapshot};
-        let temp = tempfile::tempdir().unwrap();
-        write_snapshot(temp.path(), &json!({"hidden_size":128}),
-            &[t("norm.weight", "BF16", &[128])], None);
-        let checkpoint = super::super::Checkpoint::open(temp.path()).unwrap();
-        let mut dense = vec![DenseOperand { tensor: "norm.weight".into(), shard: "native".into(),
-            encoding: Encoding::Bf16, scale: None, shape: vec![128], bytes: 256,
-            sharded_side: 0, channels_per_shard: 0, rotation: None, kernel: None }];
-        assert!(replacement_dense(&json!({"hidden_size":128,"torch_dtype":"float16"}),
-            &dense, &checkpoint).is_ok());
-        assert!(replacement_dense(&json!({"hidden_size":256}), &dense, &checkpoint)
-            .unwrap_err().to_string().contains("architecture mismatch"));
-        dense[0].shape = vec![64];
-        assert!(replacement_dense(&json!({"hidden_size":128}), &dense, &checkpoint)
-            .unwrap_err().to_string().contains("shape mismatch"));
+    fn manifest_discovery_uses_published_names_without_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["k2", "k4", "future-profile"] {
+            fixture_manifest(root.path(), name, json!([[3,3,3,3]]));
+        }
+        assert_eq!(manifest_names(root.path()).unwrap(), ["future-profile", "k2", "k4"]);
+        let path = root.path().join("manifests/exlr8-manifest-k4.json");
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["name"] = json!("up1");
+        std::fs::write(path, value.to_string()).unwrap();
+        assert!(manifest_names(root.path()).is_err());
+    }
+
+    #[test]
+    fn dense_source_names_preserve_flash_vocab_and_qualified_vision_names() {
+        let metadata = json!({"source_names": json!({
+            "embed_tokens": "model.language_model.embed_tokens.weight",
+            "norm.weight": "model.language_model.norm.weight"
+        }).to_string()});
+        let sources = source_names(&metadata).unwrap().unwrap();
+        assert_eq!(logical_name(&metadata, Some(&sources), None, "embed_tokens", true).unwrap(),
+            "model.language_model.embed_tokens.weight");
+        assert_eq!(logical_name(&metadata, Some(&sources), None, "norm.weight", false).unwrap(),
+            "model.language_model.norm.weight");
+        assert!(logical_name(&metadata, Some(&sources), None, "missing", true).is_err());
+        assert_eq!(logical_name(&json!({}), None, None, "model.visual.blocks.0.norm.weight", false).unwrap(),
+            "model.visual.blocks.0.norm.weight");
     }
 
     #[test]
@@ -1364,10 +1537,10 @@ mod mounted_tests {
         };
         let root = std::path::Path::new(&snapshot);
         assert!(super::recognizes(root).unwrap());
-        let report = super::inspect(root, "bit325", None, 6, 2, 100 << 30, 80 << 30).unwrap();
+        let report = super::inspect(root, "bit325", 6, 2, 100 << 30, 80 << 30).unwrap();
         assert!(!report.supported);
         assert!(report.selected_weights_fit);
-        assert_eq!(report.fit.len(), 32);
+        assert_eq!(report.fit.len(), report.manifests.len() * 18);
         assert!(report.dense.iter().any(|d| d.tensor == "lm_head.weight"));
         assert!(report
             .dense
@@ -1389,21 +1562,6 @@ mod mounted_tests {
                 report.render(),
             )
             .unwrap();
-        }
-        if let Some(dense) = std::env::var_os("CUTEAFD_EXLR8_TEST_DENSE") {
-            super::validate_dense_source(root, std::path::Path::new(&dense)).unwrap();
-            let official = super::inspect(
-                root,
-                "up1",
-                Some(std::path::Path::new(&dense)),
-                4,
-                1,
-                100 << 30,
-                80 << 30,
-            )
-            .unwrap();
-            assert!(official.dense_source.contains("official"));
-            assert!(official.dense_bytes > report.dense_bytes);
         }
     }
 }

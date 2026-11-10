@@ -1,0 +1,4 @@
+{
+  "mla": ["q_a_proj.weight", "kv_a_proj_with_mqa.weight", "q_b_proj.weight", "o_proj.weight"],
+  "mlp": ["gate_proj.weight", "up_proj.weight", "down_proj.weight"]
+}

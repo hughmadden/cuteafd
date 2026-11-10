@@ -47,8 +47,7 @@ impl RuntimeInventory {
             library.cuda_set_device(device)?;
             let sample = (|| -> Result<RuntimeSample> {
                 let (before, _) = library.cuda_memory_info()?;
-                load_modules(device)?;
-                let (free, total) = library.cuda_memory_info()?;
+                let (free, total) = after_modules(device, &mut load_modules, || library.cuda_memory_info())?;
                 let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
                 let info = library.cuda_device_info(device)?;
                 let text = |chars: &[std::ffi::c_char]| {
@@ -97,19 +96,47 @@ impl RuntimeInventory {
     }
 }
 
+fn after_modules<T>(device: i32, load: &mut impl FnMut(i32) -> Result<()>,
+    measure: impl FnOnce() -> Result<T>) -> Result<T> {
+    load(device)?;
+    measure()
+}
+
 #[cfg(test)]
 mod phase_tests {
     use super::InventoryPhase;
 
     #[test]
+    fn selected_modules_load_before_admission_sample_and_failure_stops_sampling() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        let selected = ["exlr8_dense_native", "glmf_stage_kda_projected_m64"];
+        let value = super::after_modules(7, &mut |device| {
+            assert_eq!(device, 7);
+            events.borrow_mut().extend(selected);
+            Ok(())
+        }, || {
+            assert_eq!(*events.borrow(), selected);
+            events.borrow_mut().push("sample");
+            Ok(42)
+        }).unwrap();
+        assert_eq!(value, 42);
+        assert_eq!(*events.borrow(), [selected[0], selected[1], "sample"]);
+        let failed: anyhow::Result<()> = super::after_modules(7, &mut |_| anyhow::bail!("module rejected"), || {
+            panic!("admission must not sample after a failed module load")
+        });
+        assert!(failed.is_err());
+    }
+
+    #[test]
     fn unknown_package_live_reservation_uses_same_positive_formula_as_plan() {
         use cuteafd_loader::placement::{inventory::loaded_code_allowance, ArchContext, ProgramSet};
         let manifest = serde_json::json!({"programs":[{"name":"qwen4_decode"}]});
-        let arch = ArchContext::for_device("sm_120", 96 << 30);
+        let arch = ArchContext::for_device(cuteafd_core::GpuArch::Sm120, 96 << 30);
         let programs = ProgramSet::from_manifest(&manifest, &["qwen4"]);
         let allowance = loaded_code_allowance("qwen4", "unmeasured", false, 0, arch, Some(&programs));
         let planned = cuteafd_loader::plan::layout::runtime_item(Some(&manifest), &["qwen4".into()],
-            "unmeasured", false, 0, 96 << 30);
+            "unmeasured", false, 0, cuteafd_core::GpuArch::Sm120, 96 << 30);
         let pending = allowance.pending(arch.context_bytes, arch.context_bytes);
         assert!(pending > 0);
         assert_eq!(pending + arch.context_bytes, planned.bytes);
@@ -149,6 +176,14 @@ pub(crate) fn startup_probe(library: &NativeLibrary, devices: &[i32], stage: &st
     result
 }
 
+/// The architecture of `device`; unsupported devices fail here, before any
+/// planner number is derived from them.
+pub(crate) fn device_arch(library: &NativeLibrary, device: i32) -> Result<cuteafd_core::GpuArch> {
+    let info = library.cuda_device_info(device)?;
+    Ok(cuteafd_core::GpuArch::from_compute_capability(info.compute_capability_major,
+        info.compute_capability_minor)?)
+}
+
 /// Ready code still missing from the current sample, using the same calibrated
 /// or manifest-derived allowance as offline planning.
 pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, split: bool, program_family: &str,
@@ -160,8 +195,9 @@ pub(crate) fn pending_code(library: &NativeLibrary, device: i32, rank: usize, sp
     let ((free, total), info) = sample?;
     let tracked = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
     let untracked = (total.saturating_sub(free) as u64).saturating_sub(tracked as u64);
-    let arch = format!("sm_{}{}", info.compute_capability_major, info.compute_capability_minor);
-    let context = cuteafd_loader::placement::ArchContext::for_device(&arch, total as u64);
+    let arch = cuteafd_core::GpuArch::from_compute_capability(info.compute_capability_major,
+        info.compute_capability_minor)?;
+    let context = cuteafd_loader::placement::ArchContext::for_device(arch, total as u64);
     let code = cuteafd_loader::placement::inventory::loaded_code_allowance(program_family, experts,
         split, rank as u8, context, Some(programs));
     let pending = code.pending(untracked, context.context_bytes);

@@ -8,6 +8,9 @@ pub struct AttentionReductionPlan {
     active_drafts: Option<usize>,
     override_rows: Option<usize>,
     rows: usize,
+    /// Compressed (indexed) attention's ten-part kernel, fixed per coordinator
+    /// architecture ([`crate::GpuArch::v41_compressed_attention`]).
+    compressed: SparseAttentionBackend,
 }
 
 impl AttentionReductionPlan {
@@ -24,7 +27,15 @@ impl AttentionReductionPlan {
             Some(rows) => rows,
             None => automatic,
         };
-        Ok(Self { capacity_rows, active_drafts, override_rows, rows })
+        Ok(Self { capacity_rows, active_drafts, override_rows, rows, compressed: SparseAttentionBackend::Bf16Aot })
+    }
+
+    /// The compressed recipe's kernel, from the coordinator architecture
+    /// ([`crate::GpuArch::v41_compressed_attention`]; BF16 AOT by default).
+    /// Keyed on the device, never on which symbols a library carries: an
+    /// SM120 library without its AOT export still refuses at plan install.
+    pub fn with_compressed(self, compressed: SparseAttentionBackend) -> Self {
+        Self { compressed, ..self }
     }
 
     pub fn rows(self) -> usize { self.rows }
@@ -34,7 +45,7 @@ impl AttentionReductionPlan {
     /// Alignment is a load contract, never a reason to change the reduction.
     pub fn sparse_recipe(self, compressed: bool) -> SparseAttentionRecipe {
         SparseAttentionRecipe { parts: if compressed { 10 } else { 2 },
-            backend: if compressed { SparseAttentionBackend::Bf16Aot } else { SparseAttentionBackend::NativeFp32 } }
+            backend: if compressed { self.compressed } else { SparseAttentionBackend::NativeFp32 } }
     }
 
     /// A row without indexed records must retain the window-only fold even when
@@ -59,7 +70,8 @@ impl AttentionReductionPlan {
     /// Admission may use validated checkpoint geometry before loading the drafter.
     /// Check raw geometry too: different widths can clamp to the same plan.
     pub fn validate_loaded(self, active_drafts: Option<usize>) -> Result<Self, AttentionPlanError> {
-        let loaded = Self::new(self.capacity_rows, active_drafts, self.override_rows)?;
+        let loaded = Self { compressed: self.compressed,
+            ..Self::new(self.capacity_rows, active_drafts, self.override_rows)? };
         if loaded != self {
             return Err(AttentionPlanError::DrafterMismatch {
                 provisional: self.active_drafts, loaded: active_drafts,
@@ -109,8 +121,81 @@ pub enum OutputPlanError {
     IncompatibleExport,
 }
 
+/// Native rotary MLA drafting contract, shared by admission and manifest validation.
+/// All exports process at most 64 rows; larger batches must be chunked by the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaDraftProgramLayout {
+    pub context: usize,
+    pub splits: usize,
+    pub chunks_per_split: usize,
+    pub partial_output_bytes: usize,
+    pub partial_lse_bytes: usize,
+    /// Producer, attention, ungated output, respectively. These phases are ordered.
+    pub scratch: [usize; 3],
+}
+
+/// Which native block-draft program set a drafter runs: the DFlash2 MLA draft
+/// (`mla_draft_*`, q-LoRA 1536 at hidden 7168) or Mistral Large 4's bundled
+/// mtp_dspark (`ml4_draft_*`: no q-LoRA, hidden 6144, block-anchored window).
+/// Both share the attention geometry (64 heads, 576/512 latent) and the
+/// ungated UV/o output; they differ in the producer and its scratch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MlaDraftKind { Dflash2, Ml4Dspark }
+
+impl MlaDraftKind {
+    pub fn hidden(self) -> usize { match self { Self::Dflash2 => 7168, Self::Ml4Dspark => 6144 } }
+
+    /// Producer scratch at `rows`: DFlash2 [rows, 2112] q|kv_a then [rows, 64, 192] q;
+    /// mtp_dspark [rows, 64, 128] q then [rows, 576] kv_a.
+    fn producer_scratch(self, rows: usize) -> usize {
+        let align = |n: usize| n.div_ceil(1024) * 1024;
+        match self {
+            Self::Dflash2 => align(rows * 2112 * 2) + align(rows * MlaDraftProgramLayout::HEADS * 192 * 2),
+            Self::Ml4Dspark => align(rows * MlaDraftProgramLayout::HEADS * 128 * 2) + align(rows * 576 * 2),
+        }
+    }
+}
+
+impl MlaDraftProgramLayout {
+    pub const ROWS: usize = 64;
+    pub const HEADS: usize = 64;
+    pub const PAGE: usize = 64;
+
+    pub fn new(context: usize) -> Result<Self, MlaDraftLayoutError> {
+        Self::for_kind(MlaDraftKind::Dflash2, context)
+    }
+
+    pub fn for_kind(kind: MlaDraftKind, context: usize) -> Result<Self, MlaDraftLayoutError> {
+        if !(1..=1_048_576).contains(&context) { return Err(MlaDraftLayoutError); }
+        let pages = context.div_ceil(Self::PAGE);
+        let splits = pages.min(16);
+        let align = |n: usize| n.div_ceil(1024) * 1024;
+        let partial_output_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 512 * 2) } else { 0 };
+        let partial_lse_bytes = if splits > 1 { align(Self::ROWS * Self::HEADS * splits * 4) } else { 0 };
+        Ok(Self { context, splits, chunks_per_split: pages.div_ceil(splits),
+            partial_output_bytes, partial_lse_bytes,
+            scratch: [kind.producer_scratch(Self::ROWS),
+                partial_output_bytes + partial_lse_bytes, align(Self::ROWS * Self::HEADS * 128 * 2)] })
+    }
+
+    /// One arena can cover all three phase-disjoint native scratch planes.
+    pub fn scratch_bytes(self) -> usize { self.scratch.into_iter().max().unwrap_or(0) }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("MLA draft program context must be in 1..=1048576")]
+pub struct MlaDraftLayoutError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SparseAttentionBackend { NativeFp32, Bf16Aot }
+
+/// Split scratch of a `parts`-part sparse attention launch over `rows` x
+/// `heads`: the native FP32 kernel's per-part partial output (512), max and
+/// sum per head. The BF16 AOT ten-part recipe uses a prefix of it, so planner
+/// and runtime reserve this one extent whichever backend the plan names.
+pub const fn sparse_split_scratch_bytes(rows: usize, parts: usize, heads: usize) -> usize {
+    rows * parts * heads * 514 * 4
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparseAttentionRecipe {
@@ -152,10 +237,21 @@ pub struct CoordinatorPrograms<'a> {
     pub split_family: Option<&'a str>,
 }
 
+/// Compound namespaces precede the ordinary first-underscore boundary. Keep
+/// runtime selection and manifest admission on the same namespace contract.
+pub fn program_namespace(name: &str) -> Option<&str> {
+    for family in ["glm_stage", "glm2_stage"] {
+        if name.strip_prefix(family).is_some_and(|suffix| suffix.starts_with('_') && suffix.len() > 1) {
+            return Some(&name[..family.len()]);
+        }
+    }
+    name.split_once('_').and_then(|(family, suffix)| (!suffix.is_empty()).then_some(family))
+}
+
 impl CoordinatorPrograms<'_> {
     /// Namespace boundaries matter: `glmf` must not select `glmf2` or `glm`.
     pub fn contains(self, name: &str) -> bool {
-        name.split_once('_').is_some_and(|(family, _)| {
+        program_namespace(name).is_some_and(|family| {
             family == self.family || self.split_family == Some(family)
         })
     }
@@ -164,6 +260,15 @@ impl CoordinatorPrograms<'_> {
     pub fn shared_scratch<'a>(self, sizes: impl IntoIterator<Item = (&'a str, u64)>) -> u64 {
         sizes.into_iter().filter(|(name, _)| self.contains(name) && !name.contains("index_topk"))
             .map(|(_, bytes)| bytes).max().unwrap_or(0)
+    }
+
+    /// Unshaped helpers are shared; shaped exports belong only to the arena
+    /// with their compiled row capacity and prefill/decode dispatch mode.
+    pub fn workspace_program(self, name: &str, rows: u64, prefill: bool) -> bool {
+        self.contains(name)
+            && !name.contains(if prefill { "_decode_" } else { "_prefill_" })
+            && name.rsplit_once("_m").and_then(|(_, suffix)| suffix.parse::<u64>().ok())
+                .is_none_or(|capacity| capacity == rows)
     }
 
     pub fn validate_v4(self, prefill_rows: u64, decode_rows: u64,
@@ -227,8 +332,15 @@ impl std::error::Error for MissingCoordinatorProgram {}
 /// the one variant. These caps describe numerical plan alternatives, not live row limits.
 pub fn attention_partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
     -> Result<Vec<(usize, String)>, AttentionPartialError> {
+    attention_partial_programs_of(manifest, family, "sparse_mla", begin, rows, sms)
+}
+
+/// [`attention_partial_programs`] of one record contract `kind` (`sparse_mla`, or a variant's
+/// `sparse_mla_nope` for its NoPE layers): `{family}_{kind}_partial_h{begin}_s{N}_m{rows}`.
+pub fn attention_partial_programs_of(manifest: &serde_json::Value, family: &str, kind: &str, begin: usize,
+    rows: usize, sms: usize) -> Result<Vec<(usize, String)>, AttentionPartialError> {
     let programs = manifest["programs"].as_array().ok_or(AttentionPartialError::InvalidManifest("program manifest"))?;
-    let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
+    let prefix = format!("{family}_{kind}_partial_h{begin}_s");
     let suffix = format!("_m{rows}");
     let variants: Vec<&serde_json::Value> = programs.iter()
         .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))).collect();
@@ -259,8 +371,15 @@ pub fn attention_partial_programs(manifest: &serde_json::Value, family: &str, be
 pub fn attention_partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
     execution_capacity_rows: usize, sms: usize,
     plan: &AttentionReductionPlan) -> Result<String, AttentionPartialError> {
+    attention_partial_program_of(manifest, family, "sparse_mla", begin, execution_capacity_rows, sms, plan)
+}
+
+/// [`attention_partial_program`] of record contract `kind` ([`attention_partial_programs_of`]).
+pub fn attention_partial_program_of(manifest: &serde_json::Value, family: &str, kind: &str, begin: usize,
+    execution_capacity_rows: usize, sms: usize,
+    plan: &AttentionReductionPlan) -> Result<String, AttentionPartialError> {
     if plan.capacity_rows() > execution_capacity_rows { return Err(AttentionPartialError::NumericalDomain); }
-    let partials = attention_partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
+    let partials = attention_partial_programs_of(manifest, family, kind, begin, execution_capacity_rows, sms)?;
     partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
         .ok_or(AttentionPartialError::NoRecipe)
 }
@@ -329,29 +448,32 @@ pub fn select_attention_plans(manifest: &mut serde_json::Value, plan: AttentionR
 #[error("invalid attention recipe scratch contract or numerical domain mismatch")]
 pub struct AttentionScratchError;
 
-/// Select the same 170/188-SM program recipe as native load, before admission.
-/// The retained plans allow another device to select its own scratch envelope.
+/// Select the program recipe exported for exactly this card's SM count, as native load does,
+/// before admission. Every exported plan must be well formed (unique positive `sm_count`,
+/// integral scratch, object geometry); a card without its own plan fails closed rather than
+/// borrowing another card's split geometry. The retained plans let another device select its
+/// own scratch envelope.
 pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(), CardPlanError> {
     let Some(programs) = manifest["programs"].as_array_mut() else { return Ok(()) };
     for program in programs {
         if program.get("card_plans").is_none() { continue; }
         let name = program["name"].as_str().unwrap_or("<unnamed>").to_string();
-        let invalid = || CardPlanError { name: name.clone() };
+        let invalid = || CardPlanError { name: name.clone(), reason: "invalid card-plan contract".into() };
         let plans = program["card_plans"].as_array().ok_or_else(invalid)?;
-        if sms == 0 || plans.len() != 2 { return Err(invalid()); }
-        let selected_sms = if sms >= 188 { 188 } else { 170 };
+        if sms == 0 || plans.is_empty() { return Err(invalid()); }
+        let mut exported = std::collections::BTreeSet::new();
         let mut selected = None;
-        for expected in [170, 188] {
-            let matching: Vec<_> = plans.iter().filter(|p| p["sm_count"].as_u64() == Some(expected)).collect();
-            if matching.len() != 1 { return Err(invalid()); }
-            let plan = matching[0];
+        for plan in plans {
+            let count = plan["sm_count"].as_u64().filter(|&count| count > 0).ok_or_else(invalid)?;
+            if !exported.insert(count) { return Err(invalid()); }
             let scratch = plan["scratch_bytes_at_capacity"].as_object().ok_or_else(invalid)?;
             if scratch.values().any(|v| v.as_u64().is_none()) || !plan["geometry"].is_object() {
                 return Err(invalid());
             }
-            if expected == selected_sms { selected = Some(plan.clone()); }
+            if count == u64::from(sms) { selected = Some(plan.clone()); }
         }
-        let plan = selected.ok_or_else(invalid)?;
+        let plan = selected.ok_or_else(|| CardPlanError { name: name.clone(),
+            reason: format!("no card plan for {sms} SMs (exported for {exported:?}); export one for this card") })?;
         program["scratch_bytes_at_capacity"] = plan["scratch_bytes_at_capacity"].clone();
         program["geometry"] = plan["geometry"].clone();
     }
@@ -359,14 +481,39 @@ pub fn select_card_plans(manifest: &mut serde_json::Value, sms: u32) -> Result<(
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("program {name} has an invalid 170/188-SM card-plan contract")]
+#[error("program {name}: {reason}")]
 pub struct CardPlanError {
     pub name: String,
+    pub reason: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mla_draft_scratch_preserves_export_capacity_and_ungated_output() {
+        for context in [1, 63, 64, 65, 1024, 1025, 262144, 1048576] {
+            let layout = MlaDraftProgramLayout::new(context).unwrap();
+            let pages = context.div_ceil(64);
+            assert_eq!(layout.splits, pages.min(16));
+            assert_eq!(layout.chunks_per_split, pages.div_ceil(layout.splits));
+            assert_eq!(layout.scratch[0], 1_843_200);
+            assert_eq!(layout.scratch[2], 1_048_576, "ungated output has exactly one value plane");
+            let partial = if layout.splits > 1 { 4_194_304 * layout.splits } else { 0 };
+            let lse = if layout.splits > 1 { 16_384 * layout.splits } else { 0 };
+            assert_eq!(layout.partial_output_bytes, partial);
+            assert_eq!(layout.partial_lse_bytes, lse);
+            assert_eq!(layout.scratch[1], partial + lse);
+            assert_eq!(layout.scratch_bytes(), layout.scratch.iter().copied().max().unwrap());
+        }
+        assert_eq!(MlaDraftProgramLayout::new(262144).unwrap().scratch_bytes(), 67_371_008);
+        assert_eq!(MlaDraftProgramLayout::new(262144).unwrap().scratch,
+            MlaDraftProgramLayout::new(1048576).unwrap().scratch);
+        for context in [0, 1048577, usize::MAX] {
+            assert_eq!(MlaDraftProgramLayout::new(context), Err(MlaDraftLayoutError));
+        }
+    }
 
     #[test]
     fn output_recipe_is_immutable_and_rejects_partial_row_exports() {
@@ -400,6 +547,39 @@ mod tests {
             assert!(plan.validate_loaded(Some(7)).is_err());
             assert_eq!(plan.rows(), plan_rows);
         }
+    }
+
+    #[test]
+    fn compressed_backend_follows_the_coordinator_architecture() {
+        use crate::GpuArch;
+        let chosen = |plan: AttentionReductionPlan, arch: GpuArch| plan.with_compressed(arch.v41_compressed_attention());
+        for (drafts, override_rows) in [(None, None), (Some(5), None), (Some(7), Some(3))] {
+            let plan = AttentionReductionPlan::new(64, drafts, override_rows).unwrap();
+            // SM120 (and SM121) keep the default plan exactly: BF16 AOT ten-part.
+            for arch in [GpuArch::Sm120, GpuArch::Sm121] {
+                assert_eq!(chosen(plan, arch), plan);
+            }
+            assert_eq!(plan.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::Bf16Aot });
+            // SM89 has no direct attention AOT: native FP32, still ten parts.
+            let sm89 = chosen(plan, GpuArch::Sm89);
+            assert_ne!(sm89, plan);
+            assert_eq!(sm89.sparse_recipe(true), SparseAttentionRecipe { parts: 10,
+                backend: SparseAttentionBackend::NativeFp32 });
+            // Window attention, rows and drafts are the same on every architecture.
+            for arch in GpuArch::ALL {
+                let chosen = chosen(plan, arch);
+                assert_eq!(chosen.sparse_recipe(false), SparseAttentionRecipe { parts: 2,
+                    backend: SparseAttentionBackend::NativeFp32 });
+                assert_eq!((chosen.rows(), chosen.capacity_rows(), chosen.active_drafts()),
+                    (plan.rows(), plan.capacity_rows(), plan.active_drafts()));
+                // Loading the drafter keeps the architecture's backend.
+                assert_eq!(chosen.validate_loaded(drafts).unwrap(), chosen);
+            }
+            assert_eq!(chosen(sm89, GpuArch::Sm120), plan);
+        }
+        // One split extent for both backends: the native kernel's layout.
+        assert_eq!(sparse_split_scratch_bytes(64, 10, 64), 64 * 10 * 64 * 514 * 4);
     }
 
     #[test]
@@ -553,6 +733,25 @@ mod tests {
     }
 
     #[test]
+    fn card_plans_select_the_exact_sm_count_and_never_round_to_another_card() {
+        // A 114-SM card (RTX 4090 D) on a 170/188-only export fails closed by name.
+        let error = select_card_plans(&mut dual_manifest(), 114).unwrap_err();
+        assert_eq!(error.name, "dsv4p_sparse_mla_decode_c128_m64");
+        assert!(error.reason.contains("114 SMs"), "{error}");
+        // A card between the two exported counts no longer borrows the 170-SM plan.
+        assert!(select_card_plans(&mut dual_manifest(), 180).is_err());
+        // An export carrying the card's own plan selects it; the others stay valid.
+        let mut manifest = dual_manifest();
+        manifest["programs"][0]["card_plans"].as_array_mut().unwrap().push(serde_json::json!(
+            {"sm_count": 114, "scratch_bytes_at_capacity": {"scratch": 77}, "geometry": {"num_splits": 7}}));
+        for (sms, bytes, splits) in [(114, 77, 7), (170, 1094778880, 130), (188, 8421376, 1)] {
+            select_card_plans(&mut manifest, sms).unwrap();
+            assert_eq!(manifest["programs"][0]["scratch_bytes_at_capacity"]["scratch"], bytes);
+            assert_eq!(manifest["programs"][0]["geometry"]["num_splits"], splits);
+        }
+    }
+
+    #[test]
     fn v41_serving_rows_cover_live_chunks_and_decoder_replay() {
         for chunk in V41_PREFILL_MIN_ROWS..=V41_PREFILL_MAX_ROWS {
             let live = v41_live_rows(chunk).unwrap();
@@ -582,6 +781,39 @@ mod tests {
                 assert!(!selected.contains(family));
             }
         }
+    }
+
+    #[test]
+    fn workspace_selection_keeps_only_its_shape_and_shared_helpers() {
+        let selected = CoordinatorPrograms { family: "dsv4f", split_family: Some("dsv4f2") };
+        for family in ["dsv4f", "dsv4f2"] {
+            for prefill in [false, true] {
+                let rows = if prefill { 4096 } else { 64 };
+                let mode = if prefill { "prefill" } else { "decode" };
+                assert!(selected.workspace_program(&format!("{family}_producer_m{rows}"), rows, prefill));
+                assert!(selected.workspace_program(&format!("{family}_sparse_mla_{mode}_c128_m{rows}"), rows, prefill));
+                assert!(selected.workspace_program(&format!("{family}_compressor_continuation_c4"), rows, prefill));
+                assert!(!selected.workspace_program(&format!("{family}_producer_m{}", if prefill { 64 } else { 4096 }), rows, prefill));
+                assert!(!selected.workspace_program("unrelated_producer_m64", rows, prefill));
+                let other = if prefill { "decode" } else { "prefill" };
+                assert!(!selected.workspace_program(&format!("{family}_index_topk_{other}_m{rows}"), rows, prefill));
+            }
+        }
+    }
+
+    #[test]
+    fn native_stages_are_not_plain_glm_programs_or_scratch() {
+        for split in [false, true] {
+            let selected = CoordinatorPrograms { family: "glm", split_family: split.then_some("glm2") };
+            assert!(!selected.contains("glm_stage_rank_pack_m64"));
+            assert!(!selected.contains("glm2_stage_swiglu_i1024"));
+            assert_eq!(selected.shared_scratch([("glm_producer_m64", 7),
+                ("glm_stage_rank_pack_m64", 900), ("glm2_stage_swiglu_i1024", 999)]), 7);
+        }
+        let stages = CoordinatorPrograms { family: "glm_stage", split_family: Some("glm2_stage") };
+        assert!(stages.contains("glm_stage_rank_pack_m64"));
+        assert!(stages.contains("glm2_stage_swiglu_i1024"));
+        assert!(!stages.contains("glm_producer_m64"));
     }
 
     #[test]

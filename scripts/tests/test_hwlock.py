@@ -145,12 +145,42 @@ def test_canonical_order_and_unknown_locks():
         hwlock.canonical(['gpu2'])
 
 
-def test_kakapo_seed_lock_is_known_and_ordered_last():
-    # The out-of-pool build seed's lock sorts after every serving lock, so a
-    # serving job and a seed lease always take shared locks in one order.
-    assert hwlock.ORDER[-1] == 'kakapo'
-    assert hwlock.canonical(['kakapo', 'moa', 'sparks', 'gpu1', 'rhea', 'gpu0']) == \
-        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo']
+def test_maxq_lock_uses_the_standard_flock_path(lockdir):
+    assert hwlock.canonical(['maxq.lock']) == ['maxq']
+    handles = hwlock._try_flocks(['maxq'])
+    assert handles is not None
+    try:
+        assert (lockdir / 'maxq.lock').is_file()
+        assert hwlock._try_flocks(['maxq']) is None
+    finally:
+        for handle in handles:
+            handle.close()
+
+
+def test_lan_seed_locks_are_known_and_ordered_after_serving_then_export_turns():
+    # The LAN-only seeds' leases sort after every serving lock, and each seed's
+    # GPU-export turn after every lease: a build holds its lease when it queues
+    # for the export, so the turn must come later in the one canonical order.
+    assert hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
+    assert hwlock.ORDER[-5:] == ('kakapo', 'cassowary', 'kakapo-export', 'cassowary-export', 'maxq')
+    assert hwlock.canonical(['cassowary-export', 'kakapo', 'moa', 'sparks', 'gpu1', 'cassowary', 'rhea', 'gpu0']) == \
+        ['sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo', 'cassowary', 'cassowary-export']
+    assert hwlock.canonical(['maxq', 'gpu0']) == ['gpu0', 'maxq']
+
+
+def test_hold_stops_waiting_when_cancelled(lockdir, monkeypatch):
+    monkeypatch.setattr(hwlock, 'LOCK_DIR', lockdir)
+    busy = spawn(lockdir, 'kakapo-export', 5.0, lockdir / 'busy')
+    try:
+        wait_for(lockdir / 'busy')
+        calls = []
+        with pytest.raises(hwlock.Cancelled):
+            with hwlock.hold(['kakapo-export'], 30, cancelled=lambda: calls.append(1) or len(calls) > 1):
+                pytest.fail('a cancelled waiter never holds the lock')
+        assert not list((lockdir / 'hwq').glob('*.ticket')) or all(
+            'kakapo-export' not in p.read_text() or str(busy.pid) in p.name for p in (lockdir / 'hwq').glob('*.ticket'))
+    finally:
+        busy.wait(timeout=10)
 
 
 def test_older_dual_gpu_waiter_is_not_overtaken_by_later_single_gpu_job(lockdir):
@@ -259,3 +289,120 @@ def test_gated_child_is_not_deadlocked_by_a_younger_waiter_behind_its_gate(lockd
     assert gate.wait(timeout=30) == 0, gate.stderr.read()
     assert marker.exists()
     assert blocked.wait(timeout=30) == 0
+
+
+# A command that tears down on SIGTERM (as `cuteafd bench smoke` does): it marks
+# the start and end of its teardown, then exits 0.
+TEARDOWN_CHILD = '''import pathlib, signal, sys, time
+d = pathlib.Path(sys.argv[1])
+def stop(*_):
+    if (d / "teardown").exists():
+        return  # repeats (systemd's cgroup-wide TERM plus hwlock's forward) change nothing
+    (d / "teardown").write_text("")
+    time.sleep(1.0)
+    (d / "torn-down").write_text("")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(d / "ready").write_text("")
+while True:
+    time.sleep(0.05)
+'''
+
+
+def held(lockdir, name):
+    import fcntl
+    with open(lockdir / f'{name}.lock', 'a') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+@pytest.mark.parametrize('cgroup_wide', [False, True])
+def test_sigterm_is_forwarded_and_locks_outlive_the_commands_teardown(lockdir, cgroup_wide):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    proc = subprocess.Popen([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--', sys.executable, '-c', TEARDOWN_CHILD, str(lockdir)],
+                            env=env, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    end = time.time() + 10
+    while not (lockdir / 'ready').exists():
+        assert time.time() < end and proc.poll() is None
+        time.sleep(0.02)
+    assert held(lockdir, 'gpu1')
+    # systemd's default KillMode=control-group signals every process at once;
+    # a plain `kill PID` reaches hwlock alone, which must forward it.
+    if cgroup_wide:
+        os.killpg(proc.pid, 15)
+    else:
+        proc.send_signal(15)
+    end = time.time() + 10
+    while not (lockdir / 'teardown').exists():
+        assert time.time() < end, 'the command never saw the signal'
+        time.sleep(0.02)
+    # Mid-teardown: hwlock is still alive and still holds the lock.
+    time.sleep(0.3)
+    assert proc.poll() is None
+    assert not (lockdir / 'torn-down').exists() and held(lockdir, 'gpu1')
+    assert proc.wait(timeout=30) == 0
+    assert (lockdir / 'torn-down').exists()
+    assert not held(lockdir, 'gpu1')
+    assert 'forwarded' in proc.stderr.read()
+
+
+def test_a_command_that_ignores_the_signal_is_killed_after_the_grace(tmp_path):
+    import signal
+    import threading
+    ready = tmp_path / 'ready'
+    cmd = [sys.executable, '-c', f'import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+           f'pathlib.Path({str(ready)!r}).write_text(""); time.sleep(60)']
+    def stop():
+        end = time.time() + 10
+        while not ready.exists() and time.time() < end:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGTERM)
+    before = signal.getsignal(signal.SIGTERM)
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.time()
+    assert hwlock.run_forwarding(cmd, dict(os.environ), grace=0.5) == 128 + signal.SIGKILL
+    assert time.time() - started < 10
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_stop_grace_fits_systemd_default_and_exceeds_smokes_teardown_bound():
+    rust = (Path(__file__).resolve().parents[2] / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
+    smoke = int(rust.split('const CANCEL_TEARDOWN_S: u64 = ', 1)[1].split(';', 1)[0])
+    spec = importlib.util.spec_from_file_location('wip_cards', SCRIPT.parents[1] / 'bench/wip-cards.py')
+    cards = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cards)
+    assert smoke < cards.SMOKE_STOP_GRACE_S < hwlock.STOP_GRACE_S < 90
+
+
+REAL_LOCK_DIR = Path.home() / '.cache' / 'cuteafd'
+
+
+def test_session_lock_directory_never_reaches_the_real_cache(tmp_path_factory):
+    """#1048: with no per-test patch, taking gpu1 lands in the session's private
+    directory, never in ~/.cache/cuteafd."""
+    lock_dir = hwlock.lock_dir()
+    assert lock_dir == Path(os.environ['CUTEAFD_LOCK_DIR'])
+    # pytest's basetemp may itself live under ~/.cache/cuteafd/builds; what matters
+    # is that this is not the hardware lock directory or its queue.
+    assert lock_dir.is_relative_to(tmp_path_factory.getbasetemp())
+    assert lock_dir.parent != REAL_LOCK_DIR
+    real_lock = REAL_LOCK_DIR / 'gpu1.lock'
+    before = real_lock.stat().st_mtime_ns if real_lock.exists() else None
+    with hwlock.hold(['gpu1'], wait=10) as handles:
+        assert len(handles) == 1
+        assert (lock_dir / 'gpu1.lock').exists()
+    after = real_lock.stat().st_mtime_ns if real_lock.exists() else None
+    assert after == before
+    assert not list((lock_dir / 'hwq').glob('*.ticket'))
+
+
+def test_the_guard_refuses_the_real_lock_directory():
+    """The session fixtures route every lock to tmp; a code path that reaches the
+    real directory anyway fails the test instead of taking a cluster lock."""
+    with pytest.raises(pytest.fail.Exception):
+        open(REAL_LOCK_DIR / 'gpu1.lock')
+    with pytest.raises(pytest.fail.Exception):
+        os.open(REAL_LOCK_DIR / 'hwq', os.O_RDONLY)

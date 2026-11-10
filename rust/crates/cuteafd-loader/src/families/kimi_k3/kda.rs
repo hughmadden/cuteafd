@@ -11,6 +11,29 @@ pub fn geometry(cfg: &KimiK3Config) -> KdaGeometry {
         output_gate: KdaOutputGate::FullRank, o_norm_dtype: DType::F32 }
 }
 
+/// Exact physical host snapshot segments: both KDA shards and every resident
+/// MLA copy. Head-split MLA keeps two copies, so neither may be deduplicated.
+pub fn cache_geometry(cfg: &KimiK3Config, mla_layers: [usize; 2], cache_format: cuteafd_core::MlaCacheFormat)
+    -> Result<crate::serving_capacity::FamilyCacheGeometry, crate::serving_capacity::CacheGeometryError> {
+    cache_geometry_for_ranks(cfg, &mla_layers, cache_format)
+}
+
+pub fn cache_geometry_for_ranks(cfg: &KimiK3Config, mla_layers: &[usize], cache_format: cuteafd_core::MlaCacheFormat)
+    -> Result<crate::serving_capacity::FamilyCacheGeometry, crate::serving_capacity::CacheGeometryError> {
+    use crate::serving_capacity::{CacheGeometryError, FamilyCacheGeometry, KvPlacement, RankCacheGeometry};
+    if !matches!(mla_layers.len(), 1 | 2) || cfg.kda_heads != 96 || cfg.kda_head_dim != 128 || cfg.kda_conv != 4
+        || cfg.layers != cfg.attention.len() || cfg.mla_record_values() != 576
+        || mla_layers.iter().any(|&n| n > cfg.mla_layers()) {
+        return Err(CacheGeometryError::Unsupported { family: "kimi_k3", what: "native single/dual-rank cache geometry" });
+    }
+    let mark = (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / mla_layers.len() as u64 * cfg.kda_layers() as u64;
+    let ranks = mla_layers.iter().map(|&layers| RankCacheGeometry {
+        persistent_unit_bytes: layers as u64 * 64 * cache_format.record_bytes() as u64,
+        active_state_per_sequence_bytes: mark, retained_mark_bytes: mark, ..Default::default()
+    }).collect();
+    Ok(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::PartitionedLayers, ranks })
+}
+
 /// The checkpoint tensor holding `role` of KDA layer `layer` (0-based), or
 /// `None` for roles Kimi K3 does not ship (the low-rank output gate).
 pub fn tensor_name(layer: usize, role: KdaRole) -> Option<String> {
@@ -43,6 +66,22 @@ pub fn pack(cfg: &KimiK3Config, layer: usize, operand: KdaOperand, ranks: usize,
 mod tests {
     use super::*;
     use crate::families::kimi_k3::config::tests::release_config;
+
+    #[test]
+    fn single_owner_cache_contains_full_state_and_each_mla_layer_once() {
+        let cfg = KimiK3Config::from_hf(&release_config()).unwrap();
+        for format in [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8] {
+            let single = cache_geometry_for_ranks(&cfg, &[cfg.mla_layers()], format).unwrap();
+            let pair = cache_geometry(&cfg, [12, 12], format).unwrap();
+            assert_eq!(single.ranks.len(), 1);
+            assert_eq!(single.ranks[0].retained_mark_bytes,
+                pair.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>());
+            assert_eq!(single.ranks[0].persistent_unit_bytes,
+                pair.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>());
+            assert!(cache_geometry_for_ranks(&cfg, &[], format).is_err());
+            assert!(cache_geometry_for_ranks(&cfg, &[0, 0, 0], format).is_err());
+        }
+    }
 
     #[test]
     fn release_layer_packs_from_kimi_names_with_native_dtypes() {

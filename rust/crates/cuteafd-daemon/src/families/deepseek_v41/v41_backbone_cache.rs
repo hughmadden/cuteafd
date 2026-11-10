@@ -33,6 +33,11 @@ pub(crate) struct CacheLease {
     slot: usize,
     generation: u64,
 }
+#[cfg(test)]
+impl CacheLease {
+    /// An unbound identity for CPU-only scheduler lifecycle tests; never used with a cache.
+    pub(crate) fn unbound_for_test(slot: usize) -> Self { Self { owner: 0, slot, generation: 0 } }
+}
 struct Request {
     id: u64,
     version: u64,
@@ -132,9 +137,9 @@ pub(crate) struct CacheAttention<'a> {
     positions: Vec<Vec<u64>>,
 }
 impl CacheAttention<'_> {
-    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>;16],usize)> {
+    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>; cuteafd_core::V41_MAX_REQUESTS],usize)> {
         let count=self.windows.len();
-        ensure!((1..=16).contains(&count) && self.positions.len()==count,
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS).contains(&count) && self.positions.len()==count,
             "invalid fixed attention request count");
         Ok((std::array::from_fn(|i| {
             let i=if i<count {i} else {0};
@@ -173,6 +178,9 @@ pub(crate) struct BackboneCache<'a> {
     /// Per capture lane: a stream for queued snapshot copies and the lease it captures.
     prefix_copies: [crate::shared::memory::SnapshotCopies<'a, CacheLease>; 2],
     prefix_stream: crate::shared::memory::LoadStream<'a>,
+    /// Recorded on the prefix stream before a lane's queued snapshot: the lane's copies wait
+    /// on it on the device instead of the host draining the prefix stream.
+    prefix_queued: prefix::PrefixEvent<'a>,
     #[cfg(test)]
     test_queued: [Option<(CacheLease, crate::shared::memory::DeviceAllocation<'a>, BackboneMark)>; 2],
     windows: Vec<DeviceOwner<'a, WindowState<'a>>>,
@@ -333,6 +341,7 @@ impl<'a> BackboneCache<'a> {
             prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
                 crate::shared::memory::SnapshotCopies::new(library)?],
             prefix_stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
+            prefix_queued: prefix::PrefixEvent::new(library)?,
             #[cfg(test)]
             test_queued: [None, None],
             windows,
@@ -484,15 +493,6 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(())
     }
-    /// Shrink a request's source bindings to `pages` (a prefix of each); see `SourceCache::rebind`.
-    pub fn rebind_sources(&mut self, lease: CacheLease, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
-        let sources = self.request(lease)?.sources;
-        for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
-            let device = state.device;
-            device.run(|| state.rebind(lease, pages, rows))?;
-        }
-        Ok(())
-    }
     /// Each source's rows per model token and page count, in `sources()` order.
     pub fn source_geometry(&self) -> [(usize, usize); 4] {
         std::array::from_fn(|i| {
@@ -509,7 +509,7 @@ impl<'a> BackboneCache<'a> {
     fn plan_stage(&self, work: &[CacheWork], replay: bool, reserve: bool) -> Result<CacheBatch> {
         self.healthy()?;
         ensure!(
-            !work.is_empty() && work.len() <= 16,
+            !work.is_empty() && work.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid cache batch request count"
         );
         let mut stage = None;
@@ -978,7 +978,7 @@ mod tests {
             assert!(bank.release(&[leases[0], leases[0]]).is_err());
             bank.validate_batch(&batch)?;
             // Commit preflight rejects missing producers without consuming history.
-            assert!(bank.commit::<WindowWave<'_, '_>, CompressorWave<'_, '_>>(&batch, &mut [], &mut [], &[0; 16]).is_err());
+            assert!(bank.commit::<WindowWave<'_, '_>, CompressorWave<'_, '_>>(&batch, &mut [], &mut [], &[0; cuteafd_core::V41_MAX_REQUESTS]).is_err());
             bank.validate_batch(&batch)?;
             bank.release(&leases[..1])?;
             assert!(bank.validate_batch(&batch).is_err());
@@ -1015,7 +1015,11 @@ mod context_geometry_tests {
         assert_eq!(BackboneCache::pages_for_context(3, 513).unwrap(), [6, 6, 6, 9]);
         assert_eq!(BackboneCache::pages_for_context(16, 1048576).unwrap(), [32768, 32768, 32768, 65536]);
         assert!(BackboneCache::pages_for_context(0, 32768).is_err());
-        assert!(BackboneCache::pages_for_context(17, 32768).is_err());
+        for concurrency in [1, 4, 16, 17, 32, 64] {
+            assert_eq!(BackboneCache::pages_for_context(concurrency, 32768).unwrap(),
+                [concurrency * 64, concurrency * 64, concurrency * 64, concurrency * 128]);
+        }
+        assert!(BackboneCache::pages_for_context(65, 32768).is_err());
         assert!(BackboneCache::pages_for_context(1, 0).is_err());
         assert!(BackboneCache::pages_for_context(1, 1048577).is_err());
     }

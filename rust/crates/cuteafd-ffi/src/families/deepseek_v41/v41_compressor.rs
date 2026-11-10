@@ -353,7 +353,7 @@ impl V41Compressor<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=4096).contains(&rows) && (1..=16).contains(&slots),
+            (1..=4096).contains(&rows) && (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots),
             "invalid compressor pooling shape"
         );
         for b in [kv, scores] {

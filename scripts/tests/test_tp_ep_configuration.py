@@ -59,13 +59,58 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_shipped_config_defaults_dual_rtx_dspark_experts_on(self) -> None:
+        result = load_file(CONFIG, 'release_resolve_tp2_dspark_experts deepseek_v41 2; '
+                           'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'on')
+
+    def test_tp2_dspark_default_follows_resolved_layout(self) -> None:
+        for family, gpus, speculator in [('deepseek_v41', 2, 'dspark'),
+                                         ('deepseek_v41', 1, 'dspark'),
+                                         ('deepseek_v41', 2, 'off'),
+                                         ('glm5', 2, 'dspark')]:
+            eligible = family == 'deepseek_v41' and gpus == 2 and speculator == 'dspark'
+            for requested in ['', 'off', 'on']:
+                with self.subTest(family=family, gpus=gpus, speculator=speculator, requested=requested):
+                    result = load(f'SPECULATOR={speculator}\nTP2_DSPARK_EXPERTS={requested}',
+                                  f'release_resolve_tp2_dspark_experts {family} {gpus}; '
+                                  'printf "%s\\n" "$TP2_DSPARK_EXPERTS"')
+                    if requested == 'on' and not eligible:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn('requires V4.1, two selected RTX GPUs and dSpark', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout.strip(), 'on' if eligible and requested != 'off' else 'off')
+        result = load('TP2_DSPARK_EXPERTS=invalid')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('TP2_DSPARK_EXPERTS must be on or off', result.stderr)
+
+    def test_native_layer_bytes_follow_shared_artifact_geometry(self) -> None:
+        import importlib.util
+        path = ROOT / "python/tools/lib/spark_packages.py"
+        spec = importlib.util.spec_from_file_location("weight_packages", path)
+        packages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packages)
+        geometry = packages.native_spark_artifacts()
+        for count in range(1, 10):
+            with self.subTest(count=count):
+                result = source_common(f"release_spark_layer_bytes {count}")
+                self.assertEqual(result.returncode == 0, count in geometry, result.stderr)
+                if count in geometry:
+                    expected = max(384 * (5120 * a.stored * 3 // 2 + 2 * a.stored * 81
+                                          + 5120 * (2 * ((a.logical // 32 + 3) // 4) + 1))
+                                   for a in geometry[count])
+                    self.assertEqual(int(result.stdout), expected)
+        self.assertEqual(geometry[8][0].stored, 288)
+
     def test_retained_canonical_and_owned_tp_counts_use_configured_hosts(self) -> None:
-        for explicit, counts in [(False, range(1, 7)), (True, (2, 3, 4, 6))]:
+        for explicit, counts in [(False, range(1, 9)), (True, range(2, 9))]:
             for count in counts:
                 overlay = [f"SPARK_COUNT={count}",
                            f"SPARK_TP={count}" if explicit else "SPARK_TP=",
                            "SPARK_EP=1" if explicit else "SPARK_EP="]
-                for rank in range(6):
+                for rank in range(8):
                     overlay += [f"SPARK_{rank}_HOST=worker-{rank}",
                                 f"SPARK_{rank}_LANE_A=192.0.2.{rank + 1}",
                                 f"SPARK_{rank}_LANE_B="]
@@ -77,15 +122,15 @@ class TopologyConfigTest(unittest.TestCase):
                                      [",".join(f"worker-{rank}" for rank in range(count))])
 
     def test_deleted_worlds_and_unqualified_ownership_refuse(self) -> None:
-        for count in (1, 5, 7, 8):
+        for count in (1, 9):
             with self.subTest(count=count):
                 result = load(f"SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1")
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("unsupported native Spark topology" if count <= 6
-                              else "SPARK_TP must be in 1..6", result.stderr)
+                message = "unsupported native Spark topology" if count == 1 else "SPARK_TP must be in 1..8"
+                self.assertIn(message, result.stderr)
 
-    def test_deleted_rank_inventory_keys_refuse(self) -> None:
-        for rank in (6, 7):
+    def test_out_of_range_inventory_keys_refuse(self) -> None:
+        for rank in (8, 9):
             for suffix in ("HOST", "LANE_A", "LANE_B"):
                 key = f"SPARK_{rank}_{suffix}"
                 with self.subTest(key=key):
@@ -183,7 +228,7 @@ class TopologyConfigTest(unittest.TestCase):
         cases = {
             "SPARK_TP=2\nSPARK_EP=1\n": "must equal SPARK_COUNT",
             "SPARK_TP=5\nSPARK_EP=2\n": "must equal SPARK_COUNT",
-            "SPARK_TP=9\nSPARK_EP=1\n": "SPARK_TP must be in 1..6",
+            "SPARK_TP=9\nSPARK_EP=1\n": "SPARK_TP must be in 1..8",
             "SPARK_EP=4\n": "SPARK_EP must be 1, 2, or 3",
             "SPARK_TP=2\n": "set together or omitted together",
             "SPARK_COUNT=6\nSPARK_TP=3\nSPARK_EP=3\n" + SIX_HOSTS: "must equal SPARK_COUNT",
@@ -216,18 +261,10 @@ class TopologyConfigTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
 
-    def test_compact_exl3_accepts_only_explicit_tp3_ep1(self) -> None:
-        for mode in ("auto", "force"):
-            result = load(f"SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3={mode}\n",
-                          "release_spark_rank_map")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), ["0 0 0", "1 0 1", "2 0 2"])
-        for tp, ep, count, extra in ((2, 1, 2, ""), (3, 2, 6, ""), (4, 1, 4, ""),
-                                      (3, 1, 3, "SPARKINFER_EXL3=disable\n")):
-            with self.subTest(tp=tp, ep=ep, extra=extra):
-                result = load(f"SPARK_COUNT={count}\nSPARK_TP={tp}\nSPARK_EP={ep}\n"
-                              "EXPERT_FORMAT=exl3\nSPARKINFER_EXL3=force\n" + extra)
-                self.assertEqual(result.returncode, 2)
+    def test_flash_exl3_rejects_explicit_topology(self) -> None:
+        result = load("SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=1\nEXPERT_FORMAT=exl3\nSPARKINFER_EXL3=auto\n", "release_spark_rank_map")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires EXPERT_FORMAT=native", result.stderr)
 
     def test_unknown_topology_alias_is_not_accepted(self) -> None:
         result = load("SPARK_GROUPS=2\n", "true")
@@ -243,12 +280,7 @@ class ExampleConfigTest(unittest.TestCase):
             "tp3ep2-native.config": ("6", "3", "2"),
             "tp2ep3-native.config": ("6", "2", "3"),
             "tp6ep1-native.config": ("6", "6", "1"),
-            # V10 candidate profiles. The native one names its explicit keys;
-            # the compact EXL3 one is IMPLICIT (no SPARK_TP/SPARK_EP keys),
-            # so its resolved keys stay empty while SPARK_COUNT=3 activates the
-            # compact TP3 rules.
             "tp3ep1-native.config": ("3", "3", "1"),
-            "exl3-compact-tp3.config": ("3", "", ""),
         }
         # The per-family starting configs (<model>-<quant>-<min|max>.config) are
         # covered by test_example_configs.py; this set is the V4.1 TP x EP layouts.
@@ -276,11 +308,18 @@ class ExampleConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         gpus, layers, count, tp, ep, budget, layer_bytes = result.stdout.splitlines()
         self.assertEqual((gpus, layers, count, tp, ep), ("1", "5", "3", "3", "1"))
-        self.assertEqual(int(layer_bytes), 2406481920)
+        # Native V4.1 uses coded UE8M0 scales, not the raw-scale estimate:
+        # payloads + (base byte + packed K32 deltas) for gate/up and down.
+        hidden, width, experts = 5120, 2304 // 3, 384
+        expected = experts * (hidden * width * 3 // 2
+                              + 2 * width * (1 + 2 * (hidden // 128))
+                              + hidden * (1 + 2 * ((width // 32 + 3) // 4)))
+        self.assertEqual(int(layer_bytes), expected)
+        self.assertEqual(expected, 2338258944)
         self.assertEqual(40 - int(layers), 35)
-        self.assertEqual(40 * int(layer_bytes), 96259276800)
-        self.assertEqual(35 * int(layer_bytes), 84226867200)
-        self.assertEqual(int(budget) - 35 * int(layer_bytes), 24892452864)
+        self.assertEqual(40 * int(layer_bytes), 93530357760)
+        self.assertEqual(35 * int(layer_bytes), 81839063040)
+        self.assertEqual(int(budget) - 35 * int(layer_bytes), 27280257024)
 
     def test_six_host_examples_use_the_connected_fifth_and_sixth_sparks(self) -> None:
         for name in ("tp3ep2-native.config", "tp2ep3-native.config", "tp6ep1-native.config"):
@@ -365,7 +404,7 @@ PREFILL_BATCH_TOKENS=2048
 CONCURRENCY=16
 PREFIX_CACHE_ENTRIES=20
 MAX_CONTEXT_TOKENS=1048576
-MAX_OUTPUT_TOKENS=393216
+MAX_OUTPUT_TOKENS=131072
 HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
@@ -381,7 +420,8 @@ dspark_draft_limit=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
-TP2_DSPARK_EXPERTS=off
+TP2_DSPARK_EXPERTS=
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 topology_explicit={topology_explicit}
 spark_tp={spark_tp}
 spark_ep={spark_ep}
@@ -393,6 +433,8 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+site_hub=0
+namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -412,6 +454,10 @@ shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CU
 shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
+v41_l2_prefetch=
+v41_engram_warm=off
+v41_decode_lanes=
+resolved_decode_lanes=2
 {extra_setup}'''
             setup += '\ncount_plan=\'{"spark_admission":"coordinator_authoritative"}\'\n'
             result = subprocess.run(
@@ -454,8 +500,8 @@ v41_fp8_head_args=()
         self.assertNotIn("--spark-tp", coordinator)
         self.assertNotIn("--spark-ep", coordinator)
         # Worker positional tail ends with topology(explicit,tp,ep) then the
-        # three optional RDMA env values.
-        self.assertTrue(all(args[-8] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
+        # two optional RDMA env values.
+        self.assertTrue(all(args[-7] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
 
     def test_planner_pool_is_forwarded_only_when_selected(self) -> None:
         for setting, expected in [("", None), ("auto", "0"), ("123456", "123456")]:
@@ -494,27 +540,9 @@ v41_fp8_head_args=()
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 4)
         for args in starts:
-            self.assertEqual(args[-8:-5], ["1", "2", "2"])
-            self.assertEqual(args[-9], "4")
+            self.assertEqual(args[-7:-4], ["1", "2", "2"])
+            self.assertEqual(args[-8], "4")
 
-    def test_compact_tp3_startup_keeps_compressed_admission_and_topology(self) -> None:
-        result, events = self.run_startup(
-            gpus=2,
-            plan=dict(version=1, rtx_gpus=2, nonce="fresh", rtx_expert_layers=20, spark_first_layer=20),
-            topology_explicit=1, spark_tp=3, spark_ep=1, spark_count=3,
-            hosts=["a", "b", "c"],
-            extra_setup='model_is_exl3=true\nexpert_format=exl3-k34\n',
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        coordinator = next(args for tool, args in events if tool == "docker" and args[0] == "run")
-        self.assertEqual(coordinator[coordinator.index("--spark-tp") + 1], "3")
-        self.assertEqual(coordinator[coordinator.index("--spark-ep") + 1], "1")
-        self.assertNotIn("--exl3-paired-tp4", coordinator)
-        starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
-        self.assertEqual(len(starts), 3)
-        for args in starts:
-            self.assertEqual(args[-8:-5], ["1", "3", "1"])
-            self.assertEqual(args[-9], "3")
 
     def test_six_rank_explicit_topology_starts_six_workers(self) -> None:
         result, events = self.run_startup(
@@ -530,8 +558,8 @@ v41_fp8_head_args=()
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         self.assertTrue(all("--first-layer" not in args for args in starts))
-        self.assertEqual([args[-9] for args in starts], ["6"] * 6)
-        self.assertEqual([args[-8:-5] for args in starts], [["1", "2", "3"]] * 6)
+        self.assertEqual([args[-8] for args in starts], ["6"] * 6)
+        self.assertEqual([args[-7:-4] for args in starts], [["1", "2", "3"]] * 6)
 
     def test_single_rtx_local_count_publishes_and_hands_off_five(self) -> None:
         # The current official 1-RTX shape on an explicit topology: 5 local
@@ -559,8 +587,8 @@ v41_fp8_head_args=()
         # Worker positional tail: ... first_layer world topology explicit,tp,ep
         for args in starts:
             self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
-            self.assertEqual(args[-9], "6")
-            self.assertEqual(args[-8:-5], ["1", "6", "1"])
+            self.assertEqual(args[-8], "6")
+            self.assertEqual(args[-7:-4], ["1", "6", "1"])
         # The boundary is acknowledged after the workers start.
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
@@ -589,8 +617,8 @@ v41_fp8_head_args=()
         self.assertEqual(len(starts), 3)
         for args in starts:
             self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
-            self.assertEqual(args[-9], "3")
-            self.assertEqual(args[-8:-5], ["1", "3", "1"])
+            self.assertEqual(args[-8], "3")
+            self.assertEqual(args[-7:-4], ["1", "3", "1"])
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -612,7 +640,7 @@ v41_fp8_head_args=()
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-9], "6", args)
+            self.assertEqual(args[-8], "6", args)
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -628,7 +656,7 @@ v41_fp8_head_args=()
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
-        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
+        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1",
              "107374182400", "19441", "snapshot", "fingerprint", "4", "1", "2", "2"],
@@ -667,7 +695,6 @@ v41_fp8_head_args=()
             hosts=["a", "b", "c", "d", "e", "f"],
             extra_env={
                 "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map,
-                "CUTEAFD_VERBS_APP_IB_PORT_NUM": "1",
                 "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "2",
             },
             extra_setup="DSPARK_DRAFT_POLICY=full\ndspark_draft_limit=7\n",
@@ -680,7 +707,7 @@ v41_fp8_head_args=()
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-5:-2], [device_map, "1", "2"])
+            self.assertEqual(args[-4:-2], [device_map, "2"])
 
 
 class VerbsDeviceMapTest(unittest.TestCase):
@@ -755,7 +782,7 @@ class ManifestWriterTest(unittest.TestCase):
     """The built-role manifest must be derived from validated build outputs."""
 
     def role_export(self, root: Path, role: str, *, intermediate: int = 1152, schema: int = 1,
-                    capability=(12, 1), capacities=(1, 16, 80, 256, 1024, 4096),
+                    capability=(12, 1), capacities=(1, 16, 64, 256, 1024, 4096),
                     object_bytes: bytes = b"object-bytes",
                     declared_bytes: bytes | None = None) -> None:
         export = root / f"v41_spark_{role}_experts"
@@ -887,7 +914,7 @@ class BuildScopeTest(unittest.TestCase):
             # The published Spark image is universal: one build serves every
             # approved topology, so an explicit TP3 config must not narrow the
             # built role set to tp3 alone.
-            self.assertIn("V41 Spark expert roles: tp2;tp3;tp6", result.stdout)
+            self.assertIn("V41 Spark expert roles: tp2;tp3;tp5;tp6;tp7;tp8", result.stdout)
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     def test_wip_dry_run_six_host_official_only_scope(self) -> None:
@@ -1420,13 +1447,17 @@ class PublishedImageReferenceTest(unittest.TestCase):
                                         "SPARK_EXPERT_DOCKER_INFERENCE="))
                 )
                 self.assertEqual(values.get("COORDINATOR_DOCKER_INFERENCE"), coordinator)
-                self.assertEqual(values.get("SPARK_EXPERT_DOCKER_INFERENCE"), spark)
-                # One release, one tag: a mixed pair fails the launcher's engine
-                # identity check at startup.
-                self.assertEqual(
-                    values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                    values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
-                )
+                if "SPARK_EXPERT_DOCKER_INFERENCE" not in values:
+                    # RTX-only launchers need no expert image and may reject its key.
+                    self.assertIn("SPARK_COUNT=0", path.read_text().splitlines())
+                else:
+                    self.assertEqual(values["SPARK_EXPERT_DOCKER_INFERENCE"], spark)
+                    # One release, one tag: a mixed pair fails the launcher's engine
+                    # identity check at startup.
+                    self.assertEqual(
+                        values["COORDINATOR_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                        values["SPARK_EXPERT_DOCKER_INFERENCE"].rsplit(":", 1)[1],
+                    )
 
     def test_no_example_pins_an_unpublished_candidate_tag(self) -> None:
         for path in sorted(EXAMPLES.glob("*.config")):
@@ -1476,11 +1507,13 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
+namespace_root=/mnt/sparknest
 host=dodo
 model_is_exl3={exl3}
 exl3_family_tag={family}
 wip_slot={wip_slot}
 HOME={home}
+hf_home="$HOME/.cache/huggingface"
 unset HF_HOME
 """
 
@@ -1500,8 +1533,8 @@ unset HF_HOME
                   wip_slot: str = '""') -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            # HF_HOME is unset below, so the remote resolves the snapshot under
-            # $HOME/.cache/huggingface.
+            # The preflight must receive hf_home explicitly, not depend on an
+            # inherited HF_HOME in its remote shell.
             (home / ".cache/huggingface/hub/models--x--M/snapshots/rev").mkdir(parents=True)
             stub = home / "bin"
             stub.mkdir()
@@ -1547,16 +1580,7 @@ unset HF_HOME
         self.assertNotIn("carries SparkInfer", wip.stderr)
         self.assertIn("Spark host preflight failed on dodo", wip.stderr)
 
-    def test_exl3_family_tag_reaches_the_manifest_path(self) -> None:
-        result = self.preflight(exl3="true", family='"k23"')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("exl3-k23/manifest.json", result.stdout)
-        self.assertNotIn("exl3-/manifest.json", result.stdout)
 
-    def test_empty_family_exl3_launch_uses_the_legacy_manifest(self) -> None:
-        result = self.preflight(exl3="true")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("exl3-/manifest.json", result.stdout)
 
 
 class SparkRoleGateTest(unittest.TestCase):
@@ -1580,7 +1604,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 
     def wip_gate(self, *, roles: list[str], verified: bool = True,
                  corrupt_hash: bool = False, corrupt_host: bool = False,
-                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None,
+                 tp: int = 3) -> subprocess.CompletedProcess[str]:
         block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1617,7 +1642,7 @@ spark_tp_roles_required=tp3
 wip_slot=slot
 wip_spark_container=wip-test
 SPARK_EXPERT_DOCKER_INFERENCE=unused
-''' + f'expert_format={expert_format}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
+''' + f'expert_format={expert_format}\nspark_tp={tp}\nspark_tp_roles_required=tp{tp}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
             return subprocess.run(['bash', '-c', script], cwd=ROOT, text=True,
                                   capture_output=True, timeout=20,
                                   env={**os.environ, 'MOCK_SLOTS': str(root)})
@@ -1626,6 +1651,14 @@ SPARK_EXPERT_DOCKER_INFERENCE=unused
         result = self.wip_gate(roles=['tp3', 'tp6'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('advertised=tp3;tp6', result.stdout)
+
+    def test_wip_accepts_verified_tp8_and_refuses_missing_or_malformed_role(self) -> None:
+        result = self.wip_gate(roles=['tp3', 'tp8'], tp=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for roles in (['tp3'], ['tp3', 'tp9'], ['tp3', 'tpword']):
+            with self.subTest(roles=roles):
+                result = self.wip_gate(roles=roles, tp=8)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_wip_nvfp4_requires_its_own_verified_role(self) -> None:
         result = self.wip_gate(roles=['tp3'], expert_format='nvfp4')

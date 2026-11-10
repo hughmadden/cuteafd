@@ -77,14 +77,49 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError('duplicate EXL3 package variant')
         seen.add(directory)
         meta = json.loads((package / directory / 'v41_exl3.json').read_text())
+        if len(meta['bits']) != 2:
+            raise ValueError(f'EXL3 packages require two decoder tiers: {directory}')
         if meta.get('compute') != manifest['compute']:
             raise ValueError(f'EXL3 variant target differs from package target: {directory}')
-        # Records without a hidden size predate other geometries: they are V4.1.
-        if meta.get('hidden', GEOMETRIES['v41'][0]) != GEOMETRIES[manifest.get('geometry', 'v41')][0]:
+        if manifest.get('geometry') not in GEOMETRIES:
+            raise ValueError('unsupported EXL3 package geometry')
+        if meta.get('hidden') != GEOMETRIES[manifest['geometry']][0]:
             raise ValueError(f'EXL3 variant hidden size does not match the package geometry: {directory}')
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
             if meta[key] != variant[key]:
                 raise ValueError(f'EXL3 variant metadata mismatch: {directory}/{key}')
+        compact = '-compact-' in directory.split('/')[0]
+        contract = (7, 3) if compact else (3, 2)
+        for record in (variant, meta):
+            if (record.get('descriptor_rows', 3), record.get('native_info_version', 2)) != contract:
+                raise ValueError(f'EXL3 variant descriptor contract mismatch: {directory}')
+        if compact:
+            geometry = manifest['geometry']
+            companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
+            widths = {dest: width for _, width, _, _, _, destinations in companions
+                      for dest in destinations}
+            ws = meta.get('warp_specialized', False)
+            cw_tile = (ws_tile(geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                               compact=True) if ws else None)
+            if (manifest['role'] != 'spark'
+                    or widths.get(directory.split('/')[0]) != meta['intermediate']
+                    or len(meta['bits']) != 2
+                    or (meta.get('tile') != (list(cw_tile) if cw_tile is not None else None) if ws
+                        else meta.get('tile') != [64, 128, 64, 128])
+                    or (ws and (not compact_ws_export(geometry, manifest['role'],
+                                                     meta['intermediate'], meta['capacity'],
+                                                     meta['bits'])
+                                or meta.get('route_block', 8) != compact_ws_route_block(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'])
+                                or meta.get('ws_dynamic_tiles', False) != ws_dynamic_tiles(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                                    compact=True)
+                                or meta.get('ws_input_stages') is not None
+                                or meta.get('token_major_rotation', False)
+                                or meta.get('fused_input_rotation', False)))
+                    or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
+                    or meta.get('input_format', 'bf16') != 'bf16'):
+                raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
             raise ValueError('EXL3 variant residency metadata mismatch')
         # A variant's tile is a claim about the geometry that was compiled, not a
@@ -105,17 +140,19 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         # Absent means the original 8-row packed-route block.
         if variant.get('route_block', 8) != meta.get('route_block', 8):
             raise ValueError(f'EXL3 variant route block mismatch: {directory}')
-        if variant.get('fused_input_rotation', False) != meta.get('fused_input_rotation', False):
-            raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
+        if variant.get('ws_dynamic_tiles', False) != meta.get('ws_dynamic_tiles', False):
+            raise ValueError(f'EXL3 variant dynamic tile claim mismatch: {directory}')
+        if variant.get('ws_input_stages') != meta.get('ws_input_stages'):
+            raise ValueError(f'EXL3 variant input stage mismatch: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
-        # A schedule variant lives in m<capacity>-<schedule> and its export
-        # records the options; a default directory records none.
+        # The variant records its exact compiled schedule, including defaults.
+        # Explicit schedule siblings must still carry a schedule and suffix.
         schedule = variant.get('schedule')
         if (variant.get('decode_schedule') != meta.get('decode_schedule')
-                or (schedule is None) != (meta.get('decode_schedule') is None)
+                or (schedule is not None and meta.get('decode_schedule') is None)
                 or directory.rsplit('/', 1)[-1] != f"m{meta['capacity']}"
                 + ('' if schedule is None else f'-{schedule}')):
             raise ValueError(f'EXL3 variant decode schedule mismatch: {directory}')
@@ -224,8 +261,6 @@ def install_package(source: Path, output: Path) -> None:
 # Routed-expert geometries the EXL3 packages can target: (hidden, intermediate,
 # experts, top-k). The names match cuteafd_core::ExpertGeometry::family.
 GEOMETRIES = {
-    'v41': (5120, 2304, 384, 6),
-    'dsv4f': (4096, 2048, 256, 6),
     'dsv4p': (7168, 3072, 384, 6),
     'glm': (6144, 2048, 256, 8),
     # GLM 5.3 Flash (glm5_next): 288 experts, SwiGLU clamped at 10.
@@ -233,128 +268,351 @@ GEOMETRIES = {
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
     'kimik3': (3584, 3072, 896, 16),
+    # Muse Spark: TP intermediate slices at the 4096-wide expert stream.
+    'muse': (4096, 4096, 256, 8),
+    # Mistral Large 4 (mistral_large4): 128 experts, softmax top-4, unclamped SiLU.
+    'ml4': (6144, 6144, 128, 4),
+    # Step-5: 352 experts, top-8, post-SiLU clamp at 7 (K4 experts, K6 tails 88-90).
+    'step5': (4096, 1536, 352, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None}
+# Activation per geometry, mirroring cuteafd_core::ExpertGeometry::activation.
+ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp'}
 
 
 def activation(geometry: str) -> str:
-    return 'situ' if geometry == 'kimik3' else 'silu'
+    return ACTIVATIONS.get(geometry, 'silu')
 
 
 def swiglu_limit(geometry: str) -> float | None:
     return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
-def route_block(geometry: str, capacity: int) -> int:
-    """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
-
-    V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
-    (H7168, 384 experts, top-6: ~64 rows per expert at 4096 rows) re-decodes every
-    weight tile once per 8 rows, so wide prefill capacities use wider blocks
-    (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
-    m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
-    fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
-    gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
-    """
-    # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
+def route_block(geometry: str, capacity: int, role: str) -> int:
+    """Cooperative decode and the remaining V4 Pro/Kimi prefill recipes."""
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
     if str(capacity) in override:
         return int(override[str(capacity)])
-    if geometry == 'qwen4':
-        return qwen4_route_block(capacity)
-    if geometry in ('glm', 'glmf'):
-        return glm_route_block(capacity)
-    if geometry != 'dsv4p' or capacity <= 256:
-        return 8
-    return 16 if capacity <= 1024 else 64
+    if role == 'coordinator':
+        if geometry == 'dsv4p' and capacity == 2048:
+            return 64
+    return 8
 
 
-def glm_route_block(capacity: int) -> int:
-    """GLM (256 experts, top-8): 8 * capacity routes, capacity / 32 rows per
-    expert on average. Measured on the coordinator rtx-tp1 package (RTX PRO
-    6000, width 2048, random top-8 routes, us): m80 8/16/32 = 2885/2905/2980;
-    m256 8/16/32/64 = 3265/3205/3260/3325; m1024 16/32/64 = 5650/4530/3910;
-    m4096 32/64 = 13820/11790 (64 with token-major rotation 11470). m256
-    keeps 8 rows (16 is 1.9% faster on the RTX, but its Spark TP3 width-640
-    kernel resolves a residency the native bridge does not take).
-    """
-    return 8 if capacity <= 256 else 64
+def token_major_rotation(geometry: str, capacity: int, role: str) -> bool:
+    """Token rotation only for surviving cooperative coordinator prefill."""
+    return role == 'coordinator' and geometry == 'dsv4p' and capacity == 2048
 
 
-def qwen4_route_block(capacity: int) -> int:
-    """Qwen 3.8 Flash Next (512 experts, top-10): 10 * capacity routes, capacity / 51
-    rows per expert on average. Coordinator rtx-tp1 package (RTX PRO 6000, width
-    640, random top-10 routes, layer 23, median us): 8-row blocks m1024 2315,
-    m4096 11626; 64: m1024 1401, m4096 3489; 32: m256 1002 (8: 1023), m1024 1168,
-    m4096 3273 (min 3176 vs 3451). m256 with 16 fails the cooperative grid check.
-    """
-    return 8 if capacity <= 80 else 32
+# Warp-specialized tile with 128-wide FC1 N tiles and a 256-wide FC2: every
+# coordinator rank width and hidden size is a whole 128 tiles, so FC1 never
+# straddles a live edge while FC2 halves the FC2 N tile count.
+TILE_RTX_MIXED = (64, 128, 64, 256)
+
+# The S1/S4 arm as it exports on SM120: 128-wide FC1/256-wide FC2 tiles with
+# dynamic tile claims, 32-row route blocks at m256 and 64 rows above it.
+_WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
+_WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
+# Prerotated 256-wide FC1 arm: the WS kernel hoists the token-major rotation
+# ahead of the block loop and keeps dynamic claims with 64-row route blocks.
+# The hoist is the SparkInfer default on SM120 only; SM121 (GB10) exports rotate
+# in tile, which measures 1.05-1.53x faster on every Spark WS cell (#912).
+_WS_K3_PREROTATE = dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256))
+
+# Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
+# (geometry, width, capacity): the measured options each cell carries, against
+# the export the coordinator shipped before it. See `warp_specialized`.
+COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
+    ('glm', 1024, 256): dict(route_block=64, wire=True, stages=3, dynamic=True),
+    ('glm', 1024, 1024): dict(route_block=64, dynamic=True),
+    ('glm', 1024, 2752): dict(route_block=64),
+    ('glm', 1024, 2048): dict(route_block=64),
+    ('glm', 1024, 4096): dict(route_block=64, dynamic=True),
+    ('glm', 2048, 256): dict(route_block=64, dynamic=True),
+    ('glm', 2048, 4096): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 256): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 1024): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 2752): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 4096): dict(route_block=64, dynamic=True),
+    ('glmf', 1024, 2048): dict(route_block=64),
+    ('glmf', 2048, 256): dict(route_block=64),
+    ('dsv4p', 1536, 4096): dict(route_block=64, dynamic=True),
+    # Qwen 3.8 Flash Next wins at every served capacity, both RTX splits.
+    ('qwen4', 640, 256): _WS_S14_M256,
+    ('qwen4', 384, 256): _WS_S14_M256,
+    ('qwen4', 256, 256): _WS_S14_M256,
+    ('qwen4', 640, 1024): _WS_S14,
+    ('qwen4', 384, 1024): _WS_S14,
+    ('qwen4', 256, 1024): _WS_S14,
+    ('qwen4', 640, 2752): _WS_S14,
+    ('qwen4', 640, 2048): _WS_S14,
+    # TP2 rank0: N192 wins both exact prefill units on random and recorded routes.
+    ('qwen4', 384, 2752): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 384, 2048): dict(route_block=64, dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256, 2752): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 256, 2048): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('qwen4', 640, 4096): _WS_S14,
+    ('qwen4', 384, 4096): _WS_S14,
+    ('qwen4', 256, 4096): _WS_S14,
+    # V4.1 EXL3 wins from m1024 up; m256 stays cooperative (0.77-0.84x).
+    # Kimi K3 ships the warp-specialized kernel on every coordinator prefill
+    # export (TJ 2026-10-29, kernel-tie rule): the prerotated 256-wide FC1 arm
+    # ties the cooperative 64-row token-major rotation at m1024-m2752 (geomean
+    # 1.005, inside round spread) and wins 1.25-1.40x above 2752, where wave
+    # merging hands one 4096/5504/8256-row packed extent to the kernel.
+    # Interleaved duel session, GPU0 pinned 450 W, 32 exact fixtures with
+    # every poisoned prefix and graph replay: rtx-tp1 1.297x m4096, rtx-tp2
+    # 1.392x; m5504 1.32/1.25x and m8256 1.32/1.26x. The arm hoists FC1's
+    # token-major rotation ahead of the block loop and keeps dynamic claims
+    # with 64-row route blocks.
+    #
+    # Every prefill capacity takes it, m256 included, so the kernel sees one
+    # recipe from a short prompt to a merged three-wave extent. The two decode
+    # capacities (m1, m80) stay cooperative: `Exl3ReductionPlan` freezes their
+    # manifest tile, route block and kernel class as the reduction geometry of
+    # every decode row, so moving them would hand C1 decode the prefill kernel
+    # with 256-wide FC1 tiles. The duel's floor is m1024, so that assignment is
+    # unmeasured, and no other family routes a decode capacity through WS.
+    ('kimik3', 3072, 256): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 256): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 1024): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 1024): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 2048): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 2048): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 2752): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 2752): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 4096): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 5504): _WS_K3_PREROTATE,
+    ('kimik3', 3072, 8256): _WS_K3_PREROTATE,
+    ('kimik3', 1536, 8256): _WS_K3_PREROTATE,
+    # ML4 K4/empty-K5, 2026-11-01: 1.036x even / 1.060x synthetic-skew.
+    # Confirmed PRO 6000: 1.05-1.07x (#924 comment 6566325329); exact cell only.
+    ('ml4', 3072, 2752): _WS_K3_PREROTATE,
+}
 
 
-def token_major_rotation(geometry: str, capacity: int) -> bool:
-    """Whether a capacity rotates each token's input once for all of its routes.
-
-    Bit-identical to per-route rotation. It pays where the rotation phase is
-    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
-    """
-    if geometry in ('glm', 'glmf', 'qwen4'):
-        # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
-        return capacity > 256
-    return geometry == 'dsv4p' and capacity > 1024
+# ABI8 RTX screen (#862), GPU0 at 450 W: TP1 m256 0.8335-0.8968x,
+# m2048 0.9494-0.9495x. Main retains only these cooperative prefill cells;
+# other noisy cells inherit the WS decision from their measured neighbours.
+COOPERATIVE_PREFILL_CELLS = {('dsv4p', 3072, 256), ('dsv4p', 3072, 2048)}
 
 
-def fused_input_rotation(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Whether FC1 rotates staged token rows in shared memory (no per-route
-    rotated copies). Bit-identical; every FC1 N tile of a block rotates it
-    again, so it pays only while few 256-wide tiles share a projection half.
-    GB10, TP4 random routes, per layer (b12x ccf9e3cd): V4 Pro width 512
-    m4096 19.1 -> 16.5 ms, 768 22.7 -> 21.9, 1024 neutral, 1536 +10%;
-    GLM width 512 m1024 8.9 -> 7.3, m4096 22.6 -> 18.3, 768 -11%, 1024 -6%,
-    640 (128-wide tiles) +16%. V4 Pro m1024 (16-row blocks) is neutral.
-    GLM 5.3 Flash (b12x be78fa4c, m1024 / m2048 / m4096 ms): width 512
-    5.41 -> 4.49, 7.93 -> 6.60, 13.77 -> 11.22; 768 7.01 -> 6.60,
-    9.93 -> 8.92, 16.42 -> 15.71; 1024 8.47 -> 8.27, 11.74 -> 11.41,
-    19.36 -> 19.64, so width 1024 keeps its m4096 package on token-major.
-    The coordinator's full-width packages are not measured and stay off.
-    """
-    if role != 'spark' or width % 256:
-        return False
-    if geometry == 'dsv4p':
-        return width <= 768 and capacity > 1024
-    if geometry == 'glm':
-        return width <= 1024 and capacity > 256
-    if geometry == 'glmf':
-        return capacity > 256 and (width <= 768 or (width == 1024 and capacity <= 1024))
-    return False
+def coordinator_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    """Measured coordinator warp-specialized options for one export cell."""
+    if role != 'coordinator':
+        return None
+    if capacity <= 80 or (geometry, width, capacity) in COOPERATIVE_PREFILL_CELLS:
+        return None
+    measured = COORDINATOR_WS_CELLS.get((geometry, width, capacity))
+    # Kimi RTX is owned by its separately measured kernel integration.
+    if geometry == 'kimik3':
+        return measured
+    if measured is not None:
+        return measured
+    # A provisional ML4 rank is evidence for one capacity, not its neighbours.
+    if geometry == 'ml4':
+        return _WS_S14_M256 if capacity <= 256 else _WS_S14
+    # Preserve measured cells; extend the nearest same-width WS recipe first.
+    candidates = [(abs(c - capacity), options) for (g, w, c), options
+                  in COORDINATOR_WS_CELLS.items() if g == geometry and w == width]
+    if candidates:
+        return min(candidates, key=lambda item: item[0])[1]
+    return _WS_S14_M256 if capacity <= 256 else _WS_S14
+
+
+# Ordinary GB10 prefill cells qualified against shipped family controls (#762).
+SPARK_WS_CELLS = {
+    ('qwen4', 640): dict(dynamic=False, tile=(64, 128, 64, 128)),
+    ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
+    ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
+    ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    # Muse K4, 2026-11-01 GB10: all low/median/high-Gini route fixtures
+    # and random routes improve with exact expert-partial replies (#923).
+    # Only measured capacities qualify; unresolved cells retain their controls.
+    ('muse', 1024, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 896, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 768, 256): dict(route_block=32, dynamic=True, tile=(64, 256, 64, 256)),
+    # S4 duel round 0, GB10 2026-11-04, recorded layer-22 Muse routes, two
+    # layers, median of three: dynamic tiles win m1024 4776 -> 4678 us (1.021x,
+    # control spread 0.08%); m2048..m4096 tie within noise and keep the control.
+    ('muse', 768, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    # S4 duel round 0, GB10 2026-11-04, recorded layer-22 Muse routes, two
+    # layers, median of three: m2048 wants the 256-wide FC2 N tile (the width
+    # default is 128/128 here because 640 % 256 != 0), 7709 -> 7468 us (1.032x,
+    # identical-control spread 1.3%; dynamic tiles at the default 128-wide N
+    # are 1.007x there). The neighbouring cells already carry this recipe and
+    # confirm it over their 128/128 default: m256 1.012x, m1024 1.024x, m2752
+    # 1.035x, m4096 1.010x.
+    ('muse', 640, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    # ML4 K4/empty-K5, GB10 2026-11-01: exact synthetic-skew-qualified cells;
+    # real-route confirmation pending. No extrapolation across rows or widths.
+    # S4 duel round 0, GB10 2026-11-04, recorded route histograms (layer 0),
+    # two layers, median of three: the static control loses to this recipe at
+    # the two cells that had no entry, m1024 6426 -> 6320 us (1.017x) and m4096
+    # 13580 -> 12904 us (1.052x), both bit-identical.
+    ('ml4', 1024, 256): _WS_K3_PREROTATE,
+    ('ml4', 1024, 1024): _WS_K3_PREROTATE,
+    ('ml4', 1024, 2048): _WS_K3_PREROTATE,
+    ('ml4', 1024, 2752): _WS_K3_PREROTATE,
+    ('ml4', 1024, 4096): _WS_K3_PREROTATE,
+    ('ml4', 1152, 256): _WS_S14,
+    ('ml4', 1152, 1024): _WS_S14,
+    ('ml4', 1152, 2752): _WS_S14,
+    ('ml4', 1152, 4096): _WS_S14,
+    ('ml4', 1280, 256): _WS_K3_PREROTATE,
+    ('ml4', 1280, 2752): _WS_K3_PREROTATE,
+    ('ml4', 1280, 4096): _WS_K3_PREROTATE,
+    ('ml4', 896, 256): _WS_S14,
+    ('ml4', 896, 1024): _WS_S14,
+    ('ml4', 896, 2752): _WS_S14,
+    ('ml4', 768, 256): _WS_K3_PREROTATE,
+    ('ml4', 768, 2048): _WS_K3_PREROTATE,
+    ('ml4', 768, 2752): _WS_K3_PREROTATE,
+    ('ml4', 768, 4096): _WS_K3_PREROTATE,
+    # Step-5 K4/K6, GB10 2026-11-01: random and synthetic Gini .4/.7/.8,
+    # exact against each tier's control; K6 ties within measured noise pass.
+    # Real-route confirmation is pending; other capacities keep their controls.
+    ('step5', 256, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+    # S4 duel round 0, GB10 2026-11-04, recorded route histograms (layer 0),
+    # K4/K6 tiers, two layers, median of five rounds: the 256-wide FC1 tile
+    # keeps the width-256 default and only the tile claims change, m4096
+    # 7170 -> 6945 us (1.032x, control spread 0.15%); m2752 ties (1.004x) and
+    # m1024/m2048 keep the static control.
+    ('step5', 256, 4096): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('step5', 384, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+    ('step5', 384, 1024): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+}
+
+
+def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
+    if role != 'spark' or capacity <= 80:
+        return None
+    return SPARK_WS_CELLS.get((geometry, width, capacity), SPARK_WS_CELLS.get((geometry, width)))
+
+
+def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
+    """Packed-route M block of a warp-specialized prefill export (see
+    `warp_specialized`); every cell whose measured arm split the block by
+    capacity carries its own row count here."""
+    cell = (coordinator_ws_cell(geometry, role, width, capacity)
+            or spark_ws_cell(geometry, role, width, capacity))
+    return cell.get('route_block', 64) if cell else 64
 
 
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Whether a capacity exports the warp-specialized prefill kernels (b12x
-    mixed_trellis_ws, 64-row route blocks): producer warps stream the Trellis
-    weights and input rows and rotate FC1 inputs one block ahead, consumer
-    warps decode and multiply. Bit-identical to the cooperative kernel.
-    Faster than the cooperative exports at every Spark width and prefill
-    capacity measured (GB10, random routes, kernel + top-k sum, median of
-    three interleaved runs, ms): V4 Pro TP4 768 m1024 11.16 -> 8.36, m4096
-    21.98 -> 17.27; GLM 5.3 TP4 512 m1024 7.23 -> 6.67, m4096 18.24 ->
-    14.60; GLM 5.3 Flash TP4 512 m4096 11.03 -> 9.07, TP2 1024 m4096 19.32
-    -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
-    GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
-    keep the cooperative kernel.
-    """
-    if role != 'spark' or geometry not in ('dsv4p', 'glm', 'glmf'):
+    """WS prefill except two measured V4 Pro losses; cooperative decode."""
+    if role == 'coordinator' and (geometry, width, capacity) in COOPERATIVE_PREFILL_CELLS:
         return False
-    return capacity >= 256
+    if geometry == 'kimik3' and role == 'coordinator':
+        return coordinator_ws_cell(geometry, role, width, capacity) is not None
+    return role in ('coordinator', 'spark') and capacity > 80
+
+
+# Measured compact warp-specialized cells on GB10 (SM121), keyed by
+# (geometry, width): each qualified capacity maps to its measured
+# (route block, FC1 N tile). The packaged compact profile carries 256, 1024
+# and 4096, and 2752 is the planner's intermediate prefill unit. Unlisted
+# capacities inherit the nearest recipe; unlisted widths use an N128 fallback.
+COMPACT_WS_CELLS = {
+    # V4 Pro TP5 has its own N128 recipe: the retired V4.1 N192 masked-tail
+    # measurement does not qualify this geometry.
+    ('dsv4p', 640): {256: (32, 128), 1024: (64, 128), 2048: (64, 128), 2752: (64, 128), 4096: (64, 128)},
+    # GLM 5.3 K4/K5 TP6 width 384. Round 2 (same-session A/B against the
+    # cooperative oracle and the entrant's N192 arm) found the 192-wide FC1
+    # tile wins from m1024 up: m4096 23.019 -> 13.023 ms N128 (1.768x) /
+    # 12.538 N192 (1.836x), m2752 16.646 -> 9.342 / 9.040, m1024 7.836 ->
+    # 4.627 / 4.601; at m256 the 32-row N128 arm stays best (4.351 -> 3.408,
+    # 1.277x, vs 3.413 for N192).
+    ('glm', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # GLM 5.3 TP3 width 768: N192 wins from m1024 up (m4096 31.624 -> 22.012 /
+    # 21.206, m2752 23.474 -> 15.701 / 15.361, m1024 11.384 -> 8.297 / 8.237);
+    # m256 keeps the 64-row N128 arm (7.492 -> 6.527 vs 6.541 for N192).
+    ('glm', 768): {256: (64, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # V4.1 K3/K4 TP4 width 640 (the only uneven V4.1 world): the 32-row block
+    # wins m256/m1024 and the 64-row block m2752/m4096. Round 2 of the Spark
+    # duel measured a non-divisible 192-wide FC1 tile here (640 = 2 x 320-row
+    # halves -> 2 x 192-wide tiles with a 128-column masked tail, uniform
+    # top-6) faster than N128 at m256/m1024/m2752 (5.594 vs 5.630, 6.630 vs
+    # 6.766, 9.942 vs 10.093 ms) and slower at m4096 (13.868 vs 13.831), so
+    # N192 takes the three smaller capacities and m4096 keeps N128.
+    # Qwen4 K4/K5 TP2 compact width 384: N192 wins m1024/m2752 (3.141 vs
+    # 3.159, 5.549 vs 5.596) and ties m4096 (7.570 vs 7.559), so the large
+    # capacities consolidate onto the same N192/64 arm as the GLM cells; only
+    # m256 keeps N128 with 32 rows (1.933 vs 1.938 for N192, and 1.978 for
+    # the 64-row arm).
+    ('qwen4', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # TP3 and TP4 compact share width 256; one table entry serves both and
+    # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
+    # m256 1.334x vs 1.327x). Width 256 also rejects a 192-wide tile.
+    ('qwen4', 256): {256: (64, 128), 1024: (64, 128), 2048: (64, 128), 2752: (64, 128), 4096: (64, 128)},
+    # GLM Flash K3/K4 TP6 width 384: N192 from m1024 up (m4096 14.390 ->
+    # 8.526 / 8.307, m2752 10.108 -> 6.438 / 6.241, m1024 4.779 -> 3.175 /
+    # 3.062); m256 keeps 32-row N128 (2.814 -> 2.171 vs 2.177).
+    ('glmf', 384): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+    # GLM Flash TP3 width 768: N192 from m1024 up (m4096 20.085 -> 14.542 /
+    # 13.928, m2752 14.319 -> 11.093 / 10.848, m1024 6.792 -> 5.645 / 5.405);
+    # m256 keeps 32-row N128 (4.804 -> 4.140 vs 4.136).
+    ('glmf', 768): {256: (32, 128), 1024: (64, 192), 2048: (64, 192), 2752: (64, 192), 4096: (64, 192)},
+
+}
+def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
+    """Compact two-tier prefill shares the ordinary WS execution class."""
+    return role == 'spark' and capacity > 80
+
+
+def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
+                      bits: list[int]) -> bool:
+    return len(bits) == 2 and compact_warp_specialized(geometry, role, width, capacity)
+
+
+def compact_ws_cell(geometry: str, width: int, capacity: int) -> tuple[int, int]:
+    cells = COMPACT_WS_CELLS.get((geometry, width))
+    if cells:
+        return cells[min(cells, key=lambda c: abs(c - capacity))]
+    # A same-width measured recipe is preferable to a geometry-specific guess.
+    peers = [cells for (g, w), cells in COMPACT_WS_CELLS.items() if w == width]
+    if peers:
+        cells = peers[0]
+        return cells[min(cells, key=lambda c: abs(c - capacity))]
+    return (32 if capacity <= 256 else 64, 128)
+
+
+def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
+    return (compact_ws_cell(geometry, width, capacity)[0]
+            if compact_warp_specialized(geometry, role, width, capacity) else None)
+
+
+def compact_ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+    if not compact_warp_specialized(geometry, role, width, capacity):
+        return None
+    n = compact_ws_cell(geometry, width, capacity)[1]
+    return (64, n, 64, 256)
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
 # multiples of 128 and multiples of 192 (GLM 5.3 TP6 width 384).
 TILE_384 = (64, 192, 64, 256)
+# Compact widths are live at 256/384 H128 blocks, so FC1 keeps 128-wide N
+# tiles (a 192 tile straddles the live edge); FC2 widens over hidden size.
+TILE_384_COMPACT = (64, 128, 64, 256)
+# The measured 192-wide compact FC1 tile: only the cells whose width is a
+# whole multiple of 192 and whose large capacities were measured with it.
+TILE_384_COMPACT_N192 = (64, 192, 64, 256)
 
 
-def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
+def wire_input(geometry: str, role: str, width: int, capacity: int, *,
+               compact: bool = False) -> bool:
     """Whether a warp-specialized export reads the FP8 E4M3 + UE8M0 K32 wire
     rows itself (the worker then skips its BF16 decode pass and FC1 gathers
     half the bytes). Bit-identical. One of the GLM 5.3 GB10 changes below.
@@ -365,65 +623,95 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     (with the 192-wide tile); 256 9.04 / 10.15 -> 7.34 / 9.36. Four input
     stages instead of three lose 0.2-0.8 ms at every width on K4/K5. Measured on
     GLM 5.3 only: GLM 5.3 Flash and V4 Pro keep the former exports until measured.
+
+    SM120 RTX PRO 6000, 2026-10-24, width1024 m256: cooperative 1737.66 us
+    -> wire/stage3/dynamic 1516.48 us (1.146x random, 1.204x median paired
+    across 72 histograms), conditions in `warp_specialized`. At m1024 wire
+    loses on random (0.927x); wider coordinator profiles keep BF16 input.
     """
+    if compact:
+        return False
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('wire'))
+    if role == 'spark' and width in (384, 640) and capacity in (2048, 2752):
+        return False
     return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
 
 
-def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
+def ws_input_stages(geometry: str, role: str, width: int, capacity: int, *,
+                    compact: bool = False) -> int | None:
     """Input-row ring depth of the Spark warp-specialized exports: GB10 gathers
     the routed rows from LPDDR5X at high latency, and four stages (the ring the
     weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
     tiers three stages measure faster than four (see `wire_input`). Bit-identical.
+    Compact widths keep the resolved default: wire input loses at width 384
+    (see `compact_warp_specialized`), so its stages stay off too.
     """
-    return 3 if geometry == 'glm' and warp_specialized(geometry, role, width, capacity) else None
+    if compact:
+        return None
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('stages') if cell else None
+    return 3 if wire_input(geometry, role, width, capacity) else None
 
 
-def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
+def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
+                     compact: bool = False) -> bool:
     """Whether Spark warp-specialized exports claim tiles dynamically. With the
     static round-robin an expert's route blocks start on different CTAs at
     different times and each streams the expert's weights from LPDDR5X (ncu,
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
     Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
+    Compact width 384 takes them at every qualified capacity: m4096
+    13.89 -> 12.94 ms, m2752 10.07 -> 9.53, m1024 5.16 -> 4.99, and m256 ties
+    its static arm at 3.81 (see `compact_warp_specialized`).
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    if compact:
+        return compact_warp_specialized(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return bool(cell and cell.get('dynamic'))
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['dynamic']
+    if (role == 'spark' and capacity in (2048, 2752)
+            and ((geometry == 'glm' and width in (384, 640))
+                 or (geometry == 'glmf' and width in (256, 384, 512, 640, 768, 1024)))):
+        return True
+    return wire_input(geometry, role, width, capacity)
 
 
-def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
+            compact: bool = False) -> tuple[int, ...] | None:
     """Warp-specialized tile for widths that are odd multiples of 128, which
     the B12x policy gives 128-wide tiles on both stages (four consumer warps).
     Bit-identical (the N tiling does not change any accumulation). Width 384
     (GLM 5.3 TP6 ranks 0-3) takes 192-wide FC1 tiles: m4096 14.89 -> 12.8 ms.
+    Compact ownership keeps FC1 at 128 except in the measured cells where the
+    192-wide tile wins from m1024 up (`compact_ws_tile`), and widens FC2 over
+    the unchanged hidden size.
     """
+    if compact:
+        return compact_ws_tile(geometry, role, width, capacity)
+    if role == 'coordinator':
+        cell = coordinator_ws_cell(geometry, role, width, capacity)
+        return cell.get('tile') if cell else None
+    if (cell := spark_ws_cell(geometry, role, width, capacity)) is not None:
+        return cell['tile']
+    if ((geometry, role, width) == ('glmf', 'spark', 384)
+            and capacity in (2048, 2752)):
+        return TILE_384
+    if ((geometry, role, width) == ('glmf', 'spark', 640)
+            and capacity in (2048, 2752)):
+        return TILE_RTX_MIXED
+    # GB10 w640: FC2 N256 wins 2.2-5.0% at m1024..m4096; FC1 stays N128.
+    if ((geometry, role, width) == ('glm', 'spark', 640)
+            and capacity in (1024, 2048, 2752, 4096)):
+        return TILE_RTX_MIXED
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
     return TILE_384
-
-
-# Decode capacities ship the tile m1 ships. B12x's mixed-Trellis planner widens
-# the tile of 10..32-row batches to (128,128,128,128) (`_projection_mixed_tile_config`
-# with no direct top-k routes, which no packaged EXL3 geometry uses). The tile is
-# part of the reduction signature a decode plan admits, so a widened decode export
-# can never be selected: rows in its range fall through to the next capacity, and
-# the export ships as dead weight (#309). Re-exporting it with the canonical tile is
-# what makes the capacity selectable again. Enabled for the geometry whose decode
-# capacities are measured; the other geometries carry the same B12x policy and can
-# be added here with their own gate run.
-DECODE_TILE_PIN = ('v41',)
-
-
-def decode_tile(geometry: str, width: int, capacity: int) -> tuple[int, ...] | None:
-    """Canonical m1 tile for a decode capacity the B12x planner would widen.
-
-    The canonical tile is the planner's own prefill/default answer at this width,
-    which is what m1 and every capacity above the widened window already compile:
-    tile_n is 256 when both the rank's intermediate width and the geometry's hidden
-    size are whole 256 tiles, 128 otherwise.
-    """
-    if geometry not in DECODE_TILE_PIN or not 10 <= capacity <= 32:
-        return None
-    tile_n = 256 if width % 256 == 0 and GEOMETRIES[geometry][0] % 256 == 0 else 128
-    return (64, tile_n, 64, tile_n)
 
 
 # Decode-schedule variants: a capacity directory m<capacity>-<name> beside the
@@ -446,6 +734,81 @@ DECODE_SCHEDULES = {
 }
 
 
+PURE_EVICT_FIRST = 'l2=2,pf1=0,pf2=0,pdl=1'
+
+
+# Decode tile/occupancy of the Spark TP6 cells measured in the S4 selection
+# audit. GB10, one TP6 rank slice, real expert count and random top-k routes,
+# the shipping K4/empty-second-tier layout, two layers, three alternating
+# rounds of 20 replays, rows 1..80, bit-identical output at every screened row.
+# The b12x gb10 m80 recipe -- 64x128 tiles at two CTAs per SM plus the pure
+# evict-first L2 hint -- beats the cooperative default at both capacities the
+# worker uses (m1 for one row, m80 for 2-80 rows). ms default -> recipe
+# (ratio, rows 1 and 80): ML4 w1024 0.174/4.831 -> 0.168/4.693 (1.036/1.029x,
+# 1.071x at two rows); Muse w768 0.180/4.582 -> 0.170/4.538 (1.056/1.010x,
+# the hint alone 1.015x at eighty rows); Muse compact w768 0.189/4.814 ->
+# 0.162/4.605 (1.164/1.045x); Step-5 w256 0.073/2.181 -> 0.057/2.064
+# (1.279/1.057x). The hint alone is 1.015..1.059x. Muse w640 needs a 128-wide
+# tile (its 640-row FC1 projection cannot split into 256-wide N tiles), keeps
+# it, and gains 1.090/1.040x from the occupancy and hint (0.159/3.975 ->
+# 0.146/3.824 ms).
+SPARK_DECODE_CELLS = {
+    ('ml4', 'tp6-width1024', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-width768', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-width640', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                          tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('muse', 'tp6-compact-width768', (4, 5)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                                  tile=(64, 128, 64, 128), blocks_per_sm=2),
+    ('step5', 'tp6-width256', (4, 6)): dict(decode_schedule=PURE_EVICT_FIRST,
+                                           tile=(64, 128, 64, 128), blocks_per_sm=2),
+}
+
+
+def spark_decode_cell(geometry: str, role: str, profile: str, capacity: int,
+                      bits: list[int]) -> dict | None:
+    """Measured default decode recipe of a Spark TP6 cell; None keeps the control."""
+    if role != 'spark' or capacity not in (1, 80):
+        return None
+    return SPARK_DECODE_CELLS.get((geometry, profile, tuple(bits)))
+
+
+def default_decode_schedule(geometry: str, role: str, profile: str,
+                            capacity: int, bits: list[int]) -> str | None:
+    """Only measured cooperative profiles use the pure streaming hint.
+
+    GB10, default/control/hint, three alternating rounds, rows 1..80: GLM
+    compact TP6 1.054..1.123x (control .997..1.002); Flash TP4 1.027..1.082x
+    (.997..1.001); Qwen compact TP4 1.003..1.094x (1.000..1.004); Kimi TP6
+    1.020..1.107x (.991..1.004). Compact m16 rows 2/4/8/16: GLM
+    1.067..1.119x (.995..1.003), Qwen 1.019..1.083x (.989..1.002).
+    RTX TP2 m1/m80: Flash median 1.015..1.144x (control .995..1.016),
+    GLM median 1.014..1.037x (.999..1.005), finite normalized fixtures.
+    Those hint-only arms leave tiles, occupancy and arithmetic unchanged. The
+    Spark TP6 cells of the S4 selection audit (`SPARK_DECODE_CELLS`) also pin
+    their tile and occupancy, so this reports their hint too.
+    """
+    measured = {
+        ('glm', 'tp6-compact-width384', (4, 5)),
+        ('glmf', 'tp4-width512', (3, 4)),
+        ('qwen4', 'tp4-compact-width256', (4, 5)),
+        ('kimik3', 'tp6-width512', (2, 3)),
+    }
+    identity = (geometry, profile, tuple(bits))
+    measured_m16 = {('glm', 'tp6-compact-width384', (4, 5)),
+                    ('qwen4', 'tp4-compact-width256', (4, 5))}
+    if role == 'spark' and ((capacity in (1, 80) and identity in measured)
+                            or (capacity == 16 and identity in measured_m16)):
+        return PURE_EVICT_FIRST
+    measured_rtx = {('glm', 'rtx-tp2', (4, 5)), ('glmf', 'rtx-tp2', (3, 4))}
+    if role == 'coordinator' and capacity in (1, 80) and identity in measured_rtx:
+        return PURE_EVICT_FIRST
+    if (cell := spark_decode_cell(geometry, role, profile, capacity, bits)) is not None:
+        return cell['decode_schedule']
+    return None
+
+
 def decode_schedule_variants(geometry: str, role: str, profile: str,
                              capacity: int) -> list[tuple[str, dict]]:
     """(name, export options) of every decode-schedule variant of one export."""
@@ -460,7 +823,7 @@ def decode_schedule_variants(geometry: str, role: str, profile: str,
 def package_name(geometry: str, bits: list[int]) -> str:
     """Package directory for one tier family; mirrors the daemon's resolver."""
     tag = ''.join(map(str, bits))
-    return f'exl3-k{tag}' if geometry == 'v41' else f'exl3-{geometry}-k{tag}'
+    return f'exl3-{geometry}-k{tag}'
 
 
 def shard_profiles(geometry: str, role: str) -> list[tuple]:
@@ -486,7 +849,7 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     profiles = []
     # Every transport count with at least one whole rotation block per rank.
     # Qwen's five H128 blocks intentionally exclude TP6.
-    worlds = range(1, min(6, blocks) + 1)
+    worlds = range(1, min(8, blocks) + 1)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):
@@ -497,7 +860,7 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     return profiles
 
 
-def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
+def profiles_for_role(role: str, geometry: str = 'dsv4p') -> list[tuple]:
     """(profile, width, experts, top-k, dtype, [layout destinations]) per role.
 
     TP4 keeps the padded 640/512 pair-split because I=2304/4 is not a whole number
@@ -505,35 +868,31 @@ def profiles_for_role(role: str, geometry: str = 'v41') -> list[tuple]:
     split exactly, each compiling one export per capacity shared by its ranks.
     Other geometries derive the same H128 split from their own intermediate.
     """
-    if geometry == 'kimik3':
-        return [profile for profile in shard_profiles(geometry, role)
-                if profile[0] == ('tp6-width512' if role == 'spark' else 'rtx-tp1')]
-    if geometry != 'v41':
-        return shard_profiles(geometry, role)
-    if role == 'spark':
-        return [('tp4-width640', 640, 384, 6, 'bf16', ['tp4-rank0', 'tp4-rank1']),
-                ('tp4-width512', 512, 384, 6, 'bf16', ['tp4-rank2', 'tp4-rank3']),
-                ('tp2-width1152', 1152, 384, 6, 'bf16', ['tp2-rank0', 'tp2-rank1']),
-                ('tp3-width768', 768, 384, 6, 'bf16',
-                 ['tp3-rank0', 'tp3-rank1', 'tp3-rank2']),
-                ('tp6-width384', 384, 384, 6, 'bf16',
-                 [f'tp6-rank{rank}' for rank in range(6)])]
-    return [('rtx-tp1', 2304, 384, 6, 'fp32', ['rtx-tp1']),
-            ('rtx-tp2', 1152, 384, 6, 'fp32', ['rtx-tp2']),
-            ('dspark', 2304, 128, 3, 'bf16', ['dspark'])]
+    return shard_profiles(geometry, role)
 
 
 def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) -> list[tuple]:
     profiles = profiles_for_role(role, geometry)
-    if all_spark_counts or role != 'spark' or geometry == 'v41':
+    if role != 'spark' or all_spark_counts:
         return profiles
-    worlds = {2, 3, 4, 6} if GEOMETRIES[geometry][1] // 128 >= 6 else {2, 3, 4}
-    if geometry == 'qwen4':
-        worlds.add(1)
-    return [profile for profile in profiles if int(profile[0].split('-')[0][2:]) in worlds]
+    from spark_packages import package_worlds
+    worlds = set(package_worlds(geometry, 'exl3'))
+    return [entry for entry in profiles if int(entry[0].split('-')[0][2:]) in worlds]
 
 
-def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41') -> list[str]:
+def compact_profiles(geometry: str, profiles: list[tuple]) -> list[tuple]:
+    """Own-maximum H128 pitch, shared by ranks of selected uneven worlds only."""
+    _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
+    units = intermediate // 128
+    worlds = sorted({int(entry[0].split('-')[0][2:]) for entry in profiles})
+    return [(f'tp{world}-compact-width{((units + world - 1) // world) * 128}',
+             ((units + world - 1) // world) * 128, experts, topk, 'bf16',
+             [f'tp{world}-compact-rank{rank}' for rank in range(world)])
+            for world in worlds if units % world]
+
+
+def parse_requested_layouts(values: list[str], role: str, geometry: str = 'dsv4p',
+                            companions: list[tuple] = ()) -> list[str]:
     """`--require-layout tp3-rank0,tp3-rank1` (repeatable): layouts the package needs.
 
     Scoped to the role being built: a coordinator cannot produce Spark ranks, so
@@ -541,8 +900,8 @@ def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41')
     GPU compile.
     """
     requested: list[str] = []
-    known = {layout for _, _, _, _, _, destinations in profiles_for_role(role, geometry)
-             for layout in destinations}
+    known = {layout for _, _, _, _, _, destinations in
+             [*profiles_for_role(role, geometry), *companions] for layout in destinations}
     for value in values:
         for name in (part.strip() for part in value.split(',')):
             if not name:
@@ -556,7 +915,7 @@ def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41')
 
 
 def tile_overrides(values: list[str], capacities: list[int], role: str,
-                   geometry: str = 'v41') -> dict[str, dict[int, tuple]]:
+                   geometry: str = 'dsv4p') -> dict[str, dict[int, tuple]]:
     """Parse repeatable `--tile PROFILE=CAPACITIES:FC1_K,FC1_N,FC2_K,FC2_N`.
 
     Capacity scoping is the point: the pinned B12x policy already picks a wider
@@ -701,18 +1060,25 @@ def compile_variants(payloads, jobs):
 
 def package_capacities(geometry: str, requested: str) -> list[int]:
     capacities = sorted(set(int(v) for v in requested.split(',')))
-    if not capacities or any(v < 1 or v > 4096 for v in capacities):
-        raise ValueError('EXL3 capacities must be in 1..4096')
+    # Kimi K3 pads a <=2752-row prefill unit into merged waves of up to three
+    # units, so its packed extents reach 8256; every other family stops at 4096.
+    limit = 8256 if geometry == 'kimik3' else 4096
+    if not capacities or any(v < 1 or v > limit for v in capacities):
+        raise ValueError(f'EXL3 capacities must be in 1..{limit}')
     if geometry == 'kimik3':
+        # m16 takes K128 tiles that drift against M1 decode; rows 2..16 run on
+        # m80 (like GLM Flash). Every other capacity is allowed.
         capacities = [v for v in capacities if v != 16]
-        if any(v not in (1, 80, 256, 1024, 4096) for v in capacities) or not capacities:
-            raise ValueError('Kimi EXL3 requires K64 capacities 1,80,256,1024,4096')
+        if not capacities:
+            raise ValueError('Kimi EXL3 needs a capacity other than 16')
     return capacities
 
 
 def build(args: argparse.Namespace) -> None:
+    if len(args.bits) != 2:
+        raise ValueError('EXL3 packages require two decoder tiers')
     validate_destination(args.output)
-    geometry = getattr(args, 'geometry', 'v41')
+    geometry = getattr(args, 'geometry', 'dsv4p')
     hidden = GEOMETRIES[geometry][0]
     capacities = package_capacities(geometry, args.capacities)
     all_counts = getattr(args, 'all_spark_counts', False)
@@ -725,7 +1091,16 @@ def build(args: argparse.Namespace) -> None:
         if unknown:
             raise ValueError(f'unknown EXL3 profiles for {geometry} {args.role}: {sorted(unknown)}')
         profiles = [entry for entry in profiles if entry[0] in only]
-    requested_layouts = parse_requested_layouts(getattr(args, 'require_layout', []), args.role, geometry)
+    companions = []
+    if getattr(args, 'compact_companions', False):
+        if args.role != 'spark' or len(args.bits) != 2:
+            raise ValueError('--compact-companions requires two-tier Spark exports')
+        companions = compact_profiles(geometry, profiles)
+    requested_layouts = parse_requested_layouts(
+        getattr(args, 'require_layout', []), args.role, geometry, companions)
+    requested_layouts = sorted(set(requested_layouts) | {
+        destination for *_, destinations in companions for destination in destinations})
+    profiles += companions
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
@@ -746,78 +1121,100 @@ def build(args: argparse.Namespace) -> None:
         variants = []
         pending = []
         for profile, width, experts, topk, dtype, destinations in profiles:
+            compact = '-compact-' in profile
             for capacity in capacities:
                 requested = tiles.get(profile, {}).get(capacity)
-                tile = requested
-                if tile is None:
-                    # A decode capacity the B12x policy widens is pinned back to the
-                    # canonical tile (an explicit override above still wins).
-                    tile = decode_tile(geometry, width, capacity)
-                # Content-keyed: an override changes the compiled geometry, so it
-                # must never land in (or be read from) the policy-keyed export, and
-                # neither may a pinned capacity: a build tree that predates the pin
-                # holds the widened export under the policy key. Without either the
-                # path is what every existing build used.
-                profile_dir = (args.build_dir / profile if tile is None else
-                               args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
-                raw = profile_dir / f'm{capacity}'  # one capacity, one directory
-                options = {}
+                tile = (64, 128, 64, 128) if compact else requested
+                compact_ws = compact and len(args.bits) == 2 and compact_ws_export(
+                    geometry, args.role, width, capacity, args.bits)
+                compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
+                                 if compact_ws else None)
+                options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
                     options['activation'] = activation(geometry)
                 if tile is not None:
                     options['tile'] = tile
-                if geometry != 'v41':
-                    options['hidden'] = hidden
-                block = route_block(geometry, capacity)
-                ws = len(args.bits) == 2 and tile is None and warp_specialized(geometry, args.role, width, capacity)
+                options['hidden'] = hidden
+                block = route_block(geometry, capacity, args.role)
+                # Coordinator Kimi retains its independently qualified K2/K3 recipe.
+                ws = compact_ws or (not compact and len(args.bits) == 2
+                                    and warp_specialized(geometry, args.role, width, capacity)
+                                    and (geometry != 'kimik3' or args.role != 'coordinator'
+                                         or tuple(args.bits) == (2, 3)))
                 if ws:
-                    block = 64
+                    block = (compact_block if compact_block is not None
+                             else ws_route_block(geometry, args.role, width, capacity))
                 if block != 8:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
-                    if wire_input(geometry, args.role, width, capacity):
+                    if wire_input(geometry, args.role, width, capacity, compact=compact_ws):
                         options['wire_input'] = True
-                    if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
+                    if (stages := ws_input_stages(geometry, args.role, width, capacity,
+                                                 compact=compact_ws)) is not None:
                         options['ws_input_stages'] = stages
-                    if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                    if ws_dynamic_tiles(geometry, args.role, width, capacity, compact=compact_ws):
                         options['ws_dynamic_tiles'] = True
-                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                    if (policy_tile := ws_tile(geometry, args.role, width, capacity,
+                                              compact=compact_ws)) is not None and requested is None:
                         options['tile'] = policy_tile
-                elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
-                    options['fused_input_rotation'] = True
-                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):
+                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
-                # The default export, then any decode-schedule variant of it: the
-                # same options plus a schedule, content-keyed in the build tree and
-                # installed as m<capacity>-<schedule> beside m<capacity>.
-                exports = [(None, raw, options)]
-                for schedule, schedule_options in decode_schedule_variants(
-                        geometry, args.role, profile, capacity):
-                    exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
-                                    / raw.name, {**options, **schedule_options}))
-                for schedule, raw, run_options in exports:
-                    pending.append((raw, width, experts, capacity, topk, dtype, run_options,
+                default_options = options
+                if (cell := spark_decode_cell(geometry, args.role, profile, capacity,
+                                              args.bits)) is not None:
+                    # An operator's --tile override of this capacity still wins.
+                    default_options = {**options, **{
+                        key: value for key, value in cell.items()
+                        if key != 'decode_schedule' and not (key == 'tile' and requested is not None)}}
+                if (schedule_hint := default_decode_schedule(
+                        geometry, args.role, profile, capacity, args.bits)) is not None:
+                    default_options = {**default_options, 'decode_schedule': schedule_hint}
+                exports = [(None, default_options)]
+                for schedule, schedule_options in ([] if compact else decode_schedule_variants(
+                        geometry, args.role, profile, capacity)):
+                    exports.append((schedule, {**options, **schedule_options}))
+                for schedule, run_options in exports:
+                    pending.append((width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
         from _export_jobs import export_jobs, gpu_workers, park_context_lease
         jobs = min(gpu_workers(export_jobs()), len(pending))
         # The planner's context idles while its workers run; free its host lease.
         park_context_lease()
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
-        payloads = [(args, expected_compute, *item[:7]) for item in pending]
-        # Spawn never inherits a CUDA context; successful manifests retain order.
-        for item, (meta, runtime_files) in zip(pending, compile_variants(payloads, jobs)):
-            raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
+        # World and rank destinations do not determine generated code. Keep all
+        # arithmetic/schedule options in the key, including compact descriptor ABI.
+        unique = {}
+        keys = []
+        for item in pending:
+            key = (*item[:5], json.dumps(item[5], sort_keys=True))
+            keys.append(key)
+            unique.setdefault(key, item)
+        # Stable width/options cache identity, independent of the first world
+        # that happened to request this variant. ABI and schedule are in options.
+        for key, item in list(unique.items()):
+            identity = json.dumps([geometry, args.role, args.bits, expected_compute, key], sort_keys=True)
+            raw = args.build_dir / f'width{item[0]}-{hashlib.sha256(identity.encode()).hexdigest()[:20]}' / f'm{item[2]}'
+            unique[key] = (raw, *item)
+        payloads = [(args, expected_compute, *item[:7]) for item in unique.values()]
+        compiled = dict(zip(unique, compile_variants(payloads, jobs)))
+        for item, key in zip(pending, keys):
+            meta, runtime_files = compiled[key]
+            source = unique[key][0]
+            width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
             for destination in destinations:
                 directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
                 for name in runtime_files:
                     target = stage / directory / name
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(raw / name, target)
+                    shutil.copy2(source / name, target)
                 variant = {'directory': directory, **{key: meta[key] for key in
                     ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
+                for key in ('descriptor_rows', 'native_info_version'):
+                    if key in meta:
+                        variant[key] = meta[key]
                 if 'tile' in meta:
                     # What the compiler actually resolved, always: the pinned
                     # policy varies per capacity (m16 is the known special case),
@@ -834,26 +1231,29 @@ def build(args: argparse.Namespace) -> None:
                     variant['route_block'] = meta['route_block']
                 if meta.get('token_major_rotation'):
                     variant['token_major_rotation'] = True
-                if meta.get('fused_input_rotation'):
-                    variant['fused_input_rotation'] = True
                 if meta.get('warp_specialized'):
                     variant['warp_specialized'] = True
+                if meta.get('ws_dynamic_tiles'):
+                    variant['ws_dynamic_tiles'] = True
+                if meta.get('ws_input_stages') is not None:
+                    variant['ws_input_stages'] = meta['ws_input_stages']
                 if 'input_format' in meta:
                     variant['input_format'] = meta['input_format']
                 if schedule is not None:
                     variant['schedule'] = schedule
+                if meta.get('decode_schedule') is not None:
                     variant['decode_schedule'] = meta['decode_schedule']
                 variants.append(variant)
         files = {str(p.relative_to(stage)): {'bytes': p.stat().st_size, 'sha256': digest(p)}
                  for p in sorted(stage.rglob('*')) if p.is_file()}
         manifest = {'schema': 'cuteafd.exl3-package.v1', 'role': args.role,
+                    'decode_capacities': [n for n in capacities if n <= 80],
                     'sparkinfer_revision': _pinned_sparkinfer.REVISION,
                     'compute': [props.major, props.minor], 'sms': props.multi_processor_count,
                     'variants': variants, 'files': files,
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
-        if geometry != 'v41':
-            manifest['geometry'] = geometry
+        manifest['geometry'] = geometry
         if requested_layouts:
             present = {v['directory'].split('/')[0] for v in variants}
             missing = sorted(set(requested_layouts) - present)
@@ -876,13 +1276,15 @@ def main() -> None:
     commands = parser.add_subparsers(dest='command', required=True)
     create = commands.add_parser('build')
     create.add_argument('--role', choices=('spark', 'coordinator'), required=True)
-    create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='v41',
+    create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='dsv4p',
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
     create.add_argument('--all-spark-counts', action='store_true',
-                        help='Opt in to all nonempty H128 Spark TP profiles (1..6)')
+                        help='Opt in to all nonempty H128 Spark TP profiles (1..8)')
+    create.add_argument('--compact-companions', action='store_true',
+                        help='Add compact two-tier exports for selected uneven Spark worlds only')
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
-                             'without selection the legacy role profiles remain the default')
+                             'without selection the family role profiles remain the default')
     create.add_argument('--require-layout', action='append', default=[],
                         help='Layouts this package must contain (comma list, repeatable). '
                              'Recorded in the manifest and re-checked on verify, so a '
@@ -893,7 +1295,7 @@ def main() -> None:
                              'tp3-width768=16:64,256,64,256; default is the B12x per-capacity policy')
     create.add_argument('--loopback', action='store_true',
                         help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
-    create.add_argument('--capacities', default='1,16,80,256,1024,4096')
+    create.add_argument('--capacities', default='1,16,80,256,1024,2048,2752,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
     create.add_argument('--build-dir', type=Path, required=True)
     create.add_argument('--output', type=Path, required=True)

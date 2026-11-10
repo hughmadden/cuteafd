@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
 import json
 import shlex
@@ -21,12 +22,84 @@ def v41_source() -> str:
 
 
 class NativeReleaseLauncherTest(unittest.TestCase):
+    def test_v41_planner_receives_normalized_effective_config(self) -> None:
+        source = v41_source()
+        block = source[source.index('count_args='):source.index('if [[ -n "$wip_layout" ]]; then', source.index('count_args='))]
+        for requested, expected in [(None, 'on'), ('off', 'off')]:
+            with self.subTest(requested=requested), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = root / 'sparse.config'
+                config.write_text('  SPECULATOR = "dspark" # draft mode\nDSPARK_DRAFT_LIMIT=\'7\' # width\n'
+                                  'SPARK_0_HOST="ostrich" # first\nSPARK_1_HOST=\'dodo\'\n'
+                                  'SPARK_0_LANE_A=10.55.0.1\nSPARK_1_LANE_A=10.55.0.2\n'
+                                  + (f'TP2_DSPARK_EXPERTS="{requested}" # explicit override\n' if requested else ''))
+                script = '''set -euo pipefail
+source scripts/lib/release-common.sh
+release_load_config "$1"
+release_resolve_tp2_dspark_experts deepseek_v41 2
+dspark_draft_limit="$DSPARK_DRAFT_LIMIT"
+get() { printf '%s' "${2:-}"; }
+container_hf_home=/hf
+namespace_mount_args=()
+'''
+                result = subprocess.run(['bash', '-c', script + block + '''
+printf '%s\\n' "$TP2_DSPARK_EXPERTS" "$SPECULATOR" "$dspark_draft_limit" "$RELEASE_AVAILABLE_SPARKS"
+cat "$count_config"
+printf 'arg=%s\\n' "${count_args[@]}"
+printf 'mount=%s\\n' "${count_mounts[@]}"
+''', 'test', str(config)], cwd=ROOT, env={**os.environ, 'HOME': str(root)}, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                self.assertEqual(lines[:4], [expected, 'dspark', '7', '2'])
+                normalized = dict(line.split('=', 1) for line in lines[4:] if not line.startswith(('arg=', 'mount=')))
+                self.assertEqual(normalized, dict(TP2_DSPARK_EXPERTS=expected, SPECULATOR='dspark', DSPARK_DRAFT_LIMIT='7',
+                    **{f'SPARK_{rank}_HOST': host for rank, host in enumerate(['ostrich', 'dodo'])}))
+                self.assertIn('arg=--config', lines)
+                self.assertIn('arg=/run/cuteafd-plan.config', lines)
+                self.assertTrue(any(line.startswith('mount=') and line.endswith(':/run/cuteafd-plan.config:ro') for line in lines))
+
+    def test_cuda_capacity_matches_uuid_not_cuda_ordinal_and_creates_no_context(self) -> None:
+        import contextlib
+        import ctypes
+        import io
+        import uuid
+        from unittest.mock import patch
+        source = (ROOT / 'scripts/lib/release-common.sh').read_text().split("<<'PYCAPACITY'\n", 1)[1].split('\nPYCAPACITY', 1)[0]
+        wanted = 'GPU-00000000-0000-0000-0000-000000000001'
+        identities = [uuid.UUID(wanted[4:]).bytes, bytes(16)]
+        calls = []
+        class Function:
+            def __init__(self, name): self.name = name
+            def __call__(self, *args):
+                calls.append(self.name)
+                if self.name == 'cuInit': return 0
+                if self.name == 'cuDeviceGetCount': args[0]._obj.value = 2
+                elif self.name == 'cuDeviceGet': args[0]._obj.value = args[1].value
+                elif self.name == 'cuDeviceGetUuid_v2': args[0]._obj[:] = identities[args[1].value]
+                elif self.name == 'cuDeviceTotalMem_v2': args[0]._obj.value = 101_973_491_712 + args[1].value
+                else: raise AssertionError('unexpected CUDA operation: ' + self.name)
+                return 0
+        class Driver:
+            def __getattr__(self, name): return Function(name)
+        with patch.object(ctypes, 'CDLL', return_value=Driver()), patch.object(sys, 'argv', ['-', wanted]):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output): exec(source, {})
+        self.assertEqual(output.getvalue().strip(), '101973491712')
+        self.assertNotIn('cuCtxCreate', calls)
+        for identity, driver, message in [
+            ('GPU-00000000-0000-0000-0000-000000000099', Driver(), 'no CUDA device matches UUID'),
+            (wanted, OSError('libcuda.so.1 unavailable'), 'libcuda.so.1 unavailable'),
+        ]:
+            with patch.object(ctypes, 'CDLL', side_effect=driver if isinstance(driver, Exception) else None,
+                              return_value=driver), patch.object(sys, 'argv', ['-', identity]):
+                with self.assertRaisesRegex(SystemExit, message): exec(source, {})
+
     def test_coordinator_capacity_registry_boundary_and_invalid_inputs(self) -> None:
         for total, budget, expected in [('98304', '', 16), ('32768', '', 8), ('98304', '32', 8),
                                         ('98304', '32.001', 16), ('32768', '96', 8)]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             gib, concurrency = result.stdout.split()
             self.assertEqual(float(gib), min(float(total) / 1024, float(budget) if budget else float('inf')))
@@ -34,7 +107,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
         for total, budget in [('0', ''), ('NaN', ''), ('98304', 'inf'), ('98304', '0'), ('bad', '')]:
             result = subprocess.run(['bash', '-c',
                 'source scripts/lib/release-common.sh; repo_root=$PWD; release_coordinator_profile "$1" "$2"',
-                'test', total, budget], cwd=ROOT, text=True, capture_output=True)
+                'test', str(int(total) * 2**20) if total.isdigit() else total, budget], cwd=ROOT, text=True, capture_output=True)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('capacity registry', result.stderr)
 
@@ -50,7 +123,7 @@ class NativeReleaseLauncherTest(unittest.TestCase):
                             source + '\npub const SMALL_CARD_DEFAULT_CONCURRENCY: u64 = 8;\n']:
                 (root / registry).write_text(changed)
                 result = subprocess.run(['bash', '-c',
-                    'source scripts/lib/release-common.sh; repo_root="$1"; release_coordinator_profile 98304',
+                    'source scripts/lib/release-common.sh; repo_root="$1"; release_coordinator_profile 103079215104',
                     'test', str(root)], cwd=ROOT, text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('capacity registry', result.stderr)
@@ -146,8 +219,8 @@ bash -c 'release_serving_docker_args; printf "%s\\0" "${RELEASE_SERVING_ARGS[@]}
                 env={**os.environ, 'TEST_UID': uid, 'TEST_GID': gid, 'TEST_USER': user})
             self.assertEqual(result.returncode, 0, result.stderr)
             args = result.stdout.decode().rstrip('\0').split('\0')
-            self.assertEqual(args[:2], ['--user', f'{uid}:{gid}'])
-            pairs = list(zip(args[2::2], args[3::2]))
+            self.assertEqual(args[:3], ['--init', '--user', f'{uid}:{gid}'])
+            pairs = list(zip(args[3::2], args[4::2]))
             self.assertEqual([value for flag, value in pairs if flag == '--group-add'], ['44', '107'])
             env = dict(value.split('=', 1) for flag, value in pairs if flag == '-e')
             self.assertEqual(env['USER'], user)
@@ -179,7 +252,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
-            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
+            self.assertIn('$(declare -f release_die release_hub_mounts release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
             self.assertIn('docker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
@@ -324,6 +397,23 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
         environment.update(CUTEAFD_DIAG_V4_VERIFY='/tmp/x', CUTEAFD_DIAG_A='1', CUTEAFD_OTHER='no')
         result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
         self.assertEqual(result.stdout, b'before\0-e\0CUTEAFD_DIAG_A=1\0-e\0CUTEAFD_DIAG_V4_VERIFY=/tmp/x\0after\0')
+        # The launch-blocking diagnostic also sets CUDA's own variable for the coordinator.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING='1')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_LAUNCH_BLOCKING=1\0-e\0CUDA_LAUNCH_BLOCKING=1\0after\0')
+        # The work-queue diagnostics set CUDA's own variables; out-of-range values refuse.
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('CUTEAFD_DIAG_', 'CUTEAFD_BENCH_NONCE'))}
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='32', CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS='16')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.stdout,
+            b'before\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUTEAFD_DIAG_CUDA_DEVICE_MAX_COPY_CONNECTIONS=16'
+            b'\0-e\0CUDA_DEVICE_MAX_CONNECTIONS=32\0-e\0CUDA_DEVICE_MAX_COPY_CONNECTIONS=16\0after\0')
+        environment.update(CUTEAFD_DIAG_CUDA_DEVICE_MAX_CONNECTIONS='64')
+        result = subprocess.run(['bash', '-c', block], env=environment, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(b'must be 1-32', result.stderr)
 
     def test_v41_speculation_trace_reaches_coordinator_with_host_mount(self) -> None:
         source = FAMILY.read_text()
@@ -609,26 +699,7 @@ spark_tp_roles=
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
 
-    def package_identity(self, manifest: dict) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ['bash', '-c', 'source scripts/lib/release-common.sh; release_exl3_package_identity test-revision'],
-            cwd=ROOT, input=json.dumps(manifest), text=True, capture_output=True,
-        )
 
-    def test_exl3_preflight_identity_binds_layout_and_package(self) -> None:
-        manifest = dict(schema='cuteafd.exl3-package.v1', role='spark',
-                        sparkinfer_revision='test-revision', files={'kernel': 'first'})
-        disjoint = self.package_identity(manifest)
-        self.assertEqual(disjoint.returncode, 0, disjoint.stderr)
-        self.assertTrue(disjoint.stdout.startswith('disjoint:'))
-        manifest['files']['kernel'] = 'second'
-        self.assertNotEqual(disjoint.stdout, self.package_identity(manifest).stdout)
-        for field, value in [('role', 'coordinator'), ('schema', 'wrong'),
-                             ('sparkinfer_revision', 'another-build')]:
-            with self.subTest(field=field, value=value):
-                result = self.package_identity({**manifest, field: value})
-                self.assertEqual(result.returncode, 2)
-                self.assertIn('invalid Spark EXL3 package identity', result.stderr)
 
     def test_shell_is_valid_and_help_exposes_native_controls(self) -> None:
         subprocess.run(
@@ -676,7 +747,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 "16",
                 "20",
                 "1048576",
-                "393216",
+                "131072",
                 "0.0.0.0:8000",
                 "19441",
                 "auto",
@@ -698,7 +769,8 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         self.assertIn('RUST_LOG=${RUST_LOG:-info}', script)
         self.assertIn('--rtx-gpus "$RELEASE_RTX_GPUS"', script)
         self.assertNotIn('--first-layer', script)
-        self.assertIn('CUDA_VISIBLE_DEVICES=$gpu_uuid_csv', script)
+        self.assertIn('release_coordinator_device_args "${release_gpu_uuids[@]}"', script)
+        self.assertIn('"${RELEASE_COORDINATOR_DEVICE_ARGS[@]}"', script)
         self.assertIn("trap cleanup EXIT", script)
 
     def test_coordinator_release_contains_both_rtx_expert_interfaces(self) -> None:
@@ -712,10 +784,10 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         with tempfile.TemporaryDirectory() as home:
             env = {**os.environ, "HOME": home, "PATH": "/usr/bin:/bin"}
             for args, message in (
-                (["--set", "CONCURRENCY=17"], "CONCURRENCY must be in 1..16"),
-                (["--set", "PREFIX_CACHE_ENTRIES=129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
+                (["--set", "CONCURRENCY=65"], "CONCURRENCY must be in 1..64"),
+                (["--set", "PREFIX_CACHE_ENTRIES=-1"], "PREFIX_CACHE_ENTRIES must be auto or non-negative"),
                 (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
-                (["--set", "MAX_OUTPUT_TOKENS=393217"], "MAX_OUTPUT_TOKENS must be in 1..393216"),
+                (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
                 (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),
                 (["--set", "NOT_A_KEY=1"], "unknown configuration key: NOT_A_KEY"),
@@ -730,6 +802,13 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                     result = subprocess.run(["./run.sh", *args], cwd=ROOT, capture_output=True, text=True, env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(message, result.stderr)
+            for override in ["CONCURRENCY=17", "CONCURRENCY=64", "PREFIX_CACHE_ENTRIES=129"]:
+                with self.subTest(override=override):
+                    result = subprocess.run(["./run.sh", "--set", override], cwd=ROOT,
+                                            capture_output=True, text=True, env=env)
+                    self.assertNotIn("CONCURRENCY must", result.stderr)
+                    self.assertNotIn("PREFIX_CACHE_ENTRIES must", result.stderr)
+                    self.assertIn("model snapshot is missing", result.stderr)
 
 
 class V10BuildTargetTest(unittest.TestCase):
@@ -781,7 +860,7 @@ class V10BuildTargetTest(unittest.TestCase):
         self.assertIn(f"coordinator image: {coordinator}", default)
         self.assertIn(f"spark image: {spark}", default)
         # The promoted default carries the universal role set.
-        self.assertIn("tp2;tp3;tp6", default)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", default)
 
 
     def test_all_examples_use_the_promoted_pair(self) -> None:
@@ -794,7 +873,12 @@ class V10BuildTargetTest(unittest.TestCase):
             with self.subTest(example=path.name):
                 text = path.read_text()
                 self.assertIn(f"COORDINATOR_DOCKER_INFERENCE={coordinator}", text)
-                self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
+                values = dict(line.split("=", 1) for line in self.assignments(path))
+                # RTX-only launchers need no expert image and may reject its key.
+                if "SPARK_EXPERT_DOCKER_INFERENCE" not in values:
+                    self.assertEqual(values.get("SPARK_COUNT"), "0")
+                else:
+                    self.assertIn(f"SPARK_EXPERT_DOCKER_INFERENCE={spark}", text)
 
 
 class V11ReleaseBuildTargetTest(unittest.TestCase):
@@ -825,7 +909,7 @@ class V11ReleaseBuildTargetTest(unittest.TestCase):
         self.assertIn("release tag: v11", v11)
         self.assertIn("coordinator image: ghcr.io/tpurtell/cuteafd-coordinator:v11", v11)
         self.assertIn("spark image: ghcr.io/tpurtell/cuteafd-spark-expert:v11", v11)
-        self.assertIn("tp2;tp3;tp6", v11)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", v11)
 
 
 if __name__ == "__main__":

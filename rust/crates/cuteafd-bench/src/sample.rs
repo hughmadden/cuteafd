@@ -22,6 +22,7 @@ pub fn report(failed: bool) -> Report {
     let setting = |name: &str, value: &str, default: Option<&str>, source: &str| Setting { name: name.into(),
         value: Some(value.into()), default: default.map(str::to_string), source: source.into() };
     let configuration = Configuration {
+        supports_thinking_off: None,
         snapshot: Some("/mnt/sparknest/hf-home/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa".into()),
         quant: vec![QuantGroup { group: "attention".into(), formats: vec!["fp8_block".into()] },
             QuantGroup { group: "routed expert".into(), formats: vec!["mxfp4".into()] },
@@ -62,24 +63,26 @@ pub fn report(failed: bool) -> Report {
     quality.settle();
     let baseline = Baseline {
         fingerprint: "3f9a2c41d07be5a1".into(), run_id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
-        card: BasicCard { decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
+        card: BasicCard { thinking: None, decode: vec![rate("code", 187.3), rate("prose", 142.6), rate("json", 201.9)],
             concurrency: [(1, 187.3, 187.3), (4, 640.0, 158.0), (8, 960.0, 118.0), (16, 1280.0, 78.0)]
                 .into_iter().map(|(width, aggregate_tok_s, per_stream_median_tok_s)| ConcurrentRate {
                     width, aggregate_tok_s, per_stream_median_tok_s, decode_s: 319.0 / per_stream_median_tok_s,
                     runs: (0..width).map(|_| ConcurrentTiming { sent_s: 0.0,
-                        timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0 }).collect(),
+                        timing: timing(320, 319.0 / per_stream_median_tok_s) }).collect(), warmup_s: 3.0,
+                    prompts: Some(if width == 1 { "code" } else { crate::panels::speed::DISTINCT_PROMPTS }.into()) })
+                .collect(),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
-            warmup_s: Some(14.2),
-            capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
+            warmup_s: Some(14.2), prompt_token_ratio: None,
+            capacity: Some(Capacity { kv_tokens: Some(14_710_000), max_tokens: None, kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
-                max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
+                max_context: Some(1 << 20), max_output: Some(131_072), host_cache_bytes: Some(64 << 30) }) },
         quality, seconds: 151.0, thermal: None, fabric: vec![],
     };
     Report {
-        schema: SCHEMA.into(), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
+        schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: "7c1e2d3f4a5b6c7d8e9f".into(), created: "2026-10-02T10:12:00Z".into(),
         finished: Some("2026-10-02T10:14:31Z".into()), status: RunStatus::Done, profile: "smoke".into(),
         plan: vec![PlannedPanel { id: "hardware".into(), passes: 1 }, PlannedPanel { id: "configuration".into(), passes: 1 }],
-        server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), family: Some("deepseek_v41".into()),
+        server: ServerInfo { model: "deepseek-ai/DeepSeek-V4.1-Flash".into(), executor: Some("serve-native".into()), family: Some("deepseek_v41".into()),
             revision: Some("dba1be0a40aa45a94ad051997016db3960a90277".into()),
             build: BuildInfo { version: "0.1.0".into(), release: None, image: None,
                 remote: Some("https://github.com/tpurtell/cuteafd".into()),
@@ -95,6 +98,7 @@ pub fn report(failed: bool) -> Report {
 #[cfg(test)]
 mod tests {
     use crate::render;
+    use crate::report::{Capacity, Report, Setting};
 
     #[test]
     fn obsolete_single_point_reports_are_refused_and_migrated_history_keeps_c8() {
@@ -160,6 +164,7 @@ mod tests {
                 // Median is 118, deliberately not the aggregate / width (120).
                 assert!(card.contains(&format!("aggregate tps · {}/stream at C8",
                     render::rate(third.per_stream_median_tok_s))));
+                assert!(card.contains(">distinct prompts</text>"), "{case}: prompt set label");
                 assert!(!card.contains("120/stream"));
             } else {
                 assert!(card.contains("C8 not measured"));
@@ -192,13 +197,153 @@ mod tests {
             report.server.configuration.settings.push(Setting { name: format!("long-option-{i}"), value: Some("x".repeat(80)),
                 source: "cli".into(), ..Default::default() });
         }
+        // Health evidence must not steal the second chip row.
+        report.fabric.push(crate::fabric::Phase { timed: true, ports: vec![crate::fabric::Port {
+            health: Some(cuteafd_transport::fabric_health::Health {
+                verdict: cuteafd_transport::fabric_health::Verdict::Warn,
+                retransmit_pct: Some(1.2), retransmit_judged: true, ..Default::default()
+            }), ..Default::default()
+        }], ..Default::default() });
         let card = render::card::card_svg(&report);
         assert!(card.contains("POWER-CAPPED"));
+        assert!(card.contains("Fabric: peak retransmits 1.2% of packets (above 0.5%)"));
+        assert!(card.contains(r#"x="56" y="516""#));
+        // Last bar ends at 496; health text starts no higher than 504 (12px font).
+        let last_bar_bottom = 416.0 + 2.0 * 30.0 + 4.0 + 16.0;
+        let health_top = 516.0 - 12.0;
+        assert!(health_top - last_bar_bottom >= 8.0);
+        assert!(card.contains(r#"x="146" y="480""#)); // Last bar's actual geometry.
+        assert!(card.contains(r#"y="598""#)); // Second chip row starts here.
+        assert!(!card.contains(r#"y="614""#)); // No health text among chips.
         assert!(card.contains("more in report"));
         assert!(card.contains(r#"y="629""#)); // Badge begins after both chip rows (ending at 618).
         assert!(!card.contains(r#"y="624""#)); // No third chip row.
         assert!(!card.contains(r#"y="638""#));
         assert!(card.contains(r#"x="56" y="647""#));
+    }
+
+    #[test]
+    fn resolved_onboard_count_enriches_capacity_only_for_spark_cards() {
+        let mut report = super::report(false);
+        let original = report.capacity_line();
+        let mut setting = Setting { name: "rtx-expert-layers".into(), value: Some("auto".into()),
+            source: "cli".into(), ..Default::default() };
+        report.server.configuration.settings.push(setting.clone());
+        assert_eq!(report.capacity_line(), original);
+        assert!(!render::card::card_svg(&report).contains("rtx-expert-layers="));
+        for count in [0, 11] {
+            setting.source = "resolved".into();
+            setting.value = Some(count.to_string());
+            *report.server.configuration.settings.last_mut().unwrap() = setting.clone();
+            assert!(report.capacity_line().contains(&format!("{count} RTX expert layers")));
+            let card = render::card::card_svg(&report);
+            assert!(card.contains(&format!("{count} RTX expert layers")));
+            assert!(!card.contains("rtx-expert-layers="));
+        }
+        report.baseline = None;
+        assert_eq!(report.capacity_line(), "11 RTX expert layers · 16 req max");
+        report.server.hardware.sparks.clear();
+        assert_eq!(report.capacity_line(), "all RTX · 16 req max");
+    }
+
+    #[test]
+    fn kv_capacity_line_shows_only_a_larger_maximum() {
+        let mut capacity = Capacity { kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            ..Default::default() };
+        assert_eq!(capacity.line(), "KV 1.8M tok (max 2.1M)");
+        for max in [Some(1_800_000), Some(1_000_000), None] {
+            capacity.max_tokens = max;
+            assert_eq!(capacity.line(), "KV 1.8M tok");
+        }
+        capacity.kv_tokens = Some(0);
+        capacity.max_tokens = Some(2_100_000);
+        assert_eq!(capacity.line(), "");
+        capacity.kv_tokens = None;
+        assert_eq!(capacity.line(), "");
+    }
+
+    #[test]
+    fn spark_capacity_keeps_maximum_before_resolved_expert_count() {
+        let mut report = super::report(false);
+        assert!(!report.server.hardware.sparks.is_empty());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("20".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            kv_format: Some("FP8 MLA latent".into()), ..Default::default() });
+        let expected = "KV 1.8M tok (max 2.1M) · 20 RTX expert layers · FP8 MLA latent";
+        assert_eq!(report.capacity_line(), expected);
+        let restored: Report = serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(restored.capacity_line(), expected);
+        report.baseline.as_mut().unwrap().card.capacity.as_mut().unwrap().kv_tokens = Some(0);
+        assert_eq!(report.capacity_line(), "20 RTX expert layers · FP8 MLA latent");
+    }
+
+    #[test]
+    fn old_reports_without_maximum_still_load() {
+        let original = super::report(false);
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(!json.contains("max_tokens"));
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.capacity().max_tokens, None);
+        assert_eq!(restored.capacity_line(), original.capacity_line());
+    }
+
+    #[test]
+    fn no_spark_moe_capacity_is_all_rtx_without_onboarding_tradeoff() {
+        let mut report = super::report(false);
+        report.server.hardware.sparks.clear();
+        report.server.family = Some("glm5_flash".into());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("45".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            kv_format: Some("FP8 MLA latent + KDA state".into()), max_requests: Some(16),
+            ..Default::default() });
+        assert_eq!(report.capacity_line(), "KV 1.8M tok · all RTX · FP8 MLA latent + KDA state · 16 req max");
+    }
+
+    #[test]
+    fn no_spark_dense_capacity_is_all_rtx_without_resolved_expert_count() {
+        let mut report = super::report(false);
+        report.server.hardware.sparks.clear();
+        report.server.family = Some("qwen3_5".into());
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(260_000), max_tokens: Some(300_000), ..Default::default() });
+        assert_eq!(report.capacity_line(), "KV 260K tok · all RTX");
+        report.baseline.as_mut().unwrap().card.capacity.as_mut().unwrap().kv_tokens = Some(0);
+        assert_eq!(report.capacity_line(), "all RTX");
+    }
+
+    #[test]
+    fn card_chips_prioritize_performance_and_keep_order_within_tiers() {
+        let mut report = super::report(false);
+        report.server.configuration.settings = ["api-key-file", "max-output", "host-cache-bytes",
+            "v4-graph-captures", "route-source", "attention-placement", "pool-tokens",
+            "prefill-waves", "prefill-rows", "draft-fp8", "draft"]
+            .into_iter().map(|name| Setting { name: name.into(), value: Some("1".into()),
+                source: "resolved".into(), ..Default::default() }).collect();
+        let card = render::card::card_svg(&report);
+        let expected = ["draft-fp8=1", "draft=1", "prefill-waves=1", "prefill-rows=1", "pool-tokens=1",
+            "attention-placement=1", "route-source=1", "v4-graph-captures=1", "host-cache-bytes=1", "max-output=1"];
+        for pair in expected.windows(2) {
+            assert!(card.find(pair[0]).unwrap() < card.find(pair[1]).unwrap(), "{pair:?}");
+        }
+        // The full configuration retains even the options omitted from the strip.
+        let full = render::report::panel_svg(&report, "configuration");
+        assert!(full.contains("api-key-file"));
+        assert!(!card.contains("api-key-file"));
+        report.server.configuration.settings = ["CUTEAFD_HOST_ISA_SELECTED", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS",
+            "CUTEAFD_THERMAL", "request-timeout", "rtx-expert-ranges", "route-source", "max-output"]
+            .into_iter().map(|name| Setting { name: name.into(),
+                value: Some(if name == "rtx-expert-ranges" { "0..0,0..0" } else { "1" }.into()),
+                source: "resolved".into(), ..Default::default() }).collect();
+        let card = render::card::card_svg(&report);
+        let expected = ["route-source=1", "rtx-expert-ranges=0..0,0..0", "max-output=1",
+            "CUTEAFD_HOST_ISA_SELECTED=1", "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=1", "CUTEAFD_THERMAL=1", "request-timeout=1"];
+        for pair in expected.windows(2) {
+            assert!(card.find(pair[0]).unwrap() < card.find(pair[1]).unwrap(), "{pair:?}");
+        }
     }
 
     #[test]
@@ -318,7 +463,8 @@ pub fn full_report() -> Report {
         tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
         verify_rows: None, reference_selection: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
-        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
+        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06,
+        precision: Some(crate::fidelity_precision::Precision::new(3.25, "exl3", false, "synthetic").unwrap()), tripwire_expect: None };
     let full_score = fidelity_run.score.clone();
     fidelity_run.score = crate::reference::Fidelity::from_records(full_score.records.iter().filter(|p| p.window[1..].parse::<usize>().unwrap() < 32).cloned().collect());
     fidelity_run.tier = crate::fidelity_dataset::STANDARD_TIER.into();

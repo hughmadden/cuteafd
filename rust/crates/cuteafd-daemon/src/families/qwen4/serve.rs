@@ -19,9 +19,10 @@
 //! prompt is retained at prompt end (unless it was a whole hit), the
 //! conversation at a normal finish (`Turn`; its kept rows are committed to
 //! the state first), a prefill whose client left is parked at its last chunk;
-//! a decode whose client left is not retained. A restored sequence's MTP
-//! drafts once its own rows reach the stash. `prompt_cache_hit_tokens`
-//! reports the restored rows; `/v1/stats` carries the cache's counters.
+//! a decode whose client left is not retained. Drafting hits require canonical
+//! MTP history and restore the final pending hidden row with the target mark.
+//! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
+//! the cache's counters.
 use super::engine::{Qwen4Engine, DECODE_ROWS};
 use super::prefix::Qwen4Prefix;
 use super::open;
@@ -30,7 +31,7 @@ use crate::shared::{console, probe, qwen::scheduler::{self, Backend, Drafts}, pr
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use cuteafd_engine::{media::{EmbeddingCache, MediaAdmission}, prefix::{MarkArena, PrefixCache, PrefixConfig, PrefixFamily}};
 use anyhow::{Context, Result};
-use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeRequest};
 use std::{path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 use tokio::sync::mpsc;
 
@@ -40,9 +41,7 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
-    /// Sequences decoding at once (each holds two state slots).
+    /// Active sequences decoding at once; retained snapshots use the prefix budget.
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.
@@ -56,6 +55,8 @@ pub(crate) struct ServeArgs {
     pub decode_share: DecodeShareArgs,
     #[command(flatten)]
     pub prefix: PrefixArgs,
+    #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
@@ -85,7 +86,9 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("qwen4", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = Arc::new(QwenEncoding::from_snapshot(&snapshot)?);
@@ -94,11 +97,11 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(encoding),
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(16);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.slots = engine_args.slots.max(args.max_sequences);
+    engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
     let drafts = if engine_args.mtp > 0 {
         Drafts::Neural { depth: engine_args.mtp.min(DECODE_ROWS - 1), fixed: args.mtp_fixed }
@@ -109,9 +112,10 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix, vision, media_cache_bytes, remote));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix,
+            vision, media_cache_bytes, remote, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;
@@ -139,7 +143,7 @@ fn console_layout(args: &ServeArgs, model: &str, drafts: Drafts, eos: &[u32]) ->
     let mut layout = console::Layout::new("qwen4", model.into(), args.engine.snapshot.clone());
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     layout.hardware = console::hardware(1, sparks, args.engine.local_experts || args.engine.shared_only);
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     layout.eos = eos.to_vec();
     layout.speculator = match drafts {
         Drafts::None => None,
@@ -165,8 +169,9 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
-    vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
-    args.planner_graph_modes = Some((max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None)));
+    vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
+    args.planner_graph_modes = Some((max_sequences, !matches!(draft, Drafts::None)));
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -189,6 +194,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let slots = prefix.mark_rule(max_sequences).slots(mark);
         args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
     }
+    args.planner_host_prefix = Some((prefix.clone(), max_sequences));
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
@@ -199,7 +205,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         if matches!(engine.experts(), Some(super::engine::Experts::SharedOnly)) {
             tracing::warn!("serve-qwen4 --shared-only: replies do not match the model (plumbing and cache gates only)");
         }
-        engine.warm_decode_graphs(max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None))?;
+        engine.warm_decode_graphs(max_sequences, !matches!(draft, Drafts::None))?;
         if let Ok(path) = std::env::var("CUTEAFD_QWEN4_PADDING_TOKENS") {
             let bytes = std::fs::read(&path).with_context(|| format!("Qwen padding tokens {path}"))?;
             anyhow::ensure!(bytes.len() % 4 == 0, "Qwen padding token file is not U32-aligned");
@@ -212,8 +218,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             *stats = serde_json::json!({});
             probe::graph_capture_stats(&mut stats);
         }
-        scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
-            decode_share, &prefix, args.token_io.token_select, &mut media, preparer.as_deref(), || {
+        scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences, draft, eos,
+            decode_share, &prefix, loop_abort, args.token_io.token_select, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
@@ -229,13 +235,11 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator),
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
-    -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
+    -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>, super::prefix::Frontier>)> {
     let entries = args.prefix_cache_entries;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| args.mark_rule(lanes).slots(mark))?;
-    let host = args.host_config(family.layout(), engine.max_context, lanes)?.map(|config|
+    let host = engine.host_prefix_config.clone().map(|config|
         CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
         .transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
@@ -246,7 +250,7 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
         pages = layout.pages, page_rows = layout.page_rows, kv_format = %engine.kv_format, host_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
-    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
         &format!("{} full-attention + BF16 index + GDN/PLE state", engine.kv_format), host_bytes);
     Ok((family, cache))
 }
@@ -318,8 +322,17 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     type History = cuteafd_loader::families::qwen4::NgramHistory;
     type Coordinates = cuteafd_loader::families::qwen4::RopePositions;
     type Encoder = crate::shared::qwen::Encoder;
-    type Meta = ();
+    type Meta = super::prefix::Frontier;
     type Prefix = Qwen4Prefix<'e, 'a>;
+
+    fn restore_draft(&self, placement: &Self::Placement, frontier: usize, tokens: &[u32],
+        draft: &mut Self::Draft) -> Result<()> {
+        super::speculate::restore_pending(self.engine, placement, frontier, tokens.get(frontier).copied(), draft)
+    }
+    fn needs_snapshot_filter(&self, neural: bool) -> bool { neural }
+    fn snapshot_compatible(&self, saved: &Self::Meta, frontier: usize, neural: bool) -> bool {
+        !neural || saved.supports_predictors(frontier)
+    }
 
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "qwen4", vocab_size: self.engine.cfg.vocab_size,
@@ -328,7 +341,7 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.engine.library }
     fn profile(&self) -> &std::cell::RefCell<[f64; 2]> { &self.engine.profile }
-    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>>)> {
+    fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, super::prefix::Frontier>)> {
         prefix_cache(self.engine, args, lanes)
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>)
@@ -348,15 +361,18 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         Self::Placement::new(units, slot, super::engine::history_of(&self.engine.cfg, &[]))
     }
     fn bind_request(&self, placement: &mut Self::Placement, coordinates: Self::Coordinates,
-        media: cuteafd_engine::media::RequestMedia, tokens: &[u32], resume: usize) {
+        media: cuteafd_engine::media::RequestMedia, tokens: &[u32], resume: usize) -> Result<()> {
         placement.rope = coordinates;
         placement.media = Some(media);
         placement.history = super::engine::history_of(&self.engine.cfg, &tokens[..resume]);
+        Ok(())
     }
     fn history(&self, placement: &Self::Placement) -> Self::History { placement.history.clone() }
-    fn prefetch(&self, tokens: &[u32], next: &[u32]) {
-        self.engine.prefetch_ple(&super::engine::history_of(&self.engine.cfg, tokens), next);
+    fn read_ahead(&self, placement: &Self::Placement, tokens: &[u32], resume: usize, chunk_ends: &[usize])
+        -> Option<cuteafd_loader::LookaheadHandle> {
+        self.engine.read_ahead_ple(&placement.history, tokens, resume, chunk_ends)
     }
+    fn prefetch_decode(&self, history: &[u32], tokens: &[u32]) { self.engine.prefetch_ple_decode(history, tokens); }
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, phase: &str) { self.engine.log_table_stats(phase); }
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize,
@@ -364,13 +380,22 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.prefill_device(placement, tokens, None, None, rows)
     }
+    fn packed_limits(&self) -> Option<crate::shared::prefill_packing::Limits> {
+        self.engine.packed_limits()
+    }
+    fn prefill_packed(&self, sequences: &mut [scheduler::PrefillSeq<'_, Self::Placement, Self::Draft>],
+        _pool: &cuteafd_engine::prefix::RefPagePool,
+        on_logits: &mut dyn FnMut(usize, crate::shared::token_io::DeviceLogits)
+            -> crate::shared::prefill_packing::MemberOutcome) -> Result<Vec<Result<()>>> {
+        self.engine.prefill_packed(sequences, on_logits)
+    }
     fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
         _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device(sequences, speculative)
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        _pool: &cuteafd_engine::prefix::RefPagePool)
+        _kind: scheduler::UngraphedKind, _pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device_ungraphed(sequences, speculative)
     }
@@ -393,8 +418,8 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         super::speculate::draft(self.engine, sequences, timing)
     }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Self::Placement, Self::Draft, Self::History>],
-        speculative: bool, draft: bool) -> Result<()> {
-        super::speculate::accept(self.engine, verified, speculative, draft)
+        speculative: bool) -> Result<()> {
+        super::speculate::accept(self.engine, verified, speculative)
     }
     fn probe_begin(&self, rows: usize) { self.engine.probe_begin(rows); }
     fn probe_end(&self) { self.engine.probe_end(); }

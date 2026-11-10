@@ -36,6 +36,10 @@ pub struct ProbeSpec {
     /// the request carries no matched-prompt evidence.
     #[serde(default)]
     pub output_dependent: bool,
+    /// Panel-local diagnostics that need not run on every benchmark arm and
+    /// carry no matched-prompt evidence, even with input-determined prompts.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pair_exempt: bool,
     /// Already-expanded native image spans, verified against prepared sources by the engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<ProbeMedia>,
@@ -115,6 +119,13 @@ pub struct ProbeImageUrl {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct ProbeImageIdentity {
+    pub encoder: String,
+    pub processor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProbeMedia {
     pub start: usize,
     pub len: usize,
@@ -122,9 +133,40 @@ pub struct ProbeMedia {
     pub key: String,
     pub grid: [u32; 3],
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<ProbeImageIdentity>,
+    /// Original fixture key, recomputed over the actual prepared input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixture: Option<ProbeFixture>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_url: Option<ProbeImageUrl>,
+}
+
+impl ProbeImageIdentity {
+    pub fn prepared(image: &cuteafd_loader::media::PreparedImage) -> Self {
+        Self { encoder: hex(&image.encoder.0), processor: hex(&image.processor.0) }
+    }
+}
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }
+fn digest(value: &str) -> anyhow::Result<[u8; 32]> {
+    anyhow::ensure!(sha256_hex(value), "invalid prepared image identity digest");
+    let mut bytes = [0; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)?; }
+    Ok(bytes)
+}
+impl ProbeMedia {
+    pub fn verify_image(&self, image: &cuteafd_loader::media::PreparedImage) -> anyhow::Result<()> {
+        use cuteafd_loader::media::{EncoderId, PreparedImage, PreprocessId};
+        let key = if let Some(identity) = &self.identity {
+            let processor = PreprocessId(digest(&identity.processor)?);
+            anyhow::ensure!(processor == image.processor, "probe image processor differs");
+            PreparedImage::key_for(EncoderId(digest(&identity.encoder)?), processor, image.grid, &image.rgb8)
+        } else { image.key };
+        anyhow::ensure!(self.len == image.tokens && self.grid == [image.grid.t, image.grid.h, image.grid.w]
+            && self.key == hex(&key.0), "probe prepared image identity differs");
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +220,10 @@ impl ProbeSpec {
     }
 
     pub fn validate_audio(&self) -> anyhow::Result<()> {
+        self.validate_audio_geometry(cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_audio_geometry(&self, policy: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
         if self.audio.is_empty() { return Ok(()); }
         anyhow::ensure!(self.media.is_empty(), "mixed expanded image/audio probes are not supported");
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe audio requires prompt_ids"))?;
@@ -185,7 +231,7 @@ impl ProbeSpec {
         let mut previous = 0;
         let mut samples = 0usize;
         for span in &self.audio {
-            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(span.samples)?;
+            let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(span.samples, policy)?;
             let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe audio extent overflow"))?;
             anyhow::ensure!(span.len == geometry.tokens && span.start >= previous && end <= tokens.len()
                 && self.score_from.is_none_or(|from| end <= from), "probe audio spans must match geometry and precede scoring");
@@ -198,18 +244,31 @@ impl ProbeSpec {
     }
 
     pub fn validate_media(&self) -> anyhow::Result<()> {
-        self.validate_audio()?;
+        self.validate_media_geometry(cuteafd_core::media::ImageTokenGeometry::MERGED)
+    }
+
+    pub fn validate_media_geometry(&self, geometry: cuteafd_core::media::ImageTokenGeometry) -> anyhow::Result<()> {
+        self.validate_media_geometries(geometry, cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+
+    pub fn validate_media_geometries(&self, geometry: cuteafd_core::media::ImageTokenGeometry,
+        audio: cuteafd_core::media::AudioTokenGeometry) -> anyhow::Result<()> {
+        self.validate_audio_geometry(audio)?;
         if self.media.is_empty() { return Ok(()); }
         let tokens = self.prompt_ids.as_ref().ok_or_else(|| anyhow::anyhow!("probe media requires prompt_ids"))?;
         anyhow::ensure!(self.media.len() <= 128, "probe media exceeds history limit");
         let mut previous = 0;
         for span in &self.media {
             let end = span.start.checked_add(span.len).ok_or_else(|| anyhow::anyhow!("probe media extent overflow"))?;
-            let [t, h, w] = span.grid;
             anyhow::ensure!(span.kind == "image" && span.len > 0 && span.start >= previous && end <= tokens.len(),
                 "probe media spans must be sorted, disjoint and inside prompt_ids");
-            anyhow::ensure!(sha256_hex(&span.key) && t == 1 && h > 0 && w > 0 && h % 2 == 0 && w % 2 == 0
-                && u64::from(h) * u64::from(w) / 4 == span.len as u64, "invalid probe media identity/grid");
+            anyhow::ensure!(sha256_hex(&span.key) && geometry.extent(span.grid)
+                .is_some_and(|(_, _, rows)| rows == span.len), "invalid probe media identity/grid");
+            if let Some(identity) = &span.identity {
+                anyhow::ensure!(sha256_hex(&identity.encoder) && sha256_hex(&identity.processor),
+                    "invalid probe prepared input identity");
+            }
+            anyhow::ensure!(span.input_key.is_none(), "probe input_key is response-only");
             let source = span.image_url.as_ref().ok_or_else(|| anyhow::anyhow!("probe media image_url required"))?;
             anyhow::ensure!(!source.url.is_empty() && source.detail.as_deref().is_none_or(|v| matches!(v, "auto" | "high" | "low")),
                 "invalid probe image source/detail");
@@ -261,7 +320,17 @@ pub struct ProbeRecord {
     pub audio: Vec<ProbeAudio>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<serde_json::Value>,
+    /// Native tower work needed by this request (false for memo / whole-prefix hits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoded: Option<bool>,
+    /// Sum of native owner encode times, excluding request/queue/poll latency.
+    /// None means the serving path has not reported timing; zero with encoded=false is a hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encode_ms: Option<f64>,
     pub cached_tokens: usize,
+    /// Executed unit count of the final prefill call; unknown unless reported by the engine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prefill_units: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states: Vec<ProbeState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -331,6 +400,14 @@ impl Probe {
             r.cold = self.spec.cold;
             r.no_speculation = self.spec.no_speculation;
         });
+    }
+
+    pub fn encoding(&self, encoded: bool, encode_ms: f64) {
+        self.with(|r| { r.encoded = Some(encoded); r.encode_ms = Some(encode_ms); });
+    }
+
+    pub fn prefill_units(&self, units: usize) {
+        self.with(|r| r.last_prefill_units = Some(units));
     }
 
     /// Echo verified descriptors only, never the image's data URL.
@@ -527,10 +604,24 @@ pub fn registry() -> &'static ProbeRegistry {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn encoding_probe_distinguishes_native_work_hits_and_unreported_paths() {
+        let probe = Probe::new(ProbeSpec::default());
+        assert_eq!(probe.record().encode_ms, None);
+        assert_eq!(probe.record().encoded, None);
+        probe.encoding(true, 1.25);
+        let wire = serde_json::to_value(probe.record()).unwrap();
+        assert_eq!(wire["encoded"], true);
+        assert_eq!(wire["encode_ms"], 1.25);
+        probe.encoding(false, 0.0);
+        assert_eq!(probe.record().encoded, Some(false));
+        assert_eq!(probe.record().encode_ms, Some(0.0));
+    }
+
+    #[test]
     fn image_probe_serialization_is_unchanged_when_audio_is_empty() {
         use super::*;
         let media = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "ab".repeat(32), grid: [1,4,4],
-            fixture: None, image_url: None };
+            identity: None, input_key: None, fixture: None, image_url: None };
         assert_eq!(serde_json::to_string(&media).unwrap(), format!(
             "{{\"start\":2,\"len\":4,\"kind\":\"image\",\"key\":\"{}\",\"grid\":[1,4,4]}}", "ab".repeat(32)));
         let spec = ProbeSpec { media: vec![media], ..Default::default() };
@@ -559,6 +650,27 @@ mod tests {
             assert!(bad.validate_audio().is_err(), "{mutation}");
         }
     }
+    #[test]
+    fn audio_probe_uses_selected_tower_policy() {
+        use cuteafd_core::media::{AudioTokenGeometry, ImageTokenGeometry};
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        for (samples, len) in [(1, 1), (1920, 1), (1921, 2), (24000, 13)] {
+            let spec = ProbeSpec { prompt_ids: Some(vec![0; len + 4]), score_from: Some(len + 2),
+                audio: vec![ProbeAudio { start: 1, len, key: "ab".repeat(32), samples,
+                    pcm_sha256: "cd".repeat(32) }], ..Default::default() };
+            spec.validate_media_geometries(ImageTokenGeometry::MERGED, policy).unwrap();
+            if samples == 1 || samples == 24000 {
+                assert!(spec.validate_audio().is_err(), "distinct PCM geometry must not use MiMo policy");
+            }
+            let mut bad = spec.clone();
+            bad.audio[0].len += 1;
+            assert!(bad.validate_audio_geometry(policy).is_err());
+        }
+        let spec = ProbeSpec { prompt_ids: Some(vec![0; 4]), audio: vec![ProbeAudio {
+            start: 1, len: 1, key: "ab".repeat(32), samples: 1, pcm_sha256: "cd".repeat(32)
+        }], ..Default::default() };
+        assert!(spec.validate_audio_geometry(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }).is_err());
+    }
     use super::*;
 
     fn dumped_row(path: &std::path::Path) -> Vec<f32> {
@@ -578,6 +690,20 @@ mod tests {
         let data = &bytes[8 + header_len..];
         assert_eq!(data.len(), vocab * 4);
         data.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect()
+    }
+
+    #[test]
+    fn final_prefill_unit_count_is_unknown_until_reported() {
+        let probe = Probe::new(ProbeSpec::default());
+        assert_eq!(probe.record().last_prefill_units, None);
+        probe.prefill_units(3);
+        assert_eq!(probe.record().last_prefill_units, Some(3));
+        probe.prefill_units(1);
+        let value = serde_json::to_value(probe.record()).unwrap();
+        assert_eq!(value["last_prefill_units"], 1);
+        let mut legacy = value;
+        legacy.as_object_mut().unwrap().remove("last_prefill_units");
+        assert_eq!(serde_json::from_value::<ProbeRecord>(legacy).unwrap().last_prefill_units, None);
     }
 
     #[test]
@@ -779,6 +905,15 @@ mod tests {
     }
 
     #[test]
+    fn pair_exempt_marks_arm_local_diagnostics() {
+        use super::*;
+        assert!(!serde_json::from_str::<ProbeSpec>("{}").unwrap().pair_exempt);
+        let spec = ProbeSpec { pair_exempt: true, ..ProbeSpec::default() };
+        let spec: ProbeSpec = serde_json::from_value(serde_json::to_value(spec).unwrap()).unwrap();
+        assert!(spec.pair_exempt && Probe::new(spec).input_determined());
+    }
+
+    #[test]
     fn output_dependent_marks_a_follow_up_prompt() {
         use super::*;
         // A spec that does not set the flag stays input-determined.
@@ -789,3 +924,6 @@ mod tests {
         assert!(Arc::ptr_eq(&probe, &claimed) && !claimed.input_determined());
     }
 }
+
+#[cfg(test)]
+mod input_identity_tests;

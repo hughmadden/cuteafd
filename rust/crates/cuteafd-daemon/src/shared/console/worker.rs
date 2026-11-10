@@ -102,11 +102,15 @@ impl Worker {
             }
             let period = if viewers { Duration::from_millis(250) } else { Duration::from_secs(2) };
             if self.snapshot_at.elapsed() >= period {
-                self.snapshot_at = Instant::now();
-                let (full, plain) = self.snapshots();
-                self.hub.set_snapshot_pair(full.to_string(), plain.map(|p| p.to_string()));
+                self.publish_snapshot();
             }
         }
+    }
+
+    fn publish_snapshot(&mut self) {
+        self.snapshot_at = Instant::now();
+        let (full, plain) = self.snapshots();
+        self.hub.set_snapshot_pair(full.to_string(), plain.map(|p| p.to_string()));
     }
 
     /// The dynamic hook may name the layer classes (V4.1: the RTX/Spark split).
@@ -229,6 +233,8 @@ impl Worker {
                     layers["class"] = json!(class);
                 }
                 self.events.push(json!({"e": "layers", "class": class}));
+                // Startup placement may finish just before the first viewer connects.
+                self.publish_snapshot();
             }
             Event::Round(round) => self.round(round),
         }
@@ -428,6 +434,18 @@ mod tests {
         let stripped = json!([without_text(&first), without_text(&round)]).to_string();
         assert!(!stripped.contains("secret"));
         assert!(!has_text(&json!({"e": "admit"})));
+    }
+
+    #[test]
+    fn layer_classes_refresh_the_cached_snapshot_without_a_viewer() {
+        let mut worker = worker();
+        worker.config["layers"]["class"] = json!([]);
+        worker.publish_snapshot();
+        assert_eq!(worker.hub.viewers(), 0);
+        assert_eq!(serde_json::from_str::<Value>(&worker.hub.snapshot()).unwrap()["config"]["layers"]["class"], json!([]));
+        worker.handle(Event::LayerClasses(vec![1, 2, 0]));
+        let snapshot: Value = serde_json::from_str(&worker.hub.snapshot()).unwrap();
+        assert_eq!(snapshot["config"]["layers"]["class"], json!([1, 2, 0]));
     }
 
     #[test]

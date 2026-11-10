@@ -1751,3 +1751,65 @@ mod tests {
         );
     }
 }
+
+/// One physical sampler arena; pinned and device storage are separate owners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SamplerAllocation {
+    pub id: &'static str,
+    pub bytes: usize,
+    pub pinned: bool,
+}
+
+/// Maximum retained sampler storage, shared by admission and allocation.
+pub fn allocations(capacity: usize, vocab: usize) -> Result<Vec<SamplerAllocation>, &'static str> {
+    if !(1..=128).contains(&capacity) || vocab == 0 {
+        return Err("sampler capacity must be 1..=128 and vocabulary nonzero");
+    }
+    let row = capacity.checked_mul(4).ok_or("sampler row overflow")?;
+    let param = capacity.checked_mul(64).ok_or("sampler params overflow")?;
+    let mask = vocab.div_ceil(32).checked_mul(row).ok_or("sampler mask overflow")?;
+    let histogram = row.checked_mul(2048).ok_or("sampler histogram overflow")?;
+    let retained = row.checked_mul(256).ok_or("sampler retained IDs overflow")?;
+    let rank_scratch = retained.checked_mul(2).ok_or("sampler rank scratch overflow")?;
+    Ok([
+        ("param_device", param, false), ("param_pinned", param, true),
+        ("mask_device", mask, false), ("mask_pinned", mask, true),
+        ("scratch", param, false), ("bitmap", mask, false), ("histogram", histogram, false),
+        ("ids_device", row, false), ("status_device", row, false),
+        ("detail_device", row, false), ("scores_device", row, false),
+        ("total_device", row, false), ("nucleus_device", row, false),
+        ("rank_order_ids", retained, false), ("rank_order_scratch", rank_scratch, false),
+        ("retained_count_device", row, false), ("pivot_passes_device", row, false),
+        ("ids_pinned", row, true), ("status_pinned", row, true),
+        ("detail_pinned", row, true), ("scores_pinned", row, true),
+        ("retained_count_staging", row, true),
+    ].into_iter().map(|(id, bytes, pinned)| SamplerAllocation { id, bytes, pinned }).collect())
+}
+
+/// Retained device sampler storage, excluding its independently charged pinned owners.
+pub fn device_bytes(capacity: usize, vocab: usize) -> usize {
+    capacity * (64 + 64 + 2 * vocab.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 32)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    fn sampler_owner_census_matches_device_formula_and_pinned_arenas() {
+        for rows in [1, 64, 128] {
+            for vocab in [1, 32, 33, 154880] {
+                let owners = allocations(rows, vocab).unwrap();
+                assert_eq!(owners.len(), 22);
+                assert_eq!(owners.iter().filter(|a| !a.pinned).map(|a| a.bytes).sum::<usize>(), device_bytes(rows, vocab));
+                assert_eq!(owners.iter().filter(|a| a.pinned).map(|a| a.bytes).sum::<usize>(),
+                    rows * (64 + vocab.div_ceil(32) * 4 + 20));
+                let ids = owners.iter().map(|a| a.id).collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(ids.len(), owners.len());
+            }
+        }
+        for (rows, vocab) in [(0, 1), (129, 1), (1, 0), (128, usize::MAX)] {
+            assert!(allocations(rows, vocab).is_err());
+        }
+    }
+}

@@ -8,8 +8,14 @@ if(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "120" OR CUTEAFD_CUDA_ARCHITECTURES STREQ
 elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
   set(CUTEAFD_V41_EXPERT_ROLE spark)
   set(CUTEAFD_V41_EXPERT_INPUT_FORMAT fp8_k32)
+elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89")
+  # SM89 (Ada) coordinators: promoted-MMA slices over the same resident experts,
+  # scratch and route planes; quantizer grids and the SM cap are sized for the
+  # largest supported SM89 card (python/tools/lib/sm89_cards.py).
+  set(CUTEAFD_V41_EXPERT_ROLE coordinator)
+  set(CUTEAFD_V41_EXPERT_INPUT_FORMAT bf16)
 else()
-  message(FATAL_ERROR "V4.1 expert AOT requires one native SM120 or SM121 target")
+  message(FATAL_ERROR "V4.1 expert AOT requires one native SM120, SM121 or SM89 target")
 endif()
 set(CUTEAFD_V41_EXPERT_SLICE_WIDTH "" CACHE STRING
   "Experimental fused-slice width (64, 128, 192); empty keeps qualified serving backend")
@@ -24,7 +30,7 @@ if(NOT CUTEAFD_V41_EXPERT_SLICE_WIDTH STREQUAL "")
   endif()
   set(CUTEAFD_V41_EXPERT_EXPORT_SCRIPT export_b12x_slices_aot.py)
   set(CUTEAFD_V41_EXPERT_EXPORT_ARGS --width "${CUTEAFD_V41_EXPERT_SLICE_WIDTH}"
-    --rows "1,16,80,256,1024,4096" --role "${CUTEAFD_V41_EXPERT_ROLE}")
+    --rows "${CUTEAFD_V41_TARGET_ROWS_ARG}" --role "${CUTEAFD_V41_EXPERT_ROLE}")
 endif()
 if(NOT CUTEAFD_V41_EXPERT_ATOMIC_MIN_CAPACITY STREQUAL "")
   if(NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "spark" OR
@@ -44,10 +50,10 @@ if(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT)
     list(APPEND CUTEAFD_V41_EXPERT_EXPORT_ARGS --compact-max-capacity 16)
   endif()
 endif()
-set(CUTEAFD_V41_EXPERT_ROWS 1 16 80 256 1024 4096)
+set(CUTEAFD_V41_EXPERT_ROWS ${CUTEAFD_V41_TARGET_ROWS})
 if(CUTEAFD_V41_EXPERT_ROLE STREQUAL "coordinator" AND CUTEAFD_V41_EXPERT_SLICE_WIDTH STREQUAL "")
-  # Eight independent-lane requests produce at most forty draft rows.
-  list(INSERT CUTEAFD_V41_EXPERT_ROWS 2 40)
+  # Draft flattened rows have independent legacy and wide covers.
+  set(CUTEAFD_V41_EXPERT_ROWS ${CUTEAFD_V41_DRAFT_ROWS})
   list(JOIN CUTEAFD_V41_EXPERT_ROWS "," CUTEAFD_V41_EXPERT_ROWS_ARG)
   list(APPEND CUTEAFD_V41_EXPERT_EXPORT_ARGS --rows "${CUTEAFD_V41_EXPERT_ROWS_ARG}")
 endif()
@@ -82,11 +88,16 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     --output-dir "${CUTEAFD_V41_EXPERT_DIR}" ${CUTEAFD_V41_EXPERT_EXPORT_ARGS}
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
+  DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/${CUTEAFD_V41_EXPERT_EXPORT_SCRIPT}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting native V4.1 expert kernels and scratch layouts"
   VERBATIM

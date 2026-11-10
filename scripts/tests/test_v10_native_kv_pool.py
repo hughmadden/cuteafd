@@ -36,7 +36,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "examples" / "configs" / "tp3ep1-native.config"
 LANE_README = REPO / "runs" / "v10-native-tp3ep1" / "tool-eval-short-oom" / "README.md"
-SELECTOR = REPO / "scripts" / "launch" / "select-release-gpus.py"
+SELECTOR = REPO / "scripts" / "lib" / "coordinator-gpus.py"
 
 # The explicit pin this profile is expected to carry. Change it here and in the
 # config together; every dependent number below is re-derived.
@@ -82,7 +82,7 @@ def load_config() -> dict[str, str]:
     """Load the profile through the real release loader (bash only, no hardware)."""
     probe = (
         'repo_root=$PWD; release_load_config "$1"; '
-        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 97887 "$COORDINATOR_GPU_BUDGET_GIB")"; '
+        'read -r profile_gib default_concurrency <<<"$(release_coordinator_profile 102641958912 "$COORDINATOR_GPU_BUDGET_GIB")"; '
         '((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY=$default_concurrency; '
         'printf "%s\\n" "$KV_POOL_SIZE" "$CONCURRENCY" "$PREFIX_CACHE_ENTRIES" '
         '"$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" '
@@ -152,7 +152,10 @@ def test_pinned_pool_is_a_whole_page_group_count_that_clears_minimum_admission()
     assert selector.parse_bytes(values["KV_POOL_SIZE"]) // selector.GROUP_BYTES == 28_276
     assert selector.parse_bytes(values["KV_POOL_SIZE"]) - global_bytes < selector.GROUP_BYTES
     # The launcher's own `desired_groups` rejects anything below this.
-    minimum = 2 * int(values["CONCURRENCY"]) + 2 * int(values["PREFIX_CACHE_ENTRIES"])
+    concurrency = int(values["CONCURRENCY"])
+    entries = values["PREFIX_CACHE_ENTRIES"]
+    entries = max(20, (5 * concurrency + 3) // 4) if entries == "auto" else int(entries)
+    minimum = 2 * concurrency + 2 * entries
     assert groups >= minimum, (groups, minimum)
     # One maximum-context request plus its full output allowance still fits.
     tokens = global_bytes // selector.GROUP_BYTES * 512
@@ -172,7 +175,7 @@ def test_pinned_pool_returns_headroom_without_changing_the_serving_contract():
     # The protocol concurrency and the per-request limits are untouched.
     assert values["CONCURRENCY"] == "16"
     assert values["MAX_CONTEXT_TOKENS"] == "1048576"
-    assert values["MAX_OUTPUT_TOKENS"] == "393216"
+    assert values["MAX_OUTPUT_TOKENS"] == "131072"
     assert values["PREFILL_BATCH_TOKENS"] == "2048"  # clamped to 256 by the native lane
     assert values["SPARK_COUNT"] == "3"
     assert (values["SPARK_TP"], values["SPARK_EP"]) == ("3", "1")

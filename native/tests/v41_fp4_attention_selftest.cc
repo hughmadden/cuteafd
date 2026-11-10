@@ -20,10 +20,14 @@ struct Buffer {
   }
   ~Buffer() { cudaFree(allocation); }
   Buffer(const Buffer&) = delete;
-  void Fill(int value) { Check(cudaMemset(data, value, bytes)); }
+  // Kernels run on a non-blocking stream, which is not ordered after the
+  // legacy stream's memset, and a pageable host-to-device cudaMemcpy may
+  // return before its bytes land: finish both before returning.
+  void Fill(int value) { Check(cudaMemset(data, value, bytes)); Check(cudaDeviceSynchronize()); }
   template<class T> void Copy(const std::vector<T>& values) {
     if (values.size()*sizeof(T) != bytes) throw std::runtime_error("test buffer size mismatch");
     Check(cudaMemcpy(data, values.data(), bytes, cudaMemcpyHostToDevice));
+    Check(cudaDeviceSynchronize());
   }
 };
 static uint16_t BFloat16(float value) {
@@ -140,6 +144,131 @@ static void WidthInvariantChecks(cudaStream_t stream, int heads) {
   std::cout << "PASS heads=" << heads << " nonuniform head groups, mixed descriptors widths 1..64 and graph replay" << std::endl;
 }
 
+// SM89 runs a split launch whose 16-head blocks (rows x heads/16 x parts)
+// overflow one wave of the device's SMs as one block per (row, part) over a
+// shared KV tile; a single row always fits one wave and keeps the 16-head
+// kernel. Every row of a batch above the crossover must match its own
+// single-row launch bit for bit: FP4 and FP8 sources and a window-only view,
+// the batch and bounded entries, two and ten parts. Elsewhere both launches
+// take the same kernel.
+static void CrossoverChecks(cudaStream_t stream, int heads) {
+  constexpr int dim=512, max_rows=64;
+  int device=0,sms=0;
+  Check(cudaGetDevice(&device));
+  Check(cudaDeviceGetAttribute(&sms,cudaDevAttrMultiProcessorCount,device));
+  Buffer query(size_t(max_rows)*heads*dim*2), output(query.bytes), serial(query.bytes), sink(heads*4);
+  Buffer window(128*512), ws(128*16), proposal(max_rows*512), ps(max_rows*16);
+  Buffer source(768*512), ss(768*32), priv(3*512), pss(3*32);
+  Buffer alternate_window(window.bytes), alternate_source(source.bytes);
+  Buffer end(8), se(8), pages(8), meta(max_rows*80), ids(max_rows*2048), bounds(max_rows*8);
+  Buffer scratch(size_t(max_rows)*10*heads*514*4), descriptors(max_rows*sizeof(cuteafd_v41_sparse_kv_t));
+  std::vector<uint16_t> q(query.bytes/2);
+  std::vector<float> sk(heads);
+  for(size_t i=0;i<q.size();++i)q[i]=BFloat16(float(int((i*29+i/512)%47)-23)/64.0f);
+  for(int h=0;h<heads;++h)sk[h]=float(h%23-11)/7.0f;
+  query.Copy(q);sink.Copy(sk);
+  // Finite E4M3 values (and E2M1 nibble pairs), with varied per-block scales.
+  auto fp8=[](size_t n,size_t salt) {
+    const uint8_t choices[]={0x28,0x38,0xb0,0x40,0x00,0xbc,0x31,0xc4};
+    std::vector<uint8_t> v(n);
+    for(size_t i=0;i<n;++i)v[i]=choices[(i*11+i/512+salt)%8];
+    return v;
+  };
+  auto fp4=[](size_t n,size_t salt) {
+    std::vector<uint8_t> v(n);
+    for(size_t i=0;i<n;++i)v[i]=uint8_t(((i*13+i/32+salt)%16)|(((i*7+i/256)%16)<<4));
+    return v;
+  };
+  auto e8m0=[](size_t n) {
+    std::vector<uint8_t> v(n);
+    for(size_t i=0;i<n;++i)v[i]=uint8_t(124+(i*5+i/16)%6);
+    return v;
+  };
+  auto e4m3_scales=[](size_t n) {
+    const uint8_t choices[]={0x30,0x38,0x3c,0x40,0x34};
+    std::vector<uint8_t> v(n);
+    for(size_t i=0;i<n;++i)v[i]=choices[(i*3+i/32)%5];
+    return v;
+  };
+  window.Copy(fp8(window.bytes,0));proposal.Copy(fp8(proposal.bytes,1));alternate_window.Copy(fp8(window.bytes,5));
+  ws.Copy(e8m0(ws.bytes));ps.Copy(e8m0(ps.bytes));
+  end.Copy<uint64_t>({2048});se.Copy<uint64_t>({512});pages.Copy<uint32_t>({1,0});
+  std::vector<uint64_t> metadata;
+  std::vector<int32_t> selected(max_rows*512);
+  for(int r=0;r<max_rows;++r) {
+    const uint64_t fields[]={2048,0,max_rows,uint64_t(2048+r),0,514,512,2,0,1};
+    metadata.insert(metadata.end(),fields,fields+10);
+    for(int k=0;k<512;++k)selected[r*512+k]=(k%19==0)?-1:(k*37+r*11)%514;
+  }
+  meta.Copy(metadata);ids.Copy(selected);bounds.Copy(std::vector<uint64_t>(max_rows,0));
+  cuteafd_v41_sparse_kv_t v{};
+  v.values[0]=window.data;v.values[1]=proposal.data;v.values[2]=source.data;v.values[3]=priv.data;
+  v.scales[0]=ws.data;v.scales[1]=ps.data;v.scales[2]=ss.data;v.scales[3]=pss.data;
+  v.window_end=reinterpret_cast<const uint64_t*>(end.data);
+  v.source_end=reinterpret_cast<const uint64_t*>(se.data);v.pages=reinterpret_cast<const uint32_t*>(pages.data);
+  v.window_proposal_capacity=max_rows;v.source_capacity=768;v.source_proposal_capacity=3;v.page_stride=2;
+  const auto* qp=reinterpret_cast<const uint16_t*>(query.data);
+  const auto* sp=reinterpret_cast<const float*>(sink.data);
+  const auto* mp=reinterpret_cast<const uint64_t*>(meta.data);
+  const auto* bp=reinterpret_cast<const uint64_t*>(bounds.data);
+  const auto* dp=reinterpret_cast<const cuteafd_v41_sparse_kv_t*>(descriptors.data);
+  auto* op=reinterpret_cast<uint16_t*>(output.data);
+  auto* rp=reinterpret_cast<uint16_t*>(serial.data);
+  auto* partial=reinterpret_cast<float*>(scratch.data);
+  const auto bounded=heads==64?cuteafd_v41_sparse_attention_bounded:cuteafd_v41_sparse_attention_heads32_bounded;
+  const auto batch=heads==64?cuteafd_v41_sparse_attention_batch:cuteafd_v41_sparse_attention_heads32_batch;
+  const auto validate=heads==64?cuteafd_v41_sparse_attention_batch_validate:cuteafd_v41_sparse_attention_heads32_batch_validate;
+  auto compare=[&](int rows,const char* what) {
+    Check(cudaStreamSynchronize(stream));
+    std::vector<uint16_t> expected(size_t(rows)*heads*dim),actual(expected.size());
+    Check(cudaMemcpy(expected.data(),serial.data,expected.size()*2,cudaMemcpyDeviceToHost));
+    Check(cudaMemcpy(actual.data(),output.data,actual.size()*2,cudaMemcpyDeviceToHost));
+    if(expected!=actual)throw std::runtime_error(what);
+  };
+  for(int format : {2,1,0}) {
+    if(format==2) {
+      source.Copy(fp4(source.bytes,0));priv.Copy(fp4(priv.bytes,3));alternate_source.Copy(fp4(source.bytes,9));
+      ss.Copy(e4m3_scales(ss.bytes));pss.Copy(e4m3_scales(pss.bytes));
+    } else {
+      source.Copy(fp8(source.bytes,2));priv.Copy(fp8(priv.bytes,4));alternate_source.Copy(fp8(source.bytes,7));
+      ss.Copy(e8m0(ss.bytes));pss.Copy(e8m0(pss.bytes));
+    }
+    v.compressed=format;
+    const int32_t* ip=format?reinterpret_cast<const int32_t*>(ids.data):nullptr;
+    std::vector<cuteafd_v41_sparse_kv_t> views(max_rows,v);
+    for(int r=0;r<max_rows;++r) if((r/3)%2) {
+      views[r].values[0]=alternate_window.data;views[r].values[2]=alternate_source.data;
+    }
+    descriptors.Copy(views);
+    for(int rows : {3,17,48,64}) {
+      // Batch entry: ten parts with a source, two without.
+      const int batch_parts=format?10:2;
+      Check(static_cast<cudaError_t>(validate(qp,sp,mp,ip,op,rows,views.data(),dp,bp,partial,
+          scratch.bytes,batch_parts,format)));
+      output.Fill(0xcd);serial.Fill(0xab);
+      Check(static_cast<cudaError_t>(batch(qp,sp,mp,ip,op,rows,dp,stream,bp,partial,batch_parts,format)));
+      Check(cudaStreamSynchronize(stream));
+      for(int r=0;r<rows;++r)
+        Check(static_cast<cudaError_t>(batch(qp+size_t(r)*heads*dim,sp,mp+r*10,ip?ip+r*512:nullptr,
+            rp+size_t(r)*heads*dim,1,dp+r,stream,bp+r,partial,batch_parts,format)));
+      compare(rows,"batch rows differ from single-row launches across the shared-tile crossover");
+      // Bounded entry, one descriptor: two and ten parts for every view.
+      for(int parts : {2,10}) {
+        output.Fill(0xcd);serial.Fill(0xab);
+        Check(static_cast<cudaError_t>(bounded(qp,sp,mp,ip,op,rows,0,&v,stream,bp,partial,scratch.bytes,parts)));
+        Check(cudaStreamSynchronize(stream));
+        for(int r=0;r<rows;++r)
+          Check(static_cast<cudaError_t>(bounded(qp+size_t(r)*heads*dim,sp,mp+r*10,ip?ip+r*512:nullptr,
+              rp+size_t(r)*heads*dim,1,0,&v,stream,bp+r,partial,scratch.bytes,parts)));
+        compare(rows,"bounded rows differ from single-row launches across the shared-tile crossover");
+      }
+    }
+    std::cout << "PASS crossover heads=" << heads << " format=" << format << " rows 3/17/48/64 vs single rows"
+              << " (16-head blocks per wave: " << sms << "; batch " << 64*heads/16*(format?10:2) << " at 64 rows)"
+              << std::endl;
+  }
+}
+
 int main() {
   Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_initialize()));
   Check(static_cast<cudaError_t>(cuteafd_v41_sparse_attention_heads32_initialize()));
@@ -147,6 +276,8 @@ int main() {
   Check(cudaStreamCreateWithFlags(&test_stream,cudaStreamNonBlocking));
   WidthInvariantChecks(test_stream,64);
   WidthInvariantChecks(test_stream,32);
+  CrossoverChecks(test_stream,64);
+  CrossoverChecks(test_stream,32);
   int checks = 0;
   for(int format : {0,1,2}) for (int rows : {1, 6, 128, 256}) {
     Buffer query(size_t(rows)*64*512*2), output(query.bytes), sink(64*4);

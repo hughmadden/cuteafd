@@ -39,11 +39,19 @@ struct PendingDraft<'a> {
     armed: bool,
     library: &'a cuteafd_ffi::NativeLibrary,
     stream: *mut c_void,
+    peers: [Option<std::rc::Rc<crate::shared::memory::device::Stream<'a>>>; 3],
 }
 impl Drop for PendingDraft<'_> {
     fn drop(&mut self) {
         if self.armed {
-            fatal_drain(unsafe { self.library.cuda_stream_synchronize(self.stream) }, "pending draft readers");
+            // A partial enqueue may fail before the root joins the peer. Drain
+            // every peer even when root synchronization reports an error.
+            let mut drained = unsafe { self.library.cuda_stream_synchronize(self.stream) };
+            for peer in self.peers.iter().flatten() {
+                let result = peer.drain();
+                drained = drained.and(result);
+            }
+            fatal_drain(drained, "pending draft readers");
         }
     }
 }
@@ -198,7 +206,7 @@ impl DsparkChain<'_, '_> {
         );
         ensure!(
             !tokens.is_empty()
-                && tokens.len() <= 16
+                && tokens.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS
                 && tokens.len() <= self.tokens.buffer.bytes / 4,
             "invalid dSpark seed count"
         );
@@ -224,7 +232,12 @@ impl DsparkChain<'_, '_> {
         }
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        let mut drained = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
+        for stage in &self.stages {
+            let result = stage.synchronize();
+            drained = drained.and(result);
+        }
+        drained
     }
     fn prepare(
         &mut self,
@@ -448,7 +461,8 @@ impl DsparkChain<'_, '_> {
         }
         self.terminal.as_ref().context("dSpark chain has no terminal")?.output_storage(count)?;
         let pending = PendingDraft { count, reads, warming: !self.has_graph(count), armed: true,
-            library: self.stream.library, stream: self.stream.raw };
+            library: self.stream.library, stream: self.stream.raw,
+            peers: self.stages.each_ref().map(DsparkStage::peer_stream) };
         // The local guard already owns reservations before any partial upload.
         unsafe {
             self.stream.library.copy_h2d_async(self.tokens.buffer,
@@ -505,6 +519,15 @@ impl DsparkChain<'_, '_> {
         let confidence = bytes[count * (self.width + 1) * 4..count * (2 * self.width + 1) * 4].chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
         Ok(Some((tokens, confidence)))
+    }
+    /// poll_replay for a caller that blocks: drain the stream before each poll,
+    /// so a cold count warms, captures and replays without the host spinning.
+    pub fn wait_replay(&mut self) -> Result<(Vec<u32>, Vec<f32>)> {
+        for _ in 0..2 {
+            if let Err(error) = self.synchronize() { self.pending = None; return Err(error); }
+            if let Some(output) = self.poll_replay()? { return Ok(output); }
+        }
+        anyhow::bail!("dSpark replay incomplete after its stream drained")
     }
     #[cfg(test)]
     pub fn cancel_pending_for_test(&mut self) {

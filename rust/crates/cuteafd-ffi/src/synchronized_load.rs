@@ -26,6 +26,41 @@ pub unsafe fn load_pair<T>(load: impl Fn(usize) -> Result<T> + Sync) -> Result<[
     })
 }
 
+/// [`load_pair`], with `beside` running on the calling thread meanwhile (the
+/// coordinator's dense weights while its two GPUs receive pushed experts).
+/// Both GPU owners are joined before `beside`'s result is returned, on every path.
+///
+/// # Safety
+/// As [`load_pair`] for the two GPU results; `beside` runs on this thread only.
+pub unsafe fn load_pair_beside<T, U>(load: impl Fn(usize) -> Result<T> + Sync,
+    beside: impl FnOnce() -> U) -> (Result<[T; 2]>, U) {
+    // SAFETY: forwarded caller contract; the inputs are empty.
+    unsafe { load_pair_with([(), ()], |rank, ()| load(rank), beside) }
+}
+
+/// [`load_pair_beside`], handing each GPU's loader its own input (for example
+/// descriptors of device memory the caller owns, whose owners outlive this call).
+///
+/// # Safety
+/// As [`load_pair`] for the two GPU results; each input must be unaliased by
+/// the other GPU's loader and by `beside`, and anything it refers to must stay
+/// alive and unmoved until this call returns.
+pub unsafe fn load_pair_with<I, T, U>(inputs: [I; 2], load: impl Fn(usize, I) -> Result<T> + Sync,
+    beside: impl FnOnce() -> U) -> (Result<[T; 2]>, U) {
+    let [left_input, right_input] = inputs.map(Loaded);
+    std::thread::scope(|scope| {
+        let load = &load;
+        // Capture each whole wrapper (not its field) so only `Loaded` crosses threads.
+        let left = scope.spawn(move || { let input = left_input; load(0, input.0).map(Loaded) });
+        let right = scope.spawn(move || { let input = right_input; load(1, input.0).map(Loaded) });
+        let value = beside();
+        let left = left.join().map_err(|_| anyhow!("rank0 weight loader panicked"));
+        let right = right.join().map_err(|_| anyhow!("rank1 weight loader panicked"));
+        let pair = (|| Ok([left??.0, right??.0]))();
+        (pair, value)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,6 +72,30 @@ mod tests {
         // SAFETY: plain integers are unaliased and have no queued device work.
         let ranks = unsafe { load_pair(|rank| { rendezvous.wait(); Ok(rank) }) }?;
         assert_eq!(ranks, [0, 1]);
+        Ok(())
+    }
+
+    #[test]
+    fn beside_runs_concurrently_and_both_ranks_join_first() -> Result<()> {
+        let rendezvous = Barrier::new(3);
+        // SAFETY: plain integers are unaliased and have no queued device work.
+        let (pair, beside) = unsafe { load_pair_beside(|rank| { rendezvous.wait(); Ok(rank) }, || {
+            rendezvous.wait();
+            7
+        }) };
+        assert_eq!((pair?, beside), ([0, 1], 7));
+        let released = Arc::new(AtomicUsize::new(0));
+        struct Owner(Arc<AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        // SAFETY: mock owners hold only an Arc.
+        let (pair, ()) = unsafe { load_pair_beside(|rank| {
+            if rank == 1 { return Err(anyhow!("injected")); }
+            Ok(Owner(released.clone()))
+        }, || ()) };
+        assert!(pair.is_err());
+        assert_eq!(released.load(Ordering::SeqCst), 1);
         Ok(())
     }
 

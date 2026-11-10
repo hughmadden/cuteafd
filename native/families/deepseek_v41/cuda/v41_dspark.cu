@@ -1,3 +1,4 @@
+#include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <math_constants.h>
 #include <curand_kernel.h>
@@ -196,14 +197,14 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   return 0;
 }
 extern "C" int32_t cuteafd_v41_markov_create(void* workspace, uint64_t bytes, void** output) {
-  return create_head(workspace, bytes, output, 256, 16);
+  return create_head(workspace, bytes, output, 256, CUTEAFD_V41_MAX_LANE_MEMBERS);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, void** output) {
-  return create_head(workspace, bytes, output, 5120, 128);
+  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_shard_create(void* workspace, uint64_t bytes,
     int32_t vocab_rows, void** output) {
-  return create_head(workspace, bytes, output, 5120, 128, vocab_rows);
+  return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS, vocab_rows);
 }
 extern "C" int32_t cuteafd_v41_markov_destroy(void* opaque) {
   if (!opaque) return cudaErrorInvalidValue;
@@ -338,7 +339,7 @@ __global__ void vocabulary_merge_greedy(const uint32_t* ids0, const float* score
 extern "C" int32_t cuteafd_v41_vocabulary_merge_greedy(const uint32_t* ids0,
     const float* scores0, const uint32_t* ids1, const float* scores1,
     uint32_t* ids, float* scores, int32_t rows, int32_t split, void* stream) {
-  if (rows < 1 || rows > 128 || split < 1 || split >= 129280) return cudaErrorInvalidValue;
+  if (rows < 1 || rows > CUTEAFD_V41_VOCAB_ROWS || split < 1 || split >= 129280) return cudaErrorInvalidValue;
   const uint64_t bytes = uint64_t(rows) * 4;
   const void* buffers[] = {ids0, scores0, ids1, scores1, ids, scores};
   for (int i = 0; i < 6; ++i) {
@@ -346,7 +347,7 @@ extern "C" int32_t cuteafd_v41_vocabulary_merge_greedy(const uint32_t* ids0,
     if (i >= 4) for (int j = 0; j < i; ++j)
       if (!disjoint(buffers[i], bytes, buffers[j], bytes)) return cudaErrorInvalidValue;
   }
-  vocabulary_merge_greedy<<<1, 128, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+  vocabulary_merge_greedy<<<1, CUTEAFD_V41_VOCAB_ROWS, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
       ids0, scores0, ids1, scores1, ids, scores, rows, uint32_t(split));
   return cudaGetLastError();
 }
@@ -436,7 +437,7 @@ __global__ void draft_step_finish(const float* shared, const float* bias,
 extern "C" int32_t cuteafd_v41_draft_step_rng(const float* shared, const float* bias,
     const uint64_t* rng, const float* temperatures, float* adjusted, uint32_t* tokens,
     int32_t rows, int32_t position, void* stream) {
-  if (rows < 1 || rows > 16 || position < 0 || position > 6) return cudaErrorInvalidValue;
+  if (rows < 1 || rows > CUTEAFD_V41_MAX_LANE_MEMBERS || position < 0 || position > 6) return cudaErrorInvalidValue;
   const uint64_t logits = uint64_t(rows) * 129280 * 4, small = uint64_t(rows) * 4;
   const void* pointers[] = {shared, bias, rng, temperatures, adjusted, tokens};
   const uint64_t bytes[] = {logits, logits, small*4, small, logits, small};

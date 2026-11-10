@@ -31,7 +31,7 @@ pub(super) fn pack_scales<'a>(
                 kernel.info().packed_weight_scale_bytes as usize,
             )?);
             unsafe {
-                kernel.pack_scales(
+                crate::shared::experts::rtx::dense::v41_pack_scales(&kernel, 
                     tensors.get(&format!("mtp.{stage}.ffn.shared_experts.{name}.scale"))?,
                     packed.last().unwrap().buffer,
                     stream.raw,

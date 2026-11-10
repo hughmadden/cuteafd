@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,33 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+
+
+@pytest.fixture(autouse=True)
+def no_stop_handlers(monkeypatch, tmp_path):
+    """main() would install its stop handlers in the pytest process; tests that
+    need a stop set cards.STOP themselves."""
+    monkeypatch.setattr(cards, 'install_stop_handlers', lambda: None)
+    monkeypatch.setitem(cards.STOP, 'signal', None)
+    monkeypatch.setattr(cards, '_LIVE', {})
+    # Tests must never enqueue against the shared cluster hardware queue.
+    monkeypatch.setattr(cards.hwlock, 'LOCK_DIR', tmp_path / 'locks')
+    monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
+    monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
+    cards.bench_panels.cache_clear()
+    bin_dir = tmp_path / '.cuteafd-test-bin'
+    bin_dir.mkdir(exist_ok=True)
+    cuteafd_bin = bin_dir / 'cuteafd'
+    fixture_path = ROOT / 'scripts/bench/fixtures/bench-panels-v1.json'
+    cuteafd_bin.write_text(
+        f'#!/usr/bin/env python3\nimport pathlib, sys\n'
+        f'if sys.argv[1:] == ["bench", "panels", "--json"]:\n'
+        f'    sys.stdout.write(pathlib.Path({str(fixture_path)!r}).read_text())\n'
+        f'    raise SystemExit(0)\n'
+        f'raise SystemExit(1)\n'
+    )
+    cuteafd_bin.chmod(0o755)
+    monkeypatch.setenv('PATH', f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
 
 
 @pytest.fixture
@@ -239,8 +267,54 @@ def test_smoke_no_outer_lock_and_detached_numeric_exit(entry, tmp_path, monkeypa
     cmd, kwargs = seen[0]
     assert cmd[0] == 'setsid'
     assert 'secret' not in str(cmd)
-    assert 'printf' in cmd[3] and '$rc' in cmd[3]
+    assert cmd[1] == '--wait'
+    assert 'printf' in cmd[4] and '$rc' in cmd[4]
     assert kwargs['env']['CUTEAFD_API_KEY'] == 'secret'
+
+
+def test_stop_signal_reaches_detached_smoke_which_finishes_its_teardown(tmp_path, monkeypatch):
+    import signal
+    # A stand-in smoke that tears down for a moment on SIGTERM, then exits 143.
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'def stop(*_):\n    time.sleep(0.5); (d/"torn-down").write_text(""); sys.exit(143)\n'
+             'signal.signal(signal.SIGTERM, stop); (d/"ready").write_text("")\n'
+             'while True: time.sleep(0.05)\n']
+    process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', dict(os.environ))
+    end = time.time() + 10
+    while not (tmp_path / 'ready').exists():
+        assert time.time() < end and process.poll() is None
+        time.sleep(0.02)
+    # What the handler does on SIGTERM: forward to the smoke's process group,
+    # whose bash wrapper must wait for smoke rather than exit first.
+    cards.forward_stop(signal.SIGTERM)
+    assert cards.wait_detached(process, grace=30) == 143
+    assert (tmp_path / 'torn-down').exists()
+    assert (tmp_path / 'exit').read_text().strip() == '143'
+    assert cards.stopped_code() == 128 + signal.SIGTERM
+    assert not cards._LIVE
+
+
+def test_stopped_wip_cards_starts_no_further_job(entry, tmp_path, monkeypatch):
+    import signal
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
+                                      '--arm', 'base=b:s', '--arm', 'cand=c:s', '--state', str(tmp_path / 'state'), '--binary', sys.executable])
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
+    started = []
+    def detached(cmd, log, exit_file, env):
+        started.append(cmd)
+        cards.STOP['signal'] = signal.SIGTERM  # the stop arrives while the first job runs
+        exit_file.write_text('143\n')
+        return SimpleNamespace(wait=lambda timeout=None: 143, pid=0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 128 + signal.SIGTERM
+    assert len(started) == 1
 
 
 def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
@@ -248,6 +322,47 @@ def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='cuteafd-coordinator-' + job['entry']['set']['INSTANCE'] + '\n'))
     with pytest.raises(ValueError, match='foreign'):
         cards.assert_absent(job)
+
+
+def test_container_absence_is_checked_at_grant_not_before_queuing(entry, tmp_path, monkeypatch):
+    # A job may queue behind a running task that still holds a container of the same
+    # name; refusing it up front wastes the queue slot. Absence is rechecked once
+    # smoke holds the card's locks (the prelaunch hook).
+    job = make(entry, tmp_path)
+    arm = dict(instance='test-base', slot='s')
+    sealed = json.dumps(dict(slot='s', seal_sha256='h', artifact_manifest_sha256='a'))
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: sealed)
+    artifacts = cards.preflight_job(job, arm)
+    assert artifacts['raptor'] == dict(slot='s', seal_sha256='h', artifact_manifest_sha256='a')
+    name = 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=name + '\n'))
+    with pytest.raises(ValueError, match='existing .*container'):
+        cards.preflight_at_grant(job, arm)
+
+
+def test_binary_defaults_to_the_arms_sealed_slot_binary(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path / 'home')
+    arm = dict(instance='test-base', slot='s')
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    with pytest.raises(ValueError, match='not on PATH'):
+        cards.resolve_binary(None, arm)
+    binary = tmp_path / 'home/.cache/cuteafd/builds/wip-test-base/slots/s/coordinator/workspace/.cuteafd-wip/cuteafd'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('#!/bin/sh\n')
+    assert cards.resolve_binary(None, arm) == str(binary)
+    # An externally reused slot names its own instance for the same default.
+    assert cards.resolve_binary(None, dict(arm, wip_instance='test-base')) == str(binary)
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: '/opt/bin/cuteafd')
+    assert cards.resolve_binary(None, arm) == '/opt/bin/cuteafd'
+    assert cards.resolve_binary('/built/cuteafd', arm) == '/built/cuteafd'
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    assert cards.resolve_binary(None, arm, dry=True) == 'cuteafd'
+    with pytest.raises(ValueError, match='neither a file nor on PATH'):
+        cards.resolve_binary('/no/such/cuteafd', arm)
+    with pytest.raises(ValueError, match='release arm'):
+        cards.resolve_binary(None, dict(instance='i', slot='s', release='v3.0.0'))
+    with pytest.raises(ValueError, match='sealed slot has no binary'):
+        cards.resolve_binary(None, dict(instance='unbuilt', slot='s'))
 
 
 def test_slot_check_every_host_and_seal(monkeypatch):
@@ -265,12 +380,16 @@ def test_slot_check_every_host_and_seal(monkeypatch):
 
 
 @pytest.mark.parametrize('family,tag,count', [('glm5', 'glm', 4), ('glm5_flash', 'glmf', 2), ('qwen4', 'qwen4', 4)])
-@pytest.mark.parametrize('declared_by', ['name', 'model', 'format'])
-def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path):
+@pytest.mark.parametrize('declared_by', ['config', 'model', 'format'])
+def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, tag, count, declared_by, tmp_path, monkeypatch):
     values = {'SPARK_COUNT': str(count)}
     name = 'unlabelled-native-card'
-    if declared_by == 'name':
-        name = tag + '-nvfp4-min'
+    if declared_by == 'config':
+        monkeypatch.setenv('HF_HOME', str(tmp_path))
+        snap = tmp_path / 'hub/models--test--model/snapshots/rev'
+        snap.mkdir(parents=True)
+        (snap / 'config.json').write_text(json.dumps({'quantization_config': {'quant_method': 'modelopt', 'moe_quant_algo': 'NVFP4'}}))
+        values['MODEL_REVISION'] = 'rev'
     elif declared_by == 'model':
         values['MODEL_ID'] = 'nvidia/Model-NVFP4'
     else:
@@ -297,7 +416,8 @@ def test_matrix_nvfp4_required_spark_packages_are_in_build_set(entry, family, ta
 
 
 def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_path, monkeypatch, capsys):
-    other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'], 'set': {'SPARK_COUNT': '2'}}
+    other = {**entry, 'name': 'glmf-min', 'family': 'glm5_flash', 'sparks': ['rhea', 'moa'],
+             'set': {'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '2'}}
     arms = cards.arms_from(['base=b:s', 'candidate=c:s'])
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     # A revision whose wip.sh predates build slots keeps the outer build.lock.
@@ -318,15 +438,18 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
     assert scopes['CUTEAFD_WIP_EXPORT_LOCKS'] == 'on'
     # Qwen has no Spark FP8 layout: its scope is the NVFP4 family (CMake adds the coordinator FP8 sibling).
-    qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
+    qwen = {**entry, 'name': 'qwen38-nvfp4-min', 'family': 'qwen4', 'sparks': [],
+            'set': {'MODEL_ID': 'nvidia/Qwen3.8-Flash-Next-NVFP4', 'SPARK_COUNT': '0'}}
     built = cards.build_scopes([qwen, other])
     families = built['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     # A 0-Spark card adds coordinator scopes only (per-card derivation).
     assert 'qwen4:nvfp4' not in families and 'glmf:fp8' in families
     coordinator = built['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
     assert 'qwen4:nvfp4' in coordinator and 'qwen4:fp8' not in coordinator
-    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5'},
-             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash'}]
+    nvfp4 = [{**entry, 'name': 'glm53-nvfp4-min', 'family': 'glm5',
+              'set': {**entry['set'], 'MODEL_ID': 'nvidia/GLM-5.3-NVFP4'}},
+             {**other, 'name': 'glmf-nvfp4-min', 'family': 'glm5_flash',
+              'set': {**other['set'], 'MODEL_ID': 'nvidia/GLM-5.3-Flash-NVFP4'}}]
     scopes = cards.build_scopes(nvfp4)
     families = set(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
     coordinator = set(scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';'))
@@ -341,10 +464,13 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
     assert 'CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES' not in expert_leg
 
 
-@pytest.mark.parametrize('name,tag', [('v4-flash-min', 'dsv4f'), ('v4-pro-exl3-max', 'dsv4p')])
+@pytest.mark.parametrize('name,tag,model', [
+    ('v4-flash-min', 'dsv4f', 'deepseek-ai/DeepSeek-V4-Flash'),
+    ('v4-pro-exl3-max', 'dsv4p', 'wrldsuksgo2mars/DeepSeek-V4-Pro-EXL3-K2-Core-K6'),
+])
 @pytest.mark.parametrize('gpus,override,wants_tp2', [([0], None, False), ([0, 1], None, True), ([0], '2', True), ([0, 1], '1', False)])
-def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, gpus, override, wants_tp2):
-    values = {'SPARK_COUNT': '4'}
+def test_v4_scopes_keep_full_experts_and_add_dual_rtx_halves(entry, name, tag, model, gpus, override, wants_tp2):
+    values = {'MODEL_ID': model, 'SPARK_COUNT': '4'}
     if override is not None:
         values['RTX_GPUS'] = override
     scope = cards.build_scopes([{**entry, 'name': name, 'family': 'deepseek_v4', 'gpus': gpus, 'set': values}])
@@ -476,7 +602,9 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
             '2026-10-14T17:13:52.242369Z  INFO cuteafd::shared::probe: matched benchmark prompt engine="d" '
             'prompt_tokens=8192 prompt_token_hash="73b4ebf8f4958775"\n'
             '2026-10-14T17:13:53.242369Z  INFO cuteafd::shared::probe: benchmark output-dependent prompt engine="d" '
-            'prompt_tokens=439\n')
+            'prompt_tokens=439\n'
+            '2026-10-14T17:13:54.242369Z  INFO cuteafd::shared::probe: benchmark arm-local prompt engine="d" '
+            'prompt_tokens=1217\n')
         (state / 'reports' / entry['name']).mkdir(parents=True)
         (state / 'reports' / entry['name'] / 'sweep.json').write_text(json.dumps({'points': [], 'prefill': []}))
         return dict(card='c', arm='a', repeat=1, simulated=False, state=str(state), nonce_seed='s', entry=entry)
@@ -484,6 +612,7 @@ def test_matched_prefill_only_sweep_needs_no_decode_rounds(tmp_path):
     assert prefill['status'] == 'pass' and prefill['first_prompt_token_hash'] == '73b4ebf8f4958775'
     # The follow-up prompt is counted, not compared: it has no hash of its own.
     assert prefill['prompt_token_hashes'] == ['73b4ebf8f4958775'] and prefill['follow_up_prompts'] == 1
+    assert prefill['arm_local_prompts'] == 1
     decode = cards.summarize_job(job(dict(name='d', profile='panels:', levels=[1, 16], set={}, sparks=[])), 0)
     assert decode['status'] == 'failed' and 'per-request console rounds' in decode['error']
     # Fidelity-only runs (no baseline) score through the probe endpoint and decode nothing either.
@@ -515,6 +644,7 @@ def _matched_row(directory, arm, text):
     hashes = cards.prompt_token_hashes(text)
     directory.mkdir(parents=True, exist_ok=True)
     return dict(card='c', arm=arm, repeat=1, nonce_seed='seed', follow_up_prompts=cards.follow_up_prompts(text),
+                arm_local_prompts=cards.arm_local_prompts(text),
                 first_prompt_token_hash=hashes[0], prompt_token_hashes=sorted(hashes), state=str(directory), status='pass')
 
 
@@ -530,6 +660,21 @@ def test_matched_pair_ignores_the_follow_up_prompt_and_still_gates_the_rest(tmp_
     assert all(row['status'] == 'pass' for row in rows)
     # One differing input-determined prompt still fails the pair.
     logs['candidate'] = _coordinator_log(prompts[:2] + [(1217, '4444444444444444')], 420)
+    rows = [_matched_row(tmp_path / 'mismatch' / arm, arm, text) for arm, text in logs.items()]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'failed' for row in rows)
+    assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
+
+
+def test_matched_pair_ignores_extra_arm_local_prompts_and_still_gates_shared_prompts(tmp_path):
+    prompts = [(48, '1111111111111111'), (437, '2222222222222222')]
+    local = 'benchmark arm-local prompt engine="test" prompt_tokens=1217\n' * 20
+    logs = {'base': _coordinator_log(prompts, 439), 'candidate': _coordinator_log(prompts, 439) + local}
+    rows = [_matched_row(tmp_path / 'match' / arm, arm, text) for arm, text in logs.items()]
+    assert [row['arm_local_prompts'] for row in rows] == [0, 20]
+    cards.validate_matched_pairs(rows, ['base', 'candidate'])
+    assert all(row['status'] == 'pass' for row in rows)
+    logs['candidate'] = _coordinator_log(prompts[:1] + [(437, '3333333333333333')], 439) + local
     rows = [_matched_row(tmp_path / 'mismatch' / arm, arm, text) for arm, text in logs.items()]
     cards.validate_matched_pairs(rows, ['base', 'candidate'])
     assert all(row['status'] == 'failed' for row in rows)
@@ -587,6 +732,38 @@ def test_cleanup_leaves_another_instances_legacy_slot_registration(tmp_path):
     assert result.returncode and 'refusing foreign registration' in result.stderr
 
 
+def test_cleanup_multi_slot_instance_slot_by_slot(tmp_path):
+    # An instance can hold several slots; each cleanup removes only its own
+    # build root, overlay and registrations, and the last one takes the root.
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    for slot in ('a', 'b'):
+        (root / 'slots' / slot / 'coordinator').mkdir(parents=True)
+    (root / '.wip-card-owner.json').write_text(json.dumps(dict(task='task', instance='test')))
+    runs = home / '.cache/cuteafd/wip-run' / 'test'
+    slots = home / '.cache/cuteafd/wip-slots' / 'test'
+    for slot in ('a', 'b'):
+        (runs / slot).mkdir(parents=True)
+        slots.mkdir(parents=True, exist_ok=True)
+        (slots / f'{slot}.json').write_text(json.dumps(dict(wip_instance='test', slot=slot)))
+    prefix = 'import subprocess\nsubprocess.check_output=lambda cmd,**kw: ""\n'
+    env = {**os.environ, 'HOME': str(home)}
+    clean = lambda slot: subprocess.run(
+        [sys.executable, '-c', prefix + cards.cleanup_script(dict(instance='test', slot=slot), 'task')],
+        env=env, text=True, capture_output=True)
+
+    first = clean('a')
+    assert first.returncode == 0, first.stderr
+    assert root.exists() and (root / 'slots' / 'b').exists() and not (root / 'slots' / 'a').exists()
+    assert (runs / 'b').exists() and not (runs / 'a').exists()
+    assert (slots / 'b.json').exists() and not (slots / 'a.json').exists()
+
+    second = clean('b')
+    assert second.returncode == 0, second.stderr
+    assert not root.exists()
+    assert not (runs / 'b').exists() and not (slots / 'b.json').exists()
+
+
 def test_summary_medians_paired_not_ratio_of_medians():
     rows = [dict(card='c', arm=arm, repeat=i, status='pass', simulated=False, C1=v) for i, values in enumerate(((10, 20), (100, 110), (20, 40)), 1) for arm, v in zip(('base', 'candidate'), values)]
     medians, paired = cards.summary_math(rows, ['base', 'candidate'])
@@ -632,11 +809,17 @@ def _trace_tools(tmp_path, extra=None):
 
 
 def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
-    function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
+    function = _wip_function('build_expert() (', '\n# Role builders end here.') + '\nnative_store_has() { return 1; }\n'
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
     trace = tmp_path / 'trace'
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    # The lease process (build-resource.py) grants the export turn; rhea's is its exclusive lease.
+    (lease / 'export-granted').write_text('{}')
     setup = f'''set -euo pipefail
 repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
@@ -644,7 +827,8 @@ release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
-'''
+wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn
     subprocess.run(['bash', '-c', setup + function + '\nbuild_expert'], check=True,
                    env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
     lines = trace.read_text().splitlines()
@@ -654,9 +838,11 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
     finalize = next(i for i, line in enumerate(lines) if 'finalize-wip-slot.sh' in line)
     assert rust < native < finalize
     assert not any(line.startswith('flock') for line in lines)
+    # The export ran inside the granted turn, and the turn was handed back.
+    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
 
 
-def test_coordinator_export_probes_after_rust_without_queued_turn(tmp_path):
+def test_coordinator_export_follows_rust_with_memory_caps(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -759,6 +945,63 @@ def test_arm_overrides_only_selected_arm_and_card(entry, tmp_path, monkeypatch, 
     assert '"GLM5_FLASH_PREFILL_BATCH": "on"' in capsys.readouterr().out
 
 
+def test_arm_config_edits_apply_after_generation(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'old=b:s', '--arm', 'new=c:s', '--state', str(state),
+        '--arm-set', 'old:COORDINATOR_GPU=0', '--arm-unset', 'old:COORDINATOR_GPUS',
+        '--arm-set', 'new:COORDINATOR_GPUS=1', '--arm-set', 'old:EMPTY=', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        dest = Path(job['state'])
+        settings = job['entry']['set']
+        assert cards.config(dest / 'base.config') == settings
+        assert json.loads((dest / 'matrix.json').read_text())['entries'][0]['set'] == settings
+        assert json.loads((dest / 'job.json').read_text())['entry']['set'] == settings
+        if job['arm'] == 'old':
+            assert settings['COORDINATOR_GPU'] == '0' and settings['EMPTY'] == ''
+            assert 'COORDINATOR_GPUS' not in settings
+        else:
+            assert settings['COORDINATOR_GPUS'] == '1' and 'COORDINATOR_GPU' not in settings
+
+
+@pytest.mark.parametrize('key', ['MEDIA_FEATURES_DIR', 'AUDIO_FEATURES_DIR'])
+def test_reference_feature_directory_is_an_isolated_arm_setting(entry, tmp_path, monkeypatch, key):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    features = tmp_path / 'sealed-features'
+    features.mkdir()
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min',
+        '--matrix', '--arm', 'native=b:s', '--arm', 'reference=c:s',
+        '--arm-wip', 'native=shared', '--arm-wip', 'reference=shared', '--state', str(state),
+        '--arm-set', f'reference:{key}={features}', '--dry-run'])
+    assert cards.main() == 0
+    for job in json.loads((state / 'plan.json').read_text())['jobs']:
+        settings = job['entry']['set']
+        assert cards.config(Path(job['state']) / 'base.config') == settings
+        if job['arm'] == 'reference':
+            assert settings[key] == str(features)
+        else:
+            assert key not in settings
+
+
+@pytest.mark.parametrize('extra,match', [
+    (['--arm-set', 'foreign:MODEL_ID=x'], 'unknown override arm'),
+    (['--arm-unset', 'foreign:MODEL_ID'], 'unknown override arm'),
+    (['--arm-unset', 'base:API_KEY_FILE'], 'driver owns'),
+    (['--arm-set', 'base:API_KEY_FILE=x'], 'driver owns'),
+    (['--arm-unset', 'base:bad-key'], 'invalid override'),
+    (['--arm-set', 'base:MODEL_ID=x', '--arm-unset', 'base:MODEL_ID'], 'both set and unset'),
+])
+def test_arm_config_edit_validation(entry, tmp_path, monkeypatch, extra, match):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)),
+        '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state'),
+        '--dry-run', *extra])
+    with pytest.raises(ValueError, match=match):
+        cards.main()
+
+
 @pytest.mark.parametrize('override,match', [('foreign:v41-min:MODEL_ID=x', 'unknown override arm'),
     ('base:foreign:MODEL_ID=x', 'selected cards'), ('base:v41-min:API_KEY_FILE=x', 'driver owns')])
 def test_arm_override_validation(entry, tmp_path, monkeypatch, override, match):
@@ -777,7 +1020,8 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     kit.mkdir()
     (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
     state = tmp_path / 'state'
-    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(state)]
+    args = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'base=b:s', '--state', str(state),
+            '--binary', sys.executable]
     if seed is not None:
         args += ['--nonce-seed', seed]
     monkeypatch.setattr(sys, 'argv', args)
@@ -789,7 +1033,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     def detached(cmd, log, exit_file, env):
         seen.append(env)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -815,9 +1059,13 @@ def test_shared_wip_same_slot_and_distinct_serving_instances(entry, tmp_path):
     jobs = [cards.generate(entry,n,a,tmp_path,tmp_path/'api-key',{},set(),None,1) for n,a in arms.items()]
     assert {j['entry']['set']['WIP_INSTANCE'] for j in jobs} == {'usage-build'}
     assert len({j['entry']['set']['INSTANCE'] for j in jobs}) == 2
-    arms['on']['slot'] = 'different'
-    with pytest.raises(ValueError,match='identical slots'):
-        cards.shared_wip(arms,[],[],1)
+    # A base and a candidate sealed in different slots of one instance.
+    split = cards.arms_from(['base=peer-base:9', 'cand=peer-cand:8'])
+    cards.shared_wip(split,['base=one-build','cand=one-build'],[],1)
+    split_jobs = {n: cards.generate(entry,n,a,tmp_path,tmp_path/'api-key',{},set(),None,1) for n,a in split.items()}
+    assert {j['entry']['set']['WIP_INSTANCE'] for j in split_jobs.values()} == {'one-build'}
+    assert len({j['entry']['set']['INSTANCE'] for j in split_jobs.values()}) == 2
+    assert {n: j['entry']['run_args'][1] for n, j in split_jobs.items()} == {'base': '9', 'cand': '8'}
     for builds,parallel in [(['off=HEAD'],1),([],2)]:
         with pytest.raises(ValueError,match='refuses'):
             cards.shared_wip(cards.arms_from(['off=off:s']),['off=shared'],builds,parallel)
@@ -837,7 +1085,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     argv = ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave',
             '--repeats', '1', '--arm', 'candidate=v3s1a-c:s',
             '--arm-release', 'release=v3s1a-release:v2.0.0', '--state', str(state),
-            '--repo', '/same-candidate-launcher']
+            '--repo', '/same-candidate-launcher', '--binary', sys.executable]
     if dry:
         argv.append('--dry-run')
     monkeypatch.setattr(sys, 'argv', argv)
@@ -850,7 +1098,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     def detached(cmd, log, exit_file, env):
         commands.append(cmd)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -867,6 +1115,23 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     if not dry:
         saved = json.loads((Path(release['state']) / 'job.json').read_text())
         assert saved['artifacts']['raptor']['image_id'] == 'sha256:abc'
+
+
+@pytest.mark.parametrize('dense', [False, True])
+def test_release_arm_worker_image_only_for_spark_entries(entry, tmp_path, dense):
+    if dense:
+        entry = dict(entry, name='dense-min', family='qwen3_5', sparks=[],
+                     set={'SPARK_COUNT': '0', 'ADDR': '0.0.0.0:8501'})
+    arm = cards.arms_from([], ['release=r:v2.0.0'])['release']
+    job = cards.generate(entry, 'release', arm, tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    values = job['entry']['set']
+    assert job['entry']['run_args'] == []
+    assert values['COORDINATOR_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0'
+    assert ('SPARK_EXPERT_DOCKER_INFERENCE' in values) == (not dense)
+    if not dense:
+        assert values['SPARK_EXPERT_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0'
+    else:
+        assert 'EXPERT_PORT' not in values
 
 
 def test_release_arm_validation_and_cleanup(entry, tmp_path, monkeypatch):
@@ -958,6 +1223,17 @@ def test_panels_levels_and_post_load_reach_every_job(entry, tmp_path, monkeypatc
         assert matrix['levels'] == [1, 16] and matrix['post_load_c1'] is True
 
 
+def test_panels_none_with_a_probe_is_a_readiness_run(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'none', '--probe', 'v41-min:console', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    entry = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert entry['profile'] == 'panels:' and entry['baseline'] is False
+
+
 def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
@@ -970,21 +1246,24 @@ def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
         assert matrix['post_load_c1'] is True and matrix['post_load_repeat'] is True
 
 
-def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch):
+@pytest.mark.parametrize('tokens', ['1536', '0'])
+def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch, tokens):
+    """0 is the omit-max_tokens probe (#951); any value reaches every job as given."""
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
         '--arm', 'a=b:s', '--arm', 'c=d:s', '--state', str(state), '--panels', 'none', '--levels', '1,16',
-        '--sweep-tokens', '1536', '--dry-run'])
+        '--sweep-tokens', tokens, '--dry-run'])
     assert cards.main() == 0
     for job in json.loads((state / 'plan.json').read_text())['jobs']:
         matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
-        assert matrix['sweep_tokens'] == 1536
+        assert matrix['sweep_tokens'] == int(tokens)
 
 
 @pytest.mark.parametrize('extra,match', [(['--post-load-c1'], 'needs --levels'),
     (['--levels', '1,16', '--post-load-repeat'], 'needs --post-load-c1'), (['--panels', 'none'], 'runs nothing'),
-    (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '0'], '1..8192'),
+    (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '-1'], '1..8192'),
+    (['--levels', '1,16', '--sweep-tokens', '8193'], '1..8192'),
     (['--levels', '1,1'], 'distinct'), (['--panels', 'bogus'], 'unknown requested panel')])
 def test_subset_flags_refuse_nonsense(entry, tmp_path, monkeypatch, extra, match):
     kit = _kit(tmp_path, entry)
@@ -1023,7 +1302,7 @@ def test_profile_collection_pulls_each_spark_and_records_failures(entry, tmp_pat
 
 
 def test_nsys_profile_frames_the_sweep_with_a_window(entry, tmp_path):
-    with pytest.raises(ValueError, match='PROFILE=nsys captures the timed sweep'):
+    with pytest.raises(ValueError, match='PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep'):
         cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1)
     job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key',
                          {'PROFILE': 'nsys,draft-timing'}, set(), None, 1)
@@ -1127,6 +1406,36 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
                                       'tp_role': None, 'nvfp4': False}
 
 
+def test_gate_glm53_max_uses_current_k4_core_k6_checkpoint():
+    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', ['glm53-exl3-max'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6'
+    assert values['MODEL_REVISION'] == '5a4e83a09a11f3145332ed632d28a9894ea88225'
+    assert card['gpus'] == [0, 1] and len(card['sparks']) == 6
+
+
+def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
+    kit = ROOT / 'scripts/bench/kits/gate'
+    card = cards.load_cards(kit, ['v41-flash-sim5090'])[0]
+    values = {**cards.config(ROOT / card['config']), **card['set']}
+    assert card['gpus'] == [0]
+    assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
+    assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
+    expected = {
+        'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
+        'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
+        'MAX_CONTEXT_TOKENS': '1048576',
+        'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
+    }
+    assert {key: values[key] for key in expected} == expected
+    # The prefill reserve is the planner's (TJ 2026-10-27): no row pin.
+    assert 'PREFILL_BATCH_TOKENS' not in values and 'PREFILL_ROWS' not in values
+    assert [values[f'SPARK_{rank}_HOST'] for rank in range(4)] == card['sparks']
+    entries = json.loads((kit / 'matrix-gate.json').read_text())['entries']
+    for key in ('ADDR', 'EXPERT_PORT'):
+        assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
+
+
 def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     # A card pinned to GPU0 (GPU1 held by another session) stages its WIP build
     # container on GPU0 too; without the key the default stays GPU1.
@@ -1134,17 +1443,21 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     card = cards.load_cards(kit, ['v41-flash-min'])[0]
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     arms = cards.arms_from(['base=x:a'])
-    for sub in ('gpu0', 'default', 'bad'):
+    for sub in ('gpu0', 'pair', 'default', 'bad'):
         (tmp_path / sub).mkdir()
-    card['set']['COORDINATOR_GPU'] = '0'
+    card['set']['COORDINATOR_GPUS'] = '0'
     cards.build_arms({'base': 'HEAD'}, arms, [card], tmp_path / 'gpu0', 'task', True)
-    assert cards.config(tmp_path / 'gpu0/build-base.config')['COORDINATOR_GPU'] == '0'
-    card['set'].pop('COORDINATOR_GPU')
-    base = cards.config(ROOT / card['config']).get('COORDINATOR_GPU', '1')
+    assert cards.config(tmp_path / 'gpu0/build-base.config')['COORDINATOR_GPUS'] == '0'
+    # The staging container binds the pair's primary alone.
+    card['set']['COORDINATOR_GPUS'] = '1,0'
+    cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'pair', 'task', True)
+    assert cards.config(tmp_path / 'pair/build-base.config')['COORDINATOR_GPUS'] == '1'
+    card['set'].pop('COORDINATOR_GPUS')
+    base = cards.config(ROOT / card['config']).get('COORDINATOR_GPUS', '1').split(',')[0]
     cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'default', 'task', True)
-    assert cards.config(tmp_path / 'default/build-base.config')['COORDINATOR_GPU'] == base
-    card['set']['COORDINATOR_GPU'] = '2'
-    with pytest.raises(ValueError, match='must be 0 or 1'):
+    assert cards.config(tmp_path / 'default/build-base.config')['COORDINATOR_GPUS'] == base
+    card['set']['COORDINATOR_GPUS'] = '2'
+    with pytest.raises(ValueError, match='must start with GPU 0 or 1'):
         cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'bad', 'task', True)
 
 
@@ -1153,9 +1466,12 @@ def _fake_slot(packages=(), audio=True):
                                              contents=dict(packages=list(packages), audio=audio)))
 
 
-def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
+def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None, smoke_envs=None):
     """Runs main() with hardware stubbed: no containers, a sealed slot, and a
-    smoke 'process' that writes an exit code and (optionally) a result."""
+    smoke 'process' that writes an exit code and (optionally) a result. The binary
+    must exist (it never runs); the sealed-slot default needs a built slot."""
+    if '--binary' not in argv:
+        argv = [*argv, '--binary', sys.executable]
     monkeypatch.setattr(sys, 'argv', ['wip-cards', *argv])
     monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
     monkeypatch.setattr(cards, 'slot_check', slot or _fake_slot())
@@ -1164,8 +1480,12 @@ def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
     def detached(cmd, log, exit_file, env):
         job = json.loads((exit_file.parent / 'job.json').read_text())
         launched.append(job['card'] + '/' + job['arm'])
+        if smoke_envs is not None:
+            smoke_envs.append(dict(env))
+        # Real smoke invokes this hook immediately before run.sh, under the turn.
+        cards.preflight_at_grant(job, {'instance': job['arm'], 'slot': 's'})
         exit_file.write_text(f'{rc_for(job)}\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     def summarize(job, code):
         row = dict(card=job['card'], arm=job['arm'], repeat=job['repeat'], simulated=False,
@@ -1246,8 +1566,9 @@ def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
     gate = ROOT / 'scripts/bench/kits/gate'
     state = tmp_path / 'state'
     argv = ['--kit', str(gate), '--cards', 'qwen38-exl3-min', '--matrix', '--arm', 'c=x:s', '--state', str(state), '--preflight-only']
-    rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4']))
+    rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4a4']))
     assert rc == 0 and launched == []
+    assert not cards.hwlock.LOCK_DIR.exists()
     job = json.loads((state / 'qwen38-exl3-min-c-r1' / 'job.json').read_text())
     hook = job['entry']['prelaunch']['argv']
     assert hook[-2] == '--preflight-job' and job['entry']['prelaunch']['required'] is True
@@ -1255,7 +1576,7 @@ def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--preflight-job', hook[-1]])
     assert cards.main() == 0
     monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot='s', seal_sha256='other', artifact_manifest_sha256='art',
-                                                                         contents=dict(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4'], audio=True))))
+                                                                         contents=dict(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4a4'], audio=True))))
     with pytest.raises(ValueError, match='sealed artifacts changed since enqueue'):
         cards.main()
 
@@ -1358,6 +1679,13 @@ def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entr
         assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
 
 
+def test_readiness_only_row_needs_no_report(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'baseline': False}, tmp_path)
+    row = cards.summarize_job(job, 0)
+    assert 'expected one report' not in (row.get('error') or '')
+    assert not any('expected one report' in e for e in row.get('errors', []))
+
+
 def test_prefill_sweep_rows(entry, tmp_path):
     entry = {**entry, 'profile': 'panels:', 'prefill_lengths': [8192]}
     job = make(entry, tmp_path)
@@ -1370,15 +1698,17 @@ def test_prefill_sweep_rows(entry, tmp_path):
 
 def test_build_scopes_are_per_card_zero_spark_and_family_counts():
     base = {'config': '/dev/null'}
-    local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'SPARK_COUNT': '0'}}
-    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'SPARK_COUNT': '6'}}
+    qwen_model = 'wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1'
+    glm_model = 'wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1'
+    local = {**base, 'name': 'qwen38-exl3-min', 'family': 'qwen4', 'sparks': [], 'set': {'MODEL_ID': qwen_model, 'SPARK_COUNT': '0'}}
+    glm = {**base, 'name': 'glm53-exl3-max', 'family': 'glm5', 'sparks': list(cards.HOSTS), 'set': {'MODEL_ID': glm_model, 'SPARK_COUNT': '6'}}
     mixed = cards.build_scopes([glm, local])
     spark = set(mixed['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';'))
     assert not any(scope.startswith('qwen4:') for scope in spark)
     assert 'qwen4:exl3-k45' in mixed['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')
     assert mixed['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6'
     assert mixed['CUTEAFD_WIP_QWEN4_AOT'] == 'ON'
-    qwen4 = {**local, 'sparks': list(cards.HOSTS[:4]), 'set': {'SPARK_COUNT': '4'}}
+    qwen4 = {**local, 'sparks': list(cards.HOSTS[:4]), 'set': {'MODEL_ID': qwen_model, 'SPARK_COUNT': '4'}}
     both = cards.build_scopes([glm, qwen4])
     assert 'qwen4:exl3-k45' in both['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')
     assert both['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'glm=6;qwen4=4'
@@ -1609,19 +1939,22 @@ def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path
     assert cards.summarize_job(job, 0)['lossless_set']['status'] == 'skipped'
 
 
-def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch):
+def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch, capsys):
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'context-state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
-        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--dry-run'])
+        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--context-suffix', '512', '--dry-run'])
     assert cards.main() == 0
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:context_load' and e['baseline'] is False
     assert e['context_lengths'] == [32768, 131072] and e['context_levels'] == [1, 8, 16]
+    assert e['context_suffix'] == 512
+    assert 'context_suffix=512' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
-    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8')])
+    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8'),
+    ('--context-suffix', '-1'), ('--context-suffix', '1048577'), ('--context-suffix', 'oops')])
 def test_context_load_invalid_options_fail_before_hardware(entry, tmp_path, monkeypatch, option, value):
     kit = _kit(tmp_path, entry)
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
@@ -1696,16 +2029,47 @@ def test_fabric_assessment_timed_contamination_and_unknown():
               dict(name='decode', timed=True, assessments=['SparkNest traffic: x', 'foreign traffic: x',
                                                           'storage attribution unavailable: x', 'xmit_wait rising above idle: x'])]
     caveats = cards.fabric_assessment(phases)
-    assert len(caveats) == 3
-    assert all('decode:' in c and 'rerun' in c for c in caveats)
+    assert len(caveats) == 1
+    assert all('decode:' in c and 'informational' in c for c in caveats)
     assert cards.fabric_assessment([]) == []
+
+
+def test_mapped_table_backend_change_makes_the_ab_rerun(tmp_path):
+    report = dict(panels=[dict(id='decode_content', passes=[dict(rows=[
+        dict(mapped_tables=[dict(name='engram', backend='mincore-routed')], fabric=dict(name='decode_content/0')),
+        dict(mapped_tables=[dict(name='engram', backend='mmap-fallback')], fabric=dict(name='decode_content/1')),
+    ])])])
+    caveats, contaminated = cards.table_backend_findings(cards.table_backend_phases(report))
+    assert contaminated
+    assert any('decode_content/1: engram read backend changed from mincore-routed to mmap-fallback' in c
+               for c in caveats)
+    rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
+                 table_caveats=caveats, table_contaminated=contaminated) for arm in ['base', 'candidate']]
+    cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'mapped-table backend change' in text
+    assert 'engram read backend changed' in text
+
+
+def test_mmap_backend_from_startup_is_configuration_not_a_rerun(tmp_path):
+    report = dict(panels=[dict(id='speed', passes=[dict(
+        mapped_tables=[dict(name='ple', backend='mmap-fallback')])])])
+    caveats, contaminated = cards.table_backend_findings(cards.table_backend_phases(report))
+    assert not contaminated
+    assert len(caveats) == 1 and 'configuration only' in caveats[0]
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10,
+                 table_caveats=caveats, table_contaminated=contaminated)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'eligible'
+    assert 'Rerun' not in (tmp_path / 'summary.md').read_text()
 
 
 def test_summary_retains_fabric_and_requires_rerun(tmp_path):
     rows = [dict(card='c', arm=arm, repeat=1, simulated=False, status='pass', C1=10,
                  fabric=[dict(name='decode', timed=True, ports=[dict(host='coordinator',device='nic',port=1,
-                     sent_bytes=100,received_bytes=100,engine_sent_bytes=40,engine_received_bytes=40,
-                     sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
+                     sent_bytes=1_000_000_000,received_bytes=1_000_000_000,engine_sent_bytes=40,engine_received_bytes=40,
+                     seconds=1, sparknest_sent_bytes=50,sparknest_received_bytes=50)])],
                  fabric_caveats=['decode: SparkNest traffic: rerun'] if arm == 'candidate' else [])
             for arm in ['base','candidate']]
     cards.write_summary(tmp_path, rows, {'base': {}, 'candidate': {}})
@@ -1722,8 +2086,35 @@ def test_fabric_health_caveat_only_gates_timed_phases():
     warning = 'fabric health: port: retransmits 0.6% of packets exceed 0.5%'
     phases = [dict(name='warmup', timed=False, assessments=[warning]),
               dict(name='decode', timed=True, assessments=[warning])]
-    assert cards.fabric_assessment(phases) == [
-        'decode: ' + warning + '; investigate fabric health and rerun before accepting A/B']
+    assert cards.fabric_assessment(phases) == []
+    phases[1]['ports'] = [dict(health=dict(retransmit_pct=0.6, retransmit_judged=True))]
+    assert 'results remain valid' in cards.fabric_assessment(phases)[0]
+    assert cards.fabric_rerun_reasons(phases) == []
+
+
+def test_coordinator_host_load_makes_the_ab_rerun(tmp_path):
+    # A quiet coordinator records low values and stays eligible; CPU pressure,
+    # memory pressure and reclaim each independently force a rerun.
+    quiet = dict(name='decode', timed=True, ports=[],
+                 host_load=dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0, seconds=10))
+    assert cards.fabric_rerun_reasons([quiet]) == []
+    assert cards.fabric_assessment([quiet]) == []
+    contaminated = [
+        dict(cpu_some_avg10=25.0, memory_some_avg10=0.5, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=9.0, pgscan_pages_per_s=0.0),
+        dict(cpu_some_avg10=1.0, memory_some_avg10=0.5, pgscan_pages_per_s=2000.0),
+    ]
+    phases = [dict(name='decode', timed=True, ports=[], host_load=load) for load in contaminated]
+    reasons = cards.fabric_rerun_reasons(phases)
+    assert any('host load' in r and 'CPU pressure' in r and '25.0%' in r for r in reasons), reasons
+    assert any('memory pressure' in r and '9.0%' in r for r in reasons), reasons
+    assert any('page reclaim' in r and '2000 pages/s' in r for r in reasons), reasons
+    assert cards.fabric_rerun_reasons([dict(phases[0], timed=False)]) == []
+    rows = [dict(card='c', arm='candidate', repeat=1, simulated=False, status='pass', C1=10, fabric=phases)]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'rerun'
+    text = (tmp_path / 'summary.md').read_text()
+    assert 'A/B Verdict: Rerun' in text and 'host load' in text
 
 
 def _checkout(path, run_sh=True):
@@ -1766,6 +2157,35 @@ def test_build_arms_serve_through_their_own_source_checkout(entry, tmp_path, mon
     assert not any('/global' in line for line in smoke)
 
 
+def test_coordinator_only_build_claims_its_root_before_any_build_work(tmp_path, monkeypatch):
+    # A 0-Spark (coordinator-only) export claims the WIP root on raptor before the
+    # source checkout runs, so a failed or interrupted build still leaves a root
+    # this task owns and a later --resume never has to adopt an unowned one.
+    home = tmp_path / 'home'
+    monkeypatch.setattr(Path, 'home', lambda: home)
+    config = tmp_path / 'zero.config'
+    config.write_text('MODEL_ID=zai-org/GLM-5.3\nSPARK_COUNT=0\n')
+    card = dict(name='zero', family='glm5', config=str(config), sparks=[], set={})
+    root = home / '.cache/cuteafd/builds/wip-test-base'
+    marker = root / '.wip-card-owner.json'
+    revision = subprocess.run(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], capture_output=True, text=True, check=True).stdout.strip()
+    real = subprocess.run
+    seen = []
+    def run(cmd, **kwargs):
+        if not isinstance(cmd, list) or cmd[0] == 'git':
+            return real(cmd, **kwargs)
+        if '-c' in cmd:  # the owner marker writes under the redirected home
+            return real(cmd, **kwargs, env={**os.environ, 'HOME': str(home)})
+        seen.append((Path(str(cmd[0])).name, marker.is_file()))
+        return subprocess.CompletedProcess(cmd, 0, '' if kwargs.get('text') else b'', '')
+    monkeypatch.setattr(cards.subprocess, 'run', run)
+    cards.build_arms({'base': revision}, cards.arms_from(['base=test-base:s']), [card], tmp_path, 'task', False)
+    assert seen, 'build_arms ran no build command'
+    assert all(claimed for _name, claimed in seen), seen
+    assert json.loads(marker.read_text()) == dict(task='task', instance='test-base')
+    assert json.loads((tmp_path / 'plan.json').read_text())['arms']['base']['cleanup_hosts']
+
+
 def test_arm_repo_overrides_arm_wip_and_unmapped_arm_falls_back_to_repo(entry, tmp_path, monkeypatch, capsys):
     pinned, fallback = tmp_path / 'pinned', tmp_path / 'fallback'
     pinned_head, fallback_head = _checkout(pinned), _checkout(fallback)
@@ -1789,7 +2209,7 @@ def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, mon
     git('update-ref', ref, first)
     real_build_arms = cards.build_arms
     def build_arms_then_move(builds, *args):
-        git('update-ref', ref, moved)  # work/p0 advances while the build runs
+        git('update-ref', ref, moved)  # dev advances while the build runs
         real_build_arms(builds, *args)
     monkeypatch.setattr(cards, 'build_arms', build_arms_then_move)
     try:
@@ -1852,3 +2272,733 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
     advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
     assert required <= advertised, sorted(required - advertised)
+
+
+@pytest.mark.parametrize('damage', ['', 'revision', 'seal', 'instance', 'unsealed-revision', 'extra-slot'])
+def test_owner_marker_adopts_only_matching_sealed_retry_root(tmp_path, damage):
+    import hashlib
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    role = root / 'slots/s/coordinator'
+    art = role / 'workspace/.cuteafd-wip'
+    art.mkdir(parents=True)
+    revision = 'a' * 40
+    raw_revision = (revision + '\n').encode()
+    (role / 'workspace/.cuteafd-source-revision').write_bytes(raw_revision)
+    source = (hashlib.sha256(raw_revision).hexdigest() + '  ./.cuteafd-source-revision\n').encode()
+    if damage == 'unsealed-revision':
+        source = b'not the source revision\n'
+    (role / 'SOURCE_SHA256SUMS').write_bytes(source)
+    (art / 'ARTIFACT_SHA256SUMS').write_bytes(b'fixture')
+    meta = dict(slot='s', role='coordinator', wip_instance='other' if damage == 'instance' else 'test',
+                source_manifest_sha256=hashlib.sha256(source).hexdigest(),
+                artifact_manifest_sha256=hashlib.sha256(b'fixture').hexdigest())
+    raw = json.dumps(meta).encode()
+    (role / 'META.json').write_bytes(raw)
+    (role / 'FINGERPRINT').write_text(hashlib.sha256(raw).hexdigest() if damage != 'seal' else 'bad')
+    if damage == 'extra-slot':
+        (root / 'slots/foreign').mkdir()
+    script = cards.owner_marker_script(root, 'task', 'test', 's', 'b' * 40 if damage == 'revision' else revision)
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                            env={**os.environ, 'HOME': str(home)}, timeout=10)
+    marker = root / '.wip-card-owner.json'
+    if damage:
+        assert result.returncode and not marker.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(marker.read_text()) == dict(task='task', instance='test')
+
+
+def _expert_leg(tmp_path, has):
+    """build_expert with native_store_has answering from `has` in order; returns (trace lines, lease dir)."""
+    function = _wip_function('build_expert() (', '\n# Role builders end here.')
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
+    tools = _trace_tools(tmp_path)
+    home = tmp_path / 'home'
+    (home / '.cache/cuteafd').mkdir(parents=True)
+    trace = tmp_path / 'trace'
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    (lease / 'export-granted').write_text('{}')
+    answers = tmp_path / 'answers'
+    answers.write_text(''.join(f'{int(not a)}\n' for a in has))
+    setup = f'''set -euo pipefail
+repo_root={str(ROOT)!r}
+sync_seed_source() {{ :; }}
+release_die() {{ exit 2; }}
+slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
+CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
+wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn
+    stub = f'''
+native_store_has() {{ local rc; rc="$(head -1 {str(answers)!r})"; sed -i 1d {str(answers)!r}; printf 'has %s\\n' "$rc" >> "$TRACE"; return "$rc"; }}
+'''
+    subprocess.run(['bash', '-c', setup + function + stub + '\nbuild_expert'], check=True, timeout=30,
+                   env={**os.environ, 'HOME': str(home), 'PATH': str(tools) + ':' + os.environ['PATH'], 'TRACE': str(trace)})
+    return trace.read_text().splitlines(), lease
+
+
+def test_native_cache_hit_on_a_lan_seed_takes_no_export_turn(tmp_path):
+    lines, lease = _expert_leg(tmp_path, [True])
+    assert not (lease / 'export-request').exists() and not (lease / 'export-done').exists()
+    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
+
+
+def test_an_export_published_while_waiting_is_restored_not_rebuilt(tmp_path):
+    # A build ahead of us in the seed's export queue exported this very key.
+    lines, lease = _expert_leg(tmp_path, [False, True])
+    assert (lease / 'export-request').exists() and (lease / 'export-done').exists()
+    native = [line for line in lines if line.endswith('/wip/output/expert native')]
+    assert len(native) == 1 and 'CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1' in native[0]
+
+
+def test_export_turn_failure_stops_the_build(tmp_path):
+    text = (ROOT / 'wip.sh').read_text()
+    turn = text[text.index('wip_seed_export_turn() {'):text.index('\nbuild_expert() (')]
+    lease = tmp_path / 'lease'
+    lease.mkdir()
+    (lease / 'export-failed').write_text('no turn for kakapo-export after 14400 s')
+    script = f'''release_die() {{ echo "die: $*"; exit 3; }}
+seed_host=kakapo wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
+''' + turn + '\nwip_seed_export_turn\necho unreachable'
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 3 and 'die: no GPU export turn on kakapo' in result.stdout
+
+
+@pytest.mark.parametrize('stop', [None, 'TERM', 'INT', 'HUP'])
+def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, monkeypatch, stop):
+    import contextlib
+    import signal
+    events, smoke_envs = [], []
+    held = []
+    real_hold = cards.hwlock.hold
+    @contextlib.contextmanager
+    def hold(names, wait, *args, **kwargs):
+        assert not held
+        assert wait == 123
+        events.append('grant')
+        with real_hold(names, wait, *args, **kwargs):
+            held.extend(names)
+            try:
+                yield
+            finally:
+                events.append('release')
+                held.clear()
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    original_preflight = cards.preflight_at_grant
+    def at_grant(job, arm):
+        assert held == ['sparks', 'gpu0', 'gpu1']
+        events.append('prelaunch-' + job['arm'])
+        return original_preflight(job, arm)
+    monkeypatch.setattr(cards, 'preflight_at_grant', at_grant)
+    def finished(job):
+        assert held
+        events.append('teardown-' + job['arm'])
+        if stop:
+            cards.forward_stop(getattr(signal, 'SIG' + stop))
+            return 128 + getattr(signal, 'SIG' + stop)
+        return 0
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--interleave',
+            '--repeats', '2', '--arm', 'base=b:s', '--arm', 'cand=c:s', '--wait', '123',
+            '--state', str(tmp_path / 'state')]
+    rc, launched = _run_main(monkeypatch, argv, rc_for=finished, smoke_envs=smoke_envs)
+    assert rc == (128 + getattr(signal, 'SIG' + stop) if stop else 0)
+    expected = ['base'] if stop else ['base', 'cand', 'cand', 'base']
+    assert launched == ['v41-min/' + arm for arm in expected]
+    assert events == ['grant', *[event for arm in expected for event in ('prelaunch-' + arm, 'teardown-' + arm)], 'release']
+    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1' for env in smoke_envs)
+    assert not held
+    locks = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    assert locks is not None
+    for handle in locks:
+        handle.close()
+
+
+@pytest.mark.parametrize('mode', ['legacy-full-build', 'native-phase'])
+def test_all_build_paths_finish_before_shared_serving_turn(entry, tmp_path, monkeypatch, mode):
+    import contextlib
+    events = []
+    @contextlib.contextmanager
+    def hold(*args, **kwargs):
+        assert events == ['build-base', 'build-cand']
+        events.append('grant')
+        yield
+        events.append('release')
+    def build(builds, arms, *args):
+        # Each build's own lock/export behavior is unchanged; never under the
+        # serving union, including old wip.sh's full-build hardware lock.
+        for name in builds:
+            assert 'grant' not in events
+            arms[name]['build_lock_mode'] = mode
+            events.append('build-' + name)
+    monkeypatch.setattr(cards, 'build_arms', build)
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    real_resolve = cards.resolve_launchers
+    monkeypatch.setattr(cards, 'resolve_launchers', lambda arms, repos, builds, *args:
+                        real_resolve(arms, repos, {}, *args))
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--interleave',
+            '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+            '--build', 'base=HEAD', '--build', 'cand=HEAD', '--state', str(tmp_path / 'state')]
+    assert _run_main(monkeypatch, argv)[0] == 0
+    assert events == ['build-base', 'build-cand', 'grant', 'release']
+
+
+def test_serving_lock_union_matches_smoke_rules():
+    import itertools
+    for gpus, hosts, exclusive, family in itertools.product(
+            ([0], [1], [0, 1]), ([], ['ostrich'], ['rhea'], ['moa'], ['rhea', 'moa']),
+            (None, False, True), ('deepseek_v41', 'glm5_flash')):
+        entry = dict(gpus=gpus, sparks=hosts, family=family)
+        if exclusive is not None:
+            entry['exclusive'] = exclusive
+        expected_exclusive = exclusive if exclusive is not None else family == 'deepseek_v41'
+        expected = []
+        if 0 in gpus or 'ostrich' in hosts or expected_exclusive:
+            expected.append('sparks')
+        expected += [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus or expected_exclusive]
+        expected += [host for host in ('rhea', 'moa') if host in hosts]
+        assert cards.serving_locks([dict(entry=entry)]) == expected
+
+
+def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                        '--interleave', '--repeats', '2', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                        '--state', str(tmp_path / 'state'), '--dry-run'])
+    assert cards.main() == 0
+    output = capsys.readouterr().out
+    assert output.count('single serving turn') == 1
+    assert 'hwlock --locks sparks,gpu0,gpu1 --wait 21600' in output
+    assert output.count('setsid ') == 4
+    assert not cards.hwlock.LOCK_DIR.exists()
+
+
+def test_stop_during_serving_turn_wait_does_not_launch(entry, tmp_path, monkeypatch):
+    import contextlib
+    import signal
+    @contextlib.contextmanager
+    def cancelled(*args, **kwargs):
+        cards.forward_stop(signal.SIGTERM)
+        assert kwargs['cancelled']()
+        raise cards.hwlock.Cancelled()
+        yield
+    monkeypatch.setattr(cards.hwlock, 'hold', cancelled)
+    rc, launched = _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                               '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state')])
+    assert rc == 143 and not launched
+
+
+@pytest.mark.parametrize('sig', ['TERM', 'INT', 'HUP'])
+def test_real_stopped_smoke_tears_down_before_parent_unlocks(entry, tmp_path, monkeypatch, sig):
+    import signal
+    signum = getattr(signal, 'SIG' + sig)
+    job = make(entry, tmp_path)
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time,os\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'def stop(n,_):\n    time.sleep(0.05); (d/"torn-down").touch(); sys.exit(128+n)\n'
+             'for n in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP): signal.signal(n,stop)\n'
+             '(d/"ready").write_text(os.environ["CUTEAFD_HW_LOCKS_HELD"])\n'
+             'while True: time.sleep(0.01)\n']
+    with cards.serving_turn([job], dict(os.environ), 5):
+        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0,gpu1'}
+        process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', env)
+        try:
+            deadline = time.monotonic() + 10
+            while not (tmp_path / 'ready').exists():
+                assert time.monotonic() < deadline and process.poll() is None
+                time.sleep(0.01)
+            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+            cards.forward_stop(signum)
+            assert cards.wait_detached(process, grace=5) == 128 + signum
+            assert (tmp_path / 'torn-down').exists()
+            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+    held = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    assert held is not None
+    for handle in held:
+        handle.close()
+
+
+def test_failed_teardown_prevents_next_arm(entry, tmp_path, monkeypatch):
+    finished = []
+    original = cards.wait_detached
+    def wait(process):
+        code = original(process)
+        finished.append('base')
+        return code
+    monkeypatch.setattr(cards, 'wait_detached', wait)
+    real_main = cards.main
+    def main():
+        def absent(job):
+            if finished:
+                raise ValueError('refusing existing (possibly foreign) container: leftover')
+        monkeypatch.setattr(cards, 'assert_absent', absent)
+        return real_main()
+    monkeypatch.setattr(cards, 'main', main)
+    with pytest.raises(ValueError, match='leftover'):
+        _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                   '--interleave', '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                   '--state', str(tmp_path / 'state')])
+    assert finished == ['base']
+
+
+@pytest.mark.parametrize('value', ['0', '-1', 'nan', 'inf'])
+def test_serving_wait_must_be_positive_finite(monkeypatch, value):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--wait', value])
+    with pytest.raises(SystemExit) as error:
+        cards.main()
+    assert error.value.code == 2
+
+
+def test_failed_build_never_takes_serving_turn(entry, tmp_path, monkeypatch):
+    def build(*args, **kwargs):
+        raise ValueError('build failed: base')
+    def forbidden(*args, **kwargs):
+        pytest.fail('a failed build must not queue for serving')
+    monkeypatch.setattr(cards, 'build_arms', build)
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    with pytest.raises(ValueError, match='build failed'):
+        _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                   '--matrix', '--arm', 'base=b:s', '--build', 'base=HEAD', '--state', str(tmp_path / 'state')])
+
+
+def test_serving_turn_preserves_inherited_locks(entry, tmp_path, monkeypatch):
+    import contextlib
+    requested = []
+    @contextlib.contextmanager
+    def hold(names, *args, **kwargs):
+        requested.append(names)
+        yield
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    env = {'CUTEAFD_HW_LOCKS_HELD': 'sparks.lock,gpu0.lock'}
+    with cards.serving_turn([make(entry, tmp_path)], env, 5):
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1'
+    assert requested == [['gpu1']]
+
+
+def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--matrix',
+            '--arm', 'base=b:s', '--state', str(tmp_path / 'state')]
+    assert _run_main(monkeypatch, argv)[0] == 0
+    def forbidden(*args, **kwargs):
+        pytest.fail('no pending jobs, so there must be no serving turn')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and not launched
+
+
+def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
+    monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
+    job = make(entry, tmp_path)
+    with cards.hwlock.hold(['gpu1'], 1):
+        with pytest.raises(TimeoutError, match='no turn'):
+            with cards.serving_turn([job], {}, 0.02):
+                pytest.fail('a conflicting turn cannot be granted')
+    assert not list((cards.hwlock.LOCK_DIR / 'hwq').glob('*.ticket'))
+
+
+def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
+    entries = [dict(entry, name='one', family='glm5_flash', gpus=[0], sparks=['ostrich'],
+                    set={'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '1', 'ADDR': '0.0.0.0:8500', 'EXPERT_PORT': '19600'}),
+               dict(entry, name='two', family='glm5_flash', gpus=[1], sparks=['rhea', 'moa'],
+                    set={'MODEL_ID': 'zai-org/GLM-5.3-Flash', 'SPARK_COUNT': '2', 'ADDR': '0.0.0.0:8501', 'EXPERT_PORT': '19601'})]
+    state = tmp_path / 'state'
+    seen = []
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, *entries)),
+                        '--cards', 'one', 'two', '--matrix', '--parallel', '2', '--arm', 'base=b:s',
+                        '--binary', sys.executable, '--state', str(state)])
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot(packages=['fp8/fp8-glmf']))
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: seen.append(('absent', job['card'])))
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
+    def detached(cmd, log, exit_file, env):
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1,rhea,moa'
+        assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1', 'rhea', 'moa']) is None
+        seen.append('launch')
+        exit_file.write_text('0\n')
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'],
+                          repeat=1, simulated=True, status='pass'))
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 0
+    assert seen == ['launch', ('absent', 'one'), ('absent', 'two')]
+
+
+def test_null_exclusive_uses_smokes_family_default():
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == [
+        'sparks', 'gpu0', 'gpu1']
+
+
+def test_cancelled_smoke_skips_remote_profile_collection(entry, tmp_path, monkeypatch):
+    import signal
+    real_main = cards.main
+    def main():
+        def forbidden(*args):
+            pytest.fail('remote postprocessing must not extend stop teardown')
+        monkeypatch.setattr(cards, 'summarize_job', forbidden)
+        return real_main()
+    monkeypatch.setattr(cards, 'main', main)
+    def stopped(job):
+        cards.forward_stop(signal.SIGTERM)
+        return 143
+    rc, launched = _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                          '--interleave', '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                          '--state', str(tmp_path / 'state')], rc_for=stopped)
+    assert rc == 143 and launched == ['v41-min/base']
+
+
+@pytest.mark.parametrize('utilization', [0.287833, 0.300341])
+def test_771_zero_ecn_and_retransmits_never_rerun(tmp_path, utilization):
+    phases = [dict(name='prefill/65536', timed=True, assessments=[
+        'fabric health: coordinator mlx5_0/1: no ECN marking under load',
+        'fabric health: coordinator mlx5_0/1: retransmits 0% of packets (warning above 0.5%)'],
+        ports=[dict(host='coordinator', health=dict(verdict='warn', ecn_marked_packets=0,
+            retransmit_pct=0.0, retransmit_judged=True, utilization=utilization))])]
+    assert cards.fabric_assessment(phases) == []
+    assert cards.fabric_rerun_reasons(phases) == []
+    rows = [dict(card='glm-max', arm='candidate', repeat=1, simulated=False, status='pass', fabric=phases,
+                 fabric_caveats=cards.fabric_assessment(phases))]
+    cards.write_summary(tmp_path, rows, {'candidate': {}})
+    assert json.loads((tmp_path / 'summary.json').read_text())['ab_verdict'] == 'eligible'
+    assert 'Rerun' not in (tmp_path / 'summary.md').read_text()
+
+
+def test_771_old_receiver_uses_exact_peer_not_whole_fabric():
+    # #771 2026-10-26T08:37: recorded Step 8K ostrich counters.
+    spark = dict(host='10.55.0.1:19843', device='rocep1s0f0', port=1, seconds=5.019005078,
+        sent_bytes=5_806_438_220, received_bytes=5_908_870_656,
+        engine_sent_bytes=5_745_843_392, engine_received_bytes=109_576_192,
+        peers=[dict(peer='00000000000000000000ffff0a370016')])
+    coordinator = dict(host='coordinator', peers=[dict(peer='00000000000000000000ffff0a370001',
+        sent_bytes=6_018_321_408, received_bytes=5_920_040_192),
+        dict(peer='00000000000000000000ffff0a370002', sent_bytes=6_018_321_408, received_bytes=5_920_040_192)])
+    phase = dict(name='prefill/8192', timed=True, ports=[spark, coordinator],
+        assessments=['foreign traffic: 10.55.0.1:19843 9.2 Gb/s received'])
+    assert cards.fabric_rerun_reasons([phase]) == []
+    assert cards.fabric_assessment([phase]) == []
+    # A real foreign ingress still clears the same threshold, despite peers.
+    spark['received_bytes'] += 6_000_000_000
+    assert len(cards.fabric_rerun_reasons([phase])) == 1
+    phase['timed'] = False
+    assert cards.fabric_rerun_reasons([phase]) == []
+
+
+def test_771_used_down_port_only_is_rerun():
+    p = dict(state='1: DOWN', engine_received_bytes=1)
+    assert cards.fabric_rerun_reasons([dict(timed=True, ports=[p])])
+    p['engine_received_bytes'] = 0
+    assert cards.fabric_rerun_reasons([dict(timed=True, ports=[p])]) == []
+
+
+@pytest.mark.parametrize('error', [ValueError('fatal preflight refusal'), OSError('missing binary')])
+def test_771_fatal_preflight_boundary_exits_nonzero(monkeypatch, capsys, error):
+    def fail():
+        raise error
+    monkeypatch.setattr(cards, 'main', fail)
+    assert cards.cli() == 2
+    assert str(error) in capsys.readouterr().err
+
+
+def test_771_missing_binary_cli_exit(tmp_path):
+    # The real hidden preflight hook reads the job before taking any locks.
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/wip-cards.py'),
+        '--preflight-job', str(tmp_path / 'missing-job.json')], capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'missing-job.json' in result.stderr and 'wip-cards:' in result.stderr
+
+
+def test_771_detached_leader_propagates_fatal_status(tmp_path):
+    # Force setsid's fork path: without --wait the outer process reports 0.
+    command = [sys.executable, '-c',
+        'import subprocess,sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)',
+        'setsid', '--wait', 'bash', '-c', 'exit 82']
+    assert subprocess.run(command, timeout=10).returncode == 82
+    process = cards.detached(['/missing/fabric-binary'], tmp_path / 'log', tmp_path / 'exit', dict(os.environ))
+    assert cards.wait_detached(process, grace=5) == 127
+    assert (tmp_path / 'exit').read_text().strip() == '127'
+
+
+def test_771_missing_borrowed_binary_real_cli(entry, tmp_path):
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/wip-cards.py'),
+        '--task', 'fabric-missing-binary', '--state', str(tmp_path / 'state'),
+        '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--matrix',
+        '--arm', 'candidate=fabric-owned:gate', '--repo', str(ROOT),
+        '--binary', str(tmp_path / 'missing-cuteafd'), '--preflight-only'], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2
+    assert 'is neither a file nor on PATH' in result.stderr
+    assert not (tmp_path / 'state/preflight.json').exists()
+
+
+def test_771_cleanup_includes_recorded_seed_hosts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: calls.append(cmd) or SimpleNamespace(stdout=''))
+    cards.cleanup({'owned': dict(instance='fabric-owned', slot='gate',
+        cleanup_hosts=['cassowary', 'future-seed'])}, 'fabric-verdict', False)
+    hosts = [cmd[3] for cmd in calls if cmd[0] == 'ssh']
+    assert hosts.count('cassowary') == 1
+    assert 'future-seed' in hosts
+
+
+def test_771_live_chip_uses_rate_and_actual_down_not_ecn_or_relative_link_speed():
+    import shutil
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node unavailable')
+    source = ROOT / 'rust/crates/cuteafd-api/assets/cuteafd-ui.js'
+    script = r"""
+const fs = require('fs'), vm = require('vm'), assert = require('assert');
+const context = {window: {}, document: {documentElement: {}}, getComputedStyle: () => ({getPropertyValue: () => ''})};
+vm.createContext(context); vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const health = {verdict: 'warn', ecn_marked_packets: 0, retransmit_pct: 0, retransmit_judged: true, moved_gb: 5};
+const p = {device: 'mlx5_0', port: 1, state: '4: ACTIVE', link_gbps: 100, health_since_start: health};
+const host = {engine: [{device: 'mlx5_0', port: 1, sent_bytes: 1}], ports: [p, {...p, port: 2, link_gbps: 200}]};
+let model = () => context.window.CuteUI.fabricModel({hosts: {coordinator: host}}, 0);
+assert.equal(model().problems.length, 0); assert.equal(model().hosts[0].rows[0].verdict, 'ok');
+p.state = null; assert.equal(model().problems.length, 0);
+p.state = '1: DOWN'; assert.equal(model().problems[0].issue, 'down');
+p.state = '4: ACTIVE'; health.retransmit_pct = 0.51; assert.equal(model().problems[0].issue, 'retransmits');
+health.retransmit_judged = false; health.moved_gb = 1; assert.equal(model().problems.length, 0);
+assert.equal(model().hosts[0].rows[0].verdict, 'idle');
+"""
+    subprocess.run([node, '-e', script, str(source)], check=True, capture_output=True, text=True)
+
+
+def test_771_registered_storage_above_threshold_is_not_hidden_by_own_slack():
+    port = dict(seconds=1, sent_bytes=10_600_000_000, received_bytes=0,
+        engine_sent_bytes=10_000_000_000, engine_received_bytes=0,
+        sparknest_sent_bytes=600_000_000, sparknest_received_bytes=0)
+    reasons = cards.fabric_rerun_reasons([dict(timed=True, ports=[port])])
+    assert len(reasons) == 1 and 'SparkNest traffic:' in reasons[0]
+
+
+def test_existing_arm_adopts_its_containers_wip_mount_root(tmp_path, monkeypatch):
+    # A build with a custom WIP_ROOT: the seal check finds it from the container's
+    # /wip mount, so the smoke binary and WIP_ROOT must name that same root.
+    root = tmp_path / 'custom-root'
+    binary = root / 'slots/s/coordinator/workspace/.cuteafd-wip/cuteafd'
+    binary.parent.mkdir(parents=True)
+    binary.write_text('')
+    calls = []
+
+    def inspect(cmd, **kwargs):
+        calls.append(cmd[-1])
+        mounted = cmd[-1] == 'cuteafd-coordinator-wip-shared'
+        return SimpleNamespace(returncode=0 if mounted else 1, stdout=str(root) + '\n' if mounted else '')
+
+    monkeypatch.setattr(cards.subprocess, 'run', inspect)
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    arms = {'base': dict(instance='a', slot='s', wip_instance='shared'),
+            'built': dict(instance='b', slot='s', root='/built/root'),
+            'release': dict(instance='r', slot=None, release='v3.0.1'),
+            'gone': dict(instance='g', slot='s')}
+    cards.adopt_roots(arms)
+    assert arms['base']['root'] == str(root)
+    assert cards.resolve_binary(None, arms['base']) == str(binary)
+    assert arms['built']['root'] == '/built/root'
+    assert 'root' not in arms['release'] and 'root' not in arms['gone']
+    assert calls == ['cuteafd-coordinator-wip-shared', 'cuteafd-coordinator-wip-g']
+
+
+def test_arm_env_takes_only_private_diagnostics():
+    arms = {'off': {}, 'on': {}}
+    assert cards.arm_env_from(['on:CUTEAFD_DIAG_K6_BF16_PARTIALS=1'], arms) == {'on': {'CUTEAFD_DIAG_K6_BF16_PARTIALS': '1'}}
+    for bad in ['on:RUST_LOG=debug', 'on:CUTEAFD_PREFILL_PACKING=exact', 'gone:CUTEAFD_DIAG_X=1', 'on:CUTEAFD_DIAG_X=a\nb']:
+        with pytest.raises(ValueError):
+            cards.arm_env_from([bad], arms)
+
+
+def test_arm_env_reaches_only_its_own_job():
+    text = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    launch = text[text.index("job_env = dict(env)"):text.index("process = detached(smoke_command(")]
+    # Inherited private diagnostics never leak into an arm that did not ask for them.
+    assert "if k.startswith('CUTEAFD_DIAG_')" in launch and "del job_env[key]" in launch
+    assert "job_env.update(job.get('arm_env', {}))" in launch
+
+
+def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path, monkeypatch):
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: f'/opt/bin/{name}')
+    with pytest.raises(ValueError, match='--cold-window drops the page cache'):
+        cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
+                       cold_hosts=['raptor'])
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path,
+                         tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+    assert job['entry']['window']['open']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    # Prefill points purge per point (before warm-up and timed request), not via the window.
+    job = cards.generate({**entry, 'prefill_lengths': [8192, 65536], 'levels': [1]}, 'e', dict(instance='t', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+    assert job['entry']['prefill_purge']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    assert 'window' not in job['entry']
+    # With PROFILE=nsys the purge runs first, then the nsys sessions start.
+    job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'b', dict(instance='q', slot='s'), tmp_path,
+                         tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1, cold_hosts=['raptor'])
+    script = job['entry']['window']['open']['argv'][2]
+    assert script.index('/opt/bin/nest drop-caches --host raptor') < script.index('start --session=')
+    with pytest.raises(ValueError, match='both use the measurement window'):
+        cards.generate({**entry, 'levels': [1]}, 'c', dict(instance='r', slot='s'), tmp_path, tmp_path / 'key',
+                       {}, set(), None, 1, exact_state=['/x', 'g'], cold_hosts=['raptor'])
+    monkeypatch.setattr(cards.shutil, 'which', lambda name: None)
+    with pytest.raises(ValueError, match='needs the SparkNest `nest` CLI'):
+        cards.generate({**entry, 'prefill_lengths': [8192]}, 'd', dict(instance='s', slot='s'), tmp_path,
+                       tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+
+
+def test_omitted_expert_port_uses_launcher_default_in_preflight_and_assert_absent(entry, tmp_path, monkeypatch):
+    omitted = {**entry, 'set': {k: v for k, v in entry['set'].items() if k != 'EXPERT_PORT'}}
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[omitted])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', omitted['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        '--preflight-only',
+    ])
+    assert cards.main() == 0
+    assert json.loads((state / 'preflight.json').read_text())['status'] == 'pass'
+    plan = json.loads((state / 'plan.json').read_text())
+    job = plan['jobs'][0]
+    assert 'EXPERT_PORT' not in job['entry']['set']
+    assert cards.LAUNCHER_DEFAULTS == {'EXPERT_PORT': '19441', 'ADDR': '0.0.0.0:8000'}
+    assert cards.container_targets(job) == [
+        ('raptor', 'cuteafd-coordinator-' + job['entry']['set']['INSTANCE']),
+        *((host, f'cuteafd-spark-expert-{host}-19441') for host in omitted['sparks']),
+    ]
+    seen = []
+    monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
+    cards.preflight_at_grant(job, {'instance': 'b', 'slot': 's'})
+    assert len(seen) == 1 + len(omitted['sparks'])
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='cuteafd-spark-expert-ostrich-19441\n'))
+    with pytest.raises(ValueError, match='cuteafd-spark-expert-ostrich-19441'):
+        cards.assert_absent(job)
+
+
+@pytest.mark.parametrize('extra_argv,expected', [
+    (['--set', 'v41-min:EXPERT_PORT=99999'], 'EXPERT_PORT must be in 1..65535'),
+    (['--arm-set', 'base:EXPERT_PORT=0'], 'EXPERT_PORT must be in 1..65535'),
+    (['--set', 'v41-min:EXPERT_PORT=not-a-port'], 'EXPERT_PORT must be in 1..65535'),
+])
+def test_invalid_container_keys_fail_at_preflight_before_hardware_grant(entry, tmp_path, monkeypatch, extra_argv, expected):
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    state = tmp_path / 'state'
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot())
+    monkeypatch.setattr(cards, 'binary_supports', lambda *a, **k: None)
+    granted = []
+    monkeypatch.setattr(cards, 'serving_turn', lambda *a, **k: granted.append(True))
+    monkeypatch.setattr(sys, 'argv', [
+        'wip-cards', '--kit', str(kit), '--cards', entry['name'], '--matrix',
+        '--arm', 'base=b:s', '--state', str(state), '--binary', sys.executable,
+        *extra_argv,
+    ])
+    with pytest.raises(ValueError, match=expected):
+        cards.main()
+    assert not granted
+    preflight = json.loads((state / 'preflight.json').read_text())
+    assert preflight['status'] == 'failed'
+    assert any(expected in problem for problem in preflight['problems'])
+    job = make(entry, tmp_path / 'direct')
+    job['entry']['set'].pop('INSTANCE')
+    with pytest.raises(ValueError, match='INSTANCE must be'):
+        cards.preflight_job(job, {'instance': 'test-base', 'slot': 's'})
+
+
+def test_panels_allowlist_derives_from_bench_cli_and_matches_fixture(entry, tmp_path):
+    fixture = json.loads((ROOT / 'scripts/bench/fixtures/bench-panels-v1.json').read_text())
+    assert 'shared_prefix' in fixture
+    assert cards.bench_panels() == frozenset(fixture)
+    assert cards.requested_panels('panels:shared_prefix') == ['shared_prefix']
+    assert cards.requested_panels('panels:shared_prefix,baseline') == ['shared_prefix', 'baseline']
+    job = cards.generate({**entry, 'profile': 'panels:shared_prefix'}, 'a', dict(instance='p', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    assert job['entry']['profile'] == 'panels:shared_prefix'
+    with pytest.raises(ValueError, match='unknown requested panel: not_a_panel'):
+        cards.requested_panels('panels:not_a_panel')
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json failed'):
+        cards.bench_panels(str(tmp_path / 'missing-cuteafd'))
+    bad_bin = tmp_path / 'bad-cuteafd'
+    bad_bin.write_text('#!/bin/sh\necho "not-json"\n')
+    bad_bin.chmod(0o755)
+    cards.bench_panels.cache_clear()
+    with pytest.raises(ValueError, match='bench panels --json returned invalid JSON'):
+        cards.bench_panels(str(bad_bin))
+
+
+def test_observer_slow_cleanup_exits_within_hook_wait_and_preserves_failures(entry, tmp_path, monkeypatch):
+    job = cards.generate(entry, 'candidate', dict(instance='obs-test', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, {'memory', 'console'}, None, 1)
+    assert job['entry']['observer']['finish_timeout_s'] == cards.OBSERVER_FINISH_TIMEOUT_S == 5
+    assert cards.observer_teardown_budget(job) == pytest.approx(3.5)
+    hook_wait_s = 0.5
+    job['entry']['observer']['finish_timeout_s'] = hook_wait_s
+    budget_s = cards.observer_teardown_budget(job)
+    assert 0.1 <= budget_s < hook_wait_s
+    stop = tmp_path / 'observer.stop'
+    monkeypatch.setenv('CUTEAFD_SMOKE_STOP', str(stop))
+    monkeypatch.setenv('CUTEAFD_SMOKE_URL', 'http://localhost:8500')
+    killed = []
+
+    class SlowSampler:
+        def __init__(self, stdout):
+            self.stdout = stdout
+            self.stderr = SimpleNamespace(read=lambda: 'sampler boom')
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(min(timeout or 10.0, 10.0))
+            raise subprocess.TimeoutExpired(['docker', 'run'], timeout or 10.0)
+
+        def kill(self):
+            killed.append(True)
+
+    def fake_popen(cmd, **kwargs):
+        kwargs['stdout'].write('{"time":1.0,"devices":[{"gpu":0,"raw_bytes":1,"sampler_bytes":0,"corrected_bytes":1}]}\n')
+        kwargs['stdout'].flush()
+        return SlowSampler(kwargs['stdout'])
+
+    def slow_run(cmd, **kwargs):
+        timeout = kwargs.get('timeout', 120)
+        time.sleep(min(timeout, 10.0))
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    def slow_console_frames(url, stop_path, output):
+        while not stop_path.exists():
+            time.sleep(0.01)
+        time.sleep(2.0)
+
+    def http(url, path):
+        if path == '/v1/stats':
+            stop.touch()
+            return {'dspark_policy': {}}
+        return {'type': 'snapshot'}
+
+    monkeypatch.setattr(cards.subprocess, 'Popen', fake_popen)
+    monkeypatch.setattr(cards, 'run', slow_run)
+    monkeypatch.setattr(cards, 'console_frames', slow_console_frames)
+    monkeypatch.setattr(cards, 'http', http)
+    started = time.monotonic()
+    cards.observe(job)
+    elapsed = time.monotonic() - started
+    assert elapsed < hook_wait_s
+    assert killed == [True]
+    teardown = json.loads((Path(job['state']) / 'observer-teardown.json').read_text())
+    assert teardown['finish_timeout_s'] == hook_wait_s
+    assert teardown['budget_s'] == pytest.approx(budget_s, abs=0.01)
+    assert [p['phase'] for p in teardown['phases']] == ['sampler_cleanup', 'sampler_wait', 'reader_join']
+    assert [p['status'] for p in teardown['phases']] == ['timeout', 'timeout', 'timeout']
+
+    # Required observer failures (e.g. empty memory samples) still raise after bounded teardown.
+    stop.unlink()
+    monkeypatch.setattr(cards.subprocess, 'Popen', lambda cmd, **kw: SlowSampler(kw['stdout']))
+    with pytest.raises(ValueError, match='memory probe produced no samples'):
+        cards.observe(job)

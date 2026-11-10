@@ -185,6 +185,8 @@ pub struct Media {
     pub kind: String,
     pub key: String,
     pub grid: [u32; 3],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<cuteafd_api::openai::probe::ProbeImageIdentity>,
     pub fixture: MediaFixture,
 }
 
@@ -199,7 +201,7 @@ pub fn verify_media_echo(window: &Window, probe: &serde_json::Value) -> anyhow::
     anyhow::ensure!(actual.len() == window.media.len(), "media probe image count differs");
     for (span, got) in window.media.iter().zip(actual) {
         anyhow::ensure!(got["start"] == span.start && got["len"] == span.len
-            && got["kind"] == span.kind && got["key"] == span.key
+            && got["kind"] == span.kind && (if span.identity.is_some() { got["input_key"] == span.key } else { got["key"] == span.key })
             && got["grid"] == serde_json::json!(span.grid), "server ran different media identity");
     }
     Ok(())
@@ -225,10 +227,12 @@ pub fn media_probe_payload(window: &Window, model: &serde_json::Value, root: &st
         anyhow::ensure!(format!("{:x}", Sha256::digest(&bytes)) == media.fixture.sha256,
             "fixture hash differs from media window");
         anyhow::ensure!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"), "media fixtures must be PNG");
-        Ok(serde_json::json!({"start":media.start,"len":media.len,"kind":media.kind,
+        let mut payload = serde_json::json!({"start":media.start,"len":media.len,"kind":media.kind,
             "key":media.key,"grid":media.grid,"fixture":media.fixture,
             "image_url":{"url":format!("data:image/png;base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes))}}))
+                base64::engine::general_purpose::STANDARD.encode(bytes))}});
+        if let Some(identity) = &media.identity { payload["identity"] = serde_json::to_value(identity)?; }
+        Ok(payload)
     }).collect()
 }
 

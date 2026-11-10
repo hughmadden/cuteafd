@@ -14,6 +14,7 @@ struct RecordedExchange<'e, 'a> {
     engine: &'e GlmfEngine<'a>,
     execution: &'e Execution<'a>,
     entry: Cell<Option<*mut c_void>>,
+    work: Vec<(usize, [&'e Workspace<'a>; 2])>,
 }
 
 impl attention::LayerProtocol for RecordedExchange<'_, '_> {
@@ -42,7 +43,14 @@ impl attention::LayerProtocol for RecordedExchange<'_, '_> {
         let ordinal = self.execution.plan.hops()[..index].iter().filter(|h| h.charged() && h.to == hop.to).count();
         let slot = lane * cuteafd_loader::placement::HOP_SLOTS as usize + ordinal % per_lane;
         self.engine.record_exchange(hop.from as usize, "hop", slot, true);
-        Ok((self.execution.hops.send(index, lane, source, rows)?, hop.to as usize, slot))
+        let destination = match hop.at {
+            HopPoint::AfterAttention(_) | HopPoint::BeforeLayer(0) => {
+                let work = self.work.iter().find(|(at, _)| *at == lane).context("hop lane workspace")?.1;
+                Some(work[hop.to as usize].streams[usize::from(matches!(hop.at, HopPoint::AfterAttention(_)))].buffer)
+            }
+            _ => None,
+        };
+        Ok((self.execution.hops.send_into(index, lane, source, rows, destination)?, hop.to as usize, slot))
     }
 
     fn land(&self, (ticket, to, slot): Self::Ticket) -> Result<*mut c_void> {
@@ -59,6 +67,7 @@ struct Owners {
 }
 
 struct Bindings<'e, 'a, 'c> {
+    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmfEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: [&'e StepTables; 2],
@@ -72,7 +81,7 @@ struct Bindings<'e, 'a, 'c> {
 }
 
 #[derive(Clone, Copy)]
-struct Ticket {
+pub(super) struct Ticket {
     layer: usize,
     lane: usize,
     spark: bool,
@@ -89,17 +98,19 @@ impl<'a> GlmfEngine<'a> {
         // Context tables currently describe one global unit partition, not per-layer geometry.
         ensure!(self.context.is_none() && !plan.modes().contains(&LayerMode::ContextSplit),
             "GLM mixed context execution requires per-layer paging tables");
-        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_lane_count)?;
+        ensure!(plan.spec().lanes == self.prefill_waves as u64,
+            "GLM Flash hop slots must match admitted unit slots");
+        cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_waves)?;
         ensure!(plan.modes().iter().all(|mode| !matches!(mode,
             LayerMode::Whole { ffn: FfnMode::Owner, .. })), "GLM layer executor requires split FFNs");
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library,
             [0, 1].map(|rank| RankDevice { device: exchange.device(rank), stream: exchange.stream(rank) }),
-            plan.hops(), plan.spec())?;
+            plan.hops(), plan.spec(), decode_peer_bytes(self.decode_rows, self.cfg.hidden))?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 terminal owner")?,
             exchange.abort_word(1)?.context("rank 1 terminal owner")?])?;
         hops.validate_binding(&plan, exchange)?;
-        self.layer_waves = RefCell::new((0..self.prefill_lane_count).map(|_| None).collect());
+        self.layer_waves = RefCell::new((0..self.prefill_waves).map(|_| None).collect());
         self.layer_execution = Some(Execution { plan, hops });
         Ok(())
     }
@@ -134,7 +145,8 @@ impl<'a> GlmfEngine<'a> {
         let execution = self.layer_execution.as_ref().context("per-layer execution binding")?;
         let rows = bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>();
         execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
-        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None) };
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: bindings.iter().map(|b| (b.lane, b.work)).collect() };
         attention::layer_pipeline_with(scope, &execution.plan, &exchange,
             LaneOrder::OrderedChunks, &rows, bindings)?;
         for binding in bindings.iter_mut() { binding.finish()?; }
@@ -151,10 +163,10 @@ impl<'a> GlmfEngine<'a> {
             self.release_retired_graphs()?;
             if self.embedding.device_gather() { self.gather_streams(w, rows)?; }
         }
-        let mut bindings = [Bindings { engine: self, work: [w, w1], tables: [tables, tables1],
+        let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables: [tables, tables1],
             owners: self.layer_owners(), lane: 0, rows, graphed, on_layer, prepared: Cell::new(None),
-            tap: (rows.saturating_sub(crate::families::glm5::dflash::TAP_ROWS),
-                rows.min(crate::families::glm5::dflash::TAP_ROWS), 0) }];
+            tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS),
+                rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.layer_pipeline(scope, &mut bindings)?;
         if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
@@ -163,67 +175,56 @@ impl<'a> GlmfEngine<'a> {
         Ok(Some(self.device_logits(w, logit_rows, false)))
     }
 
-    pub(super) fn layer_steps(&self, scope: &SubmissionScope<'_>, lanes: &[(StepTables, &[u32])],
-        logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
-        let workspaces = self.prefill_lanes_of(0, lanes.len())?;
-        let peers = self.peer_workspaces(false, Some(lanes.len()))?.context("per-layer peer lanes")?;
-        let total: usize = lanes.iter().map(|(tables, _)| tables.kv_slots.len()).sum();
-        ensure!(!lanes.is_empty() && logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
-            "per-layer prefill logit rows exceed admission");
-        let units = lanes.iter().zip(workspaces.iter()).enumerate().map(|(lane, ((tables, _), w))|
-            Ok((w, Some(peers.get(lane)?), tables))).collect::<Result<Vec<_>>>()?;
-        self.on(1, || unsafe {
-            // SAFETY: drain this engine's peer stream before replacing its persistent tables.
-            self.library.cuda_stream_synchronize(self.stream_of(1))
-        })?;
-        let ranked = self.step_tables(&units, &lanes.iter().map(|(t, _)| placement_units(t)).collect::<Vec<_>>())?;
-        let mut bindings = Vec::new();
-        let mut first = 0;
-        for (lane, ((tables, tokens), w)) in lanes.iter().zip(workspaces.iter()).enumerate() {
-            let rows = tables.kv_slots.len();
-            ensure!(rows <= w.rows && tokens.len() == rows && tables.segments.is_empty(),
-                "per-layer lane needs unpacked rows within its workspace");
-            self.load_streams(w, tokens, false)?;
-            self.inject_media(w, tables, media)?;
-            let tap_start = (total - total.min(crate::families::glm5::dflash::TAP_ROWS)).max(first).min(first + rows);
-            let n = first + rows - tap_start;
-            bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?],
-                tables: [&ranked[lane][0], &ranked[lane][1]], owners: self.layer_owners(),
-                lane, rows, graphed: false, on_layer: None, prepared: Cell::new(None), tap: (tap_start - first, n,
-                    tap_start.saturating_sub(total - total.min(crate::families::glm5::dflash::TAP_ROWS))) });
-            first += rows;
-        }
-        self.prepare_route_checks(&bindings.iter().map(|binding| binding.rows).collect::<Vec<_>>())?;
-        self.layer_pipeline(scope, &mut bindings)?;
-        if logit_rows == 0 { self.synchronize()?; return Ok(None); }
-        let last = lanes.len() - 1;
-        if device {
-            let w = &workspaces[last];
-            let rows = lanes[last].0.kv_slots.len();
-            ensure!(logit_rows <= rows, "device logits span per-layer lanes");
-            self.layer_head(w, rows, logit_rows)?;
-            return Ok(Some(StepLogits::Device(self.device_logits(w, logit_rows, false))));
-        }
-        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
-        let mut first = 0;
-        for ((tables, _), w) in lanes.iter().zip(workspaces.iter()) {
-            let rows = tables.kv_slots.len();
-            let wanted = (first + rows).saturating_sub((total - logit_rows).max(first));
-            if wanted > 0 {
-                self.layer_head(w, rows, wanted)?;
-                logits.extend(self.download(&w.logits, wanted * self.cfg.vocab_size * 4)?.chunks_exact(4)
-                    .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())));
-            }
-            first += rows;
-        }
-        Ok(Some(StepLogits::Host(logits)))
+    fn unit_binding<'s>(&'s self, work: [&'s Workspace<'a>; 2],
+        tables: &'s [StepTables; 2], unit: &'s crate::shared::prefill_pipeline::Unit,
+        total: usize, prepared: Option<usize>) -> Bindings<'s, 'a, 's> {
+        let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+        let from = unit.rows.start.max(window).min(unit.rows.end);
+        Bindings { unit: Some(unit), engine: self, work, tables: [&tables[0], &tables[1]], owners: self.layer_owners(),
+            lane: unit.slot, rows: unit.rows.len(), graphed: false, on_layer: None,
+            prepared: Cell::new(prepared), tap: (from - unit.rows.start, unit.rows.end - from,
+                from.saturating_sub(window)) }
     }
 
-    fn layer_head(&self, w: &Workspace<'_>, rows: usize, wanted: usize) -> Result<()> {
+    pub(super) fn unit_attention(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("per-layer execution")?;
+        execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: vec![(unit.slot, work)] };
+        let mut binding = self.unit_binding(work, tables, unit, total, Some(layer));
+        attention::pipeline_attention(&exchange, &execution.plan, layer, unit.slot, unit.rows.len(),
+            &mut binding, consumed)?;
+        Ok(())
+    }
+
+    pub(super) fn unit_ffn_begin(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize) -> Result<Ticket> {
+        self.unit_binding(work, tables, unit, total, Some(layer)).begin_ffn(layer, None)
+    }
+
+    pub(super) fn unit_ffn_finish(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize, ticket: Ticket) -> Result<()> {
+        self.unit_binding(work, tables, unit, total, Some(layer)).finish_ffn(layer, ticket)
+    }
+
+    pub(super) fn unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("per-layer execution")?;
+        let exchange = RecordedExchange { engine: self, execution, entry: Cell::new(None),
+            work: vec![(unit.slot, work)] };
+        let mut binding = self.unit_binding(work, tables, unit, total, Some(unit.layers.end));
+        attention::pipeline_hops(&exchange, &execution.plan, HopPoint::Exit, unit.slot, unit.rows.len(),
+            &mut binding, consumed)?;
+        ensure!(consumed.len() == execution.plan.hops().len() && consumed.iter().all(|&count| count == 1),
+            "planned unit hop missing or duplicated");
+        Ok(())
+    }
+
+    pub(super) fn normalize_head(&self, w: &Workspace<'_>, rows: usize) -> Result<()> {
         self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-            ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])?;
-        self.logits(w, rows, wanted, false)
+            ("out", w.x.buffer.ptr)], &[Scalar::I32(rows as i32)])
     }
 }
 
@@ -274,6 +275,7 @@ impl Bindings<'_, '_, '_> {
         let weights = self.layer(rank, layer);
         let slot = slot(layer, false, self.lane);
         if rank == 0 { return e.meet_attention(w, slot, self.rows, weights, self.cap()); }
+        if let Some(out) = e.core_attention_meet(rank, w, weights, slot, self.rows)? { return Ok(out); }
         if e.output_shard_attention(weights) { return e.complete_output_shard(rank, w, weights, slot, self.rows, self.cap()); }
         let exchange = e.exchange()?;
         let precise = e.precise_attention(weights);
@@ -333,26 +335,14 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         let rank = usize::from(hop.to);
         let w = self.work[rank];
         if let HopPoint::AfterAttention(layer) = hop.at {
-            let bytes = self.rows * HC * self.engine.cfg.hidden * 2;
-            self.engine.on(rank, || unsafe {
-                // SAFETY: the landed buffer and persistent streams hold exactly these admitted rows.
-                self.engine.library.copy_d2d_async(w.streams[1].buffer,
-                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: residual, bytes,
-                        device_id: self.engine.exchange()?.device(rank), flags: 0 }, bytes, self.engine.stream_of(rank))
-            })?;
+            ensure!(residual == w.streams[1].buffer.ptr, "FFN residual must land in its consumer operand");
             let weights = self.layer(rank, layer);
             self.engine.run_on(rank, false, "mhc_pre", &[("residual", w.streams[1].buffer.ptr),
                 ("fn", weights.ptr("ffn.fn")?), ("scale", weights.ptr("ffn.scale")?), ("base", weights.ptr("ffn.base")?),
                 ("norm", weights.ptr("post_norm")?), ("post", w.post.buffer.ptr), ("comb", w.comb.buffer.ptr),
                 ("y", w.x.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[Scalar::I32(self.rows as i32)])?;
         } else if hop.at == HopPoint::BeforeLayer(0) {
-            let bytes = self.rows * HC * self.engine.cfg.hidden * 2;
-            self.engine.on(rank, || unsafe {
-                // SAFETY: the initial ownership hop landed these rows before the first collapse.
-                self.engine.library.copy_d2d_async(w.streams[0].buffer,
-                    cuteafd_ffi::CuteafdDeviceBuffer { ptr: residual, bytes,
-                        device_id: self.engine.exchange()?.device(rank), flags: 0 }, bytes, self.engine.stream_of(rank))
-            })?;
+            ensure!(residual == w.streams[0].buffer.ptr, "entry residual must land in its consumer operand");
         } else {
             ensure!(hop.at == HopPoint::Entry && residual == w.streams[0].buffer.ptr,
                 "split-FFN GLM executor has an unexpected boundary hop");
@@ -391,14 +381,14 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         ensure!(masked || layer.dense || real > 0, "per-layer MoE needs positive real rows");
         let mut spark = false;
         if !masked && !e.tp2_layer(index) {
-            let out = GlmfEngine::peer_ffn_out(w1, peer)?;
-            if !layer.dense || peer.has("w_gate_up_fp8") {
+            let out = e.peer_ffn_out(index, w1, peer)?;
+            if !layer.dense || (peer.has("w_gate_up_fp8") || core::native_ffn(peer)) {
                 e.ffn_on(1, w1, peer, if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate },
                     self.cap(), out, rows)?;
             }
         }
         if masked {
-            for (rank, buffer) in [(0, w.delta.buffer), (1, w1.shared.buffer)] {
+            for (rank, buffer) in [(0, w.delta.buffer), (1, if e.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer })] {
                 e.on(rank, || unsafe {
                     // SAFETY: masked startup owns both persistent FFN outputs of the bucket width.
                     e.library.cuda_zero_bytes_async(buffer, self.rows * e.cfg.hidden * 2, e.stream_of(rank))
@@ -408,14 +398,14 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }])?;
-            e.probe_ring(index, w, real, matches!(e.routed_experts(index), Some(Experts::Spark { .. })))?;
+            e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
-            } else if let Some(Experts::Spark { transports, .. }) = e.routed_experts(index) {
+            } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
                 ensure!(e.layer_waves.borrow()[self.lane].is_none(), "unconsumed per-layer Spark wave");
-                let mut transports = transports.borrow_mut();
-                let transport = transports.get_mut(self.lane).context("per-layer Spark lane transport")?;
-                let wave = e.spark_dispatch(w, index, real, self.tables[0].decode, transport, || {
+                let mut transport = transport.borrow_mut();
+                let wave = e.spark_send(w, index, real, self.tables[0].decode, transport.exchange()?,
+                    self.unit.map(|unit| unit.reply_origins()).transpose()?.flatten(), || {
                     e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)
                 })?;
                 e.layer_waves.borrow_mut()[self.lane] = Some(wave);
@@ -431,20 +421,20 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let e = self.engine;
         let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
-            let Some(Experts::Spark { transports, runtime }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
+            let Some(Experts::Spark { transport }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
-            // Only protocol assembly state moves into receive. All QPs, receive registrations,
-            // intake planes and pinned upload owners remain in the engine through teardown.
-            let mut transports = transports.borrow_mut();
-            runtime.block_on(e.spark_land(self.work[0], real,
-                transports.get_mut(self.lane).context("Spark completion transport")?, wave))?;
+            // A device wait on the stream: the QPs, intake planes and staging stay
+            // with the link's exchange through teardown.
+            let mut transport = transport.borrow_mut();
+            e.spark_land(self.work[0], real, transport.exchange()?, wave)?;
         }
         if !self.layer(0, index).dense && real < self.rows {
             let offset = real * e.cfg.hidden * 2;
             let bytes = (self.rows - real) * e.cfg.hidden * 2;
             let peer = self.layer(1, index);
-            let peer_buffer = if peer.dense && peer.has("w_gate_up_fp8") { self.work[1].delta.buffer }
+            let peer_buffer = if peer.dense && (peer.has("w_gate_up_fp8") || core::native_ffn(peer)) { self.work[1].delta.buffer }
                 else if peer.dense { self.work[1].zero.as_ref().context("peer zero rows")?.buffer }
+                else if e.tp2_layer(index) { self.work[1].delta.buffer }
                 else { self.work[1].shared.buffer };
             for (rank, buffer) in [(0, self.work[0].delta.buffer), (1, peer_buffer)] {
                 e.on(rank, || unsafe {
@@ -455,7 +445,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             }
         }
         e.exchange_push(e.exchange()?, "main", 1, slot(index, true, self.lane),
-            GlmfEngine::peer_ffn_out(self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
+            e.peer_ffn_out(index, self.work[1], self.layer(1, index))?, self.rows * e.cfg.hidden * 2)?;
         crate::shared::console::layer_mark(index);
         e.probe_mark(index)?;
         if self.on_layer.is_some() && index + 1 < e.weights.layers.len() {
@@ -505,8 +495,8 @@ mod tests {
         let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,
             row_bytes: 32, rows: 8, lanes: lanes as u64, entry_gpu: 0,
             head_gpu: 0, terminal: TerminalHome::Replicated };
-        let placement = Placement { pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: AttentionPlacement::Layers,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
+        let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: AttentionPlacement::Layers,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
             tp2: None, items: vec![], hops: plan_hops(modes, &spec).unwrap() };

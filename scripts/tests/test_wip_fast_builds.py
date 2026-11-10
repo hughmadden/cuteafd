@@ -126,13 +126,15 @@ def test_finalize_records_key_and_phases(tmp_path):
     (incoming / 'workspace/.cuteafd-wip').mkdir(parents=True)
     (incoming / 'workspace/.cuteafd-wip/V41_EXPERT_TP_AOT.json').write_text('{"schema":1,"spark_tp_roles":[]}')
     values = dict(wip_instance='i', wip_root='', wip_build_key=KEY, slot='s', role='coordinator', image='img',
-                  image_id='id', source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
+                  image_id='id', image_layers='["sha256:l1","sha256:l2"]',
+                  source_manifest_sha256='s', artifact_sha256='a', sparkinfer_revision='r',
                   transformers_revision='t', transformers_source_digest='d', build_output=str(output),
                   incoming=str(incoming))
     prefix = ''.join(f'{k}={v!r}\n' for k, v in values.items())
     subprocess.run(['bash', '-c', 'set -euo pipefail\n' + prefix + block], check=True)
     meta = json.loads((incoming / 'META.json').read_text())
     assert meta['build_key'] == KEY
+    assert meta['base_image_layers'] == ['sha256:l1', 'sha256:l2']
     assert [(p['phase'], p['seconds']) for p in meta['build_phases']] == [('rust', 12), ('native', 3)]
 
 
@@ -266,7 +268,7 @@ def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, caps
     monkeypatch.setattr(cards, 'toolchain_hash', lambda rev: '0123456789abcdef')
     monkeypatch.setattr(cards, 'build_slot_capable', lambda rev: False)
     config = tmp_path / 'card.config'
-    config.write_text('SPARK_COUNT=0\n')
+    config.write_text('MODEL_ID=zai-org/GLM-5.3-Flash\nSPARK_COUNT=0\n')
     entry = {'name': 'glmf-max', 'family': 'glm5_flash', 'config': str(config), 'sparks': [], 'gpus': [0, 1]}
     arms = cards.arms_from(['cand=c:s'])
     cards.build_arms({'cand': 'new'}, arms, [entry], tmp_path, 'task', True)
@@ -282,6 +284,8 @@ def test_seed_uses_only_owner_aware_build_resource():
     assert 'wip_seed_lease_' not in text
     assert 'wip_build_resource_acquire' in text
     helpers = text[text.index('wip_seed_lock() {'):text.index('\n}\n', text.index('wip_seed_lock() {')) + 3]
-    result = subprocess.run(['bash', '-c', helpers + '\nwip_seed_lock rhea; wip_seed_lock ostrich; wip_seed_lock kakapo'],
+    common = (ROOT / 'scripts/lib/release-common.sh').read_text()
+    lan = common[common.index('release_lan_seed_hosts=('):common.index('# release_host_has_rdma HOST')]
+    result = subprocess.run(['bash', '-c', lan + helpers + '\nfor h in rhea ostrich kakapo cassowary; do wip_seed_lock $h; done'],
                             capture_output=True, text=True, timeout=5)
-    assert result.stdout.split() == ['rhea', 'sparks', 'kakapo']
+    assert result.stdout.split() == ['rhea', 'sparks', 'kakapo', 'cassowary']

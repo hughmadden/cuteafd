@@ -191,7 +191,10 @@ def test_bench_ab_concurrency_distinct_default_and_explicit_opt_out(tmp_path, mo
     assert [c[c.index("--label") + 1] for c in concurrent] == ["a", "b"]
 
 
-def test_bench_ab_agentic_battery_rows_and_summary(tmp_path, monkeypatch):
+@pytest.mark.parametrize("task_name", ["task", "backoff"])
+def test_bench_ab_agentic_battery_rows_and_summary(tmp_path, monkeypatch, task_name):
+    tmp_path = tmp_path / task_name
+    tmp_path.mkdir()
     spec = importlib.util.spec_from_file_location("bench_ab", SCRIPT.with_name("bench-ab.py"))
     ab = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ab)
@@ -200,7 +203,7 @@ def test_bench_ab_agentic_battery_rows_and_summary(tmp_path, monkeypatch):
     def fake_run(cmd, cwd=None, log=None, timeout=0):
         commands.append(cmd)
         output = Path(cmd[cmd.index("--output") + 1])
-        value = 2.0 if "off" in str(tmp_path / output.parent.name) else 0.5
+        value = 2.0 if output.parent.name == "off" else 0.5
         output.write_text(json.dumps({"summary": {"c1": {"ttft_later_s": value, "decode_tps": 30.0},
                                                   "c4": {"ttft_later_s": 2 * value, "decode_tps": 90.0}}}))
 

@@ -17,10 +17,32 @@ cuteafd_cdi_require() { # cuteafd_cdi_require NAME...   (fail unless the CDI spe
   done
 }
 
+cuteafd_cdi_only_all() { # true when every readable spec names only `all`
+  local spec any=0
+  local -a specs=(${CUTEAFD_CDI_SPECS:-/var/run/cdi/nvidia.yaml /etc/cdi/nvidia.yaml})
+  for spec in "${specs[@]}"; do
+    [[ -r "$spec" ]] || continue
+    any=1
+    grep -E "^[[:space:]]*-?[[:space:]]*name:" "$spec" | grep -Eqv "name:[[:space:]]*[\"']?all[\"']?[[:space:]]*\$" && return 1
+  done
+  ((any))
+}
+
+cuteafd_cdi_single_gpu_host() {
+  [[ -z "${CUTEAFD_CDI_GPU_COUNT:-}" ]] || { [[ "$CUTEAFD_CDI_GPU_COUNT" == 1 ]]; return; }  # script tests only
+  local smi
+  smi="$(command -v nvidia-smi || { [[ -x /usr/lib/wsl/lib/nvidia-smi ]] && echo /usr/lib/wsl/lib/nvidia-smi; })" || return 1
+  [[ -n "$smi" && "$("$smi" -L 2>/dev/null | wc -l)" == 1 ]]
+}
+
 cuteafd_cdi_gpu_args() { # cuteafd_cdi_gpu_args all|INDEX_OR_UUID[,INDEX_OR_UUID...]  -> CUTEAFD_CDI_ARGS
   local -a names
   IFS=, read -ra names <<<"$1"
   ((${#names[@]})) && [[ -n "${names[0]}" ]] || { echo "cuteafd: empty GPU request" >&2; return 1; }
+  # WSL2's spec lists only `all`; on a single-GPU host that is the one GPU asked for.
+  if ((${#names[@]} == 1)) && [[ "${names[0]}" != all ]] && cuteafd_cdi_only_all && cuteafd_cdi_single_gpu_host; then
+    names=(all)
+  fi
   cuteafd_cdi_require "${names[@]}" || return 1
   CUTEAFD_CDI_ARGS=()
   local name

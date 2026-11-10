@@ -98,23 +98,24 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
     for buckets in ("PLAIN_BUCKETS", "SPEC_BUCKETS"):
         assert f"check_bucket_thresholds({buckets}, DECODE_PROJECTION_THRESHOLDS)?" in engine
     # The buckets are the startup graph set's, shared with admission and the planner.
-    graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/qwen_graphs.rs").read_text()
     assert "QWEN_PLAIN_BUCKETS as PLAIN_BUCKETS, QWEN_SPEC_BUCKETS as SPEC_BUCKETS" in engine
-    assert "pub const QWEN_PLAIN_BUCKETS: &[usize] = &[1, 4, 8, 16];" in graphs
-    assert "pub const QWEN_SPEC_BUCKETS: &[usize] = &[2, 4, 8, 16, 24, 32, 64];" in graphs
     assert int(re.search(r"pub\(crate\) const FP8_HEAD_ROWS: usize = (\d+);", engine).group(1)) == rust("FP8_PROJECTION_SKINNY_ROWS")
     assert "_HeadFp8(vocab, h, max_rows=FP8_DECODE_ROWS)" in qwen
     tables = {node.targets[0].id: ast.literal_eval(node.value) for node in skinny.body
               if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
               and node.targets[0].id in ("DECODE_TMA_TILES", "SKINNY_TILES_BY_ROWS")}
-    assert set(tables["DECODE_TMA_TILES"]) == {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    # Qwen's row-tiled shapes are pinned exactly; other families' keys (Step-5's, fork #71)
+    # must not alias a Qwen [N, K].
+    qwen_tiles = {(2560, 6144), (16480, 2560), (13952, 2560), (2560, 640), (10240, 320)}
+    step5_tiles = {(4096, 12288), (4096, 6144), (384, 4096), (3072, 4096)}
+    assert set(tables["DECODE_TMA_TILES"]) == qwen_tiles | step5_tiles
     for (n, k), entries in tables["SKINNY_TILES_BY_ROWS"].items():
         assert len({t for _, _, _, t in entries}) == 1
         assert entries[-1][0] == scalar_rule(n, k)
 
 
 def test_head72_uses_the_b12x_le128_tile():
-    export = module("python/tools/aot/export_b12x_vision_attention_aot.py", "vision_export")
+    export = module("python/tools/aot/export_b12x_vision_aot.py", "vision_export")
     assert export.tile_for_head_dim(64) == (128,128)
     assert export.tile_for_head_dim(72) == (128,64)
     assert export.tile_for_head_dim(128) == (128,64)
@@ -122,14 +123,15 @@ def test_head72_uses_the_b12x_le128_tile():
         with pytest.raises(ValueError): export.tile_for_head_dim(dim)
 
 
-def test_qwen_abi_keeps_mimo_prefix_and_matches_c_rust_suffix():
+def test_vision_pointer_count_abi_matches_c_rust():
     gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_vision_gate")
     assert ctypes.sizeof(gate.Block) == 96
-    assert ctypes.sizeof(gate.common.Spec) == 2752
-    assert ctypes.sizeof(gate.Spec) == 3792
-    assert gate.Spec.hidden.offset == 2752
-    assert gate.Spec.patch_bias.offset == 2792
-    assert gate.Spec.norm1_bias.offset == 2896
+    assert ctypes.sizeof(gate.common.Spec) == 256
+    assert ctypes.sizeof(gate.Spec) == 256
+    assert gate.Spec.blocks.offset == 72
+    assert gate.Spec.hidden.offset == 80
+    assert gate.Spec.patch_bias.offset == 120
+    assert gate.Spec.norm1_bias.offset == 224
 
 
 def test_qwen_patch_lut_uses_host_f64_rescale_then_f32_normalize():
@@ -196,6 +198,83 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
 
 
+def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    family = (root / "mod.rs").read_text()
+    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
+    assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
+    assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
+
+    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    /// Pre-capture every reachable")]
+    assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
+    assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
+    assert "shape.slot_rows() as usize" in prepare
+    assert "RetainedUploads::new(" in engine
+    stage = engine[engine.index("    fn stage(&self"):engine.index("    fn stage_table")]
+    assert "w.staging.borrow_mut().upload(dst, bytes, self.execution_stream())" in stage
+    assert "copy_h2d_ordered" not in stage
+    assert "begin_staging(" not in engine and "reserve_h2d_ordered(" not in engine
+
+
+def test_packed_qwen_metadata_is_uploaded_once_and_only_viewed_inside_layers():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families"
+    moe = (root / "qwen4/engine.rs").read_text()
+    packed = moe[moe.index("    pub(crate) fn prefill_packed("):moe.index("    pub(crate) fn mtp_prefill_rows(")]
+    assert packed.count("self.stage_step_tables(w, &all)?;") == 1
+    assert "run_prefill_units(&mut hooks, &[unit], 1)?" in packed
+    hooks = moe[moe.index("struct PackedHooks"):moe.index("struct UnitHooks")]
+    assert "stage_step_tables" not in hooks
+    assert "self.w.table_view.set(Some(view))" in hooks
+    assert "self.w.table_view.set(None)" in hooks
+    assert "local_seq_first" in moe and "seq_first\", w.first_table()" in moe
+    dense = (root / "qwen3_5/engine.rs").read_text()
+    packed = dense[dense.index("    pub(crate) fn prefill_packed("):dense.index("    pub(crate) fn packed_head(")]
+    assert packed.count("self.row_tables(&all)?;") == 1
+    layers = packed[packed.index("for (index, layer)"):]
+    assert "row_tables(" not in layers
+    for field in ["slots", "seq_first", "positions", "rope_positions", "kv_slots", "page_table"]:
+        assert f"planes.{field} = view(" in layers
+
+
+def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    for filename in ["mod.rs", "dual.rs"]:
+        startup = (root / filename).read_text()
+        assert startup.count("engine.admit_host_memory(args)?;") == 1
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_scoring_prefill()?")
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("let result = body(&engine);")
+
+    admit = engine[engine.index("    pub(super) fn admit_host_memory("):engine.index("    fn future_host_workspaces(")]
+    assert "!self.host_memory_admitted" in admit
+    assert "prefix.resolve_host_config(layout, self.max_context, *lanes)?" in admit
+    assert admit.index("self.future_host_workspaces(") < admit.index("budget::admit_host_memory(")
+    assert "config.as_ref().map_or(0, |c| c.bytes)" in admit
+    assert admit.index("budget::admit_host_memory(") < admit.index("self.host_prefix_config = config;")
+    assert "self.host_memory_admitted = true;" in admit
+
+    future = engine[engine.index("    fn future_host_workspaces("):engine.index("    /// Size every unit-table upload")]
+    assert "for owner in 0..self.gdn_banks.len()" in future
+    assert "for decode in [false, true]" in future
+    assert "self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }" in future
+    for field in ["host.staging", "host.logits"]:
+        assert field in future
+    assert "self.mtp_prefill_workspace.borrow().is_none()" in future
+    assert "self.mtp_prefill_rows()" in future
+    assert "ple.mapped()" in future
+    assert '"staging/mapped-table-worker"' in future
+    assert "ple.mapped().host_workspace_bytes()" in future
+    assert "HostAllocation::new" not in future
+
+    serve = (root / "serve.rs").read_text()
+    assert "args.planner_host_prefix = Some((prefix.clone(), max_sequences));" in serve
+    cache = serve[serve.index("fn prefix_cache"):]
+    assert "engine.host_prefix_config.clone().map(|config|" in cache
+    assert ".host_config(" not in cache and ".resolve_host_config(" not in cache
+    assert ".with_scoring(" not in cache
+
+
 def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
@@ -209,10 +288,10 @@ def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
 def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
-    timer = serve[serve.index("        let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("verify_stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
+    timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
     assert '"verify": verify.snapshot()' in serve
-    assert serve.count("&cache, media, preparer, &verify_stats);") == 2
+    assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
     assert "decode_bucket(rows, spec) } else { rows }" in engine
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
@@ -221,13 +300,13 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
 def test_shared_copy_extensions_precede_grammar_and_verify_width():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
-    trim = serve[serve.index("        let mut sequences: Vec<Vec<u32>>"):serve.index("        let starts: Vec<usize>")]
+    trim = serve[serve.index("    let sequences: Vec<Vec<u32>>"):serve.index("    let starts: Vec<usize>")]
     assert trim.index("state.truncate_proposal") < trim.index("let spec = sequences.iter().any")
     assert "Drafts::Copy" not in serve
     copy = serve.index("resource::copy_continuation(")
     select = serve.index("resource::select_drafted(", copy)
     substitute = serve.index("*proposal = copy.tokens;", select)
-    assert copy < select < substitute < serve.index("let mut sequences: Vec<Vec<u32>>")
+    assert copy < select < substitute < serve.index("let sequences: Vec<Vec<u32>>")
     route = engine[engine.index("pub(crate) fn copy_verify_row_limit"):engine.index("pub(crate) fn verify_bucket_rows")]
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in route
     assert "copy_row_limit(rows, sequences)" in route and "else { rows }" in route
@@ -250,7 +329,7 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     scoring = serve[serve.index("|placement, chunk|"):serve.index("|placement, chunk|") + 160]
     assert "verify_device_ungraphed" in scoring
     assert "active.iter().any(|a| a.job.probe.is_some())" in serve
-    assert "if diagnostic {\n            engine.verify_device_ungraphed" in serve
+    assert "if diagnostic {\n        engine.verify_device_ungraphed" in serve
     assert "logits.rows = rows;" in engine
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
     assert "Qwen serving graph was not captured at startup" in engine
@@ -273,6 +352,29 @@ def test_qwen_startup_graphs_precede_ready_and_diagnostics_bypass_capture():
     assert 'get QWEN_STARTUP_GRAPHS' in launcher
     assert 'on) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=1)' in launcher
     assert 'off) trace_args+=(-e CUTEAFD_QWEN4_STARTUP_GRAPHS=0)' in launcher
+
+
+def test_qwen_startup_shapes_drain_without_serving_warmup_reachability():
+    engine = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/engine.rs").read_text()
+
+    def check(source):
+        start = source.index("    pub fn warm_decode_graphs(")
+        end = source.index("    /// Compare real logits", start)
+        warm = source[start:end]
+        loop = warm[warm.index("            for &(rows, spec, geometry) in &shapes {"):]
+        loop = loop[:loop.index("\n            }")]
+        assert loop.index("self.step(") < loop.index("self.drain_state()?;")
+        # No engine execution helper may enter startup warm-up, even indirectly.
+        assert "warm_decode_graphs(" not in source[:start] + source[end:]
+
+    check(engine)
+    drain = "                self.drain_state()?;\n"
+    warm_start = engine.index("    pub fn warm_decode_graphs(")
+    drain_at = engine.index(drain, warm_start)
+    with pytest.raises((AssertionError, ValueError)):
+        check(engine[:drain_at] + engine[drain_at + len(drain):])
+    with pytest.raises(AssertionError):
+        check(engine + "\nfn serving_step() { self.warm_decode_graphs(1, false); }\n")
 
 
 @pytest.mark.parametrize("family", ["qwen4", "mimo_v2", "glm5_flash", "glm5"])
@@ -302,3 +404,172 @@ def test_qwen_interpolation_is_multiply_then_divide_not_ratio():
     source = (ROOT/"native/shared/cuda/vision_qwen.cuh").read_text()
     assert "__fdiv_rn(float(y)*47.f,float(gh-1))" in source
     assert "__fdiv_rn(float(x)*47.f,float(gw-1))" in source
+
+
+def test_qwen_dead_pool_map_and_route_staging_are_not_retained():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    admission = (root / "admission.rs").read_text()
+    prefix = (root / "prefix.rs").read_text()
+    for dead in ["pool_logical", "router_host", "map_pools("]:
+        assert dead not in engine
+    assert "map_pools(" not in prefix
+    assert "pub router:" not in admission
+    assert "host.router" not in engine
+
+
+def packed_spec_fields(snapshot, family, placements=None):
+    """Execute the actual ctypes packer without allocating checkpoint payloads."""
+    import json
+    snapshot = Path(snapshot)
+    gate = module(f"python/tools/qualify/{family}/qualify-vision.py", f"storage_{family}")
+    config = json.loads((snapshot / "config.json").read_text())
+    prefix = "visual." if family == "mimo_v2" else "model.visual."
+    with (snapshot / "vision.safetensors").open("rb") as source:
+        header = json.loads(source.read(int.from_bytes(source.read(8), "little")))
+
+    arena, cursor = {}, [0]
+
+    class SizedBytes(bytes):
+        def __new__(cls, size):
+            result = super().__new__(cls, b"")
+            result.size = size
+            return result
+        def __len__(self):
+            return self.size
+
+    # Exercise the actual elementwise packer operations on every BF16 bit
+    # pattern, without materializing the towers' multi-GiB matrix payloads.
+    patterns = np.arange(65536, dtype=np.uint16)
+
+    class ShapeOnly:
+        def __init__(self, shape, dtype=np.uint16, pieces=(), sample=None):
+            self.shape, self.dtype = tuple(shape), np.dtype(dtype)
+            self.nbytes = int(np.prod(shape)) * self.dtype.itemsize
+            self.pieces = pieces
+            self.sample = patterns if sample is None else sample
+        def astype(self, dtype):
+            return ShapeOnly(self.shape, dtype, self.pieces, self.sample.astype(dtype))
+        def __lshift__(self, bits):
+            return ShapeOnly(self.shape, self.dtype, self.pieces, self.sample << bits)
+        def view(self, dtype):
+            return ShapeOnly(self.shape, dtype, self.pieces, self.sample.view(dtype))
+        def tobytes(self):
+            expected = patterns.tobytes() if self.dtype == np.uint16 else (patterns.astype(np.uint32) << 16).tobytes()
+            assert self.sample.tobytes() == expected, self.pieces
+            cursor[0] = (cursor[0] + 255) & ~255
+            offset = cursor[0]
+            for name, count in self.pieces:
+                length = count * self.dtype.itemsize
+                arena[name] = (offset, length)
+                offset += length
+            assert offset == cursor[0] + self.nbytes
+            cursor[0] = offset
+            return SizedBytes(self.nbytes)
+
+    tensors = {name.removeprefix(prefix): ShapeOnly(entry["shape"], pieces=((name.removeprefix(prefix), int(np.prod(entry["shape"]))),))
+               for name, entry in header.items() if name.startswith(prefix)}
+    concatenate = np.concatenate
+    def shapes_only(values, *args, **kwargs):
+        if isinstance(values[0], ShapeOnly):
+            assert all(value.sample.tobytes() == values[0].sample.tobytes() for value in values)
+            return ShapeOnly((sum(value.shape[0] for value in values), *values[0].shape[1:]), values[0].dtype,
+                tuple(piece for value in values for piece in value.pieces), values[0].sample)
+        return concatenate(values, *args, **kwargs)
+    np.concatenate = shapes_only
+    try:
+        spec, _ = gate.pack_spec(config, tensors)
+        # Evaluate the unmodified pre-change packer and fixed-array declaration
+        # from this branch's base. No checkpoint allocation or CUDA imports.
+        old_common_source = subprocess.check_output(["git", "-C", str(ROOT), "show",
+            "34b0d33b1985441746df5e2fe02c2ae3a9a29f6f:python/tools/qualify/mimo_v2/qualify-vision.py"], text=True)
+        common_ast = ast.parse(old_common_source)
+        selected = [node for node in common_ast.body if isinstance(node, ast.ClassDef)
+                    and node.name in ("Block", "Spec")]
+        # The second packing run records old placements independently.
+        new_arena = dict(arena)
+        cursor[0] = 0
+        arena.clear()
+        scope = {"C": ctypes, "np": np, "NO_OFFSET": (1 << 64) - 1,
+                 "FIELDS": gate.common.FIELDS if hasattr(gate, "common") else gate.FIELDS}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), "old fixed vision ABI", "exec"), scope)
+        import types
+        old_common = types.SimpleNamespace(Spec=scope["Spec"], Block=scope["Block"], NO_OFFSET=(1 << 64) - 1)
+        old_source = subprocess.check_output(["git", "-C", str(ROOT), "show",
+            f"34b0d33b1985441746df5e2fe02c2ae3a9a29f6f:python/tools/qualify/{family}/qualify-vision.py"], text=True)
+        nodes = ast.parse(old_source).body
+        scope.update(common=old_common, Block=old_common.Block)
+        if family != "mimo_v2":
+            declaration = next(node for node in nodes if isinstance(node, ast.ClassDef) and node.name == "Spec")
+            exec(compile(ast.Module(body=[declaration], type_ignores=[]), "old tower ABI", "exec"), scope)
+        pack = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "pack_spec")
+        exec(compile(ast.Module(body=[pack], type_ignores=[]), "old tower packer", "exec"), scope)
+        fixed, _ = scope["pack_spec"](config, tensors)
+        assert arena == new_arena
+        # Compare every old scalar, complete live block bytes and layer offsets;
+        # only storage representation (pointers vs arrays) is allowed to change.
+        for name, kind in fixed._fields_:
+            if name == "blocks":
+                assert bytes(fixed.blocks)[:spec.depth * 96] == ctypes.string_at(spec.blocks, spec.depth * 96)
+            elif name in ("norm1_bias", "norm2_bias", "q_norm", "k_norm"):
+                assert list(getattr(fixed, name))[:spec.depth] == [getattr(spec, name)[i] for i in range(spec.depth)]
+            elif issubclass(kind, ctypes.Array):
+                assert bytes(getattr(fixed, name)) == bytes(getattr(spec, name))
+            else:
+                assert getattr(fixed, name) == getattr(spec, name), name
+    finally:
+        np.concatenate = concatenate
+    # Qwen's probe admits 4096 while serving intentionally admits 1024. Compare
+    # the same admitted request capacity rather than changing probe behavior.
+    if family == "qwen4":
+        spec.max_tokens = 1024
+    remap = {}
+    if placements is not None:
+        # No numerical data is materialized here: BF16 matrices are copied and
+        # BF16 vectors are widened identically. Each tensor's full byte extent
+        # and destination are checked, including the second fused gate/up part.
+        assert set(placements) == set(arena)
+        for name, (offset, length) in arena.items():
+            destination, expected_length = placements[name]
+            assert length == expected_length, name
+            remap[offset] = destination
+    values = []
+    layers = ("blocks", "norm1_bias", "norm2_bias", "q_norm", "k_norm")
+    for name, _ in spec._fields_:
+        if name in layers or name == "storage_abi":
+            continue
+        value = getattr(spec, name)
+        if name == "norm_eps":
+            import struct
+            values.append(int.from_bytes(struct.pack("<f", value), "little"))
+        elif name == "merger_extra":
+            values.extend(value)
+        else:
+            if name in ("patch", "merger_norm", "merger_fc1", "merger_fc2", "patch_bias",
+                        "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias"):
+                value = remap.get(value, value)
+            values.append(value)
+    # Merger extras are offsets, not geometry.
+    values[25:33] = [remap.get(value, value) for value in values[25:33]]
+    for i in range(spec.depth):
+        block = spec.blocks[i]
+        values.extend(remap.get(getattr(block, name), getattr(block, name))
+                      if name not in ("window", "column_order") else getattr(block, name)
+                      for name, _ in block._fields_)
+    for name in layers[1:]:
+        values.extend(remap.get(getattr(spec, name)[i], getattr(spec, name)[i]) for i in range(spec.depth))
+    return values
+
+
+@pytest.mark.parametrize("depth", [24, 27, 28, 30, 50])
+def test_ctypes_storage_is_owned_at_tower_depth(depth):
+    import gc
+    gate = module("python/tools/qualify/qwen4/qualify-vision.py", "owned_depth")
+    spec = gate.Spec(depth=depth)
+    spec.blocks[depth - 1].norm1 = 1234
+    spec.q_norm[depth - 1] = gate.common.NO_OFFSET
+    gc.collect()
+    assert spec.storage_abi == 3
+    assert len(spec._layer_storage["blocks"]) == depth
+    assert spec.blocks[depth - 1].norm1 == 1234
+    assert spec.q_norm[depth - 1] == gate.common.NO_OFFSET

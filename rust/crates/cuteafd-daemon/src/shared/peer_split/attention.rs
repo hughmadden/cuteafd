@@ -177,6 +177,9 @@ mod terminal_tests {
 pub(crate) struct Query {
     pub values: *const c_void,
     pub row_pitch: usize,
+    /// Bytes of this rank's half per row when a layer's query is narrower than the exchange's
+    /// widest (Mistral Large 4's NoPE 512 beside its 576 latent); None: the exchange's width.
+    pub width: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -218,7 +221,10 @@ trait ContextProtocol {
 
 impl ContextProtocol for ContextExchange<'_> {
     fn push_query(&self, rank: usize, slot: usize, query: Query, rows: usize) -> Result<()> {
-        self.push_query(rank, slot, query.values, query.row_pitch, rows)
+        match query.width {
+            Some(width) => self.push_query_width(rank, slot, query.values, query.row_pitch, rows, width),
+            None => self.push_query(rank, slot, query.values, query.row_pitch, rows),
+        }
     }
     fn push_candidates(&self, rank: usize, slot: usize, candidates: Candidates, rows: usize) -> Result<()> {
         self.push_candidates(rank, slot, candidates.scores, candidates.indices, rows)
@@ -554,7 +560,7 @@ fn layer_stack_with(placement: &Placement, exchange: &impl LayerProtocol,
     Ok(())
 }
 
-/// Shared two-lane serving executor. Binding happens before any capture or
+/// Shared admitted-lane serving executor. Binding happens before any capture or
 /// enqueue, and requires hop/FFN waits to share one terminal owner. A family
 /// supplies only attention/FFN kernels and residual packing, not peer order.
 pub(crate) fn layer_pipeline<K: PipelineKernels>(scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
@@ -591,7 +597,7 @@ pub(crate) fn layer_pipeline_selected<K: PipelineKernels>(scope: &crate::shared:
     layer_pipeline_selected_instances(scope, plan, &exchanges, lanes, order, rows, kernels)
 }
 
-fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
+pub(crate) fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point: HopPoint,
     lane: usize, rows: usize, kernels: &mut impl LayerKernels, consumed: &mut [usize]) -> Result<()> {
     for (index, &hop) in plan.hops().iter().enumerate().filter(|(_, hop)| hop.at == point) {
         ensure!(consumed[index] == 0, "duplicate planned hop {index} in lane {lane}");
@@ -601,7 +607,7 @@ fn pipeline_hops(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, point
     Ok(())
 }
 
-fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, layer: usize,
+pub(crate) fn pipeline_attention(exchange: &impl LayerProtocol, plan: &LayerExecutionPlan, layer: usize,
     lane: usize, rows: usize, kernels: &mut impl LayerKernels, consumed: &mut [usize]) -> Result<Option<usize>> {
     exchange.require_live()?;
     if layer == 0 { pipeline_hops(exchange, plan, HopPoint::Entry, lane, rows, kernels, consumed)?; }
@@ -644,7 +650,7 @@ fn validate_pipeline_selection(plan: &LayerExecutionPlan, lanes: &[usize], rows:
     cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes,
         usize::try_from(plan.spec().lanes)?)?;
     ensure!(!lanes.is_empty() && lanes.len() == count && lanes.len() == rows.len()
-        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs one or two admitted lanes");
+        && lanes.len() as u64 <= plan.spec().lanes, "layer pipeline needs a nonempty subset of admitted lanes");
     ensure!(lanes.iter().enumerate().all(|(index, &lane)| (lane as u64) < plan.spec().lanes
         && !lanes[..index].contains(&lane)), "layer pipeline duplicate or unadmitted lane");
     ensure!(rows.iter().all(|&rows| rows > 0 && rows as u64 <= plan.spec().rows),
@@ -1028,7 +1034,7 @@ mod tests {
     impl ContextKernels for &Recorder {
         fn produce(&mut self) -> Result<Query> {
             self.note("produce");
-            Ok(Query { values: std::ptr::null(), row_pitch: 32 })
+            Ok(Query { values: std::ptr::null(), row_pitch: 32, width: None })
         }
         fn score(&mut self) -> Result<Option<Candidates>> {
             self.note("score");
@@ -1095,9 +1101,9 @@ mod tests {
 
     fn placement(modes: &[LayerMode]) -> Placement {
         use cuteafd_loader::placement::{plan_hops, ExpertHome, HopSpec, LayerAssignment};
-        Placement {
+        Placement { expert_tier: None,
             pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: cuteafd_loader::placement::AttentionPlacement::Layers,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: vec![], tp2: None, items: vec![],
             hops: plan_hops(modes, &HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows: 6, lanes: 2, entry_gpu: 0, head_gpu: 0, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } }).unwrap(),
@@ -1142,8 +1148,12 @@ mod tests {
     }
 
     fn execution_plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPlan {
+        execution_plan_shape(modes, entry, head, 6, 2)
+    }
+
+    fn execution_plan_shape(modes: &[LayerMode], entry: u8, head: u8, rows: u64, lanes: u64) -> LayerExecutionPlan {
         use cuteafd_loader::placement::{plan_hops, HopSpec, ResidualHome};
-        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows: 6, lanes: 2, entry_gpu: entry, head_gpu: head, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } };
+        let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows, lanes, entry_gpu: entry, head_gpu: head, terminal: match modes.last() { Some(LayerMode::Whole { ffn: FfnMode::Owner, .. }) => cuteafd_loader::placement::TerminalHome::AttentionOwner, _ => cuteafd_loader::placement::TerminalHome::Replicated } };
         let mut p = placement(modes);
         p.hops = plan_hops(modes, &spec).unwrap();
         p.residual = vec![ResidualHome::Owned(entry)];
@@ -1457,6 +1467,37 @@ mod tests {
                         ["owned", "begin", "finish"].map(|call| (lane, layer, call))).collect();
                     assert_eq!(*trace.calls.borrow(), expected);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn short_prompt_runs_one_active_lane_at_every_admitted_wave_count() {
+        use crate::shared::experts::rtx::pair::submit_scoped;
+        use cuteafd_loader::serving_capacity::prefill_waves::{unit_rows, MAX_WAVES};
+        let modes = [LayerMode::HeadSplit, LayerMode::Whole { gpu: 1, ffn: FfnMode::Split },
+            LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }];
+        for waves in 1..=MAX_WAVES {
+            let unit = unit_rows(waves);
+            let plan = execution_plan_shape(&modes, 0, 0, unit, waves);
+            let chunks = crate::shared::prefill_pipeline::prefill_units(335, unit as usize, waves as usize, 64).unwrap();
+            assert_eq!(chunks, vec![0..335]);
+            for lane in 0..waves as usize {
+                let trace = PipelineTrace::new(&plan);
+                let mut kernels = [PipelineRecorder { shared: &trace, lane }];
+                submit_scoped(|| Ok(()), || Ok(()), |scope|
+                    layer_pipeline_selected_instances(scope, &plan, &[&trace], &[lane],
+                        LaneOrder::Independent, &[335], &mut kernels)).unwrap();
+                assert_eq!(trace.calls.borrow().len(), modes.len() * 3);
+                assert!(trace.calls.borrow().iter().all(|&(actual, _, _)| actual == lane));
+                let transfers = trace.transfers.borrow();
+                for index in 0..plan.hops().len() {
+                    for pushed in [true, false] {
+                        assert_eq!(transfers.iter().filter(|&&event| event == (lane, index, pushed)).count(), 1);
+                    }
+                }
+                trace.schedule.borrow_mut().end_request();
+                super::super::order::check(&trace.schedule.borrow()).unwrap();
             }
         }
     }

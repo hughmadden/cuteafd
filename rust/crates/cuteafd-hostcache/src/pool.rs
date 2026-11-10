@@ -1,12 +1,12 @@
 //! Pinned slab pool (packet HC-1): all pinned host memory is allocated at construction to the
 //! configured quota in fixed chunks and never grows. Each chunk is carved for one size class
-//! (page, tail, draft, scores); each class keeps a free list; a class claims a free chunk when
+//! (page, tail, draft, scores, draft page); each class keeps a free list; a class claims a free chunk when
 //! its list is empty and releases a chunk when every slab in it is free. Allocation and release
 //! are O(1); bytes in use is exact and equals slabs held × class size.
 use serde::Serialize;
 use thiserror::Error;
 
-/// The four slab sizes a snapshot needs.
+/// The slab classes a snapshot may need.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
 pub enum Class {
     /// One source page.
@@ -17,19 +17,22 @@ pub enum Class {
     Draft,
     /// One scores row.
     Scores,
+    /// One full-context drafter page, independent of target page geometry.
+    DraftPage,
 }
 
 impl Class {
     /// Every class, in the pool's per-class array order.
-    pub const ALL: [Class; 4] = [Class::Page, Class::Tail, Class::Draft, Class::Scores];
+    pub const ALL: [Class; 5] = [Class::Page, Class::Tail, Class::Draft, Class::Scores, Class::DraftPage];
 
     /// Index into the pool's per-class arrays.
-    const fn index(self) -> usize {
+    pub(crate) const fn index(self) -> usize {
         match self {
             Class::Page => 0,
             Class::Tail => 1,
             Class::Draft => 2,
             Class::Scores => 3,
+            Class::DraftPage => 4,
         }
     }
 }
@@ -50,6 +53,8 @@ pub struct Layout {
     pub draft: usize,
     /// Bytes of a scores slab.
     pub scores: usize,
+    /// Bytes of one independent full-context draft page (zero disables it).
+    pub draft_page: usize,
 }
 
 impl Layout {
@@ -60,13 +65,24 @@ impl Layout {
             tail: crate::TAIL_BYTES,
             draft: crate::DRAFT_BYTES,
             scores,
+            draft_page: 0,
         }
     }
     /// A generic family's layout (`cuteafd-engine::prefix`): pages of `page` bytes (every
     /// segment of one page index), the positional mark as the tail class, optional drafter rings,
     /// no scores. The V4.1 engine keeps [`Layout::engine`].
     pub fn family(page: usize, mark: usize, draft: usize) -> Self {
-        Self { page, tail: mark, draft, scores: 0 }
+        Self { page, tail: mark, draft, scores: 0, draft_page: 0 }
+    }
+    pub fn with_draft_pages(mut self, bytes: usize) -> Self {
+        self.draft_page = bytes;
+        self
+    }
+    pub fn page_class(bank: usize) -> Class {
+        if bank == crate::DRAFT_PAGE_BANK { Class::DraftPage } else { Class::Page }
+    }
+    pub fn page_size(&self, bank: usize) -> usize {
+        self.size(Self::page_class(bank))
     }
     /// Bytes of one slab of `class`.
     pub fn size(&self, class: Class) -> usize {
@@ -75,6 +91,7 @@ impl Layout {
             Class::Tail => self.tail,
             Class::Draft => self.draft,
             Class::Scores => self.scores,
+            Class::DraftPage => self.draft_page,
         }
     }
 }
@@ -343,7 +360,7 @@ impl SlabPool {
     }
 
     /// Whether all requested slabs fit together, including per-class chunk fragmentation.
-    pub(crate) fn can_take(&self, counts: [u64; 4]) -> bool {
+    pub(crate) fn can_take(&self, counts: [u64; Class::ALL.len()]) -> bool {
         let mut chunks = 0;
         for (class, count) in Class::ALL.into_iter().zip(counts) {
             if count == 0 { continue; }
@@ -357,14 +374,14 @@ impl SlabPool {
 
     /// Cap extra class demand to what an empty pool can hold beside the incoming store.
     /// Scale every class together; chunk rounding can make a small quota allow no overage.
-    pub(crate) fn pressure_target(&self, incoming: [u64; 4], bytes: [u64; 4]) -> [u64; 4] {
-        let extra = std::array::from_fn::<_, 4, _>(|i| {
+    pub(crate) fn pressure_target(&self, incoming: [u64; Class::ALL.len()], bytes: [u64; Class::ALL.len()]) -> [u64; Class::ALL.len()] {
+        let extra = std::array::from_fn::<_, { Class::ALL.len() }, _>(|i| {
             let size = self.layout.size(Class::ALL[i]) as u64;
             if size == 0 { 0 } else { bytes[i].div_ceil(size) }
         });
         let target = |scale: u64| std::array::from_fn(|i|
             incoming[i].saturating_add(((extra[i] as u128 * scale as u128) / 65536) as u64));
-        let fits = |counts: [u64; 4]| {
+        let fits = |counts: [u64; Class::ALL.len()]| {
             let chunks = Class::ALL.into_iter().zip(counts).try_fold(0u64, |n, (class, count)| {
                 let size = self.layout.size(class);
                 if count == 0 { return Some(n); }
@@ -531,13 +548,14 @@ pub mod testing {
     /// The chunk size the pool suites use: small enough to exhaust in a few takes.
     pub const CHUNK: usize = 1 << 16;
 
-    /// The layout the pool suites use: four distinct sizes, none a divisor of [`CHUNK`].
+    /// The layout the pool suites use: five distinct enabled slab sizes.
     pub fn layout() -> Layout {
         Layout {
             page: 4096,
             tail: 8192,
             draft: 2048,
             scores: 1024,
+            draft_page: 512,
         }
     }
 
@@ -625,14 +643,14 @@ mod tests {
 
     #[test]
     fn pressure_headroom_is_capped_by_simultaneous_class_capacity() {
-        let layout = Layout { page: 64, tail: 128, draft: 0, scores: 0 };
+        let layout = Layout { page: 64, tail: 128, draft: 0, scores: 0, draft_page: 0 };
         let mut memory = testing::FakePinned::new(usize::MAX);
         let pool = SlabPool::new(512, 256, layout, &mut memory).unwrap();
-        assert_eq!(pool.pressure_target([4, 2, 0, 0], [1 << 30; 4]), [4, 2, 0, 0]);
-        let target = pool.pressure_target([1, 1, 0, 0], [256, 256, 0, 0]);
+        assert_eq!(pool.pressure_target([4, 2, 0, 0, 0], [1 << 30; 5]), [4, 2, 0, 0, 0]);
+        let target = pool.pressure_target([1, 1, 0, 0, 0], [256, 256, 0, 0, 0]);
         assert!(target[0] >= 1 && target[1] >= 1);
         assert!(pool.can_take(target));
-        assert_eq!(pool.pressure_target([1, 1, 0, 0], [0; 4]), [1, 1, 0, 0]);
+        assert_eq!(pool.pressure_target([1, 1, 0, 0, 0], [0; 5]), [1, 1, 0, 0, 0]);
     }
 
     #[test]
@@ -667,6 +685,7 @@ mod tests {
             tail: 4096,
             draft: 4096,
             scores: 4096,
+            draft_page: 0,
         };
         let pool = SlabPool::new(10_000, 10_000, layout, &mut mem).expect("pool");
         assert_eq!(pool.free_bytes(Class::Page), 8192);

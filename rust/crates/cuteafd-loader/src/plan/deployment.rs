@@ -70,7 +70,13 @@ pub struct DeploymentSpec<'a> {
     pub snapshot: &'a str,
     pub rtx_gpus: usize,
     pub spark_ranks: usize,
-    pub prefill_rows: u64,
+    pub prefill_unit_rows: u64,
+    pub prefill_waves: u64,
+    pub decode_lanes: u8,
+    pub prefill_span_rows: u64,
+    /// The reserve the depth cuts (the standard 8192, or the planner's fit
+    /// cap below it); launches pass it back.
+    pub prefill_reserve_rows: u64,
     pub topology: Topology,
     pub roles: Vec<SparkRole>,
     pub peers: Vec<String>,
@@ -101,8 +107,9 @@ impl<'a> DeploymentSpec<'a> {
     }
 
     pub fn from_exlr8(native: &'a super::exlr8::NativePlan, options: &'a DeploymentOptions) -> Result<Self> {
-        ensure!(options.rtx_gpus == 2 && options.spark_tp.is_none() && options.spark_ep.is_none()
-            && options.speculator == "off", "EXLR8 deployment requires two RTX, canonical Spark wire and no speculator");
+        ensure!((1..=2).contains(&options.rtx_gpus) && options.spark_tp.is_none() && options.spark_ep.is_none()
+            && matches!(options.speculator.as_str(), "off" | "dflash2"),
+            "EXLR8 deployment requires one or two RTX GPUs, canonical Spark wire and off or dflash2 speculation");
         Self::build(&native.report, options, Some(native))
     }
 
@@ -116,35 +123,31 @@ impl<'a> DeploymentSpec<'a> {
             "--spark-tp and --spark-ep must be set together");
         let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
         let explicit = options.spark_tp.is_some()
-            || (family == "deepseek_v41" && if exl3 { ranks == 3 } else { ranks != 0 && ranks != 4 });
+            || (family == "deepseek_v41" && ranks != 0 && ranks != 4);
         let topology = Topology { tp: options.spark_tp.unwrap_or(ranks),
             ep: options.spark_ep.unwrap_or(1),
             wire: if explicit { SparkWire::NativeOwnership } else { SparkWire::Canonical } };
         if explicit {
-            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 6 && topology.ep > 0
+            ensure!(ranks > 0 && topology.tp > 0 && topology.tp <= 8 && topology.ep > 0
                 && topology.ep <= 3 && topology.tp * topology.ep == ranks,
-                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..6, EP 1..3)",
+                "Spark topology {}x{} must match selected physical rank count {ranks} (TP 1..8, EP 1..3)",
                 topology.tp, topology.ep);
             ensure!(topology.ep == 1 || matches!((topology.tp, topology.ep), (2, 2) | (3, 2) | (2, 3)),
                 "unsupported replicated Spark topology {}x{}; supported: TP2EP2, TP3EP2, TP2EP3",
                 topology.tp, topology.ep);
-            ensure!(!exl3 || (family == "deepseek_v41" && topology.tp == 3 && topology.ep == 1),
-                "explicit Spark topology requires native experts or V4.1 compact EXL3 TP3EP1");
+            ensure!(!exl3, "explicit Spark topology requires native experts");
         }
         if ranks > 0 {
             ensure!(!explicit || family == "deepseek_v41",
                 "native ownership wire requires V4.1 experts");
-            ensure!(!explicit || matches!((topology.tp, topology.ep),
-                (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)),
-                "unqualified Spark ownership topology {}x{}; supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3",
-                topology.tp, topology.ep);
-            ensure!(ranks <= 6, "Spark worlds above six ranks have no qualified package");
+            ensure!(ranks <= 8, "Spark transport supports at most eight ranks");
             let experts = report.experts.as_ref().context("Spark deployment requires an expert package")?;
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && (1..=6).contains(&ranks) && experts.package == "glm:exlr8",
-                "EXLR8 deployment requires GLM native canonical Sparks"); }
+            else { ensure!((1..=8).contains(&ranks) && matches!((family, experts.package.as_str()),
+                ("glm5", "glm:exlr8") | ("glm5_flash", "glmf:exlr8")),
+                "EXLR8 deployment requires a matching native family/package and canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -161,7 +164,12 @@ impl<'a> DeploymentSpec<'a> {
             .then(|| format!("tp{}", topology.tp));
         Ok(Self { version: 1, family, snapshot: &report.snapshot,
             rtx_gpus: options.rtx_gpus, spark_ranks: ranks,
-            prefill_rows: report.prefill_rows.unwrap_or(0), topology, roles, peers,
+            prefill_unit_rows: report.prefill_unit_rows.unwrap_or(0),
+            prefill_waves: report.prefill_waves.unwrap_or(0),
+            decode_lanes: report.decode_lanes,
+            prefill_span_rows: report.prefill_span_rows.unwrap_or(0),
+            prefill_reserve_rows: report.prefill_reserve_rows
+                .unwrap_or(crate::serving_capacity::prefill_waves::RESERVE_ROWS), topology, roles, peers,
             speculator: &options.speculator, admission: &options.admission,
             spark_admission: SparkAdmission::CoordinatorAuthoritative,
             launch: report.launch.as_ref(), exlr8: native.map(|n| &n.selection),
@@ -190,7 +198,7 @@ mod tests {
         let report = plan_spark_count(dir.path(), &PlanOptions {
             placement: ExpertPlacement::from_spark_ranks(ranks),
             vision: crate::plan::MediaMode::Off, audio: crate::plan::MediaMode::Off,
-            layout: Some(LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
                 workspace_manifest: Some(manifest), pool_tokens: Some(0),
                 prefill_rows: 256, context_tokens: 262_144, ..Default::default() }),
             ..Default::default()
@@ -209,6 +217,11 @@ mod tests {
                 ..Default::default() };
             let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
             assert_eq!(deployment.roles.len(), ranks);
+            for device in deployment.memory_layout.devices.iter()
+                .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+                assert_eq!(device.worker_budget_bytes, 108 << 30);
+                assert_eq!(device.capacity_bytes, 121 << 30);
+            }
             assert_eq!(deployment.topology, Topology { tp: ranks, ep: 1, wire: if ranks != 4 { SparkWire::NativeOwnership } else { SparkWire::Canonical } });
             assert_eq!(deployment.spark_admission, SparkAdmission::CoordinatorAuthoritative);
             assert!(deployment.estimated_placement.is_some());
@@ -228,6 +241,32 @@ mod tests {
     }
 
     #[test]
+    fn deployment_preserves_independent_unit_wave_span_and_transport_geometry() {
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            let (_dir, mut report) = fixture(gpus, ranks);
+            for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "kimi_k3", "step5"] {
+                report.family = Some(family.into());
+                for (unit, waves, span, transports) in [(2048, 2, 16384, 1), (4096, 2, 8192, 3), (4096, 1, 16384, 2)] {
+                    report.prefill_unit_rows = Some(unit);
+                    report.prefill_waves = Some(waves);
+                    report.prefill_span_rows = Some(span);
+                    report.prefill_transports = Some(transports);
+                    let options = DeploymentOptions { rtx_gpus: gpus, ..Default::default() };
+                    let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
+                    assert_eq!((deployment.prefill_unit_rows, deployment.prefill_waves, deployment.prefill_span_rows),
+                        (unit, waves, span), "{family} {gpus}+{ranks}");
+                    let value = serde_json::to_value(deployment).unwrap();
+                    assert_eq!(value["report"]["prefill_transports"], transports);
+                    for legacy in ["prefill_rows", "prefill_lanes", "prefill_slots"] {
+                        assert!(value.get(legacy).is_none());
+                        assert!(value["report"].get(legacy).is_none());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_deployment_preserves_selection_and_live_worker_boundary() {
         use crate::plan::{exlr8::{NativePlan, NativeSelection, SparkRequirements}, RuntimeStatus, Status};
         let (_dir, mut report) = fixture(2, 4);
@@ -238,20 +277,32 @@ mod tests {
         for component in &mut report.components {
             if component.status == Status::Ready { component.status = Status::Planned; }
         }
+        report.exlr8_prefill_activations = Some(crate::plan::exlr8::PrefillActivations::A8);
         let native = NativePlan { report, selection: NativeSelection {
-            manifest: "up1".into(), set_id: "checkpoint-set".into(), dense_from: "official-fp8".into() },
+            manifest: "up1".into(), set_id: "checkpoint-set".into() },
             sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
                 k1_workspace: "checked_by_worker_live_admission" } };
         let mut options = DeploymentOptions { rtx_gpus: 2, speculator: "off".into(), ..Default::default() };
-        let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
-        assert!(!deployment.executable && deployment.wip_launchable);
-        let value = serde_json::to_value(deployment).unwrap();
-        assert_eq!(value["version"], 1);
-        assert_eq!(value["exlr8"]["manifest"], "up1");
-        assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
-        assert_eq!(value["exlr8"]["dense_from"], "official-fp8");
-        assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
-        assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
+        for gpus in 0..=3 {
+            options.rtx_gpus = gpus;
+            if !(1..=2).contains(&gpus) {
+                assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+                continue;
+            }
+            let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+            assert!(!deployment.executable && deployment.wip_launchable);
+            let value = serde_json::to_value(deployment).unwrap();
+            assert_eq!(value["version"], 1);
+            assert_eq!(value["exlr8"]["manifest"], "up1");
+            assert_eq!(value["exlr8"]["set_id"], "checkpoint-set");
+            assert_eq!(value["report"]["exlr8_prefill_activations"], "a8");
+            assert_eq!(value["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([100, 100, 100, 100]));
+            assert_eq!(value["spark_requirements"]["k1_workspace"], "checked_by_worker_live_admission");
+            assert_eq!(value["rtx_gpus"], gpus);
+        }
+        options.rtx_gpus = 1;
+        options.speculator = "dflash2".into();
+        assert!(DeploymentSpec::from_exlr8(&native, &options).is_ok());
         options.spark_tp = Some(4);
         options.spark_ep = Some(1);
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
@@ -259,6 +310,35 @@ mod tests {
         options.spark_ep = None;
         options.speculator = "auto".into();
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+    }
+
+    #[test]
+    fn native_flash_deployment_admits_only_declared_coordinator_worlds() {
+        use crate::plan::exlr8::{NativePlan, NativeSelection, SparkRequirements};
+        for gpus in [1, 2] {
+            let (_dir, mut report) = fixture(gpus, 4);
+            report.family = Some("glm5_flash".into());
+            report.experts.as_mut().unwrap().package = "glmf:exlr8".into();
+            use crate::plan::family::Family;
+            let execution = crate::plan::families::glm::GLM5_FLASH.exlr8_execution().check(gpus, true);
+            let admitted = execution.is_ok();
+            report.runtime = Some(if admitted { crate::plan::RuntimeStatus::Serving }
+                else { crate::plan::RuntimeStatus::Planned });
+            report.native_serving_admitted = admitted;
+            report.placement_supported = admitted;
+            if let Err(error) = execution { report.hints.push(error.hint()); }
+            let mut native = NativePlan { report,
+                selection: NativeSelection { manifest: "k4".into(), set_id: "flash-set".into() },
+                sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
+                    k1_workspace: "checked_by_worker_live_admission" } };
+            let options = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
+            let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+            assert!(deployment.wip_launchable);
+            assert_eq!(deployment.exlr8.unwrap().manifest, "k4");
+            assert_eq!(deployment.memory_layout, native.report.memory_layout.as_ref().unwrap());
+            native.report.experts.as_mut().unwrap().package = "glm:exlr8".into();
+            assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+        }
     }
 
     #[test]
@@ -312,31 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn compact_exl3_tp3_normalizes_topology_without_native_role_proof() {
-        let (_dir, mut report) = fixture(1, 3);
-        report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
-        for explicit in [false, true] {
-            let options = DeploymentOptions { rtx_gpus: 1,
-                spark_tp: explicit.then_some(3), spark_ep: explicit.then_some(1),
-                ..Default::default() };
-            let deployment = DeploymentSpec::from_report(&report, &options).unwrap();
-            assert_eq!(deployment.topology, Topology { tp: 3, ep: 1, wire: SparkWire::NativeOwnership });
-            assert_eq!(deployment.roles.iter().map(|r| (r.group, r.tp_rank)).collect::<Vec<_>>(),
-                [(0, 0), (0, 1), (0, 2)]);
-            assert!(deployment.artifact_requirements.verify_live_identity);
-            assert!(deployment.artifact_requirements.spark_tp_role.is_none());
-            assert!(!deployment.artifact_requirements.require_symbols_verified);
-            assert!(!deployment.artifact_requirements.verify_native_library_sha256);
-        }
-        for (tp, ep) in [(2, 1), (4, 1), (3, 2)] {
-            report.spark_ranks = tp * ep;
-            let options = DeploymentOptions { rtx_gpus: 1,
-                spark_tp: Some(tp), spark_ep: Some(ep), ..Default::default() };
-            assert!(DeploymentSpec::from_report(&report, &options).is_err());
-        }
-    }
-
-    #[test]
     fn generic_deployment_retains_family_ranges_and_runtime_proof_limits() {
         let (_dir, mut report) = fixture(1, 4);
         for family in ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"] {
@@ -384,14 +439,28 @@ mod tests {
             assert_eq!(deployment.topology.tp, ranks);
             for unqualified in [7, 8] {
                 report.spark_ranks = unqualified;
-                assert!(DeploymentSpec::from_report(&report, &options).is_err());
+                let result = DeploymentSpec::from_report(&report, &options);
+                if package == "v41:mxfp4" {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.is_err());
+                    if package.ends_with(":nvfp4") {
+                        assert!(format!("{:#}", result.unwrap_err()).contains("NVFP4 is deprecated"));
+                    }
+                }
             }
         }
         for package in ["qwen4:nvfp4", "qwen4:fp8", "qwen4:exl3-k45"] {
             report.family = Some("qwen4".into());
             report.experts.as_mut().unwrap().package = package.into();
+            report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 640;
             report.spark_ranks = 5;
-            assert!(DeploymentSpec::from_report(&report, &options).is_err());
+            let result = DeploymentSpec::from_report(&report, &options);
+            if package == "qwen4:fp8" {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+            }
         }
         report.family = Some("deepseek_v41".into());
         report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
@@ -410,8 +479,8 @@ mod tests {
         report.spark_ranks = 1;
         let options = DeploymentOptions { spark_tp: Some(1), ..options };
         let error = DeploymentSpec::from_report(&report, &options).unwrap_err().to_string();
-        assert!(error.contains("ownership topology 1x1"), "{error}");
-        assert!(error.contains("supported: TP2EP1, TP3EP1, TP4EP1, TP6EP1"), "{error}");
+        assert!(error.contains("missing Spark package recipe"), "{error}");
+        assert!(error.contains("TP1"), "{error}");
     }
 
     #[test]
@@ -435,7 +504,9 @@ mod tests {
         options.peers.push("worker:0".into());
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
         options.peers.clear();
-        report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();
+        report.experts.as_mut().unwrap().package = "dsv4p:exl3-k2".into();
+        report.family = Some("deepseek_v4".into());
+        report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 3072;
         assert!(DeploymentSpec::from_report(&report, &options).is_err());
         options.spark_tp = None; options.spark_ep = None;
         assert_eq!(DeploymentSpec::from_report(&report, &options).unwrap().topology.wire,

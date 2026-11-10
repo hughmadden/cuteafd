@@ -3,7 +3,7 @@
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use cuteafd_hostcache::snapshot::testing::{resident_snapshots, snapshots};
 use cuteafd_hostcache::snapshot::{DevicePageId, SnapshotMeta};
-use cuteafd_hostcache::{SnapshotKind, COMPRESSORS};
+use cuteafd_hostcache::{SnapshotKind, PAGE_BANKS};
 
 /// Lookups per second over 10k resident 4k-token snapshots sharing a 2k-token prefix.
 fn lookup(c: &mut Criterion) {
@@ -21,11 +21,11 @@ fn lookup(c: &mut Criterion) {
     group.finish();
 }
 
-/// Planning a 1M-token snapshot: one page slab per 100 tokens across four compressors.
+/// Planning a 1M-token snapshot: one page slab per 100 tokens in every page bank.
 fn plan_store(c: &mut Criterion) {
     let mut store = snapshots(1 << 28);
     let tokens: Vec<u32> = (0..1_000_000).collect();
-    let pages: [Vec<DevicePageId>; COMPRESSORS] = std::array::from_fn(|compressor| {
+    let pages: [Vec<DevicePageId>; PAGE_BANKS] = std::array::from_fn(|compressor| {
         (0..(1_000_000 / 100) as u32)
             .map(|page| DevicePageId {
                 compressor: compressor as u8,

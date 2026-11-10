@@ -68,8 +68,8 @@ impl<'library> DsparkWeights<'library> {
             sink: self.tensor(&format!("mtp.{stage}.attn.attn_sink"))?,
             draft: DeviceAllocation::new(library, rows as usize * 1024)?,
             positions: DeviceAllocation::new(library, rows as usize * 8)?,
-            descriptors: DeviceAllocation::new(library, 128)?,
-            staging: HostAllocation::new(library, 128 + rows as usize * 8)?,
+            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES)?,
+            staging: HostAllocation::new(library, cuteafd_core::V41_READ_DESCRIPTOR_BYTES + rows as usize * 8)?,
             requests,
             width: self.draft_width,
             graph: BindingGraphs::new(library)?,
@@ -98,23 +98,23 @@ impl DsparkAttentionWave<'_, '_> {
     pub(super) fn projection_capacity_with_width(requests: u32, width: usize) -> Result<u32> {
         ensure!(matches!(width, 5 | 7), "draft width must be five or seven");
         ensure!(
-            (1..=16).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
             "invalid attention request capacity"
         );
         // Storage follows compiled buckets; launches use the actual live rows.
         let rows = requests as usize * width;
-        Ok(if rows <= 16 { 16 } else if rows <= 40 { 40 } else if rows <= 80 { 80 } else { 256 })
+        Ok(if rows <= 16 { 16 } else if rows <= 40 { 40 } else if rows <= cuteafd_core::V41_DRAFT_LEGACY_ROWS { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u32 })
     }
     pub fn additional_bytes(rows: u32) -> Result<usize> {
         ensure!((1..=4096).contains(&rows), "invalid attention wave rows");
-        Ok(rows as usize * (1024 + 8) + 128)
+        Ok(rows as usize * (1024 + 8) + cuteafd_core::V41_READ_DESCRIPTOR_BYTES)
     }
     pub fn device_bytes(library: &NativeLibrary, requests: u32) -> Result<usize> {
         Self::device_bytes_with_width(library, requests, 5)
     }
     pub fn device_bytes_with_width(library: &NativeLibrary, requests: u32, width: usize) -> Result<usize> {
         ensure!(
-            (1..=16).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
             "invalid attention wave request capacity"
         );
         let rows = requests * width as u32;
@@ -157,8 +157,8 @@ impl DsparkAttentionWave<'_, '_> {
     ) -> Result<()> {
         self.stage_upload(read, requests);
         let staging = self.staging.bytes_mut();
-        self.stream.library.copy_h2d(self.descriptors.buffer, &staging[..128])?;
-        self.stream.library.copy_h2d(self.positions.buffer, &staging[128..])
+        self.stream.library.copy_h2d(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES])?;
+        self.stream.library.copy_h2d(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..])
     }
     /// The containing chain retains staging and cache reads through completion.
     pub(super) unsafe fn upload_on(&mut self, read: &WindowRead,
@@ -166,19 +166,19 @@ impl DsparkAttentionWave<'_, '_> {
         self.stage_upload(read, requests);
         let staging = self.staging.bytes_mut();
         unsafe {
-            self.stream.library.copy_h2d_async(self.descriptors.buffer, &staging[..128], stream)?;
-            self.stream.library.copy_h2d_async(self.positions.buffer, &staging[128..], stream)
+            self.stream.library.copy_h2d_async(self.descriptors.buffer, &staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES], stream)?;
+            self.stream.library.copy_h2d_async(self.positions.buffer, &staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..], stream)
         }
     }
     fn stage_upload(&mut self, read: &WindowRead, requests: &[(WindowLease, u64)]) {
         let bytes =
-            unsafe { std::slice::from_raw_parts(read.descriptors.as_ptr().cast::<u8>(), 128) };
+            unsafe { std::slice::from_raw_parts(read.descriptors.as_ptr().cast::<u8>(), cuteafd_core::V41_READ_DESCRIPTOR_BYTES) };
         let staging = self.staging.bytes_mut();
-        staging[..128].copy_from_slice(bytes);
-        staging[128..].fill(0);
+        staging[..cuteafd_core::V41_READ_DESCRIPTOR_BYTES].copy_from_slice(bytes);
+        staging[cuteafd_core::V41_READ_DESCRIPTOR_BYTES..].fill(0);
         for (request, &(_, end)) in requests.iter().enumerate() {
             for draft in 0..self.width {
-                let offset = 128 + (request * self.width + draft) * 8;
+                let offset = cuteafd_core::V41_READ_DESCRIPTOR_BYTES + (request * self.width + draft) * 8;
                 // attention_read checked end+width before this upload.
                 staging[offset..offset + 8].copy_from_slice(&(end + draft as u64).to_ne_bytes());
             }
@@ -337,4 +337,14 @@ impl Drop for DsparkAttentionWave<'_, '_> {
         // SAFETY: owning stream has drained before executable retirement.
         fatal_drain(unsafe { self.graph.clear() }, "dSpark attention_wave graphs");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn wide_drafter_uses_its_own_flattened_cover() {
+    assert_eq!(DsparkAttentionWave::projection_capacity_with_width(32, 7).unwrap(),
+        cuteafd_core::V41_DRAFT_WIDE_ROWS as u32);
+    assert_eq!(DsparkAttentionWave::projection_capacity_with_width(16, 5).unwrap(),
+        cuteafd_core::V41_DRAFT_LEGACY_ROWS as u32);
+    assert!(DsparkAttentionWave::projection_capacity_with_width(33, 7).is_err());
 }

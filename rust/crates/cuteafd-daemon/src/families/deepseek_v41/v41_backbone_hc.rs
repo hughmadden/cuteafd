@@ -11,6 +11,10 @@ pub(crate) struct BackboneHcWeights<'a> {
 }
 impl<'a> BackboneHcWeights<'a> {
     pub fn layer(&self) -> usize { self.layer }
+    /// The buffers one sublayer's mHC reads (L2 prefetch): function, scale, base, norm.
+    pub(crate) fn decode_reads(&self, attention: bool) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
+        Self::names(self.layer, attention).into_iter().flatten().filter_map(|name| self.tensors.get(&name).ok()).collect()
+    }
     pub(crate) fn prepare_bindings<'w>(
         &'w self,
         attention: &HcSublayer<'w, 'a>,
@@ -72,6 +76,16 @@ impl<'a> BackboneHcWeights<'a> {
             capacity,
         ))
     }
+    pub(crate) fn block_on_storage(&self,
+        attention: std::rc::Rc<crate::families::deepseek_v41::v41_hc::HcStorage<'a>>,
+        ffn: std::rc::Rc<crate::families::deepseek_v41::v41_hc::HcStorage<'a>>,
+        unit: usize,
+    ) -> Result<crate::families::deepseek_v41::v41_block::BackboneBlockWave<'_, 'a>> {
+        Ok(crate::families::deepseek_v41::v41_block::BackboneBlockWave::new(
+            self.library, self.layer,
+            HcSublayer::on_storage(self.library, &self.tensors, Self::names(self.layer, true)?, attention, unit)?,
+            HcSublayer::on_storage(self.library, &self.tensors, Self::names(self.layer, false)?, ffn, unit)?, unit))
+    }
     pub fn boundary(
         &self,
         attention: bool,
@@ -85,5 +99,12 @@ impl<'a> BackboneHcWeights<'a> {
             capacity,
             budget,
         )
+    }
+}
+
+#[cfg(test)]
+impl BackboneHcWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.tensors.visit(prefix, f);
     }
 }

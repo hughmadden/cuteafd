@@ -238,11 +238,10 @@ fn a_fresh_prompt_snapshot_outlives_a_stale_turn_snapshot() {
     let layout = cuteafd_hostcache::pool::testing::layout();
     let b_bytes = 2 * (layout.tail + layout.scores) as u64 + 3 * layout.page as u64;
 
-    // Deleting A's prompt snapshot frees its tail only (its pages are A's turn's too), so A's
-    // turn snapshot goes next. The bank order deleted B's fresh prompt snapshot before A's
-    // stale turn ([a_prompt, b_prompt, a_turn]) and left only B's turn.
+    // A's leaf turn leaves before its ancestor prompt. With that descendant gone, A's
+    // prompt becomes a leaf and its older use beats B's leaf turn. B's reusable base survives.
     let (evicted, _) = store.evict_to(b_bytes);
-    assert_eq!(evicted, vec![a_prompt, a_turn]);
+    assert_eq!(evicted, vec![a_turn, a_prompt]);
     assert_eq!(store.bytes_used(), b_bytes);
 
     // An exact repeat of B's prompt still restores from RAM instead of prefilling.

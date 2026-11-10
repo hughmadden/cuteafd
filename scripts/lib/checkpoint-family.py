@@ -5,7 +5,7 @@ layers carry routed experts.
   checkpoint-family.py CONFIG_JSON   -> "FAMILY MODEL_TYPE FIRST_LAYER LAST_LAYER"
 
 FAMILY is the long family id (deepseek_v41, deepseek_v4, glm5, glm5_flash,
-mimo_v2, qwen4). The Spark ranks serve routed experts on [FIRST, LAST]
+mimo_v2, qwen4, qwen3_5, step5, kimi_k3, muse_spark, mistral_large4). The Spark ranks serve routed experts on [FIRST, LAST]
 (LAST -1: through the end); MTP/nextn layers past the decoder stay off them for
 GLM 5.3 Flash and Qwen 3.8, whose serve paths do not run their MTP heads.
 
@@ -18,7 +18,6 @@ both implementations are checked against.
 from __future__ import annotations
 
 import json
-import math
 import re
 import sys
 
@@ -34,6 +33,8 @@ FAMILIES = {
     "step5_vl": "step5",
     "step5": "step5",
     "kimi_k3": "kimi_k3",
+    "muse_spark": "muse_spark",
+    "mistral_large4": "mistral_large4",
 }
 
 
@@ -91,7 +92,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark", "mistral_large4"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -125,6 +126,18 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         if type(first) is not int or not 0 <= first < layers or text.get("moe_layer_freq", 1) != 1:
             raise SystemExit("unsupported kimi_k3 MoE layer pattern")
         last = layers - 1
+    elif family == "muse_spark":
+        # Every decoder layer is a MoE (mlp_layer_types all sparse).
+        if _pattern(text, layers, {"mlp_layer_types": {"sparse": False}}) is None:
+            raise SystemExit("config lacks mlp_layer_types")
+        last = layers - 1
+    elif family == "mistral_large4":
+        if text.get("model_type") != "mistral_large4_text":
+            raise SystemExit("mistral_large4 needs text_config.model_type mistral_large4_text")
+        # Dense prefix (mlp_layer_types / first_k_dense_replace); the bundled
+        # mtp_dspark drafter is dense, so the Sparks serve backbone layers only.
+        first = _dense_prefix(text, layers)
+        last = layers - 1
     elif family in ("qwen4", "qwen3_5"):
         kinds = {"linear_attention": "gdn", "full_attention": "full"}
         if _pattern(text, layers, {"layer_types": kinds}) is None:
@@ -149,6 +162,9 @@ def routed_layers(config: dict) -> int | None:
         return len(_step5_routed(text))
     if family in ("deepseek_v41", "deepseek_v4", "qwen4"):
         return layers
+    if family == "muse_spark":
+        _, _, first, last = describe(config)
+        return last - first + 1
     if family == "glm5":
         first = _dense_prefix(text, layers)
         if not 0 <= first <= layers:
@@ -157,7 +173,7 @@ def routed_layers(config: dict) -> int | None:
     if family == "glm5_flash":
         # Reuse the runtime-equivalent pattern checks, including agreement.
         describe(config)
-    if family == "kimi_k3":
+    if family in ("kimi_k3", "mistral_large4"):
         _, _, first, last = describe(config)
         return last - first + 1
     dense = _pattern(text, layers, {"mlp_layer_types": {"dense": True, "sparse": False},
@@ -171,21 +187,15 @@ def routed_layers(config: dict) -> int | None:
 
 
 def onboard(value: str, config: dict | None = None) -> str:
-    accepted = "RTX_EXPERT_LAYERS must be auto, max, all, N or N% (0..100%)"
+    accepted = "RTX_EXPERT_LAYERS must be auto, all or N"
     count = routed_layers(config) if config is not None else None
-    if value in ("auto", "max"):
+    if value in ("auto", "all"):
         return value
-    if value == "all":
-        return str(count) if count is not None else value
     if re.fullmatch(r"[0-9]+", value):
         number = int(value)
         if count is not None and number > count:
             raise SystemExit(f"{accepted}; checkpoint has {count} routed layers")
         return str(number)
-    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?%", value):
-        percent = float(value[:-1])
-        if math.isfinite(percent) and percent <= 100:
-            return str(math.floor(count * percent / 100 + 0.5)) if count is not None else value
     raise SystemExit(accepted)
 
 

@@ -19,6 +19,26 @@ pub struct GlmfResidentRank {
     pub weights: u64,
 }
 
+/// Native EXLR8 allocations from the shared planner's already-owned target plans.
+/// Shared experts have separate format-level arenas; MTP never enters these plans.
+pub fn native_resident(selection: &crate::plan::exlr8::dense::DenseSelection, layers: usize,
+    plans: &[crate::plan::exlr8::dense::DensePlan], shared_bytes: &[u64])
+    -> anyhow::Result<Vec<GlmfResidentRank>> {
+    use crate::plan::exlr8::dense::resident_native;
+    anyhow::ensure!(matches!(plans.len(), 1 | 2) && plans.len() == shared_bytes.len(),
+        "Flash native resident owners must match one/two shared expert ranks");
+    plans.iter().zip(shared_bytes).enumerate().map(|(rank, (plan, &shared))| {
+        anyhow::ensure!(plan.world == plans.len() && plan.rank == rank,
+            "Flash native resident plan rank/world mismatch");
+        let mut resident = GlmfResidentRank { embedding: 0, weights: shared };
+        for (group, _, bytes) in resident_native(selection, layers, plan)? {
+            let total = if group == "embedding" { &mut resident.embedding } else { &mut resident.weights };
+            *total = total.checked_add(bytes).ok_or_else(|| anyhow::anyhow!("Flash native resident overflow"))?;
+        }
+        Ok(resident)
+    }).collect()
+}
+
 /// No tensor data is read. FP8 block scales and FP32 auxiliaries are counted as uploaded, not
 /// as the source checkpoint stores them. Routed experts, media and external drafts are separate.
 pub fn resident_weights(checkpoint: &Checkpoint, cfg: &GlmNextConfig, layers: usize, ranks: usize,
@@ -38,6 +58,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
         return Err("GLM Flash attention weights require valid one/two-rank ownership".into());
     }
     let owned = attention == AttentionPlacement::Layers;
+    let core = super::core::CoreInventory::from_checkpoint(cfg, checkpoint).map_err(|e| e.to_string())?;
     let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .ok_or_else(|| format!("GLM Flash resident operand missing: {name}"));
     let elements = |name: &str| -> Result<u64, String> {
@@ -62,12 +83,16 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
     };
     let fp8 = |names: &[String], split: bool, row128: bool| fp8_ranks(names, if split { ranks } else { 1 }, row128);
     out[0].weights = tensor("model.language_model.norm.weight")?.meta.byte_length.max(256)
-        + if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
+        + if let Some(head) = core.get_weight("lm_head") {
+            head.resident_bytes(1).map_err(|e| e.to_string())?
+        } else if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
             else { tensor("lm_head.weight")?.meta.byte_length.max(256) };
     let mut mla_owner = first_owner;
     for layer in 0..layers.min(cfg.layers) {
         let owner = mla_owner;
         if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
+        let native = core.layer_weights(cfg, layer, ranks, owned.then_some(owner as u8)
+            .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
         let one = |s: &str| -> Result<u64, String> { Ok(tensor(s)?.meta.byte_length.max(256)) };
@@ -83,17 +108,25 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             bytes += one(&format!("{p}.input_layernorm.weight"))? + one(&format!("{p}.post_attention_layernorm.weight"))?;
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    let inputs: Vec<_> = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
-                        .iter().map(|s| a(&format!("{s}.weight"))).collect();
-                    let mut input_values = 0;
-                    for (i, name) in inputs.iter().enumerate() {
-                        input_values += elements(name)? / if ranks > 1 && !matches!(i, 3 | 4) { ranks as u64 } else { 1 };
+                    if core.get_weight(&a("q_proj")).is_some() {
+                        bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
+                            .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+                        let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
+                            + elements(&a("b_proj.weight"))? / ranks as u64;
+                        bytes += (aux * 2).max(256);
+                    } else {
+                        let inputs: Vec<_> = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
+                            .iter().map(|s| a(&format!("{s}.weight"))).collect();
+                        let mut input_values = 0;
+                        for (i, name) in inputs.iter().enumerate() {
+                            input_values += elements(name)? / if ranks > 1 && !matches!(i, 3 | 4) { ranks as u64 } else { 1 };
+                        }
+                        bytes += if repr.kda_fp8 { input_values.max(256) + (input_values / 128 * 4).max(256) }
+                            else { (input_values * 2).max(256) };
+                        let output_split = ranks > 1 && !(repr.kda_fp8 && repr.output_shard);
+                        bytes += if repr.kda_fp8 { fp8(&[a("o_proj.weight")], output_split, true)? }
+                            else { (elements(&a("o_proj.weight"))? * 2 / ranks as u64).max(256) };
                     }
-                    bytes += if repr.kda_fp8 { input_values.max(256) + (input_values / 128 * 4).max(256) }
-                        else { (input_values * 2).max(256) };
-                    let output_split = ranks > 1 && !(repr.kda_fp8 && repr.output_shard);
-                    bytes += if repr.kda_fp8 { fp8(&[a("o_proj.weight")], output_split, true)? }
-                        else { (elements(&a("o_proj.weight"))? * 2 / ranks as u64).max(256) };
                     bytes += ((elements(&a("f_b_proj.weight"))? + elements(&a("g_b_proj.weight"))?) * 2 / ranks as u64).max(256);
                     bytes += f32(&["q", "k", "v"].map(|s| a(&format!("{s}_conv1d.weight"))), ranks > 1)?;
                     bytes += f32(&[a("A_log")], ranks > 1)? + f32(&[a("dt_bias")], ranks > 1)?;
@@ -105,9 +138,14 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
                         bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
                         bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
-                        bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
-                        bytes += fp8_ranks(&[a("q_b_proj.weight")], parts, false)?
-                            + fp8_ranks(&[a("o_proj.weight")], parts, false)?;
+                        if core.get_weight(&a("q_a_proj")).is_some() {
+                            bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
+                                .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+                        } else {
+                            bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
+                            bytes += fp8_ranks(&[a("q_b_proj.weight")], parts, false)?
+                                + fp8_ranks(&[a("o_proj.weight")], parts, false)?;
+                        }
                         bytes += one(&a("indexer.wq_b.weight"))?;
                         bytes += ["wk.weight", "weights_proj.weight", "index_kpool_compress_gate"].iter()
                             .map(|s| elements(&a(&format!("indexer.{s}")))).collect::<Result<Vec<_>, _>>()?.into_iter().sum::<u64>() * 2;
@@ -117,7 +155,10 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             }
             let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
             let gate = format!("{mlp}.gate_proj.weight");
-            if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
+            if core.get_weight(&gate).is_some() {
+                bytes += native[rank].iter().filter(|(name, _)| name.starts_with("mlp."))
+                    .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+            } else if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
                 if rank == 0 {
                     for s in ["gate_proj", "up_proj", "down_proj"] {
                         bytes += one(&format!("{mlp}.{s}.weight"))?;
@@ -223,10 +264,67 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires published native Flash checkpoint headers; CPU only"]
+    fn published_native_residency_consumes_owned_plans_without_mtp_or_duplicate_vocabulary() {
+        use crate::plan::exlr8::{dense::{DensePlan, DenseRecord, DenseRole, DenseSelection}, residency::{ExpertSet, MetadataInput}};
+        use std::collections::BTreeMap;
+        let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT").expect("Flash snapshot"));
+        let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json")).unwrap();
+        let cfg = GlmNextConfig::from_hf(&config).unwrap();
+        let selection = DenseSelection::from_hf(&config).unwrap();
+        let records = DenseRecord::inventory(&snapshot).unwrap().into_iter().filter(|record|
+            selection.role(&record.tensor, cfg.layers).unwrap() != DenseRole::Excluded).collect::<Vec<_>>();
+        let metadata = MetadataInput::open(&snapshot, "k4").unwrap();
+        let routed = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
+        let costs = crate::plan::exlr8::routed_expert_costs(&metadata, &routed).unwrap();
+        assert_eq!(costs.len(), routed.len());
+        for (&layer, cost) in routed.iter().zip(&costs) {
+            assert_eq!(cost.whole.resident, metadata.plan(layer, 1, 0, ExpertSet::Routed).unwrap().resident_bytes as u64);
+            for rank in 0..2 {
+                assert_eq!(cost.half[rank].resident, metadata.plan(layer, 2, rank, ExpertSet::Routed).unwrap().resident_bytes as u64);
+                assert_eq!(cost.half[rank].staging, 0);
+            }
+            assert!(cost.tp2 && cost.spark_ok);
+        }
+        for invalid in [vec![0], vec![cfg.layers], vec![3, 3], vec![4, 3]] {
+            assert!(crate::plan::exlr8::routed_expert_costs(&metadata, &invalid).is_err());
+            assert!(crate::plan::exlr8::shared_expert_resident(&metadata, &invalid, 1).is_err());
+        }
+        assert!(crate::plan::exlr8::shared_expert_resident(&metadata, &routed, 0).is_err());
+        for world in [1, 2] {
+            // Owner facts come from outside admission. No Flash policy runs here.
+            for owners in [BTreeMap::new(), if world == 2 { cfg.attention.iter().enumerate()
+                .filter(|(_, kind)| **kind == GlmNextAttention::Mla).map(|(layer, _)| (layer, 1)).collect()
+                } else { BTreeMap::new() }] {
+                let plans = (0..world).map(|rank| DensePlan::for_rank_owned(&records, world, rank, &owners).unwrap())
+                    .collect::<Vec<_>>();
+                let layers = cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
+                let shared = crate::plan::exlr8::shared_expert_resident(&metadata, &layers, world).unwrap();
+                for (rank, &bytes) in shared.iter().enumerate() {
+                    let expected = layers.iter().map(|&layer|
+                        metadata.plan(layer, world, rank, ExpertSet::Shared).unwrap().resident_bytes as u64).sum::<u64>();
+                    assert_eq!(bytes, expected);
+                }
+                let resident = native_resident(&selection, cfg.layers, &plans, &shared).unwrap();
+                for (rank, result) in resident.iter().enumerate() {
+                    assert_eq!(result.weights + result.embedding, plans[rank].resident_bytes as u64 + shared[rank]);
+                    assert!(!plans[rank].tensors.iter().any(|slice| slice.tensor.contains(&format!("layers.{}.", cfg.layers))));
+                    if rank == 0 { assert!(result.embedding > 0); } else { assert_eq!(result.embedding, 0); }
+                }
+                assert!(native_resident(&selection, cfg.layers, &plans, &[]).is_err());
+                let mut invalid = plans.clone(); invalid[0].rank = world;
+                assert!(native_resident(&selection, cfg.layers, &invalid, &shared).is_err());
+                invalid = plans.clone(); invalid[0].resident_bytes += 1;
+                assert!(native_resident(&selection, cfg.layers, &invalid, &shared).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn real_exl3_and_fp8_headers_match_rc3_uploaded_operands() {
         let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
             .unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
-        for model in ["wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", "zai-org/GLM-5.3-Flash"] {
+        for model in ["wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", "zai-org/GLM-5.3-Flash"] {
             let Ok(resolved) = crate::resolve_snapshot_at_revision(model, Some(&home), None) else { continue };
             let Some(path) = resolved.snapshot_path else { continue };
             let checkpoint = Checkpoint::open(&path).unwrap();

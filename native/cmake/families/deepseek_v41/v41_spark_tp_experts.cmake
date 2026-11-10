@@ -9,7 +9,7 @@
 # same libcuteafd_native.so.
 #
 # The exporter runs on the target SM121 device and pre-compiles capacities
-# 1/16/80/256/1024/4096 ahead of runtime. The TP degree is a plan-time role
+# from CUTEAFD_V41_TARGET_ROWS ahead of runtime. The TP degree is a plan-time role
 # property; live row counts are never part of the AOT compile key. TP6 is pure
 # tensor parallelism over the official intermediate 2304: six 384-wide ranks
 # with no storage padding (kernel_intermediate == intermediate == 384).
@@ -19,37 +19,42 @@ endif()
 
 set(CUTEAFD_V41_SPARK_TP_SELECTED)
 foreach(tp IN LISTS CUTEAFD_SPARK_TP_ROLES)
-  if(tp STREQUAL "tp2" OR tp STREQUAL "tp3" OR tp STREQUAL "tp6")
+  if(tp MATCHES "^tp[2-8]$")
+    string(REGEX REPLACE "^tp" "" world "${tp}")
+    set(artifacts_var "CUTEAFD_NATIVE_ARTIFACTS_v41_${world}")
+    set(role "spark_tp${world}")
+    if(NOT role IN_LIST ${artifacts_var})
+      continue() # Adjacent-width objects are built by shared/mxfp4_widths.cmake.
+    endif()
     if(tp IN_LIST CUTEAFD_V41_SPARK_TP_SELECTED)
       message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES lists ${tp} more than once")
     endif()
     list(APPEND CUTEAFD_V41_SPARK_TP_SELECTED "${tp}")
   else()
-    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got ${tp}")
+    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts tp2 through tp8, got ${tp}")
   endif()
 endforeach()
 
 set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
 set(CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS)
-set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS 1 16 80 256 1024 4096)
-set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096")
-# Decode capacities share the fast width-192, six-K-step reduction recipe;
-# prefill keeps its existing direct-token fold.
-# Per-role cache strings so a build can select a width map for TP2, TP3 and TP6
-# independently (for example a capacity-80 candidate) without patching this file.
-# Each value is either a
-# scalar 64/128/192 or a full `capacity:width` map; the exporter validates that a
-# map covers every precompiled capacity exactly once and that widths are
-# 64/128/192, so an invalid override fails the export instead of being silently
-# accepted here. For TP6 the extra `slices * width <= kernel_intermediate`
-# relation (384 % 32 == 0, so 384/64, 384/128 and 384/192 all tile exactly) is
-# checked by the exporter's slice kernel too; an untileable width fails there.
-set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP2 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP3 expert slice width: scalar 64/128/192 or capacity:width map")
-set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
-  "Spark TP6 expert slice width: scalar 64/128/192 or capacity:width map")
+set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS ${CUTEAFD_V41_TARGET_ROWS})
+set(CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "${CUTEAFD_V41_TARGET_ROWS_ARG}")
+# Derive defaults on every configure; cached maps can retain retired capacities.
+# Explicit CUTEAFD_V41_SPARK_TP{2,3,6,8}_SLICE_WIDTH_OVERRIDE values select a
+# scalar 64/128/192 or full capacity:width map. The exporter validates coverage
+# and tiling, so invalid explicit overrides still fail rather than being repaired.
+set(default_width_map)
+foreach(rows IN LISTS CUTEAFD_V41_TARGET_ROWS)
+  list(APPEND default_width_map "${rows}:192")
+endforeach()
+list(JOIN default_width_map "," default_width_map)
+foreach(world 2 3 6 8)
+  set(width_var "CUTEAFD_V41_SPARK_TP${world}_SLICE_WIDTH")
+  set(${width_var} "${default_width_map}")
+  if(DEFINED ${width_var}_OVERRIDE)
+    set(${width_var} "${${width_var}_OVERRIDE}")
+  endif()
+endforeach()
 
 foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
   if(tp STREQUAL "tp2")
@@ -62,6 +67,11 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
     set(width_map "${CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH}")
     set(wrapper_src families/deepseek_v41/src/v41_spark_tp3_experts.cc)
     set(variant_header v41_spark_tp3_expert_variants.h)
+  elseif(tp STREQUAL "tp8")
+    set(role spark_tp8)
+    set(width_map "${CUTEAFD_V41_SPARK_TP8_SLICE_WIDTH}")
+    set(wrapper_src families/deepseek_v41/src/v41_spark_tp8_experts.cc)
+    set(variant_header v41_spark_tp8_expert_variants.h)
   else()
     set(role spark_tp6)
     set(width_map "${CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH}")
@@ -78,7 +88,7 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
   # be lost when a width map is overridden.
   set(width_stamp "${CMAKE_CURRENT_BINARY_DIR}/v41_${role}_width.stamp")
   file(GENERATE OUTPUT "${width_stamp}"
-    CONTENT "role=${role}\nwidth=${width_map}\natomic_min_capacity=256\n")
+    CONTENT "role=${role}\nwidth=${width_map}\natomic_min_capacity=none\n")
   set(dir "${CMAKE_CURRENT_BINARY_DIR}/v41_${role}_experts")
   set(objects)
   set(headers)
@@ -97,16 +107,19 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       --output-dir "${dir}" --role "${role}"
       --rows "${CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG}"
       --width "${width_map}"
-      --atomic-min-capacity 256 --standard-names
-    COMMAND "${CMAKE_COMMAND}" -E copy
-      "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
-    DEPENDS
+      --standard-names
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/${wrapper_src}"
       "${width_stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${role} replicated-group Spark expert kernels"
     VERBATIM

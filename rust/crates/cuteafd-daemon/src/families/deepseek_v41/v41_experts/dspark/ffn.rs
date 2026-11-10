@@ -54,7 +54,10 @@ impl<'library> DsparkWeights<'library> {
         })
     }
 }
-impl DsparkFfn<'_, '_> {
+impl<'a> DsparkFfn<'_, 'a> {
+    pub(super) fn peer_stream(&self) -> Option<std::rc::Rc<crate::shared::memory::device::Stream<'a>>> {
+        self.experts.peer_stream()
+    }
     #[cfg(test)]
     pub(super) fn expert_diagnostics(&self)->[CuteafdDeviceBuffer;4] {
         let [hidden,ids,routing]=self.experts.inputs();

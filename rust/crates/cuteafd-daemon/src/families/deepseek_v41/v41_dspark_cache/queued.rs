@@ -3,16 +3,16 @@ use super::*;
 
 pub(crate) struct WindowWrite {
     owner: u64,
-    descriptors: [V41KvWrite; 16],
+    descriptors: [V41KvWrite; cuteafd_core::V41_MAX_REQUESTS],
     leases: Vec<WindowLease>,
-    seen: [bool; 16],
-    ends: [Option<u64>; 16],
+    seen: [bool; cuteafd_core::V41_MAX_REQUESTS],
+    ends: [Option<u64>; cuteafd_core::V41_MAX_REQUESTS],
     source_rows: u32,
     _reservation: WriteReservation,
 }
 impl WindowWrite {
     pub fn descriptor_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.descriptors.as_ptr().cast::<u8>(), 384) }
+        unsafe { std::slice::from_raw_parts(self.descriptors.as_ptr().cast::<u8>(), cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES) }
     }
 }
 impl DsparkWindow<'_> {

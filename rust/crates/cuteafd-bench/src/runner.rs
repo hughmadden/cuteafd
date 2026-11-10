@@ -18,6 +18,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
+pub(crate) fn probe_server(model: &str, context: &crate::context::ServerContext) -> Value {
+    json!({"model": model, "family": context.family, "executor": context.command,
+        "snapshot": context.snapshot, "settings": context.settings, "build": crate::server::build_info()})
+}
+
 /// What a client asks to run.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RunRequest {
@@ -47,6 +52,8 @@ pub struct RunRequest {
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default)]
     pub context_levels: Option<Vec<usize>>,
+    #[serde(default)]
+    pub context_suffix: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -417,6 +424,7 @@ impl Bench {
             "readiness_s": crate::context::readiness_s(),
             "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
             "snapshot": crate::context::get().snapshot,
+            "settings": crate::context::get().settings,
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
             "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))
@@ -454,8 +462,13 @@ impl Bench {
 
     /// One remote probe is registered inside the serving process, where the registry lives.
     /// It holds the same exclusive inference slot as a benchmark, including on errors.
-    pub fn probe(self: &Arc<Self>, body: Value, mut spec: cuteafd_api::openai::probe::ProbeSpec) -> anyhow::Result<Value> {
+    pub fn probe_fixture(self: &Arc<Self>, body: Value, mut spec: cuteafd_api::openai::probe::ProbeSpec, cache_exact: bool) -> anyhow::Result<Value> {
         anyhow::ensure!(body.is_object(), "probe body must be a chat object");
+        let fixture = if cache_exact {
+            anyhow::ensure!(serde_json::to_value(&spec)? == serde_json::to_value(cuteafd_api::openai::probe::ProbeSpec::default())?,
+                "cache_exact owns its probe switches; omit spec");
+            Some(crate::baseline::cache_fixture(&body)?)
+        } else { None };
         if spec.dump_rows.is_some() {
             let root = std::env::var_os("CUTEAFD_PROBE_DUMP_ROOT")
                 .ok_or_else(|| anyhow::anyhow!("remote row dumps require CUTEAFD_PROBE_DUMP_ROOT"))?;
@@ -482,11 +495,17 @@ impl Bench {
         let mut client = Client::new(&base, Some(active.token), active.cancel).with_api_key(self.api_key.get().cloned());
         client.discover()?;
         let model = client.model.clone();
-        let chat = client.chat(body, Some(spec))?;
-        let mut value = serde_json::to_value(chat)?;
+        let mut value = if let Some(fixture) = fixture {
+            let info = self.server_info(&model);
+            client.configuration = info.configuration.clone();
+            let started = Instant::now();
+            let mut check = crate::report::Check::new("cache_exact", "Media prefix-cache restore");
+            crate::baseline::cache_exact_fixture(&client, &info, &mut check, Some(&fixture))?;
+            check.seconds = started.elapsed().as_secs_f64();
+            json!({"cache_exact": check})
+        } else { serde_json::to_value(client.chat(body, Some(spec))?)? };
         let context = crate::context::get();
-        value["server"] = json!({"model": model, "family": context.family,
-            "snapshot": context.snapshot, "settings": context.settings, "build": crate::server::build_info()});
+        value["server"] = probe_server(&model, &context);
         Ok(value)
     }
 
@@ -505,6 +524,7 @@ impl Bench {
         let context_load = panels::context_load::Options {
             lengths: request.context_lengths.clone().unwrap_or(defaults.lengths),
             levels: request.context_levels.clone().unwrap_or(defaults.levels),
+            suffix_tokens: request.context_suffix.unwrap_or(defaults.suffix_tokens),
         };
         context_load.validate().map_err(StartError::InvalidContext)?;
         let (name, planned) = match (&request.panels, &request.profile) {
@@ -534,7 +554,7 @@ impl Bench {
             *slot = Some(active.clone());
         }
         let report = Arc::new(Mutex::new(Report {
-            schema: SCHEMA.into(), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
+            schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: id.clone(), created: now_rfc3339(), finished: None, status: RunStatus::Running,
             profile: name, plan: plan.clone(), server: ServerInfo::default(), fingerprint: String::new(), baseline: None,
             panels: plan.iter().map(|p| PanelResult { id: p.id.clone(),
                 title: panels::find(&p.id).map_or(p.id.clone(), |panel| panel.title().to_string()),

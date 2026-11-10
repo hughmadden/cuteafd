@@ -14,7 +14,6 @@ use cuteafd_transport::{
 
 const HIDDEN: usize = 5120;
 const K32_ROW_BYTES: usize = 5280;
-const REQUEST_ROW_BYTES: usize = 40 + 6 * 12 + K32_ROW_BYTES;
 const RESPONSE_ROW_BYTES: usize = 4 + V41_PARTIAL_ROW_BYTES as usize;
 const SLOT: usize = 8 << 20;
 const DEPTH: usize = 8;
@@ -25,7 +24,9 @@ const FLOOR_ENDPOINT_SPAN: usize = 2 * FLOOR_DIRECTION_SPAN;
 const MAX_FRAME: usize = 64 << 20;
 const CAPACITY: u32 = 4096;
 fn request_wire(rows: u32) -> usize {
-    EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN + rows as usize * REQUEST_ROW_BYTES
+    cuteafd_core::expert_geometry::expert_request_payload_offset(
+        EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, rows as usize * 40, rows as usize * 6 * 12,
+    ).unwrap() + rows as usize * K32_ROW_BYTES
 }
 fn response_wire(rows: u32) -> usize {
     EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN + rows as usize * RESPONSE_ROW_BYTES

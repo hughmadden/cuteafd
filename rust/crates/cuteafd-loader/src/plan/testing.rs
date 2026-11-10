@@ -1,10 +1,104 @@
 //! Checkpoint fixtures for planner tests (this crate's and the daemon's CLI
 //! tests): headers with the real geometry of each family over sparse,
 //! all-zero payloads, so a fixture costs no disk.
+pub mod exlr8;
+
 use serde_json::{json, Value};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+
+/// Shared full-plan wall budget, including first-use metadata rather than only a warm report.
+pub struct BudgetedPlanInput { input: super::PlanInput }
+
+impl BudgetedPlanInput {
+    pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
+        Ok(Self { input: super::PlanInput::open(snapshot)? })
+    }
+
+    pub fn from_checkpoint(checkpoint: super::Checkpoint) -> Self {
+        Self { input: super::PlanInput::from_checkpoint(checkpoint) }
+    }
+
+    pub fn checkpoint(&self) -> &super::Checkpoint { self.input.checkpoint() }
+
+    pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> { self.input.expert_catalog() }
+
+    #[track_caller]
+    pub fn plan_spark_count(&self, options: &super::PlanOptions, available: usize,
+        explicit: Option<usize>) -> Result<super::PlanReport, super::PlanError> {
+        let started = std::time::Instant::now();
+        let result = self.input.plan_spark_count(options, available, explicit);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30),
+            "full Spark-count plan exceeded 30s: snapshot={} options={options:?}", self.checkpoint().snapshot.display());
+        result
+    }
+
+    #[track_caller]
+    pub fn plan(&self, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
+        let (result, phases) = self.input.plan_with_timings(options);
+        eprintln!("full-plan {:?} ranks={} phases={phases:?}", self.checkpoint().snapshot, options.placement.spark_ranks());
+        assert!(phases.total() < std::time::Duration::from_secs(30),
+            "full plan exceeded 30s: snapshot={} ranks={} phases={phases:?} options={options:?}",
+            self.checkpoint().snapshot.display(), options.placement.spark_ranks());
+        result
+    }
+}
+
+#[track_caller]
+pub fn plan(snapshot: &Path, options: &super::PlanOptions) -> Result<super::PlanReport, super::PlanError> {
+    BudgetedPlanInput::open(snapshot)?.plan(options)
+}
+
+/// Tiny native TikToken snapshot, deliberately without tokenizer.json.
+pub fn write_kimi_tokenizer(snapshot: &Path) {
+    use base64::Engine;
+    let ranks = (0..=255u8).map(|byte| format!("{} {byte}\n",
+        base64::engine::general_purpose::STANDARD.encode([byte]))).collect::<String>();
+    fs::write(snapshot.join("tiktoken.model"), ranks).unwrap();
+    fs::write(snapshot.join("tokenization_kimi.py"), format!("{}\nnum_reserved_special_tokens = 256\n",
+        crate::tokenizer::tiktoken::KIMI_PATTERN.join("\n"))).unwrap();
+    fs::write(snapshot.join("tokenizer_config.json"), json!({"added_tokens_decoder": {
+        "256": {"content": "<|open|>"}, "257": {"content": "<|end_of_msg|>"}
+    }}).to_string()).unwrap();
+}
+
+/// Real Kimi geometry with one sparse shard per layer, below the header limit.
+pub fn write_kimi_snapshot(dir: &Path, all: bool) {
+    write_kimi_tensors(dir, kimi_k3_tensors(all));
+}
+
+/// Sparse K6 header fixture only, not a numerically quantized checkpoint.
+/// The payload is intentionally unsuitable for layer-forward qualification.
+pub fn write_kimi_core_snapshot(dir: &Path, all: bool) {
+    let mut tensors = Vec::new();
+    for tensor in kimi_k3_tensors(all) {
+        if let Some(stem) = tensor.0.strip_suffix(".weight").filter(|stem|
+            crate::families::kimi_k3::core::split(stem).is_some()) {
+            let n = if stem.ends_with(".kv_a_proj_with_mqa") { tensor.2[0].next_multiple_of(128) } else { tensor.2[0] };
+            tensors.extend(exl3(stem, n, tensor.2[1], 6));
+        } else { tensors.push(tensor); }
+    }
+    write_kimi_tensors(dir, tensors);
+}
+
+fn write_kimi_tensors(dir: &Path, tensors: Vec<Tensor>) {
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.split(".layers.").nth(1)
+            .and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), kimi_k3_config().to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map":weight_map}).to_string()).unwrap();
+}
 
 /// (name, safetensors dtype, shape).
 pub type Tensor = (String, &'static str, Vec<usize>);
@@ -285,6 +379,159 @@ pub fn glm5_tensors(expert: impl Fn(&str, usize, usize) -> Vec<Tensor>) -> Vec<T
     out
 }
 
+/// Compact, constructor-valid GLM weight geometry for CPU allocation tests.
+/// Payloads remain sparse zeros until a test explicitly fills them.
+pub fn glm5_compact_weights() -> (Value, Vec<Tensor>) {
+    let mut config = glm5_config();
+    for (key, value) in [("hidden_size", 256), ("num_attention_heads", 2),
+        ("q_lora_rank", 256), ("kv_lora_rank", 128), ("qk_nope_head_dim", 64),
+        ("v_head_dim", 128), ("index_n_heads", 2), ("intermediate_size", 512),
+        ("n_routed_experts", 2), ("num_experts_per_tok", 2), ("moe_intermediate_size", 256)] {
+        config[key] = json!(value);
+    }
+    let mut tensors = vec![t("lm_head.weight", "BF16", &[64, 256]),
+        t("model.embed_tokens.weight", "BF16", &[64, 256]), t("model.norm.weight", "BF16", &[256])];
+    for layer in 0..2 {
+        let root = format!("model.layers.{layer}");
+        for (leaf, width) in [("input_layernorm.weight", 256), ("post_attention_layernorm.weight", 256),
+            ("self_attn.q_a_layernorm.weight", 256), ("self_attn.kv_a_layernorm.weight", 128)] {
+            tensors.push(t(format!("{root}.{leaf}"), "BF16", &[width]));
+        }
+        for (leaf, n, k) in [("q_a_proj", 256, 256), ("kv_a_proj_with_mqa", 192, 256),
+            ("q_b_proj", 256, 256), ("kv_b_proj", 384, 128), ("o_proj", 256, 256)] {
+            tensors.extend(fp8(&format!("{root}.self_attn.{leaf}"), n, k, None));
+        }
+        if layer == 0 {
+            tensors.extend(fp8(&format!("{root}.self_attn.indexer.wq_b"), 256, 256, None));
+            tensors.extend(fp8(&format!("{root}.self_attn.indexer.wk"), 128, 256, None));
+            tensors.push(t(format!("{root}.self_attn.indexer.weights_proj.weight"), "BF16", &[2, 256]));
+            for leaf in ["weight", "bias"] {
+                tensors.push(t(format!("{root}.self_attn.indexer.k_norm.{leaf}"), "BF16", &[128]));
+            }
+        } else {
+            tensors.push(t(format!("{root}.mlp.gate.weight"), "BF16", &[2, 256]));
+            tensors.push(t(format!("{root}.mlp.gate.e_score_correction_bias"), "F32", &[2]));
+        }
+        let (mlp, intermediate) = if layer == 0 { ("mlp", 512) } else { ("mlp.shared_experts", 256) };
+        for (leaf, n, k) in [("gate_proj", intermediate, 256), ("up_proj", intermediate, 256),
+            ("down_proj", 256, intermediate)] {
+            tensors.extend(fp8(&format!("{root}.{mlp}.{leaf}"), n, k, None));
+        }
+        if layer == 1 {
+            for expert in 0..2 {
+                for leaf in ["gate_proj", "up_proj", "down_proj"] {
+                    tensors.extend(fp8(&format!("{root}.mlp.experts.{expert}.{leaf}"), 256, 256, None));
+                }
+            }
+        }
+    }
+    (config, tensors)
+}
+
+/// PROGRAMS.json entries (256-byte scratch each) for a GLM 5.3 native plan: the context split's
+/// programs and the decode/prefill producers, attention, o_proj and dense/MoE FFNs of both shares.
+pub fn glm5_native_programs() -> Value {
+    use crate::placement::families::glm5 as glm;
+    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| format!("glm_{name}"))
+        .chain(["glm_paged_staging_gather_kv".to_string()]).collect::<Vec<_>>();
+    for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+        names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
+        for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
+            names.extend([format!("{prefix}_producer_{cap}"), format!("{prefix}_sparse_mla_{mode}_{cap}"),
+                format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
+                format!("{prefix}_ffn_i{dense}_{cap}")]);
+        }
+    }
+    names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
+    json!({"programs": names.into_iter().map(|name|
+        json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()})
+}
+
+/// A native K6 package manifest for `core`: one row policy and its three
+/// dense_trellis_k6 programs per weight geometry, plus the stage programs each
+/// variant's admission checks (GLM's `glm{,2}_stage_*`; Mistral Large 4's
+/// `ml4_*`, its `ml42_*` head-split share and its context-split extras).
+pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::families::glm5::core::CoreInventory)
+    -> anyhow::Result<Value> {
+    use anyhow::Context as _;
+    use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+    let mut weights = Vec::new();
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
+            .flat_map(std::collections::BTreeMap::into_values)); }
+    } }
+    if let Some(head) = core.get_weight(cfg.head()) {
+        weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
+    }
+    let mut policies = std::collections::BTreeMap::new();
+    let mut programs = std::collections::BTreeMap::new();
+    for w in weights {
+        let [n, k] = w.shape;
+        let side = if w.side == TrellisSide::Input { 2 } else { 1 };
+        let book = w.codebook.marker();
+        let shape = format!("k{k}_n{n}_s{side}_{book}");
+        let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+        policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
+            "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
+            "output_program":routes[2]}));
+        let output = if w.stem == cfg.head() { "f32" } else { "bf16" };
+        let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
+            json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
+                "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
+                "splits":k.div_ceil(1024),"ctas_per_sm":4}),
+            json!({"features":n,"output_dtype":output,"max_rows":4096})];
+        let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
+            vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+            vec!["input", "svh", "output"]];
+        for i in 0..3 {
+            let name = format!("dense_trellis_k6_{}", routes[i]);
+            programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
+                "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
+                "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
+                "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
+        }
+    }
+    for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
+        for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+            let name = format!("{prefix}_stage_swiglu_i{inter}");
+            programs.insert(name.clone(), json!({"name":name}));
+        }
+        for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
+            "absorb_bf16_context", "query_rope_context"] {
+            let name = format!("{prefix}_stage_{stage}_{cap}");
+            programs.insert(name.clone(), json!({"name":name}));
+        } }
+    }
+    if cfg.variant.ml4().is_some() {
+        // export_b12x_dsv4_aot --geometry ml4: whole-attention stages and their
+        // 32-head share under a head split (`ml42_*`).
+        let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+        let mut names = vec!["ml4_index_kw".to_string(), "ml4_norm".into(), "ml4_router_scores".into(),
+            "ml4_expert_input_quant".into(), "ml4_index_topk_decode_m64".into(), "ml4_index_topk_prefill_m4096".into(),
+            "ml4_sparse_mla_decode_m64".into(), "ml4_sparse_mla_nope_decode_m64".into(),
+            "ml4_sparse_mla_prefill_m4096".into(), "ml4_sparse_mla_nope_prefill_m4096".into()];
+        for ranks in [1, 2] {
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                names.push(format!("ml4_swiglu_i{inter}"));
+            }
+        }
+        for cap in ["m64", "m4096"] {
+            names.extend([format!("ml4_values_{cap}"), format!("ml4_index_query_scale_{cap}"),
+                format!("ml4_index_layer_norm_{cap}"), format!("ml4_index_q_{cap}"), format!("{split}_values_{cap}")]);
+            for tag in ["", "_nope"] {
+                for stage in ["query_scale", "rank_pack", "absorb", "index_post"] {
+                    names.push(format!("ml4_{stage}{tag}_{cap}"));
+                }
+                names.extend([format!("{split}_query_scale{tag}_{cap}"), format!("{split}_absorb{tag}_{cap}")]);
+            }
+        }
+        for name in names { programs.insert(name.clone(), json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})); }
+    }
+    Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
+        "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+}
+
+
 /// GLM 5.3 Flash's config with `layers` layers (KDA / MLA alternating, the
 /// first dense).
 pub fn glm5_flash_config(layers: usize) -> Value {
@@ -305,6 +552,12 @@ pub fn glm5_flash_config(layers: usize) -> Value {
             "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4,
                                    "gate_lower_bound": -5.0}}
     })
+}
+
+/// Complete bundled GLM Flash tower headers for cross-crate admission tests.
+pub fn glm5_flash_vision_tensors() -> Vec<Tensor> {
+    super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)).collect()
 }
 
 /// Complete coordinator headers plus one expert per routed layer; payloads stay sparse.
@@ -416,6 +669,28 @@ pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBu
     programs
 }
 
+/// The coordinator EXL3 capacity manifests Muse onboarding reads (rtx-tp1 and
+/// rtx-tp2 of `exl3-muse-k45`, F32 out) under `share/exl3`, beside a
+/// PROGRAMS.json the fixture writes too; returns that PROGRAMS.json.
+pub fn write_muse_exl3_capacities(dir: &Path) -> std::path::PathBuf {
+    let share = dir.join("share");
+    for (layout, intermediate) in [("rtx-tp1", 4096), ("rtx-tp2", 2048)] {
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = share.join("exl3/exl3-muse-k45").join(format!("{layout}/m{capacity}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                "capacity": capacity, "hidden": 4096, "experts": 256, "intermediate": intermediate, "top_k": 8,
+                "bits": [4, 5], "output_dtype": "fp32", "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32},
+                "buffers": {"scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 4096 * 8,
+                    "zero_on_create": false}}
+            })).unwrap()).unwrap();
+        }
+    }
+    let programs = share.join("PROGRAMS.json");
+    if !programs.exists() { fs::write(&programs, b"{}").unwrap(); }
+    programs
+}
+
 /// Every Qwen routed expert of every layer as complete EXL3 projections at
 /// `bits`, a BF16 router per layer, and the storage map.
 pub fn qwen4_exl3(layers: usize, bits: usize) -> (Vec<Tensor>, Value) {
@@ -472,11 +747,23 @@ pub fn write_v4_snapshot(path: &Path) {
 }
 
 pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
+    write_v4_snapshot_format(path, stages, false, false);
+}
+
+pub fn write_v4_pro_exl3_snapshot(path: &Path) {
+    write_v4_snapshot_format(path, 0, true, true);
+}
+
+pub fn write_v4_pro_mxfp4_snapshot(path: &Path) {
+    write_v4_snapshot_format(path, 0, true, false);
+}
+
+fn write_v4_snapshot_format(path: &Path, stages: usize, pro: bool, exl3_experts: bool) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
-    let hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
+    let mut hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
     let mut ratios = vec![0, 0];
     ratios.extend([4, 128, 4]);
-    let args = json!({
+    let mut args = json!({
         "vocab_size": 64, "dim": 4096, "moe_inter_dim": 2048, "n_layers": 4, "n_hash_layers": 1, "n_heads": 64,
         "n_routed_experts": 256, "n_shared_experts": 1, "n_activated_experts": 6, "score_func": "sqrtsoftplus",
         "route_scale": 1.5, "swiglu_limit": 10.0, "q_lora_rank": 1024, "head_dim": 512, "rope_head_dim": 64,
@@ -486,6 +773,12 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
         "compress_ratios": ratios[1..].to_vec(), "dspark_block_size": if stages > 0 { 5 } else { 0 },
         "dspark_target_layer_ids": [1, 2, 3], "dspark_markov_rank": 256
     });
+    if pro {
+        args["dim"] = json!(7168);
+        args["moe_inter_dim"] = json!(3072);
+        args["n_routed_experts"] = json!(384);
+    }
+    if exl3_experts { hf["quantization_config"] = exl3_compact(2); }
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::from_model_args(&args, stages).unwrap();
     let mut tensors = vec![t("embed.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
         t("head.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
@@ -510,11 +803,16 @@ pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
         ]);
     }
     for layer in 0..4 {
-        for expert in 0..256 {
-            for (projection, rows, cols) in [("w1", 2048, 4096), ("w2", 4096, 2048), ("w3", 2048, 4096)] {
+        for expert in 0..cfg.n_routed_experts {
+            for (projection, rows, cols) in [("w1", cfg.moe_inter_dim, cfg.dim),
+                ("w2", cfg.dim, cfg.moe_inter_dim), ("w3", cfg.moe_inter_dim, cfg.dim)] {
                 let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
-                tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
-                tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+                if exl3_experts {
+                    tensors.extend(exl3(&name, rows, cols, 2));
+                } else {
+                    tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
+                    tensors.push(t(format!("{name}.scale"), "F8_E8M0", &[rows, cols / 32]));
+                }
             }
         }
     }
@@ -605,33 +903,19 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
     for ranks in [1, 2] {
         let role = if ranks == 1 { "rtx_backbone" } else { "rtx_tp2" };
         for format in ["mxfp4", "nvfp4"] {
-            let manifest = json!({"role":role, "geometry":{"hidden":5120,
+            let manifest = json!({"role":role, "decode_capacities":[1,16,64], "geometry":{"hidden":5120,
                 "intermediate":2304/ranks,"kernel_intermediate":2304/ranks,
-                "experts":384,"topk":6}, "variants":([1,16,80,256,1024,4096].map(|c|
+                "experts":384,"topk":6}, "variants":([1,16,64,256,1024,4096].map(|c|
                     json!({"capacity_rows":c,"core_scratch_nbytes":if c==16 {99999}else{c*7}})))});
             fs::write(share.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json")),
                 serde_json::to_vec(&manifest).unwrap()).unwrap();
-        }
-        for bits in 2..=5 {
-            let tiers = if bits == 5 { "45".to_owned() } else { format!("{bits}{}", bits+1) };
-            for capacity in [1,16,80,256,1024,4096] {
-                let path = share.join("exl3").join(format!("exl3-k{tiers}"))
-                    .join(format!("rtx-tp{ranks}")).join(format!("m{capacity}"));
-                fs::create_dir_all(&path).unwrap();
-                fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
-                    "capacity":capacity,"hidden":5120,"experts":384,
-                    "intermediate":2304/ranks,"top_k":6,"input_format":"e4m3_k32",
-                    "trellis_lut":{"bytes":32},"buffers":{
-                        "scratch":{"allocation":"scratch","dtype":"f32","bytes":capacity*7,
-                            "zero_on_create":false}}})).unwrap()).unwrap();
-            }
         }
     }
     let matrices = [(5120,1152),(1152,5120),(5120,1280),(1280,32768),
         (32768,8192),(8192,5120),(5120,2304),(2304,5120),(5120,512),
         (1280,4096),(6144,25600),(15360,5120)];
     let variants = matrices.into_iter().flat_map(|(k,n)|
-        [1,16,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
+        [1,16,64,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
             "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
             "expected_m":if c<=80 {16}else{c},"split_k_slices":1,"all_rows":c<=80}))).collect::<Vec<_>>();
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
@@ -639,6 +923,12 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
         "role":"coordinator","input_format":"bf16","geometry":{"hidden":5120,
             "intermediate":2304,"kernel_intermediate":2304,"experts":128,"topk":3},
         "variants":([16,40,80,256].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*7})))
+    })).unwrap()).unwrap();
+    // `--tp2-dspark-experts` charges the dSpark TP2 role's own workspaces.
+    fs::write(share.join("V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"), serde_json::to_vec(&json!({
+        "role":"dspark_tp2","input_format":"fp8_k32","geometry":{"hidden":5120,
+            "intermediate":1152,"kernel_intermediate":1152,"experts":128,"topk":3},
+        "variants":([1,16,40,80,256,1024,4096].map(|c|json!({"capacity_rows":c,"core_scratch_nbytes":c*11})))
     })).unwrap()).unwrap();
     programs
 }
@@ -747,4 +1037,579 @@ pub fn kimi_k3_config() -> Value {
         "text_config": text,
         "vision_config": {"vt_num_hidden_layers": 27},
     })
+}
+
+/// Release tensor headers. Only routed layer 1 includes experts unless `all`.
+pub fn kimi_k3_tensors(all: bool) -> Vec<Tensor> {
+    use crate::families::kimi_k3::config::{KimiAttention, KimiK3Config};
+    let cfg = KimiK3Config::from_hf(&kimi_k3_config()).unwrap();
+    let mut out = Vec::new();
+    let p = "language_model.model.";
+    out.push(t(format!("{p}embed_tokens.weight"), "BF16", &[163840, 7168]));
+    out.push(t("language_model.lm_head.weight", "BF16", &[163840, 7168]));
+    for name in ["norm", "output_attn_res_norm"] { out.push(t(format!("{p}{name}.weight"), "BF16", &[7168])); }
+    out.push(t(format!("{p}output_attn_res_proj.weight"), "BF16", &[1, 7168]));
+    for layer in 0..93 {
+        let b = format!("{p}layers.{layer}");
+        for n in ["input_layernorm", "post_attention_layernorm", "self_attention_res_norm", "mlp_res_norm"] {
+            out.push(t(format!("{b}.{n}.weight"), "BF16", &[7168]));
+        }
+        for n in ["self_attention_res_proj", "mlp_res_proj"] { out.push(t(format!("{b}.{n}.weight"), "BF16", &[1, 7168])); }
+        let a = format!("{b}.self_attn");
+        out.push(t(format!("{a}.g_proj.weight"), "BF16", &[12288, 7168]));
+        out.push(t(format!("{a}.o_proj.weight"), "BF16", &[7168, 12288]));
+        if cfg.attention[layer] == KimiAttention::Kda {
+            for proj in ["q", "k", "v"] {
+                out.push(t(format!("{a}.{proj}_proj.weight"), "BF16", &[12288, 7168]));
+                out.push(t(format!("{a}.{proj}_conv1d.weight"), "F32", &[12288, 1, 4]));
+            }
+            out.push(t(format!("{a}.f_a_proj.weight"), "BF16", &[128, 7168]));
+            out.push(t(format!("{a}.f_b_proj.weight"), "BF16", &[12288, 128]));
+            out.push(t(format!("{a}.b_proj.weight"), "BF16", &[96, 7168]));
+            out.push(t(format!("{a}.A_log"), "F32", &[128]));
+            out.push(t(format!("{a}.dt_bias"), "F32", &[12288]));
+            out.push(t(format!("{a}.o_norm.weight"), "F32", &[128]));
+        } else {
+            out.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[1536, 7168]));
+            out.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[1536]));
+            out.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[18432, 1536]));
+            out.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, 7168]));
+            out.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
+            out.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[24576, 512]));
+        }
+        if layer == 0 {
+            for (proj, n, k) in [("gate", 33792, 7168), ("up", 33792, 7168), ("down", 7168, 33792)] {
+                out.push(t(format!("{b}.mlp.{proj}_proj.weight"), "BF16", &[n, k]));
+            }
+            continue;
+        }
+        let m = format!("{b}.block_sparse_moe");
+        out.push(t(format!("{m}.gate.weight"), "BF16", &[896, 7168]));
+        out.push(t(format!("{m}.gate.e_score_correction_bias"), "F32", &[896]));
+        out.push(t(format!("{m}.routed_expert_down_proj.weight"), "BF16", &[3584, 7168]));
+        out.push(t(format!("{m}.routed_expert_up_proj.weight"), "BF16", &[7168, 3584]));
+        out.push(t(format!("{m}.routed_expert_norm.weight"), "BF16", &[3584]));
+        for (proj, n, k) in [("gate", 6144, 7168), ("up", 6144, 7168), ("down", 7168, 6144)] {
+            out.push(t(format!("{m}.shared_experts.{proj}_proj.weight"), "BF16", &[n, k]));
+        }
+        if all || layer == 1 {
+            for e in 0..896 {
+                for (w, n, k) in [("w1", 3072, 3584), ("w3", 3072, 3584), ("w2", 3584, 3072)] {
+                    out.extend(exl3(&format!("{m}.experts.{e}.{w}"), n, k, 2));
+                }
+            }
+        }
+    }
+    out.push(t("vision_tower.encoder.blocks.0.wqkv.weight", "BF16", &[1536, 1024]));
+    out.push(t("mm_projector.proj.0.weight", "BF16", &[4096, 4096]));
+    out
+}
+
+/// CPU-only installed package fixture; no native objects are executed.
+pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> std::path::PathBuf {
+    use serde_json::json;
+    let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+        "/../../../third_party/sparkinfer.lock.json"))).unwrap();
+    let revision = lock["revision"].as_str().unwrap();
+    let mut programs = Vec::new();
+    for (name, geometry) in [
+        ("kimik3_router_scores", json!({"hidden":7168,"experts":896,"top_k":16})),
+        ("kimik3_expert_input_quant", json!({"hidden":3584})),
+        ("kimik3_latent_down", json!({"width":7168,"outputs":3584})),
+        ("kimik3_latent_up", json!({"width":3584,"outputs":7168})),
+        ("kimik3_rmsnorm_h3584", json!({"hidden":3584})),
+    ] {
+        if !spark { programs.push(json!({"name":name,"geometry":geometry,"object_sha256":"b".repeat(64)})); }
+    }
+    if !spark {
+        for (name, bytes) in [("kimik3_kda_m64", 8_673_280), ("kimik3_kda_m4096", 629_464_064),
+            ("kda_fused_h96_m64", 17_330_176), ("kda_fused_h96_m4096", 1_182_153_728)] {
+            programs.push(json!({"name":name,"scratch_bytes_at_capacity":{"scratch":bytes}}));
+        }
+        for (suffix, producer, output, attention) in [("",92_798_976,100_663_296,50_528_256),
+            ("_h96",168_296_448,201_326_592,101_056_512)] {
+            for rows in [64,4096] {
+                for (prefix, bytes) in [("mla_producer",producer), ("mla_output",output)] {
+                    programs.push(json!({"name":format!("kimik3_{prefix}{suffix}_m{rows}"),
+                        "scratch_bytes_at_capacity":{"scratch":bytes}}));
+                }
+            }
+            for (mode, rows, bytes) in [("decode",64,attention),("verify",64,attention),("extend",4096,0)] {
+                programs.push(json!({"name":format!("kimik3_dense_mla_{mode}{suffix}_m{rows}"),
+                    "scratch_bytes_at_capacity":{"scratch":bytes}}));
+            }
+        }
+    }
+    std::fs::create_dir_all(root.join("share")).unwrap();
+    let path = root.join("share/PROGRAMS.json");
+    std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
+    let package = root.join("lib/exl3/exl3-kimik3-k23");
+    let layouts = if spark {
+        crate::plan::experts::spark_worlds("kimik3:exl3-k23", 3072).into_iter().flat_map(|world| {
+            let recipe = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, world).unwrap();
+            recipe.required_layouts.into_iter().zip(recipe.widths)
+        }).collect::<Vec<_>>()
+    } else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
+    let mut variants = Vec::new();
+    for (layout, intermediate) in layouts {
+        for capacity in [1, 80, 256, 1024, 2048, 2752, 4096] {
+            let directory = format!("{layout}/m{capacity}");
+            let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
+                "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
+                "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision,
+                "descriptor_rows":if layout.contains("-compact-") {7} else {3},
+                "native_info_version":if layout.contains("-compact-") {3} else {2},
+                "trellis_lut":{"bytes":4096},"buffers":{"scratch":{"allocation":"scratch",
+                    "bytes":capacity * 4096,"dtype":"f32","zero_on_create":false}}});
+            let target = package.join(&directory);
+            std::fs::create_dir_all(target.join("routes")).unwrap();
+            std::fs::write(target.join("v41_exl3.json"), meta.to_string()).unwrap();
+            for file in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
+                std::fs::write(target.join(file), []).unwrap();
+            }
+            variants.push(meta);
+        }
+    }
+    std::fs::write(package.join("manifest.json"), json!({"schema":"cuteafd.exl3-package.v1",
+        "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
+        "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
+    path
+}
+
+/// Muse Spark Open 816B-A42B `config.json` (meta-models rev 0fb02478) as an
+/// EXL3 K4 + Core-K6 publication declares it; towers trimmed to their types.
+pub fn muse_spark_config() -> Value {
+    let layers = 62;
+    let full = |l: usize| (layers - 1 - l) % 4 == 0;
+    let text = json!({
+        "model_type": "muse_spark_text", "attention_bias": false, "attention_dropout": 0.0,
+        "bos_token_id": 200000, "eos_token_id": 200001, "pad_token_id": 200018,
+        "final_logit_softcapping": 20.0, "head_dim": 64, "hidden_act": "silu", "hidden_size": 8192,
+        "initializer_range": 0.02, "intermediate_size": 16384,
+        "layer_rope_theta": (0..layers).map(|l| if full(l) { json!(0) } else { json!(500000.0) }).collect::<Vec<_>>(),
+        "layer_types": (0..layers).map(|l| if full(l) { "full_attention" } else { "sliding_attention" }).collect::<Vec<_>>(),
+        "max_position_embeddings": 1048576, "mlp_layer_types": vec!["sparse"; layers],
+        "moe_hidden_size": 4096, "moe_intermediate_size": 4096, "num_attention_heads": 128,
+        "num_experts_per_tok": 8, "num_hidden_layers": layers, "num_key_value_heads": 16,
+        "num_local_experts": 256, "num_shared_experts": 0, "output_multiplier": 0.17677669529663687,
+        "post_norm_eps": 1e-8, "qk_scale_factor": 5.4730064863875, "residual_gate_temperature": 0.3,
+        "rms_norm_eps": 1e-5, "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+        "routed_scaling_factor": 1.0, "sliding_window": 2048, "tie_word_embeddings": false,
+        "use_cache": true, "vocab_size": 202048,
+    });
+    json!({
+        "architectures": ["MuseSparkForConditionalGeneration"], "model_type": "muse_spark",
+        "audio_token_id": 200038, "image_token_id": 200092, "video_token_id": 200091, "dtype": "bfloat16",
+        "quantization_config": {"bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "checkpoint_format": "exl3",
+            "codebook": "mcg", "format": "exl3", "method": "exl3", "quant_method": "exl3", "lm_head": true,
+            "per_module_metadata": "quantize_config.json:tensor_storage"},
+        "text_config": text,
+        "vision_config": {"model_type": "muse_spark_vision", "hidden_size": 1536, "num_hidden_layers": 50},
+        "audio_config": {"model_type": "muse_spark_audio", "out_hidden_size": 8192},
+    })
+}
+
+/// Muse Spark EXL3 K4 + Core-K6 headers: K6 attention q/k/v/o, pre/post expert
+/// projections and head; BF16 norms, residual gates, output gate, embedding;
+/// FP32 router. Routed experts (K4, split per expert) only on `expert_layers`.
+pub fn muse_spark_tensors(expert_layers: &[usize]) -> (Vec<Tensor>, Vec<(String, usize, usize, usize)>) {
+    let (h, q, kv, e, v) = (8192, 8192, 1024, 4096, 202048);
+    let p = "model.language_model";
+    let mut out = vec![t(format!("{p}.embed_tokens.weight"), "BF16", &[v, h]),
+        t(format!("{p}.norm.weight"), "BF16", &[h])];
+    // The K6 head is stored at whole 128-row blocks: 202,112 rows for 202,048 logical.
+    let stored = v.next_multiple_of(128);
+    let mut projections = vec![("lm_head".to_string(), 6, h, stored)];
+    out.extend(exl3("lm_head", stored, h, 6));
+    for layer in 0..62 {
+        let b = format!("{p}.layers.{layer}");
+        for norm in ["input_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm"] {
+            out.push(t(format!("{b}.{norm}.weight"), "BF16", &[h]));
+        }
+        for gate in ["post_attention_residual_gate", "post_feedforward_residual_gate"] {
+            out.push(t(format!("{b}.{gate}.gate"), "BF16", &[h]));
+        }
+        out.push(t(format!("{b}.self_attn.gate_proj.weight"), "BF16", &[q, h]));
+        for (proj, n, k) in [("q_proj", q, h), ("k_proj", kv, h), ("v_proj", kv, h), ("o_proj", h, q)] {
+            let name = format!("{b}.self_attn.{proj}");
+            out.extend(exl3(&name, n, k, 6));
+            projections.push((name, 6, k, n));
+        }
+        for (proj, n, k) in [("pre_expert_proj", e, h), ("post_expert_proj", h, e)] {
+            let name = format!("{b}.mlp.{proj}");
+            out.extend(exl3(&name, n, k, 6));
+            projections.push((name, 6, k, n));
+        }
+        out.push(t(format!("{b}.mlp.pre_expert_norm.weight"), "BF16", &[e]));
+        out.push(t(format!("{b}.mlp.experts.post_expert_norm.weight"), "BF16", &[e]));
+        out.push(t(format!("{b}.mlp.gate.weight"), "F32", &[256, h]));
+        out.push(t(format!("{b}.mlp.gate.e_score_correction_bias"), "F32", &[256]));
+        if expert_layers.contains(&layer) {
+            for expert in 0..256 {
+                for (proj, n, k) in [("gate_proj", 4096, e), ("up_proj", 4096, e), ("down_proj", e, 4096)] {
+                    let name = format!("{b}.mlp.experts.{expert}.{proj}");
+                    out.extend(exl3(&name, n, k, 4));
+                    projections.push((name, 4, k, n));
+                }
+            }
+        }
+    }
+    out.push(t("model.vision_tower.patch_embedder.patch_embedding.weight", "BF16", &[1536, 3, 2, 14, 14]));
+    out.push(t("model.vision_projection.weight", "BF16", &[8192, 4096]));
+    out.push(t("model.audio_tower.proj.weight", "BF16", &[8192, 2048]));
+    (out, projections)
+}
+
+/// One shard per layer (the 15K-entry expert headers of a layer stay below the
+/// header bound), the index, `config.json` and `quantize_config.json`.
+/// Routed experts are written for `expert_layers` only; the index still names
+/// every layer's experts so the inventory is complete.
+pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, false, false);
+}
+
+pub fn write_muse_vision_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, true, false);
+}
+
+pub fn write_muse_media_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, true, true);
+}
+
+fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool, audio: bool) {
+    let (mut tensors, mut projections) = muse_spark_tensors(expert_layers);
+    tensors.retain(|tensor| !crate::media::muse_vision::is_tensor(&tensor.0)
+        && !tensor.0.starts_with("model.audio_tower."));
+    if vision {
+        tensors.extend(crate::media::muse_vision::tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape)));
+    }
+    if audio {
+        tensors.retain(|tensor| !tensor.0.starts_with("model.audio_tower."));
+        tensors.extend(crate::media::pcm_audio::tensor_shapes().into_iter()
+            .map(|(name, shape)| t(format!("model.audio_tower.{name}"), "BF16", &shape)));
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.split(".layers.").nth(1).and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in &shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), tensors);
+        for (name, ..) in tensors { weight_map.insert(name.clone(), Value::String(file.clone())); }
+    }
+    // Absent shards: experts of the other layers, indexed but not local.
+    for layer in (0..62).filter(|layer| !expert_layers.contains(layer)) {
+        let file = format!("model-experts-{layer:05}.safetensors");
+        for expert in 0..256 {
+            for (proj, n, k) in [("gate_proj", 4096, 4096), ("up_proj", 4096, 4096), ("down_proj", 4096, 4096)] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}");
+                for (tensor, ..) in exl3(&name, n, k, 4) { weight_map.insert(tensor, Value::String(file.clone())); }
+                projections.push((name, 4, k, n));
+            }
+        }
+    }
+    // Text/admission fixtures carry classification sentinels, not bundled towers.
+    let mut config = muse_spark_config();
+    if audio {
+        config["audio_config"] = json!({"model_type":"muse_spark_audio",
+            "hidden_sizes":crate::media::pcm_audio::WIDTHS, "patch_sizes":crate::media::pcm_audio::PATCHES,
+            "depths":[2,2,2,2], "num_hidden_layers":4, "conv_kernel_size":7,
+            "mlp_ratio":4, "rms_norm_eps":1e-6, "hidden_act":"gelu", "out_hidden_size":8192});
+        config["audio_token_id"] = json!(200038);
+        fs::write(dir.join("processor_config.json"), json!({"feature_extractor":{"sampling_rate":24000,
+            "samples_per_token":1920, "feature_size":1, "padding_value":0, "padding_side":"right"}}).to_string()).unwrap();
+    } else { config.as_object_mut().unwrap().remove("audio_config"); }
+    if vision {
+        config["out_hidden_size"] = json!(6144);
+        config["projector_hidden_size"] = json!(4096);
+        config["projector_hidden_act"] = json!("gelu");
+        config["vision_config"] = json!({"hidden_size":1536, "intermediate_size":8960,
+            "num_attention_heads":16, "num_hidden_layers":50, "patch_size":14, "patch_temporal":2,
+            "merge_size":2, "pos_emb_height":32, "pos_emb_width":32, "hidden_act":"gelu",
+            "layer_norm_eps":1e-5, "rope_parameters":{"rope_type":"axial", "rope_theta":10000.0},
+            "layer_types":vec!["window_attention";50]});
+    } else { config.as_object_mut().unwrap().remove("vision_config"); }
+    fs::write(dir.join("config.json"), config.to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    let mut compact = exl3_compact(4);
+    for key in ["core_bits", "head_bits"] { compact[key] = json!(6.0); }
+    compact["lm_head"] = json!(true);
+    let mut manifest = exl3_manifest(&compact, &projections);
+    // The quantizer records the head's logical and N128-padded stored extents.
+    manifest["tensor_storage"]["lm_head"]["out_features"] = json!(202048);
+    manifest["tensor_storage"]["lm_head"]["stored_out_features"] = json!(202112);
+    manifest["tensor_storage"]["lm_head"]["in_features"] = json!(8192);
+    write_quantize_config(dir, &manifest);
+}
+
+/// Official Step-5 geometry as sparse headers for shared planner/runtime tests.
+pub fn step5_fixture(kind: &str) -> (Value, Vec<Tensor>) {
+    let source: Value = serde_json::from_str(include_str!("families/step5/fixtures/official-fp8.json")).unwrap();
+    let mut config = source["config"].clone();
+    if kind == "nvfp4" {
+        config = serde_json::from_str(include_str!("families/step5/fixtures/official-nvfp4-config.json")).unwrap();
+    } else if kind == "bf16" {
+        config.as_object_mut().unwrap().remove("quantization_config");
+    }
+    let mut tensors = Vec::new();
+    for (name, value) in source["tensors"].as_object().unwrap() {
+        let dtype = value[0].as_str().unwrap();
+        let shape: Vec<usize> = value[1].as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
+        let dtype = match dtype { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", _ => panic!("{dtype}") };
+        if kind == "bf16" && name.ends_with("weight_scale_inv") { continue; }
+        if kind == "nvfp4" && name.ends_with("weight_scale_inv") { continue; }
+        if dtype == "F8_E4M3" && kind == "nvfp4" {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let [e,n,k]: [usize;3] = shape.try_into().unwrap();
+            tensors.push(t(name, "U8", &[e,n,k/2]));
+            tensors.push(t(format!("{stem}.weight_scale"), "F8_E4M3", &[e,n,k/16]));
+            tensors.push(t(format!("{stem}.weight_scale_2"), "F32", &[e]));
+            tensors.push(t(format!("{stem}.input_scale"), "F32", &[e]));
+        } else { tensors.push((name.clone(), if kind == "bf16" { "BF16" } else { dtype }, shape)); }
+    }
+    // Only originally quantized expert matrices widen in the BF16 root;
+    // all release FP32 norms/router/index weights stay FP32.
+    if kind == "bf16" {
+        for (name,dtype,_) in &mut tensors {
+            if source["tensors"][name.as_str()][0] == "F32" { *dtype = "F32"; }
+        }
+    }
+    (config,tensors)
+}
+
+/// Published K4 expert/K6 core headers, shared by loader and daemon regressions.
+pub fn write_step5_exl3_snapshot(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let (mut config, tensors) = step5_fixture("bf16");
+    let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
+        "bits": 4.0, "core_bits": 6.0, "mtp_bits": 4.0, "head_bits": 6.0, "codebook": "mcg",
+        "mcg_multiplier": 0xCBAC1FEDu64, "out_scales": "auto", "expert_bits": 4.0,
+        "expert_bits_by_layer": {"88": 6.0, "89": 6.0, "90": 6.0},
+        "per_module_metadata": "quantize_config.json:tensor_storage"});
+    config["quantization_config"] = declaration.clone();
+    let core = |name: &str| -> Option<usize> {
+        if name == "lm_head.weight" { return Some(6); }
+        let rest = name.strip_prefix("model.layers.")?;
+        let (layer, leaf) = rest.split_once('.')?;
+        let layer: usize = layer.parse().ok()?;
+        let quantized = matches!(leaf, "self_attn.q_proj.weight" | "self_attn.k_proj.weight"
+            | "self_attn.v_proj.weight" | "self_attn.o_proj.weight")
+            || leaf.starts_with("share_expert.") || leaf.starts_with("mlp.")
+            || leaf == "eh_proj.weight" || leaf == "transformer.shared_head.output.weight";
+        quantized.then_some(if layer >= 92 { 4 } else { 6 })
+    };
+    let mut out: Vec<Tensor> = Vec::new();
+    let mut storage = serde_json::Map::new();
+    let mut module = |out: &mut Vec<Tensor>, stem: &str, n: usize, k: usize, bits: usize| {
+        out.extend(exl3(stem, n, k, bits));
+        storage.insert(stem.to_owned(), serde_json::json!({"quant_format": "exl3", "bits_per_weight": bits,
+            "mcg_multiplier": 0xCBAC1FEDu64, "in_features": k, "out_features": n, "stored_out_features": n,
+            "stored_tensors": {
+                format!("{stem}.trellis"): {"shape": [k / 16, n / 16, 16 * bits], "torch_dtype": "int16"},
+                format!("{stem}.suh"): {"shape": [k], "torch_dtype": "float16"},
+                format!("{stem}.svh"): {"shape": [n], "torch_dtype": "float16"},
+                format!("{stem}.mcg"): {"shape": [], "torch_dtype": "int32"}}}));
+    };
+    for (name, dtype, shape) in tensors {
+        if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
+            let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
+            let bits = if layer >= 88 { 6 } else { 4 };
+            let (base, proj) = stem.rsplit_once('.').unwrap();
+            for expert in 0..shape[0] {
+                module(&mut out, &format!("{base}.experts.{expert}.{proj}"), shape[1], shape[2], bits);
+            }
+        } else if let Some(bits) = core(&name) {
+            module(&mut out, name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits);
+        } else {
+            out.push((name, dtype, shape));
+        }
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in out {
+        let shard = tensor.0.strip_prefix("model.layers.").and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok()).map_or(96, |l| l + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}-of-00096.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    std::fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::write(dir.join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
+    let mut manifest = declaration.as_object().unwrap().clone();
+    for (key, value) in [("method", Value::from("exl3")), ("group_size", Value::from(-1)),
+        ("desc_act", Value::from(false)), ("sym", Value::from(true)), ("lm_head", Value::from(true)),
+        ("tensor_storage", Value::Object(storage)), ("kept_tensors", serde_json::json!({})),
+        ("module_include", serde_json::json!([])), ("calibration", serde_json::json!({})),
+        ("meta", serde_json::json!({}))] {
+        manifest.insert(key.into(), value);
+    }
+    std::fs::write(dir.join("quantize_config.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+}
+
+/// Installed native and expert package metadata for the Step-5 header fixture.
+pub fn step5_native_manifest(dir: &std::path::Path) -> std::path::PathBuf {
+    let ops = ["hidden_norm", "final_norm", "residual_bf16", "residual_f32", "swa_attention",
+        "csa_attention", "region_compress", "region_scores", "region_selection", "region_commit",
+        "sliding_commit", "attn_q", "attn_kv", "attn_gate", "attn_out", "router",
+        "dense_gate_up", "dense_down", "shared_gate_up", "shared_down"];
+    let programs = ["step5", "step52"].iter().flat_map(|prefix| ops.iter().map(move |op|
+        serde_json::json!({"name": format!("{prefix}_{op}"), "capacity_rows": 4096}))).collect::<Vec<_>>();
+    let path = dir.join("PROGRAMS.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"programs": programs,
+        "capacities": {"max_context": 1048576}})).unwrap()).unwrap();
+    install_step5_rtx_expert_packages(&path);
+    path
+}
+
+/// The coordinator RTX expert packages every Step format onboards through:
+/// fp8moe (FP8, NVFP4 W4A4, BF16 tails) TP1/TP2 scratch tables and the EXL3
+/// rtx-tp1/rtx-tp2 trees, beside the program manifest as a WIP share holds them.
+fn install_step5_rtx_expert_packages(manifest: &std::path::Path) {
+    let root = manifest.parent().unwrap();
+    for name in ["fp8-step5", "fp8-step5-nvfp4a4", "fp8-step5-bf16-weights"] {
+        let package = root.join("fp8").join(name);
+        for tp in ["tp1", "tp2"] { std::fs::create_dir_all(package.join(tp)).unwrap(); }
+        let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
+            serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
+        std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
+            "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}})).unwrap()).unwrap();
+    }
+    install_step5_exl3_rtx_package(manifest);
+}
+
+pub fn install_step5_exl3_rtx_package(manifest: &std::path::Path) {
+    for (tp, intermediate) in [(1, 1536), (2, 768)] {
+    let root = manifest.parent().unwrap().join(format!("exl3/exl3-step5-k46/rtx-tp{tp}"));
+    for capacity in crate::placement::inventory::exl3_capacities(4096) {
+        let path = root.join(format!("m{capacity}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": intermediate, "top_k": 8,
+            "bits": [4, 6], "activation": "silu_post_clamp", "swiglu_limit": 7.0,
+            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
+        })).unwrap()).unwrap();
+    }
+    }
+}
+
+/// Mistral Large 4's real header inventory (the official FP8 release @f12dabdc,
+/// 56,563 tensors) from the checked-in templates, keeping the routed experts of
+/// `expert_layers` only (`None`: every layer). `quantized`: the K4 experts + K6 core
+/// publication form instead (wq, wkv_a padded to 640, wo, shared expert,
+/// dense FFN and output at K6; wkv_b, indexer wk/weights_proj, norms, router,
+/// embeddings, drafter and vision byte for byte; indexer wq_b kept FP8).
+pub fn mistral_large4_tensors(expert_layers: Option<&[usize]>, quantized: bool) -> Vec<Tensor> {
+    #[derive(serde::Deserialize)]
+    struct Template { pattern: String, axes: Vec<Vec<usize>>, dtype: String, shape: Vec<usize> }
+    let templates: Vec<Template> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json")).unwrap();
+    let dtype = |d: &str| -> &'static str { match d { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", other => panic!("{other}") } };
+    let mut out = Vec::new();
+    for template in templates {
+        let mut names = vec![template.pattern.clone()];
+        for axis in &template.axes {
+            names = names.into_iter().flat_map(|name| axis.iter().map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+        }
+        for name in names {
+            if let Some((layer, _)) = name.strip_prefix("layers.").and_then(|r| r.split_once(".experts."))
+                .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest))) {
+                if expert_layers.is_some_and(|keep| !keep.contains(&layer)) { continue; }
+            }
+            out.push(t(name, dtype(&template.dtype), &template.shape));
+        }
+    }
+    if !quantized { return out; }
+    let core = |stem: &str| -> Option<bool> {
+        if stem == "output" { return Some(false); }
+        let rest = stem.strip_prefix("layers.")?.split_once('.')?.1;
+        match rest {
+            "attention.wq" | "attention.wo" | "shared_experts.w1" | "shared_experts.w2" | "shared_experts.w3"
+            | "feed_forward.w1" | "feed_forward.w2" | "feed_forward.w3" => Some(false),
+            "attention.wkv_a_with_mqa" => Some(true),
+            _ if rest.starts_with("experts.") => Some(false),
+            _ => None,
+        }
+    };
+    let mut quantized = Vec::new();
+    let mut shapes = std::collections::BTreeMap::new();
+    for tensor in &out {
+        if let Some(stem) = tensor.0.strip_suffix(".weight") { shapes.insert(stem.to_owned(), tensor.2.clone()); }
+    }
+    for tensor in out {
+        let (stem, suffix) = crate::plan::format::split_stem(&tensor.0);
+        let Some(pad) = core(stem) else { quantized.push(tensor); continue };
+        if suffix == "qscale_weight" { continue; }
+        let shape = &shapes[stem];
+        let bits = if stem.contains(".experts.") { 4 } else { 6 };
+        let n = if pad { shape[0].next_multiple_of(128) } else { shape[0] };
+        quantized.extend(exl3(stem, n, shape[1], bits));
+    }
+    quantized
+}
+
+/// The compact and full EXL3 K4 + Core-K6 metadata of a Mistral Large 4
+/// publication (GLM 5.3 K4-Core-K6 contract).
+pub fn mistral_large4_exl3_config(tensors: &[Tensor]) -> (Value, Value) {
+    let compact = json!({"bits": 4.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
+        "head_bits": 6.0, "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3",
+        "native_quantization_config": mistral_large4_config()["quantization_config"]});
+    let mut full = compact.clone();
+    full.as_object_mut().unwrap().extend(json!({"codebook": "mcg", "desc_act": false, "group_size": -1,
+        "lm_head": true, "method": "exl3", "out_scales": "auto", "sym": true}).as_object().unwrap().clone());
+    let projections: Vec<(String, usize, usize, usize)> = tensors.iter().filter_map(|(name, _, shape)| {
+        let stem = name.strip_suffix(".trellis")?;
+        Some((stem.to_owned(), shape[2] / 16, shape[0] * 16, shape[1] * 16))
+    }).collect();
+    (compact, exl3_manifest(&full, &projections))
+}
+
+/// A Mistral Large 4 header snapshot in the release's own layout: config.json,
+/// `consolidated-NNNNN.safetensors` shards (one per layer, sparse payloads)
+/// and the index config.json's `transformers_weights` names.
+/// Mistral Large 4's release config.json (@f12dabdc).
+pub fn mistral_large4_config() -> Value {
+    serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap()
+}
+
+pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>, quantized: bool) {
+    let tensors = mistral_large4_tensors(expert_layers, quantized);
+    let mut config: Value = serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap();
+    if quantized {
+        let (compact, manifest) = mistral_large4_exl3_config(&tensors);
+        config["quantization_config"] = compact;
+        write_quantize_config(dir, &manifest);
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.strip_prefix("layers.").and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("consolidated-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::write(dir.join("consolidated.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    // The release's Mistral-format params.json: its mtp block describes the bundled drafter.
+    fs::write(dir.join("params.json"), json!({"softmax_tanh_gating": 30.0, "mtp": {"n_layers": 3, "depth": 3,
+        "ragged_attention": "2048,2048,2048", "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+        "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}},
+        // The release's vision_encoder block (@f12dabdc), which names the image markers.
+        "vision_encoder": {"image_token_id": 10, "image_break_token_id": 12, "image_end_token_id": 13,
+            "intermediate_size": 6144, "num_hidden_layers": 30, "num_attention_heads": 16,
+            "mm_projector_id": "patch_merge", "spatial_merge_size": 2, "hidden_size": 2048, "num_channels": 3,
+            "image_size": 1540, "max_image_size": 1540, "patch_size": 14, "rope_theta": 10000.0,
+            "add_pre_mm_projector_layer_norm": true, "adapter_bias": false}}).to_string()).unwrap();
+    fs::write(dir.join("processor_config.json"),
+        include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
 }

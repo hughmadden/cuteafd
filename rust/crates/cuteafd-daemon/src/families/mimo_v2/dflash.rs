@@ -90,6 +90,9 @@ struct Workspace<'a> {
     logits: Dev<'a>,
     unary: Dev<'a>,
     candidates: Dev<'a>,
+    /// Pinned landing of `unary` then `candidates`: both download behind the
+    /// round's one host wait.
+    landing: crate::shared::memory::HostAllocation<'a>,
     positions: Dev<'a>,
     tables: Dev<'a>,
     /// Token ids of the block rows (anchors; the mask rows' sentinel).
@@ -132,10 +135,14 @@ pub(crate) struct Draft {
 }
 
 pub(crate) struct MimoDrafter<'a> {
+    pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     library: &'a NativeLibrary,
+    projections: cuteafd_ffi::draft_projection::DraftProjections<'a>,
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
+    /// The draft round's host wait: sleeps instead of spinning the engine thread.
+    round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     /// Ring slots (sequences with a drafter context).
     pub slots: usize,
     max_sequences: usize,
@@ -145,7 +152,6 @@ pub(crate) struct MimoDrafter<'a> {
     layers: Vec<DraftLayer<'a>>,
     /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
     pub taps: Dev<'a>,
-    first_lane_taps: Option<Dev<'a>>,
     fused: Dev<'a>,
     fused_norm: Dev<'a>,
     context_kv: Dev<'a>,
@@ -361,7 +367,8 @@ impl<'a> MimoDrafter<'a> {
             MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
             MimoDraftRepresentation::Fp8Only => ("fp8", "w8a16-chunk64"),
         };
-        let numerics = format!("{storage}-{rows}-{head}-{:?}-r1", self.confidence_scales).to_ascii_lowercase();
+        let kv = if self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "-kv-fp8" } else { "" };
+        let numerics = format!("{storage}-{rows}-{head}-{:?}{kv}-r1", self.confidence_scales).to_ascii_lowercase();
         let key = format!("mimo_v2/dflash/{numerics}");
         let mut fit = crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory, &key)?;
         fit.key = key;
@@ -371,14 +378,23 @@ impl<'a> MimoDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. `mask_row` is the mask token's embedding.
-    pub fn load(library: &'a NativeLibrary, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
         max_sequences: usize, mask_row: Vec<u8>, representation: MimoDraftRepresentation,
-        scales: fp8_linear::Fp8Scales) -> Result<Self> {
+        scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
         let cfg = DflashConfig::read(dir)?;
+        let h = cfg.hidden;
+        let shapes = [(h * cfg.taps.len(), h), (h, cfg.qkv_width()), (h, 2 * cfg.kv_heads * cfg.head_dim),
+            (cfg.heads * cfg.head_dim, h), (h, 2 * cfg.intermediate), (cfg.intermediate, h)];
+        let projections = cuteafd_ffi::draft_projection::DraftProjections::load(programs,
+            if representation == MimoDraftRepresentation::Bf16Only { &shapes } else { &[] },
+            cuteafd_ffi::draft_projection::batch_rows(TAP_ROWS, cfg.block, max_sequences,
+                programs.capacities().decode_rows.unwrap_or(0)))?;
+
         ensure!(matches!(representation, MimoDraftRepresentation::Bf16Only | MimoDraftRepresentation::Fp8Only),
             "MiMo serving supports only immutable bf16-only or fp8-only drafter storage; historical dual/mixed controls are not production modes");
-        let capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        let mut capacity = MimoDraftCapacity::new(slots, max_sequences, cfg.block)?;
+        capacity.kv_cache = kv_cache;
         let runtime_layout = cfg.runtime_layout(representation, capacity)?;
         let weight_layout = runtime_layout.weights;
         ensure!(mask_row.len() == cfg.hidden * 2, "mask row of {} bytes", mask_row.len());
@@ -450,8 +466,8 @@ impl<'a> MimoDrafter<'a> {
                 gate_up: matrix(concat(&[(&format!("{p}.mlp.gate_proj.weight"), inter),
                     (&format!("{p}.mlp.up_proj.weight"), inter)], h)?, 2 * inter, h, false)?,
                 down: matrix(tensor(&format!("{p}.mlp.down_proj.weight"), &[h, inter])?, h, inter, false)?,
-                k_ring: zeroed(slots * RING * kv * 2)?,
-                v_ring: zeroed(slots * RING * kv * 2)?,
+                k_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
+                v_ring: zeroed(slots * RING * kv_cache.plane_record_bytes(cfg.kv_heads, cfg.head_dim))?,
             })
         }).collect::<Result<Vec<_>>>()?;
         let taps = cfg.taps.len() * h;
@@ -459,8 +475,10 @@ impl<'a> MimoDrafter<'a> {
             max_load_staging = weight_layout.max_load_staging, slots, max_sequences,
             "DFlash immutable weight storage");
         Ok(Self {
-            library,
+            kv_cache,
+            library, projections,
             stream,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
             fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
@@ -468,7 +486,6 @@ impl<'a> MimoDrafter<'a> {
             norm: tensor("norm.weight", &[h])?,
             layers,
             taps: zeroed(TAP_ROWS * taps * 2)?,
-            first_lane_taps: None,
             fused: zeroed(TAP_ROWS * h * 2)?,
             fused_norm: zeroed(TAP_ROWS * h * 2)?,
             context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
@@ -500,26 +517,15 @@ impl<'a> MimoDrafter<'a> {
         self.tap_into(&self.taps, layer, hidden, first, n)
     }
 
-    /// Called once after admission, while the enclosing engine owns failures.
-    /// The ordinary tap pointer remains stable for existing decode graphs.
-    pub fn prepare_prefill_lanes(&mut self) -> Result<()> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
-        if self.first_lane_taps.is_none() {
-            self.first_lane_taps = Some(DeviceAllocation::new(self.library, self.cfg.prefill_lane_tap_bytes()?)?);
-        }
-        Ok(())
-    }
-
-    pub fn tap_lane(&self, lane: usize, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
-        self.tap_into(self.lane_taps(lane)?, layer, hidden, first, n)
-    }
-
-    fn lane_taps(&self, lane: usize) -> Result<&Dev<'a>> {
-        match lane {
-            0 => self.first_lane_taps.as_ref().context("paired prefill taps were not admitted"),
-            1 => Ok(&self.taps),
-            _ => anyhow::bail!("prefill tap lane {lane} is outside 0..2"),
-        }
+    pub fn tap_at(&self, layer: usize, hidden: *const c_void, first: usize, destination: usize, n: usize) -> Result<()> {
+        let Some(index) = self.tap_index(layer) else { return Ok(()) };
+        ensure!(destination + n <= TAP_ROWS, "MiMo unit tap exceeds the tail ring");
+        let h = self.cfg.hidden;
+        // SAFETY: caller supplies live unit rows; the destination is the unit's
+        // disjoint part of the admitted whole-span tail staging.
+        unsafe { self.library.glm_dflash_tap(hidden.cast::<u8>().add(first * h * 2).cast(),
+            self.taps.buffer.ptr.cast::<u8>().add(destination * self.cfg.taps.len() * h * 2).cast(),
+            n, h, self.cfg.taps.len() * h, index * h, self.stream) }
     }
 
     fn tap_into(&self, taps: &Dev<'_>, layer: usize, hidden: *const c_void, first: usize, n: usize) -> Result<()> {
@@ -554,7 +560,7 @@ impl<'a> MimoDrafter<'a> {
             DraftWeight::Fp8(_) => anyhow::bail!("FP8-only DFlash has no BF16 fallback"),
         };
         // SAFETY: the selected rows belong to the live BF16 matrix.
-        unsafe { self.library.linear_bf16(x, at(bf16, first * k * 2), out, rows, k, n, self.stream) }
+        unsafe { Ok(self.projections.launch(x, at(bf16, first * k * 2), out, rows, k, n, self.stream)?) }
     }
 
     pub fn context_rings(&self) -> Vec<CuteafdDeviceBuffer> {
@@ -566,16 +572,6 @@ impl<'a> MimoDrafter<'a> {
         self.update_from(&self.taps, rows)
     }
 
-    /// Consume independent request banks in lane order. The context projection
-    /// scratch is reused; drain before overwriting its synchronous table uploads.
-    /// No captured graph or persistent target tap pointer changes here.
-    pub fn update_lane(&self, lane: usize, rows: &[ContextRow]) -> Result<()> {
-        let taps = self.lane_taps(lane)?;
-        // SAFETY: the engine owns this stream and both tap banks through its
-        // terminal guard; no pending peer wait remains after paired prefill.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.update_from(taps, rows)
-    }
 
     fn update_from(&self, taps: &Dev<'_>, rows: &[ContextRow]) -> Result<()> {
         if rows.is_empty() {
@@ -609,7 +605,7 @@ impl<'a> MimoDrafter<'a> {
                 self.library.mimo_dflash_qk_rope(self.context_kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, self.context_slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, c.kv_heads,
-                    c.rope_dim, c.theta, c.eps, c.v_scale, s)?;
+                    c.rope_dim, c.theta, c.eps, c.v_scale, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -618,7 +614,9 @@ impl<'a> MimoDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: every reader of the drafter's tables, inputs and taps runs on its
+        // stream outside capture; the ordered copy follows them and keeps its source.
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
@@ -643,6 +641,7 @@ impl<'a> MimoDrafter<'a> {
             logits: alloc(rows * c.vocab * 4)?,
             unary: alloc(drafted * 16 * 4)?,
             candidates: alloc(drafted * 16 * 4)?,
+            landing: crate::shared::memory::HostAllocation::new(self.library, 2 * drafted * 16 * 4)?,
             positions: alloc(rows * 8)?,
             tables: alloc(3 * sequences * 4)?,
             ids: alloc(rows * 4)?,
@@ -722,7 +721,7 @@ impl<'a> MimoDrafter<'a> {
                     .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(MASK_ID, block - 1))).collect();
                 embedding.check(&sequences.iter().map(|seq| seq.anchor).collect::<Vec<_>>())?;
                 self.put(&w.ids, bytes_of(&ids))?;
-                // SAFETY: the ids are up (synchronous copy); `h` holds the block rows; the
+                // SAFETY: the ids are up (ordered on this stream); `h` holds the block rows; the
                 // mask row is a live [hidden] BF16 buffer.
                 unsafe { embedding.embed_device_ids(w.ids.buffer, None, rows, 1,
                     Some((self.mask_device.buffer.ptr.cast_const(), &self.mask_row)), w.h.buffer, self.stream)? };
@@ -743,12 +742,12 @@ impl<'a> MimoDrafter<'a> {
                     c.qkv_width())?;
                 l.mimo_dflash_qk_rope(w.qkv.buffer.ptr, layer.q_norm.buffer.ptr, layer.k_norm.buffer.ptr,
                     w.positions.buffer.ptr, std::ptr::null(), w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, rows,
-                    c.heads, c.kv_heads, c.rope_dim, c.theta, eps, c.v_scale, s)?;
+                    c.heads, c.kv_heads, c.rope_dim, c.theta, eps, c.v_scale, false, s)?;
                 l.mimo_dflash_attention(w.q.buffer.ptr, w.k.buffer.ptr, w.v.buffer.ptr, layer.k_ring.buffer.ptr,
                     layer.v_ring.buffer.ptr, w.tables.buffer.ptr, at(&w.tables, s_count * 4),
                     at(&w.tables, 2 * s_count * 4), layer.sinks.as_ref().map_or(std::ptr::null(), |t| t.buffer.ptr),
                     w.attn.buffer.ptr, w.attention_workspace.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), s)?;
+                    max_keys, c.window, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
                 self.linear(w.attn.buffer.ptr, &layer.o, 0, w.delta.buffer.ptr, rows,
                     attention_width, h)?;
                 l.mimo_dflash_add_norm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr, w.n.buffer.ptr,
@@ -768,16 +767,26 @@ impl<'a> MimoDrafter<'a> {
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
-            l.cuda_stream_synchronize(s)?;
+        }
+        let drafted = s_count * c.drafts();
+        let landing = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: both halves stay inside the 2 x drafted x 64-byte landing.
+            ptr: unsafe { w.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes: drafted * 64, ..w.landing.buffer };
+        // The round's results download on its stream, then one host wait
+        // covers the round and both copies (no second, synchronous drain).
+        // SAFETY: the device buffers hold `drafted` 64-byte rows; the landing
+        // is pinned, owned by the workspace, and read only after the wait.
+        unsafe {
+            l.copy_d2h_host_buffer_async(landing(0), CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer },
+                drafted * 64, s)?;
+            l.copy_d2h_host_buffer_async(landing(drafted * 64),
+                CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer }, drafted * 64, s)?;
+            self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
         self.timing.dump_head_input(w.n.buffer, rows, h)?;
         let confidence_span = self.timing.host_span();
-        let drafted = s_count * c.drafts();
-        let mut unary = vec![0u8; drafted * 64];
-        let mut candidates = vec![0u8; drafted * 64];
-        l.copy_d2h(&mut unary, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.unary.buffer })?;
-        l.copy_d2h(&mut candidates, CuteafdDeviceBuffer { bytes: drafted * 64, ..w.candidates.buffer })?;
+        let (unary, candidates) = w.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
             let rows = (0..c.drafts()).map(|j| i * c.drafts() + j);
@@ -819,7 +828,7 @@ pub(crate) fn features(top: &[f32]) -> [f32; 4] {
     [best - top.get(1).copied().unwrap_or(f32::NEG_INFINITY), 1.0 / total, entropy.max(0.0), 0.0]
 }
 
-impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
+impl crate::shared::speculation::dflash::ReplayDrafter for MimoDrafter<'_> {
     fn block(&self) -> usize {
         self.cfg.block
     }
@@ -828,8 +837,8 @@ impl crate::families::glm5::dflash::ReplayDrafter for MimoDrafter<'_> {
         self.max_sequences.min(self.slots)
     }
 
-    fn resident_modes(&self) -> Vec<crate::families::glm5::dflash::ReplayMode> {
-        use crate::families::glm5::dflash::ReplayMode;
+    fn resident_modes(&self) -> Vec<crate::shared::speculation::dflash::ReplayMode> {
+        use crate::shared::speculation::dflash::ReplayMode;
         let name = match self.representation {
             MimoDraftRepresentation::Bf16Only => "BF16",
             MimoDraftRepresentation::Fp8Only => "FP8",

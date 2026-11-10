@@ -1,5 +1,6 @@
 //! The mandatory baseline: the basic card (C1 decode on code, prose and JSON
-//! with thinking off; C1/C4/C8/C16 code aggregate tok/s; 8K prefill rate and TTFT) and quick quality (logit
+//! with thinking off; C1 code and C4/C8/C16 aggregate tok/s with a distinct prompt per stream; 8K prefill rate
+//! and TTFT) and quick quality (logit
 //! fidelity against eight sealed published windows, prefix-cache restore exactness,
 //! lossless speculation, chat-template round trip, C1 vs C4 divergence).
 //! Budgeted to about three minutes so Release smoke fits five with the load.
@@ -10,7 +11,7 @@ use crate::report::{
     now_rfc3339, BasicCard, Baseline, Check, CheckStatus, ConcurrentRate, ConcurrentTiming, ContentRate,
     PrefillRate, Quality, ServerInfo, StreamTiming,
 };
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::probe::{ProbeRecord, ProbeSpec};
 use serde_json::{json, Value};
@@ -37,8 +38,8 @@ fn messages(text: &str) -> Value {
     json!([{"role": "user", "content": text}])
 }
 
-fn plain(text: &str, max_tokens: u64) -> Value {
-    json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+pub(crate) fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
+    crate::request::thinking_off(&client.configuration, json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
 
 /// Expected seconds of the whole baseline at `rates`.
@@ -46,7 +47,7 @@ pub fn estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     let decode = 3.0 * rates.seconds(60.0, DECODE_TOKENS as f64);
     let prefill = rates.seconds(PREFILL_TOKENS as f64 + 1600.0, 4.0);
     let fidelity = 4096.0 / rates.decode_tok_s + 24000.0 / rates.prefill_tok_s + 8.0 * 0.15;
-    let cache = rates.seconds(6.0 * 1500.0, 30.0);
+    let cache = rates.seconds(6.0 * CACHE_PROMPT_TOKENS as f64, 30.0);
     let spec = rates.seconds(200.0, 2.0 * 128.0 * 1.6);
     let template = rates.seconds(400.0, 400.0);
     let c4 = rates.seconds(500.0, 2.0 * 64.0);
@@ -66,13 +67,14 @@ fn concurrent_estimate_s(rates: &Rates, info: &ServerInfo) -> f64 {
     }).sum()
 }
 
-fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64) -> ConcurrentRate {
+fn concurrent_rate(results: Vec<common::Timed>, warmup_s: f64, prompts: &str) -> ConcurrentRate {
     let mut per: Vec<_> = results.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let first = results.iter().map(common::Timed::first).fold(f64::INFINITY, f64::min);
     let last = results.iter().map(common::Timed::last).fold(0.0, f64::max);
     ConcurrentRate { width: results.len(), aggregate_tok_s: common::aggregate(&results),
         per_stream_median_tok_s: common::median(&mut per), decode_s: (last - first).max(0.0), warmup_s,
-        runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect() }
+        runs: results.into_iter().map(|r| ConcurrentTiming { sent_s: r.sent, timing: r.chat.timing }).collect(),
+        prompts: Some(prompts.into()) }
 }
 
 struct Run<'a> {
@@ -137,38 +139,38 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let started = Instant::now();
     let kv = crate::context::kv().unwrap_or_default();
     let from_settings = crate::report::Capacity::from_settings(info);
-    let capacity = crate::report::Capacity { kv_tokens: kv.tokens.or(from_settings.kv_tokens), kv_pages: kv.pages,
+    let capacity = crate::report::Capacity { kv_tokens: kv.tokens.or(from_settings.kv_tokens), max_tokens: kv.max_tokens, kv_pages: kv.pages,
         kv_format: kv.format, max_requests: from_settings.max_requests, max_context: Some(max_context),
         max_output: Some(max_output), host_cache_bytes: kv.host_bytes.or(from_settings.host_cache_bytes) };
     let mut run = Run {
         client, info, progress, max_context,
         baseline: Baseline { fingerprint: fingerprint.into(), run_id: run_id.into(), created: now_rfc3339(),
-            card: BasicCard { capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
+            card: BasicCard { thinking: Some(info.configuration.thinking_label().into()), capacity: Some(capacity), ..BasicCard::default() }, quality: Quality::default(), seconds: 0.0, thermal: None, fabric: vec![] },
     };
     // Warm-up: first-use workspaces, graphs and tables (untimed), and a two-point
-    // fit of tokens per filler word for the prefill case.
+    // fit of tokens per reference token for the prefill case.
     run.step(0.01, "warm-up");
     let warmup = Instant::now();
     let mut fit = Vec::new();
-    for (i, words) in [300usize, 900].into_iter().enumerate() {
-        let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), filler(17 + i as u64, words));
-        let chat = client.chat(plain(&text, 8), None).context("warm-up request")?;
+    for words in [300usize, 900] {
+        let text = format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(99, words));
+        let chat = client.chat(plain(client, &text, 8), None).context("warm-up request")?;
         fit.push((words as f64, chat.timing.prompt_tokens as f64));
     }
-    client.chat(plain(&format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
+    client.chat(plain(client, &format!("[{}] {}", nonce(), CONTENT[0].1), 32), None).context("warm-up decode")?;
     run.baseline.card.warmup_s = Some(warmup.elapsed().as_secs_f64());
     // C1 decode per content type.
     for (i, (content, prompt)) in CONTENT.iter().enumerate() {
         run.step(0.04 + 0.08 * i as f64, &format!("C1 decode · {content}"));
         let fabric_mark = client.fabric_mark();
-        let chat = client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+        let chat = client.chat(plain(client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
             .with_context(|| format!("{content} decode"))?;
         if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/{content}/c1"), true) {
             run.baseline.fabric.push(phase);
         }
         if *content == "code" {
             run.baseline.card.concurrency.push(concurrent_rate(vec![common::Timed { sent: 0.0, chat: chat.clone() }],
-                run.baseline.card.warmup_s.unwrap_or_default()));
+                run.baseline.card.warmup_s.unwrap_or_default(), "code"));
         }
         run.baseline.card.decode.push(ContentRate { content: content.to_string(), tok_s: chat.timing.decode_tok_s(),
             runs: vec![chat.timing], acceptance: None });
@@ -178,44 +180,45 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let levels = concurrent_levels(info);
     anyhow::ensure!(!levels.is_empty(), "server admits no concurrent sequences");
     for (i, width) in levels.iter().copied().filter(|width| *width > 1).enumerate() {
-        run.step(0.28 + 0.035 * i as f64, &format!("C{width} code warm-up"));
+        run.step(0.28 + 0.035 * i as f64, &format!("C{width} warm-up"));
         let warmup = Instant::now();
-        speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-            .with_context(|| format!("C{width} code warm-up"))?;
+        speed::distinct_batch(client, width, SWEEP_TOKENS, 1).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} warm-up"))?;
         let warmup_s = warmup.elapsed().as_secs_f64();
         client.check()?;
         let fabric_mark = client.fabric_mark();
-        let batch = speed::code_batch(client, width, SWEEP_TOKENS).into_iter().collect::<Result<Vec<_>>>()
-            .with_context(|| format!("C{width} code decode"))?;
-        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/code/c{width}"), true) {
+        let batch = speed::distinct_batch(client, width, SWEEP_TOKENS, 0).into_iter().collect::<Result<Vec<_>>>()
+            .with_context(|| format!("C{width} decode"))?;
+        if let Some(phase) = client.fabric_since(fabric_mark, &format!("decode/distinct/c{width}"), true) {
             run.baseline.fabric.push(phase);
         }
-        run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s));
+        run.baseline.card.concurrency.push(concurrent_rate(batch, warmup_s, speed::DISTINCT_PROMPTS));
         run.publish();
     }
     // 8K prefill: a cold prompt sized from the fit.
     run.step(0.40, "8K prefill");
     let (slope, intercept) = match fit.as_slice() {
         [(w0, t0), (w1, t1)] if w1 > w0 && t1 > t0 => ((t1 - t0) / (w1 - w0), t0 - (t1 - t0) / (w1 - w0) * w0),
-        _ => (1.3, 20.0),
+        _ => (1.0, 20.0),
     };
+    run.baseline.card.prompt_token_ratio = Some(slope);
     let target = PREFILL_TOKENS.min(max_context.saturating_sub(64)) as f64;
     let words = ((target - intercept) / slope).max(64.0) as usize;
-    // Warm beyond the full 8K chunk when context permits. Near-equal filler
+    // Warm beyond the full 8K chunk when context permits. Near-equal corpus
     // lengths can move a lane boundary and leave part of the measured lane
     // cold. Keep normal prefix-cache retention work in both requests.
     let warm_target = (target + 512.0).min(max_context.saturating_sub(64) as f64);
     let warm_words = ((warm_target - intercept) / slope).max(64.0) as usize;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(98, warm_words));
-    client.chat(plain(&text, 1), None).context("8K prefill warm-up")?;
-    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), filler(99, words));
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(98, warm_words));
+    client.chat(plain(client, &text, 1), None).context("8K prefill warm-up")?;
+    let text = format!("[{}] Reply with the single word OK.\n\n{}", nonce(), corpus(99, words));
     // Prime this exact lane shape and its routed expert accesses too. A cold
     // probe neither reads nor retains a prefix, so the timed ordinary request
     // still performs its full prefill and normal snapshot work.
-    client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+    client.chat(plain(client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
         .context("8K prefill route warm-up")?;
     let fabric_mark = client.fabric_mark();
-    let chat = client.chat(plain(&text, 1), None).context("8K prefill")?;
+    let chat = client.chat(plain(client, &text, 1), None).context("8K prefill")?;
     if let Some(phase) = client.fabric_since(fabric_mark, "prefill/8k", true) { run.baseline.fabric.push(phase); }
     let t = chat.timing.clone();
     anyhow::ensure!(t.cached_tokens == 0, "8K cold prefill reused {} cached tokens", t.cached_tokens);
@@ -267,6 +270,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("quick_subset", "bench-v1:legacy,a00,a04,a08,a20,c00,d00,e00");
     check.set("per_window", json!(crate::panels::fidelity::window_summaries(&scored)));
     check.set("verdict", json!(verdict));
+    check.set("precision", json!(scored.precision));
     check.set("run", json!(scored));
     check.status = if verdict.pass { CheckStatus::Pass } else { CheckStatus::Fail };
     crate::quality::apply_fidelity(run.info, check);
@@ -315,36 +319,83 @@ fn compare_rows(a: &ProbeRecord, b: &ProbeRecord) -> (usize, Vec<usize>) {
 /// reported, not gated, because prefill kernels with unordered reductions (Spark FP32 atomics) are
 /// not bit-reproducible run to run, which is a property of the kernels, not of the cache.
 fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
-    if run.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
+    cache_exact_fixture(run.client, run.info, check, None)?;
+    if matches!(check.status, CheckStatus::Pass | CheckStatus::Info | CheckStatus::Fail) {
+        cache_continuation(run, check, cache_minimum_tokens(run.info))?;
+    }
+    Ok(())
+}
+
+/// One ordinary chat image or audio clip, not pre-expanded token ids.
+pub(crate) fn cache_fixture(body: &Value) -> Result<Value> {
+    let messages = body["messages"].as_array().context("cache_exact fixture requires messages")?;
+    anyhow::ensure!(messages.len() == 1 && messages[0]["role"] == "user", "cache_exact needs one user fixture message");
+    let content = messages[0]["content"].as_array().context("cache_exact fixture requires content parts")?;
+    anyhow::ensure!(content.iter().all(|p| matches!(p["type"].as_str(), Some("text" | "image_url" | "input_audio"))),
+        "cache_exact supports text, image_url or input_audio parts");
+    let mut media = content.iter().filter(|p| p["type"] != "text");
+    let fixture = media.next().context("cache_exact needs one image or audio clip")?.clone();
+    anyhow::ensure!(media.next().is_none(), "cache_exact needs exactly one image or audio clip");
+    Ok(fixture)
+}
+
+fn cache_body(client: &Client, text: &str, max_tokens: u64, fixture: Option<&Value>) -> Value {
+    let mut body = plain(client, text, max_tokens);
+    if let Some(fixture) = fixture {
+        body["messages"][0]["content"] = json!([fixture, {"type": "text", "text": text}]);
+    }
+    body
+}
+
+pub(crate) fn cache_exact_fixture(client: &Client, info: &ServerInfo, check: &mut Check, fixture: Option<&Value>) -> Result<()> {
+    cache_exact_with(client, info, check, fixture, |body, spec| probed(client, body, spec))
+}
+
+fn cache_exact_with(client: &Client, info: &ServerInfo, check: &mut Check, fixture: Option<&Value>,
+    mut request: impl FnMut(Value, ProbeSpec) -> Result<ProbeRecord>) -> Result<()> {
+    if info.setting("prefix-cache-entries").is_some_and(|v| v == "0") {
         check.status = CheckStatus::Skipped;
         check.summary = "prefix cache off (--prefix-cache-entries 0)".into();
         return Ok(());
     }
-    let client = run.client;
+    let body = |text: &str, n| cache_body(client, text, n, fixture);
     let rows = |n: usize| ProbeSpec { no_speculation: true, record_rows: n, top_k: 1, ..ProbeSpec::default() };
     // Prompt end: the first request computes and retains, the second restores it whole.
-    let text = format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), filler(31, 1100));
-    let first = probed(client, plain(&text, 2), rows(2))?;
+    let (text, turn_text) = cache_prompts();
+    let first = request(body(&text, 2), rows(2))?;
     if !honoured(&first) {
         unsupported(check);
         return Ok(());
     }
-    let restored = probed(client, plain(&text, 2), rows(2))?;
+    if let Some(fixture) = fixture { cache_bound(&first, fixture)?; }
+    let restored = request(body(&text, 2), rows(2))?;
+    let minimum = cache_minimum_tokens(info);
+    check.set("prompt_reference_tokens", CACHE_PROMPT_TOKENS as u64);
+    check.set("minimum_prompt_tokens", minimum as u64);
+    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
+    if !cache_coverage(check, "prompt", restored.prompt_ids.len(), minimum) { return Ok(()); }
     // Turn end. Long enough to clear the cache's minimum snapshot size and several units; the
     // answer runs past 25 tokens, so the turn ends at its length limit and the turn snapshot is
     // followed by a decode step.
-    let turn_text = format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
-        nonce(), filler(57, 900));
-    let turn = probed(client, plain(&turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
-    let reference = probed(client, plain(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
+    let turn = request(body(&turn_text, TURN_TOKENS as u64), rows(TURN_TOKENS))?;
+    if let Some(fixture) = fixture { cache_bound(&turn, fixture)?; }
+    check.set("turn_prompt_tokens", turn.prompt_ids.len() as u64);
+    if !cache_coverage(check, "turn prompt", turn.prompt_ids.len(), minimum) { return Ok(()); }
+    let reference = request(body(&turn_text, TURN_TOKENS as u64 + 1), rows(TURN_TOKENS + 1))?;
     let mut ids = turn.prompt_ids.clone();
     ids.extend(&turn.generated[..turn.generated.len().saturating_sub(1)]);
     // The turn's own generated ids are the prompt, so it is not comparable between arms.
-    let again = probed(client, plain("cache probe", 2),
-        ProbeSpec { prompt_ids: Some(ids), output_dependent: true, ..rows(2) })?;
-    let cold = probed(client, plain(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    let (again_body, again_spec) = cache_replay(client, ids, &turn, fixture, rows(2))?;
+    let again = request(again_body, again_spec)?;
+    let cold = request(body(&turn_text, 1), ProbeSpec { cold: true, ..rows(1) })?;
+    if let Some(fixture) = fixture {
+        for record in [&restored, &reference, &again, &cold] { cache_bound(record, fixture)?; }
+        check.set("fixture_type", fixture["type"].clone());
+        check.set("encodes", json!([("prompt", &first), ("prompt_restore", &restored), ("turn", &turn),
+            ("turn_prompt_restore", &reference), ("turn_restore", &again), ("cold", &cold)].map(|(phase, r)|
+            json!({"phase": phase, "encoded": r.encoded, "encode_ms": r.encode_ms}))));
+    }
     let verdict = Restores::judge(&first, &restored, &turn, &reference, &again, &cold);
-    check.set("prompt_tokens", restored.prompt_ids.len() as u64);
     check.set("prompt_restored", restored.cached_tokens as u64);
     check.set("prompt_rows_compared", verdict.prompt.compared as u64);
     check.set("turn_tokens", again.prompt_ids.len() as u64);
@@ -355,6 +406,139 @@ fn cache_exact(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.status = verdict.status();
     check.summary = verdict.summary();
     Ok(())
+}
+
+/// Responses strip image URLs and may carry response-only input_key. Restore the
+/// verified source from our original fixture, in the spec only (never duplicated in chat).
+fn cache_replay(client: &Client, ids: Vec<u32>, turn: &ProbeRecord, fixture: Option<&Value>, mut spec: ProbeSpec)
+    -> Result<(Value, ProbeSpec)> {
+    spec.prompt_ids = Some(ids);
+    spec.output_dependent = true;
+    spec.media = turn.media.clone();
+    spec.audio = turn.audio.clone();
+    let mut body = cache_body(client, "cache probe", 2, fixture);
+    if let Some(fixture) = fixture.filter(|f| f["type"] == "image_url") {
+        let source: cuteafd_api::openai::probe::ProbeImageUrl = serde_json::from_value(fixture["image_url"].clone()).context("cache_exact image_url source")?;
+        for span in &mut spec.media {
+            span.image_url = Some(source.clone());
+            span.input_key = None;
+        }
+        body = plain(client, "cache probe", 2);
+    }
+    Ok((body, spec))
+}
+
+fn cache_bound(record: &ProbeRecord, fixture: &Value) -> Result<()> {
+    let image = fixture["type"] == "image_url";
+    anyhow::ensure!(if image { record.media.len() == 1 && record.audio.is_empty() }
+        else { record.audio.len() == 1 && record.media.is_empty() }, "cache_exact fixture was not bound by the engine");
+    Ok(())
+}
+
+/// Exercise a short fresh prefill immediately after a multi-unit prompt. Whole
+/// hits above only decode and cannot catch a leaked prefill staging-reuse flag.
+fn cache_continuation(run: &mut Run<'_>, check: &mut Check, minimum: usize) -> Result<()> {
+    let client = run.client;
+    let text = format!("[{}] Read these notes.\n\n{}", nonce(), corpus(73, CACHE_PROMPT_TOKENS));
+    let discovery = probed(client, plain(client, &text, 1), ProbeSpec {
+        no_speculation: true, record_rows: 1, ..ProbeSpec::default() })?;
+    if !cache_coverage(check, "continuation seed", discovery.prompt_ids.len(), minimum) { return Ok(()); }
+    // A suffix has no discovery-prefix hit and ends on exactly three units,
+    // rather than a short last call that clears reuse before the test.
+    let seed_ids = cache_seed_ids(&discovery.prompt_ids, minimum)?;
+    let seed = probed(client, plain(client, "cache continuation seed", 1), ProbeSpec {
+        no_speculation: true, prompt_ids: Some(seed_ids), record_rows: 1, ..ProbeSpec::default() })?;
+    let ids = cache_continuation_ids(&seed.prompt_ids)?;
+    let probe = |cold| ProbeSpec { cold, no_speculation: true, prompt_ids: Some(ids.clone()),
+        record_rows: 1, top_k: usize::MAX, ..ProbeSpec::default() };
+    let warm = probed(client, plain(client, "cache continuation", 1), probe(false))?;
+    let cold = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let repeat = probed(client, plain(client, "cache continuation", 1), probe(true))?;
+    let fresh = warm.prompt_ids.len().saturating_sub(warm.cached_tokens);
+    let covered = continuation_covered(&seed, &warm, minimum);
+    check.set("continuation_seed_tokens", seed.prompt_ids.len() as u64);
+    check.set("continuation_seed_cached_tokens", seed.cached_tokens as u64);
+    check.set("continuation_seed_final_units", json!(seed.last_prefill_units));
+    check.set("continuation_final_units", json!(warm.last_prefill_units));
+    check.set("continuation_cached_tokens", warm.cached_tokens as u64);
+    check.set("continuation_fresh_tokens", fresh as u64);
+    check.set("continuation_covered", covered);
+    check.set("continuation_vs_cold", continuation_rows(&warm, &cold)?);
+    check.set("continuation_cold_noise", continuation_rows(&cold, &repeat)?);
+    if !covered {
+        check.summary.push_str(" · short fresh continuation path not covered");
+        if check.status == CheckStatus::Pass { check.status = CheckStatus::Info; }
+    }
+    Ok(())
+}
+
+fn cache_seed_ids(discovered: &[u32], minimum: usize) -> Result<Vec<u32>> {
+    anyhow::ensure!(minimum >= 128 && discovered.len() > minimum, "seed needs a distinct suffix of at least {minimum} input ids");
+    let suffix = &discovered[discovered.len() - minimum..];
+    anyhow::ensure!(suffix[0] != discovered[0], "seed suffix must start outside the discovery prefix");
+    Ok(suffix.to_vec())
+}
+
+fn continuation_covered(seed: &ProbeRecord, warm: &ProbeRecord, minimum: usize) -> bool {
+    seed.prompt_ids.len() == minimum && seed.cached_tokens == 0
+        && seed.last_prefill_units.is_some_and(|units| units >= 2)
+        && warm.cached_tokens == minimum && warm.prompt_ids.len() == minimum + 64
+        && warm.last_prefill_units == Some(1)
+}
+
+fn cache_continuation_ids(prefix: &[u32]) -> Result<Vec<u32>> {
+    anyhow::ensure!(prefix.len() >= 128, "continuation seed is too short");
+    let mut ids = prefix.to_vec();
+    // Reuse input text ids, not generated output: both arms see the same input.
+    ids.extend_from_slice(&prefix[prefix.len() - 128..prefix.len() - 64]);
+    Ok(ids)
+}
+
+/// KL(cold || warm) from complete vocabulary log-probabilities, not a top-k
+/// approximation. Retain scalar evidence only; three full rows stay local.
+fn continuation_rows(warm: &ProbeRecord, cold: &ProbeRecord) -> Result<Value> {
+    anyhow::ensure!(warm.prompt_ids == cold.prompt_ids, "continuation prompts differ");
+    let at = cold.prompt_ids.len();
+    let a = warm.rows.iter().find(|row| row.position == at).context("warm continuation row missing")?;
+    let b = cold.rows.iter().find(|row| row.position == at).context("cold continuation row missing")?;
+    anyhow::ensure!(a.finite && b.finite && !a.top.is_empty() && a.top.len() == b.top.len(),
+        "continuation rows are incomplete or non-finite");
+    let values: std::collections::HashMap<_, _> = a.top.iter().copied().collect();
+    let mut kl = 0.0;
+    let mut mass = 0.0;
+    for &(token, lp) in &b.top {
+        let q = *values.get(&token).context("continuation vocabularies differ")?;
+        let p = f64::from(lp).exp();
+        mass += p;
+        if p > 0.0 { kl += p * (f64::from(lp) - f64::from(q)); }
+    }
+    anyhow::ensure!((mass - 1.0).abs() < 1e-4 && kl.is_finite(), "continuation row is not a full distribution");
+    Ok(json!({"rows": 1, "vocab": b.top.len(), "kl": kl.max(0.0),
+        "top1": u8::from(a.argmax == b.argmax), "warm_argmax": a.argmax,
+        "cold_argmax": b.argmax, "byte_identical": a.hash == b.hash}))
+}
+
+// Leave room for model/reference tokenizer differences above three 2752-row units.
+const CACHE_PROMPT_TOKENS: usize = 10240;
+
+fn cache_minimum_tokens(info: &ServerInfo) -> usize {
+    let positive = |name| info.setting(name).and_then(|s| s.parse::<usize>().ok()).filter(|n| *n > 0);
+    // Qwen's explicit unit override takes precedence over its span-sized prefill-rows.
+    positive("prefill-units").or_else(|| positive("prefill-rows"))
+        .map_or(8256, |rows| rows.saturating_mul(3))
+}
+
+fn cache_coverage(check: &mut Check, name: &str, actual: usize, minimum: usize) -> bool {
+    if actual >= minimum { return true; }
+    check.status = CheckStatus::Skipped;
+    check.summary = format!("multi-unit coverage missing: {name} has {actual} tokens, needs at least {minimum}");
+    false
+}
+
+fn cache_prompts() -> (String, String) {
+    (format!("[{}] Read the notes and answer in one word.\n\n{}", nonce(), corpus(31, CACHE_PROMPT_TOKENS)),
+        format!("[{}] Here are some notes.\n\n{}\n\nCount from one to forty in words, separated by commas.",
+            nonce(), corpus(57, CACHE_PROMPT_TOKENS)))
 }
 
 /// Generated tokens of the turn-end case's turn.
@@ -471,13 +655,13 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{tag}] {}", CONTENT[0].1);
     let spec = |off: bool| ProbeSpec { cold: true, no_speculation: off, record_rows: TOKENS as usize, top_k: 2,
         ..ProbeSpec::default() };
-    let on = run.client.chat(plain(&text, TOKENS), Some(spec(false)))?;
+    let on = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(false)))?;
     let on_record = probe_of(&on)?;
     if !honoured(on_record) {
         unsupported(check);
         return Ok(());
     }
-    let off = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let off = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(true)))?;
     let off_record = probe_of(&off)?;
     let (a, b) = (&on_record.generated, &off_record.generated);
     let same = a.iter().zip(b).take_while(|(x, y)| x == y).count();
@@ -492,7 +676,7 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     // without drafts, always (#533: drafts-off nondeterminism hid behind
     // on/off agreement). Rows that differ here are run-to-run nondeterminism,
     // not anything a verify does.
-    let again = run.client.chat(plain(&text, TOKENS), Some(spec(true)))?;
+    let again = run.client.chat(plain(run.client, &text, TOKENS), Some(spec(true)))?;
     let again_record = probe_of(&again)?;
     let same_again = b.iter().zip(&again_record.generated).take_while(|(x, y)| x == y).count();
     let repeat = RowNoise::between(again_record, off_record, off_record.prompt_ids.len() + same_again);
@@ -512,14 +696,14 @@ fn spec_lossless(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
             check.summary = format!("{speculator}: {} greedy tokens identical with drafts on and off {rates}{repeat_note}", a.len());
         } else {
             // Plain decode must reproduce itself; agreement with drafts on cannot excuse it.
-            check.set("replay", replay(&tag, &text, TOKENS, off_record));
+            check.set("replay", replay(&run.info.configuration, &tag, &text, TOKENS, off_record));
             check.status = CheckStatus::Fail;
             check.summary = format!("{speculator}: drafts on and off agree, but plain decode does not repeat {rates}{repeat_note}");
         }
         return Ok(());
     }
     // Any divergence keeps what replays it (the verdict below may still pass a near tie).
-    check.set("replay", replay(&tag, &text, TOKENS, off_record));
+    check.set("replay", replay(&run.info.configuration, &tag, &text, TOKENS, off_record));
     // Evidence for numerics vs state: how far the drafted run's rows already
     // were from the one-row run's on the identical prefix. A flip within that
     // noise is rounding; noise that is zero until a point and then grows
@@ -564,9 +748,9 @@ pub(crate) fn top_two_margin(record: &ProbeRecord, position: usize) -> Option<f6
 
 /// What replays one probed request exactly: the nonce, the request text and the prompt ids the
 /// engine ran. Random nonces are otherwise lost, so every lossless failure keeps this.
-pub(crate) fn replay(nonce: &str, text: &str, max_tokens: u64, record: &ProbeRecord) -> Value {
-    json!({"nonce": nonce, "text": text, "max_tokens": max_tokens, "thinking": "disabled", "temperature": 0,
-        "prompt_ids": record.prompt_ids})
+pub(crate) fn replay(configuration: &crate::report::Configuration, nonce: &str, text: &str, max_tokens: u64, record: &ProbeRecord) -> Value {
+    crate::request::thinking_off(configuration, json!({"nonce": nonce, "text": text, "max_tokens": max_tokens, "thinking": "disabled", "temperature": 0,
+        "prompt_ids": record.prompt_ids}))
 }
 
 /// The lossless verdict for a drafts-on vs drafts-off flip.
@@ -769,13 +953,13 @@ fn template(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
 fn c1_c4(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     let text = format!("[{}] {}", nonce(), CONTENT[1].1);
     let probe = || Some(ProbeSpec { cold: true, record_rows: 64, top_k: 2, ..ProbeSpec::default() });
-    let one = run.client.chat(plain(&text, 64), probe())?;
+    let one = run.client.chat(plain(run.client, &text, 64), probe())?;
     let client = run.client.clone();
     let four: Vec<Result<Chat>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..4).map(|_| {
             let client = client.clone();
             let text = text.clone();
-            scope.spawn(move || client.chat(plain(&text, 64), probe()))
+            scope.spawn(move || client.chat(plain(&client, &text, 64), probe()))
         }).collect();
         handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("thread panicked")))).collect()
     });
@@ -834,6 +1018,174 @@ mod tests {
     use crate::report::Check;
 
     #[test]
+    fn media_cache_fixture_rejects_ambiguous_or_missing_inputs() {
+        for part in [json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}}),
+            json!({"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}})] {
+            let body = json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "notes"}, part]}]});
+            assert_eq!(cache_fixture(&body).unwrap(), part);
+            let mut twice = body.clone();
+            twice["messages"][0]["content"].as_array_mut().unwrap().push(part);
+            assert!(cache_fixture(&twice).is_err());
+        }
+        for body in [json!({"messages": []}), json!({"messages": [{"role": "user", "content": "text"}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "video_url"}]}]})] {
+            assert!(cache_fixture(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn media_cache_fixtures_exercise_prompt_and_turn_exactness() {
+        use cuteafd_api::openai::probe::{ProbeAudio, ProbeMedia};
+        use std::sync::{Arc, atomic::AtomicBool};
+        let client = Client::new("http://unused", None, Arc::new(AtomicBool::new(false)));
+        let n = 9000;
+        for image in [true, false] {
+            for corrupt in [None, Some(1), Some(4)] {
+                let fixture = if image { json!({"type": "image_url", "image_url": {"url": "fixture", "detail": "low"}}) }
+                    else { json!({"type": "input_audio", "input_audio": {"data": "fixture", "format": "wav"}}) };
+                let mut index = 0;
+                let mut check = Check::new("cache_exact", "media");
+                cache_exact_with(&client, &ServerInfo::default(), &mut check, Some(&fixture), |body, spec| {
+                    let i = index; index += 1;
+                    if image && i == 4 {
+                        assert_eq!(body["messages"][0]["content"], "cache probe", "expanded image source belongs only in spec");
+                    } else { assert_eq!(body["messages"][0]["content"][0], fixture); }
+                    assert!(spec.no_speculation);
+                    assert_eq!(spec.cold, i == 5);
+                    assert_eq!(spec.output_dependent, i == 4);
+                    assert_eq!(spec.prompt_ids.is_some(), i == 4);
+                    let prompt = if i == 4 { n + TURN_TOKENS - 1 } else { n };
+                    let count = [2, 2, TURN_TOKENS, TURN_TOKENS + 1, 2, 1][i];
+                    assert_eq!(spec.record_rows, count);
+                    let mut record = ProbeRecord { engine: Some("test".into()), prompt_ids: vec![1; prompt],
+                        cached_tokens: if matches!(i, 1 | 3 | 4) { prompt } else { 0 },
+                        generated: (prompt..prompt + count).map(|v| v as u32).collect(),
+                        encoded: Some(i == 0), encode_ms: Some(if i == 0 { 2.5 } else { 0.0 }), ..Default::default() };
+                    if image {
+                        record.media = vec![ProbeMedia { start: 1, len: 2, kind: "image".into(), key: "ab".repeat(32),
+                            grid: [1, 2, 4], identity: None, input_key: None, fixture: None, image_url: None }];
+                    } else {
+                        record.audio = vec![ProbeAudio { start: 1, len: 2, key: "ab".repeat(32), samples: 3840, pcm_sha256: "cd".repeat(32) }];
+                    }
+                    if i == 4 {
+                        assert_eq!(spec.prompt_ids.as_ref().unwrap().len(), prompt);
+                        let mut expected = record.media.clone();
+                        if image { expected[0].image_url = Some(serde_json::from_value(fixture["image_url"].clone()).unwrap()); }
+                        assert_eq!(spec.media, expected);
+                        assert_eq!(spec.audio, record.audio);
+                        spec.validate_media_geometries(cuteafd_core::media::ImageTokenGeometry::MERGED,
+                            cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 }).unwrap();
+                    }
+                    if image { record.media[0].input_key = Some("ef".repeat(32)); }
+                    for position in prompt..prompt + count {
+                        record.rows.push(cuteafd_api::openai::probe::ProbeRow {
+                            position, hash: if corrupt == Some(i) && position == prompt + 1 { "bad".into() }
+                                else { position.to_string() }, ..Default::default() });
+                    }
+                    Ok(record)
+                }).unwrap();
+                assert_eq!(index, 6);
+                assert_eq!(check.status, if corrupt.is_some() { CheckStatus::Fail } else { CheckStatus::Pass }, "{}", check.summary);
+                assert_eq!(check.metrics["prompt_rows_compared"], 2);
+                assert_eq!(check.metrics["turn_rows_compared"], 2);
+            }
+            assert!(cache_bound(&ProbeRecord::default(), &if image { json!({"type": "image_url"}) }
+                else { json!({"type": "input_audio"}) }).is_err());
+        }
+    }
+
+    #[test]
+    fn short_continuation_keeps_the_prefix_and_appends_only_input_text_ids() {
+        let prefix: Vec<_> = (0..10240).collect();
+        let ids = cache_continuation_ids(&prefix).unwrap();
+        assert_eq!(&ids[..prefix.len()], &prefix);
+        assert_eq!(&ids[prefix.len()..], &prefix[prefix.len() - 128..prefix.len() - 64]);
+        assert!(cache_continuation_ids(&[1; 127]).is_err());
+    }
+
+    #[test]
+    fn continuation_coverage_requires_actual_multi_unit_final_call_and_fresh_seed() {
+        let discovered: Vec<u32> = (0..9592).collect();
+        let ids = cache_seed_ids(&discovered, 8256).unwrap();
+        assert_eq!(ids.len(), 8256);
+        assert_eq!(ids[0], 1336);
+        assert!(cache_seed_ids(&[1; 9000], 8256).is_err());
+        assert!(cache_seed_ids(&discovered, discovered.len()).is_err());
+        let mut seed = ProbeRecord { prompt_ids: ids, last_prefill_units: Some(3), ..ProbeRecord::default() };
+        let mut warm = ProbeRecord { prompt_ids: cache_continuation_ids(&seed.prompt_ids).unwrap(),
+            cached_tokens: 8256, last_prefill_units: Some(1), ..ProbeRecord::default() };
+        assert!(continuation_covered(&seed, &warm, 8256));
+        for units in [None, Some(0), Some(1)] {
+            seed.last_prefill_units = units;
+            assert!(!continuation_covered(&seed, &warm, 8256));
+        }
+        seed.last_prefill_units = Some(3);
+        seed.cached_tokens = 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        seed.cached_tokens = 0;
+        warm.last_prefill_units = None;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+        warm.last_prefill_units = Some(1);
+        warm.cached_tokens -= 1;
+        assert!(!continuation_covered(&seed, &warm, 8256));
+    }
+
+    #[test]
+    fn continuation_kl_distinguishes_gross_drift_from_cold_noise() {
+        use cuteafd_api::openai::probe::summarize;
+        let record = |logits: &[f32]| ProbeRecord { prompt_ids: vec![1, 2],
+            rows: vec![summarize(2, logits, usize::MAX, &[])], ..ProbeRecord::default() };
+        let cold = record(&[0.0, 6.0, -4.0]);
+        let noise = continuation_rows(&record(&[0.0001, 6.0, -4.0]), &cold).unwrap();
+        assert_eq!(noise["top1"], 1);
+        assert!(noise["kl"].as_f64().unwrap() < 1e-5);
+        let missing = continuation_rows(&record(&[6.0, 0.0, -4.0]), &cold).unwrap();
+        assert_eq!(missing["top1"], 0);
+        assert!(missing["kl"].as_f64().unwrap() > 5.0);
+        let mut incomplete = cold.clone();
+        incomplete.rows[0].top.truncate(1);
+        assert!(continuation_rows(&incomplete, &cold).is_err());
+    }
+
+    #[test]
+    fn cache_prompts_cover_three_largest_prefill_units() {
+        assert!(CACHE_PROMPT_TOKENS >= 3 * 2752);
+        let (prompt, turn) = cache_prompts();
+        for (text, seed) in [(prompt, 31), (turn, 57)] {
+            let body = corpus(seed, CACHE_PROMPT_TOKENS);
+            assert!(text.contains(&body));
+            assert!(body.len() > corpus(seed, 3 * 2752).len());
+        }
+    }
+
+    #[test]
+    fn cache_coverage_requires_three_actual_model_units() {
+        use crate::report::Setting;
+        let mut info = ServerInfo::default();
+        assert_eq!(cache_minimum_tokens(&info), 8256);
+        for value in ["0", "auto", ""] {
+            info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some(value.into()),
+                ..Setting::default() }];
+            assert_eq!(cache_minimum_tokens(&info), 8256);
+        }
+        info.configuration.settings = vec![Setting { name: "prefill-rows".into(), value: Some("4096".into()),
+            ..Setting::default() }];
+        assert_eq!(cache_minimum_tokens(&info), 12288);
+        info.configuration.settings.push(Setting { name: "prefill-units".into(), value: Some("2752".into()),
+            ..Setting::default() });
+        let minimum = cache_minimum_tokens(&info);
+        assert_eq!(minimum, 8256);
+        for name in ["prompt", "turn prompt"] {
+            let mut check = Check::new("cache_exact", "Prefix cache exactness");
+            assert!(!cache_coverage(&mut check, name, 8121, minimum));
+            assert_eq!(check.status, CheckStatus::Skipped);
+            assert!(check.summary.contains("8121"));
+            assert!(check.summary.contains("8256"));
+            assert!(cache_coverage(&mut Check::new("cache_exact", "Prefix cache exactness"), name, minimum, minimum));
+        }
+    }
+
+    #[test]
     fn concurrent_levels_respect_admission_and_card_memory() {
         use crate::report::Setting;
         let mut info = ServerInfo::default();
@@ -876,8 +1228,9 @@ mod tests {
                 ..StreamTiming::default() }, ..Chat::default() } };
         let results = vec![timed(0.0, 1.0, 4.0, 321), timed(0.5, 1.5, 2.0, 161)];
         let expected = common::aggregate(&results);
-        let rate = concurrent_rate(results, 9.0);
+        let rate = concurrent_rate(results, 9.0, speed::DISTINCT_PROMPTS);
         assert_eq!(rate.width, 2);
+        assert_eq!((rate.prompts.as_deref(), rate.prompt_label()), (Some("distinct-v1"), "distinct prompts"));
         assert_eq!(rate.aggregate_tok_s, expected);
         // 320 + 160 emitted decode tokens over [1, 5], not a sum of stream rates.
         assert_eq!(rate.aggregate_tok_s, 120.0);
@@ -911,7 +1264,7 @@ mod tests {
     fn a_divergence_keeps_what_replays_it() {
         let record = ProbeRecord { prompt_ids: vec![3, 1, 4], ..ProbeRecord::default() };
         let text = format!("[{}] {}", "0a1b2c3d4e", CONTENT[0].1);
-        assert_eq!(replay("0a1b2c3d4e", &text, 128, &record), json!({"nonce": "0a1b2c3d4e", "text": text,
+        assert_eq!(replay(&crate::report::Configuration::default(), "0a1b2c3d4e", &text, 128, &record), json!({"nonce": "0a1b2c3d4e", "text": text,
             "max_tokens": 128, "thinking": "disabled", "temperature": 0, "prompt_ids": [3, 1, 4]}));
     }
 

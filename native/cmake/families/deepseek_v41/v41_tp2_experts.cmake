@@ -1,6 +1,6 @@
 # TP2 RTX backbone experts coexist with dSpark and full-width RTX variants.
 if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "coordinator")
-  message(FATAL_ERROR "TP2 V4.1 experts require the SM120 coordinator expert build")
+  message(FATAL_ERROR "TP2 V4.1 experts require the SM120 or SM89 coordinator expert build")
 endif()
 set(CUTEAFD_V41_TP2_EXPERT_DIR "${CMAKE_CURRENT_BINARY_DIR}/v41_tp2_experts")
 set(CUTEAFD_V41_TP2_EXPERT_OBJECTS)
@@ -9,7 +9,7 @@ set(CUTEAFD_V41_TP2_COMPACT_ARGS)
 if(CUTEAFD_V41_TP2_COMPACT_EXPERIMENT)
   list(APPEND CUTEAFD_V41_TP2_COMPACT_ARGS --compact-max-capacity 16 --compact-live-rows 8)
 endif()
-foreach(rows IN ITEMS 1 16 80 256 1024 4096)
+foreach(rows IN LISTS CUTEAFD_V41_TARGET_ROWS)
   set(stem "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_rtx_tp2_m${rows}")
   list(APPEND CUTEAFD_V41_TP2_EXPERT_OBJECTS "${stem}.o")
   list(APPEND CUTEAFD_V41_TP2_EXPERT_HEADERS "${stem}.h")
@@ -23,12 +23,10 @@ add_custom_command(
     "${Python3_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     --output-dir "${CUTEAFD_V41_TP2_EXPERT_DIR}" --role rtx_tp2
-    --rows 1,16,80,256,1024,4096 --width 192 --atomic-min-capacity 256 --standard-names
+    --rows ${CUTEAFD_V41_TARGET_ROWS_ARG} --width 192 --standard-names
     ${CUTEAFD_V41_TP2_COMPACT_ARGS}
-  COMMAND "${CMAKE_COMMAND}" -E copy
-    "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_expert_variants.h"
-    "${CUTEAFD_V41_TP2_EXPERT_DIR}/v41_tp2_expert_variants.h"
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
+  DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_spark_tp3_launch_geometry.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_experts_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"

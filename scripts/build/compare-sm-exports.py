@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Compare CPU-only SM120 AOT exports, including their embedded CUDA images.
+"""Compare CPU-only SM120 (or, with --arch sm89, SM89) AOT exports, including
+their embedded CUDA images.
 
 Run in the coordinator compiler image without --gpus. Differences are evidence
 for review, not proof of incompatibility; --require-identical is an optional
 strict gate. Reports include exact object bytes, cubins, headers and metadata.
+SM89 mode exports the sm_89 coordinator build's groups on b12x's offline SM89
+target. Programs in its recorded-variation file may differ in device code only:
+the toolchain compiles them to different instruction orders run to run.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
@@ -16,20 +21,68 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import runpy
 import struct
 import subprocess
 import sys
 import time
 
-ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().parents[2])).resolve()
+def _gitdir_from_file(dot_git: Path) -> Path | None:
+    if not dot_git.is_file():
+        return None
+    for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("gitdir:"):
+            return (dot_git.parent / line.partition(":")[2].strip()).resolve()
+    return None
+
+
+def resolve_source_root(path: Path | str | None = None, env=os.environ) -> Path:
+    if path is None and env.get("CUTEAFD_SOURCE_ROOT"):
+        return Path(env["CUTEAFD_SOURCE_ROOT"]).expanduser().resolve()
+    root = Path(path or Path(__file__).resolve().parents[2]).expanduser().resolve()
+    gitdir = _gitdir_from_file(root / ".git")
+    if gitdir is not None and (gitdir / "gitdir").is_file():
+        worktree_git = (gitdir / (gitdir / "gitdir").read_text(encoding="utf-8").strip()).resolve()
+        if worktree_git.parent.is_dir():
+            return worktree_git.parent
+    if path is None and env.get("CUTEAFD_SPARKINFER_SOURCE_DIR"):
+        sparkinfer = Path(env["CUTEAFD_SPARKINFER_SOURCE_DIR"]).expanduser().resolve()
+        if sparkinfer.name == "sparkinfer" and sparkinfer.parent.name == "third_party" and sparkinfer.parents[1].is_dir():
+            return sparkinfer.parents[1]
+    return root
+
+
+ROOT = resolve_source_root()
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
+_spec = importlib.util.spec_from_file_location("v41_capacities", ROOT / "python/tools/lib/v41_capacities.py")
+_v41 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_v41)
+V41_CAPACITIES = ",".join(map(str, _v41.TARGET_CAPACITIES))
+# The groups an sm_89 coordinator build exports (native CMake with
+# CUTEAFD_CUDA_ARCHITECTURES=89). Its narrow FP8 plans stay off; the lagged mHC
+# begin is exported for the manifest's inventory (build-wip-artifacts.sh's
+# v41_hc_lagged_aot), and its program table holds only the Spark reply
+# reducers (expert-reply). The target is every supported SM89 card.
+SM89_GROUPS = ("v41-fp8", "v41-experts", "v41-index", "v41-router",
+               "v41-slices-rtx_backbone", "v41-slices-rtx_tp2", "v41-slices-dspark_tp2", "expert-reply")
+ARCHES = {"sm120": {"sms": (188, 170)}, "sm89": {"sms": (128, 114), "capability": [8, 9]}}
+SM89_VARIATION = ROOT / "scripts/build/sm89-export-variation.json"
+SUPPORTED_CAPABILITIES = ([12, 0], [12, 1], [8, 9])
+V41_DRAFT_CAPACITIES = ",".join(map(str, _v41.DRAFT_CAPACITIES))
+V41_PROJECTION_CAPACITIES = ",".join(map(str, _v41.PROJECTION_CAPACITIES))
+# EXL3 packages also carry the prefill wave units (#762): 2048 and 2752 rows.
+EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
+# Kimi K3 merges up to three 2752-row wave units, so its packed extents reach
+# 8256 rows and its warp-specialized cells cover every capacity above 2752.
+EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
-                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
-EXL3_GEOMETRIES = ("v41", "dsv4f", "dsv4p", "glm", "glmf", "qwen4")
+                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
+                     "step5", "step5_nvfp4", "step5_bf16")
+EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3", "ml4")
 
 
 def load_file(name, path):
@@ -43,8 +96,44 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def dense_geometry_jobs():
+    # Read literal geometry requests without importing CUDA or the exporter.
+    path = ROOT / "python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    wanted = {"NATIVE_TRELLIS_GEOMETRIES", "NATIVE_MXFP8_GEOMETRIES", "TRELLIS_SHAPES", "SCALED_SHAPES"}
+    shapes = {node.targets[0].id: ast.literal_eval(node.value)
+              for node in ast.parse(path.read_text()).body
+              if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in wanted}
+    trellis = sorted(set(shapes["NATIVE_TRELLIS_GEOMETRIES"])
+                     - {shape[1:] for shape in shapes["TRELLIS_SHAPES"]})
+    scaled = sorted(set(shapes["NATIVE_MXFP8_GEOMETRIES"])
+                    - {(k, n, side) for _, k, n, encoding, side in shapes["SCALED_SHAPES"]
+                       if encoding == "mxfp8"})
+    cores = [f"trellis_k{k}_n{n}_s{s}{dtype}" for k, n, s in trellis for dtype in ("", "_bf16")]
+    scaled = [f"mxfp8_k{k}_n{n}_s{s}" for k, n, s in scaled]
+    glue = [f"trellis_input_k{k}_{dtype}"
+            for k in sorted({k for k, _, _ in trellis} - {shape[1] for shape in shapes["TRELLIS_SHAPES"]})
+            for dtype in ("f16", "bf16")]
+    glue += [f"trellis_output_n{n}"
+             for n in sorted({n for _, n, _ in trellis} - {shape[2] for shape in shapes["TRELLIS_SHAPES"]})]
+    glue += ["fp8_row_k4096_n154880_s1", "fp8_row_embedding_k4096_n154880",
+             "f32_narrow_pack_n1536_p2048", "f32_narrow_pack_n512_p2048",
+             "f32_narrow_pack_n128_p288", "f32_narrow_pack_n32_p288",
+             "bf16_projection_k4096_n32", "bf16_projection_k4096_n128",
+             "bf16_projection_k4096_n288"]
+    return [(f"exlr8-dense-geometry-{label}", "export_b12x_dsv4_aot.py",
+             ["--geometry", "exlr8_dense", "--only", ",".join(names),
+              "--dense-trellis-families", "glm,glmf"])
+            for label, names in (("trellis", cores),
+                                 ("mxfp8", scaled), ("glue", glue))]
+
+
 def jobs(scope):
     result = []
+    drafter = load_file("compare_draft_bf16", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    result.append(("draft-bf16", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "qwen38", "--only", ",".join(
+                       f"k{k}_n{n}" for k, n in sorted(drafter.draft_bf16_shapes()))]))
     # Small-row top-k deliberately exercises the fused persistent route, which
     # the production m64 table does not select.
     for geometry in ("flash", "pro", "glm", "glmf"):
@@ -52,6 +141,11 @@ def jobs(scope):
             result.append((f"suspect-{geometry}-m{rows}", "export_b12x_dsv4_aot.py",
                            ["--geometry", geometry, "--decode-rows", str(rows),
                             "--only", f"index_topk_decode_m{rows}"]))
+        # The production decode table selects the tiled m64 route; it must stay
+        # identical across SM counts.
+        result.append((f"production-indexer-{geometry}-m64", "export_b12x_dsv4_aot.py",
+                       ["--geometry", geometry, "--decode-rows", "64",
+                        "--only", "index_topk_decode_m64"]))
         mla = [f"sparse_mla_{mode}{kind}_m{rows}"
                for mode, rows in (("decode", 64), ("prefill", 4096))
                for kind in (("_win", "_c4", "_c128") if geometry in ("flash", "pro") else ("",))]
@@ -65,10 +159,19 @@ def jobs(scope):
         suffix = "" if heads == 48 else "_h96"
         names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
                  for op in ("mla_producer", "mla_output")]
-        names += [f"dense_mla_{mode}{suffix}_m{rows}"
+        names += [f"mla_producer{suffix}_fp8_m{rows}" for rows in (64, 4096)]
+        names += [f"dense_mla_{mode}{suffix}{cache}_m{rows}"
+                  for cache in ("", "_fp8")
                   for mode, rows in (("decode", 64), ("verify", 64), ("extend", 4096))]
         result.append((f"kimi-mla-h{heads}", "export_b12x_dsv4_aot.py",
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
+    result.append(("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "ml4", "--only", "draft_context_fc"]))
+    result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join([
+                       "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+                       "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+                       "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"])]))
     result.append(("kimi-residual", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "attn_res_c1_keep_append", "attn_res_c2_add_append",
@@ -79,10 +182,19 @@ def jobs(scope):
     result.append(("kimi-situ", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join(
                        f"situ_i{width}" for width in (3072, 6144, 16896, 33792))]))
+    result.append(("kimi-ffn", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(
+                       f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+                       for op in ("gate_up", "down")) + "," + ",".join(
+                       f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792))]))
     result.append(("kimi-routing", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    for geometry in ("mimo", "mimof"):
+        result.append((f"routed-{geometry}-row-addresses", "package_fp8_moe_aot.py",
+                       ["--geometry", geometry, "--capacities", "2752", "--layouts", "tp2", "--row-addresses"]))
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
@@ -91,11 +203,23 @@ def jobs(scope):
             result.append((name, "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
                             "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128",
-                            "--atomic-min-capacity", "256", "--standard-names"]))
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" else []), "--standard-names"]))
+    for family in ("v41", "dsv4f", "dsv4p"):
+        packages = load_file("compare_spark_packages", ROOT / "python/tools/lib/spark_packages.py")
+        artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                     for artifact in values}
+        for role, artifact in artifacts.items():
+            width = 192 if family == "v41" and (
+                not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
+            result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
+                           ["--geometry", family, "--role", role, "--rows", V41_CAPACITIES if family == "v41" else CAPACITIES,
+                            "--width", ",".join(f"{capacity}:{width}" for capacity in (V41_CAPACITIES if family == "v41" else CAPACITIES).split(",")),
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" and not role.startswith("spark_w") else []),
+                            "--standard-names"]))
     result.extend([
-        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),
+        ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", V41_PROJECTION_CAPACITIES]),
         ("v41-experts", "export_b12x_v41_experts_aot.py",
-         ["--role", "coordinator", "--input-format", "bf16", "--rows", "1,2,40,16,80,256,1024,4096"]),
+         ["--role", "coordinator", "--input-format", "bf16", "--rows", V41_DRAFT_CAPACITIES]),
         ("v41-index", "export_b12x_v41_index_aot.py", []),
         ("v41-router", "export_b12x_v41_router_aot.py", []),
         ("v41-attention", "export_b12x_v41_attention_aot.py", []),
@@ -111,10 +235,17 @@ def jobs(scope):
         ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
         ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
+    for heads, suffix in ((128, ""), (64, "-tp2")):
+        for group in ("pointwise", "projections", "attention"):
+            result.append((f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                           ["--heads", str(heads), "--group", group]))
+    result.append(("muse-tp-combine", "export_b12x_muse_aot.py", ["--group", "tp-combine"]))
+    result.append(("expert-partial", "export_b12x_expert_partial_aot.py", []))
+    result.append(("expert-reply", "export_b12x_dsv4_aot.py", ["--geometry", "expert_reply"]))
+    result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
-        args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
-        if role != "dspark_tp2":
-            args += ["--atomic-min-capacity", "256"]
+        args = ["--role", role, "--rows", V41_DRAFT_CAPACITIES if role == "dspark_tp2" else V41_CAPACITIES, "--width", "192", "--standard-names"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
     result.append(("v41-slices-rtx_tp2-hybrid", "export_b12x_slices_aot.py",
                    ["--role", "rtx_tp2", "--rows", "1,2,16,80", "--width", "192",
@@ -122,7 +253,7 @@ def jobs(scope):
                     "--standard-names"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         result.append((f"v41-nvfp4-{role}", "export_b12x_v41_nvfp4_aot.py",
-                       ["--role", role, "--rows", CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
+                       ["--role", role, "--rows", V41_CAPACITIES, "--tile-m", "16", "--output-shards", "0"]))
     result.extend((f"routed-{geometry}", "package_fp8_moe_aot.py",
                    ["--geometry", geometry, "--capacities", CAPACITIES])
                   for geometry in ROUTED_GEOMETRIES)
@@ -132,40 +263,162 @@ def jobs(scope):
     result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
+    geometry_worlds = load_file("spark_packages", ROOT / "python/tools/lib/spark_packages.py").geometry_worlds
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+        layouts = ",".join(f"tp{world}" for world in geometry_worlds(geometry))
+        for input_format in (("bf16",) if geometry == "step5_bf16" else ("wire", "bf16")):
+            result.append((f"routed-{geometry}-spark-{input_format}", "package_fp8_moe_aot.py",
+                           ["--geometry", geometry, "--capacities", CAPACITIES,
+                            "--layouts", layouts, "--exact-slices", "--role", "spark",
+                            "--input", input_format]))
+    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
+                           ("dsv4p", "2,3"), ("kimik3", "2,3")):
+        capacities = EXL3_CAPACITIES_KIMIK3 if geometry == "kimik3" else EXL3_CAPACITIES
+        result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
+                       ["--geometry", geometry, "--capacities", capacities, "--bits", bits,
+                        "--compact-companions"]))
+    exl3_capacity_args = {geometry: EXL3_CAPACITIES_KIMIK3 if geometry == "kimik3"
+                          else EXL3_CAPACITIES for geometry in EXL3_GEOMETRIES}
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", "2,3"])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
+                    "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    result.append(("exl3-kimik3-k23", "package_exl3_aot.py",
-                   ["--geometry", "kimik3", "--capacities", CAPACITIES, "--bits", "2,3"]))
-    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
-                           ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"), ("step5", "4,6"), ("ml4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits]))
+                       ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
+    # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
+    result.append(("exl3-muse-k45", "package_exl3_aot.py",
+                   ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                   ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry]])
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
-        ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
+        ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "dense_trellis_k6,kimi_split"]),
+        ("ml4-k6-dense", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "ml4"]),
+        ("ml4", "export_b12x_dsv4_aot.py", ["--geometry", "ml4"]),
+        # With its head split (ml42) and the token-split extras, as context-enabled images build.
+        ("ml4-context", "export_b12x_dsv4_aot.py", ["--geometry", "ml4", "--context-split", "on"]),
+        ("glm-k6-dense", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glm"]),
+        ("glmf-k6-dense", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glmf"]),
+        ("step5-dense-trellis", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "step5"]),
+        ("glmf-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf_stage"]),
+        ("glmf2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf2_stage"]),
+        ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8", "--exlr8-family", "glm"]),
+        ("exlr8-glmf", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8", "--exlr8-family", "glmf"]),
+        ("glm-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm_stage"]),
+        ("glm2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glm2_stage"]),
         ("exlr8-dense-trellis", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "trellis_q_b,trellis_o,trellis_gate_up,trellis_down"]),
+        ("exlr8-dense-trellis-tp2", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only",
+          "trellis_q_b_tp2,trellis_o_tp2,trellis_gate_up_tp2,trellis_down_tp2"]),
+        ("exlr8-dense-trellis-bf16", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"trellis_{name}{tp}_bf16" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-a8", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_{name}{tp}_a8" for tp in ("", "_tp2")
+              for name in ("q_b", "o", "gate_up", "down")]
+             + [f"quant_k{k}_a8" for k in (2048, 6144, 8192, 12288, 16384)])]),
         ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),
         ("exlr8-dense-int4", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "int4_q_b,int4_o"]),
+        ("exlr8-dense-int4-tp2", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", "int4_q_b_tp2,int4_o_tp2"]),
         ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
+        ("exlr8-dense-transforms", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_input_k{k}_{dt}" for k in (2048, 6144, 8192, 12288, 16384)
+              for dt in ("f16", "bf16")]
+             + [f"trellis_output_n{n}" for n in (6144, 8192, 12288, 16384)])]),
+        ("exlr8-dense-glue", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"swiglu_split_i{i}" for i in (12288, 6144)]
+             + [f"f32_narrow_pack_n{n}_p{p}" for n, p in
+                ((2048, 2624), (576, 2624), (128, 160), (32, 160))]
+             + ["bf16_index_weights"])]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
-        ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
+        ("vision-attention", "export_b12x_vision_aot.py", ["--capability", "120"]),
+        ("vision-d96-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--learned-position"]),
+        ("vision-d128-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--head-dim", "128", "--hidden", "2048", "--bf16-products", "--bf16-before-gamma"]),
+        ("vision-d96-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention"]),
+        ("vision-d96-windows", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--windowed"]),
+        # Covers Muse transformer programs using the exporter's shared geometry.
+        ("vision-transformer", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "transformer"]),
+        ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
+        ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
+    for name, _, args in result:
+        if name.startswith("exlr8-dense-"):
+            args.extend(["--dense-trellis-families", "glm"])
+    result.extend(dense_geometry_jobs())
+    result.extend((f"exlr8-dense-scope-{family}", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "exlr8_dense", "--dense-trellis-families", family])
+                  for family in ("glm", "glmf"))
     return result
+
+
+def routed_package_layouts(package, geometry, base, role):
+    """Evaluate this checkout's shipped layout policy without entering its compiler."""
+    requested = None
+    if role == "spark":
+        shared = ROOT / "python/tools/lib/spark_packages.py"
+        if shared.is_file():
+            worlds = load_file("source_spark_packages", shared).geometry_worlds(geometry)
+        else:
+            scope = load_file("source_release_scope", ROOT / "scripts/build/release-scope.py")
+            family = geometry.partition('_')[0]
+            worlds = sorted({int(item.split('=')[1])
+                             for item in scope.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS']
+                             if item.split('=')[0] == family})
+            if not worlds:
+                # A family absent from release scope must use its own planner's
+                # registered worlds, never the exporter's unused geometric defaults.
+                source = (ROOT / "rust/crates/cuteafd-loader/src/plan/experts.rs").read_text()
+                import re
+                match = re.search(r'if family == "' + re.escape(family)
+                                  + r'" \{ matches!\(world, ([0-9 |]+)\)', source)
+                if not match:
+                    raise ValueError(f"{geometry}: no shipped release or planner world witness")
+                worlds = [int(value.strip()) for value in match[1].split('|')]
+        requested = ','.join(f'tp{world}' for world in worlds)
+    path = Path(package.__file__)
+    tree = ast.parse(path.read_text())
+    build = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build")
+    selected = []
+    for node in build.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "wire"
+                                               for target in node.targets):
+            break
+        if node.lineno > next(item.lineno for item in build.body if isinstance(item, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == "capacities"
+                                      for target in item.targets)):
+            selected.append(node)
+    else:
+        raise ValueError(f"{path}: production layout policy has no compiler boundary")
+    args = argparse.Namespace(geometry=geometry, role=role, layouts=requested, exact_slices=True,
+                              all_spark_counts=False)
+    namespace = {**vars(package), "args": args, "base": base}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
+    layouts = namespace.get("layouts")
+    if not isinstance(layouts, list) or not layouts:
+        raise ValueError(f"{path}: production layout policy returned no layouts")
+    return layouts
 
 
 def export_routed(extra, output):
@@ -178,31 +431,48 @@ def export_routed(extra, output):
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
     base = GEOMETRIES[geometry]
-    layouts = extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"]
-    if "--exact-slices" in extra:
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    source_policy = "--source-package-layouts" in extra
+    layouts = (routed_package_layouts(package, geometry, base, role) if source_policy else
+               extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"])
+    if "--exact-slices" in extra and not source_policy:
         for layout in list(layouts):
             tp = int(layout.removeprefix("tp"))
             widths = sorted(set(package.exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{width}" for width in widths]
-            if base.weights == "mxfp4" and tp == 6:
+            if base.weights == "mxfp4" and base.intermediate // 128 % tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(
                     set(package.exact_widths(base.intermediate, tp, 32)), reverse=True)]
+    indirect = "--row-addresses" in extra
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    requested_input = extra[extra.index("--input") + 1] if "--input" in extra else None
+    wire = indirect or package.input_kind(role, base.weights, requested_input) == "wire"
+    segmented = indirect or (role == "spark" and wire and base.weights in ("fp8", "mxfp4"))
+    if segmented:
+        from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
-    for layout in layouts:
+    for layout in dict.fromkeys(layouts):
         _, g = package.layout_geometry(base, layout)
-        forms = [(rows, "auto") for rows in capacities]
-        forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, False)]
-        for rows, form in forms:
+        forms = [(rows, "auto", indirect) for rows in capacities]
+        forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
+        if segmented and not indirect:
+            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
+        for rows, form, row_addresses in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
+            if row_addresses and not indirect:
+                stem += "_segments"
             with exportable_compilation():
-                program = compile_fp8_moe_aot(g, route="auto", max_rows=rows, wire=False, prefill=form)
+                program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
+                    max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
+                    **({"row_addresses": True} if row_addresses else {}))
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
-                            "scratch_bytes": fp8_moe_scratch_bytes(g, "auto", rows, False, form)})
+                            "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
+                                              if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))})
             print(f"exported {stem}", flush=True)
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
@@ -221,11 +491,20 @@ def cpu_trellis_luts(modules, cpu_device):
             module._trellis256_execution_lut = original
 
 
+def _policy_role_args(policy, role):
+    """Role argument for a loaded package's policy function.
+
+    Every package that accepts a role is called with it explicitly; a baseline
+    from before the role split takes two arguments and is called without one.
+    """
+    return (role,) if getattr(getattr(policy, "__code__", None), "co_argcount", 0) >= 3 else ()
+
+
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
     import torch
-    from b12x.moe._shared.kernels.w4a16 import mixed_trellis, mixed_trellis4
-    with cpu_trellis_luts((mixed_trellis, mixed_trellis4), torch.device("cpu")):
+    from b12x.moe._shared.kernels.w4a16 import mixed_trellis
+    with cpu_trellis_luts((mixed_trellis,), torch.device("cpu")):
         _export_exl3(extra, output)
 
 
@@ -237,36 +516,79 @@ def _export_exl3(extra, output):
     capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
                   else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
-    for profile, width, experts, topk, dtype, _ in package.profiles_for_role("coordinator", geometry):
+    compact = "--compact-companions" in extra
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    if compact:
+        if len(bits) != 2:
+            raise ValueError("compact companions require two-tier Spark exports")
+        role = "spark"
+        profiles = package.compact_profiles(geometry, package.build_profiles(role, geometry))
+    else:
+        profiles = (package.build_profiles(role, geometry) if "--source-package-layouts" in extra
+                    else package.profiles_for_role(role, geometry))
+    for profile, width, experts, topk, dtype, _ in profiles:
         for rows in capacities:
-            options = {"hidden": package.GEOMETRIES[geometry][0], "compile_only": True}
-            if getattr(package, "activation", lambda _: "silu")(geometry) != "silu":
-                options["activation"] = package.activation(geometry)
-            block = package.route_block(geometry, rows)
-            if len(bits) == 2 and package.warp_specialized(geometry, "coordinator", width, rows):
-                block = 64
-                options["warp_specialized"] = True
-                if package.wire_input(geometry, "coordinator", width, rows):
-                    options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, "coordinator", width, rows)
-                if stages is not None:
-                    options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, "coordinator", width, rows):
-                    options["ws_dynamic_tiles"] = True
-                tile = package.ws_tile(geometry, "coordinator", width, rows)
-                if tile is not None:
-                    options["tile"] = tile
-            elif len(bits) == 2 and package.fused_input_rotation(geometry, "coordinator", width, rows):
-                options["fused_input_rotation"] = True
-            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
-                options["token_major_rotation"] = True
-            # The package pins its decode capacities to the canonical tile (#309);
-            # compare the geometry that ships, not the planner's widened default.
-            tile = package.decode_tile(geometry, width, rows)
+            options = {"compile_only": True}
+            if compact:
+                options["compact_weights"] = True
+            tile = (64, 128, 64, 128) if compact else None
             if tile is not None:
                 options["tile"] = tile
-            options.update(route_block=block, swiglu_limit=package.swiglu_limit(geometry))
-            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
+            options["hidden"] = package.GEOMETRIES[geometry][0]
+            if package.activation(geometry) != "silu":
+                options["activation"] = package.activation(geometry)
+            block = package.route_block(geometry, rows, *_policy_role_args(package.route_block, role))
+            # A baseline package that predates the measured-tier gate only has
+            # the width/capacity predicate; keep its exports loadable.
+            compact_ws = compact and len(bits) == 2 and (
+                package.compact_ws_export(geometry, role, width, rows, bits)
+                if hasattr(package, 'compact_ws_export') else
+                package.compact_warp_specialized(geometry, role, width, rows))
+            # Baselines retain their measured-tier filter; current packages use
+            # every two-tier prefill cell except measured V4 Pro losses and Kimi RTX policy.
+            ws_tiers = getattr(package, "WS_TIER_PAIRS", None)
+            eligible = ((geometry, bits) in ws_tiers if ws_tiers is not None
+                        else geometry != "kimik3" or bits == (2, 3))
+            ws = compact_ws or (len(bits) == 2 and tile is None
+                                and (role != "coordinator" or eligible)
+                                and package.warp_specialized(geometry, role, width, rows))
+            if ws:
+                block = (package.compact_ws_route_block(geometry, role, width, rows)
+                         if compact_ws else
+                         package.ws_route_block(geometry, role, width, rows)
+                         if hasattr(package, "ws_route_block") else 64)
+                # The compact keyword only exists where the compact WS policy does;
+                # never pass it to a baseline package that predates the policy.
+                compact_kw = {"compact": True} if compact_ws else {}
+                options["warp_specialized"] = True
+                if package.wire_input(geometry, role, width, rows, **compact_kw):
+                    options["wire_input"] = True
+                stages = package.ws_input_stages(geometry, role, width, rows, **compact_kw)
+                if stages is not None:
+                    options["ws_input_stages"] = stages
+                if package.ws_dynamic_tiles(geometry, role, width, rows, **compact_kw):
+                    options["ws_dynamic_tiles"] = True
+                policy_tile = package.ws_tile(geometry, role, width, rows, **compact_kw)
+                if policy_tile is not None:
+                    options["tile"] = policy_tile
+            elif (len(bits) == 2 and tile is None and hasattr(package, "fused_input_rotation")
+                  and package.fused_input_rotation(geometry, role, width, rows)):
+                options["fused_input_rotation"] = True
+            elif len(bits) == 2 and package.token_major_rotation(
+                    geometry, rows, *_policy_role_args(package.token_major_rotation, role)):
+                options["token_major_rotation"] = True
+            if block != 8:
+                options["route_block"] = block
+            if (limit := package.swiglu_limit(geometry)) != 10.0:
+                options["swiglu_limit"] = limit
+            default_options = dict(options)
+            if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
+                default_options["decode_schedule"] = schedule
+            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
+            if not compact:
+                for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
+                    export(output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
+                           dtype, **{**options, **schedule_options})
 
 
 def export_exl3_routes(extra, output):
@@ -275,11 +597,18 @@ def export_exl3_routes(extra, output):
     from export_b12x_exl3_routes_aot import export
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
-    _, width, experts, topk, _, _ = package.profiles_for_role("coordinator", geometry)[0]
+    profiles = package.profiles_for_role("coordinator", geometry)
+    _, _, experts, topk, _, _ = profiles[0]
     for rows in capacities:
-        block = (64 if package.warp_specialized(geometry, "coordinator", width, rows)
-                 else package.route_block(geometry, rows))
-        export(output / f"m{rows}", rows, experts, topk, block)
+        blocks = sorted({(package.ws_route_block(geometry, "coordinator", width, rows)
+                          if hasattr(package, "ws_route_block") else 64)
+                         if package.warp_specialized(geometry, "coordinator", width, rows)
+                         else package.route_block(
+                             geometry, rows, *_policy_role_args(package.route_block, "coordinator"))
+                         for _, width, *_ in profiles})
+        for block in blocks:
+            stem = f"m{rows}" if len(blocks) == 1 else f"m{rows}-b{block}"
+            export(output / stem, rows, experts, topk, block)
 
 
 def worker(payload):
@@ -288,12 +617,22 @@ def worker(payload):
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
-    os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = "1"
-    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = "1"
+    candidates = payload.get("candidates", "1")
+    os.environ["CUTEAFD_EXPORT_NARROW_AOT"] = candidates
+    os.environ["CUTEAFD_EXPORT_HC_LAGGED"] = payload.get("hc_lagged", candidates)
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
-    _initialize_worker(0, (12, 0), "sm-export-comparison", "sm-export-comparison",
+    native_spark = (payload["exporter"] == "export_b12x_slices_aot.py"
+                    and any(role.startswith("spark") for role in payload["args"]))
+    exl3_spark = payload["exporter"] == "package_exl3_aot.py" and (
+        "--compact-companions" in payload["args"] or
+        ("--role" in payload["args"] and payload["args"][payload["args"].index("--role") + 1] == "spark"))
+    routed_spark = (payload["exporter"] == "package_fp8_moe_aot.py" and "--role" in payload["args"]
+                    and payload["args"][payload["args"].index("--role") + 1] == "spark")
+    capability = (tuple(payload["capability"]) if payload.get("capability")
+                  else (12, 1) if native_spark or exl3_spark or routed_spark else (12, 0))
+    _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
                        payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
     import torch
     import importlib.metadata
@@ -317,7 +656,7 @@ def worker(payload):
         export_exl3_routes(payload["args"], output)
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
-        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py"):
+        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_aot.py"):
             # Standalone exporters initialize a one-SM offline target themselves.
             # Retain this worker's synthetic target so the comparison is meaningful.
             from b12x._lib import compile_pool
@@ -336,7 +675,7 @@ def worker(payload):
     if torch.cuda.is_initialized():
         raise RuntimeError("SM comparison initialized CUDA")
     (Path(payload["output"]) / "comparison-plans.json").write_text(json.dumps(plans, indent=2) + "\n")
-    summary = {"sms": payload["sms"], "capability": [12, 0], "cuda_initialized": False,
+    summary = {"sms": payload["sms"], "capability": list(capability), "cuda_initialized": False,
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
                "exporter": payload["exporter"], "args": payload["args"], "toolchain": toolchain,
@@ -379,7 +718,7 @@ def clean_metadata(value):
     return value
 
 
-def metadata(directory):
+def metadata(directory, excluded=()):
     records = {}
     for path in sorted(directory.rglob("*.json")):
         if path.name == "comparison-context.json":
@@ -389,8 +728,17 @@ def metadata(directory):
         prefix = "" if prefix == "." else prefix + "/"
         if path.name == "comparison-plans.json":
             for name, record in value.items():
-                records[name] = {**records.get(name, {}), **clean_metadata(record)}
+                if name not in excluded:
+                    records[name] = {**records.get(name, {}), **clean_metadata(record)}
             continue
+        # Drop only named deleted records, preserving every surviving contract
+        # and table-level field while avoiding list-index shifts after deletion.
+        value = dict(value)
+        for field in ("programs", "variants", "objects"):
+            if field in value:
+                value[field] = [record for record in value[field]
+                                if prefix + record.get("label", record.get("name", record.get("stage", "")))
+                                not in excluded]
         for record in value.get("programs", value.get("variants", value.get("objects", []))):
             name = record.get("label", record.get("name", record.get("stage")))
             if name:
@@ -412,19 +760,70 @@ def differing_fields(left, right, prefix=""):
     return [] if left == right else [prefix.lstrip(".")]
 
 
-def compare(left, right, *, source_comparison=False):
+def aggregate_header_after_removals(header, removed):
+    """Edit only generated includes and initializer records for deleted objects."""
+    text = header.decode("utf-8")
+    for name in sorted(removed):
+        include = f'#include "{name}.h"\n'
+        if text.count(include) != 1:
+            raise ValueError(f"aggregate header missing unique removed include: {name}")
+        text = text.replace(include, "", 1)
+    prefix = "#define CUTEAFD_DSV4_PROGRAMS "
+    lines = text.splitlines(keepends=True)
+    tables = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+    if len(tables) != 1:
+        raise ValueError("aggregate header missing unique program table")
+    index = tables[0]
+    table = lines[index][len(prefix):].removesuffix("\n")
+    entries = re.findall(r'\{"([^"\n]+)", [^{}\n]*\}', table)
+    records = re.findall(r'\{"[^"\n]+", [^{}\n]*\}', table)
+    if ", ".join(records) != table or any(entries.count(name) != 1 for name in removed):
+        raise ValueError("aggregate header has invalid or missing removed program records")
+    lines[index] = prefix + ", ".join(record for name, record in zip(entries, records)
+                                    if name not in removed) + "\n"
+    return "".join(lines).encode("utf-8")
+
+
+def read_variation(path):
+    """Recorded run-to-run device-code variation: {toolchain, programs: [group/stem]}."""
+    record = json.loads(path.read_text())
+    programs = record.get("programs")
+    if (not isinstance(record.get("toolchain"), dict) or not isinstance(programs, list)
+            or not programs or len(programs) != len(set(programs))
+            or any(not isinstance(name, str) or name.count("/") != 1 for name in programs)):
+        raise ValueError(f"{path}: recorded variation needs a toolchain and unique group/program names")
+    return record
+
+
+def variation_for(record, group, contexts):
+    """Program stems of `group` allowed to vary, if both exports used the recorded toolchain."""
+    if record is None or any(context.get("toolchain", {}).get(name) != version
+                             for context in contexts for name, version in record["toolchain"].items()):
+        return frozenset()
+    return frozenset(name.split("/", 1)[1] for name in record["programs"] if name.split("/", 1)[0] == group)
+
+
+def compare(left, right, *, source_comparison=False, expected_removals=None, variation=None, group=None):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
-    if not left_names or left_names != right_names:
+    if not left_names or not right_names or (not source_comparison and left_names != right_names):
         raise ValueError(f"object set mismatch: {left_names ^ right_names}, left={len(left_names)}, right={len(right_names)}")
+    added = sorted(right_names - left_names)
+    removed = sorted(left_names - right_names)
+    for directory, names in ((left, removed), (right, added)):
+        for name in names:
+            if not list(inspector.cuda_images((directory / name).read_bytes())):
+                raise ValueError(f"{name}: no CUDA ELF images; cannot classify device-code differences")
+            if name.endswith(".o") and not (directory / name).with_suffix(".h").is_file():
+                raise ValueError(f"{name}: missing exported ABI header")
     contexts = [json.loads((directory / "comparison-context.json").read_text()) for directory in (left, right)]
     if any(context.get("cuda_initialized") is not False for context in contexts):
         raise ValueError("comparison context did not prove CPU-only export")
     for context in contexts:
         sms = context.get("sms")
-        if type(sms) is not int or sms <= 0 or context.get("capability") != [12, 0]:
-            raise ValueError("comparison context must identify positive SM count and compute 12.0")
+        if type(sms) is not int or sms <= 0 or context.get("capability") not in SUPPORTED_CAPABILITIES:
+            raise ValueError("comparison context must identify positive SM count and a supported compute capability")
     if source_comparison:
         if contexts[0]["sms"] != contexts[1]["sms"]:
             raise ValueError("source comparison contexts must have the same SM count")
@@ -440,6 +839,7 @@ def compare(left, right, *, source_comparison=False):
         if contexts[0][key] != contexts[1][key] and not (source_comparison and key in source_fields):
             raise ValueError(f"comparison target differs beyond {'source' if source_comparison else 'SM count'}: {key}")
     metas = [metadata(directory) for directory in (left, right)]
+    allowed = variation_for(variation, group, contexts)
     if contexts[0]["exporter"] == "export_b12x_dsv4_aot.py" and "--only" not in contexts[0]["args"]:
         for target in metas:
             for name, record in target.items():
@@ -447,7 +847,7 @@ def compare(left, right, *, source_comparison=False):
                     raise ValueError(f"{name}: default serving table contains co-resident paged_fused "
                                      "without a live-kernel residency gate/fallback")
     records = []
-    for name in sorted(left_names):
+    for name in sorted(left_names & right_names):
         blobs = [(directory / name).read_bytes() for directory in (left, right)]
         images = [list(inspector.cuda_images(blob)) for blob in blobs]
         if any(not item for item in images):
@@ -468,20 +868,73 @@ def compare(left, right, *, source_comparison=False):
             raise ValueError(f"{name}: missing exported ABI header")
         same_object = blobs[0] == blobs[1]
         same_cubins = sorted(blob for _, blob in images[0]) == sorted(blob for _, blob in images[1])
+        # Device code only, with the same kernels, headers and plan: recorded
+        # variation when listed, otherwise a candidate for the record.
+        code_only = (not same_cubins and headers[0] == headers[1] and not fields
+                     and [[s["section"] for s in image] for image in sections[0]]
+                     == [[s["section"] for s in image] for image in sections[1]])
+        recorded = code_only and stem in allowed
         records.append({"program": stem, "artifact_kind": Path(name).suffix[1:], "object_identical": same_object,
                         "cubins_identical": same_cubins, "header_identical": headers[0] == headers[1],
                         "object_sha256": [sha(blob) for blob in blobs], "object_bytes": list(map(len, blobs)),
                         "cubin_sha256": cubin_hashes, "cubin_sections": sections,
                         "sass_identical": text_hashes[0] == text_hashes[1] if all(text_hashes) else None,
                         "metadata_changed_fields": fields,
-                        "classification": "identical" if same_object else "host-only" if same_cubins else "cubin-bytes"})
+                        "classification": "identical" if same_object else "host-only" if same_cubins
+                        else "recorded-variation" if recorded else "cubin-bytes",
+                        **({"variation_candidate": code_only and not recorded} if variation is not None else {})})
     header_names = {path.relative_to(directory).as_posix()
                     for directory in (left, right) for path in directory.rglob("*.h")}
     headers_changed = [name for name in sorted(header_names)
                        if not all((directory / name).exists() for directory in (left, right))
                        or (left / name).read_bytes() != (right / name).read_bytes()]
-    return {"contexts": contexts, "programs": records,
-            "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
+    report = {"contexts": contexts, "programs": records,
+              "added_programs": added, "removed_programs": removed,
+              "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
+    if expected_removals is not None:
+        if not source_comparison:
+            raise ValueError("expected removals require a baseline source comparison")
+        removed_stems = {str(Path(name).with_suffix("")) for name in removed}
+        common_stems = {row["program"] for row in records}
+        if removed_stems & common_stems:
+            raise ValueError(f"partially removed program artifacts: {sorted(removed_stems & common_stems)}")
+        filtered = [metadata(directory, removed_stems) for directory in (left, right)]
+        changed = differing_fields(*filtered)
+        allowed_headers = {str(Path(name).with_suffix(".h")) for name in removed if name.endswith(".o")}
+        changed_headers = set(headers_changed) - allowed_headers
+        for name in sorted(changed_headers):
+            path = Path(name)
+            local_removals = {Path(artifact).stem for artifact in removed
+                              if artifact.endswith(".o") and Path(artifact).parent == path.parent}
+            if path.name == "dsv4_programs.h" and local_removals:
+                if all((directory / name).is_file() for directory in (left, right)):
+                    expected = aggregate_header_after_removals((left / name).read_bytes(), local_removals)
+                    if expected == (right / name).read_bytes():
+                        changed_headers.remove(name)
+        survivors = [row["program"] for row in records if row["classification"] != "recorded-variation" and (
+                     not all((row["object_identical"], row["cubins_identical"], row["header_identical"],
+                              row["sass_identical"] is not False)) or row["metadata_changed_fields"])]
+        if survivors or changed_headers or changed:
+            raise ValueError(f"changed survivors: {survivors}; headers={sorted(changed_headers)}; metadata={changed}")
+    return report
+
+
+def read_expected_removals(path):
+    names = path.read_text().splitlines()
+    if not names or any(not name or name != name.strip() or Path(name).is_absolute()
+                        or ".." in Path(name).parts or Path(name).suffix for name in names):
+        raise ValueError("expected removals must list relative program stems, one per line without suffixes")
+    if len(names) != len(set(names)):
+        raise ValueError("duplicate expected removal")
+    return set(names)
+
+
+def validate_expected_removals(reports, expected):
+    added = {name for report in reports for name in report["added_programs"]}
+    removed = {str(Path(name).with_suffix("")) for report in reports for name in report["removed_programs"]}
+    if added or removed != expected:
+        raise ValueError(f"expected removals mismatch: extra={sorted(removed - expected)}, "
+                         f"missing={sorted(expected - removed)}, added={sorted(added)}")
 
 
 def parse_sms(value):
@@ -496,7 +949,13 @@ def parse_sms(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sms", type=parse_sms, default=(188, 170))
+    parser.add_argument("--arch", choices=tuple(ARCHES), default="sm120",
+                        help="sm89: the sm_89 coordinator groups on the offline SM89 target")
+    parser.add_argument("--sms", type=parse_sms, help="default: 188,170 (sm120) or 128,114 (sm89)")
+    parser.add_argument("--variation", type=Path,
+                        help="recorded device-code variation (default for sm89: scripts/build/sm89-export-variation.json)")
+    parser.add_argument("--role", choices=("coordinator", "spark"), default="coordinator",
+                        help="role for non-compact EXL3 expert groups")
     parser.add_argument("--scope", choices=("suspects", "all"), default="all")
     parser.add_argument("--groups", help="comma-separated job names; --list prints available names")
     parser.add_argument("--list", action="store_true")
@@ -504,6 +963,8 @@ def main():
     parser.add_argument("--compare-only", action="store_true")
     parser.add_argument("--baseline-source", type=Path,
                         help="baseline engine checkout with pinned fork; compare sources at the first --sms count")
+    parser.add_argument("--expected-removals", type=Path,
+                        help="exact removed program stems, one per line; requires --baseline-source")
     parser.add_argument("--require-identical", action="store_true")
     parser.add_argument("--timeout", type=int, default=7200, help="seconds per export context")
     parser.add_argument("--workers", type=int, default=1, help="independent CPU export groups in parallel")
@@ -512,7 +973,22 @@ def main():
     if args._worker:
         worker(json.loads(args._worker))
         return 0
+    target = ARCHES[args.arch]
+    args.sms = args.sms or target["sms"]
+    variation_path = args.variation or (SM89_VARIATION if args.arch == "sm89" else None)
+    try:
+        variation = read_variation(variation_path) if variation_path else None
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
+    if args.expected_removals and not args.baseline_source:
+        parser.error("--expected-removals requires --baseline-source")
+    try:
+        expected_removals = read_expected_removals(args.expected_removals) if args.expected_removals else None
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     selected_jobs = jobs(args.scope)
+    if args.arch == "sm89":
+        selected_jobs = [job for job in selected_jobs if job[0] in SM89_GROUPS]
     if args.list:
         print("\n".join(name for name, _, _ in selected_jobs))
         return 0
@@ -522,13 +998,16 @@ def main():
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
         selected_jobs = [job for job in selected_jobs if job[0] in selected]
+    selected_jobs = [(name, exporter, [*extra, "--role", args.role]
+                      if exporter == "package_exl3_aot.py" else extra)
+                     for name, exporter, extra in selected_jobs]
     output = args.output_dir.expanduser().resolve()
     load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py").check_path(str(output))
     output.mkdir(parents=True, exist_ok=True)
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
     reports = []
-    baseline_source = args.baseline_source.expanduser().resolve() if args.baseline_source else None
+    baseline_source = resolve_source_root(args.baseline_source) if args.baseline_source else None
     if baseline_source and not (baseline_source / "third_party/sparkinfer.lock.json").is_file():
         parser.error("--baseline-source must be an engine checkout with a pinned SparkInfer tree")
 
@@ -547,7 +1026,15 @@ def main():
             if directory.exists() and any(directory.iterdir()):
                 raise ValueError(f"output is not empty: {directory}; use --compare-only or a fresh output root")
             directory.mkdir(parents=True, exist_ok=True)
-            payload = dict(sms=sms, exporter=exporter, args=extra, output=str(directory))
+            context_args = list(extra)
+            if baseline_source and exporter in ("package_fp8_moe_aot.py", "package_exl3_aot.py"):
+                if "--layouts" in context_args:
+                    index = context_args.index("--layouts")
+                    del context_args[index:index + 2]
+                context_args.append("--source-package-layouts")
+            payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory))
+            if "capability" in target:
+                payload.update(capability=target["capability"], candidates="0", hc_lagged="1")
             print(f"export {name} SMs={sms}", flush=True)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
                        CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),
@@ -561,14 +1048,25 @@ def main():
                     print(f"{name} SMs={sms} failed; {(directory / 'export.log').read_text()[-12000:]}",
                           file=sys.stderr, flush=True)
                     raise
-        report = compare(*directories, source_comparison=True) if baseline_source else compare(*directories)
+        options = {"expected_removals": expected_removals} if expected_removals is not None else {}
+        if variation is not None:
+            options.update(variation=variation, group=name)
+        report = (compare(*directories, source_comparison=True, **options) if baseline_source
+                  else compare(*directories, **options))
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
+        if baseline_source and expected_removals is None and report["removed_programs"]:
+            raise ValueError(f"shipped programs removed: {report['removed_programs']}")
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
+        for label in ("added", "removed"):
+            for program in report[f"{label}_programs"]:
+                print(f"{name}/{program}: {label}", flush=True)
         for record in report["programs"]:
             print(f"{name}/{record['program']}: {record['classification']}; "
                   f"header={'same' if record['header_identical'] else 'different'}; "
-                  f"sass={record['sass_identical']}; metadata_fields={len(record['metadata_changed_fields'])}", flush=True)
+                  f"sass={record['sass_identical']}; metadata_fields={len(record['metadata_changed_fields'])}"
+                  + ("; device code only, not in the recorded variation" if record.get("variation_candidate") else ""),
+                  flush=True)
         return report
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -585,10 +1083,22 @@ def main():
     if failures:
         print(f"Failed export groups: {', '.join(row['group'] for row in failures)}", file=sys.stderr)
         return 1
-    different = sum(not row["object_identical"] for report in reports for row in report["programs"])
+    if expected_removals is not None:
+        try:
+            validate_expected_removals(reports, expected_removals)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    different = sum(not row["object_identical"] and row["classification"] != "recorded-variation"
+                    for report in reports for row in report["programs"])
+    varied = sum(row["classification"] == "recorded-variation" for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
-    print(f"Compared {total} programs: {total - different} identical objects, {different} different. Report: {output / 'comparison.json'}")
-    return int(args.require_identical and different > 0)
+    inventory_delta = sum(len(report[key]) for report in reports
+                          for key in (("removed_programs",) if baseline_source
+                                      else ("added_programs", "removed_programs")))
+    print(f"Compared {total} common programs: {total - different - varied} identical objects, {different} different, "
+          f"{varied} recorded variation, {inventory_delta} added/removed. Report: {output / 'comparison.json'}")
+    return int(args.require_identical and (different > 0 or (inventory_delta > 0 and expected_removals is None)))
 
 
 if __name__ == "__main__":

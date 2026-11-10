@@ -1,6 +1,7 @@
 //! Digest of engram rows gathered through the serving pipeline (prefetch,
 //! gather worker, staging) for a fixed pseudo-random token stream: compare
-//! two builds for byte-identical gathers. Usage: SNAPSHOT [WAVES] [SCALE_PRELOAD_GIB].
+//! two builds, or mapped against preloaded tables, for byte-identical gathers.
+//! Usage: SNAPSHOT [WAVES] [PRELOAD_GIB] (8 holds the scales; 190 every table).
 use anyhow::{Context, Result};
 use cuteafd_loader::{read_official_v41_catalog, EngramGatherPoll, EngramPipeline, EngramRequestTokens, EngramTokenMap};
 use sha2::{Digest, Sha256};
@@ -14,8 +15,10 @@ fn main() -> Result<()> {
     let cap = cuteafd_loader::plan::mapped_scale_preload_bytes(cap)?;
     let catalog = read_official_v41_catalog(snapshot)?;
     let map = EngramTokenMap::from_file(&snapshot.join("tokenizer.json"))?;
-    // SAFETY: the checkpoint snapshot is immutable while this process runs.
-    let pipeline = unsafe { EngramPipeline::new(&catalog, map, 256, 4, 256 * 64 * 1024, cap)? };
+    // SAFETY: the configured native library and snapshot remain immutable.
+    let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map,
+        cuteafd_loader::EngramStagingShape::new(256, 2)?, cap)? };
     let mut histories = [pipeline.new_history()?, pipeline.new_history()?];
     let mut state = 0x2545_f491_4f6c_dd1du64;
     let mut next = || {
@@ -32,7 +35,7 @@ fn main() -> Result<()> {
         let lengths = [[1, 1], [6, 3], [96, 31]][wave_index % 3];
         let tokens: Vec<Vec<u32>> = lengths.iter().map(|&n| (0..n).map(|_| next()).collect()).collect();
         let requests: Vec<_> = histories.iter().zip(&tokens)
-            .map(|(history, token_ids)| EngramRequestTokens { history, token_ids, image_mask: None }).collect();
+            .map(|(history, token_ids)| EngramRequestTokens { history, token_ids, image_mask: None, l14_gate: None }).collect();
         let mut wave = pipeline.prepare(&requests)?;
         for layer in 0..2 {
             let view_histories: Vec<_> = histories.iter().collect();

@@ -75,8 +75,8 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     )?;
     let weights = MimoWeights {
         layers: vec![],
-        norm: Dev::new(&library, 256)?,
-        head: super::super::head::MimoHead::Bf16(Dev::new(&library, 256)?),
+        norm: DeviceAllocation::new(&library, 256)?,
+        head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256)?),
         output_fp8: false,
     };
     let mut engine = ManuallyDrop::new(MimoEngine::new(
@@ -87,10 +87,11 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         lead.raw,
         64,
         64,
+        16384,
         1,
         1,
         embedding,
-        MimoKvCache::Int8,
+        MimoKvFormats::default(),
         MimoPrefillOutput::AllRows,
     )?);
     let fixture_head = engine.weights.head.allocations()[0].buffer;

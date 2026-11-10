@@ -11,7 +11,7 @@ phase="${6:-all}"
 # Name the failing line and command: a container exec only reports an exit code.
 trap 'status=$?; echo "build-wip-artifacts.sh: line $LINENO: \"$BASH_COMMAND\" exited $status (role ${2:-?}, phase $phase)" >&2' ERR
 # export: only the native/AOT outputs and their native-store entry, no Cargo and
-# no daemon (an export host such as oliver; the slot's own native phase then
+# no daemon (an export host such as maxq; the slot's own native phase then
 # restores the entry with CUTEAFD_WIP_NATIVE_REQUIRE_HIT=1).
 case "$phase" in all|rust|native|export) ;; *) usage ;; esac
 source_dir="$(realpath "$1")"
@@ -42,8 +42,8 @@ if [[ -n "$spark_tp_roles" ]]; then
   IFS=';' read -ra spark_tp_role_list <<<"$spark_tp_roles"
   for spark_tp_role in "${spark_tp_role_list[@]}"; do
     case "$spark_tp_role" in
-      tp2|tp3|tp6) ;;
-      *) echo "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $spark_tp_role" >&2; exit 2 ;;
+      tp2|tp3|tp5|tp6|tp7|tp8) ;;
+      *) echo "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8, got: $spark_tp_role" >&2; exit 2 ;;
     esac
   done
   [[ "$role" == expert ]] ||
@@ -53,6 +53,7 @@ fi
 # Extra routed-expert kernel families (FAMILY:ROLE list, e.g. dsv4f:spark),
 # validated by native/cmake/shared/expert_families.cmake. Empty keeps the V4.1 image.
 # Both builds take the same list; CMake keeps the entries for its architecture.
+v41_expert_aot=ON
 expert_families="${CUTEAFD_WIP_EXPERT_FAMILIES:-}"
 [[ "$role" != expert || ";$expert_families;" != *";glmfdense:"* ]] || { echo "CUTEAFD_WIP_EXPERT_FAMILIES: glmfdense is coordinator-only; remove it from the Spark expert scope" >&2; exit 2; }
 # Optional Spark siblings retain unquantized BF16 expert inputs. Empty keeps
@@ -82,6 +83,35 @@ case "$nvfp4_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_NVFP4_AOT must be ON or OFF
 # would otherwise keep an earlier build's ON.
 exlr8_aot="${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
 case "$exlr8_aot" in ON|OFF) ;; *) echo "CUTEAFD_WIP_EXLR8_AOT must be ON or OFF, got: $exlr8_aot" >&2; exit 2 ;; esac
+# The V4.1 coordinator candidates: direct attention, lagged mHC begin and narrow
+# projection scheduling. The lagged begin export has its own switch: SM89 carries
+# it for the manifest's program inventory (exact prefill packing) beside its own
+# native boundary.
+v41_candidate_aot="$coordinator_aot"
+v41_hc_lagged_aot="$coordinator_aot"
+# >>> sm89 V4.1 coordinator
+# SM89 (RTX 4090 class) coordinators carry DeepSeek V4.1 only, exported on b12x's
+# offline SM89 target with no GPU (native/CMakeLists.txt): the FP8 bundle with
+# the mHC projection, index scorer and router (V41_FP8), the dSpark draft
+# experts (V41_EXPERT), the full-width backbone experts (V41_LOCAL_EXPERT) and
+# the TP2 backbone and dSpark TP2 experts (V41_TP2_EXPERT). Everything else
+# stays off: the V4.1 candidates (direct attention is SM120-only; narrow
+# scheduling is unqualified on SM89) except the lagged mHC export, which SM89
+# lists in its manifest but does not serve (its own boundary is native), NVFP4
+# W4A4 experts (FP4 MMA is SM120), and every other family's programs and expert
+# packages, EXL3, EXLR8, vision and audio, which have no SM89 exporters. Its
+# coordinator program table (PROGRAMS.json) holds only the Spark reply reducers
+# (`expert_reply`), for compressed SPARK_REPLY_FORMAT replies.
+# `cuteafd plan --coordinator-arch sm_89` names what is missing.
+if [[ "$role" == coordinator && "$cuda_arch" == 89 ]]; then
+  v41_candidate_aot=OFF exl3_aot=OFF nvfp4_aot=OFF audio_aot=OFF exlr8_aot=OFF
+  expert_families="" bf16_families=""
+  for switch in DSV4 GLM GLMF MIMO QWEN4 QWEN_DENSE STEP5 KIMIK3 MUSE ML4 VISION_ATTENTION; do
+    printf -v "CUTEAFD_WIP_${switch}_AOT" '%s' OFF
+  done
+  echo "WIP coordinator sm_89: DeepSeek V4.1 exports only (FP8 bundle, router, index scorer, experts)" >&2
+fi
+# <<< sm89 V4.1 coordinator
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -133,6 +163,7 @@ export CARGO_TARGET_DIR="$build_dir/cargo-target$( [[ "${CUTEAFD_KACHE_MODE:-dis
 # CUTEAFD_WIP_HOST_ISA overrides (e.g. "x86-64-v2 x86-64-v4" for both). Each ISA
 # builds into $CARGO_TARGET_DIR-<isa>.
 source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+cuteafd_build_parallelism
 host_isa_text="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")"
 mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"
@@ -158,7 +189,7 @@ wip_tree_fingerprint() {
   find "$@" -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.cu' -o -name '*.cc' -o -name '*.h' -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' \) \
     -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 }
-# Dev-only Cargo features (wip.sh validates dev-* names; the coordinator leg only).
+# Coordinator Cargo features (wip.sh validates jemalloc and dev-* names).
 cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"
 cargo_feature_args=()
 [[ -z "$cargo_features" ]] || cargo_feature_args=(--features "$cargo_features")
@@ -211,7 +242,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
-      grep -vE '^CUTEAFD_WIP_KIMIK3_AOT=OFF$' |
+      grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4)_AOT=OFF$' |
       grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" "$coordinator_aot" "$xgrammar"
@@ -285,21 +316,20 @@ cmake \
   -DCUTEAFD_ENABLE_CUDA=ON \
   -DCUTEAFD_ENABLE_VISION_ATTENTION_AOT="${CUTEAFD_WIP_VISION_ATTENTION_AOT:-ON}" \
   -DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot" \
-  -DCUTEAFD_ENABLE_V41_EXPERT_AOT=ON \
+  -DCUTEAFD_ENABLE_V41_EXPERT_AOT="$v41_expert_aot" \
   -DCUTEAFD_SPARK_TP_ROLES="$spark_tp_roles" \
   -DCUTEAFD_EXPERT_FAMILIES="$expert_families" \
   -DCUTEAFD_GENERIC_SPARK_COUNTS="${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \
   -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="$nvfp4_aot" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES="$exl3_aot" \
-  -DCUTEAFD_V41_EXL3_BITS="${CUTEAFD_WIP_EXL3_BITS:-2;3}" \
   -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
   -DCUTEAFD_DSV4_MAX_CONTEXT="${CUTEAFD_WIP_DSV4_MAX_CONTEXT:-1048576}" \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_DSV4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLM_AOT:-OFF}" || echo OFF)" \
-  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_WIP_GLM_AOT:-OFF}" == ON || "${CUTEAFD_WIP_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_WIP_DSV4_AOT:-OFF}" == ON ) ]] && echo "${CUTEAFD_WIP_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
+  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_WIP_GLM_AOT:-OFF}" == ON || "${CUTEAFD_WIP_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_WIP_DSV4_AOT:-OFF}" == ON || "${CUTEAFD_WIP_ML4_AOT:-OFF}" == ON ) ]] && echo "${CUTEAFD_WIP_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MIMO_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_WIP_MIMO_GEOMETRIES:-mimo}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLMF_AOT:-OFF}" || echo OFF)" \
@@ -308,10 +338,13 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_STEP5_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MUSE_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
-  -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
-  -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
-  -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
+  -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_WIP_EXLR8_FAMILIES:-}" \
+  -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$v41_candidate_aot" \
+  -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$v41_hc_lagged_aot" \
+  -DCUTEAFD_ENABLE_V41_NARROW_AOT="$v41_candidate_aot" \
   -DCUTEAFD_ENABLE_RDMA=ON \
   -DCUTEAFD_HOST_ISA="${host_isa_cmake:-}" \
   -DCUTEAFD_SPARKINFER_SOURCE_DIR="$source_dir/third_party/sparkinfer" \
@@ -346,14 +379,6 @@ fi
 # official-only WIP build (CUTEAFD_WIP_EXL3_AOT=OFF) has no exl3/ directory and
 # the native launch path never references one.
 if [[ "$exl3_aot" == ON ]]; then
-  wip_exl3_bits="${CUTEAFD_WIP_EXL3_BITS:-2;3}"
-  wip_exl3_tag="k${wip_exl3_bits//[;]/}"
-  wip_exl3_tag="${wip_exl3_tag//,/}"
-  python3 "$source_dir/python/tools/aot/package_exl3_aot.py" install \
-    --package "$build_dir/native/exl3-$wip_exl3_tag" --output "$output_dir/exl3/exl3-$wip_exl3_tag"
-  python3 "$source_dir/python/tools/aot/package_exl3_aot.py" verify \
-    --package "$output_dir/exl3/exl3-$wip_exl3_tag" --role "$role"
-  # Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
   IFS=';' read -ra wip_family_list <<<"$expert_families"
   for wip_family in "${wip_family_list[@]}"; do
     [[ "$wip_family" == *:exl3-k* ]] || continue
@@ -371,6 +396,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
   case "$wip_family" in
     *:fp8) wip_package="fp8-${wip_family%%:*}" ;;
     step5:bf16) wip_package="fp8-step5-bf16-weights" ;;
+    step5:nvfp4) wip_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
     *) continue ;;
@@ -412,6 +438,10 @@ if [[ "$coordinator_aot" == ON ]]; then
         "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
     fi
   done
+  if [[ -f "$build_dir/native/v41_dspark_tp2_experts/v41_experts.json" ]]; then
+    install -m 0644 "$build_dir/native/v41_dspark_tp2_experts/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"
+  fi
 fi
 # Always emit the built-role manifest (empty for the legacy default). Roles are
 # derived from the AOT export manifests CMake actually produced and bound to the
@@ -449,9 +479,12 @@ elif [[ -f "$output_dir/COMPILER_PROVENANCE.json" ]]; then
 fi
 # Generic-family tables must come from this build, not an earlier role/opt-in.
 # A native-cache hit restored the table with the rest of the native outputs.
+# Native V4.1 experts are always enabled by the CMake scope above;
+# generic EXL3/FP8 scopes and optional package flags use that same codec table.
 if ((${native_hit:-0})); then
   :
-elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
+elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
+    || ( "$role" == expert && ( -n "${expert_families:-}${bf16_families:-}" || "${exl3_aot:-OFF}" == ON || "${nvfp4_aot:-OFF}" == ON || "${v41_expert_aot:-OFF}" == ON ) ) ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"

@@ -6,6 +6,7 @@ use std::{ffi::c_void, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V41Exl3Info {
+    pub version: u32,
     /// Bytes per output element: BF16 (2) or FP32 (4).
     pub output_element_bytes: usize,
     pub hidden: usize,
@@ -27,8 +28,7 @@ pub struct V41Exl3Info {
 /// split of three H128 blocks per rank (384 rows), alongside TP3's six blocks.
 pub fn exl3_shard_widths(geometry: cuteafd_core::ExpertGeometry) -> Vec<u32> {
     let blocks = geometry.intermediate / 128;
-    let mut widths: Vec<u32> = [1u32, 2, 3, 4, 6]
-        .into_iter()
+    let mut widths: Vec<u32> = (1..=cuteafd_core::MAX_SPARK_WORLD as u32)
         .filter(|&world| geometry.intermediate % 128 == 0 && blocks >= world)
         .flat_map(|world| [blocks / world, blocks.div_ceil(world)])
         .map(|count| count * 128)
@@ -45,7 +45,7 @@ impl V41Exl3Info {
 
     fn from_words_for_geometry(words: [u32; 16], geometry: cuteafd_core::ExpertGeometry) -> Result<Self> {
         ensure!(
-            words[0] == 2
+            (words[0] == 2 || (words[0] == 3 && words[6] == 2))
                 && matches!(words[15], 2 | 4)
                 && words[1] == geometry.hidden
                 && exl3_shard_widths(geometry).contains(&words[2])
@@ -53,13 +53,13 @@ impl V41Exl3Info {
                 && words[3] >= words[5]
                 && words[4] > 0
                 && (1..=16).contains(&words[5])
-                && matches!(words[6], 2..=4),
+                && words[6] == 2,
             "invalid EXL3 native geometry: {words:?}"
         );
         let tier_count = words[6] as usize;
         let bits: [u32; 4] = words[11..15].try_into().unwrap();
         ensure!(
-            bits[..tier_count].iter().all(|bit| (2..=5).contains(bit))
+            bits[..tier_count].iter().all(|bit| (2..=6).contains(bit))
                 && bits[tier_count..].iter().all(|bit| *bit == 0)
                 && bits[..tier_count]
                     .iter()
@@ -72,6 +72,7 @@ impl V41Exl3Info {
             "invalid EXL3 pointer/scalar ABI"
         );
         Ok(Self {
+            version: words[0],
             output_element_bytes: words[15] as usize,
             hidden: words[1] as usize,
             intermediate: words[2] as usize,
@@ -86,7 +87,6 @@ impl V41Exl3Info {
             sum_scalars: words[10] as usize,
         })
     }
-
 }
 
 type Launch = unsafe extern "C" fn(*mut c_void, *const *mut c_void, *const i32, *mut c_void) -> i32;
@@ -279,26 +279,22 @@ mod info_tests {
     }
 
     #[test]
-    #[ignore = "requires a CUDA GPU, CUTEAFD_NATIVE_LIB and four-tier CUTEAFD_EXL3_AOT"]
-    fn native_four_tier_library_loads_through_rust_owner() -> Result<()> {
-        let native = unsafe { crate::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        native.cuda_set_device(0)?;
-        let path =
-            std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?).join("libcuteafd_exl3.so");
-        let first = unsafe { V41Exl3Kernel::load(&path)? };
-        let second = unsafe { V41Exl3Kernel::load(&path)? };
-        assert_eq!(first.info().tier_count, 4);
-        assert_eq!(first.info().bits, [2, 3, 4, 5]);
-        assert_eq!(first.info(), second.info());
-        drop(first);
-        drop(second);
-        let reloaded = unsafe { V41Exl3Kernel::load(&path)? };
-        assert_eq!(reloaded.info().tier_count, 4);
-        Ok(())
+    fn compact_native_info_requires_two_tiers_and_explicit_version() {
+        let base = [3u32, 5120, 384, 384, 16, 6, 2, 44, 18, 7, 3, 3, 4, 0, 0, 2];
+        assert_eq!(V41Exl3Info::from_words(base).unwrap().version, 3);
+        for version in [0, 1, 4, u32::MAX] {
+            let mut words = base;
+            words[0] = version;
+            assert!(V41Exl3Info::from_words(words).is_err());
+        }
+        let mut words = base;
+        words[6] = 3;
+        words[13] = 5;
+        assert!(V41Exl3Info::from_words(words).is_err());
     }
 
     #[test]
-    fn native_info_accepts_two_through_four_distinct_tiers() {
+    fn native_info_requires_two_distinct_tiers() {
         for bits in [&[2, 5][..], &[2, 3, 5], &[2, 3, 4, 5]] {
             let mut words = [
                 2,
@@ -319,9 +315,14 @@ mod info_tests {
                 2,
             ];
             words[11..11 + bits.len()].copy_from_slice(bits);
-            let info = V41Exl3Info::from_words(words).unwrap();
-            assert_eq!(info.tier_count, bits.len());
-            assert_eq!(&info.bits[..bits.len()], bits);
+            let result = V41Exl3Info::from_words(words);
+            if bits.len() == 2 {
+                let info = result.unwrap();
+                assert_eq!(info.tier_count, bits.len());
+                assert_eq!(&info.bits[..bits.len()], bits);
+            } else {
+                assert!(result.is_err());
+            }
         }
     }
 
@@ -330,14 +331,14 @@ mod info_tests {
     #[test]
     fn native_info_accepts_every_published_shard_width() {
         let base = [2u32, 5120, 768, 384, 16, 6, 2, 44, 18, 7, 3, 2, 3, 0, 0, 2];
-        for intermediate in [384u32, 512, 640, 768, 1152, 2304] {
+        for intermediate in [256u32, 384, 512, 640, 768, 1152, 2304] {
             let mut words = base;
             words[2] = intermediate;
             let info = V41Exl3Info::from_words(words)
                 .unwrap_or_else(|error| panic!("shard width {intermediate} must be accepted: {error}"));
             assert_eq!(info.intermediate, intermediate as usize);
         }
-        for intermediate in [0u32, 256, 576, 896, 1024, 1280] {
+        for intermediate in [0u32, 128, 576, 896, 1024, 1280] {
             let mut words = base;
             words[2] = intermediate;
             assert!(
@@ -388,16 +389,17 @@ mod info_tests {
     #[test]
     fn shard_widths_follow_the_expert_geometry() {
         use cuteafd_core::ExpertGeometry;
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [384, 512, 640, 768, 1152, 2304]);
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [256, 384, 512, 640, 768, 1152, 2304]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [384, 512, 640, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [256, 384, 512, 640, 768, 1024, 2048]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::QWEN4), [128, 256, 384, 640]);
     }
 
     #[test]
     fn native_info_rejects_invalid_tier_headers_before_slicing() {
-        let valid = [2, 5120, 512, 6, 16, 6, 4, 44, 18, 7, 3, 2, 3, 4, 5, 2];
-        for count in [0, 1, 5, u32::MAX] {
+        let valid = [2, 5120, 512, 6, 16, 6, 2, 32, 11, 6, 3, 2, 3, 0, 0, 2];
+        assert!(V41Exl3Info::from_words(valid).is_ok());
+        for count in [0, 1, 3, 4, 5, u32::MAX] {
             let mut words = valid;
             words[6] = count;
             assert!(V41Exl3Info::from_words(words).is_err());
@@ -408,7 +410,7 @@ mod info_tests {
             assert!(V41Exl3Info::from_words(words).is_err());
         }
         let mut nonzero_padding = valid;
-        nonzero_padding[6] = 3;
+        nonzero_padding[13] = 4;
         assert!(V41Exl3Info::from_words(nonzero_padding).is_err());
     }
 }

@@ -17,9 +17,9 @@ import re
 import tarfile
 
 PREFIX = 'CUTEAFD_RELEASE_'
-SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
+SWITCHES = ('DSV4', 'GLM', 'GLMF', 'MIMO', 'QWEN4', 'QWEN_DENSE', 'STEP5', 'KIMIK3', 'MUSE', 'AUDIO', 'CONTEXT_SPLIT', 'EXLR8')
 LISTS = ('EXPERT_FAMILIES', 'GENERIC_SPARK_COUNTS', 'SPARK_TP_ROLES', 'MIMO_GEOMETRIES',
-         'FP8_MOE_BF16_FAMILIES')
+         'FP8_MOE_BF16_FAMILIES', 'EXLR8_FAMILIES')
 # v2.0.0 shipped set: complete releases retain this previous-release floor.
 PREVIOUS_RELEASE_FLOOR = {
     'EXPERT_FAMILIES': {'dsv4p:exl3-k23', 'glm:exl3-k45', 'glmf:exl3-k34', 'qwen4:exl3-k45',
@@ -42,16 +42,12 @@ PREVIOUS_RELEASE_FLOOR = {
         }.items() for count in counts
     } | {'qwen4:nvfp4=6', 'qwen4:nvfp4a4=6'},
 }
-DEFAULT_MATRIX = 'scripts/bench/release-smoke-v3.json'
+DEFAULT_MATRIX = 'scripts/bench/release-smoke-v4.json'
 
 
-# Package/layout evidence extracted from both stopped v2.0.0 images. Base V4.1
-# EXL3 packages are always built, separately from the named expert families.
+# Retained package/layout floor from the stopped v2.0.0 images.
 def previous_release_packages():
     packages = {'coordinator': {}, 'expert': {}}
-    for name in ('exl3-k23', 'exl3-k34'):
-        packages['coordinator'][f'exl3/{name}'] = ['dspark', 'rtx-tp1', 'rtx-tp2']
-        packages['expert'][f'exl3/{name}'] = [f'tp{tp}-rank{rank}' for tp in (2, 3, 4) for rank in range(tp)]
     for name in ('dsv4p-k23', 'glm-k45', 'glmf-k34', 'qwen4-k45'):
         qwen = name.startswith('qwen4')
         path = f'exl3/exl3-{name}'
@@ -167,6 +163,34 @@ def derive(repo, matrix, scope='all', environ=None):
             if key.endswith('MIMO_GEOMETRIES'):
                 value = value.replace(',', ';')
             result[key] = ';'.join(sorted(tokens(result[key]) | tokens(value)))
+    if scope == 'all':
+        # Card scopes are intentionally narrow. A complete release must instead
+        # expose every alias backed by its enabled families' width-class objects.
+        path = Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py'
+        spec = importlib.util.spec_from_file_location('release_spark_packages', path)
+        packages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packages)
+        counts = tokens(result[PREFIX + 'GENERIC_SPARK_COUNTS'])
+        experts = tokens(result[PREFIX + 'EXPERT_FAMILIES'])
+        for expert in tuple(experts):
+            family, kind = expert.split(':', 1)
+            if family in ('dsv4f', 'dsv4p') and kind.startswith('spark'):
+                experts.update(f'{family}:spark' + ('' if world == 4 else f'_tp{world}')
+                               for world in packages.package_worlds(family, 'mxfp4'))
+                continue
+            if kind not in ('fp8', 'bf16', 'nvfp4', 'nvfp4a4') and not kind.startswith('exl3-k'):
+                continue
+            if family == 'glmfdense':
+                continue  # Dense-only MLPs have no Spark package.
+            format = 'exl3' if kind.startswith('exl3-k') else kind
+            formats = (format, 'nvfp4a4') if format == 'nvfp4' and family != 'step5' else (format,)
+            counts.update(f'{family}:{alias}={world}' for alias in formats
+                          for world in packages.package_worlds(family, format))
+        result[PREFIX + 'EXPERT_FAMILIES'] = ';'.join(sorted(experts))
+        result[PREFIX + 'GENERIC_SPARK_COUNTS'] = ';'.join(sorted(counts))
+        result[PREFIX + 'SPARK_TP_ROLES'] = ';'.join(sorted(tokens(
+            result[PREFIX + 'SPARK_TP_ROLES']) | {
+                f'tp{world}' for world in packages.package_worlds('v41', 'mxfp4') if world != 4}))
     return result, entries
 
 
@@ -182,9 +206,14 @@ def requirements(repo, matrix, scope):
         if family == 'deepseek_v4':
             tag = 'dsv4p' if any(s.startswith('dsv4p:') for s in experts) else 'dsv4f'
             programs = {tag, tag + '2'} if dual else {tag}
-        elif family in ('glm5', 'glm5_flash'):
-            tag = 'glm' if family == 'glm5' else 'glmf'
-            programs = {tag, tag + '2'} if dual else {tag}
+        elif family == 'glm5':
+            programs = {'glm', 'dense_trellis_k6', 'glm_stage'}
+            if dual:
+                programs |= {'glm2', 'glm2_stage'}
+        elif family == 'glm5_flash':
+            programs = {'glmf', 'dense_trellis_k6', 'glmf_stage'}
+            if dual:
+                programs |= {'glmf2', 'glmf2_stage'}
         elif family == 'mimo_v2':
             programs = tokens(scopes['CUTEAFD_WIP_MIMO_GEOMETRIES'])
         elif family == 'qwen4':
@@ -194,7 +223,9 @@ def requirements(repo, matrix, scope):
         elif family == 'step5':
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
-            programs = {'kimik3'}
+            programs = {'kimik3', 'dense_trellis_k6', 'kimi_split'}
+        elif family == 'muse_spark':
+            programs = {'muse', 'dense_trellis_k6', 'expert_partial'} | ({'muse2'} if dual else set())
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES'])),
                            spark_count=count, spark_tp=tp, dual=dual,
@@ -295,16 +326,19 @@ def check_inventory(root, role, wanted, symbols=None):
                 missing = set(entry['programs']) - present
                 require(not missing, f'PROGRAMS.json missing program families {sorted(missing)}')
                 if entry['context_split']:
+                    context_families = set(entry['programs']) & {'dsv4f', 'dsv4p', 'glm', 'glmf'}
                     require(any(p.get('op') == 'scored_index_topk'
-                                for p in programs if p.get('family') == entry['programs'][0]),
+                                for p in programs if p.get('family') in context_families),
                             'PROGRAMS.json missing context-split programs')
             if entry.get('exlr8'):
                 # Each role's table carries the fork's EXLR8 set for that role (the
                 # exporter records it); the coordinator's sits beside the family programs.
                 exlr8_role = 'coordinator' if role == 'coordinator' else 'spark'
                 manifest = read_json(share / 'PROGRAMS.json')
-                recorded = manifest.get('families', {}).get('exlr8', {})
-                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == 'exlr8'}
+                key = {'glm5': 'exlr8', 'glm5_flash': 'exlr8_glmf'}.get(entry['family'])
+                require(key is not None, f'unsupported EXLR8 checkpoint family {entry["family"]}')
+                recorded = manifest.get('families', {}).get(key, {})
+                names = {p.get('name') for p in manifest.get('programs', []) if p.get('family') == key}
                 require(recorded.get('role') == exlr8_role, f'PROGRAMS.json has no EXLR8 {exlr8_role} programs')
                 require(names and names == set(recorded.get('programs', [])),
                         f'PROGRAMS.json EXLR8 programs {sorted(names)} differ from the recorded set')
@@ -339,6 +373,8 @@ def check_inventory(root, role, wanted, symbols=None):
                     check_package(root, f'exl3/exl3-{family}-{kind[5:]}', layouts, role, verified)
                 elif kind in ('fp8', 'nvfp4', 'nvfp4a4') or item == 'step5:bf16':
                     suffix = '-bf16-weights' if item == 'step5:bf16' else '' if kind == 'fp8' else '-' + kind
+                    if item == 'step5:nvfp4':
+                        suffix = '-nvfp4a4'
                     layouts = [f'tp{entry["spark_tp"]}'] if role == 'expert' else ['tp1']
                     if role == 'coordinator' and entry['dual'] and family != 'glmfdense':
                         layouts.append('tp2')
@@ -378,8 +414,12 @@ def revision_requirements(repo, revision):
             'release publication requires a clean full Git revision')
     # Materialize the build revision's matrix, config and shared derivation, not
     # the publisher's potentially different checkout or environment override.
+    policy_path = 'scripts/build/spark-package-ranges.json'
+    policy = json.loads(subprocess.check_output(
+        ['git', '-C', str(repo), 'show', f'{revision}:{policy_path}']))
     archive = subprocess.check_output(['git', '-C', str(repo), 'archive', revision, '--',
-                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX])
+                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX,
+                                       *policy['shared_inputs']])
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tree:

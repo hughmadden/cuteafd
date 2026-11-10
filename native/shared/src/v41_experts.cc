@@ -33,6 +33,8 @@
 #elif defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
 /* Pure TP6 Spark shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp6_expert_variants.h"
+#elif defined(CUTEAFD_V41_SPARK_TP8_EXPERTS)
+#include "v41_spark_tp8_expert_variants.h"
 #elif defined(CUTEAFD_V41_DSPARK_TP2_EXPERTS)
 #include "v41_dspark_tp2_expert_variants.h"
 #elif defined(CUTEAFD_V41_TP2_EXPERTS)
@@ -45,6 +47,10 @@
 #endif
 #ifndef CUTEAFD_V41_OUTPUT_KIND
 #define CUTEAFD_V41_OUTPUT_KIND(capacity) 0
+#endif
+/* SM89 exports declare their compute major; every other variant table is 12.x. */
+#ifndef CUTEAFD_V41_CC_MAJOR
+#define CUTEAFD_V41_CC_MAJOR 12
 #endif
 #ifndef CUTEAFD_V41_GROUP_ROWS
 #define CUTEAFD_V41_GROUP_ROWS(capacity, rows) 0u
@@ -197,10 +203,11 @@ namespace {
 // Cubins require the exported architecture, not the export host's SM count.
 int32_t reject_expert_device(const char* what, int device, int major, int minor, int sms) {
   std::fprintf(stderr,
-               "cuteafd: %s AOT kernels support compute 12.%d up to %d SMs, but device "
+               "cuteafd: %s AOT kernels support compute %d.%d up to %d SMs, but device "
                "%d is compute %d.%d with %d SMs; rebuild with sufficient architecture capacity "
                "(cudaErrorInvalidDevice)\n",
-               what, int(CUTEAFD_V41_CC_MINOR), int(CUTEAFD_V41_SMS), device, major, minor, sms);
+               what, int(CUTEAFD_V41_CC_MAJOR), int(CUTEAFD_V41_CC_MINOR), int(CUTEAFD_V41_SMS),
+               device, major, minor, sms);
   return cudaErrorInvalidDevice;
 }
 }  // namespace
@@ -218,7 +225,8 @@ extern "C" int32_t cuteafd_expert_initialize(int32_t capacity, void** out) {
   if (status != cudaSuccess) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
   if (status != cudaSuccess) return status;
-  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR || sms <= 0 || sms > CUTEAFD_V41_SMS)
+  if (major != CUTEAFD_V41_CC_MAJOR || minor != CUTEAFD_V41_CC_MINOR || sms <= 0 ||
+      sms > CUTEAFD_V41_SMS)
     return reject_expert_device("v41 expert", device, major, minor, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   if (variant->device >= 0) {
@@ -306,7 +314,7 @@ extern "C" int32_t cuteafd_expert_launch(void* kernel, const cuteafd_expert_laun
 // Every role that needs it defines these entry points in exactly one member.
 #if !defined(CUTEAFD_V41_LOCAL_EXPERTS) && !defined(CUTEAFD_V41_NVFP4_VARIANTS_HEADER) && \
     !defined(CUTEAFD_V41_SPARK_TP2_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP3_EXPERTS) && \
-    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS) && !defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
+    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP8_EXPERTS) && !defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
 namespace {
 struct InputQuantModule {
   cudaLibrary_t library = nullptr;
@@ -325,7 +333,7 @@ extern "C" int32_t cuteafd_v41_expert_input_quant_initialize(void** out) {
   status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
-  if (major != 12 || minor != CUTEAFD_V41_CC_MINOR)
+  if (major != CUTEAFD_V41_CC_MAJOR || minor != CUTEAFD_V41_CC_MINOR)
     return reject_expert_device("v41 expert input-quant", device, major, minor, sms);
   std::lock_guard<std::mutex> lock(initialization_mutex);
   auto* owner = input_quant.device == device ? &input_quant :

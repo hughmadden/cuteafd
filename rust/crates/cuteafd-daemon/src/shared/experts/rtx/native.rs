@@ -12,14 +12,14 @@ use cuteafd_ffi::{
 };
 use std::{ffi::c_void, rc::Rc};
 
-pub(crate) fn kernel_capacities(max_rows: usize) -> Result<Vec<u32>> {
+pub(crate) fn kernel_capacities(max_rows: usize, exports: &[u32]) -> Result<Vec<u32>> {
     ensure!((1..=4096).contains(&max_rows), "invalid TP2 rank capacity");
-    let capacities = [1, 16, 80, 256, 1024, 4096];
+    let capacities = exports;
     let compiled = capacities
-        .into_iter()
+        .iter().copied()
         .find(|&c| c as usize >= max_rows)
-        .unwrap();
-    Ok(capacities.into_iter().filter(|&c| c <= compiled).collect())
+        .context("native package lacks covering capacity")?;
+    Ok(capacities.iter().copied().filter(|&c| c <= compiled).collect())
 }
 
 pub(super) fn output_bytes(geometry: ExpertGeometry, rows: usize) -> Result<usize> {
@@ -179,6 +179,13 @@ impl<'a> NativeTp2Weights<'a> {
     pub(crate) fn uses_bf16_input(&self) -> bool {
         self.weights[0].is_nvfp4()
     }
+    /// The same resident weights admitted at another row capacity: executions
+    /// built from it size kernel capacities, scratch and output at `max_rows`.
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        let workspace_bytes = NativeTp2::workspace_bytes_for_format(self.device.library, max_rows,
+            self.selection, self.output_policy, self.uses_bf16_input())?;
+        Ok(Self { max_rows, workspace_bytes, ..self.clone() })
+    }
 }
 
 impl<'a> NativeTp2<'a> {
@@ -235,6 +242,12 @@ impl<'a> NativeTp2<'a> {
         output_policy: NativeOutputPolicy,
         nvfp4: bool,
     ) -> Result<usize> {
+        Ok(Self::allocation_sizes_for_format(library, max_rows, selection, output_policy, nvfp4)?
+            .into_iter().sum())
+    }
+
+    pub(crate) fn allocation_sizes_for_format(library: &NativeLibrary, max_rows: usize,
+        selection: RtxSelectionPolicy, output_policy: NativeOutputPolicy, nvfp4: bool) -> Result<[usize; 2]> {
         ensure!(
             !nvfp4
                 || (output_policy == NativeOutputPolicy::KernelPlanes
@@ -242,7 +255,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let layer = ExpertLayer::BackboneTp2 { layer: 0, rank: 0 };
-        let infos = kernel_capacities(max_rows)?
+        let infos = kernel_capacities(max_rows, &if nvfp4 { library.nvfp4_expert_exports(3)? }
+            else { library.native_expert_exports(3)? }.capacities)?
             .into_iter()
             .map(|capacity| layer.select_info(library, capacity, nvfp4))
             .collect::<Result<Vec<_>>>()?;
@@ -256,14 +270,14 @@ impl<'a> NativeTp2<'a> {
             .into_iter()
             .max()
             .unwrap();
-        scratch
-            .checked_add(Self::partial_bytes(
-                expert_geometry(),
-                max_rows,
-                output_policy,
-                nvfp4,
-            )?)
-            .context("TP2 workspace overflow")
+        Self::allocation_sizes(scratch, expert_geometry(), max_rows, output_policy, nvfp4)
+    }
+
+    pub(super) fn allocation_sizes(scratch: usize, geometry: ExpertGeometry, rows: usize,
+        output_policy: NativeOutputPolicy, nvfp4: bool) -> Result<[usize; 2]> {
+        let partial = Self::partial_bytes(geometry, rows, output_policy, nvfp4)?;
+        scratch.checked_add(partial).context("TP2 workspace overflow")?;
+        Ok([scratch, partial])
     }
 
     fn partial_bytes(
@@ -481,6 +495,65 @@ impl<'a> NativeTp2<'a> {
         }))
     }
 
+    /// One GPU's half of the GPU expert tier: per resident layer (strictly
+    /// increasing), the compact `ExpertWeights` of its resident experts
+    /// (`ExpertWeights::load_resident`, `tier::load_halves`). Executions
+    /// launch the layer's kernel over the compact planes, so their routes must
+    /// carry compact slots (`tier::TierResidency::slot_of`), never expert ids.
+    pub(crate) fn resident_weights(
+        device: Device<'a>,
+        rank: u8,
+        weights: Rc<DeviceOwner<'a, Vec<ExpertWeights<'a>>>>,
+        max_rows: usize,
+        selection: RtxSelectionPolicy,
+        output_policy: NativeOutputPolicy,
+    ) -> Result<NativeTp2Weights<'a>> {
+        ensure!(weights.device.id == device.id && std::ptr::eq(weights.device.library, device.library),
+            "tier halves live on another device");
+        let layers = weights.iter().map(|weight| match weight.layer {
+            ExpertLayer::BackboneTp2 { layer, rank: half } if half == rank as usize && weight.resident_ids().is_some()
+                => Ok(layer),
+            other => bail!("{other:?} is not a resident TP2 half of rank {rank}"),
+        }).collect::<Result<Vec<_>>>()?;
+        validate_layers(&layers, rank)?;
+        ensure!(weights.iter().all(|weight| !weight.is_nvfp4()), "tier halves take the native MXFP4 layout");
+        let workspace_bytes = Self::workspace_bytes_for_format(device.library, max_rows, selection, output_policy, false)?;
+        Ok(NativeTp2Weights { device, rank, layers, max_rows, workspace_bytes, weights, selection, output_policy })
+    }
+
+    /// [`Self::load_pair_weights`] over halves a push group delivered
+    /// (already transformed and published on their GPUs).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        output_policy: NativeOutputPolicy,
+        pushed: [Vec<ExpertWeights<'a>>; 2],
+    ) -> Result<[NativeTp2Weights<'a>; 2]> {
+        let workspaces = [Self::admit(devices[0], catalog, 0, &layers, max_rows, budgets[0], selection, output_policy)?,
+            Self::admit(devices[1], catalog, 1, &layers, max_rows, budgets[1], selection, output_policy)?];
+        let [left, right] = pushed;
+        for (rank, weights) in [&left, &right].into_iter().enumerate() {
+            ensure!(weights.len() == layers.len() && weights.iter().zip(&layers).all(|(w, &layer)|
+                w.layer == ExpertLayer::BackboneTp2 { layer, rank }), "pushed TP2 halves differ from admission");
+        }
+        let owners = [Rc::new(devices[0].own(|| Ok(left))?), Rc::new(devices[1].own(|| Ok(right))?)];
+        Ok(std::array::from_fn(|rank| NativeTp2Weights {
+            device: devices[rank],
+            rank: rank as u8,
+            layers: layers.clone(),
+            max_rows,
+            workspace_bytes: workspaces[rank],
+            weights: owners[rank].clone(),
+            selection,
+            output_policy,
+        }))
+    }
+
     pub(crate) fn load(
         device: Device<'a>,
         catalog: &cuteafd_loader::OfficialV41Catalog,
@@ -603,7 +676,8 @@ impl<'a> NativeTp2<'a> {
             "NVFP4 W4A4 requires BF16 route planes and explicit FirstCapacity selection"
         );
         let kernels = device.run(|| {
-            kernel_capacities(max_rows)?
+            kernel_capacities(max_rows, &if nvfp4 { device.library.nvfp4_expert_exports(3)? }
+                else { device.library.native_expert_exports(3)? }.capacities)?
                 .into_iter()
                 .map(|c| {
                     ExpertLayer::BackboneTp2 {
@@ -641,11 +715,10 @@ impl<'a> NativeTp2<'a> {
             .map(|k| k.info().scratch_bytes as usize)
             .max()
             .unwrap();
+        let [scratch_bytes, partial_bytes] = Self::allocation_sizes(
+            scratch_bytes, geometry, max_rows, output_policy, nvfp4)?;
         let scratch = Allocation::new(device, scratch_bytes)?;
-        let output = Allocation::new(
-            device,
-            Self::partial_bytes(geometry, max_rows, output_policy, nvfp4)?,
-        )?;
+        let output = Allocation::new(device, partial_bytes)?;
         let stream = Stream::new(device)?;
         let states = device.own(|| {
             let mut states = Vec::with_capacity(kernels.len());
@@ -716,10 +789,8 @@ impl<'a> NativeTp2<'a> {
             self.layers.contains(&layer),
             "TP2 weight metadata layer unavailable"
         );
-        Ok(self.weights[super::resident_index(&self.layers, layer)?]
-            .budget()
-            .resident_bytes
-            / self.geometry.experts as usize)
+        let weights = &self.weights[super::resident_index(&self.layers, layer)?];
+        Ok(weights.budget().resident_bytes / weights.experts().max(1))
     }
 
     fn execution_index(&self, rows: usize) -> Result<usize> {
@@ -756,6 +827,7 @@ impl RtxExpertLayer for NativeTp2<'_> {
             PartialDtype::F32
         }
     }
+    fn uses_fp8_input(&self) -> bool { !self.nvfp4 }
     fn partial_layout(&self, rows: usize) -> Result<PartialLayout> {
         ensure!(
             (1..=self.max_rows).contains(&rows),
@@ -1081,10 +1153,10 @@ mod tests {
             (255, vec![1, 16, 80, 256]),
             (4096, vec![1, 16, 80, 256, 1024, 4096]),
         ] {
-            assert_eq!(kernel_capacities(rows).unwrap(), expected);
+            assert_eq!(kernel_capacities(rows, &[1,16,80,256,1024,4096]).unwrap(), expected);
         }
-        assert!(kernel_capacities(0).is_err());
-        assert!(kernel_capacities(4097).is_err());
+        assert!(kernel_capacities(0, &[1,16,80,256,1024,4096]).is_err());
+        assert!(kernel_capacities(4097, &[1,16,80,256,1024,4096]).is_err());
     }
     #[test]
     fn output_extent_uses_each_geometry() {
@@ -1098,5 +1170,16 @@ mod tests {
             }
         }
         assert!(output_bytes(ExpertGeometry::DEEPSEEK_V4_PRO, usize::MAX).is_err());
+    }
+}
+
+#[cfg(test)]
+impl NativeTp2Weights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (layer, w) in self.layers.iter().zip(self.weights.iter()) {
+            for (plane, b) in w.buffers.iter().enumerate() {
+                f(format!("gpu{}.tp2.layers.{layer}.plane{plane}", self.device.id), b.buffer);
+            }
+        }
     }
 }

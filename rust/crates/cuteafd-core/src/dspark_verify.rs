@@ -4,6 +4,22 @@ pub const MAX_DSPARK_PROPOSALS: usize = 7;
 
 /// Total target rows per V4.1 verifier lane, including all request anchors.
 pub const V41_VERIFY_ROWS: usize = 64;
+/// Compiled target decode covers; Python/CMake exports read V41_VERIFY_ROWS.
+pub const V41_DECODE_CAPACITIES: [usize; 3] = [1, 16, V41_VERIFY_ROWS];
+/// Legacy drafter cover for 16 request sequences flattened at width five.
+/// This is not a target verifier capacity, even when a lane has fewer requests.
+pub const V41_DRAFT_LEGACY_ROWS: usize = 80;
+/// Thirty-two lane members at width seven produce 224 rows, covered by 256.
+pub const V41_DRAFT_WIDE_ROWS: usize = 256;
+pub const V41_TARGET_CAPACITIES: [u64; 6] = [1, 16, V41_VERIFY_ROWS as u64, 256, 1024, 4096];
+
+/// Persistent request identities are shared by the two decode lanes.
+pub const V41_MAX_REQUESTS: usize = crate::concurrency::MAX_CONCURRENCY as usize;
+pub const V41_MAX_LANE_MEMBERS: usize = V41_MAX_REQUESTS.div_ceil(2);
+/// Vocabulary heads cover every lane member's anchor and maximum draft suffix.
+pub const V41_VOCAB_ROWS: usize = V41_MAX_LANE_MEMBERS * (MAX_DSPARK_PROPOSALS + 1);
+pub const V41_WRITE_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 24;
+pub const V41_READ_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct GreedyVerification {

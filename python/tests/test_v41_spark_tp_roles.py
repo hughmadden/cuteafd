@@ -8,6 +8,7 @@ without a GPU so they can run before any export/build lease.
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +86,7 @@ def test_existing_tp4_and_rtx_roles_are_unchanged() -> None:
 
 def test_dsv4_coordinator_roles_share_per_device_handles_and_tp2_symbols() -> None:
     family = (ROOT / 'native/cmake/shared/expert_families.cmake').read_text()
-    assert '(dsv4f|dsv4p):(spark|spark_tp2|rtx_backbone|rtx_tp2)' in family
+    assert '(dsv4f|dsv4p):(spark|spark_tp2|spark_tp3|spark_tp6|spark_tp8|rtx_backbone|rtx_tp2)' in family
     assert 'if(role MATCHES "^rtx_")' in family
     assert '#define CUTEAFD_EXPERT_PER_DEVICE_HANDLES 1' in family
     assert 'set(symbol "cuteafd_${family}_tp2")' in family
@@ -126,7 +127,7 @@ def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
     assert "SM121 Spark expert build" in tp
     assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
-    assert "--atomic-min-capacity 256" in tp
+    assert "--atomic-min-capacity" not in tp
     assert "--role \"${role}\"" in tp
     assert "v41_spark_tp2_experts.cc" in tp
     assert "v41_spark_tp3_experts.cc" in tp
@@ -179,7 +180,7 @@ def test_spark_tp_width_maps_are_per_role_cache_knobs_with_identical_defaults() 
     # and re-couple the roles. Exactly one copy of the default remains per role.
     assert "set(CUTEAFD_V41_SPARK_TP_SLICE_WIDTH" not in tp
     assert "CUTEAFD_V41_SPARK_TP_SLICE_WIDTH" not in tp
-    assert tp.count(SPARK_WIDTH_DEFAULT) == 3
+    assert tp.count(SPARK_WIDTH_DEFAULT) == 4
 
 
 def test_each_role_forwards_its_own_width_map_to_the_exporter() -> None:
@@ -225,7 +226,7 @@ def test_width_override_invalidates_stale_exports_without_reconfigure_churn() ->
     )
     assert 'file(GENERATE OUTPUT "${width_stamp}"' in tp
     assert "width=${width_map}" in tp
-    assert "atomic_min_capacity=256" in tp
+    assert "atomic_min_capacity=none" in tp
     assert '"${width_stamp}"' in tp
     # Content-stable generation only: no unconditional write that would churn the
     # AOT objects on every unchanged configure.
@@ -237,8 +238,8 @@ def test_atomic_threshold_survives_a_width_override() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
     # The width map and the atomic threshold travel in the same exporter command,
     # so overriding a width cannot silently drop direct token accumulation.
-    assert '--width "${width_map}"\n      --atomic-min-capacity 256' in tp
-    assert "--atomic-min-capacity 256 --standard-names" in tp
+    assert '--width "${width_map}"' in tp
+    assert "--atomic-min-capacity" not in tp
 
 
 # --------------------------------------------------------------------------- #
@@ -272,12 +273,12 @@ def test_cmake_make_width_override_invalidation() -> None:
     assert len(steps["after_default"]["spark_tp3"]) == 1
     for role in ("spark_tp2", "spark_tp3"):
         assert steps["default_manifests"][role]["width"] == fixture.DEFAULT_MAP
-        assert steps["default_manifests"][role]["atomic_min_capacity"] == "256"
+        assert steps["default_manifests"][role]["atomic_min_capacity"] is None
 
     # TP2 cap80 -> 128 alone: TP2 re-exports, TP3 does not, atomic stays.
     assert len(steps["after_override"]["spark_tp2"]) == 2
     assert steps["override_manifests"]["spark_tp2"]["width"] == fixture.TP2_CAP80_128
-    assert steps["override_manifests"]["spark_tp2"]["atomic_min_capacity"] == "256"
+    assert steps["override_manifests"]["spark_tp2"]["atomic_min_capacity"] is None
     assert len(steps["after_override"]["spark_tp3"]) == 1
     assert steps["override_manifests"]["spark_tp3"]["width"] == fixture.DEFAULT_MAP
 
@@ -393,18 +394,22 @@ def test_decode_width_recipe_uses_wide_arithmetic_for_m1() -> None:
 
 
 
-def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity() -> None:
+def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity(monkeypatch) -> None:
     source = ROOT / "python/tools/aot/export_b12x_v41_fp8_aot.py"
     tree = ast.parse(source.read_text())
-    body = next(node.body for node in ast.walk(tree)
-                if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
-                and node.test.id == "fixed_output")
-    recipe = compile(ast.Module(body=body, type_ignores=[]), str(source), "exec")
-    for capacity in (1, 16, 80):
-        namespace = {"capacity": capacity, "expected_m": capacity}
-        exec(recipe, namespace)
-        assert namespace["expected_m"] == 16
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "expected_rows")
+    namespace = {"os": os}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), "exec"), namespace)
+    monkeypatch.delenv("CUTEAFD_EXPORT_NARROW_AOT", raising=False)
+    for name, n in (("o_b", 5120), ("o_b_tp2", 2560)):
+        for capacity in (1, 16, 80):
+            for sms in (114, 128, 170, 188):
+                assert namespace["expected_rows"](name, capacity, 8192, n, 1, sms) == 16
+    assert namespace["expected_rows"]("o_b", 256, 8192, 5120, 1, 188) == 256
+    assert namespace["expected_rows"]("q_a", 80, 5120, 1280, 1, 114) == 80
     text = source.read_text()
+    assert 'fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80' in text
     assert "if fixed_output and split_k != 1:" in text
     assert "'all_rows': fixed_output or capacity == 1" in text
 

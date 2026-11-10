@@ -1,3 +1,4 @@
+#include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -264,7 +265,7 @@ __global__ void embed_kernel(const __nv_bfloat16* table, const int32_t* tokens,
 template<int Width>
 static int32_t launch_dspark_embed(const uint16_t* table, const int32_t* tokens,
     uint16_t* residual, float* pre, int32_t requests, void* stream) {
-  if(requests<1 || requests>16)return cudaErrorInvalidValue;
+  if(requests<1 || requests>CUTEAFD_V41_MAX_LANE_MEMBERS)return cudaErrorInvalidValue;
   const uint64_t w=uint64_t(129280)*5120*2,t=uint64_t(requests)*4,
       r=uint64_t(requests)*Width*40960,p=uint64_t(requests)*Width*16;
   if(!valid(table,w,2)||!valid(tokens,t,4)||!valid(residual,r,2)||!valid(pre,p,4)||
@@ -310,16 +311,33 @@ __global__ void dspark_terminal_layout_kernel(const __nv_bfloat16* residual,
   for(int col=threadIdx.x;col<20480;col+=256)output[row*20480+col]=residual[source*20480+col];
   if(threadIdx.x<4)output_pre[row*4+threadIdx.x]=pre[source*4+threadIdx.x];
 }
+// The same copy in 16-byte words over ten blocks per row (a row is 2560
+// words), when both planes are 16-byte aligned: one word a thread, where the
+// scalar copy spent 80 two-byte moves a thread across one block a row.
+template<int Width>
+__global__ void dspark_terminal_layout_words(const uint4* residual,
+    const float* pre, uint4* output, float* output_pre, int requests) {
+  const uint64_t row=blockIdx.x;
+  const uint64_t source=(row%requests)*Width+row/requests;
+  const uint64_t word=uint64_t(blockIdx.y)*256+threadIdx.x;
+  output[row*2560+word]=residual[source*2560+word];
+  if(blockIdx.y==0 && threadIdx.x<4)output_pre[row*4+threadIdx.x]=pre[source*4+threadIdx.x];
+}
 }
 template<int Width>
 static int32_t launch_dspark_terminal_layout(const uint16_t* residual,
     const float* pre, uint16_t* output, float* output_pre, int32_t requests, void* stream) {
-  if(requests<1 || requests>16)return cudaErrorInvalidValue;
+  if(requests<1 || requests>CUTEAFD_V41_MAX_LANE_MEMBERS)return cudaErrorInvalidValue;
   const uint64_t r=uint64_t(requests)*Width*40960,p=uint64_t(requests)*Width*16;
   if(!valid(residual,r,2)||!valid(pre,p,4)||!valid(output,r,2)||!valid(output_pre,p,4)||
       !disjoint(residual,r,output,r)||!disjoint(residual,r,output_pre,p)||
       !disjoint(pre,p,output,r)||!disjoint(pre,p,output_pre,p)||!disjoint(output,r,output_pre,p))
     return cudaErrorInvalidValue;
+  if(reinterpret_cast<uintptr_t>(residual)%16==0 && reinterpret_cast<uintptr_t>(output)%16==0) {
+    dspark_terminal_layout_words<Width><<<dim3(requests*Width,10),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const uint4*>(residual),pre,reinterpret_cast<uint4*>(output),output_pre,requests);
+    return cudaGetLastError();
+  }
   dspark_terminal_layout_kernel<Width><<<requests*Width,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<const __nv_bfloat16*>(residual),pre,reinterpret_cast<__nv_bfloat16*>(output),output_pre,requests);
   return cudaGetLastError();

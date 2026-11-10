@@ -100,13 +100,6 @@ int32_t cuteafd_peer_wait_diagnostic(const uint32_t* flag, uint32_t* recv_state,
 int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* descriptor,
     const uint32_t* words, void* stream);
 
-// Write-mode Spark completions: one warp spins (acquire, system scope) until
-// each of `ranks` u64 flags (`stride_words` apart, device memory the NICs
-// write) carries the next sequence of `state` (u32 [1], zeroed; graph-safe) in
-// its low 32 bits, sets bit r of `error` for a rank whose flag has bit 63, then
-// advances `state`. Traps after 60 s.
-int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
-    uint32_t* state, uint32_t* error, void* stream);
 // Optional terminal cancellation. The legacy wait/symbol above is unchanged.
 // Initialize before enqueueing any abortable wait. `aborted` is a separate,
 // zeroed local u32 that outlives every eager/captured wait and is never reset.
@@ -117,6 +110,77 @@ int32_t cuteafd_peer_abort_initialize(void);
 int32_t cuteafd_peer_wait_abortable(const uint32_t* flag, uint32_t* recv_state,
     const uint32_t* aborted, void* stream);
 int32_t cuteafd_peer_abort_publish(uint32_t* aborted, void* independent_stream);
+
+// On the stream: copy `count` (1..4) byte regions (`bytes[i]` from
+// `sources[i]` to `destinations[i]`, any alignment; device pointers or the
+// device aliases of mapped pinned host memory) with SM loads and stores,
+// then a system-scope fence. The Spark exchange stages and lands its rows
+// this way: SM work stays in stream order behind stream memory waits.
+int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream);
+// The same regions by copy engine: one cudaMemcpyAsync per region (any
+// alignment; device memory or a mapped host alias on either side).
+int32_t cuteafd_copy_engine_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream);
+
+// Staging into mapped pinned host memory (the Spark request arena). Some hosts
+// take SM stores to host memory far below the link rate (about 2 GB/s from a
+// 4090 D behind an EPYC root complex, against 24 GB/s by copy engine), so a
+// stager uses the copy engine from a measured size, but only where this
+// device's stream memory waits hold later copy-engine work. On the current
+// device, with its own stream: first checks that a pending stream wait holds
+// a copy-engine copy into the arena, then times the staging sequence (a
+// satisfied stream wait, the copies, a publishing stream write) with SM and
+// copy-engine copies of `regions` (1..4) equal parts, at totals doubling from
+// 2 KiB up to `capacity` (at most 512 KiB). `host` and `alias` are one idle
+// mapped pinned arena of `capacity` (at least 4 KiB) bytes; the probe
+// overwrites it. Takes a few tens of milliseconds.
+#define CUTEAFD_STAGING_PROBE_SIZES 10
+typedef struct cuteafd_staging_probe {
+  uint32_t copy_engine_held;  // 1: a pending stream wait held a later copy-engine copy
+  uint32_t probes;            // entries in bytes, sm_us and copy_engine_us
+  uint64_t crossover_bytes;   // smallest probed total from which the copy engine is faster (0: never)
+  uint64_t bytes[CUTEAFD_STAGING_PROBE_SIZES];
+  float sm_us[CUTEAFD_STAGING_PROBE_SIZES];          // per staged wave
+  float copy_engine_us[CUTEAFD_STAGING_PROBE_SIZES];
+} cuteafd_staging_probe_t;
+int32_t cuteafd_staging_probe(void* host, void* alias, uint64_t capacity, uint32_t regions,
+    cuteafd_staging_probe_t* out);
+
+// One Spark rank's reply for `cuteafd_pull_frames`: the frames it arrived in
+// (`count` of them, at most CUTEAFD_PULL_MAX_FRAMES), each `bytes` from
+// `source` (a device-visible address of mapped pinned host memory: a
+// registered receive slot) to `offset` bytes into the rank's plane. The host
+// exchange worker writes it in mapped pinned memory before it publishes the
+// rank's arrival; the kernel reads it when it runs, so a captured launch
+// pulls whatever the worker published for that replay. A count of 0 copies
+// nothing (the worker clears counts before it releases waits after a failure).
+#define CUTEAFD_PULL_MAX_FRAMES 4
+#define CUTEAFD_PULL_MAX_RANKS 8
+typedef struct cuteafd_pull_entry {
+  uint64_t source;
+  uint64_t offset;
+  uint64_t bytes;
+} cuteafd_pull_entry_t;
+typedef struct cuteafd_pull_frames {
+  uint32_t count;
+  uint32_t reserved;
+  cuteafd_pull_entry_t frame[CUTEAFD_PULL_MAX_FRAMES];
+} cuteafd_pull_frames_t;
+// On the stream: pulls `count` (1..8) ranks' published frames
+// (`replies[i]`, mapped) into device planes `planes[i]` (16-byte aligned,
+// `capacity[i]` bytes). Frames 4-byte aligned in source, offset and size; a
+// frame past its plane or misaligned copies nothing.
+int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, void* stream);
+// *capturing = 1 while `stream` captures a graph (active or invalidated),
+// else 0: copies of one moment's addresses must not enter a captured graph.
+int32_t cuteafd_cuda_stream_capturing(void* stream, int32_t* capturing);
+// As cuteafd_pull_frames with `blocks` (1..1024) blocks of 256 threads,
+// rounded up to a whole number per rank; 0 sizes the grid by the planes'
+// capacity, as cuteafd_pull_frames does.
+int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t blocks, void* stream);
 
 // P2P probe for `cuteafd fabric --p2p`. Runs one measurement between devices
 // `a` and `b` (peer access enabled both ways by the call) and writes the time

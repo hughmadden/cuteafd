@@ -2,6 +2,10 @@
 //! The target owns the selected vocabulary-head format; drafters borrow it.
 use thiserror::Error;
 
+/// Serving and standalone admission use the same drafter batch default.
+pub const DEFAULT_DRAFT_SEQUENCES: usize = 4;
+
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MimoDraftRepresentation {
     Bf16Only,
@@ -19,6 +23,7 @@ pub struct MimoDraftCapacity {
     pub context_slots: usize,
     pub max_batch_sequences: usize,
     pub block_rows: usize,
+    pub kv_cache: crate::families::qwen4::Qwen4KvCache,
 }
 
 impl MimoDraftCapacity {
@@ -43,6 +48,7 @@ impl MimoDraftCapacity {
             ));
         }
         Ok(Self {
+            kv_cache: crate::families::qwen4::Qwen4KvCache::Bf16,
             context_slots,
             max_batch_sequences,
             block_rows: mul(max_batch_sequences as u64, block as u64)?
@@ -65,9 +71,16 @@ pub struct MimoDraftGeometry {
     pub sinks: bool,
 }
 
-/// One byte-exact retained DFlash context mark (BF16 K/V and valid floor).
-pub fn mimo_draft_mark_bytes(layers: u64, kv_width: u64) -> Result<u64, MimoDraftStorageError> {
-    mul(mul(mul(layers, 1024)?, kv_width)?, 4)?.checked_add(8)
+/// One byte-exact retained DFlash context mark (opaque K/V records and valid floor).
+pub fn mimo_draft_mark_bytes(layers: u64, kv_heads: u64, head_dim: u64,
+    kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<u64, MimoDraftStorageError> {
+    let payload = mul(kv_heads, head_dim)?;
+    let plane = match kv_cache {
+        crate::families::qwen4::Qwen4KvCache::Bf16 => mul(payload, 2)?,
+        crate::families::qwen4::Qwen4KvCache::Fp8 => add(payload, mul(kv_heads, 4)?)?
+            .checked_add(15).ok_or(MimoDraftStorageError::Overflow)? / 16 * 16,
+    };
+    mul(mul(mul(layers, 1024)?, plane)?, 2)?.checked_add(8)
         .ok_or(MimoDraftStorageError::Overflow)
 }
 
@@ -148,6 +161,8 @@ impl MimoDraftRuntimeLayout {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MimoDraftStorageError {
+    #[error(transparent)]
+    Topk(#[from] crate::formats::dflash::DflashTopkVocabError),
     #[error("unsupported MiMo DFlash storage: {0}")]
     Unsupported(&'static str),
     #[error("MiMo DFlash storage byte count overflow")]
@@ -169,6 +184,7 @@ impl MimoDraftWeightLayout {
         g: MimoDraftGeometry,
         mode: MimoDraftRepresentation,
     ) -> Result<Self, MimoDraftStorageError> {
+        crate::formats::dflash::validate_topk_vocab(g.vocab)?;
         if [
             g.hidden,
             g.intermediate,
@@ -290,9 +306,12 @@ mod tests {
     }
 
     #[test]
-    fn retained_draft_context_mark_counts_both_bf16_planes_and_floor() {
-        assert_eq!(mimo_draft_mark_bytes(5, 8 * 128).unwrap(), 20 * 1024 * 1024 + 8);
-        assert!(mimo_draft_mark_bytes(u64::MAX, 1024).is_err());
+    fn retained_draft_context_mark_counts_both_planes_and_floor() {
+        assert_eq!(mimo_draft_mark_bytes(5, 8, 128, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap(), 20 * 1024 * 1024 + 8);
+        assert!(mimo_draft_mark_bytes(u64::MAX, 1024, 1, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+        assert_eq!(mimo_draft_mark_bytes(5, 8, 128, crate::families::qwen4::Qwen4KvCache::Fp8).unwrap(),
+            5 * 1024 * 2 * 1056 + 8);
+        assert!(mimo_draft_mark_bytes(u64::MAX, 8, 128, crate::families::qwen4::Qwen4KvCache::Fp8).is_err());
     }
 
     fn pro() -> MimoDraftGeometry {
@@ -365,7 +384,8 @@ mod tests {
             MimoDraftCapacity {
                 context_slots: 20,
                 max_batch_sequences: 16,
-                block_rows: 128
+                block_rows: 128,
+                kv_cache: crate::families::qwen4::Qwen4KvCache::Bf16,
             }
         );
         assert!(MimoDraftCapacity::new(16, 20, 8).is_err());
@@ -375,6 +395,12 @@ mod tests {
     }
     #[test]
     fn reject_overflow_and_fp8_alignment_but_preserve_bf16_geometry() {
+        for vocab in [15, i32::MAX as u64 + 1] {
+            let mut g = pro();
+            g.vocab = vocab;
+            assert!(matches!(MimoDraftWeightLayout::new(g, MimoDraftRepresentation::Bf16Only),
+                Err(MimoDraftStorageError::Topk(_))));
+        }
         let mut g = pro();
         g.hidden = 6145;
         assert!(MimoDraftWeightLayout::new(g, MimoDraftRepresentation::Fp8Only).is_err());

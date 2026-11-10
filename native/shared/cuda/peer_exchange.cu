@@ -2,10 +2,12 @@
 // `cuteafd fabric --p2p` probe that measures it against the copy engine and a
 // pinned-host bounce.
 #include "cuteafd_peer_exchange.h"
+#include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <stdint.h>
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <atomic>
 #include <thread>
@@ -62,6 +64,32 @@ __device__ void diagnostic_published(cuteafd_peer_diagnostic_t d, uint32_t seque
   __threadfence_system();
 }
 
+__device__ __forceinline__ uint32_t arrive_acq_rel_gpu(uint32_t* counter) {
+  uint32_t previous;
+  asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], 1;" : "=r"(previous) : "l"(counter) : "memory");
+  return previous;
+}
+
+// Publishes the next sequence on the peer `flag` once every block's stores are
+// visible there. The barrier orders a block's stores before its thread 0's
+// arrival, a release at GPU scope; the last block's arrival acquires every
+// other block's, and its system-scope release of the flag carries them all
+// (causality is transitive across the two scopes). Exactly one system-scope
+// operation per push: on a GeForce PCIe pair each system fence costs a PCIe
+// round trip and they serialise, so a fence per block cost about 1.3 us per
+// block (a 1 MiB push with 32 blocks took 82 us instead of 44 on 4090 Ds).
+template<bool Diagnostic>
+__device__ __forceinline__ void publish(uint32_t* flag, uint32_t* state, cuteafd_peer_diagnostic_t diagnostic) {
+  __syncthreads();
+  if (threadIdx.x == 0 && arrive_acq_rel_gpu(&state[1]) == gridDim.x - 1) {
+    state[1] = 0;
+    const uint32_t sequence = state[0] + 1;
+    state[0] = sequence;
+    store_release_sys(flag, sequence);
+    if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
+  }
+}
+
 template<bool Diagnostic = false>
 __global__ void push_signal(uint4* destination, const uint4* source, uint64_t units, uint32_t* flag,
     uint32_t* state, cuteafd_peer_diagnostic_t diagnostic = {}) {
@@ -69,20 +97,7 @@ __global__ void push_signal(uint4* destination, const uint4* source, uint64_t un
   const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
   for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < units; i += stride)
     destination[i] = source[i];
-  // Every block's peer stores are ordered before its arrival; the last block
-  // to arrive publishes the sequence (fence cumulativity carries the others').
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (atomicAdd(&state[1], 1u) == gridDim.x - 1) {
-      __threadfence_system();
-      state[1] = 0;
-      const uint32_t sequence = state[0] + 1;
-      state[0] = sequence;
-      store_release_sys(flag, sequence);
-      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
-    }
-  }
+  publish<Diagnostic>(flag, state, diagnostic);
 }
 
 // Up to four strided byte planes (each local or on the peer), then one
@@ -109,19 +124,7 @@ __global__ void push_planes(Planes planes, uint32_t* flag, uint32_t* state,
     reinterpret_cast<uint4*>(static_cast<uint8_t*>(plane.destination) + row * plane.destination_pitch)[column] =
         reinterpret_cast<const uint4*>(static_cast<const uint8_t*>(plane.source) + row * plane.source_pitch)[column];
   }
-  if (!flag) return;
-  __threadfence_system();
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    if (atomicAdd(&state[1], 1u) == gridDim.x - 1) {
-      __threadfence_system();
-      state[1] = 0;
-      const uint32_t sequence = state[0] + 1;
-      state[0] = sequence;
-      store_release_sys(flag, sequence);
-      if constexpr (Diagnostic) diagnostic_published(diagnostic, sequence);
-    }
-  }
+  if (flag) publish<Diagnostic>(flag, state, diagnostic);
 }
 
 __device__ __forceinline__ uint64_t global_ns() {
@@ -164,40 +167,6 @@ __global__ void host_signal(uint32_t* flag, uint32_t* send_state, uint32_t* desc
     const uint32_t sequence = send_state[0] + 1;
     send_state[0] = sequence;
     store_release_sys(flag, sequence);
-  }
-}
-
-__device__ __forceinline__ uint64_t load_acquire_sys_u64(const uint64_t* address) {
-  uint64_t value;
-  asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(address) : "memory");
-  return value;
-}
-
-// Waits for every rank's NIC-written completion flag (low 32 bits = the next
-// sequence of `state`), records ranks that flagged an error, then advances
-// the sequence. One warp; lane r watches rank r.
-__global__ void wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words, uint32_t* state,
-    uint32_t* error) {
-  const uint32_t expected = state[0] + 1;
-  const uint32_t rank = threadIdx.x;
-  if (rank < ranks) {
-    const uint64_t* flag = flags + uint64_t(rank) * stride_words;
-    const uint64_t start = global_ns();
-    uint32_t polls = 0;
-    uint64_t value = load_acquire_sys_u64(flag);
-    while (uint32_t(value) != expected) {
-      if ((++polls & 1023) == 0 && global_ns() - start > kWaitTimeoutNs) {
-        printf("spark wait: rank %u flag %llx, waiting for %u after 60 s\n", rank, (unsigned long long)value, expected);
-        __trap();
-      }
-      value = load_acquire_sys_u64(flag);
-    }
-    if (value >> 63) atomicOr(error, 1u << rank);
-  }
-  __syncwarp();
-  if (threadIdx.x == 0) {
-    __threadfence();
-    state[0] = expected;
   }
 }
 
@@ -262,10 +231,110 @@ __global__ void sm_copy(uint4* destination, const uint4* source, uint64_t units)
     destination[i] = source[i];
 }
 
+// Up to four byte regions in one launch (the Spark exchange's staging into
+// mapped host memory). A region whose pointers and length are 16-byte
+// aligned moves in uint4 units, any other byte by byte. SM copies run in
+// stream order behind stream memory waits, which copy-engine work need not.
+struct Regions {
+  const uint8_t* source[4];
+  uint8_t* destination[4];
+  uint64_t bytes[4];
+  uint32_t vector[4];
+  uint32_t count;
+};
+
+struct PullFrames {
+  const cuteafd_pull_frames_t* reply[CUTEAFD_PULL_MAX_RANKS];
+  uint8_t* plane[CUTEAFD_PULL_MAX_RANKS];
+  uint64_t capacity[CUTEAFD_PULL_MAX_RANKS];
+  uint32_t count;
+};
+
+constexpr uint32_t kPullWords = sizeof(cuteafd_pull_frames_t) / 8;
+static_assert(sizeof(cuteafd_pull_frames_t) % 8 == 0, "a pull descriptor is whole 8-byte words");
+
+// Pulls each rank's published reply frames from mapped pinned memory into its
+// device plane. Blocks are dealt to the ranks round-robin (block b serves rank
+// b % count): each block reads only its rank's descriptor, every word at once
+// (one PCIe round trip, the count beside the frames), and copies a strided
+// share of that rank's frames. Descriptor reads are mapped-memory
+// transactions that queue behind each other, so each block reads one rank's,
+// never all of them. A frame whose source, offset and size are 16-byte
+// aligned copies in uint4 units, otherwise in u32 units (a payload follows
+// its 96-byte header and 4-byte row indices). A frame past its plane,
+// misaligned, or of a cleared descriptor (count 0) copies nothing.
+__global__ void pull_frames(PullFrames pull) {
+  __shared__ uint64_t words[kPullWords];
+  __shared__ uint64_t source[CUTEAFD_PULL_MAX_FRAMES], destination[CUTEAFD_PULL_MAX_FRAMES],
+      units[CUTEAFD_PULL_MAX_FRAMES];
+  __shared__ uint32_t vector[CUTEAFD_PULL_MAX_FRAMES];
+  const uint32_t r = blockIdx.x % pull.count;
+  if (threadIdx.x < kPullWords)
+    words[threadIdx.x] = reinterpret_cast<const volatile uint64_t*>(pull.reply[r])[threadIdx.x];
+  __syncthreads();
+  if (threadIdx.x < CUTEAFD_PULL_MAX_FRAMES) {
+    // Word 0 holds `count` (and `reserved`); frame f is words 1 + 3f.. 3 + 3f.
+    const uint32_t f = threadIdx.x, count = uint32_t(words[0]);
+    uint64_t from = 0, offset = 0, bytes = 0;
+    if (f < count) { from = words[1 + 3 * f]; offset = words[2 + 3 * f]; bytes = words[3 + 3 * f]; }
+    const bool fits = from && offset <= pull.capacity[r] && bytes <= pull.capacity[r] - offset &&
+        ((from | offset | bytes) & 3) == 0;
+    vector[f] = ((from | offset | bytes) & 15) == 0;
+    source[f] = from;
+    destination[f] = reinterpret_cast<uint64_t>(pull.plane[r]) + offset;
+    units[f] = fits ? (vector[f] ? bytes / 16 : bytes / 4) : 0;
+  }
+  __syncthreads();
+  // This rank's blocks are r, r + count, ...: this block's place among them.
+  const uint32_t share = blockIdx.x / pull.count;
+  const uint32_t shares = (gridDim.x - r + pull.count - 1) / pull.count;
+  const uint64_t stride = uint64_t(shares) * blockDim.x, first = uint64_t(share) * blockDim.x + threadIdx.x;
+  for (uint32_t f = 0; f < CUTEAFD_PULL_MAX_FRAMES; ++f) {
+    if (vector[f]) {
+      const uint4* from = reinterpret_cast<const uint4*>(source[f]);
+      uint4* to = reinterpret_cast<uint4*>(destination[f]);
+#pragma unroll 4
+      for (uint64_t i = first; i < units[f]; i += stride) to[i] = from[i];
+    } else {
+      const uint32_t* from = reinterpret_cast<const uint32_t*>(source[f]);
+      uint32_t* to = reinterpret_cast<uint32_t*>(destination[f]);
+#pragma unroll 4
+      for (uint64_t i = first; i < units[f]; i += stride) to[i] = from[i];
+    }
+  }
+}
+
+__global__ void copy_regions(Regions regions) {
+  const uint64_t stride = uint64_t(gridDim.x) * blockDim.x;
+  const uint64_t first = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  for (uint32_t r = 0; r < regions.count; ++r) {
+    if (regions.vector[r]) {
+      const uint4* source = reinterpret_cast<const uint4*>(regions.source[r]);
+      uint4* destination = reinterpret_cast<uint4*>(regions.destination[r]);
+      for (uint64_t i = first; i < regions.bytes[r] / 16; i += stride) destination[i] = source[i];
+    } else {
+      for (uint64_t i = first; i < regions.bytes[r]; i += stride) regions.destination[r][i] = regions.source[r][i];
+    }
+  }
+  // System-scope visibility before a following stream write publishes them.
+  __threadfence_system();
+}
+
 unsigned default_blocks(uint64_t units, uint32_t blocks) {
   if (blocks) return blocks;
   const uint64_t wanted = (units + 1023) / 1024;
   return unsigned(std::max<uint64_t>(1, std::min<uint64_t>(wanted, 32)));
+}
+
+// Staging copies are bandwidth-bound and overlap compute: at most an eighth of
+// this device's SMs (at least 8), queried at runtime so the RTX PRO 6000, the
+// 5090 and GB10 each size their own grid.
+unsigned staging_blocks(uint64_t units) {
+  int device = 0, sms = 0;
+  if (cudaGetDevice(&device) != cudaSuccess ||
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess || sms <= 0) sms = 64;
+  const uint64_t cap = std::max<uint64_t>(8, uint64_t(sms) / 8);
+  return unsigned(std::max<uint64_t>(1, std::min<uint64_t>((units + 1023) / 1024, cap)));
 }
 
 #define CHECK(call) do { const cudaError_t status_ = (call); if (status_ != cudaSuccess) return status_; } while (0)
@@ -338,7 +407,7 @@ extern "C" int32_t cuteafd_peer_exchange_initialize() {
   for (const void* kernel : {reinterpret_cast<const void*>(push_signal<false>), reinterpret_cast<const void*>(push_planes<false>),
        reinterpret_cast<const void*>(wait_flag),
        reinterpret_cast<const void*>(add_bf16), reinterpret_cast<const void*>(host_signal),
-       reinterpret_cast<const void*>(wait_written)}) {
+       reinterpret_cast<const void*>(copy_regions), reinterpret_cast<const void*>(pull_frames)}) {
     const cudaError_t status = cudaFuncGetAttributes(&attributes, kernel);
     if (status != cudaSuccess) return status;
   }
@@ -454,13 +523,6 @@ extern "C" int32_t cuteafd_host_signal(uint32_t* flag, uint32_t* send_state, uin
   if (!flag || !send_state || !descriptor || !words || !stream) return cudaErrorInvalidValue;
   host_signal<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flag, send_state, descriptor,
       make_uint4(words[0], words[1], words[2], words[3]));
-  return cudaGetLastError();
-}
-
-extern "C" int32_t cuteafd_spark_wait_written(const uint64_t* flags, uint32_t ranks, uint32_t stride_words,
-    uint32_t* state, uint32_t* error, void* stream) {
-  if (!flags || !state || !error || !stream || !ranks || ranks > 32 || !stride_words) return cudaErrorInvalidValue;
-  wait_written<<<1, 32, 0, static_cast<cudaStream_t>(stream)>>>(flags, ranks, stride_words, state, error);
   return cudaGetLastError();
 }
 
@@ -702,5 +764,206 @@ extern "C" int32_t cuteafd_p2p_probe(int32_t a, int32_t b, uint64_t bytes, int32
     return cudaErrorUnknown;
   *microseconds = median(samples);
   CHECK(cudaSetDevice(previous));
+  return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t blocks, void* stream);
+
+extern "C" int32_t cuteafd_pull_frames(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, void* stream) {
+  return cuteafd_pull_frames_blocks(replies, planes, capacity, count, 0, stream);
+}
+
+extern "C" int32_t cuteafd_pull_frames_blocks(const cuteafd_pull_frames_t* const* replies, void* const* planes,
+    const uint64_t* capacity, uint32_t count, uint32_t grid, void* stream) {
+  if (!replies || !planes || !capacity || !count || count > CUTEAFD_PULL_MAX_RANKS || !stream || grid > 1024)
+    return cudaErrorInvalidValue;
+  PullFrames pull{};
+  pull.count = count;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (!replies[r] || !planes[r] || (reinterpret_cast<uintptr_t>(planes[r]) & 15)) return cudaErrorInvalidValue;
+    pull.reply[r] = replies[r];
+    pull.plane[r] = static_cast<uint8_t*>(planes[r]);
+    pull.capacity[r] = capacity[r];
+  }
+  // Sized by the planes' capacity (an upper bound on the bytes): about eight
+  // 16-byte units per thread, up to 64 blocks of 256 threads per rank, which
+  // reach the mapped-memory read rate (~53 GB/s, PCIe gen5); a decode-sized
+  // wave takes a block per rank. A wider grid reads more descriptors for no
+  // more bandwidth.
+  uint64_t capacity_units = 0;
+  for (uint32_t r = 0; r < count; ++r) capacity_units += capacity[r] / 16;
+  // A caller-chosen grid wins; 0 keeps this sizing. Either is a whole number
+  // of blocks per rank.
+  const uint64_t sized = grid ? grid
+      : std::min<uint64_t>(std::max<uint64_t>((capacity_units + 2047) / 2048, 1), 64ull * count);
+  const uint64_t blocks = (sized + count - 1) / count * count;
+  pull_frames<<<unsigned(blocks), 256, 0, static_cast<cudaStream_t>(stream)>>>(pull);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_sm_copy_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream) {
+  if (!destinations || !sources || !bytes || !count || count > 4 || !stream) return cudaErrorInvalidValue;
+  Regions regions{};
+  regions.count = count;
+  uint64_t largest = 1;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (bytes[r] && (!destinations[r] || !sources[r])) return cudaErrorInvalidValue;
+    regions.source[r] = static_cast<const uint8_t*>(sources[r]);
+    regions.destination[r] = static_cast<uint8_t*>(destinations[r]);
+    regions.bytes[r] = bytes[r];
+    regions.vector[r] = ((reinterpret_cast<uintptr_t>(sources[r]) | reinterpret_cast<uintptr_t>(destinations[r]) |
+        bytes[r]) & 15) == 0;
+    const uint64_t units = regions.vector[r] ? bytes[r] / 16 : bytes[r];
+    if (units > largest) largest = units;
+  }
+  copy_regions<<<staging_blocks(largest), 256, 0, static_cast<cudaStream_t>(stream)>>>(regions);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_cuda_stream_capturing(void* stream, int32_t* capturing) {
+  if (!capturing) return cudaErrorInvalidValue;
+  cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+  const cudaError_t queried = cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status);
+  if (queried != cudaSuccess) return queried;
+  *capturing = status != cudaStreamCaptureStatusNone;
+  return cudaSuccess;
+}
+
+extern "C" int32_t cuteafd_copy_engine_regions(void* const* destinations, const void* const* sources,
+    const uint64_t* bytes, uint32_t count, void* stream) {
+  if (!destinations || !sources || !bytes || !count || count > 4 || !stream) return cudaErrorInvalidValue;
+  for (uint32_t r = 0; r < count; ++r)
+    if (bytes[r] && (!destinations[r] || !sources[r])) return cudaErrorInvalidValue;
+  for (uint32_t r = 0; r < count; ++r) {
+    if (!bytes[r]) continue;
+    const cudaError_t status = cudaMemcpyAsync(destinations[r], sources[r], bytes[r], cudaMemcpyDefault,
+        static_cast<cudaStream_t>(stream));
+    if (status != cudaSuccess) return status;
+  }
+  return cudaSuccess;
+}
+
+namespace {
+// The staging probe's own resources; freed on every return path.
+struct StagingProbeSide {
+  cudaStream_t stream = nullptr;
+  cudaEvent_t start = nullptr, stop = nullptr;
+  uint8_t* source = nullptr;
+  uint32_t* words = nullptr;  // mapped pinned: [hold, satisfied, published]
+  ~StagingProbeSide() {
+    if (stream) cudaStreamSynchronize(stream);
+    if (start) cudaEventDestroy(start);
+    if (stop) cudaEventDestroy(stop);
+    if (source) cudaFree(source);
+    if (words) cudaFreeHost(words);
+    if (stream) cudaStreamDestroy(stream);
+  }
+};
+
+CUdeviceptr mapped_alias(uint32_t* word) {
+  void* alias = nullptr;
+  return cudaHostGetDevicePointer(&alias, word, 0) == cudaSuccess ? reinterpret_cast<CUdeviceptr>(alias) : 0;
+}
+
+// Whether `bytes` of the host arena all read `value` (every 64th byte: a
+// copy-engine copy lands in whole lines).
+bool arena_reads(const uint8_t* host, uint64_t bytes, uint8_t value) {
+  const volatile uint8_t* seen = host;
+  for (uint64_t i = 0; i < bytes; i += 64)
+    if (seen[i] != value) return false;
+  return seen[bytes - 1] == value;
+}
+}  // namespace
+
+extern "C" int32_t cuteafd_staging_probe(void* host, void* alias, uint64_t capacity, uint32_t regions,
+    cuteafd_staging_probe_t* out) {
+  if (!host || !alias || !out || regions < 1 || regions > 4 || capacity < 4096) return cudaErrorInvalidValue;
+  *out = cuteafd_staging_probe_t{};
+  const uint64_t largest = std::min<uint64_t>(capacity & ~uint64_t(15), 512u << 10);
+  StagingProbeSide side;
+  CHECK(cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking));
+  CHECK(cudaEventCreate(&side.start));
+  CHECK(cudaEventCreate(&side.stop));
+  CHECK(cudaMalloc(&side.source, largest));
+  CHECK(cudaMemsetAsync(side.source, 0xA5, largest, side.stream));
+  CHECK(cudaHostAlloc(&side.words, 64, cudaHostAllocMapped | cudaHostAllocPortable));
+  std::memset(side.words, 0, 64);
+  const CUdeviceptr hold = mapped_alias(side.words), satisfied = mapped_alias(side.words + 1),
+      published = mapped_alias(side.words + 2);
+  if (!hold || !satisfied || !published) return cudaErrorInvalidValue;
+  CHECK(cudaStreamSynchronize(side.stream));
+  const CUstream stream = reinterpret_cast<CUstream>(side.stream);
+  uint8_t* arena = static_cast<uint8_t*>(host);
+  volatile uint32_t* hold_word = side.words;
+
+  // 1. A copy-engine copy queued behind a pending stream wait must not land
+  // (nor the stream go idle) until the host releases the wait.
+  bool held = true;
+  for (const uint64_t bytes : {uint64_t(4096), largest}) {
+    std::memset(arena, 0, bytes);
+    *hold_word = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (cuStreamWaitValue32(stream, hold, 1, CU_STREAM_WAIT_VALUE_GEQ) != CUDA_SUCCESS) return cudaErrorUnknown;
+    CHECK(cudaMemcpyAsync(alias, side.source, bytes, cudaMemcpyDefault, side.stream));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    const cudaError_t idle = cudaStreamQuery(side.stream);
+    if (idle != cudaErrorNotReady) held = false;
+    if (!arena_reads(arena, bytes, 0)) held = false;
+    *hold_word = 1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    CHECK(cudaStreamSynchronize(side.stream));
+    cudaGetLastError();  // clears the query's not-ready
+    if (!arena_reads(arena, bytes, 0xA5)) return cudaErrorUnknown;  // the copy itself went wrong
+    if (!held) break;
+  }
+  out->copy_engine_held = held;
+  if (!held) return cudaSuccess;
+
+  // 2. The staging sequence per wave, SM against copy engine, best of two
+  // timed passes after a warm one.
+  constexpr uint32_t kWaves = 16;
+  for (uint64_t total = 2048; total <= largest && out->probes < CUTEAFD_STAGING_PROBE_SIZES; total *= 2) {
+    void* destinations[4];
+    const void* sources[4];
+    uint64_t sizes[4];
+    const uint64_t part = (total / regions) & ~uint64_t(15);
+    for (uint32_t r = 0; r < regions; ++r) {
+      destinations[r] = static_cast<uint8_t*>(alias) + r * part;
+      sources[r] = side.source + r * part;
+      sizes[r] = r + 1 < regions ? part : total - part * (regions - 1);
+    }
+    float best[2] = {0, 0};
+    for (int engine = 0; engine < 2; ++engine) {
+      for (int pass = 0; pass < 3; ++pass) {
+        CHECK(cudaEventRecord(side.start, side.stream));
+        for (uint32_t wave = 0; wave < kWaves; ++wave) {
+          if (cuStreamWaitValue32(stream, satisfied, 0, CU_STREAM_WAIT_VALUE_GEQ) != CUDA_SUCCESS) return cudaErrorUnknown;
+          const int32_t status = engine ? cuteafd_copy_engine_regions(destinations, sources, sizes, regions, side.stream)
+                                        : cuteafd_sm_copy_regions(destinations, sources, sizes, regions, side.stream);
+          if (status != cudaSuccess) return status;
+          if (cuStreamWriteValue32(stream, published, wave, CU_STREAM_WRITE_VALUE_DEFAULT) != CUDA_SUCCESS)
+            return cudaErrorUnknown;
+        }
+        CHECK(cudaEventRecord(side.stop, side.stream));
+        CHECK(cudaEventSynchronize(side.stop));
+        float ms = 0;
+        CHECK(cudaEventElapsedTime(&ms, side.start, side.stop));
+        const float us = 1000.0f * ms / kWaves;
+        if (pass > 0 && (pass == 1 || us < best[engine])) best[engine] = us;
+      }
+    }
+    out->bytes[out->probes] = total;
+    out->sm_us[out->probes] = best[0];
+    out->copy_engine_us[out->probes] = best[1];
+    ++out->probes;
+  }
+  // The smallest probed total from which the copy engine wins at every larger probe.
+  for (uint32_t p = out->probes; p-- > 0;) {
+    if (out->copy_engine_us[p] >= out->sm_us[p]) break;
+    out->crossover_bytes = out->bytes[p];
+  }
   return cudaSuccess;
 }

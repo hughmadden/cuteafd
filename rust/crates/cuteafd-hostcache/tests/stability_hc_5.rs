@@ -104,7 +104,7 @@ impl Soak {
         let expected = stored_bytes(self.cache.engine_mut(), &snapshot);
         let outcome = self.cache.store(&snapshot, self.generation as u64);
         // The cache may evict unpinned snapshots while planning under class exhaustion.
-        reconcile(&self.cache, &mut self.model);
+        reconcile(&self.cache, &mut self.model, &snapshot.meta);
         self.prune_stored();
         if let StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) = outcome {
             let key = self.model.plan(&snapshot.meta, &device_pages(&snapshot));

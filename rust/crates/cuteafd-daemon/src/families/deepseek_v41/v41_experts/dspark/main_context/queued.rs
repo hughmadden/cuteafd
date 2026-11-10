@@ -17,7 +17,7 @@ impl DsparkMainContext<'_, '_> {
             host[i*8..i*8+8].copy_from_slice(&position.to_ne_bytes());
         }
         for stage in 0..3 {
-            host[self.capacity as usize*8+stage*384..self.capacity as usize*8+(stage+1)*384]
+            host[self.capacity as usize*8+stage*cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES..self.capacity as usize*8+(stage+1)*cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES]
                 .copy_from_slice(writes[stage].descriptor_bytes());
         }
         self.pending_writes = Some(writes); // Own reservations before any launch.
@@ -28,9 +28,9 @@ impl DsparkMainContext<'_, '_> {
             let span = self.timing.begin("context", None, rows as usize, self.stream.raw)?;
             self.enqueue(rows)?;
             for stage in 0..3 {
-                let start = self.capacity as usize*8 + stage*384;
+                let start = self.capacity as usize*8 + stage*cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES;
                 lib.copy_h2d_async(self.commit_descriptors[stage].buffer,
-                    &self.commit_staging.bytes_mut()[start..start+384], self.stream.raw)?;
+                    &self.commit_staging.bytes_mut()[start..start+cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES], self.stream.raw)?;
                 windows[stage].enqueue_write(&self.pending_writes.as_ref().unwrap()[stage],
                     self.rotated[stage].buffer, self.commit_descriptors[stage].buffer, self.stream.raw)?;
             }
@@ -41,6 +41,11 @@ impl DsparkMainContext<'_, '_> {
     pub fn poll_commit(&self) -> Result<bool> {
         ensure!(self.pending_writes.is_some(), "main-context commit not pending");
         unsafe { self.stream.library.cuda_stream_query(self.stream.raw) }
+    }
+    /// poll_commit for a caller that blocks until the commit drains.
+    pub fn wait_commit(&self) -> Result<()> {
+        ensure!(self.pending_writes.is_some(), "main-context commit not pending");
+        self.synchronize()
     }
     pub fn publish_commit(&mut self, windows: &mut [DsparkWindow<'_>; 3]) -> Result<()> {
         ensure!(self.poll_commit()?, "main-context commit has not completed");

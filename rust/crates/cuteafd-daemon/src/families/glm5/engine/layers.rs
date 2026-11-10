@@ -9,16 +9,18 @@ pub(super) struct Execution<'a> {
     plan: LayerExecutionPlan,
     hops: HopLink<'a>,
     // Keep dispatched receivers owned across submission errors until engine drainage.
-    waves: RefCell<Vec<Option<SparkExpertWave>>>,
+    waves: RefCell<Vec<Option<PendingWave>>>,
     pub(super) segments: Vec<GlmOwnedSegment>,
 }
 
 enum Transport<'t, 'l> {
     Serial(Option<(&'t mut SparkLink<'l>, &'t tokio::runtime::Runtime)>),
-    Lane(&'t mut SparkLane<'l>),
+    Continuous(&'t mut crate::shared::spark_waves::Waves<'l>),
+    Local,
 }
 
 struct Bindings<'e, 'a, 't, 'l, 'c> {
+    unit: Option<&'e crate::shared::prefill_pipeline::Unit>,
     engine: &'e GlmEngine<'a>,
     work: [&'e Workspace<'a>; 2],
     tables: &'e [StepTables; 2],
@@ -29,12 +31,41 @@ struct Bindings<'e, 'a, 't, 'l, 'c> {
     tap: (usize, usize, usize),
 }
 
+enum PendingWave {
+    Landed(usize),
+    Dispatched(crate::shared::spark_waves::WaveTicket),
+}
+
+struct UnitExchange<'e, 'a> {
+    engine: &'e GlmEngine<'a>,
+    execution: &'e Execution<'a>,
+}
+
+impl attention::LayerProtocol for UnitExchange<'_, '_> {
+    type Ticket = crate::shared::peer_split::hop::HopTicket;
+    fn require_live(&self) -> Result<()> { self.engine.exchange()?.require_live() }
+    fn push_entry(&self, from: usize, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()> {
+        self.engine.exchange()?.push_to(from, DIRECT, source, destination, bytes)
+    }
+    fn wait_entry(&self, to: usize) -> Result<()> { self.engine.exchange()?.wait(to, DIRECT) }
+    fn send(&self, index: usize, lane: usize, source: *const c_void, rows: usize) -> Result<Self::Ticket> {
+        self.execution.hops.send(index, lane, source, rows)
+    }
+    fn land(&self, ticket: Self::Ticket) -> Result<*mut c_void> { self.execution.hops.land(ticket) }
+}
+
 #[derive(Clone, Copy)]
-enum Ticket {
+pub(super) enum Ticket {
     Complete,
     Skip(usize),
     Spark,
     Lane,
+}
+
+fn validate_owned_kv(cfg: &GlmDsaConfig, index: usize, pages: usize, owned: bool, bytes: usize) -> Result<()> {
+    ensure!(bytes == if owned { (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 },
+        "GLM layer {index} KV ownership differs from placement");
+    Ok(())
 }
 
 impl<'a> GlmEngine<'a> {
@@ -54,10 +85,10 @@ impl<'a> GlmEngine<'a> {
             for rank in 0..2 {
                 let layer = if rank == 0 { &self.weights.layers[index] } else { &self.peer()?.layers[index] };
                 ensure!(layer.split && !layer.attention_split && layer.attention_owner == Some(gpu)
-                    && layer.range("q_a_norm").is_some() == (gpu as usize == rank), "GLM layer {index} owner differs from loaded weights");
-                let (kv, index_cache, _) = self.rank_caches(rank, index);
-                ensure!(kv.buffer.bytes == if rank == gpu as usize { (self.pages + 1) * RECORD_PAGE_BYTES } else { 256 },
-                    "GLM layer {index} KV ownership differs from placement");
+                    && layer.holds_attention() == (gpu as usize == rank), "GLM layer {index} owner differs from loaded weights");
+                let (kv, index_cache, _) = self.rank_caches_of(rank, index);
+                let owned = rank == gpu as usize && self.cfg.owns_kv(index);
+                validate_owned_kv(&self.cfg, index, self.pages, owned, kv.buffer.bytes)?;
                 ensure!(index_cache.is_some() == (rank == gpu as usize && layer.full_indexer), "GLM index ownership");
             }
             if self.cfg.index_source(index) < plan.modes().len() {
@@ -66,7 +97,7 @@ impl<'a> GlmEngine<'a> {
         }
         let exchange = self.exchange()?;
         let mut hops = HopLink::new(self.library, [0, 1].map(|rank| RankDevice {
-            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec)?;
+            device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec, DECODE_ROWS * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
         let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
@@ -82,7 +113,7 @@ impl<'a> GlmEngine<'a> {
         (0..self.weights.layers.len()).map(|index| (0..2).filter(|&rank| {
             let layer = if rank == 0 { &self.weights.layers[index] }
                 else { &self.peer.as_ref().unwrap().layers[index] };
-            layer.range("q_a_norm").is_some() && self.rank_caches(rank, index).0.buffer.bytes > 256
+            layer.holds_attention() && self.rank_caches(rank, index).0.buffer.bytes > 256
         }).map(|rank| rank as u8).collect()).collect()
     }
 
@@ -98,43 +129,80 @@ impl<'a> GlmEngine<'a> {
         experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>) -> Result<Option<DeviceLogits>> {
         let owners = self.loaded_attention_owners();
-        let mut bindings = [Bindings { engine: self, work: [w, w1], tables, lane: 0,
+        let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables, lane: 0,
             transport: Transport::Serial(experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime))),
-            owners, on_layer, tap: (rows.saturating_sub(super::super::dflash::TAP_ROWS), rows.min(super::super::dflash::TAP_ROWS), 0) }];
+            owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
         if self.weights.layers.len() < self.cfg.layers { return Ok(None); }
-        if wanted == 0 {
-            // SAFETY: the completed pipeline owns this stream and its KV writes.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            return Ok(None);
-        }
+        if wanted == 0 { return Ok(None); }
         self.launch_head(w, rows, wanted)?;
         if tables[0].decode && rows == wanted { self.select_greedy(w, rows)?; }
         Ok(Some(self.device_logits(w, wanted, tables[0].decode && rows == wanted)))
     }
 
-    pub(super) fn layer_prefill(&self, scope: &SubmissionScope<'_>, work: &[&Workspace<'a>],
-        peers: &PeerWorkspaces<'_, 'a>, tables: &[[StepTables; 2]], wanted: usize) -> Result<Option<StepLogits>> {
-        let mut transports = self.lanes.borrow_mut();
-        ensure!(transports.len() >= tables.len(), "GLM per-layer lane transport inventory");
-        let total = tables.iter().map(|t| t[0].positions.len()).sum::<usize>();
-        let mut first = 0;
-        let mut bindings = Vec::new();
-        for (lane, ((table, w), transport)) in tables.iter().zip(work).zip(transports.iter_mut()).enumerate() {
-            let rows = table[0].positions.len();
-            let start = total.saturating_sub(super::super::dflash::TAP_ROWS).max(first).min(first + rows);
-            let owners = self.loaded_attention_owners();
-            bindings.push(Bindings { engine: self, work: [w, peers.get(lane)?], tables: table, lane,
-                transport: Transport::Lane(transport), owners, on_layer: None,
-                tap: (start - first, first + rows - start, start.saturating_sub(total.saturating_sub(super::super::dflash::TAP_ROWS))) });
-            first += rows;
+    pub(super) fn validate_owned_units(&self) -> Result<usize> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        execution.hops.validate_binding(&execution.plan, self.exchange()?)?;
+        for (layer, owners) in self.loaded_attention_owners().iter().enumerate() {
+            execution.plan.validate_state_owners(layer, owners)?;
         }
-        self.run_layer_pipeline(scope, LaneOrder::OrderedChunks, &mut bindings)?;
-        if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        let counts: Vec<_> = tables.iter().map(|table| table[0].positions.len()).collect();
-        self.prefill_logits(work, &counts, wanted)
+        Ok(execution.plan.hops().len())
     }
+
+    fn unit_binding<'s, 't, 'l>(&'s self, work: [&'s Workspace<'a>; 2], tables: &'s [StepTables; 2],
+        unit: &'s crate::shared::prefill_pipeline::Unit, total: usize, transport: Transport<'t, 'l>)
+        -> Bindings<'s, 'a, 't, 'l, 's> {
+        let window = total.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS);
+        let from = unit.rows.start.max(window).min(unit.rows.end);
+        Bindings { unit: Some(unit), engine: self, work, tables, lane: unit.slot, transport,
+            owners: self.loaded_attention_owners(), on_layer: None,
+            tap: (from - unit.rows.start, unit.rows.end - from, from.saturating_sub(window)) }
+    }
+
+    pub(super) fn owned_unit_attention(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        let exchange = UnitExchange { engine: self, execution };
+        let mut binding = self.unit_binding(work, tables, unit, total, Transport::Local);
+        unit_attention(&exchange, &execution.plan, unit, layer, &mut binding, consumed)
+    }
+
+    pub(super) fn owned_unit_begin(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        waves: &mut crate::shared::spark_waves::Waves<'_>) -> Result<Ticket> {
+        self.unit_binding(work, tables, unit, total, Transport::Continuous(waves)).begin_ffn(layer, None)
+    }
+
+    pub(super) fn owned_unit_finish(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, layer: usize, total: usize,
+        waves: &mut crate::shared::spark_waves::Waves<'_>, ticket: Ticket) -> Result<()> {
+        self.unit_binding(work, tables, unit, total, Transport::Continuous(waves)).finish_ffn(layer, ticket)
+    }
+
+    pub(super) fn owned_unit_exit(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
+        unit: &crate::shared::prefill_pipeline::Unit, total: usize, consumed: &mut [usize]) -> Result<()> {
+        let execution = self.layer_execution.as_ref().context("GLM layer execution")?;
+        let exchange = UnitExchange { engine: self, execution };
+        let mut binding = self.unit_binding(work, tables, unit, total, Transport::Local);
+        unit_exit(&exchange, &execution.plan, unit, &mut binding, consumed)
+    }
+}
+
+fn unit_attention(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan,
+    unit: &crate::shared::prefill_pipeline::Unit, layer: usize, kernels: &mut impl LayerKernels,
+    consumed: &mut [usize]) -> Result<()> {
+    attention::pipeline_attention(exchange, plan, layer, unit.slot, unit.rows.len(), kernels, consumed)?;
+    Ok(())
+}
+
+fn unit_exit(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan,
+    unit: &crate::shared::prefill_pipeline::Unit, kernels: &mut impl LayerKernels,
+    consumed: &mut [usize]) -> Result<()> {
+    attention::pipeline_hops(exchange, plan, HopPoint::Exit, unit.slot, unit.rows.len(), kernels, consumed)?;
+    ensure!(consumed.len() == plan.hops().len() && consumed.iter().all(|&count| count == 1),
+        "planned unit hop missing or duplicated");
+    Ok(())
 }
 
 impl Bindings<'_, '_, '_, '_, '_> {
@@ -171,13 +239,20 @@ impl Bindings<'_, '_, '_, '_, '_> {
                     let local = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
                     let peer = e.recv(rank, slot(index, true, self.lane))?;
                     let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
-                    e.norm_full(rank, w, weight, 2, Scalar::I32(self.rows() as i32), first, second)
+                    e.ffn_norm(rank, index, self.lane, w, self.layer(rank, index), weight,
+                        Scalar::I32(self.rows() as i32), first, second)
                 }
             })?;
         }
         if let Some(drafter) = &e.drafter {
-            let (first, rows, offset) = self.tap;
-            if rows > 0 { drafter.tap_at(index, self.work[0].h.buffer.ptr, first, rows, offset)?; }
+            if self.tables[0].segments.is_empty() {
+                let (first, rows, offset) = self.tap;
+                if rows > 0 { drafter.tap_at(index, self.work[0].h.buffer.ptr, first, rows, offset)?; }
+            } else {
+                for (s, _) in &self.tables[0].segments {
+                    drafter.tap_at(index, self.work[0].h.buffer.ptr, s.end_row() - s.tap_rows, s.tap_rows, s.tap_offset)?;
+                }
+            }
         }
         Ok(())
     }
@@ -214,7 +289,7 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
             let rows = Scalar::I32(self.rows() as i32);
             if index == 0 { e.norm_full(rank, w, self.layer(rank, index).ptr("input_norm")?, 0, rows,
                 w.delta.buffer.ptr, w.delta.buffer.ptr)?; }
-            e.attention_on(rank, w, index, self.layer(rank, index), rows, self.cap(), &self.tables[rank])?;
+            e.attention_unit(rank, w, index, self.layer(rank, index), rows, self.cap(), self.tables, self.lane)?;
             e.norm_full(rank, w, self.layer(rank, index).ptr("post_norm")?, 1, rows,
                 w.delta.buffer.ptr, w.delta.buffer.ptr)
         })
@@ -236,21 +311,26 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         ensure!(owner.is_none(), "GLM FFNs are split");
         let e = self.engine;
         let [w, w1] = self.work;
-        let layer = self.layer(0, index);
+        let layer = &e.weights.layers[index];
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(w, layer, self.rows())?;
-            e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)?;
+            e.ring_local_routes(index, w, self.rows())?;
+            e.shared_on(0, index, w, layer, rows, self.cap())?;
             e.moe_front_on(1, w1, self.layer(1, index), self.rows())?;
-            e.ffn_on(1, w1, self.layer(1, index), e.cfg.moe_intermediate, self.cap(), w1.shared.buffer.ptr, rows)?;
+            e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
             let pair = e.tp2.as_ref().context("TP2")?;
             e.tp2_rank(pair, 0, index, self.lane, w, self.rows())?;
             e.tp2_rank(pair, 1, index, self.lane, w1, self.rows())?;
             return Ok(Ticket::Complete);
         }
-        self.segment(1, index, GlmOwnedPhase::FfnFront, || e.ffn_on(1, w1, self.layer(1, index),
-            if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
-            if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows))?;
+        self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+            e.ffn_on(1, w1, self.layer(1, index),
+                if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate }, self.cap(),
+                if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr }, rows)?;
+            if !layer.dense { e.meet_shared_core(1, index, w1, self.layer(1, index), self.rows())?; }
+            Ok(())
+        })?;
         if self.tables[0].decode && !layer.dense {
             if let Some(l2) = &e.peer()?.l2 {
                 e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
@@ -263,19 +343,21 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
-        e.moe_stage(w, index, layer, real, self.cap())?;
         let decode = self.tables[0].decode;
-        if decode { e.prefetch(index)?; }
-        match &mut self.transport {
-            Transport::Serial(Some((link, _))) => {
-                let execution = e.layer_execution.as_ref().context("layer execution")?;
-                ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
-                execution.waves.borrow_mut()[self.lane] = Some(e.moe_send(w, index, real, decode, link)?);
-                Ok(Ticket::Spark)
-            },
-            Transport::Lane(lane) => { e.lane_send(w, index, real, lane)?; Ok(Ticket::Lane) }
+        let execution = e.layer_execution.as_ref().context("layer execution")?;
+        ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
+        // Routes and wire rows go to the link's exchange; the shared expert
+        // and the prefetch queue behind them; the planes' wait is queued in
+        // `finish_ffn`. The host never waits for the GPU or the Sparks.
+        let cap = self.cap();
+        let (pending, ticket) = match &mut self.transport {
+            Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
+                link.exchange()?)?), Ticket::Spark),
+            Transport::Continuous(waves) => (PendingWave::Dispatched(e.moe_wave(w, index, layer, real, cap, waves, self.unit.map(|unit| unit.reply_origins()).transpose()?.flatten())?), Ticket::Lane),
             _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
-        }
+        };
+        execution.waves.borrow_mut()[self.lane] = Some(pending);
+        Ok(ticket)
     }
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
         let e = self.engine;
@@ -283,30 +365,42 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let real = self.tables[0].exchange_rows;
         let planes = match ticket {
             Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
-            Ticket::Spark => match &mut self.transport {
-                Transport::Serial(Some((link, runtime))) => {
-                    let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
-                        .take().context("missing dispatched Spark wave")?;
-                    Some((link.intake.pointers(), runtime.block_on(e.moe_land(real, link, wave))?))
-                },
-                _ => anyhow::bail!("Spark completion transport changed"),
-            },
-            Ticket::Lane => match &mut self.transport {
-                Transport::Lane(lane) => Some((lane.intake.pointers(), e.lane_land(real, lane)?)),
-                _ => anyhow::bail!("lane completion transport changed"),
-            },
+            Ticket::Spark | Ticket::Lane => {
+                let pending = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
+                    .take().context("missing dispatched Spark wave")?;
+                let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>, slot| -> Result<()> {
+                    // SAFETY: the landed slot and workspace are ordered on the engine stream.
+                    unsafe { waves.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), real, e.stream) }
+                };
+                match (&mut self.transport, ticket, pending) {
+                    (Transport::Serial(Some((link, _))), Ticket::Spark, PendingWave::Landed(slot)) => reduce(link.exchange()?, slot)?,
+                    (Transport::Continuous(waves), Ticket::Lane, PendingWave::Dispatched(wave)) => {
+                        let slot = wave.slot();
+                        waves.land(wave, e.stream)?;
+                        reduce(waves, slot)?;
+                    }
+                    _ => anyhow::bail!("Spark completion transport changed"),
+                }
+                None
+            }
             Ticket::Complete => None,
         };
         if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
+        if !self.layer(0, index).dense { e.tap_width(w, index, real)?; }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {
                 let w = self.work[rank];
-                let out = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
-                e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
+                let layer = self.layer(rank, index);
+                if layer.dense { e.publish_projection(rank, index, self.lane, w, layer, "down", self.rows())?; }
+                else {
+                    let out = if rank == 0 { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
+                    e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
+                }
             }
         }
         self.join(index)?;
+        if !self.layer(0, index).dense { e.finish_width_tap(w, index, real)?; }
         let bytes = self.rows() * e.cfg.hidden * 2;
         if let Some(callback) = self.on_layer.as_mut() { callback(index, &e.download(&w.h, bytes)?)?; }
         if let Some(probe) = e.draft_probe.borrow_mut().as_mut() {
@@ -326,6 +420,25 @@ mod tests {
     use cuteafd_loader::placement::{plan_hops, residual_homes, AttentionPlacement, ExpertHome,
         HopSpec, LayerAssignment, TerminalHome};
 
+    #[test]
+    fn ml4_binding_validates_local_kv_while_execution_reads_the_latent_source() -> Result<()> {
+        let cfg = GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::mistral_large4_config())?;
+        let borrower = (0..cfg.layers).find(|&layer| !cfg.owns_kv(layer)).context("ML4 latent borrower")?;
+        let source = cfg.kv_source(borrower);
+        let pages = 3;
+        let mut buffers = vec![256usize; cfg.layers];
+        buffers[source] = (pages + 1) * PAGE_ROWS * cfg.record_bytes(source);
+        assert!(cfg.owns_kv(source));
+        validate_owned_kv(&cfg, source, pages, true, buffers[source])?;
+        validate_owned_kv(&cfg, borrower, pages, false, buffers[borrower])?;
+        let effective = latent_cache(&cfg, borrower, &buffers);
+        assert!(std::ptr::eq(effective, &buffers[source]));
+        assert!(!std::ptr::eq(effective, &buffers[borrower]));
+        assert!(validate_owned_kv(&cfg, borrower, pages, false, *effective).is_err());
+        assert!(validate_owned_kv(&cfg, source, pages, true, 256).is_err());
+        Ok(())
+    }
+
     struct Trace {
         plan: LayerExecutionPlan,
         schedule: RefCell<HostSchedule>,
@@ -333,6 +446,7 @@ mod tests {
         lane: Cell<usize>,
         fail: Option<usize>,
         calls: Cell<usize>,
+        k6: bool,
     }
     struct Lane<'a> { trace: &'a Trace, lane: usize }
 
@@ -343,16 +457,16 @@ mod tests {
                 gpu: first ^ ((layer / 4) % 2) as u8, ffn: FfnMode::Split }).collect();
             let spec = HopSpec { storage: cuteafd_loader::placement::HopStorage::ReceiveSlots, row_bytes: 32, rows: 8, lanes: lanes as u64,
                 entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Replicated };
-            let placement = Placement { pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]),
+            let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]),
                 attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
-                peer_row_bytes: 0, onboard_layers: 0,
+                peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
                 layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
                 movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec).unwrap(),
                 tp2: None, items: vec![], hops: plan_hops(&modes, &spec).unwrap() };
             let plan = LayerExecutionPlan::new(&placement, spec).unwrap();
             let owners = (0..modes.len()).map(|layer| plan.attention_owners(layer).unwrap()).collect();
             Self { plan, owners, schedule: RefCell::new(Default::default()), lane: Cell::new(0),
-                fail: None, calls: Cell::new(0) }
+                fail: None, calls: Cell::new(0), k6: false }
         }
         fn callback(&self) -> Result<()> {
             let call = self.calls.replace(self.calls.get() + 1);
@@ -417,8 +531,22 @@ mod tests {
                     schedule.push(0, "routes", at, "TP2 routes");
                     schedule.wait(1, "routes", at, "TP2 routes");
                 }
-                2 => schedule.sync(0, "Spark route staging"),
+                2 => {
+                    if self.trace.k6 {
+                        let at = slot(layer, true, self.lane);
+                        schedule.push_to(1, "main", at, 1, "K6 shared core");
+                        schedule.wait_for(1, "main", at, 1, "K6 shared meet");
+                    }
+                    schedule.sync(0, "Spark route staging");
+                }
                 _ => (),
+            }
+            if self.trace.k6 && layer % 3 != 0 {
+                let at = slot(layer, true, self.lane);
+                for rank in 0..if layer % 3 == 1 { 2 } else { 1 } {
+                    schedule.push_to(rank, "main", at, 1, "K6 shared core");
+                    schedule.wait_for(rank, "main", at, 1, "K6 shared meet");
+                }
             }
             if layer % 3 == 1 {
                 for rank in 0..2 { schedule.push(rank, "main", slot(layer, true, self.lane), "FFN publication"); }
@@ -429,12 +557,114 @@ mod tests {
             self.trace.callback()?;
             assert_eq!(layer, ticket);
             let mut schedule = self.trace.schedule.borrow_mut();
+            let at = slot(layer, true, self.lane);
+            let dense_core = self.trace.k6 && layer % 3 == 0;
             if layer % 3 != 1 {
-                for rank in 0..2 { schedule.push(rank, "main", slot(layer, true, self.lane), "FFN publication"); }
+                for rank in 0..2 {
+                    schedule.push_to(rank, "main", at, usize::from(dense_core), "FFN publication");
+                }
             }
-            for rank in 0..2 { schedule.wait(rank, "main", slot(layer, true, self.lane), "FFN join"); }
+            for rank in 0..2 {
+                schedule.wait_for(rank, "main", at, usize::from(dense_core), "FFN join");
+            }
             schedule.sync(0, "layer diagnostic download");
             Ok(())
+        }
+    }
+
+    struct Units<'a> {
+        trace: &'a Trace,
+        live: [Option<usize>; 3],
+        pending: std::collections::VecDeque<(usize, usize)>,
+        consumed: Vec<Vec<usize>>,
+        committed: usize,
+        peak: usize,
+        retired: bool,
+    }
+
+    impl crate::shared::prefill_pipeline::PrefillHooks for Units<'_> {
+        type Ticket = usize;
+        fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+            if layer % 3 == 2 { crate::shared::prefill_pipeline::FfnRoute::Spark }
+            else { crate::shared::prefill_pipeline::FfnRoute::Local }
+        }
+        fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            self.trace.callback()?;
+            ensure!(self.live[unit.slot].replace(unit.index).is_none(), "reused an in-flight GLM unit slot");
+            Ok(())
+        }
+        fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            assert_eq!(self.live[unit.slot], Some(unit.index));
+            unit_attention(self.trace, &self.trace.plan, unit, layer,
+                &mut Lane { trace: self.trace, lane: unit.slot }, &mut self.consumed[unit.index])
+        }
+        fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            let mut lane = Lane { trace: self.trace, lane: unit.slot };
+            let ticket = lane.begin_ffn(layer, None)?;
+            lane.finish_ffn(layer, ticket)
+        }
+        fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<usize> {
+            let ticket = Lane { trace: self.trace, lane: unit.slot }.begin_ffn(layer, None)?;
+            self.pending.push_back((unit.index, layer));
+            self.peak = self.peak.max(self.pending.len());
+            Ok(ticket)
+        }
+        fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: usize) -> Result<()> {
+            ensure!(self.pending.pop_front() == Some((unit.index, layer)), "GLM Spark completion is not FIFO");
+            Lane { trace: self.trace, lane: unit.slot }.finish_ffn(layer, ticket)
+        }
+        fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            unit_exit(self.trace, &self.trace.plan, unit, &mut Lane { trace: self.trace, lane: unit.slot },
+                &mut self.consumed[unit.index])
+        }
+        fn commit_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+            assert_eq!(self.committed, unit.index);
+            assert_eq!(self.live[unit.slot].take(), Some(unit.index));
+            assert!(!self.pending.iter().any(|&(index, _)| index == unit.index));
+            self.committed += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn owned_continuous_depth_three_recycles_five_units_and_drains_every_failure() {
+        use crate::shared::prefill_pipeline::{run_prefill_units, Unit};
+        for first in [0, 1] {
+            let mut calls = 0;
+            for failure in std::iter::once(None).chain((0..4096).map(Some)) {
+                if failure.is_some_and(|cut| cut >= calls) { break; }
+                let mut trace = Trace::new(first, 3);
+                trace.k6 = true;
+                trace.fail = failure;
+                let units: Vec<_> = (0..5).map(|index| Unit { index, sequence: 0, segments: vec![],
+                    rows: index * 8..(index + 1) * 8, layers: 0..12, slot: index % 3, barrier: false }).collect();
+                let state = RefCell::new(Units { trace: &trace, live: [None; 3], pending: Default::default(),
+                    consumed: vec![vec![0; trace.plan.hops().len()]; 5], committed: 0, peak: 0, retired: false });
+                let result = pair::submit_scoped(|| Ok(()), || {
+                    let mut state = state.borrow_mut();
+                    state.pending.clear();
+                    state.live.fill(None);
+                    state.retired = true;
+                    Ok(())
+                }, |_| run_prefill_units(&mut *state.borrow_mut(), &units, 3));
+                let state = state.borrow();
+                assert!(state.pending.is_empty() && state.live.iter().all(Option::is_none));
+                if failure.is_none() {
+                    result.unwrap();
+                    assert!(!state.retired);
+                    assert_eq!(state.committed, 5);
+                    assert_eq!(state.peak, 3, "depth three collapsed to serialized GLM waves");
+                    assert!(state.consumed.iter().flatten().all(|&n| n == 1));
+                    check_host(&trace.schedule.borrow()).unwrap();
+                    order::check_submission_faults(&trace.schedule.borrow().streams()).unwrap();
+                    calls = trace.calls.get();
+                    assert!(calls < 4096);
+                } else {
+                    assert!(result.is_err());
+                    assert!(state.retired, "submission failure did not retire GLM units");
+                    order::check_terminal(&trace.schedule.borrow().streams(), true).unwrap();
+                }
+            }
         }
     }
 
@@ -447,6 +677,45 @@ mod tests {
                 let schedule = trace.schedule.borrow();
                 check_host(&schedule).unwrap();
                 order::check_submission_faults(&schedule.streams()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn k6_meet_precedes_routed_publication_on_each_existing_ffn_slot() {
+        use crate::shared::peer_split::order::Op;
+        for first in [0, 1] {
+            for (lanes, lane_order) in [(1, LaneOrder::Independent),
+                (1, LaneOrder::OrderedChunks), (2, LaneOrder::OrderedChunks)] {
+                let mut trace = Trace::new(first, 2);
+                trace.k6 = true;
+                for _ in 0..3 { trace.run(lanes, lane_order).unwrap(); }
+                let host = trace.schedule.borrow();
+                check_host(&host).unwrap();
+                let schedule = host.streams();
+                order::check(&schedule).unwrap();
+                for rank in 0..2 {
+                    let stream = &schedule.streams[rank];
+                    let cores = stream.iter().filter(|(_, label)| label == "K6 shared core").count();
+                    assert_eq!(cores, 3 * lanes * 8, "all MoE layers meet, including the terminal layer");
+                    for at in (1..4 * lanes).step_by(2) {
+                        let publications = stream.iter().filter_map(|(op, _)| match op {
+                            Op::Push(flag) if flag.exchange == "main" && flag.slot == at => Some(flag.target),
+                            _ => None,
+                        }).collect::<Vec<_>>();
+                        assert!(!publications.is_empty());
+                        assert!(publications.windows(2).any(|pair| pair == [1, 0]),
+                            "the native F32 suffix precedes the ordinary routed prefix");
+                    }
+                }
+                // A consumer cannot skip the first sequence just because the
+                // following routed publication uses a different destination.
+                let mut crossed = schedule.clone();
+                let (op, _) = crossed.streams[1].iter_mut()
+                    .find(|(_, label)| label == "K6 shared meet").unwrap();
+                let Op::Wait(flag) = op else { unreachable!() };
+                flag.target = 0;
+                assert!(order::check(&crossed).unwrap_err().to_string().contains("crossed destination"));
             }
         }
     }

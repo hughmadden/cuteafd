@@ -68,7 +68,7 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_depende
         vec![cuteafd_loader::V41Image::decode(IMAGE_BYTES)?]
     } else { Vec::new() };
     let request = NativeRequest {
-        prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images, media: Vec::new(), audio: Vec::new(),
+        prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images, media: Vec::new(), audio: Vec::new(),
         max_tokens: rows, sampling: cuteafd_core::TargetSamplingParams::greedy(), stop_token_ids: Vec::new(),
         events, probe: Some(Arc::clone(&probe)), usage: None,
     };
@@ -145,8 +145,8 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
         let (name, value) = line.split_once('=')?;
         (name.trim() == key).then(|| value.trim())
     }));
-    let entries = config_value("PREFIX_CACHE_ENTRIES").map(str::parse::<usize>).transpose()?
-        .unwrap_or(serve.prefix_cache_entries as usize);
+    let entries = config_value("PREFIX_CACHE_ENTRIES").filter(|value| *value != "auto")
+        .map(str::parse::<usize>).transpose()?.unwrap_or(serve.resolved_prefix_entries() as usize);
     ensure!(entries > 0, "--resume-at requires a device prefix cache");
     let (queue, worker) = if let Some(url) = url {
         use cuteafd_api::openai::auth::ApiKey;

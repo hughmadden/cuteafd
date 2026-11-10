@@ -23,6 +23,8 @@ import _pinned_sparkinfer
 
 def write_bridge(output: Path, manifest: dict) -> None:
     """Generate a small owned-device C bridge; reject unfamiliar exported types."""
+    if len(manifest['bits']) != 2:
+        raise ValueError('EXL3 export requires two decoder tiers')
     if (manifest['blocks_per_sm'] not in (1, 2)
             or not 1 <= manifest['sms'] <= (2**31 - 1) // manifest['blocks_per_sm']):
         raise ValueError('invalid EXL3 cooperative grid capacity')
@@ -97,7 +99,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
             'int device = -1; if (cudaGetDevice(&device) != cudaSuccess || device != ctx->device) return int(cudaErrorInvalidDevice);',
             *checks, *declarations, f'return {entry["wrapper"]}({", ".join(args)});', '}']
     core, epilogue = manifest['objects']
-    info = [2, manifest['hidden'], manifest['intermediate'], manifest['experts'],
+    info = [manifest.get('native_info_version', 2), manifest['hidden'], manifest['intermediate'], manifest['experts'],
         manifest['capacity'], manifest['top_k'], len(manifest['bits']),
         len(core['pointer_slots']), len(core['scalar_slots']),
         len(epilogue['pointer_slots']), len(epilogue['scalar_slots']),
@@ -115,10 +117,13 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            blocks_per_sm: int | None = None,
            tile: tuple[int, ...] | None = None, hidden: int = 5120, route_block: int = 8,
            token_major_rotation: bool = False, swiglu_limit: float | None = 10.0,
-           fused_input_rotation: bool = False, warp_specialized: bool = False,
+           warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
-           compile_only: bool = False, activation: str = "silu") -> dict:
+           compile_only: bool = False, activation: str = "silu",
+           compact_weights: bool = False) -> dict:
+    if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 7) for b in bits):
+        raise ValueError("export requires two distinct K2..K6 decoder tiers")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -126,25 +131,25 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
-    if activation not in ("silu", "situ"):
-        raise ValueError("EXL3 activation must be silu or situ")
+    if compact_weights and len(bits) != 2:
+        raise ValueError("compact weights require a disjoint two-tier export")
+    if activation not in ("silu", "situ", "silu_post_clamp"):
+        raise ValueError("EXL3 activation must be silu, situ or silu_post_clamp")
     if activation == "situ" and swiglu_limit is not None:
         raise ValueError("Situ does not use a SwiGLU clamp")
+    if activation == "silu_post_clamp" and swiglu_limit is None:
+        raise ValueError("silu_post_clamp bounds SiLU at a positive SwiGLU limit")
     if route_block not in (8, 16, 32, 64):
         raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
     # Token-major input rotation reads each token's input block once for all of
     # its routes (bit-identical); it applies to two-tier packed-route exports.
     if token_major_rotation and (len(bits) != 2):
         raise ValueError("token-major rotation requires a disjoint two-tier export")
-    # FC1 rotates the staged token rows in shared memory instead of reading
-    # materialized per-route copies (bit-identical); wide packed blocks only.
-    if fused_input_rotation and (len(bits) != 2 or route_block < 16):
-        raise ValueError("fused input rotation requires a disjoint two-tier export with 16+ row blocks")
     # Warp-specialized prefill: producer warps stream weights and input rows and
     # rotate FC1 inputs; consumer warps decode and multiply (bit-identical to the
     # cooperative kernel). FC1, SwiGLU and FC2 become three launches of the core.
     if warp_specialized and (len(bits) != 2 or route_block < 16
-                             or fused_input_rotation or token_major_rotation):
+                             or token_major_rotation):
         raise ValueError("warp-specialized prefill requires a disjoint two-tier export with 16+ "
                          "row blocks and brings its own input rotation")
     # Wire input: the warp-specialized FC1 producers read the E4M3 + UE8M0 K32
@@ -167,29 +172,26 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # l2/pf1/pf2/pdl options): when and with which L2 policy the cooperative
     # kernel fetches weight words. Bit-identical to the default schedule; the
     # manifest records the canonical options, and only when one is set.
-    if decode_schedule is not None and (warp_specialized
-                                        or len(bits) != 2):
-        raise ValueError("a decode schedule applies to cooperative disjoint two-tier exports")
+    if decode_schedule is not None and warp_specialized:
+        raise ValueError("a decode schedule applies to cooperative exports only")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     import torch
     from b12x.moe._shared.kernels.w4a16.host import route_pack_capacity
     from b12x.moe._shared.kernels.w4a16.mixed_trellis import (
-        EXL3_AOT_MAX_SMS, compile_mixed_trellis, compile_mixed_trellis3, make_mixed_trellis_buffers,
+        EXL3_AOT_MAX_SMS, compile_mixed_trellis, make_mixed_trellis_buffers,
     )
-    from b12x.moe._shared.kernels.w4a16.mixed_trellis4 import compile_mixed_trellis4
     from b12x.moe.fused_moe._impl import (
         _projection_mixed_direct_topk_routes, _projection_mixed_tile_config,
     )
 
-    if len(bits) not in (2, 3, 4) or len(set(bits)) != len(bits) or any(b not in range(2, 6) for b in bits):
-        raise ValueError("export requires two to four distinct K2..K5 decoder tiers")
-    if blocks_per_sm is not None and len(bits) != 2:
-        raise ValueError("explicit residency is currently supported only for two-tier exports")
     # swiglu_limit None is b12x's unclamped SwiGLU (GLM); DeepSeek clamps at 10.
     if swiglu_limit is not None and not swiglu_limit > 0:
         raise ValueError("SwiGLU limit must be positive or None (no clamp)")
-    if not 1 <= capacity <= 4096 or not 1 <= topk <= 16 or experts < topk or experts > 1024:
+    # 8256 rows is the widest compiled prefill extent: Kimi K3 merges three
+    # 2752-row wave units into one expert unit. Which extents a family ships is
+    # its packager policy (`package_exl3_aot.package_capacities`).
+    if not 1 <= capacity <= 8256 or not 1 <= topk <= 16 or experts < topk or experts > 1024:
         raise ValueError("invalid EXL3 capacity, top-k or expert count")
     # Whole H128 rotation blocks on both projection axes.
     if hidden < 128 or hidden % 128 or intermediate < 128 or intermediate % 128:
@@ -200,11 +202,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     workspace_sms = EXL3_AOT_MAX_SMS[(props.major, props.minor)]
     if props.multi_processor_count > workspace_sms:
         raise ValueError("EXL3 device exceeds the declared AOT workspace SM capacity")
-    direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=len(bits) == 2)
+    direct = _projection_mixed_direct_topk_routes(capacity, topk, direct_exl3=True)
     if routing != "auto":
         direct = routing == "direct"
-    if direct and len(bits) != 2:
-        raise ValueError("three/four-tier export requires packed routing")
     block_m = 8 if direct else route_block
     route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
@@ -220,29 +220,24 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         route_ids_dtype=torch.int32)
     if activation != "silu":
         options["activation"] = activation
-    if len(bits) == 2:
-        rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
-        if fused_input_rotation and not direct:
-            rotation = {"fused_input_rotation": True}
-        if warp_specialized and not direct:
-            rotation = {"warp_specialized": True}
-            if wire_input:
-                rotation["input_format"] = "e4m3_k32"
-            if ws_input_stages is not None:
-                rotation["ws_input_stages"] = ws_input_stages
-            if ws_dynamic_tiles:
-                rotation["ws_dynamic_tiles"] = True
-        schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
-        launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
-                                      force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
-    elif len(bits) == 3:
-        launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2])
-    else:
-        launch = compile_mixed_trellis4(**options, tier2_num_experts=experts, tier2_bits=bits[2],
-            tier3_num_experts=experts, tier3_bits=bits[3])
+    rotation = {"token_major_rotation": True} if token_major_rotation and not direct else {}
+    if warp_specialized and not direct:
+        rotation = {"warp_specialized": True}
+        if wire_input:
+            rotation["input_format"] = "e4m3_k32"
+        if ws_input_stages is not None:
+            rotation["ws_input_stages"] = ws_input_stages
+        if ws_dynamic_tiles:
+            rotation["ws_dynamic_tiles"] = True
+    if compact_weights:
+        rotation["compact_weights"] = True
+    schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
+    launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
+                                  force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     output.mkdir(parents=True, exist_ok=True)
     objects = []
-    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:
+    sum_compiled = launch.topk_sum.compiled
+    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", sum_compiled)]:
         compiled.export_to_c(str(output), label, "cuteafd_" + label)
         header = (output / (label + ".h")).read_text()
         wrapper = re.search(r"static inline int32_t (cute_dsl_\w+_wrapper)\((.*?)\) \{", header, re.S)
@@ -284,7 +279,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "gpu": _pinned_sparkinfer.export_target(props), "compute": [props.major, props.minor], "sms": workspace_sms,
         "physical_sms": props.multi_processor_count,
         "hidden": hidden, "intermediate": intermediate, "experts": experts, "top_k": topk,
-        "capacity": capacity, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": swiglu_limit,
+        "capacity": capacity, "decode_capacity": capacity <= 80, "output_dtype": output_dtype, "bits": list(bits), "swiglu_limit": swiglu_limit,
         "direct": direct, "route_slots": route_slots, "route_blocks": route_blocks,
         "tile": list(options['force_tile_config']), "blocks_per_sm": launch.blocks_per_sm,
         "shared_memory_bytes": launch.shared_memory_bytes, "buffers": layouts, "objects": objects,
@@ -294,6 +289,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if compact_weights:
+        manifest.update(descriptor_rows=7, native_info_version=3)
     if activation != "silu":
         manifest["activation"] = activation
     if experts > 512:
@@ -309,8 +306,6 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             manifest["ws_input_stages"] = ws_input_stages
         if ws_dynamic_tiles:
             manifest["ws_dynamic_tiles"] = True
-    elif fused_input_rotation and not direct:
-        manifest["fused_input_rotation"] = True
     elif token_major_rotation and not direct:
         manifest["token_major_rotation"] = True
     if getattr(launch, "decode_schedule", None) is not None:
@@ -343,13 +338,11 @@ def main() -> None:
     parser.add_argument("--topk", type=int, choices=range(1, 17), metavar="1..16", default=6)
     parser.add_argument("--swiglu-limit", default="10",
                         help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
-    parser.add_argument("--activation", choices=("silu", "situ"), default="silu")
+    parser.add_argument("--activation", choices=("silu", "situ", "silu_post_clamp"), default="silu")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
     parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,
                         help="Packed-route M block (rows per expert block); direct routes ignore it")
-    parser.add_argument("--fused-input-rotation", action="store_true",
-                        help="FC1 rotates staged token rows itself (packed 16+ row blocks)")
     parser.add_argument("--warp-specialized", action="store_true",
                         help="Warp-specialized prefill kernels (packed 16+ row blocks)")
     parser.add_argument("--wire-input", action="store_true",
@@ -358,6 +351,8 @@ def main() -> None:
                         help="Warp-specialized input-row ring depth (default: kernel policy)")
     parser.add_argument("--ws-dynamic-tiles", action="store_true",
                         help="Warp-specialized CTAs claim tiles from a workspace counter")
+    parser.add_argument("--compact-weights", action="store_true",
+                        help="Seven-row per-expert compact weights (native info version 3)")
     parser.add_argument("--token-major-rotation", action="store_true",
                         help="Rotate each token's input once for all of its routes (packed routes)")
     parser.add_argument("--decode-schedule",
@@ -370,12 +365,11 @@ def main() -> None:
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
            route_block=args.route_block, token_major_rotation=args.token_major_rotation,
-           fused_input_rotation=args.fused_input_rotation,
            warp_specialized=args.warp_specialized, wire_input=args.wire_input,
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
            activation=args.activation,
-           decode_schedule=args.decode_schedule)
+           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights)
 
 
 if __name__ == "__main__":

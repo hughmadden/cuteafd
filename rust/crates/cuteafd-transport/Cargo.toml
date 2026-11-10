@@ -9,6 +9,7 @@ repository.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 futures.workspace = true
+rayon.workspace = true
 cuteafd-core = { path = "../cuteafd-core" }
 cuteafd-loader = { path = "../cuteafd-loader" }
 cuteafd-ffi = { path = "../cuteafd-ffi" }
@@ -21,5 +22,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+cuteafd-ffi = { path = "../cuteafd-ffi", features = ["test-support"] }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

@@ -9,14 +9,23 @@ dead process and is removed. A request takes its locks only when no older live
 ticket wants any of the same locks, so a job waiting for both GPUs is not
 overtaken by later single-GPU jobs, while jobs on disjoint locks still run side
 by side. The locks themselves are the usual flock files, taken in the canonical
-order (sparks, gpu0, gpu1, rhea, moa, kakapo), so callers that still use plain flock
-stay excluded (they are just not queued fairly). Exit 75 when the wait expires.
+order (sparks, gpu0, gpu1, rhea, moa, kakapo, cassowary, kakapo-export,
+cassowary-export, maxq), so callers that still use plain flock stay excluded (they are
+just not queued fairly). Exit 75 when the wait expires.
 
 Default: the locks are held while CMD runs, and CUTEAFD_HW_LOCKS_HELD names
 them so a `cuteafd bench smoke` child skips taking them again. --gate is for a
 CMD that takes the locks itself (an older smoke binary, a driver script): once
 it is our turn the locks are left for CMD, and our ticket stays live until CMD
 exits, so later ticket holders still wait behind it.
+
+SIGTERM, SIGINT or SIGHUP while CMD runs is forwarded to CMD, and the locks
+stay held until CMD exits (at most STOP_GRACE_S = 80 s, then CMD is killed):
+`cuteafd bench smoke` tears down its containers on that signal, and the next
+lock holder must find the hardware clean. 80 s fits systemd's default
+TimeoutStopSec (90 s), so `systemctl --user stop UNIT` on a unit running
+hwlock is safe with the default KillMode=control-group; do not pass
+KillMode=mixed or process, or a TimeoutStopSec below 90 s.
 
 --preflight runs a bounded shell check before enqueue and after grant (only
 after grant with --preflight-at-grant), while
@@ -37,11 +46,34 @@ import sys
 import time
 from pathlib import Path
 
-# kakapo is the out-of-pool build seed (10 GbE, never serves): last, so a
-# serving job's locks are always taken before a seed lease's.
-ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', 'kakapo')
-LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+# kakapo and cassowary are the LAN-only build seeds (10 GbE, never serve): after
+# every serving lock, so a serving job's locks are always taken before a seed
+# lease's. Each seed's GPU-export turn (SEED-export) comes last: a build takes it
+# while its counting lease on that seed is live (scripts/build/build-resource.py).
+LAN_SEEDS = ('kakapo', 'cassowary')
+# maxq's RTX PRO 6000 Max-Q (SM120, WSL2) handles builds, AOT exports, quants,
+# CPU gates and single-GPU correctness, never perf A/B, cards or serving.
+ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export' for seed in LAN_SEEDS),
+         'maxq')
+_DEFAULT_LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+# An explicit assignment (a driver pinning a private directory, a test) wins;
+# otherwise CUTEAFD_LOCK_DIR is read when the lock is taken, so a process that
+# sets it after importing this module still never reaches the real locks.
+LOCK_DIR = _DEFAULT_LOCK_DIR
+
+
+def lock_dir() -> Path:
+    """The lock directory for this call: an explicit LOCK_DIR assignment, else CUTEAFD_LOCK_DIR."""
+    if LOCK_DIR != _DEFAULT_LOCK_DIR:
+        return LOCK_DIR
+    return Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
+
+
 POLL_S = 2.0
+# How long a signalled CMD may take to exit (its teardown) before it is killed;
+# under systemd's default TimeoutStopSec (90 s), above smoke's 60 s teardown bound.
+STOP_GRACE_S = 80.0
+FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)
 
 
@@ -54,7 +86,7 @@ def canonical(names) -> list[str]:
 
 
 def _queue() -> Path:
-    queue = LOCK_DIR / 'hwq'
+    queue = lock_dir() / 'hwq'
     queue.mkdir(parents=True, exist_ok=True)
     return queue
 
@@ -132,7 +164,7 @@ def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[s
 def _try_flocks(locks: list[str]) -> list | None:
     held = []
     for name in locks:
-        handle = open(LOCK_DIR / f'{name}.lock', 'a')
+        handle = open(lock_dir() / f'{name}.lock', 'a')
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -146,6 +178,10 @@ def _try_flocks(locks: list[str]) -> list | None:
 
 class PreflightFailed(Exception):
     pass
+
+
+class Cancelled(Exception):
+    """The waiter's `cancelled` callback asked it to stop waiting."""
 
 
 def check_preflight(command, timeout):
@@ -175,9 +211,10 @@ def check_preflight(command, timeout):
 
 @contextlib.contextmanager
 def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str = '',
-         preflight_timeout: float = 300, preflight_at_grant_only: bool = False):
+         preflight_timeout: float = 300, preflight_at_grant_only: bool = False, cancelled=None):
     """Hold `names` (canonical order) for the body; FIFO against other tickets.
-    With `gate`, release the flocks at our turn and keep the ticket instead."""
+    With `gate`, release the flocks at our turn and keep the ticket instead.
+    `cancelled()`, polled while waiting, raises Cancelled when true."""
     locks = canonical(names)
     # A check on state the queue itself changes (free memory on shared hosts) is
     # meaningful only once our turn comes; such checks run at grant alone.
@@ -190,11 +227,13 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
         held = None
         deadline = time.monotonic() + wait
         while (held := _try_flocks(locks)) is None:
+            if cancelled is not None and cancelled():
+                raise Cancelled(f'stopped waiting for {",".join(locks)}')
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'no flocks for {",".join(locks)} after {wait:.0f} s inside a gate')
             time.sleep(POLL_S)
         try:
-            yield
+            yield held
         finally:
             for handle in held:
                 handle.close()
@@ -209,6 +248,8 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
                 held = _try_flocks(locks)
                 if held is not None:
                     break
+            if cancelled is not None and cancelled():
+                raise Cancelled(f'stopped waiting for {",".join(locks)}')
             if time.monotonic() >= deadline:
                 raise TimeoutError(f'no turn for {",".join(locks)} after {wait:.0f} s')
             if not announced:
@@ -236,13 +277,56 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
         path.unlink(missing_ok=True)
         ticket.close()
     try:
-        yield
+        yield held
     finally:
         for handle in held:
             handle.close()
         if gate:
             path.unlink(missing_ok=True)
             ticket.close()
+
+
+def run_forwarding(cmd, env, grace: float = STOP_GRACE_S) -> int:
+    """Runs CMD to completion while the caller holds the locks. A SIGTERM,
+    SIGINT or SIGHUP is forwarded to CMD, which then gets `grace` seconds to
+    exit (its own teardown) before SIGKILL; only then does this return, so
+    the locks outlive whatever CMD cleans up. Returns CMD's exit status
+    (128 + N when a signal N ended it)."""
+    received: list[int] = []
+    child = None
+
+    def forward(signum, _frame):
+        if not received:
+            received.append(signum)
+        if child is not None and child.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signum)
+
+    previous = {sig: signal.signal(sig, forward) for sig in FORWARDED}
+    try:
+        child = subprocess.Popen(cmd, env=env)
+        if received:  # arrived before CMD existed
+            forward(received[0], None)
+        deadline = None
+        while True:
+            try:
+                code = child.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if received and deadline is None:
+                deadline = time.monotonic() + grace
+                print(f'hwlock: signal {received[0]} forwarded; holding the locks up to {grace:.0f} s '
+                      'while the command stops', file=sys.stderr)
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f'hwlock: the command did not stop within {grace:.0f} s; killing it', file=sys.stderr)
+                child.kill()
+                code = child.wait()
+                break
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 128 - code if code < 0 else code
 
 
 def main() -> int:
@@ -271,7 +355,7 @@ def main() -> int:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
             else:
                 env[GATE_ENV] = ':'.join(filter(None, [os.environ.get(GATE_ENV, ''), str(GATE_SEQ[0])]))
-            return subprocess.run(cmd, env=env).returncode
+            return run_forwarding(cmd, env)
     except PreflightFailed as error:
         print(f'hwlock: {error}', file=sys.stderr)
         return 78

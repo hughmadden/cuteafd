@@ -73,31 +73,23 @@ impl Segment {
 /// The pass over `chunks` (each sequence's length before the pass and the rows it adds, in step
 /// order), or why it does not fit.
 pub(crate) fn plan(chunks: &[(usize, usize)], limits: &Limits) -> Result<Vec<Segment>> {
-    ensure!(!chunks.is_empty(), "a packed prefill needs a sequence");
+    let layout = crate::shared::prefill_packing::plan(chunks, &crate::shared::prefill_packing::Limits {
+        rows: limits.rows, chunk_rows: limits.chunk_rows, max_context: limits.max_context, taps: limits.taps,
+    })?;
     let mut out = Vec::with_capacity(chunks.len());
-    let (mut first, mut pages, mut pools, mut taps) = (0, 0, 0, 0);
-    for &(start, rows) in chunks {
-        ensure!(rows > 0, "a packed prefill chunk of no rows");
-        ensure!(rows <= limits.chunk_rows, "a packed prefill chunk of {rows} rows (its own pass cuts it past {})",
-            limits.chunk_rows);
+    let (mut pages, mut pools) = (0, 0);
+    for segment in layout {
+        let crate::shared::prefill_packing::Segment { first, rows, start, tap_offset, tap_rows } = segment;
         let end = start + rows;
-        ensure!(end <= limits.max_context, "a packed prefill to position {end} past the context {}", limits.max_context);
         let (page_columns, pool_columns) = (end.div_ceil(PAGE_ROWS), end.div_ceil(POOL_PAGE_TOKENS));
-        let tap_rows = limits.taps.map_or(0, |cap| rows.min(cap));
         out.push(Segment { first, rows, start, page_offset: pages, page_columns, pool_offset: pools, pool_columns,
-            long: end > limits.dense_context, tap_offset: taps, tap_rows });
-        first += rows;
+            long: end > limits.dense_context, tap_offset, tap_rows });
         pages += page_columns;
         pools += pool_columns;
-        taps += tap_rows;
     }
-    ensure!(first <= limits.rows, "a packed prefill of {first} rows exceeds the {}-row workspace", limits.rows);
     ensure!(pages <= limits.table_pages && pools <= limits.table_pool_pages,
         "a packed prefill's page tables ({pages} record and {pools} pool pages) exceed one table row ({} and {})",
         limits.table_pages, limits.table_pool_pages);
-    if let Some(cap) = limits.taps {
-        ensure!(taps <= cap, "a packed prefill's drafter taps ({taps} rows) exceed the {cap} tap rows");
-    }
     Ok(out)
 }
 

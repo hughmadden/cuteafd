@@ -210,7 +210,7 @@ pub(super) fn pack_grouped_scales<'a>(
     for stage in 0..3 {
         output.push(DeviceAllocation::new(library, 1048576)?);
         unsafe {
-            library.v41_fp8_matrix_kernel(1, 32768, 8192)?.pack_scales(
+            crate::shared::experts::rtx::dense::v41_pack_scales(&library.v41_fp8_matrix_kernel(1, 32768, 8192)?,
                 tensors.get(&format!("mtp.{stage}.attn.wo_a.scale"))?,
                 output.last().unwrap().buffer,
                 stream.raw,

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -191,16 +192,59 @@ def test_strict_ready_rejects_invalid_tolerance(tmp_path, tolerance):
 
 def test_pool_following_v4_page_tables_use_the_planners_kv_records_scope(tmp_path):
     engine = (Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4/engine.rs").read_text()
-    allocation = engine.split("c4_page_table: {", 1)[1].split("},", 1)[0]
+    def enclosed(source, opening, closing):
+        start = source.index(opening)
+        depth = 0
+        for end in range(start, len(source)):
+            depth += source[end] == opening
+            depth -= source[end] == closing
+            if depth == 0:
+                return source[start + 1:end]
+        raise AssertionError("unclosed source block")
+
+    signature = enclosed(engine.split("fn step_buffers", 1)[1], "(", ")")
+    assert re.findall(r"(\w+)\s*:\s*usize", signature) == ["rows", "page_lists", "members"]
+    body = enclosed(engine.split("fn step_buffers", 1)[1], "{", "}")
+    allocation = enclosed(body.split("c4_page_table:", 1)[1], "{", "}")
     assert 'scope("kv/records")' in allocation
-    assert "ints(rows.max(1) * self.shape.units)?" in allocation
-    table_bytes = (2_097_152 // 256) * (2 * 4096 + 64) * 4
+    assert allocation.index('scope("kv/records")') < allocation.index("ints(")
+    assert re.search(r"ints\s*\(\s*page_lists\s*\*\s*\(\s*self\.shape\.units\s*\+\s*if\s+members\s*>\s*1\s*\{\s*3\s*\}\s*else\s*\{\s*0\s*\}\s*\)\s*\)", allocation)
+    call = enclosed(engine.split("self.step_buffers", 1)[1], "(", ")")
+    branches = re.findall(r"if\s+shared_page_list\s*\{\s*([\w:]+)\s*\}\s*else\s*\{\s*(\w+)\s*\}", call)
+    assert re.match(r"\s*t\s*,", call)
+    assert len(branches) == 2
+    assert [value.rsplit("::", 1)[-1] for value, _ in branches] == ["V4_PACKED_MEMBERS"] * 2
+    assert [fallback for _, fallback in branches] == ["t", "1"]
+    units, waves, members, decode_rows = 2_097_152 // 256, 2, 16, 64
+    table_bytes = waves * members * (units + 3) * 4 + decode_rows * units * 4
     log = tmp_path / "coordinator.log"
     log.write_text(report(1000 * MIB + table_bytes, 900 * MIB + table_bytes,
                           {"weights": 900 * MIB, "kv/records": table_bytes}))
     categories = memory_audit.summarize(next(memory_audit.reports(str(log))))["devices"][0]["categories"]
     assert categories["kv"] == table_bytes
     assert categories.get("workspace", 0) == 0
+
+
+def test_v4_admits_tables_and_frozen_prefix_quota_before_first_reservation():
+    root = Path(__file__).parents[2] / "rust/crates/cuteafd-daemon/src/families/deepseek_v4"
+    startup = (root / "mod.rs").read_text().split("pub(crate) fn with_engine", 1)[1]
+    assert startup.index("engine.attach_peer(") < startup.index("admission::host_memory(")
+    assert startup.index("admission::host_memory(") < startup.index("engine.attach_context(")
+    assert startup.index("admission::host_memory(") < startup.index("engine.prepare_workspaces()")
+    assert "body(&engine, &mut transports, &runtime, host_config)" in startup
+    admission = (root / "admission.rs").read_text().split("pub(crate) fn host_memory(", 1)[1]
+    admission = admission.split("pub(crate) fn request(", 1)[0]
+    assert admission.count("resolve_host_config(") == 1
+    assert admission.count("admit_host_memory(") == 1
+    assert "config.as_ref().map_or(0, |c| c.bytes)" in admission
+    assert "&tables, logits" in admission
+    serve = (root / "serve.rs").read_text()
+    cache = serve.split("fn prefix_cache", 1)[1].split("/// Gives a finished", 1)[0]
+    assert "host_config.map(|config|" in cache
+    assert ".host_config(" not in cache
+    assert ".host_tier(" not in cache
+    assert "resolve_host_config(" not in cache
+    assert "prefix_cache(engine, prefix, host_config)?" in serve
 
 
 def test_glmf_kda_only_pool_backing_uses_the_planners_prefix_scope():

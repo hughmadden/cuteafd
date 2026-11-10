@@ -76,21 +76,66 @@ impl Fixture {
             .arg(&module)
             .status()?;
         anyhow::ensure!(status.success(), "fixture module filesystem check failed");
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let (c_object, cc_object) = (directory.join("fixture.o"), directory.join("kernels.o"));
+        let status = Command::new("python3")
+            .arg(repo.join("python/tools/lib/mxfp4_layouts.py"))
+            .arg("--header")
+            .arg(directory.join("cuteafd_mxfp4_layouts.h"))
+            .status()?;
+        anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
         let status = Command::new("cc")
-            .args(["-shared", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
-            .arg(
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/native_library_lifetime.c"),
-            )
+            .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixtures.join("native_library_lifetime.c"))
+            .arg("-I")
+            .arg(&directory)
+            .arg("-o")
+            .arg(&c_object)
+            .env("TMPDIR", &directory)
+            .status()?;
+        anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
+        // Load-only kernels run the shared CUDA rule on the CPU.
+        let status = Command::new("c++")
+            .args(["-std=c++17", "-c", "-fPIC", "-O1", "-Wall", "-Wextra", "-Werror"])
+            .arg(fixtures.join("native_library_kernels.cc"))
+            .arg("-o")
+            .arg(&cc_object)
+            .env("TMPDIR", &directory)
+            .status()?;
+        anyhow::ensure!(status.success(), "building CPU fixture kernels failed");
+        let status = Command::new("c++")
+            .args(["-shared", "-fPIC"])
+            .arg(&c_object)
+            .arg(&cc_object)
             .arg("-o")
             .arg(&module)
             .env("TMPDIR", &directory)
             .status()?;
-        anyhow::ensure!(status.success(), "building CPU lifetime fixture failed");
+        anyhow::ensure!(status.success(), "linking CPU lifetime fixture failed");
         Ok(Self {
             module,
             events: directory.join("events"),
         })
+    }
+
+    /// Configure static package ABI before loading a CPU expert module.
+    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
+        // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(*const u32, *const u64)> =
+                library.lib.get(b"fixture_configure_fp8")?;
+            configure(words.as_ptr(), scratch.as_ptr());
+        }
+        Ok(())
+    }
+
+    pub fn configure_fp8_segments(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this CPU-only fixture export toggles its static segment metadata.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_configure_fp8_segments")?;
+            configure();
+        }
+        Ok(())
     }
 
     pub fn load(&self) -> Result<NativeLibrary> {
@@ -106,6 +151,26 @@ impl Fixture {
         Ok(library)
     }
 
+    pub fn quiet_events(&self, library: &NativeLibrary, quiet: bool) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_quiet_events")?;
+            configure(i32::from(quiet));
+        }
+        Ok(())
+    }
+
+    pub fn block_first_stream(&self, library: &NativeLibrary, block: bool) -> Result<()> {
+        // SAFETY: the CPU fixture owns this mutex-protected injection control.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_block_first_stream")?;
+            configure(i32::from(block));
+        }
+        Ok(())
+    }
+
     pub fn resident(&self) -> Result<bool> {
         Ok(fs::read_to_string("/proc/self/maps")?
             .lines()
@@ -114,6 +179,37 @@ impl Fixture {
 
     pub fn events(&self) -> Result<String> {
         Ok(fs::read_to_string(&self.events)?)
+    }
+
+    /// CPU byte-roundtrip mode; ordinary lifetime fixtures retain deferred uploads.
+    pub fn immediate_copies(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: this export belongs only to the CPU fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> =
+                library.lib.get(b"fixture_configure_immediate_copies")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    /// Queue copies and deterministic route-dependent fake expert reads, rather
+    /// than executing either at submission. Only explicit advance/drain runs work.
+    pub fn queued_experts(&self, library: &NativeLibrary) -> Result<()> {
+        // SAFETY: these exports belong only to the CPU fixture built above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn()> = library.lib.get(b"fixture_configure_queued_experts")?;
+            configure();
+        }
+        Ok(())
+    }
+
+    pub fn advance_queued_experts(&self, library: &NativeLibrary, operations: usize) -> Result<()> {
+        // SAFETY: the fixture executes at most this many previously queued operations.
+        unsafe {
+            let advance: Symbol<unsafe extern "C" fn(usize)> = library.lib.get(b"fixture_advance_queued_experts")?;
+            advance(operations);
+        }
+        Ok(())
     }
 
     pub fn configure_memory(&self, library: &NativeLibrary, device: i32, total: usize) -> Result<()> {
@@ -145,11 +241,25 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn finish_ordered_uploads(&self, library: &NativeLibrary) -> Result<()> {
+        library.release_ordered_h2d_staging()
+    }
+
     pub fn configure_drain_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
         // SAFETY: this export belongs to the CPU-only fixture loaded above.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(i32)> =
                 library.lib.get(b"fixture_configure_drain_after")?;
+            configure(completed);
+        }
+        Ok(())
+    }
+
+    pub fn configure_bind_after(&self, library: &NativeLibrary, completed: i32) -> Result<()> {
+        // SAFETY: this export belongs to the CPU-only fixture loaded above.
+        unsafe {
+            let configure: Symbol<unsafe extern "C" fn(i32)> =
+                library.lib.get(b"fixture_configure_bind_after")?;
             configure(completed);
         }
         Ok(())

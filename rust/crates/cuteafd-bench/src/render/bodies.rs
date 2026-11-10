@@ -78,6 +78,10 @@ pub fn decode_scaling(doc: &mut Doc, theme: &Theme, report: &Report, x: f64, y: 
     let top = y + 36.0 * scale;
     let bottom = y + 106.0 * scale;
     doc.text(x, y, Font::new(15.0 * scale, theme.muted).spacing(3.0 * scale).weight(600), "DECODE SCALING");
+    // Waves of one repeated prompt share experts and drafts; say which kind this is.
+    if let Some(point) = points.iter().find(|point| point.width > 1) {
+        doc.text(x + width, y, Font::new(12.0 * scale, theme.muted).anchor(Anchor::End), point.prompt_label());
+    }
     doc.line(x, bottom, x + width, bottom, theme.line2, 1.0);
     let max = points.iter().map(|point| point.aggregate_tok_s).fold(1.0f64, f64::max) * 1.08;
     let px = |level: usize| {
@@ -318,11 +322,16 @@ impl<'a> View<'a> {
             y += chips(doc, t, 120.0, y, w - 120.0, &items, t.series[0]) + 6.0;
         }
         y += row(doc, t, 0.0, y, w, "Speculator", &c.speculator_label());
-        y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity().line());
+        y += row(doc, t, 0.0, y, w, "Thinking", c.thinking_label());
+        y += row(doc, t, 0.0, y, w, "Capacity", &self.report.capacity_line());
         if let Some(layout) = &c.layout {
             y += row(doc, t, 0.0, y, w, "Layout", layout);
         }
-        let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str()))
+        for setting in c.non_default().filter(|s| DEPLOYMENT.contains(&s.name.as_str())) {
+            y += row(doc, t, 0.0, y, w, "Deployment", &setting.chip());
+        }
+        let options: Vec<String> = c.non_default().filter(|s| !DEPLOYMENT.contains(&s.name.as_str())
+            && s.name != "rtx-expert-layers")
             .map(|s| s.chip()).collect();
         doc.text(0.0, y + 14.0, Font::new(10.0, t.muted).spacing(1.2), "OPTIONS");
         if options.is_empty() {
@@ -365,7 +374,7 @@ impl<'a> View<'a> {
             doc.text(x, 80.0, Font::new(11.0, t.ink2), &fit(sub, 11.0, headline_width));
         };
         let code_tokens = b.card.decode_of("code").and_then(|d| d.runs.first()).map_or(0, |r| r.completion_tokens);
-        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tps", &format!("thinking off · {code_tokens} tokens"),
+        big(doc, 0.0, "C1 CODE DECODE", &rate(code), "tps", &format!("{} · {code_tokens} tokens", self.report.server.configuration.thinking_label()),
             t.series[0]);
         decode_scaling(doc, t, self.report, headline_width + 24.0, 12.0, headline_width, 0.48);
         let prefill_x = 2.0 * (headline_width + 24.0);
@@ -390,7 +399,7 @@ impl<'a> View<'a> {
                 &format!("{warn}{}", rate(d.tok_s)));
         }
         let extra = by;
-        doc.text(0.0, 102.0 + extra, Font::new(11.0, t.ink2), &fit(&self.report.capacity().line(), 11.0, w));
+        doc.text(0.0, 102.0 + extra, Font::new(11.0, t.ink2), &fit(&self.report.capacity_line(), 11.0, w));
         // Quick quality.
         let mut y = 116.0 + extra;
         doc.line(0.0, y, w, y, t.line, 1.0);
@@ -418,6 +427,16 @@ impl<'a> View<'a> {
                 doc.text(w, y + 13.0, Font::new(10.0, t.muted).anchor(Anchor::End), &seconds(check.seconds));
             }
             y += 22.0;
+            if check.id == "fidelity" {
+                if let Some(precision) = check.metrics.get("precision")
+                    .and_then(|v| serde_json::from_value::<crate::fidelity_precision::Precision>(v.clone()).ok()) {
+                    for line in wrap(&precision.label(), 10.5, w - 22.0) {
+                        doc.text(22.0, y + 11.0, Font::new(10.5, t.ink2), &line);
+                        y += 16.0;
+                    }
+                    y += 4.0;
+                }
+            }
         }
         y
     }

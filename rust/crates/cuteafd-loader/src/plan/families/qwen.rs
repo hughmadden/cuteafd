@@ -14,9 +14,22 @@ pub struct Qwen;
 pub static QWEN4: Qwen = Qwen;
 
 impl Family for Qwen {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "Qwen 3.8 Flash Next cards are 1 RTX + 0 Sparks: no Spark round trip for a second lane to hide, and the 5090 + 1 Spark card is memory-tight for its workspace (#744)" }
+    }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // The Qwen engine's decode programs run 64 rows.
+        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+    }
+    fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
+        // Shared token-table staging follows the admitted executor depth.
+        crate::serving_capacity::prefill_waves::PrefillLimits::default()
+    }
     fn id(&self) -> &'static str {
         "qwen4"
     }
+    fn media_cache_headroom(&self) -> bool { true }
     fn runtime(&self) -> RuntimeStatus {
         RuntimeStatus::Serving
     }
@@ -214,7 +227,7 @@ impl FamilyModel for QwenModel {
     }
 
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         Some(Ok(crate::plan::layout::qwen::layout(report, self, input, options)))
     }

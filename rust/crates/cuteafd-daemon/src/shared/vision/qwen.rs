@@ -3,7 +3,7 @@ use super::*;
 
 impl TowerSpec {
     pub fn qwen(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         let v = &cfg["vision_config"];
         for (name, want) in [
             ("depth", 27), ("hidden_size", 1152), ("intermediate_size", 4304),
@@ -26,6 +26,7 @@ impl TowerSpec {
         {
             return Err(VisionError::Unsupported("Qwen tower config/merger geometry or image capacity".into()));
         }
+        let depth = v["depth"].as_u64().unwrap() as usize;
         let tensors = tower_catalog(snapshot, "model.visual.")?;
         let mut reads = Vec::new();
         let mut cursor = 0usize;
@@ -50,14 +51,14 @@ impl TowerSpec {
             abi_version: 2, reserved: 2, max_tokens: max_tokens as u32, output_width: 2560,
             hidden: 1152, depth: 27, heads: 16, kv_heads: 16, head_dim: 72,
             intermediate: 4304, patch_size: 16, merger_width: 4608, norm_eps: 1e-6,
-            merger_extra: [NO_VISION_OFFSET; 8], q_norm: [NO_VISION_OFFSET; 28],
-            k_norm: [NO_VISION_OFFSET; 28], ..Default::default()
-        };
+            merger_extra: [NO_VISION_OFFSET; 8], q_norm: vec![NO_VISION_OFFSET; depth],
+            k_norm: vec![NO_VISION_OFFSET; depth], ..Default::default()
+        }.with_depth(depth);
         native.patch = put("patch_embed.proj.weight", &[1152, 3, 2, 16, 16], false)?;
         native.patch_bias = put("patch_embed.proj.bias", &[1152], true)?;
         // Position table stays BF16 just like the official learned embedding.
         native.pos_embed = put("pos_embed.weight", &[2304, 1152], false)?;
-        for i in 0..27 {
+        for i in 0..depth {
             let mut field = |suffix: &str, shape: &[usize], vector: bool| {
                 put(&format!("blocks.{i}.{suffix}"), shape, vector)
             };
@@ -148,6 +149,7 @@ mod tests {
     fn qwen_headers_match_biased_head72_tower_without_lm_reads() {
         let dir = snapshot();
         let spec = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
+        super::super::tests::assert_ctypes_spec(dir.path(), "qwen4", &spec);
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Qwen);
         assert_eq!(spec.reads.len(), 333);
         assert_eq!(spec.native.head_dim, 72);
@@ -159,7 +161,7 @@ mod tests {
         assert!(spec.reads.iter().all(|r| r.destination % 256 == 0));
         assert!(TowerSpec::qwen(dir.path(), 4097).is_err());
         let p = dir.path().join("config.json");
-        let mut cfg: serde_json::Value = serde_json::from_reader(File::open(&p).unwrap()).unwrap();
+        let mut cfg: serde_json::Value = cuteafd_loader::read_json_file(&p).unwrap();
         cfg["vision_config"]["intermediate_size"] = 4305.into();
         std::fs::write(&p, serde_json::to_vec(&cfg).unwrap()).unwrap();
         assert!(TowerSpec::qwen(dir.path(), 1024).unwrap_err().to_string().contains("intermediate_size"));
@@ -168,7 +170,7 @@ mod tests {
     fn qwen_rejects_unknown_shards_and_inconsistent_norm_shape() {
         let dir = snapshot();
         let p = dir.path().join("model.safetensors.index.json");
-        let mut index: serde_json::Value = serde_json::from_reader(File::open(&p).unwrap()).unwrap();
+        let mut index: serde_json::Value = cuteafd_loader::read_json_file(&p).unwrap();
         index["weight_map"]["model.visual.extra.weight"] = "../outside.safetensors".into();
         std::fs::write(&p, serde_json::to_vec(&index).unwrap()).unwrap();
         assert!(TowerSpec::qwen(dir.path(), 1).unwrap_err().to_string().contains("shard path"));

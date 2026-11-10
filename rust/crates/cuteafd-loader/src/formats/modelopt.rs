@@ -257,7 +257,13 @@ impl ModelOpt {
             }
             parent = module.rsplit_once('.').map(|(head, _)| head);
         }
-        if let Some(glob) = self.exclude.iter().find(|glob| glob_match(glob, stem)) {
+        // Stacked MoE projections are parameters of the MoE, not child Linear
+        // modules: a router wildcard must not exclude its gate_proj parameter.
+        let owner = stem.rsplit_once('.').and_then(|(parent, parameter)| {
+            (parent.ends_with(".moe") && matches!(parameter, "gate_proj" | "up_proj" | "down_proj"))
+                .then_some(parent)
+        }).unwrap_or(stem);
+        if let Some(glob) = self.exclude.iter().find(|glob| glob_match(glob, owner)) {
             return Declared::Excluded { glob };
         }
         match &self.default {
@@ -366,6 +372,72 @@ pub fn glob_match(glob: &str, name: &str) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stacked_parameter_exclusions_match_owners_not_router_prefixes() {
+        let config = json!({"quant_method":"modelopt", "quant_algo":"NVFP4", "group_size":16,
+            "ignore":["*layers.3.moe.gate*", "*layers.88.moe"]});
+        let mo = ModelOpt::from_json(None, Some(&config)).unwrap().unwrap();
+        assert!(matches!(mo.declared("model.layers.3.moe.gate"), Declared::Excluded { .. }));
+        for projection in ["gate_proj", "up_proj", "down_proj"] {
+            assert!(matches!(mo.declared(&format!("model.layers.3.moe.{projection}")), Declared::Quantized { .. }));
+            assert!(matches!(mo.declared(&format!("model.layers.88.moe.{projection}")), Declared::Excluded { .. }));
+        }
+    }
+
+    #[test]
+    fn official_nvfp4_inventories_preserve_every_tensor_declaration() {
+        let Some(root) = std::env::var_os("CUTEAFD_MODELOPT_INVENTORY_ROOT") else { return };
+        let root = std::path::PathBuf::from(root);
+        // Freeze the pre-owner-fix lookup independently of declared(): equality
+        // includes the algorithm, declaring module and exact exclusion glob.
+        fn before_owner_fix<'a>(mo: &'a ModelOpt, stem: &str) -> Declared<'a> {
+            let mut parent = Some(stem);
+            while let Some(module) = parent {
+                if let Some((name, algo)) = mo.layers.get_key_value(module) {
+                    return Declared::Quantized { algo, module: name };
+                }
+                parent = module.rsplit_once('.').map(|(head, _)| head);
+            }
+            if let Some(glob) = mo.exclude.iter().find(|glob| glob_match(glob, stem)) {
+                return Declared::Excluded { glob };
+            }
+            match &mo.default {
+                Some(algo) => Declared::Quantized { algo, module: "*" },
+                None => Declared::Unlisted,
+            }
+        }
+        for (model, revision, expected) in [
+            ("GLM-5.3-NVFP4", "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf", 232403),
+            ("GLM-5.3-Flash-NVFP4", "09b04e5e74bca08ca8549fc736d4cdd8624bfde3", 147661),
+            ("Qwen3.8-Flash-Next-NVFP4", "2061e0b0c5d92bdf7c8fbd4241bbc2af239d7e2d", 299545),
+            ("DeepSeek-V4.1-Flash-NVFP4", "3431dde3247c13b5957f682b1e3c6fcae2566079", 188245),
+        ] {
+            let snapshot = root.join(format!("models--nvidia--{model}/snapshots/{revision}"));
+            let config = read_json(&snapshot.join("config.json")).unwrap().unwrap();
+            let mo = ModelOpt::read(&snapshot, &config).unwrap().unwrap();
+            let index = read_json(&snapshot.join("model.safetensors.index.json")).unwrap().unwrap();
+            let tensors = index["weight_map"].as_object().unwrap();
+            assert_eq!(tensors.len(), expected, "{model}: incomplete inventory");
+            let mut classified = [0usize; 3];
+            for tensor in tensors.keys() {
+                // Check both the raw parameter and its owning logical stem,
+                // including scales, norms and non-weight parameters.
+                let stem = tensor.rsplit_once('.').map_or(tensor.as_str(), |(stem, _)| stem);
+                for name in [tensor.as_str(), stem] {
+                    assert_eq!(mo.declared(name), before_owner_fix(&mo, name),
+                        "changed declaration for {model}/{tensor} at {name}");
+                }
+                classified[match mo.declared(stem) {
+                    Declared::Quantized { .. } => 0,
+                    Declared::Excluded { .. } => 1,
+                    Declared::Unlisted => 2,
+                }] += 1;
+            }
+            assert!(classified[0] > 0 && classified[1] > 0, "{model}: missing declaration classes");
+            eprintln!("{model}: {expected} tensors unchanged; quantized/excluded/unlisted={classified:?}");
+        }
+    }
 
     #[test]
     fn globs_match_like_fnmatch() {

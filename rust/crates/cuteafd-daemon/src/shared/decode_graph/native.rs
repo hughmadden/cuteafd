@@ -97,6 +97,12 @@ impl<'a> RowGraphs<'a> {
     /// # Safety
     /// All launches on this wave's storage drained. The wave retains weights,
     /// workspace, geometry and buffers until clear, then drops them afterward.
+    /// Whether inserting `rows` retires (destroys) another graph, whose
+    /// queued launches must have drained first.
+    pub fn would_retire(&self, rows: usize) -> bool {
+        let decode_rows = self.decode_rows;
+        rows > decode_rows && self.bank.count(|&r| r > decode_rows && r != rows) >= LARGE_SHAPES
+    }
     pub unsafe fn insert(&mut self, rows: usize, graph: *mut c_void) -> Result<()> {
         ensure!((1..=4096).contains(&rows) && !graph.is_null(), "invalid row graph binding");
         let device = self.library.cuda_get_device()?;

@@ -25,6 +25,31 @@ fn byte_tokenizer() -> tempfile::TempDir {
 }
 
 #[test]
+fn added_markers_and_grammar_document_use_native_tiktoken_without_json_file() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::plan::testing::write_kimi_tokenizer(dir.path());
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    assert_eq!(tokenizer.added_token_ids(&["<|end_of_msg|>", "a", "missing", "<|open|>"]), [257, 256]);
+    let doc = tokenizer.grammar_tokenizer_json().unwrap();
+    let grammar: tokenizers::Tokenizer = serde_json::from_str(&doc).unwrap();
+    for text in ["hello", "<|open|>user<|end_of_msg|>"] {
+        assert_eq!(grammar.encode_fast(text, false).unwrap().get_ids(), tokenizer.encode_ids(text).unwrap());
+    }
+    assert!(!dir.path().join("tokenizer.json").exists());
+}
+
+#[test]
+fn added_markers_do_not_include_ordinary_json_vocabulary() {
+    let dir = byte_tokenizer();
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("tokenizer.json")).unwrap()).unwrap();
+    value["added_tokens"] = serde_json::json!([{"id":256,"content":"<|open|>","single_word":false,
+        "lstrip":false,"rstrip":false,"normalized":false,"special":true}]);
+    std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+    let tokenizer = LoadedTokenizer::from_snapshot(dir.path()).unwrap();
+    assert_eq!(tokenizer.added_token_ids(&["a", "missing", "<|open|>"]), [256]);
+}
+
+#[test]
 fn terminal_utf8_matches_lossy_whole_decode_at_every_byte_boundary() {
     let dir = byte_tokenizer();
     for text in [
@@ -426,4 +451,29 @@ fn official_literal_prompt_ids_are_plain_bpe_and_not_control_ids() {
         assert_eq!(tokenizer.decode_ids(&ids, false).unwrap().text, token.content);
         println!("literal {} -> {ids:?}", token.content);
     }
+}
+
+#[test]
+fn every_family_media_marker_is_a_media_literal() {
+    // Each family's media spellings, from its checkpoint's own added tokens on sparknest.
+    let media = ["<|begin_of_image|>", "<|end_of_image|>", "<|image|>", "<|begin_of_video|>", "<|video|>",
+        "<|begin_of_audio|>", // GLM 5.3 / Flash
+        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<|audio_pad|>",
+        "<|audio_start|>", // Qwen 3.8
+        "<|mimo_video_start|>", "<|mimo_audio_start|>", "<|mimo_audio_eod|>", // MiMo
+        "<｜deepseek_image｜>", "<｜rl_image_pad｜>", "<|place_holder_mm_span_0021|>", // DeepSeek V4/V4.1
+        "[IMG]", "[IMG_BREAK]", "[IMG_END]", "[AUDIO]", "[BEGIN_AUDIO]", // Mistral Large 4
+        "<|vid_start|>", "<|vid_end|>", "<|vid_frame_separator|>", "<|patch|>", "<|soft_audio_start|>", // Muse
+        "<|media_begin|>", "<|media_content|>", "<|media_end|>", "<|media_pad|>", // Kimi K3
+        "<im_start>", "<im_patch>", "<im_end>", "<patch_start>", "<patch_newline>", "<patch_end>"]; // Step 5
+    for marker in media { assert!(super::is_media_marker(marker), "{marker}"); }
+    // Chat, tool, grounding and code tokens stay ordinary literals.
+    for text in ["<|im_start|>", "<|im_end|>", "[INST]", "[THINK]", "[PREFIX]", "<|box_start|>", "<|quad_end|>",
+        "<|object_ref_start|>", "<|begin_of_box|>", "<|fim_prefix|>", "<|code_prefix|>", "<think>", "<|open|>"] {
+        assert!(!super::is_media_marker(text), "{text}");
+    }
+    let tokens = LiteralTokens::new(media.iter().chain(["[INST]", "<|im_start|>"].iter()).map(|t| t.to_string()));
+    let text = media.join(" ") + " [INST] <|im_start|>";
+    let found: Vec<_> = tokens.spans(&text, true).into_iter().map(|span| text[span].to_owned()).collect();
+    assert_eq!(found, media.map(str::to_owned));
 }

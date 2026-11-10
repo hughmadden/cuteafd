@@ -1,5 +1,6 @@
 #include "cuteafd_native.h"
 #include "../shared/src/rdma_endpoint_destroy.h"
+#include "../shared/src/rdma_landing_slots.h"
 
 #include <cassert>
 #include <cstring>
@@ -170,9 +171,26 @@ void test_rdma_destroy_failure_retains_registrations() {
   assert(quiesced.released);
 }
 
+void test_rdma_landing_slots_rotate_independently_of_header_ring() {
+  for (size_t depth : {2, 3}) {
+    cuteafd::RdmaLandingSlots slots{12288, depth, 0};
+    // Initial eight receives and every subsequent repost use the same phase.
+    for (size_t sequence = 0; sequence < 4096; ++sequence) {
+      const size_t expected = (sequence % depth) * slots.bytes;
+      assert(slots.offset() == expected);
+      assert(slots.offset() == expected);  // A failed post changes no phase.
+      slots.posted();
+    }
+    slots = {12288, depth, 0};
+    assert(slots.offset() == 0);  // A drained reconnect starts at slot zero.
+  }
+}
+
 void test_rdma_abi() {
   unsigned char endpoint_byte = 0;
   assert(cuteafd_rdma_rc_endpoint_post_recv_at(nullptr, 0, 1, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_recv_landing_at(nullptr, 0, 1, 1, 0, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_send_at(nullptr, &endpoint_byte, 0, 1, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
@@ -233,49 +251,32 @@ void test_rdma_abi() {
       "missing-device", 1, 256, 1, 4096, 4096, 4096, 4096, 8, 8, 1, 0, &selected) ==
       CUTEAFD_STATUS_INVALID_ARGUMENT);
 
+  // Loopback probes bind the GID their caller selected by address; without
+  // a device and GID they refuse rather than guess from table order.
   cuteafd_rdma_rc_send_recv_probe_t loopback = {};
+  assert(cuteafd_rdma_rc_send_recv_loopback_probe(nullptr, 1, 0, 12288, &loopback) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_send_recv_loopback_probe("missing-device", 1, 256, 12288, &loopback) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
   const cuteafd_status_t loopback_status =
-      cuteafd_rdma_rc_send_recv_loopback_probe(1, 12288, &loopback);
-  assert(loopback_status == CUTEAFD_STATUS_OK ||
-         loopback_status == CUTEAFD_STATUS_RDMA_UNAVAILABLE);
+      cuteafd_rdma_rc_send_recv_loopback_probe("missing-device", 1, 0, 12288, &loopback);
+  assert(loopback_status == CUTEAFD_STATUS_RDMA_UNAVAILABLE);
   assert(loopback.port_num == 1);
   assert(loopback.bytes == 12288);
-  if (loopback_status == CUTEAFD_STATUS_OK) {
-    assert(loopback.completed == 1);
-    assert(loopback.payload_matches == 1);
-    assert(loopback.sender_qp_num != 0);
-    assert(loopback.receiver_qp_num != 0);
-    assert(loopback.send_completions == 1);
-    assert(loopback.recv_completions == 1);
-    assert(loopback.poll_iterations > 0);
-    assert(loopback.device_name[0] != '\0');
-    assert(loopback.status[0] != '\0');
-  }
 
   const std::vector<unsigned char> request_frame = protocol_v2_frame(1, 12288);
   const std::vector<unsigned char> response_frame = protocol_v2_frame(2, 12288);
   cuteafd_rdma_rc_protocol_v2_loopback_probe_t protocol_loopback = {};
-  const cuteafd_status_t protocol_loopback_status =
-      cuteafd_rdma_rc_protocol_v2_loopback_probe(1, request_frame.data(), request_frame.size(),
-                                               response_frame.data(), response_frame.size(),
-                                               &protocol_loopback);
-  assert(protocol_loopback_status == CUTEAFD_STATUS_OK ||
-         protocol_loopback_status == CUTEAFD_STATUS_RDMA_UNAVAILABLE);
+  assert(cuteafd_rdma_rc_protocol_v2_loopback_probe(
+             nullptr, 1, 0, request_frame.data(), request_frame.size(), response_frame.data(),
+             response_frame.size(), &protocol_loopback) == CUTEAFD_STATUS_INVALID_ARGUMENT);
+  const cuteafd_status_t protocol_loopback_status = cuteafd_rdma_rc_protocol_v2_loopback_probe(
+      "missing-device", 1, 0, request_frame.data(), request_frame.size(), response_frame.data(),
+      response_frame.size(), &protocol_loopback);
+  assert(protocol_loopback_status == CUTEAFD_STATUS_RDMA_UNAVAILABLE);
   assert(protocol_loopback.port_num == 1);
   assert(protocol_loopback.request_bytes == request_frame.size());
   assert(protocol_loopback.response_bytes == response_frame.size());
-  if (protocol_loopback_status == CUTEAFD_STATUS_OK) {
-    assert(protocol_loopback.completed == 1);
-    assert(protocol_loopback.request_payload_matches == 1);
-    assert(protocol_loopback.response_payload_matches == 1);
-    assert(protocol_loopback.client_qp_num != 0);
-    assert(protocol_loopback.server_qp_num != 0);
-    assert(protocol_loopback.send_completions == 2);
-    assert(protocol_loopback.recv_completions == 2);
-    assert(protocol_loopback.poll_iterations > 0);
-    assert(protocol_loopback.device_name[0] != '\0');
-    assert(protocol_loopback.status[0] != '\0');
-  }
 }
 
 }  // namespace
@@ -289,6 +290,7 @@ int main() {
   test_error_propagation();
   test_nccl_abi();
   test_rdma_destroy_failure_retains_registrations();
+  test_rdma_landing_slots_rotate_independently_of_header_ring();
   test_rdma_abi();
   std::cout << "cuteafd_native_selftest passed\n";
   return 0;

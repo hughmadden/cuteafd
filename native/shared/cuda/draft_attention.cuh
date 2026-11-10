@@ -13,5 +13,6 @@ int launch(const void* q, const void* k_block, const void* v_block,
            const void* ctx_lengths, const void* ctx_ends, const void* sinks,
            void* out, void* workspace, int sequences, int block_rows,
            int heads, int kv_heads, int ring, int max_keys, int window,
-           bool causal, int head_dim, int slices, float scale, cudaStream_t stream);
+           bool causal, int head_dim, int slices, bool fp8, float scale, cudaStream_t stream,
+           const int32_t* pages = nullptr, int table_width = 0);
 }  // namespace cuteafd::draft_attention

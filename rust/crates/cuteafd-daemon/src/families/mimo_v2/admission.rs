@@ -1,11 +1,11 @@
 //! Pre-allocation descriptions shared with MiMo's allocation path. CUDA
 //! manifest queries read shape/scratch metadata before loading any weights.
 use anyhow::{ensure, Context, Result};
-use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, resolve_transport_lanes, workspace_scratch, draft_reservations_with, DraftReservations, DraftScratch};
+use cuteafd_loader::families::mimo_v2::admission::{tensor_bytes, draft_prefix_reservations, prefill_shape, workspace_scratch, draft_reservations_with, DraftReservations, DraftScratch};
 
 use cuteafd_core::serving_capacity::MemoryReservation;
 use cuteafd_ffi::programs::Programs;
-use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoPrefillOutput, MimoV2Config};
+use cuteafd_loader::families::mimo_v2::{MimoKvCache, MimoKvFormats, MimoPrefillOutput, MimoV2Config};
 
 /// Exact tensor admission against the measured post-module baseline.
 pub(super) struct Preflight {
@@ -17,6 +17,7 @@ pub(super) struct Preflight {
     pub placement: cuteafd_loader::placement::Placement,
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
+    pub prefill_rows: usize,
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -42,10 +43,11 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     }
     let whole = Bytes2 { resident: expert_layer_bytes(tensors, 1, 0, Slicing::Padded)?, staging: 0 };
     let routed = opened.cfg.dense.iter().take(layers).filter(|&&dense| !dense).count();
-    let zero_local = args.onboard.layers(routed) == Some(0);
+    let onboard = args.onboard.resolve(routed);
+    let zero_local = onboard.layers(routed) == Some(0);
     let metadata = if zero_local { None } else { package_manifest(&directory, None)? };
     if zero_local || (metadata.is_none()
-        && args.onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
+        && onboard == cuteafd_loader::placement::Onboard::Auto && args.fp8_package.is_none()) {
         ensure!(args.peers.is_some(), "MiMo zero local experts requires Spark peers");
         let costs = opened.cfg.dense.iter().take(layers).map(|&dense| (!dense).then_some(ExpertCost {
             whole, half: [Bytes2::default(); 2], tp2: ranks == 2, spark_ok: true,
@@ -119,29 +121,36 @@ mod draft_prefix_tests {
         std::fs::write(dir.path().join("dflash/config.json"),
             r#"{"num_hidden_layers":5,"num_key_value_heads":8,"head_dim":128}"#).unwrap();
         let cfg = MimoV2Config::from_hf(&config).unwrap();
-        let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
-            &cfg, cfg.layers, 1, MimoKvCache::Int8, 0).unwrap();
-        let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-        let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 1024).unwrap();
-        for concurrency in [4, 16] {
-            for enabled in [false, true] {
-                // Include a budget-tight case to catch the concurrency floor and
-                // a warm mark changing the number of affordable retained slots.
-                for mib in [0, 1024, 2048] {
-                    let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
-                    let slots = mark_slots(&cli.prefix, concurrency,
-                        aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
-                    let layout = plan(dir.path(), &PlanOptions {
-                        layout: Some(LayoutOptions {
-                            concurrency: concurrency as u64, mimo_prefix_draft: enabled,
-                            mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()
-                        }), ..Default::default()
-                    }).unwrap().memory_layout.unwrap();
-                    let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
-                    assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
-                    let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
-                    assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
-                    assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+        assert_eq!(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }.mimo_swa_kv, MimoKvFormats::default().sliding);
+        for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            let cache = cuteafd_loader::serving_capacity::mimo_cache_geometry(
+                &cfg, cfg.layers, 1, MimoKvFormats { full: MimoKvCache::Int8, sliding }, 0).unwrap();
+            let target: u64 = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
+            for draft_kv_cache in [cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+                cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8] {
+                let draft = cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(5, 8, 128, draft_kv_cache).unwrap();
+                for concurrency in [4, 16] {
+                    for enabled in [false, true] {
+                        // Include a budget-tight case to catch the concurrency floor and
+                        // a warm mark changing the number of affordable retained slots.
+                        for mib in [0, 1024, 2048] {
+                            let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", &mib.to_string()]);
+                            let slots = mark_slots(&cli.prefix, concurrency,
+                                aggregate_mark_bytes(target, draft, enabled).unwrap() as usize).unwrap() as u64;
+                            let layout = plan(dir.path(), &PlanOptions {
+                                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                                    concurrency: concurrency as u64, mimo_prefix_draft: enabled, draft_kv_cache,
+                                    mimo_swa_kv: sliding,
+                                    mimo_prefix_mark_bytes: mib << 20, host_cache_bytes: Some(0), ..Default::default()
+                                }), ..Default::default()
+                            }).unwrap().memory_layout.unwrap();
+                            let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
+                            assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
+                            let reservations = draft_prefix_reservations(enabled, draft, slots, concurrency as u64).unwrap();
+                            assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
+                            assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
+                        }
+                    }
                 }
             }
         }
@@ -160,8 +169,8 @@ mod draft_prefix_tests {
         let target = 256u64 << 20;
         let draft = 20u64 << 20;
         let bytes = |enabled| aggregate_mark_bytes(target, draft + 8, enabled).unwrap();
-        let slots = |enabled| cuteafd_engine::prefix::MarkArena::slots_for(16, 24, bytes(enabled) as usize, 12usize << 30);
-        assert_eq!(slots(false), cuteafd_engine::prefix::MarkArena::slots_for(16, 24, target as usize, 12usize << 30));
+        let slots = |enabled| cuteafd_engine::prefix::MarkArena::slots_for(16, 24, bytes(enabled) as usize, 12usize << 30, false);
+        assert_eq!(slots(false), cuteafd_engine::prefix::MarkArena::slots_for(16, 24, target as usize, 12usize << 30, false));
         assert!(slots(true) <= slots(false));
         assert_eq!(bytes(false), target);
         assert!(draft_prefix_reservations(false, draft + 8, 42, 18).unwrap().is_empty());
@@ -173,10 +182,33 @@ mod draft_prefix_tests {
     }
 }
 
+pub(super) fn resolved_prefill_shape(spark_ranks: usize, rows: usize, waves: usize)
+    -> Result<cuteafd_loader::serving_capacity::PrefillShape> {
+    use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+    Ok(prefill_shape(spark_ranks, PrefillLimits::default(), PrefillOverrides {
+        unit_rows: (rows > 0).then_some(rows as u64),
+        waves: (waves > 0).then_some(waves as u64), ..Default::default()
+    })?.units())
+}
+
 /// Resolve physical reservations after module preload, before model allocations.
 /// The same profile can be serialized by a planner; explicit benchmark pool
 /// and context arguments are always preserved.
 pub(super) fn preflight(
+    opened: &super::Opened,
+    args: &super::EngineArgs,
+    programs: &Programs<'_>,
+    split_device: Option<i32>,
+    serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
+    prefill_output: MimoPrefillOutput,
+    prefix_draft: bool,
+    automatic_context: bool,
+) -> Result<Preflight> {
+    preflight_shape(opened, args, programs, split_device, serving,
+        prefill_output, prefix_draft, automatic_context)
+}
+
+fn preflight_shape(
     opened: &super::Opened,
     args: &super::EngineArgs,
     programs: &Programs<'_>,
@@ -217,14 +249,12 @@ pub(super) fn preflight(
     );
     let context = checkpoint_context_limit(&opened.checkpoint.config)?
         .context("MiMo checkpoint has no max_position_embeddings; specify its context capability in config.json")?;
-    let kv = args.kv_cache.into();
+    let kv = args.kv_formats();
     let cache = mimo_cache_geometry(cfg, layers, ranks, kv, args.mtp)?;
     let draft_mark_bytes = args.draft.as_deref().filter(|_| prefix_draft).map(super::dflash::drafter_dir)
         .map(|dir| -> Result<u64> {
             let draft = super::dflash::DflashConfig::read(&dir)?;
-            let width = (draft.kv_heads as u64).checked_mul(draft.head_dim as u64)
-                .context("DFlash KV width overflow")?;
-            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, width)?)
+            Ok(cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(draft.layers as u64, draft.kv_heads as u64, draft.head_dim as u64, args.draft_kv_cache)?)
         }).transpose()?.unwrap_or(0);
     let target_mark_bytes = cache
         .ranks
@@ -258,8 +288,11 @@ pub(super) fn preflight(
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena,
                 page_owners: Default::default(),
             };
-            prefix.with_scoring(if args.full_prefill_logits { args.prefill_rows } else { 64 },
-                args.prefill_rows, cfg.vocab_size)?.host_config(layout, args.max_context, concurrency)?
+            let scoring_rows = if args.full_prefill_logits {
+                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
+            } else { 64 };
+            prefix.with_scoring(scoring_rows, scoring_rows.max(64), cfg.vocab_size)?
+                .resolve_host_config(layout, args.max_context, concurrency)?
         }
         None => None,
     };
@@ -299,7 +332,8 @@ pub(super) fn preflight(
         .iter()
         .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
         .collect::<Vec<_>>();
-    let transport_lanes = transport_lanes(backend == ExpertBackend::Spark, cfg)?;
+    let transport_lanes = resolved_prefill_shape(usize::from(args.peers.is_some()),
+        args.prefill_rows, args.prefill_waves)?.waves as usize;
     let spark_ranks = match args
         .peers
         .as_deref()
@@ -323,11 +357,10 @@ pub(super) fn preflight(
     let mut memory = Vec::with_capacity(ranks);
     let mut post_kv_loading_additional = Vec::with_capacity(ranks);
     let mut draft_packing = Vec::new();
-    let mut first_lane_tap_bytes = 0;
     for (rank, &device) in devices.iter().enumerate() {
         let device_id = u32::try_from(device).context("negative CUDA device id")?;
         let (free, total) =
-            crate::shared::peer_split::on_device(library, device, args.device, || {
+            crate::shared::peer_split::on_device(library, device, || {
                 library.cuda_memory_info()
             })?;
         memory.push(DeviceMemory {
@@ -344,14 +377,14 @@ pub(super) fn preflight(
         let cublas = MemoryReservation { name: "runtime.loaded_code".into(), bytes: pending };
         let mut additional = vec![cublas.clone()];
         additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0)?);
+            cfg, ranks, rank, args.prefill_rows, transport_lanes, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
         // Only modules and the already-attached peer are live before drafter
         // packing. Spark transport, samplers, marks, graphs and reusable target
         // workspaces are constructed later and do not consume this phase.
         post_kv_loading_additional.push(additional.clone());
         if rank == 0 {
             additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks)?);
+                cfg, 1, 0, args.prefill_rows, transport_lanes, spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
             if serving.is_some() {
                 additional.extend(cuteafd_loader::families::mimo_v2::admission::sampling_reservations(cfg.vocab_size)?);
             }
@@ -373,7 +406,6 @@ pub(super) fn preflight(
                 additional.extend(reservations.steady);
                 additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
                     args.rings as u64)?);
-                first_lane_tap_bytes = draft.prefill_lane_tap_bytes()? as u64;
                 draft_packing = reservations.packing;
             }
             if backend == ExpertBackend::Local && args.expert_window.is_some() {
@@ -401,19 +433,12 @@ pub(super) fn preflight(
         });
     }
     let profiles_for = |selected_spark_ranks: usize| -> Result<_> {
-        let lanes = if selected_spark_ranks == 0 { 1 } else { transport_lanes };
+        let lanes = transport_lanes;
         let mut selected_runtime = runtime.clone();
         for (rank, costs) in selected_runtime.iter_mut().enumerate() {
-            costs.additional.retain(|cost| !cost.name.starts_with("transport.")
-                && cost.name != "draft.prefill_first_lane_taps");
+            costs.additional.retain(|cost| !cost.name.starts_with("transport."));
             costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks)?);
-            if rank == 0 && first_lane_tap_bytes > 0
-                && cuteafd_loader::families::mimo_v2::admission::prefill_lane_taps(
-                    lanes, args.prefill_rows, args.mtp, prefill_output) {
-                costs.additional.push(MemoryReservation { name: "draft.prefill_first_lane_taps".into(),
-                    bytes: first_lane_tap_bytes });
-            }
+                cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks, cuteafd_core::SparkReplyFormat::Bf16)?);
             costs.workspaces = workspace_options(cfg, args, programs, ranks, rank, lanes,
                 selected_spark_ranks > 0, VOCABULARY_HEAD_WORKSPACE as u64, prefill_output,
                 opened.weight_formats.any_fp8_output())?;
@@ -469,7 +494,8 @@ pub(super) fn preflight(
         gpus: memory.iter().map(|m| (m.total_bytes, Baseline::Measured { free_bytes: m.baseline_free_bytes })).collect(),
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
         context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
-        onboard: args.onboard, experts: expert_costs, expert_workspace, tp2_workspace,
+        onboard: args.onboard.resolve(cfg.dense.iter().take(layers).filter(|&&dense| !dense).count()),
+        experts: expert_costs, expert_workspace, tp2_workspace,
         rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
     };
     let solution = solve_working_set(&inputs, &no_spark_profiles.steady)
@@ -480,7 +506,7 @@ pub(super) fn preflight(
     for (rank, costs) in post_kv_loading_additional.iter_mut().enumerate() {
         costs.retain(|cost| !cost.name.starts_with("transport."));
         costs.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
-            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0)?);
+            cfg, ranks, rank, args.prefill_rows, solution.working_set.prefill_lanes as usize, 0, cuteafd_core::SparkReplyFormat::Bf16)?);
     }
     let report = reservation_report(&profiles.steady, &memory, policy)?;
     tracing::info!(reservations = %report, working_set = ?solution.working_set,
@@ -499,6 +525,26 @@ pub(super) fn preflight(
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
         slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
     resolve_pool_context(&mut capacity, automatic_context, profiles.steady.pool_unit_rows)?;
+    let diagnostic_rows = if std::env::var("CUTEAFD_ROUTE_CHECK").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0) > 0 {
+        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?.max(64)
+    } else { args.prefill_rows.min(256) };
+    let diagnostic_layers = placement.tp2.map_or(0, |tp2| tp2.layers);
+    let mut tables = cuteafd_loader::families::mimo_v2::admission::future_host_workspaces(cfg,
+        args.prefill_rows, solution.working_set.prefill_lanes as usize, ranks, pool_tokens,
+        usize::try_from(capacity.effective_max_context_tokens)?, solution.working_set.spark_ranks,
+        args.expert_input.into(), kv, prefill_output, serving.is_some(), diagnostic_rows, diagnostic_layers)?;
+    if args.token_io.embed_placement == Some(crate::shared::token_io::EmbedPlacement::Host) {
+        tables.push(("mimo/embedding".into(), tensor_bytes("MiMo host embedding", &[cfg.vocab_size, cfg.hidden, 2])?));
+    }
+    let score_rows = if args.full_prefill_logits {
+        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
+    } else { 64 };
+    let scoring = cuteafd_core::memory_layout::host_logits_bytes(score_rows as u64,
+        score_rows.max(64) as u64, cfg.vocab_size as u64).context("MiMo host scoring overflow")?;
+    let views = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect::<Vec<_>>();
+    crate::shared::memory::budget::admit_host_memory(host_bytes, &views, scoring,
+        serving.map_or(0, |(prefix, _)| prefix.host_cache_headroom_bytes))?;
     if !draft_packing.is_empty() {
         let units = capacity.allocated_gpu_kv_tokens / profiles.steady.pool_unit_rows;
         for (rank, phase) in profiles.post_target_kv.iter().enumerate() {
@@ -562,6 +608,7 @@ pub(super) fn preflight(
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: solution.working_set,
+        prefill_rows: args.prefill_rows,
     })
 }
 
@@ -663,15 +710,6 @@ fn expert_backend(routed_layers: usize, skip: bool, local: bool, peers: bool) ->
     }
 }
 
-pub(super) fn transport_lanes(spark: bool, cfg: &MimoV2Config) -> Result<usize> {
-    if !spark {
-        return Ok(1);
-    }
-    let configured = std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok();
-    resolve_transport_lanes(spark, cfg.program_family()?, configured.as_deref())
-}
-
-
 fn workspace_options(
     cfg: &MimoV2Config,
     args: &super::EngineArgs,
@@ -691,7 +729,7 @@ fn workspace_options(
 > {
     let _ = head_workspace_bytes;
     cuteafd_loader::families::mimo_v2::admission::workspace_options(cfg, ranks, rank,
-        args.prefill_rows, args.max_context, transport_lanes, spark, args.expert_input.into(), args.kv_cache.into(), args.mtp,
+        args.prefill_rows, args.max_context, transport_lanes, spark, args.expert_input.into(), args.kv_formats(), args.mtp,
         prefill_output, fp8_output, |name| Ok(programs.spec(name)?.scratch.get("scratch").copied().unwrap_or(0)))
 }
 
@@ -804,7 +842,7 @@ pub(super) fn workspace_native_scratch(
     ranks: usize,
     rank: usize,
     decode: bool,
-    kv: MimoKvCache,
+    kv: MimoKvFormats,
     fp8_output: bool,
 ) -> Result<u64> {
     workspace_scratch(cfg, ranks, rank, decode, kv, fp8_output, |name| {
@@ -836,16 +874,29 @@ mod tests {
     }
 
     #[test]
-    fn prefill_lane_defaults_follow_family_and_preserve_explicit_overrides() {
-        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimof", 2), ("mimof2", 2), ("mimop", 3), ("mimop2", 3)] {
-            assert_eq!(super::resolve_transport_lanes(true, family, None).unwrap(), default);
-            for lanes in 1..=4 {
-                let configured = lanes.to_string();
-                assert_eq!(super::resolve_transport_lanes(true, family, Some(&configured)).unwrap(), lanes);
+    fn prefill_uses_shared_fixed_depth() {
+        let shape = super::prefill_shape(6, None).unwrap();
+        assert_eq!((shape.unit_rows, shape.waves), (2752, 3));
+        assert_eq!(super::prefill_shape(6, Some(1024)).unwrap().waves, 3);
+        assert!(super::prefill_shape(6, Some(4096)).is_err());
+        let local = super::prefill_shape(0, None).unwrap();
+        assert_eq!((local.unit_rows, local.waves), (4096, 1));
+    }
+
+    #[test]
+    fn explicit_prefill_pins_match_shared_planner_without_fallback() {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillLimits, PrefillOverrides};
+        for ranks in [0, 2, 6] { for (rows, waves) in [(0, 0), (1024, 0), (4096, 2), (2752, 3), (2048, 4), (4096, 3)] {
+            let runtime = super::resolved_prefill_shape(ranks, rows, waves);
+            let planner = prefill_shape(ranks, PrefillLimits::default(), PrefillOverrides {
+                unit_rows: (rows > 0).then_some(rows as u64),
+                waves: (waves > 0).then_some(waves as u64), ..Default::default()
+            });
+            match planner {
+                Ok(shape) => assert_eq!(runtime.unwrap(), shape.units()),
+                Err(_) => assert!(runtime.is_err(), "invalid pin must not shrink"),
             }
-            assert!(super::resolve_transport_lanes(true, family, Some("5")).is_err());
-            assert_eq!(super::resolve_transport_lanes(false, family, Some("5")).unwrap(), 1);
-        }
+        } }
     }
 
     #[test]
@@ -883,28 +934,11 @@ mod tests {
     }
 
     #[test]
-    fn independent_prefill_admits_two_lead_heads_and_no_peer_head() {
-        let last = MimoPrefillOutput::LastRow;
-        assert_eq!(workspace_shapes(4096, true, true, 2, last, 0), [
-            ("prefill", false, 4096, true), ("decode", true, 64, true),
-            ("prefill_first_lane", false, 4096, true),
-        ]);
-        assert!(workspace_shapes(4096, false, true, 2, last, 0).iter().all(|shape| !shape.3));
-        assert!(!workspace_shapes(4096, true, true, 2, MimoPrefillOutput::AllRows, 0)[2].3);
-        assert!(!workspace_shapes(4096, true, true, 2, last, 1)[2].3);
-        for (rows, spark, lanes) in [(4096, false, 2), (4096, true, 1), (1024, true, 2)] {
-            assert_eq!(workspace_shapes(rows, true, spark, lanes, last, 0).len(), 2);
+    fn prefill_units_admit_one_scratch_and_one_head() {
+        for waves in 1..=4 {
+            assert_eq!(workspace_shapes(4096, true, true, waves, MimoPrefillOutput::LastRow, 0),
+                [("prefill", false, 4096, true), ("decode", true, 64, true)]);
         }
-    }
-
-    #[test]
-    fn paired_tap_bank_admits_only_one_additional_bf16_activation_extent() {
-        let (mut cfg, _) = draft_fixture();
-        cfg.hidden = 4096;
-        cfg.taps = vec![9, 19, 29, 39, 49];
-        assert_eq!(cfg.prefill_lane_tap_bytes().unwrap(), 1024 * 5 * 4096 * 2);
-        cfg.hidden = usize::MAX;
-        assert!(cfg.prefill_lane_tap_bytes().is_err());
     }
 
     #[test]
@@ -963,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_mark_arena_reserves_actual_concurrency_even_above_nominal_budget() {
+    fn serving_mark_arena_honors_zero_budget_and_host_staging() {
         use clap::Parser;
         #[derive(Parser)]
         struct Cli {
@@ -971,9 +1005,10 @@ mod tests {
             prefix: crate::shared::prefix::PrefixArgs,
         }
         let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0"]);
-        // Sixteen live requests need capture/restore slots even when retained
-        // entry marks do not fit the nominal mark-cache budget.
-        assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 34);
+        // Device-only retention is disabled when no complete mark fits.
+        assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 0);
+        let hosted = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0", "--host-cache-bytes", "auto"]);
+        assert_eq!(mark_slots(&hosted.prefix, 16, 37_500_000).unwrap(), 2);
         let disabled = Cli::parse_from(["serve", "--prefix-cache-entries", "0"]);
         assert_eq!(mark_slots(&disabled.prefix, 16, 37_500_000).unwrap(), 0);
         assert!(mark_slots(&cli.prefix, 65, 37_500_000).is_err());
@@ -1083,6 +1118,31 @@ mod tests {
     }
 
     #[test]
+    fn compact_draft_rings_preserve_every_other_reservation() {
+        use cuteafd_loader::families::{mimo_v2::draft_representation::{MimoDraftCapacity,
+            MimoDraftRepresentation}, qwen4::Qwen4KvCache};
+        let (cfg, headers) = draft_fixture();
+        for mode in [MimoDraftRepresentation::Bf16Only, MimoDraftRepresentation::Fp8Only] {
+            let capacity = MimoDraftCapacity::new(20, 16, cfg.block).unwrap();
+            let bf16 = draft_reservations_with(&cfg, &headers, mode, capacity, |_| Ok(2048)).unwrap();
+            let compact = MimoDraftCapacity { kv_cache: Qwen4KvCache::Fp8, ..capacity };
+            let fp8 = draft_reservations_with(&cfg, &headers, mode, compact, |_| Ok(2048)).unwrap();
+            assert_eq!(bf16.steady.len(), fp8.steady.len());
+            for (a, b) in bf16.steady.iter().zip(&fp8.steady) {
+                assert_eq!(a.name, b.name);
+                if a.name.ends_with("_ring") {
+                    assert_eq!(a.bytes, 20 * 1024 * 128 * 2);
+                    assert_eq!(b.bytes, 20 * 1024 * 144);
+                } else {
+                    assert_eq!(a.bytes, b.bytes, "{}", a.name);
+                }
+            }
+            assert_eq!(bf16.packing.iter().map(|r| r.bytes).sum::<u64>(),
+                fp8.packing.iter().map(|r| r.bytes).sum::<u64>());
+        }
+    }
+
+    #[test]
     fn unsupported_draft_source_fails_before_native_workspace_queries() {
         use cuteafd_loader::families::mimo_v2::draft_representation::{
             MimoDraftCapacity, MimoDraftRepresentation,
@@ -1131,6 +1191,7 @@ mod tests {
             .any(|r| r.name == "draft.weights.bf16_values"));
         assert!(reservations.packing.is_empty());
         let invalid = MimoDraftCapacity {
+            kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             context_slots: 16,
             max_batch_sequences: 20,
             block_rows: 160,
@@ -1149,7 +1210,7 @@ mod tests {
     fn lead_reserves_unsplit_mtp_programs_and_peer_only_its_share() {
         let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
         let mut lead = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 0, true, MimoKvCache::Int8, false, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 0, true, MimoKvFormats::default(), false, |name| {
             lead.push(name.to_string());
             Ok(if name.starts_with("mimop_") {
                 4096
@@ -1163,7 +1224,7 @@ mod tests {
         assert!(lead.iter().any(|n| n.starts_with("mimop2_")));
         assert!(lead.iter().any(|n| n.starts_with("mimop_full_attention")));
         let mut peer = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 1, false, MimoKvCache::Int8, false, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 1, false, MimoKvFormats::default(), false, |name| {
             peer.push(name.to_string());
             Ok(2048)
         })
@@ -1175,10 +1236,32 @@ mod tests {
     }
 
     #[test]
+    fn selected_swa_format_queries_target_and_unsplit_mtp_programs() {
+        let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
+        for sliding in [MimoKvCache::Bf16, MimoKvCache::Int8, MimoKvCache::Fp8] {
+            for (rank, decode) in [(0, true), (0, false), (1, true), (1, false)] {
+                let mut queried = Vec::new();
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+                let bytes = workspace_scratch(&cfg, 2, rank, decode, kv, false, |name| {
+                    queried.push(name.to_owned());
+                    Ok(if name.contains("swa_attention") { 8192 } else { 4096 })
+                }).unwrap();
+                assert_eq!(bytes, 8192);
+                let (mode, cap) = if decode { ("decode", "m64") } else { ("prefill", "m4096") };
+                for family in if rank == 0 { vec!["mimop2", "mimop"] } else { vec!["mimop2"] } {
+                    assert!(queried.contains(&format!("{family}_swa_producer{}_{}", sliding.program_tag(), cap)));
+                    assert!(queried.contains(&format!("{family}_swa_attention{}_{mode}_{cap}", sliding.program_tag())));
+                    assert!(queried.contains(&format!("{family}_full_attention_kvint8_{mode}_{cap}")));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn missing_selected_native_program_fails_before_workspace_allocation() {
         let cfg =
             MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_flash_config()).unwrap();
-        let error = workspace_scratch(&cfg, 1, 0, true, MimoKvCache::Bf16, false, |name| {
+        let error = workspace_scratch(&cfg, 1, 0, true, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, false, |name| {
             if name == "mimo_full_attention_decode_m64" {
                 anyhow::bail!("missing {name}")
             } else {
@@ -1192,7 +1275,7 @@ mod tests {
     fn selected_fp8_output_reserves_each_rank_family_scratch_and_requires_export() {
         let cfg = MimoV2Config::from_hf(&cuteafd_loader::plan::testing::mimo_pro_config()).unwrap();
         let mut queried = Vec::new();
-        let bytes = workspace_scratch(&cfg, 2, 0, false, MimoKvCache::Int8, true, |name| {
+        let bytes = workspace_scratch(&cfg, 2, 0, false, MimoKvFormats::default(), true, |name| {
             queried.push(name.to_owned());
             Ok(match name {
                 "mimop_o_w8_m4096" => 69_206_016,
@@ -1203,7 +1286,7 @@ mod tests {
         .unwrap();
         assert_eq!(bytes, 69_206_016);
         assert!(queried.iter().any(|name| name == "mimop2_o_w8_m4096"));
-        let peer = workspace_scratch(&cfg, 2, 1, false, MimoKvCache::Int8, true, |name| {
+        let peer = workspace_scratch(&cfg, 2, 1, false, MimoKvFormats::default(), true, |name| {
             Ok(if name == "mimop2_o_w8_m4096" {
                 34_603_008
             } else {
@@ -1212,7 +1295,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(peer, 34_603_008);
-        let error = workspace_scratch(&cfg, 2, 1, true, MimoKvCache::Int8, true, |name| {
+        let error = workspace_scratch(&cfg, 2, 1, true, MimoKvFormats::default(), true, |name| {
             if name == "mimop2_o_w8_m64" {
                 anyhow::bail!("missing {name}");
             }

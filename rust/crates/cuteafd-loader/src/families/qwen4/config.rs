@@ -50,6 +50,11 @@ pub struct Qwen4Config {
 }
 
 impl Qwen4Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str {
+        crate::plan::Family::id(&crate::plan::families::qwen::QWEN4)
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self> {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
     }

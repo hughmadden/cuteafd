@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 6 ]]; then
-  echo "usage: finalize-wip-slot.sh SOURCE_DIR ROLE SLOT BUILD_OUTPUT IMAGE IMAGE_ID" >&2
+if [[ $# -lt 6 || $# -gt 7 ]]; then
+  echo "usage: finalize-wip-slot.sh SOURCE_DIR ROLE SLOT BUILD_OUTPUT IMAGE IMAGE_ID [IMAGE_LAYERS]" >&2
   exit 2
 fi
 
@@ -12,6 +12,9 @@ slot="$3"
 build_output="$(realpath "$4")"
 image="$5"
 image_id="$6"
+# The image's RootFS layer list (JSON), its identity across Docker's classic and
+# containerd stores, where save/load gives the same image a different .Id.
+image_layers="${7:-}"
 wip_instance="${WIP_INSTANCE:-}"
 wip_root="${WIP_ROOT:-}"
 wip_build_key="${CUTEAFD_WIP_BUILD_KEY:-}"
@@ -41,7 +44,8 @@ fi
 if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then
   "$build_output/cuteafd" programs-check --native-lib "$build_output/libcuteafd_native.so" \
     --manifest "$build_output/PROGRAMS.json" \
-    --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+    --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
+    --exlr8-family "${CUTEAFD_WIP_EXLR8_FAMILIES:-}"
 fi
 
 slot_root="/wip/slots/$slot/$role"
@@ -138,6 +142,11 @@ metadata = {
 build_key = ${wip_build_key@Q}
 if build_key:
     metadata["build_key"] = build_key
+# Sealed where IMAGE_ID is this host's store-local ID: the layer list is the
+# store-independent identity remote Sparks must match (golden-run).
+image_layers = ${image_layers@Q}
+if image_layers:
+    metadata["base_image_layers"] = json.loads(image_layers)
 phases_path = pathlib.Path(${build_output@Q}) / "BUILD_PHASES.tsv"
 if phases_path.is_file():
     phases = []

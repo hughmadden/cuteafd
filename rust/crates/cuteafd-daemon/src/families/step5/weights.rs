@@ -1,7 +1,8 @@
 //! Header-admitted target weights. No routed-expert or MTP residency is implied.
 use crate::shared::memory::device::{Allocation, Device};
 use crate::shared::peer_split::{slice_2d, Axis};
-use crate::shared::qwen::weights::{materialize_bf16, WeightReader};
+#[cfg(test)]
+use crate::shared::qwen::weights::materialize_bf16;
 use crate::shared::token_io::{EmbedPlacement, EmbedSource, TokenEmbedding};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
@@ -14,6 +15,8 @@ use std::collections::BTreeMap;
 
 const EMBEDDING: &str = "model.embed_tokens.weight";
 
+/// The host packing the dense records replaced (the unit tests' oracle).
+#[cfg(test)]
 fn pack(
     operand: &WeightOperand,
     layout: &RankWeightLayout,
@@ -75,8 +78,11 @@ fn pack(
 }
 
 pub(super) fn validate_live_weights(device: i32, weights: &[Allocation<'_>]) -> Result<()> {
-    ensure!(!weights.is_empty() && weights.iter().all(|weight| {
-        let buffer = weight.buffer;
+    validate_live_buffers(device, &weights.iter().map(|w| w.buffer).collect::<Vec<_>>())
+}
+
+pub(super) fn validate_live_buffers(device: i32, weights: &[CuteafdDeviceBuffer]) -> Result<()> {
+    ensure!(!weights.is_empty() && weights.iter().all(|buffer| {
         !buffer.ptr.is_null() && buffer.device_id == device && buffer.bytes >= 256
     }), "Step-5 live native weight allocation inventory");
     Ok(())
@@ -95,12 +101,88 @@ pub(super) fn load_operand<'a>(
     } else {
         "f32"
     });
-    let reader = WeightReader {
-        library: device.library,
-        checkpoint,
-    };
-    let bytes = pack(operand, layout, |name| reader.raw(name))?;
-    device.run(|| reader.upload(&bytes))
+    let allocation = Allocation::new(device, usize::try_from(operand.allocation_bytes)?)?;
+    load_records(device, checkpoint, layout, operand, allocation.buffer)?;
+    Ok(allocation)
+}
+
+/// `operand`'s bytes as shared dense records into `buffer` (allocated as the
+/// mount allocates it): unchanged checkpoint rectangles (whole tensors, a
+/// rank's rows, a rank's column window, in source order), or for an F32
+/// source of a BF16 operand one staged step narrowed on the GPU. Filled
+/// through the mount at once, or recorded for the coordinator push group.
+fn load_records(device: Device<'_>, checkpoint: &Checkpoint, layout: &RankWeightLayout, operand: &WeightOperand,
+    buffer: CuteafdDeviceBuffer) -> Result<()> {
+    use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
+    let dense = DenseLoad::mount(device.library);
+    let elem = if operand.dtype == DType::Bf16 { 2 } else { 4 };
+    let mut lands = Vec::new();
+    let mut at = 0usize;
+    for source in &operand.sources {
+        let meta = &source.meta;
+        ensure!(meta.dtype == operand.dtype || (operand.dtype == DType::Bf16 && meta.dtype == DType::F32),
+            "Step-5 native parameter precision changed");
+        let total = if meta.shape.len() >= 2 { meta.shape[0] } else { 1 };
+        let bytes = usize::try_from(meta.byte_length)?;
+        ensure!(total > 0 && bytes % total == 0, "{}: rows do not divide the tensor", meta.name);
+        let whole = Rect { name: meta.name.clone(), path: checkpoint.snapshot.join(&source.shard), base: meta.byte_offset,
+            row_bytes: bytes / total, rows: 0..total, cols: 0..bytes / total };
+        let rect = match operand.slice {
+            WeightSlice::Replicated => whole,
+            WeightSlice::Rows | WeightSlice::Cols => {
+                ensure!(operand.sources.len() == 1 && meta.shape.len() == 2, "Step-5 split source layout");
+                let (rank, ranks) = (layout.rank, layout.ranks);
+                // Narrowing is elementwise: a source element's width selects the window.
+                let elem = if meta.dtype == DType::F32 { 4 } else { elem };
+                if operand.slice == WeightSlice::Rows {
+                    ensure!(total % ranks == 0, "{}: rows do not split over {ranks} GPUs", meta.name);
+                    whole.sub(rank * total / ranks..(rank + 1) * total / ranks)
+                } else {
+                    let width = meta.shape[1] / ranks * elem;
+                    ensure!(meta.shape[1] % ranks == 0, "{}: columns do not split over {ranks} GPUs", meta.name);
+                    Rect { cols: rank * width..(rank + 1) * width, ..whole }
+                }
+            }
+        };
+        if meta.dtype == operand.dtype {
+            let n = rect.bytes();
+            lands.push((rect, at));
+            at += n;
+        } else {
+            // Elementwise narrowing permits small windows even for a vector
+            // represented as one checkpoint row.
+            let limit = crate::shared::experts::rtx::dense::TRANSFORM_BYTES;
+            for row in 0..rect.rows.len() {
+                for first in (0..rect.width()).step_by(limit) {
+                    let n = limit.min(rect.width() - first);
+                    ensure!(n % 4 == 0 && n <= STEP_BYTES, "{}: invalid F32 narrowing window", meta.name);
+                    let piece = Rect { cols: rect.cols.start + first..rect.cols.start + first + n,
+                        ..rect.sub(row..row + 1) };
+                    // SAFETY: every narrowed window lies inside the operand.
+                    let dst = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(at) }.cast(),
+                        bytes: n / 2, ..buffer };
+                    device.run(|| dense.step(Step { device: device.id, rects: vec![piece],
+                        jobs: vec![Job::NarrowF32Bf16 { at: 0, bytes: n, dst }] }, std::ptr::null_mut()))?;
+                    at += n / 2;
+                }
+            }
+        }
+    }
+    let expected = operand.shape.iter().try_fold(elem, |n: usize, dim| n.checked_mul(*dim))
+        .context("Step-5 packed size overflow")?;
+    ensure!(at == expected && expected.max(256) as u64 == operand.allocation_bytes && buffer.bytes >= expected,
+        "Step-5 packed storage disagrees with header admission");
+    if !lands.is_empty() {
+        device.run(|| dense.operand(Operand { device: device.id, buffer, lands, bytes: at }))?;
+    }
+    Ok(())
+}
+
+/// The host packing of `operand` (the records' reference).
+#[cfg(test)]
+pub(super) fn pack_reference(operand: &WeightOperand, layout: &RankWeightLayout,
+    read: impl FnMut(&str) -> Result<(Vec<u8>, DType, Vec<usize>)>) -> Result<Vec<u8>> {
+    pack(operand, layout, read)
 }
 
 pub(super) struct RankWeights<'a> {
@@ -186,6 +268,7 @@ mod tests {
             rank,
             ranks: 2,
             operands: vec![],
+            core: Default::default(),
             resident_bytes: 0,
         }
     }

@@ -7,6 +7,12 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{
     CuteafdDeviceBuffer, NativeLibrary, V41CandidateBlocks, V41IndexScores, V41IndexTopK,
 };
+use crate::shared::memory::row_window::{RowWindow, ScratchGuard};
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static SKIP_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 use std::{collections::{BTreeSet}, cell::Cell, ffi::c_void, marker::PhantomData, rc::Rc};
 const WIDTH: usize = 16384;
 const BLOCKS: usize = WIDTH / 8;
@@ -16,6 +22,20 @@ const MAX_RETAINED_DECODE_GRAPHS: usize = 512;
 const DECODE_WIDTH_BUCKET: usize = 512;
 const AUDIT_WIDTH: usize = 2048;
 const AUDIT_SOURCE_BYTES: usize = 2048 * 68;
+
+fn metadata_staging_bytes(rows: usize) -> usize { rows * 56 }
+
+fn stage_metadata(staging: &mut [u8], metadata: &[[u64; 6]]) -> Result<()> {
+    let rows = metadata.len();
+    ensure!(staging.len() >= metadata_staging_bytes(rows), "index metadata staging too small");
+    for (i, m) in metadata.iter().enumerate() {
+        for (j, value) in m.iter().enumerate() {
+            staging[i * 48 + j * 8..i * 48 + j * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
+    }
+    Ok(())
+}
 
 struct AsyncAuditRow<'a> {
     host: HostAllocation<'a>,
@@ -129,16 +149,45 @@ impl IndexSelectionOutput<'_> {
         Ok(())
     }
 }
-pub(crate) struct IndexSelectionWave<'a> {
-    stream: LoadStream<'a>,
+/// Shared selection storage (`row_window` contract).
+/// Row planes: buffer 9 (selected IDs reused by attention until the next index
+/// producer) in both source and follower, and buffer 12 in the source (candidate
+/// blocks retained through later reindex hooks). Follower blocks are unused and
+/// unit-sized. A scratch guard cannot protect readers in those future hooks.
+/// Scratch: 0 metadata, 1 lengths, 2 tile offsets, 3 candidate IDs, 4 scores,
+/// 5 block scores, 6 block IDs, 7 top-k state, 8 top-k workspace,
+/// 10 block top-k state and 11 block workspace. All are written and fully
+/// consumed within one selection hook on this shared stream. Source/reindex
+/// also share that stream and guard: source/reindex order within a unit is the
+/// stream's order; release once after the hook's last fork reader joins.
+/// Per slot: LayerStaging pinned uploads, graph/phase/bindings and optional
+/// diagnostic AsyncAudit (including its pinned per-layer snapshots).
+pub(crate) struct IndexSelectionStorage<'a> {
+    guard: Rc<ScratchGuard<'a>>,
+    retained_blocks: bool,
+    stream: Rc<LoadStream<'a>>,
     buffers: Vec<Rc<DeviceAllocation<'a>>>,
+    score: V41IndexScores<'a>,
+    top: V41IndexTopK<'a>,
+    candidates: V41CandidateBlocks<'a>,
+    rows: usize,
+    unit: usize,
+}
+impl Drop for IndexSelectionStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the shared stream and all its storage are still live.
+        crate::shared::decode_graph::fatal_drain(unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        }.map_err(Into::into), "index selection storage");
+    }
+}
+pub(crate) struct IndexSelectionWave<'a> {
+    storage: Rc<IndexSelectionStorage<'a>>,
+    window: RowWindow,
     shared_scratch_busy: Option<Rc<Cell<bool>>>,
     /// Per-layer pinned metadata and lengths (see `LayerStaging`).
     staging: LayerStaging<'a>,
     capacity: usize,
-    score: V41IndexScores<'a>,
-    top: V41IndexTopK<'a>,
-    candidates: V41CandidateBlocks<'a>,
     graph: Option<(*mut c_void, Vec<usize>)>,
     graphs: crate::shared::decode_graph::GraphBank<Vec<usize>, crate::shared::decode_graph::GraphOwner<'a, ()>>,
     retain_decode_graphs: bool,
@@ -155,6 +204,14 @@ fn slice(mut b: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> CuteafdDevi
     b.ptr = unsafe { b.ptr.cast::<u8>().add(offset).cast() };
     b.bytes = bytes;
     b
+}
+fn selection_view(window: &RowWindow, retained_blocks: bool, i: usize,
+    buffer: CuteafdDeviceBuffer) -> CuteafdDeviceBuffer {
+    match i {
+        9 => window.apply(buffer, 2048),
+        12 if retained_blocks => window.apply(buffer, 8192),
+        _ => buffer,
+    }
 }
 impl<'a> IndexSelectionWave<'a> {
     fn sizes(capacity: usize) -> Result<[usize; 13]> {
@@ -182,73 +239,109 @@ impl<'a> IndexSelectionWave<'a> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         Ok(Self::sizes(capacity)?.iter().sum())
     }
-    pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
-        ensure!(
-            Self::device_bytes(capacity)? <= budget,
-            "index selection exceeds budget"
-        );
+    pub fn storage_bytes(rows: usize, unit: usize) -> Result<usize> {
+        Ok(cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes(
+            rows as u64, unit as u64)?[0] as usize)
+    }
+    pub fn follower_storage_bytes(rows: usize, unit: usize) -> Result<usize> {
+        Ok(cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes(
+            rows as u64, unit as u64)?[1] as usize)
+    }
+    pub fn storage(library: &'a NativeLibrary, rows: usize, unit: usize, readers: &[i32]) -> Result<Rc<IndexSelectionStorage<'a>>> {
+        Self::storage_bytes(rows, unit)?;
+        let sizes = Self::sizes(unit)?;
+        Ok(Rc::new(IndexSelectionStorage {
+            guard: Rc::new(ScratchGuard::new(library, readers)?), retained_blocks: true,
+            stream: Rc::new(LoadStream { library, raw: library.cuda_stream_create()? }),
+            buffers: sizes.into_iter().enumerate().map(|(i, bytes)| {
+                DeviceAllocation::new(library, match i {
+                    9 => rows * 2048,
+                    12 => rows * 8192,
+                    _ => bytes,
+                }).map(Rc::new)
+            }).collect::<Result<_>>()?,
+            score: library.v41_index_scores()?, top: library.v41_index_topk()?,
+            candidates: library.v41_candidate_blocks()?, rows, unit,
+        }))
+    }
+    pub fn on_storage(storage: Rc<IndexSelectionStorage<'a>>) -> Result<Self> {
+        let library = storage.stream.library;
+        let capacity = storage.unit;
+        ensure!(library.cuda_get_device()? == storage.buffers[0].buffer.device_id,
+            "index selection storage device differs");
         Ok(Self {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            buffers: Self::sizes(capacity)?
-                .into_iter()
-                .map(|n| DeviceAllocation::new(library, n).map(Rc::new))
-                .collect::<Result<_>>()?,
-            shared_scratch_busy: None,
-            staging: LayerStaging::new(library, capacity * 56, 40)?,
-            capacity,
-            score: library.v41_index_scores()?,
-            top: library.v41_index_topk()?,
-            candidates: library.v41_candidate_blocks()?,
-            graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
-            ready: None,
-            pending: None,
-            in_flight: false,
+            storage, window: RowWindow::NONE, shared_scratch_busy: None,
+            staging: LayerStaging::new(library, metadata_staging_bytes(capacity), 40)?, capacity,
+            graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
+            retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
+            ready: None, pending: None, in_flight: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
             async_audit: AsyncAudit::new(library, capacity)?,
         })
+    }
+    pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
+        ensure!(Self::device_bytes(capacity)? <= budget, "index selection exceeds budget");
+        Self::on_storage(Self::storage(library, capacity, capacity, &[library.cuda_get_device()?])?)
     }
     /// Only selected IDs and source candidate blocks survive another stage.
     pub fn shared_device_bytes(capacity: usize) -> Result<usize> {
         let sizes = Self::sizes(capacity)?;
         Ok(sizes[9] + sizes[12])
     }
-    /// Create a follower in the same lane. Both owners retain independent
-    /// outputs/graphs; their temporary scores and top-k workspace are shared.
-    /// An outstanding queued selection excludes the other owner until polled
-    /// complete or explicitly drained. No cross-lane storage is involved.
+    /// A follower keeps independent row planes but shares all hook-local scratch
+    /// and the source stream, so queued hooks are device-ordered across slots.
+    pub fn follower_storage(source: &Rc<IndexSelectionStorage<'a>>) -> Result<Rc<IndexSelectionStorage<'a>>> {
+        let library = source.stream.library;
+        ensure!(library.cuda_get_device()? == source.buffers[0].buffer.device_id,
+            "shared index workspace device differs");
+        let buffers = source.buffers.iter().enumerate().map(|(i, allocation)| {
+            if [9, 12].contains(&i) { DeviceAllocation::new(library,
+                if i == 9 { source.rows * 2048 } else { source.unit * 8192 }).map(Rc::new) }
+            else { Ok(allocation.clone()) }
+        }).collect::<Result<_>>()?;
+        Ok(Rc::new(IndexSelectionStorage {
+            guard: source.guard.clone(), retained_blocks: false,
+            stream: source.stream.clone(), buffers, rows: source.rows, unit: source.unit,
+            score: library.v41_index_scores()?, top: library.v41_index_topk()?,
+            candidates: library.v41_candidate_blocks()?,
+        }))
+    }
     pub fn sharing_scratch(source: &mut Self, budget: usize) -> Result<Self> {
         ensure!(!source.in_flight && source.shared_scratch_busy.is_none(), "index scratch already shared or pending");
-        source.stream.require_complete()?;
-        let capacity = source.capacity;
-        ensure!(Self::shared_device_bytes(capacity)? <= budget, "shared index outputs exceed budget");
-        let library = source.stream.library;
-        ensure!(library.cuda_get_device()? == source.b(0).device_id, "shared index workspace device differs");
-        let sizes = Self::sizes(capacity)?;
-        let buffers = source.buffers.iter().enumerate().map(|(i, allocation)| {
-            if [9, 12].contains(&i) { DeviceAllocation::new(library, sizes[i]).map(Rc::new) }
-            else { Ok(allocation.clone()) }
-        }).collect::<Result<Vec<_>>>()?;
+        source.storage.stream.require_complete()?;
+        ensure!(Self::follower_storage_bytes(source.storage.rows, source.storage.unit)? <= budget,
+            "shared index outputs exceed budget");
+        let mut value = Self::on_storage(Self::follower_storage(&source.storage)?)?;
+        value.window = source.window.clone();
         let busy = Rc::new(Cell::new(false));
-        let value = Self {
-            stream: LoadStream { library, raw: library.cuda_stream_create()? }, buffers,
-            shared_scratch_busy: Some(busy.clone()), staging: LayerStaging::new(library, capacity * 56, 40)?,
-            capacity, score: library.v41_index_scores()?, top: library.v41_index_topk()?,
-            candidates: library.v41_candidate_blocks()?, graph: None,
-            graphs: crate::shared::decode_graph::GraphBank::new(None), retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0, ready: None, pending: None, in_flight: false,
-            audit: source.audit,
-            async_audit: AsyncAudit::new(library, capacity)?,
-        };
-        source.shared_scratch_busy = Some(busy);
+        source.shared_scratch_busy = Some(busy.clone());
+        value.shared_scratch_busy = Some(busy);
         Ok(value)
     }
+    #[cfg(test)]
+    pub(super) fn scratch_stream(&self) -> *mut std::ffi::c_void { self.storage.stream.raw }
+    pub(crate) fn release_scratch(&self) -> Result<()> { self.storage.guard.release() }
+    fn acquire_scratch(&self) -> Result<()> {
+        #[cfg(test)]
+        if SKIP_ACQUIRE.with(|skip| skip.get()) { return Ok(()); }
+        // SAFETY: source and follower share this live writer stream.
+        unsafe { self.storage.guard.acquire(self.storage.stream.raw) }
+    }
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        crate::shared::memory::row_window::require_rest(self.in_flight || self.ready.is_some(), "index selection", "a selection is in flight or unconsumed")?;
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.end <= self.storage.rows
+                && range.len() <= self.capacity, "selection window outside reserve or unit");
+        }
+        self.window = window;
+        Ok(())
+    }
     fn b(&self, i: usize) -> CuteafdDeviceBuffer {
-        self.buffers[i].buffer
+        selection_view(&self.window, self.storage.retained_blocks, i,
+            self.storage.buffers[i].buffer)
     }
     fn synchronize(&self) -> Result<()> {
-        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
+        unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
     }
     pub fn enable_small_graph_shapes(&mut self) {
         if !self.retain_decode_graphs {
@@ -261,7 +354,7 @@ impl<'a> IndexSelectionWave<'a> {
             return self.clear_graph();
         }
         ensure!(!self.in_flight, "index selection pending");
-        self.stream.require_complete()?;
+        self.storage.stream.require_complete()?;
         self.ready = None;
         Ok(())
     }
@@ -278,7 +371,7 @@ impl<'a> IndexSelectionWave<'a> {
         let cached = self.graphs.get(&key).map(|owner| owner.raw);
         if let Some(limit) = fixed_limit {
             ensure!(!self.in_flight, "index selection pending");
-            self.stream.require_complete()?;
+            self.storage.stream.require_complete()?;
             self.ready = None;
             if !fixed_binding_admitted(cached.is_some(), policy.unwrap().0, self.graphs.len(), limit) {
                 tracing::debug!(target: "cuteafd::target_step", rows=fingerprint[1],
@@ -309,9 +402,9 @@ impl<'a> IndexSelectionWave<'a> {
         Ok(true)
     }
     fn insert_graph(&mut self, graph: *mut c_void, fingerprint: Vec<usize>) -> Result<()> {
-        let device = self.stream.library.cuda_get_device()?;
+        let device = self.storage.stream.library.cuda_get_device()?;
         // SAFETY: request/cache proposals and wave storage remain pinned by the lane.
-        let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.stream.library, device, graph, ())? };
+        let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.storage.stream.library, device, graph, ())? };
         tracing::debug!(target: "cuteafd::graph_capture", site="index_selection", device,
             bank=self as *const Self as usize, key=?fingerprint, "native binding graph captured");
         self.graphs.insert(fingerprint.clone(), owner, None);
@@ -333,7 +426,7 @@ impl<'a> IndexSelectionWave<'a> {
     pub fn clear_graph(&mut self) -> Result<()> {
         ensure!(!self.in_flight, "index selection pending");
         self.ready = None;
-        self.stream.require_complete()?;
+        self.storage.stream.require_complete()?;
         self.graph = None;
         self.graphs.retire_all();
         drop(self.graphs.drain_retired(|| Ok(()))?);
@@ -352,12 +445,12 @@ impl<'a> IndexSelectionWave<'a> {
     ) -> Result<()> {
         let source = query.layer == 20;
         let follower = use_candidates;
-        let stream = self.stream.raw;
+        let stream = self.storage.stream.raw;
         let passes = if follower { 1 } else { tiles };
         for tile in 0..passes {
             unsafe {
                 if follower {
-                    self.candidates.expand(
+                    self.storage.candidates.expand(
                         shared
                             .context("candidate source missing")?
                             .blocks
@@ -368,7 +461,7 @@ impl<'a> IndexSelectionWave<'a> {
                         stream,
                     )?;
                 } else {
-                    self.candidates.tile(
+                    self.storage.candidates.tile(
                         self.b(3),
                         self.b(2),
                         rows,
@@ -382,7 +475,7 @@ impl<'a> IndexSelectionWave<'a> {
                     let p = requests[group.request].proposal;
                     let slots = p.cache.pool_rows.bytes / 8;
                     let stride = p.cache.pool_pages.bytes / (slots * 4);
-                    self.score.execute_overlay(
+                    self.storage.score.execute_overlay(
                         slice(query.packed, offset * 2048, n * 2048),
                         slice(query.scales, offset * 128, n * 128),
                         slice(query.head_weights, offset * 64, n * 64),
@@ -404,7 +497,7 @@ impl<'a> IndexSelectionWave<'a> {
                         stream,
                     )?;
                 }
-                self.top.update(
+                self.storage.top.update(
                     self.b(4),
                     self.b(3),
                     self.b(7),
@@ -416,7 +509,7 @@ impl<'a> IndexSelectionWave<'a> {
                     stream,
                 )?;
                 if source {
-                    self.candidates.maxima(
+                    self.storage.candidates.maxima(
                         self.b(4),
                         self.b(2),
                         self.b(1),
@@ -426,7 +519,7 @@ impl<'a> IndexSelectionWave<'a> {
                         width,
                         stream,
                     )?;
-                    self.top.update_blocks(
+                    self.storage.top.update_blocks(
                         self.b(5),
                         self.b(6),
                         self.b(10),
@@ -453,7 +546,15 @@ impl<'a> IndexSelectionWave<'a> {
         requests: &[SelectionRequest<'_>],
         shared: Option<&IndexSelectionOutput<'_>>,
     ) -> Result<IndexSelectionOutput<'s>> {
-        unsafe { self.execute_inner(query, requests, shared, false)?; }
+        if self.window.is_windowed() {
+            // SAFETY: retained inputs; finish drains outside a chain and only
+            // publishes an ordering event inside one.
+            unsafe { self.enqueue_selection(query, requests, shared)?;
+                crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw)?; }
+            self.poll_pending()?;
+        } else {
+            unsafe { self.execute_inner(query, requests, shared, false)?; }
+        }
         self.output()
     }
     /// # Safety
@@ -467,8 +568,8 @@ impl<'a> IndexSelectionWave<'a> {
     pub fn poll_pending(&mut self) -> Result<bool> {
         ensure!(self.in_flight && self.pending.is_some(), "no pending index selection");
         let ready = if crate::shared::memory::chain::active() {
-            unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) }.map(|()| true)
-        } else { unsafe { self.stream.library.cuda_stream_query(self.stream.raw) } };
+            unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) }.map(|()| true)
+        } else { unsafe { self.storage.stream.library.cuda_stream_query(self.storage.stream.raw) } };
         match ready {
             Ok(false) => Ok(false),
             Ok(true) => { self.ready = self.pending.take(); self.in_flight = false;
@@ -496,12 +597,12 @@ impl<'a> IndexSelectionWave<'a> {
             "invalid selection producer layer"
         );
         ensure!(
-            !requests.is_empty() && requests.len() <= 16,
+            !requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "invalid selection request count"
         );
         let rows: usize = requests.iter().map(|r| r.positions.len()).sum();
         ensure!(
-            rows > 0 && rows <= self.capacity,
+            rows > 0 && rows <= self.capacity && self.window.admits(rows),
             "selection rows exceed capacity"
         );
         ensure!(
@@ -608,42 +709,38 @@ impl<'a> IndexSelectionWave<'a> {
         fingerprint.extend([width, usize::from(use_candidates)]);
         fingerprint.push(if query.layer > 20 { 1 } else { tiles });
         let (host, staging) = self.staging.region(query.layer);
-        for (i, m) in metadata.iter().enumerate() {
-            for (j, value) in m.iter().enumerate() {
-                staging[i * 48 + j * 8..i * 48 + j * 8 + 8].copy_from_slice(&value.to_ne_bytes());
-            }
-            staging[rows * 48 + i * 8..rows * 48 + i * 8 + 8].copy_from_slice(&m[1].to_ne_bytes());
-        }
+        stage_metadata(staging, &metadata)?;
         // Prefill tails (and any other uncached large shape) bind eagerly.
-        let forced_eager = crate::shared::decode_graph::census::eager("index")
+        let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
         let capture = if forced_eager { false } else { self.select_graph(&fingerprint)? };
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
             unsafe {
-                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-                self.stream.library.copy_host_buffer_h2d_async(self.b(0), host, rows * 48, self.stream.raw)?;
+                crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+                self.acquire_scratch()?;
+                self.storage.stream.library.copy_host_buffer_h2d_async(self.b(0), host, rows * 48, self.storage.stream.raw)?;
                 let mut lengths = host;
                 lengths.ptr = host.ptr.cast::<u8>().add(rows * 48).cast(); lengths.bytes = rows * 8;
-                self.stream.library.copy_host_buffer_h2d_async(self.b(1), lengths, rows * 8, self.stream.raw)?;
+                self.storage.stream.library.copy_host_buffer_h2d_async(self.b(1), lengths, rows * 8, self.storage.stream.raw)?;
             }
         } else {
             let (metadata, lengths) = (self.b(0), self.b(1));
             let (_, staged) = self.staging.region(query.layer);
-            self.stream.library.copy_h2d(metadata, &staged[..rows * 48])?;
-            self.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
+            self.storage.stream.library.copy_h2d(metadata, &staged[..rows * 48])?;
+            self.storage.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
         }
         if capture && self.graph.is_none() {
             unsafe {
-                self.stream
+                self.storage.stream
                     .library
-                    .cuda_graph_begin_capture(self.stream.raw)?;
+                    .cuda_graph_begin_capture(self.storage.stream.raw)?;
             }
             let launched = unsafe {
                 self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates)
             };
-            let captured = unsafe { self.stream.library.cuda_graph_end_capture(self.stream.raw) };
+            let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
             match (launched, captured) {
                 (Ok(()), Ok(g)) => {
                     if super::graph_policy::fixed_binding_limit().is_some() {
@@ -653,7 +750,7 @@ impl<'a> IndexSelectionWave<'a> {
                 },
                 (Err(e), Ok(g)) => {
                     unsafe {
-                        self.stream.library.cuda_graph_exec_destroy(g)?;
+                        self.storage.stream.library.cuda_graph_exec_destroy(g)?;
                     }
                     return Err(e);
                 }
@@ -663,11 +760,11 @@ impl<'a> IndexSelectionWave<'a> {
         let dispatch = || unsafe {
             if capture {
                 let g = self.graph.as_ref().context("selection graph missing")?.0;
-                self.stream.library.cuda_graph_launch(g, self.stream.raw)
+                self.storage.stream.library.cuda_graph_launch(g, self.storage.stream.raw)
             } else { self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {
-            unsafe { self.stream.library.cuda_graph_census_call(self.stream.raw, c"index", rows, capture,
+            unsafe { self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"index", rows, capture,
                 crate::shared::decode_graph::census::arm(), dispatch) }
         } else { dispatch() };
         if self.audit && launched.is_ok() {
@@ -692,7 +789,7 @@ impl<'a> IndexSelectionWave<'a> {
     pub fn finish_audit(&mut self) -> Result<()> {
         let Some(audit) = self.async_audit.as_mut() else { return Ok(()) };
         // SAFETY: querying does not drain or change stream ordering.
-        ensure!(unsafe { self.stream.library.cuda_stream_query(self.stream.raw)? },
+        ensure!(unsafe { self.storage.stream.library.cuda_stream_query(self.storage.stream.raw)? },
             "async index audit inspected before target completion");
         for row in &mut audit.layers {
             let Some((layer, bytes, source_end, description)) = row.pending.take() else { continue };
@@ -725,8 +822,8 @@ impl<'a> IndexSelectionWave<'a> {
         let audit = self.async_audit.as_mut().unwrap();
         let saved = &mut audit.layers[layer];
         ensure!(saved.pending.is_none(), "async index audit slot reused before target completion");
-        let library = self.stream.library;
-        let stream = self.stream.raw;
+        let library = self.storage.stream.library;
+        let stream = self.storage.stream.raw;
         let mut host = saved.host.buffer;
         let metadata_offset = audit.score_bytes * 2;
         for (i, values) in metadata.iter().enumerate() {
@@ -741,7 +838,7 @@ impl<'a> IndexSelectionWave<'a> {
             host.ptr = saved.host.buffer.ptr.cast::<u8>().add(metadata_offset).cast();
             host.bytes = rows * 48;
             library.copy_host_buffer_h2d_async(audit.metadata.buffer, host, rows * 48, stream)?;
-            self.score.execute_overlay(query.packed, query.scales, query.head_weights,
+            self.storage.score.execute_overlay(query.packed, query.scales, query.head_weights,
                 p.cache.packed, p.cache.scales, p.cache.device_pages, p.cache.device_rows,
                 slice(audit.metadata.buffer, 0, rows * 48), positions,
                 slice(audit.scores.buffer, 0, rows * width * 4), p.packed, p.scales,
@@ -789,7 +886,7 @@ impl<'a> IndexSelectionWave<'a> {
     unsafe fn audit_scores(&self, query: &IndexQueryOutput<'_>, requests: &[SelectionRequest<'_>],
         rows: usize, width: usize) -> Result<()> {
         self.synchronize()?;
-        let library = self.stream.library;
+        let library = self.storage.stream.library;
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
             if !bytes.is_empty() { library.copy_d2h(&mut bytes, buffer)?; }
@@ -847,7 +944,7 @@ impl<'a> IndexSelectionWave<'a> {
                 "index audit table mismatch at layer {} request {request}", query.layer);
             // SAFETY: all original inputs are drained and retained; only scratch scores are overwritten.
             unsafe {
-                self.score.execute_overlay(
+                self.storage.score.execute_overlay(
                     slice(query.packed, offset * 2048, n * 2048),
                     slice(query.scales, offset * 128, n * 128),
                     slice(query.head_weights, offset * 64, n * 64),
@@ -856,7 +953,7 @@ impl<'a> IndexSelectionWave<'a> {
                     slice(self.b(3), offset * width * 8, n * width * 8),
                     slice(self.b(4), offset * width * 4, n * width * 4),
                     p.packed, p.scales, p.capacity, n, width, 1, stride,
-                    p.cache.packed.bytes / 64, self.stream.raw)?;
+                    p.cache.packed.bytes / 64, self.storage.stream.raw)?;
             }
             offset += n;
         }
@@ -907,6 +1004,105 @@ impl Drop for IndexSelectionWave<'_> {
 mod graph_tests {
     use super::*;
 
+    #[test]
+    fn reserve_growth_retains_source_and_follower_selections() -> Result<()> {
+        for unit in [1, 16, 80, 4096] {
+            assert_eq!(IndexSelectionWave::storage_bytes(unit, unit)?,
+                IndexSelectionWave::device_bytes(unit)?);
+            assert_eq!(IndexSelectionWave::storage_bytes(8256, unit)?
+                - IndexSelectionWave::device_bytes(unit)?, (8256 - unit) * (8192 + 2048));
+            assert_eq!(IndexSelectionWave::follower_storage_bytes(8256, unit)?,
+                8256 * 2048 + unit * 8192);
+        }
+        assert!(IndexSelectionWave::storage_bytes(16, 0).is_err());
+        assert!(IndexSelectionWave::storage_bytes(16, 17).is_err());
+        assert!(IndexSelectionWave::storage_bytes(8256, 4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn planner_selection_bytes_match_runtime_allocations() -> Result<()> {
+        use cuteafd_loader::placement::families::deepseek_v41::owners::index_selection_storage_bytes;
+        for (rows, unit) in [(1, 1), (80, 80), (6144, 2048), (8192, 2048), (8256, 2752), (8256, 4096)] {
+            let planned = index_selection_storage_bytes(rows as u64, unit as u64)?;
+            // Independently sum the actual allocation sizes, including FFI top-k
+            // workspaces; do not just compare two calls of the shared formula.
+            let mut source = IndexSelectionWave::sizes(unit)?;
+            source[9] = rows * 2048;
+            source[12] = rows * 8192;
+            assert_eq!(planned[0] as usize, source.into_iter().sum::<usize>());
+            assert_eq!(planned[1] as usize, rows * 2048 + unit * 8192);
+            assert_eq!(planned[0] as usize, IndexSelectionWave::storage_bytes(rows, unit)?);
+            assert_eq!(planned[1] as usize, IndexSelectionWave::follower_storage_bytes(rows, unit)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_attention_retains_ids_until_the_next_index_producer() -> Result<()> {
+        use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+        let producers = [2, 8, 14, 20, 24, 28, 32, 36];
+        let routes: Vec<_> = (0..40).map(|layer| if layer < 2 {
+            FfnRoute::Local
+        } else { FfnRoute::Spark }).collect();
+        for span in [65, 129, 257] {
+            let units = sequence_units(span, 64, 3, 40)?;
+            let steps = prefill_schedule(&routes, &units, 3)?;
+            // Exercise both the source and follower view used by b(9). Replaying
+            // the old fixed-offset view must corrupt a later attention hook.
+            for retained_blocks in [true, false] {
+                for windowed in [true, false] {
+                    let mut ids = vec![0u32; 3 * 64 * 512];
+                    let buffer = CuteafdDeviceBuffer { ptr: ids.as_mut_ptr().cast(),
+                        bytes: ids.len() * 4, device_id: 0, ..Default::default() };
+                    let mut corrupt = 0;
+                    let mut reads = 0;
+                    for step in &steps {
+                        let Step::Attention { layer, unit } = *step else { continue; };
+                        if layer < 2 || (layer < 24) != retained_blocks { continue; }
+                        let unit = &units[unit];
+                        let window = RowWindow::rows(unit.slot * 64..unit.slot * 64 + unit.rows.len());
+                        let view = selection_view(if windowed { &window } else { &RowWindow::NONE },
+                            retained_blocks, 9, buffer);
+                        let offset = (view.ptr as usize - buffer.ptr as usize) / 4;
+                        let rows = &mut ids[offset..offset + unit.rows.len() * 512];
+                        let producer = *producers.iter().rev().find(|&&p| p <= layer).unwrap();
+                        let expected = (unit.index * 40 + producer + 1) as u32;
+                        if producer == layer { rows.fill(expected); }
+                        else {
+                            reads += 1;
+                            corrupt += usize::from(rows.iter().any(|&id| id != expected));
+                        }
+                    }
+                    assert!(reads > 0);
+                    if windowed { assert_eq!(corrupt, 0, "span {span}, source {retained_blocks}"); }
+                    else { assert!(corrupt > 0, "the old shared output must fail"); }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn index_metadata_staging_covers_c64_and_short_rows() -> Result<()> {
+        for count in [1, 16, 33, 64] {
+            for rows in [count, count * 7] {
+                let metadata: Vec<_> = (0..rows).map(|row|
+                    [row as u64 % count as u64, 1000 + row as u64, 2, 3, 4, 5]).collect();
+                let capacity = metadata_staging_bytes(4096);
+                let mut bytes = vec![0xa5; capacity + 16];
+                stage_metadata(&mut bytes[..capacity], &metadata)?;
+                let expected: Vec<_> = metadata.iter().flat_map(|m| m.iter().copied())
+                    .chain(metadata.iter().map(|m| m[1])).flat_map(u64::to_ne_bytes).collect();
+                assert_eq!(&bytes[..expected.len()], &expected);
+                assert!(bytes[expected.len()..].iter().all(|&b| b == 0xa5));
+                let mut short = vec![0xa5; expected.len() - 1];
+                assert!(stage_metadata(&mut short, &metadata).is_err());
+                assert!(short.iter().all(|&b| b == 0xa5));
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn score_groups_ignore_request_partition_but_preserve_launch_bindings() {
         let binding = [17; 10];
@@ -994,9 +1190,9 @@ mod graph_tests {
             assert!(wave.select_graph_with_policy(&fingerprint, None)?);
             if wave.graph.is_none() {
                 unsafe {
-                    library.cuda_graph_begin_capture(wave.stream.raw)?;
-                    library.copy_d2d_async(output, input, rows * 4, wave.stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(wave.stream.raw)?;
+                    library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
+                    library.copy_d2d_async(output, input, rows * 4, wave.storage.stream.raw)?;
+                    let graph = library.cuda_graph_end_capture(wave.storage.stream.raw)?;
                     wave.insert_graph(graph, fingerprint)?;
                 }
             }
@@ -1008,7 +1204,7 @@ mod graph_tests {
             let value = iteration as u8 + 1;
             library.copy_h2d(input, &vec![value; 320])?;
             library.copy_h2d(output, &[0; 320])?;
-            unsafe { library.cuda_graph_launch(graph, wave.stream.raw)?; }
+            unsafe { library.cuda_graph_launch(graph, wave.storage.stream.raw)?; }
             wave.synchronize()?;
             let mut actual = vec![0; 320];
             library.copy_d2h(&mut actual, output)?;
@@ -1026,16 +1222,16 @@ mod graph_tests {
             assert!(wave.select_graph_with_policy(&fingerprint, None)?);
             assert!(wave.graph.is_none());
             unsafe {
-                library.cuda_graph_begin_capture(wave.stream.raw)?;
-                library.copy_d2d_async(output, input, 16, wave.stream.raw)?;
-                let graph = library.cuda_graph_end_capture(wave.stream.raw)?;
+                library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
+                library.copy_d2d_async(output, input, 16, wave.storage.stream.raw)?;
+                let graph = library.cuda_graph_end_capture(wave.storage.stream.raw)?;
                 wave.insert_graph(graph, fingerprint)?;
             }
             assert!(wave.graphs.len() <= MAX_RETAINED_DECODE_GRAPHS + 1);
             let value = (key % 251 + 1) as u8;
             library.copy_h2d(input, &vec![value; 320])?;
             library.copy_h2d(output, &[0; 320])?;
-            unsafe { library.cuda_graph_launch(wave.graph.as_ref().unwrap().0, wave.stream.raw)?; }
+            unsafe { library.cuda_graph_launch(wave.graph.as_ref().unwrap().0, wave.storage.stream.raw)?; }
             wave.synchronize()?;
             let mut actual = vec![0; 320];
             library.copy_d2h(&mut actual, output)?;
@@ -1059,9 +1255,9 @@ mod graph_tests {
             if capture && wave.graph.is_none() {
                 // SAFETY: both allocations outlive the bank and the stream is drained.
                 let graph = unsafe {
-                    library.cuda_graph_begin_capture(wave.stream.raw)?;
-                    library.copy_d2d_async(output, input, rows * 4, wave.stream.raw)?;
-                    library.cuda_graph_end_capture(wave.stream.raw)?
+                    library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
+                    library.copy_d2d_async(output, input, rows * 4, wave.storage.stream.raw)?;
+                    library.cuda_graph_end_capture(wave.storage.stream.raw)?
                 };
                 wave.insert_graph(graph, fingerprint.clone())?;
                 wave.record_fixed_capture(&fingerprint);
@@ -1074,9 +1270,9 @@ mod graph_tests {
                 if capture {
                     let graph = wave.graph.as_ref().unwrap().0;
                     assert_eq!(*fixed_handles.entry(key).or_insert(graph), graph);
-                    library.cuda_graph_launch(graph, wave.stream.raw)?;
+                    library.cuda_graph_launch(graph, wave.storage.stream.raw)?;
                 } else {
-                    library.copy_d2d_async(output, input, rows * 4, wave.stream.raw)?;
+                    library.copy_d2d_async(output, input, rows * 4, wave.storage.stream.raw)?;
                 }
             }
             wave.synchronize()?;

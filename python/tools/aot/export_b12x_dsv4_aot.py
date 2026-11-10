@@ -46,7 +46,100 @@ CHECKPOINT_CONTEXTS = {
     "qwen35": ("Qwen/Qwen3.5-9B", 262144),
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
+    "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "ml4": ("mistralai/Mistral-Large-4-1T-A52B", 1048576),
 }
+
+
+def exl3_reply_programs(max_rows):
+    """Model-shaped fused sums; expert counts and row count remain runtime bounds."""
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    from b12x.moe._shared.kernels.w4a16.kernel import W4A16TopKSumKernel
+    import torch
+
+    shapes = ((2560, 10), (3584, 16), (4096, 6), (4096, 8),
+              (5120, 6), (6144, 4), (6144, 8), (7168, 6))
+
+    def compile_one(width, topk, format):
+        kernel = W4A16TopKSumKernel(topk=topk, hidden_size=width,
+            element_dtype="fp16", full_rotation=True,
+            full_rotation_output_dtype="bf16", num_experts=1,
+            route_num_experts=1, use_expert_map=True, reply_format=format)
+        row_bytes = width + width // 32 if format == 1 else width // 2 + width // 16
+        return compile_program(kernel, name=f"expert_reply_exl3_h{width}_k{topk}_{format}",
+            operands=(Operand("fc2_ptr", torch.float16, f"[rows,{topk},{width}]"),
+                      Operand("output_ptr", torch.uint8, f"[rows,{row_bytes}]", "out"),
+                      Operand("topk_weights_ptr", torch.float32, f"[rows,{topk}]", align=4),
+                      Operand("route_expert_ids_ptr", torch.int32, f"[rows,{topk}]", align=4),
+                      Operand("expert_map_ptr", torch.int32, "[experts]", align=4),
+                      Operand("svh_ptr", torch.float16, f"[local_experts,{width}]")),
+            scalars=tuple(Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")),
+            key=(width, topk, format), geometry=dict(width=width, topk=topk,
+                format=format, row_bytes=row_bytes))
+
+    return [(f"exl3_h{width}_k{topk}_{format}", "expert_reply_exl3", {"max_rows": max_rows},
+             lambda w=width, k=topk, f=format: compile_one(w, k, f))
+            for width, topk in shapes for format in (1, 2)]
+
+
+def draft_bf16_shapes():
+    # hidden, query heads, KV heads, head width, MLP width, tap count
+    families = {
+        "dspark-qwen": (5120, 40, 8, 128, 10240, 5),
+        "dspark-kimi": (7168, 64, 16, 64, 14336, 5),
+        "dflash2-glm": (6144, 64, 8, 128, 12288, 6),
+        "dflash2-glmf": (4096, 32, 8, 128, 12288, 5),
+        "dflash-qwen27": (5120, 32, 8, 128, 17408, 5),
+        "dflash-qwen35": (2048, 32, 8, 128, 6144, 8),
+        "dflash-kimi-modal": (7168, 32, 8, 128, 14336, 6),
+        "dflash-mimo-pro": (6144, 128, 8, 128, 16384, 5),
+        "dflash-mimo-flash": (4096, 64, 8, 128, 16384, 5),
+        "dflash2-muse-radix": (8192, 64, 8, 128, 28672, 5),
+        "dflash2-muse-nvidia": (8192, 128, 16, 64, 24576, 5),
+    }
+    result = {}
+    for family, (h, heads, kv, d, inter, taps) in families.items():
+        for k, n in ((h * taps, h), (h, (heads + 2 * kv) * d),
+                     (h, 2 * kv * d), (heads * d, h), (h, 2 * inter), (inter, h)):
+            result.setdefault((k, n), []).append(family)
+    for h in (2048, 4096, 5120, 6144, 7168, 8192):
+        result.setdefault((h, h // 4), []).append("dflash-convolution")
+        result.setdefault((h, 256), []).append("dflash-selector")
+    for h, inter in ((7168, 14336), (6144, 24576)):
+        result.setdefault((h, 2 * inter), []).append("mla-dflash/ml4-ffn")
+        result.setdefault((inter, h), []).append("mla-dflash/ml4-ffn")
+    for h in (2048, 4096, 5120, 6144):
+        result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
+    result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    return result
+
+
+def compile_draft_bf16_projection(k, n):
+    import torch
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+    tiles = ((16, 1, 4, 16, 64, 6),)
+    launch = TmaBf16Projection(n, k, tiles_by_rows=tiles)
+    return compile_program(launch, name="draft_bf16_projection", operands=(
+        Operand("x", torch.bfloat16, f"[rows,{k}]"),
+        Operand("w", torch.bfloat16, f"[{n},{k}]"),
+        Operand("out", torch.bfloat16, f"[rows,{n}]", "out")),
+        scalars=(Scalar("rows"),), key=launch.key(), geometry=dict(
+            width=k, outputs=n, output_dtype="torch.bfloat16",
+            reduction="ordered_k16", tiles_by_rows=tiles))
+
+
+def native_scalar_abi(stem: str, geometry: dict, scalars: list) -> tuple[str, list]:
+    # Old geometry has no flag; explicit false must generate the same native ABI.
+    runtime_sms = geometry.get("runtime_sm_count", False)
+    if type(runtime_sms) is not bool:
+        raise ValueError(f"{stem}: runtime_sm_count must be a boolean")
+    if runtime_sms and (not scalars or scalars[-1] != ("device_sm_count", "int32")
+                        or sum(name == "device_sm_count" for name, _ in scalars) != 1):
+        raise ValueError(f"{stem}: runtime SM count must be the last int32 scalar")
+    public = scalars[:-1] if runtime_sms else scalars
+    kinds = "".join(SCALAR_KINDS[kind] for _, kind in public)
+    return kinds + ("s" if runtime_sms else ""), public
 
 
 def geometry_context(name: str, requested: int) -> int:
@@ -148,6 +241,89 @@ def head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int
     return [item for item in programs(g, decode_rows, prefill_rows, max_context) if item[0].startswith(keep)]
 
 
+def glm_stage_geometry(g, split: bool):
+    return dataclasses.replace(g, name="glm53_tp2", heads=g.heads // 2,
+                               dense_inter=g.dense_inter // 2, moe_inter=g.moe_inter // 2) if split else g
+
+
+def glm_stage_programs(g, decode_rows: int, prefill_rows: int):
+    """Dormant primitive boundaries; the official fused GLM table stays unchanged."""
+    from functools import partial
+    from b12x.integration.cuteafd.glm_attention import compile_glm_attention_stage_aot
+
+    out = []
+    for rows in (decode_rows, prefill_rows):
+        mode = "decode" if rows == decode_rows else "prefill"
+        for stage in ("rank_pack", "query_rope", "index_post", "absorb", "values"):
+            modes = (None, mode) if stage in ("absorb", "values") else (None,)
+            for weights in modes:
+                params = dict(stage=stage, max_rows=rows, fp8_only=weights)
+                suffix = "_bf16" if weights is None and stage in ("absorb", "values") else ""
+                out.append((f"{stage}{suffix}_m{rows}", "attention_stage", params,
+                            partial(compile_glm_attention_stage_aot, g, **params)))
+        if g.heads == 32:
+            for stage in ("query_rope", "absorb"):
+                modes = (mode, None) if stage == "absorb" else (None,)
+                for weights in modes:
+                    params = dict(stage=stage, max_rows=rows, query_row=2 * g.heads * g.latent_dim)
+                    if stage == "absorb":
+                        params["fp8_only"] = weights
+                    suffix = "_bf16" if stage == "absorb" and weights is None else ""
+                    out.append((f"{stage}{suffix}_context_m{rows}", "attention_stage", params,
+                                partial(compile_glm_attention_stage_aot, g, **params)))
+    # The calibrated K6 gate/up projections stay separate through their BF16
+    # egress. Reuse the existing format-neutral GLM SwiGLU boundary.
+    from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
+    for inter in sorted({g.dense_inter, g.moe_inter}):
+        params = dict(inter=inter)
+        out.append((f"swiglu_i{inter}", "swiglu_split", params,
+                    partial(compile_swiglu_split_aot, **params)))
+    return out
+
+
+def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
+    """Native trellis projection boundaries using the original Flash primitives."""
+    from functools import partial
+    from b12x.integration.cuteafd.glmf_split import (
+        compile_glmf_kda_core_aot, compile_glmf_stage_aot,
+        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
+        compile_glmf_projected_index_c_aot, compile_glmf_projected_index_keys_aot)
+    out = []
+    # Wide decode still selects the narrow stage for batches of at most 64 rows.
+    decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
+        out.append((f"kda_core_m{rows}", "kda_core", params,
+                    partial(compile_glmf_kda_core_aot, g, **params)))
+        for stage in ("rank_norm", "absorb", "values"):
+            params = dict(stage=stage, max_rows=rows)
+            out.append((f"{stage}_m{rows}", "attention_stage", params,
+                        partial(compile_glmf_stage_aot, g, **params)))
+        for inter in sorted({g.dense_inter, g.moe_inter}):
+            params = dict(stage="swiglu", max_rows=rows, inter=inter)
+            out.append((f"swiglu_i{inter}_m{rows}", "swiglu_split", params,
+                        partial(compile_glmf_stage_aot, g, **params)))
+    # Append native-weight seams without moving or changing the existing entries.
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
+        out.append((f"kda_projected_m{rows}", "kda_core", params,
+                    partial(compile_glmf_projected_kda_aot, g, **params)))
+        for stage in ("absorb", "values"):
+            params = dict(stage=stage, max_rows=rows,
+                          mode="decode" if rows in decode_caps else "prefill")
+            out.append((f"{stage}_fp8_m{rows}", "attention_stage", params,
+                        partial(compile_glmf_fp8_stage_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, verify_rows=rows if rows in decode_caps else 64)
+        out.append((f"index_projected_c_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_c_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows)
+        out.append((f"index_projected_keys_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_keys_aot, g, **params)))
+    return out
+
+
 def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """GLM 5.x programs, same (stem suffix, op, params, thunk) shape as ``programs``."""
     from b12x.integration.cuteafd import glm_attention as attn
@@ -220,7 +396,9 @@ def glm_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context:
 
 def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """MiMo V2 programs, same (stem suffix, op, params, thunk) shape as ``programs``.
-    Full-attention producers and attention come in both KV record formats (BF16, int8 ``_kvint8``). qkv and the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
+    Full-attention producers and attention retain BF16 and int8 ``_kvint8``.
+    SWA additionally exports E4M3 ``_kvfp8`` with direct compact reads. QKV and
+    the dense FFN take only the checkpoint's E4M3 weights (per-row x 128-K FP32
     scales): decode rows up to ``fp8_rows`` on the GEMVs, W8A16 above; prefill W8A8
     (``fp8_rows`` nonzero) or W8A16. ``o_w8`` takes one E4M3 output weight for
     every row count, with no BF16 operand; its prefill activation precision is
@@ -245,12 +423,12 @@ def mimo_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"ffn_m{rows}", "ffn", {"max_rows": rows, "inter": g.dense_inter, "fp8_only": mode},
              lambda r=rows, m=mode: ffn.compile_mimo_ffn_aot(g, max_rows=r, fp8_only=m)),
         ]
-        # KV records: BF16 (no tag) and, for the full-attention page pool, int8 (``_kvint8``: FP32
-        # scales per 32 dims). SWA rings stay BF16 (bounded per sequence; widening their 8-bit
-        # records costs a decode step ~1.3%). The fork's E4M3 records are not exported (golden KL
-        # +0.235 Flash / +0.012 V2.6 Pro over BF16).
+        # Compact SWA reads codes directly and commits the record bytes unchanged.
         for kind in ("full", "swa"):
-            for kv, tag in (("bf16", ""), ("int8", "_kvint8"))[:2 if kind == "full" else 1]:
+            formats = (("bf16", ""), ("int8", "_kvint8"))
+            if kind == "swa":
+                formats += (("fp8", "_kvfp8"),)
+            for kv, tag in formats:
                 out += [
                     (f"{kind}_producer{tag}_m{rows}", "producer",
                      {"kind": kind, "max_rows": rows, "fp8_only": mode, "kv": kv},
@@ -473,6 +651,163 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return programs
 
 
+def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Mistral Large 4: the shared GLM primitives at its geometry (RoPE layers on
+    the 656-byte GLM 5.3 contract, NoPE layers on the 528-byte GLM 5.3 Flash
+    one) plus the per-head query scale, the indexer's LayerNorm and the NoPE
+    index epilogue. The dense core is the shared K6 trellis (dense_trellis_k6
+    with the ml4 shapes); the FFN activation is the format-neutral SwiGLU."""
+    from b12x.integration.cuteafd import glm_ffn as ffn
+    from b12x.integration.cuteafd import glm_indexer as idx
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+    from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
+
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
+    rope_g = ml4.rope_attention(g)
+    index_pages = -(-max_context // PAGE_ROWS)
+    kw = g.index_head_dim + g.index_heads
+    out = [
+        ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(rope_g)),
+        # The indexer's [wk | weights_proj] over h, BF16 as shipped (modules_to_not_convert).
+        ("index_kw", "bf16_projection", {"width": g.hidden, "outputs": kw},
+         lambda: compile_bf16_projection_aot(width=g.hidden, outputs=kw)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(rope_g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(rope_g)),
+    ]
+    # Whole and two-GPU (intermediate-split) widths of the dense layer and shared expert.
+    for inter in sorted({g.dense_inter, g.moe_inter, g.dense_inter // 2, g.moe_inter // 2}):
+        out.append((f"swiglu_i{inter}", "swiglu_split", {"inter": inter},
+                    lambda i=inter: compile_swiglu_split_aot(inter=i)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        for rope in (True, False):
+            tag = "" if rope else "_nope"
+            out += [
+                (f"query_scale{tag}_m{rows}", "query_scale", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=r)),
+                (f"rank_pack{tag}_m{rows}", "rank_pack", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_rank_pack_aot(g, rope=rope, max_rows=r)),
+                (f"absorb{tag}_m{rows}", "absorb", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=r)),
+                (f"index_post{tag}_m{rows}", "index_post", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=r)),
+                (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
+                 # Decode exports one card plan per SM count (the exporter passes sm_count).
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+            ]
+        out += [
+            (f"values_m{rows}", "values", {"max_rows": rows},
+             lambda r=rows: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=r)),
+            (f"index_query_scale_m{rows}", "query_scale", {"rope": False, "heads": g.index_heads, "max_rows": rows},
+             lambda r=rows: ml4.compile_query_scale_aot(g, rope=False, max_rows=r, heads=g.index_heads,
+                                                        head_dim=g.index_head_dim)),
+            # The indexer query over a checkpoint keeping its FP8 block-128 wq_b as shipped.
+            (f"index_q_m{rows}", "index_q", {"mode": mode, "max_rows": rows, "fp8_weights": "only"},
+             lambda mode=mode, r=rows: ml4.compile_index_q_fp8_aot(g, mode=mode, max_rows=r)),
+            (f"index_layer_norm_m{rows}", "layer_norm", {"width": g.hidden, "max_rows": rows},
+             lambda r=rows: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=r, eps=g.index_norm_eps)),
+            (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": index_pages},
+             lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(rope_g, max_rows=rows, max_pages=index_pages,
+                                                                          mode=mode)),
+        ]
+    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
+    draft = ml4.ML4_DRAFT
+    out += [
+        # Restore chunking must not change the context FC's reduction order.
+        ("draft_context_fc", "bf16_projection", {"width": 5 * g.hidden, "outputs": g.hidden, "max_rows": 2048},
+         lambda: compile_bf16_projection_aot(width=5 * g.hidden, outputs=g.hidden)),
+        ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
+        ("draft_attention_m64", "mla_draft_attention",
+         {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_attention_aot(draft, max_rows=64, max_context=max_context)),
+        ("draft_output_m64", "mla_draft_output", {"max_rows": 64},
+         lambda: ml4.compile_draft_output_aot(draft, max_rows=64)),
+    ]
+    return out
+
+
+def ml4_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """One GPU's share of Mistral Large 4's two-GPU head split (``ml42``, ``g`` = ML4_TP2: 32
+    heads): its heads' query scale, absorb and W_UV, and sparse MLA over a whole history
+    (context prefill's staging), on RoPE (656-byte) and NoPE (528-byte) layers. The
+    ``_context`` producer stages write a share's heads into the combined two-GPU query
+    (token rows 2 x 32 x latent apart). The latent record, indexer, norms, router and
+    SwiGLU stay ``ml4_*`` (one per model); the K6 TP2 shapes are dense_trellis_k6's."""
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+
+    out = []
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        for rope in (True, False):
+            tag = "" if rope else "_nope"
+            combined = 2 * g.heads * (g.kv_lora_rank + (g.qk_rope_dim if rope else 0))
+            out += [
+                (f"query_scale{tag}_m{rows}", "query_scale", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=r)),
+                (f"absorb{tag}_m{rows}", "absorb", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=r)),
+                (f"absorb{tag}_context_m{rows}", "absorb", {"rope": rope, "max_rows": rows, "query_row": combined},
+                 lambda r=rows, rope=rope, c=combined: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope,
+                                                                            max_rows=r, query_row=c)),
+                (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+            ]
+            if rope:
+                # NoPE layers write no RoPE tail: their query scale has no output to place.
+                out.append((f"query_scale_context_m{rows}", "query_scale",
+                            {"rope": True, "max_rows": rows, "query_row": combined},
+                            lambda r=rows, c=combined: ml4.compile_query_scale_aot(g, rope=True, max_rows=r,
+                                                                                    query_row=c)))
+        out.append((f"values_m{rows}", "values", {"max_rows": rows},
+                    lambda r=rows: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=r)))
+    return out
+
+
+def ml4_context_split_programs(g, decode_rows: int, max_context: int):
+    """Mistral Large 4's token-split extras (``ml4_*``, the 64-head model): GLM's scored
+    top-k, candidate merge and 32-head LSE combine at its index geometry, and per record
+    contract the 64-head-query partials at 128^-0.5 and the staging gathers (656-byte RoPE
+    ``sparse_mla_partial``/``kv``, 528-byte NoPE ``sparse_mla_nope_partial``/``kv_nope``)."""
+    from b12x.integration.cuteafd import context_split as split
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+
+    rope_g, nope_g = ml4.rope_attention(g), ml4.nope_attention(g)
+    pages = -(-max_context // PAGE_ROWS)
+    half = g.heads // 2
+    out = [
+        (f"scored_index_topk_decode_m{decode_rows}", "scored_index_topk",
+         {"max_rows": decode_rows, "max_pages": pages, "mode": "decode"},
+         lambda: split.compile_scored_index_topk_aot(rope_g, max_rows=decode_rows, max_pages=pages)),
+        ("dsa_candidate_merge", "dsa_candidate_merge", {"topk": g.index_topk},
+         lambda: split.compile_dsa_candidate_merge_aot(topk=g.index_topk)),
+        ("lse_combine2", "lse_combine2", {"heads": half, "has_sink": False},
+         lambda: split.compile_lse_combine2_aot(heads=half, has_sink=False)),
+    ]
+    caps = sorted({cap for cap in (1, 8) if cap < decode_rows} | {decode_rows})
+    for tag, attention in (("", rope_g), ("_nope", nope_g)):
+        plans = {(sms, cap): split.sparse_mla_partial_split_plan(
+            attention, max_rows=cap, head_count=half, sm_count=sms) for sms in (170, 188) for cap in caps}
+        for begin in (0, half):
+            for splits in sorted(set(plans.values())):
+                served = sorted(key for key, s in plans.items() if s == splits)
+                sms_served = sorted({sm for sm, _ in served})
+                out.append((f"sparse_mla{tag}_partial_h{begin}_s{splits}_m{decode_rows}", "sparse_mla_partial",
+                            {"max_rows": decode_rows, "head_begin": begin, "head_count": half,
+                             "num_splits": splits, "device_sm_counts": sms_served, "rope": not tag,
+                             "row_caps": {str(sm): [cap for s2, cap in served if s2 == sm] for sm in sms_served}},
+                            lambda a=attention, begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
+                                a, max_rows=decode_rows, head_begin=begin, head_count=half, num_splits=splits)))
+    for kind, attention in (("index", None), ("kv", rope_g), ("kv_nope", nope_g)):
+        row_bytes, page_bytes = (128, 8448) if attention is None else (attention.record_bytes, attention.kv_page_bytes)
+        out.append((f"paged_staging_gather_{kind}", "paged_staging_gather",
+                    {"row_bytes": row_bytes, "page_rows": PAGE_ROWS, "page_bytes": page_bytes},
+                    lambda rb=row_bytes, pb=page_bytes: split.compile_paged_staging_gather_aot(
+                        row_bytes=rb, page_rows=PAGE_ROWS, page_bytes=pb)))
+    return out
+
+
 def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Kimi KDA plus NoPE MLA at 48 heads/rank and 96 heads/context rank."""
     from b12x.integration.cuteafd import glmf, kimi_mla
@@ -484,21 +819,52 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
-        mla = kimi_mla.KimiMlaGeometry(heads=heads)
         suffix = "" if heads == 48 else "_h96"
-        for rows in sorted({decode_rows, prefill_rows}):
-            for op, fn in (("mla_producer", kimi_mla.compile_kimi_mla_producer_aot),
-                           ("mla_output", kimi_mla.compile_kimi_mla_output_aot)):
-                out.append((f"{op}{suffix}_m{rows}", op, {"max_rows": rows, "heads": heads},
-                            lambda r=rows, g=mla, fn=fn: fn(g, max_rows=r)))
-        for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
-            out.append((f"dense_mla_{mode}{suffix}_m{rows}", "dense_mla",
-                        {"mode": mode, "max_rows": rows, "heads": heads},
-                        lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
-                            g, max_rows=r, max_context=max_context, mode=m)))
+        for cache in ("bf16", "fp8"):
+            mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache)
+            cache_suffix = "" if cache == "bf16" else "_fp8"
+            for rows in sorted({decode_rows, prefill_rows}):
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer",
+                            {"max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", {"max_rows": rows, "heads": heads},
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+            for mode, rows in (("decode", decode_rows), ("verify", decode_rows), ("extend", prefill_rows)):
+                out.append((f"dense_mla_{mode}{suffix}{cache_suffix}_m{rows}", "dense_mla",
+                            {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache},
+                            lambda m=mode, r=rows, g=mla: kimi_mla.compile_kimi_dense_mla_aot(
+                                g, max_rows=r, max_context=max_context, mode=m)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())
+    out.extend(mla_draft_programs(decode_rows, max_context))
+    return out
+
+
+def mla_draft_programs(max_rows: int, max_context: int):
+    """Shared rotary MLA drafter; checkpoint scales are runtime ABI inputs."""
+    from b12x.integration.cuteafd import kimi_mla
+
+    def build(op, window=None, cache="bf16"):
+        g = kimi_mla.MlaDraftGeometry(window_size=window, kv_cache=cache)
+        fn = getattr(kimi_mla, f"compile_mla_draft_{op}_aot")
+        kwargs = {"max_rows": max_rows}
+        if op == "attention":
+            kwargs["max_context"] = max_context
+        return fn(g, **kwargs)
+
+    out = [(f"mla_draft_output_m{max_rows}", "mla_draft_output", {"max_rows": max_rows},
+            lambda: build("output"))]
+    for cache in ("bf16", "fp8"):
+        cache_suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"mla_draft_producer{cache_suffix}_m{max_rows}", "mla_draft_producer",
+                    {"max_rows": max_rows, "kv_cache": cache}, lambda c=cache: build("producer", cache=c)))
+        for window in (None, 4096):
+            suffix = "full" if window is None else f"w{window}"
+            out.append((f"mla_draft_attention_{suffix}{cache_suffix}_m{max_rows}", "mla_draft_attention",
+                        {"max_rows": max_rows, "window_size": window, "max_context": max_context, "kv_cache": cache},
+                        lambda w=window, c=cache: build("attention", w, c)))
     return out
 
 
@@ -568,6 +934,10 @@ def kimi_w8_programs():
                            ("down", {"width": width, "outputs": 7168})):
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
+        # Speed-first default; compensation is for informational F32 comparisons.
+        params = {"width": 7168, "outputs": 2 * width, "compensated": True}
+        out.append((f"ffn_gate_up_i{width}_comp", "bf16_projection", params,
+                    lambda kw=params: build_projection(kw)))
     return out
 
 
@@ -650,7 +1020,7 @@ def qwen4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
 
 
 def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int, *, norm_dtype):
-    """Ordinary residual, dense BF16 FFN and unrestricted causal hybrid attention."""
+    """Ordinary residual, native checkpoint projections and unrestricted full attention."""
     from b12x.integration.cuteafd import qwen_dense as dense
 
     out = [
@@ -671,6 +1041,25 @@ def qwen_dense_programs(g, decode_rows: int, prefill_rows: int, max_context: int
             (f"ffn_m{rows}", "ffn", {"max_rows": rows},
              lambda r=rows: dense.compile_qwen_dense_ffn_aot(g, max_rows=r)),
         ]
+        out += [
+            (f"attn_producer_kv_fp8_m{rows}", "attn_producer", {"max_rows": rows, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_producer_aot(g, max_rows=r, kv_format="fp8")),
+            (f"full_gqa_kv_fp8_m{rows}", "full_gqa", {"max_rows": rows, "max_splits": 32, "kv_format": "fp8"},
+             lambda r=rows: dense.compile_qwen_dense_full_gqa_aot(g, max_rows=r, max_splits=32, kv_format="fp8")),
+        ]
+        if g.name == "qwen38_27b":
+            from b12x.integration.cuteafd import qwen_dense_fp8 as native
+            for op, compile_fn in [
+                ("gdn", native.compile_qwen_dense_gdn_fp8_aot),
+                ("attn_producer", native.compile_qwen_dense_producer_fp8_aot),
+                ("attn_o", native.compile_qwen_dense_attn_o_fp8_aot),
+                ("ffn", native.compile_qwen_dense_ffn_fp8_aot),
+            ]:
+                out.append((f"{op}_fp8_m{rows}", op, {"max_rows": rows, "fp8_weights": "only"},
+                            lambda r=rows, fn=compile_fn: fn(g, max_rows=r)))
+            out.append((f"attn_producer_fp8_kv_fp8_m{rows}", "attn_producer",
+                        {"max_rows": rows, "fp8_weights": "only", "kv_format": "fp8"},
+                        lambda r=rows: native.compile_qwen_dense_producer_fp8_aot(g, max_rows=r, kv_format="fp8")))
     return out
 
 
@@ -728,6 +1117,16 @@ def context_split_programs(g, decode_rows: int, max_context: int):
     return out
 
 
+def dense_family_scopes(families, exlr8_family):
+    requested = set((families if families is not None else "kimik3").split(","))
+    if not requested or requested - {"kimik3", "glm", "glmf", "step5", "muse", "ml4"}:
+        raise ValueError("--dense-trellis-families takes kimik3, glm, glmf, step5, muse and/or ml4")
+    k6 = tuple(name for name in ("kimik3", "glm", "glmf", "step5", "muse", "ml4") if name in requested)
+    native = tuple(name for name in k6 if name in ("glm", "glmf")) \
+        if families is not None else tuple(filter(None, (exlr8_family or "").split(",")))
+    return k6, native
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -740,10 +1139,20 @@ def main() -> None:
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands)")
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
+                             "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
+                             "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
+                             "dense_trellis_k6 (native K6 core projections)")
+    parser.add_argument("--dense-trellis-families",
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4 "
+                             "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
+    parser.add_argument("--expert-partial-width", type=int, default=4096)
+    parser.add_argument("--expert-partial-topk", type=int, default=8)
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
+    parser.add_argument("--exlr8-family",
+                        help="explicit comma-separated EXLR8 checkpoint families: glm,glmf")
     parser.add_argument("--decode-rows", type=int, default=64)
     parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
                         help="with glmf: also the decode and verify programs at this many rows (serve "
@@ -761,17 +1170,25 @@ def main() -> None:
         args.context_split = "only"
     args.context_split_only = args.context_split == "only"
 
+    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    exlr8_families = tuple(args.exlr8_family.split(",")) if args.exlr8_family else ()
+    if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
+            or len(set(exlr8_families)) != len(exlr8_families)):
+        raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
     import torch
     from b12x.integration.cuteafd import (
         FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
         validate_exported_header,
     )
 
-    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    try:
+        dense_families, native_families = dense_family_scopes(args.dense_trellis_families, args.exlr8_family)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -779,7 +1196,13 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries != ["exlr8"]):
+    capability = (props.major, props.minor)
+    if capability == (8, 9):
+        # An sm_89 coordinator exports only the Spark reply reducers (its V4.1
+        # programs have their own exporters).
+        if set(geometries) != {"expert_reply"} or args.context_split_only:
+            raise SystemExit("an sm_89 coordinator exports only the expert_reply geometry")
+    elif capability not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply") for g in geometries)):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -797,10 +1220,89 @@ def main() -> None:
     entries, includes = [], []
     work = []
     for name in geometries:
+        if name in ("glmf_stage", "glmf2_stage"):
+            g = GLM53_FLASH
+            if name == "glmf2_stage":
+                g = dataclasses.replace(g, name="glmf_tp2", heads=g.heads // 2,
+                    kda_heads=g.kda_heads // 2, dense_inter=g.dense_inter // 2,
+                    moe_inter=g.moe_inter // 2)
+            manifest["families"][name] = dataclasses.asdict(g)
+            work += [(name, *item) for item in glmf_stage_programs(
+                g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)]
+            continue
+        if name in ("glm_stage", "glm2_stage"):
+            g = glm_stage_geometry(GLM53, name == "glm2_stage")
+            manifest["families"][name] = dataclasses.asdict(g)
+            work += [(name, *item) for item in glm_stage_programs(g, args.decode_rows, args.prefill_rows)]
+            continue
+        if name == "kimi_split":
+            from export_b12x_kimi_split_aot import programs as kimi_split_programs
+            manifest["families"][name] = {"abi_version": 1}
+            work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
+                     for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_reply":
+            from b12x.moe._shared.kernels.w4a16.expert_reply import (compile_expert_reply_aot,
+                compile_expert_reply_reduce_aot, compile_expert_reply_reduce_tier_aot)
+            manifest["families"][name] = {"fp8_block": 32, "nvfp4_block": 16}
+            if capability != (8, 9):
+                # An sm_89 coordinator only decodes Spark replies (and has no
+                # E2M1 conversion for the quantizer).
+                for suffix, quantize, stage in (("quantize", True, False), ("dequantize", False, False), ("stage", False, True)):
+                    work.append((name, suffix, "expert_reply", {"max_rows": args.prefill_rows},
+                                 lambda q=quantize, s=stage: compile_expert_reply_aot(quantize=q, stage=s)))
+                work += [(name, *item) for item in exl3_reply_programs(args.prefill_rows)]
+            work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},
+                         compile_expert_reply_reduce_aot))
+            if capability != (12, 1):
+                # Coordinators: the reduce with a GPU expert tier's BF16 plane.
+                # Last, so every other program keeps its object and table index.
+                work.append((name, "reduce_tier", "expert_reply", {"max_rows": args.prefill_rows},
+                             compile_expert_reply_reduce_tier_aot))
+            continue
+        if name == "expert_partial":
+            from export_b12x_expert_partial_aot import programs as partial_programs
+            manifest["families"][name] = {"width": args.expert_partial_width,
+                                          "topk": args.expert_partial_topk}
+            work += [(name, *item) for item in partial_programs(
+                args.expert_partial_width, args.expert_partial_topk, args.prefill_rows)]
+            continue
+        if name in ("muse", "muse2"):
+            from export_b12x_muse_aot import programs as muse_programs
+            heads = 128 if name == "muse" else 64
+            manifest["families"][name] = {"heads": heads, "kv_heads": heads // 8, "head_dim": 64,
+                                           "hidden": 8192, "window": 2048}
+            work += [(name, *item) for item in muse_programs(heads, args.prefill_rows)]
+            continue
+        if name == "ml4":
+            from b12x.integration.cuteafd.mistral_large4 import ML4, ML4_TP2
+            extent = geometry_context(name, args.max_context)
+            manifest["families"][name] = dataclasses.asdict(ML4)
+            manifest["family_capacities"][name] = {"max_context": extent}
+            work += [(name, *item) for item in ml4_programs(ML4, args.decode_rows, args.prefill_rows, extent)]
+            # One GPU of the two-GPU head split (heads and context placement), after the
+            # whole model's programs.
+            manifest["families"]["ml42"] = dataclasses.asdict(ML4_TP2)
+            manifest["family_capacities"]["ml42"] = {"max_context": geometry_context("ml42", args.max_context)}
+            work += [("ml42", *item) for item in ml4_head_split_programs(ML4_TP2, args.decode_rows,
+                                                                         args.prefill_rows, extent)]
+            continue
+        if name == "dense_trellis_k6":
+            from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies
+            manifest["families"][name] = {
+                "abi_version": 1,
+                "architectures": dense_families,
+                "row_policies": row_policies(dense_families),
+                "measured_not_exported": ["tiled_mcg"],
+            }
+            work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
+            continue
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
+            if not native_families:
+                raise SystemExit("exlr8_dense requires glm and/or glmf in --dense-trellis-families")
             manifest["families"][name] = {"abi_version": 1}
-            work += [(name, *item) for item in dense_programs()]
+            work += [(name, *item) for item in dense_programs(families=native_families)]
             continue
         if name == "exlr8":
             continue  # appended after every other family, below
@@ -877,6 +1379,11 @@ def main() -> None:
         for name in (n for n in geometries if n in bases):
             work += [(families[name], *item) for item in context_split_programs(
                 bases[name], args.decode_rows, geometry_context(name, args.max_context))]
+        if "ml4" in geometries:
+            # Mistral Large 4's token-split extras: both record contracts' partials and gathers.
+            from b12x.integration.cuteafd.mistral_large4 import ML4
+            work += [("ml4", *item) for item in ml4_context_split_programs(
+                ML4, args.decode_rows, geometry_context("ml4", args.max_context))]
         if "glmf2" in geometries:
             # GLM Flash context keeps the compact index cache on two GPUs: each GPU's share commits
             # its KDA heads and rebuilds the (replicated) index tails in one launch.
@@ -890,14 +1397,32 @@ def main() -> None:
         # Last, so every other family's objects and table indices are unchanged.
         # The fork owns the program list and its role split.
         from export_b12x_exlr8_aot import programs as exlr8_programs
-        exlr8_work = exlr8_programs(role=args.exlr8_role)
-        manifest["families"]["exlr8"] = {"hidden": 6144, "units": 16, "top_k": 8, "role": args.exlr8_role,
-                                         "programs": [f"exlr8_{item[0]}" for item in exlr8_work]}
-        work += [("exlr8", *item) for item in exlr8_work]
+        for exlr8_family in exlr8_families:
+            if exlr8_family == "glm":
+                exlr8_work = exlr8_programs(role=args.exlr8_role)
+                family = "exlr8"
+                geometry = {"hidden": 6144, "units": 16, "top_k": 8}
+            else:
+                cfg = GLM53_FLASH
+                exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
+                    units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
+                    swiglu_limit=cfg.swiglu_limit)
+                family = "exlr8_glmf"
+                geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
+                            "top_k": cfg.top_k, "experts": cfg.routed_experts,
+                            "swiglu_limit": cfg.swiglu_limit}
+            manifest["families"][family] = {**geometry, "role": args.exlr8_role,
+                                           "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
+            work += [(family, *item) for item in exlr8_work]
+    # Append shared drafter exports after all existing objects: table indices stay stable.
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2")):
+        work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection", {"max_rows": 2048},
+                  lambda k=k, n=n: compile_draft_bf16_projection(k, n))
+                 for k, n in sorted(draft_bf16_shapes())]
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = f"{family}_{suffix}"
+        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
@@ -914,7 +1439,7 @@ def main() -> None:
             if abi is not None and program.abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
             abi = program.abi
-            kinds = "".join(SCALAR_KINDS[kind] for _, kind in abi["scalars"])
+            kinds, public_scalars = native_scalar_abi(stem, program.geometry, abi["scalars"])
             program.export_to_c(str(output), label, "cuteafd_" + label)
             checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
@@ -931,7 +1456,7 @@ def main() -> None:
             "name": stem, "family": family, "op": op, "params": params,
             "geometry": plans[-1]["geometry"],
             "pointers": [dict(zip(("name", "dtype", "shape", "role"), p)) for p in abi["pointers"]],
-            "scalars": [dict(zip(("name", "type"), s)) for s in abi["scalars"]],
+            "scalars": [dict(zip(("name", "type"), s)) for s in public_scalars],
             "scratch_bytes_at_capacity": scratch, "capacity_rows": capacity,
             **({"card_plans": plans} if len(plans) > 1 else
                {"entry": plans[0]["entry"], "object_sha256": plans[0]["object_sha256"]}),
@@ -944,6 +1469,7 @@ def main() -> None:
     (output / "dsv4_programs.h").write_text("\n".join([
         "#pragma once",
         *includes,
+        f"#define CUTEAFD_DSV4_CC_MAJOR {props.major}",
         f"#define CUTEAFD_DSV4_CC_MINOR {props.minor}",
         "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(entries),
         "",

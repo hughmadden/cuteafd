@@ -2,6 +2,239 @@
 use super::{Demand, PlacementError};
 use cuteafd_core::ExpertGeometry;
 
+/// Selected receive mode is a physical fact; this recipe never runs the probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkIntakeMode { Gpu, Pinned, Host }
+
+/// Raw intake storage only. Worker arenas, endpoint rings, native code and
+/// stream/event overhead must be composed independently before family Ready.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkIntakeOwners {
+    pub gpu: u8,
+    pub ranks: usize,
+    pub rows: u64,
+    pub row_bytes: u64,
+    pub waves: usize,
+    pub mode: SparkIntakeMode,
+}
+
+impl SparkIntakeOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        if prefix.is_empty() || self.gpu > 1 || !(1..=8).contains(&self.ranks)
+            || !(1..=4).contains(&self.waves) || self.rows == 0 || self.row_bytes == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark intake owner geometry".into()));
+        }
+        let plane = self.rows.checked_mul(self.row_bytes)
+            .ok_or(Refusal::Overflow("Spark intake plane"))?;
+        let logical = plane.checked_mul(self.waves as u64)
+            .ok_or(Refusal::Overflow("Spark intake reserve"))?;
+        let raw = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical.max(256))
+            .map_err(|e| Refusal::InvalidFact(e.to_string()))?;
+        let mut owners = (0..self.ranks).map(|rank| Allocation::buffer(
+            format!("{prefix}.rank.{rank}.storage"), Location::coordinator(self.gpu), raw,
+            lifetime, Category::Transport, "Spark intake")).collect::<Vec<_>>();
+        if self.mode != SparkIntakeMode::Gpu {
+            let whole = plane.checked_mul(self.ranks as u64)
+                .ok_or(Refusal::Overflow("Spark intake pinned staging"))?;
+            let bytes = if self.mode == SparkIntakeMode::Pinned {
+                whole.min(cuteafd_core::serving_capacity::SPARK_INTAKE_SMALL_WAVE_BYTES).max(256)
+            } else { whole };
+            owners.push(Allocation::buffer(format!("{prefix}.staging"), Location::PINNED,
+                bytes, lifetime, Category::Staging, "Spark intake"));
+        }
+        Ok(owners)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark intake requires a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
+/// Selected request-staging topology; registered slots alias one whole owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SparkWaveStaging {
+    Registered { slot_bytes: u64 },
+    Standalone { slot_bytes: u64 },
+}
+
+/// Wave controls, optional mapped pull descriptors and request staging only.
+/// Intake planes, endpoint rings and native overhead are separate components.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkWaveOwners {
+    pub ranks: usize,
+    pub waves: usize,
+    pub pinned: u8,
+    pub staging: SparkWaveStaging,
+}
+
+impl SparkWaveOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal, View};
+        use cuteafd_core::{memory_layout::Category, serving_capacity::*};
+        let all = if self.ranks == SPARK_INTAKE_MAX_RANKS { u8::MAX }
+            else if self.ranks < SPARK_INTAKE_MAX_RANKS { (1u8 << self.ranks) - 1 } else { 0 };
+        let (registered, slot_bytes) = match self.staging {
+            SparkWaveStaging::Registered { slot_bytes } => (true, slot_bytes),
+            SparkWaveStaging::Standalone { slot_bytes } => (false, slot_bytes),
+        };
+        if prefix.is_empty() || !(1..=SPARK_INTAKE_MAX_RANKS).contains(&self.ranks)
+            || !(1..=4).contains(&self.waves) || self.pinned & !all != 0 || slot_bytes == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark wave owner geometry".into()));
+        }
+        let owner = |leaf: String, bytes, category| Allocation::buffer(
+            format!("{prefix}.{leaf}"), Location::PINNED, bytes, lifetime, category, "Spark wave storage");
+        let mut allocations = vec![owner("control".into(),
+            ((1 + 3 * self.waves + SPARK_INTAKE_MAX_RANKS) * SPARK_WAVE_CONTROL_LINE_BYTES) as u64,
+            Category::Transport)];
+        if self.pinned != 0 {
+            allocations.push(owner("pulls".into(),
+                (self.waves * SPARK_INTAKE_MAX_RANKS * SPARK_WAVE_PULL_STRIDE_BYTES) as u64, Category::Transport));
+        }
+        let backing_bytes = if registered {
+            slot_bytes.checked_mul(self.waves as u64)
+                .ok_or(Refusal::Overflow("Spark registered request staging"))?
+        } else { slot_bytes };
+        for slot in 0..if registered { 1 } else { self.waves } {
+            allocations.push(owner(format!("staging.storage.{slot}"), backing_bytes, Category::Staging));
+        }
+        for slot in 0..self.waves {
+            let mut allocation = owner(format!("staging.slot.{slot}"), slot_bytes, Category::Staging);
+            allocation.view = Some(View { backing: format!("{prefix}.staging.storage.{}", if registered { 0 } else { slot }),
+                offset: if registered { slot_bytes * slot as u64 } else { 0 } });
+            allocations.push(allocation);
+        }
+        Ok(allocations)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark waves require a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
+/// One coordinator link's native send/receive allocations. Registered egress,
+/// GPU landing and retained receive-frame views are not additional ring owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkEndpointOwners {
+    pub ranks: usize,
+    pub geometry: ExpertGeometry,
+    pub endpoint: cuteafd_core::SparkEndpoint,
+    pub rings: cuteafd_core::SparkRings,
+}
+
+impl SparkEndpointOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        if prefix.is_empty() || !(1..=cuteafd_core::serving_capacity::SPARK_INTAKE_MAX_RANKS).contains(&self.ranks)
+            || self.geometry.hidden == 0 || self.geometry.topk == 0 {
+            return Err(Refusal::InvalidFact("invalid Spark endpoint owner geometry".into()));
+        }
+        let rings = self.endpoint.endpoint_rings(self.geometry, self.rings)
+            .ok_or_else(|| Refusal::InvalidFact("invalid Spark endpoint ring geometry".into()))?;
+        let (send, recv) = self.endpoint.wire_bytes(self.geometry)
+            .ok_or_else(|| Refusal::InvalidFact("invalid Spark endpoint wire geometry".into()))?;
+        if rings.max_frame_bytes == 0 || rings.slot_bytes == 0 || rings.alignment == 0
+            || send > rings.max_frame_bytes || recv > rings.max_frame_bytes {
+            return Err(Refusal::InvalidFact("Spark endpoint wire exceeds its ring capacity".into()));
+        }
+        let span = |wire: usize| -> Result<u64, Refusal> {
+            let slot = wire.max(rings.slot_bytes).min(rings.max_frame_bytes);
+            slot.checked_add(rings.alignment - 1).map(|bytes| bytes / rings.alignment * rings.alignment)
+                .and_then(|stride| stride.checked_mul(rings.depth))
+                .and_then(|bytes| u64::try_from(bytes).ok()).ok_or(Refusal::Overflow("Spark endpoint ring"))
+        };
+        let (send, recv) = (span(send)?, span(recv)?);
+        Ok((0..self.ranks).flat_map(|rank| [("send", send), ("recv", recv)].into_iter().map(move |(name, bytes)|
+            Allocation::buffer(format!("{prefix}.rank.{rank}.{name}"), Location::PINNED, bytes,
+                lifetime, Category::Transport, "Spark endpoint rings"))).collect())
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark endpoints require a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
+/// Physical coordinator owners of one running link, not Spark worker memory
+/// or a complete family's Ready census.
+#[derive(Debug, Clone, Copy)]
+pub struct SparkLinkOwners {
+    pub intake: SparkIntakeOwners,
+    pub waves: SparkWaveOwners,
+    pub endpoints: SparkEndpointOwners,
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
+    /// Physical link capability, including shared decode/prefill links; never a request role.
+    pub prefill: bool,
+    /// Retained registered backing when staging falls back to standalone slots.
+    pub unused_egress_bytes: Option<u64>,
+}
+
+impl SparkLinkOwners {
+    pub fn allocations(self, prefix: &str, lifetime: super::planner::Lifetime)
+        -> Result<Vec<super::planner::Allocation>, super::planner::Refusal> {
+        use super::planner::{Allocation, Location, Refusal};
+        use cuteafd_core::memory_layout::Category;
+        let geometry = self.endpoints.geometry;
+        let bf16_row_bytes = u64::from(geometry.hidden).checked_mul(2)
+            .ok_or(Refusal::Overflow("Spark reply row"))?;
+        if prefix.is_empty() || self.intake.ranks != self.waves.ranks
+            || self.intake.ranks != self.endpoints.ranks || self.intake.waves != self.waves.waves
+            || !geometry.partial_replies() && self.intake.row_bytes != bf16_row_bytes
+            || self.unused_egress_bytes.is_some_and(|bytes| bytes == 0
+                || matches!(self.waves.staging, SparkWaveStaging::Registered { .. })) {
+            return Err(Refusal::InvalidFact("inconsistent Spark link owner geometry".into()));
+        }
+        let mut owners = self.intake.allocations(&format!("{prefix}.intake"), lifetime)?;
+        owners.extend(self.waves.allocations(&format!("{prefix}.waves"), lifetime)?);
+        owners.extend(self.endpoints.allocations(&format!("{prefix}.endpoints"), lifetime)?);
+        if let Some(bytes) = self.unused_egress_bytes {
+            owners.push(Allocation::buffer(format!("{prefix}.unused-egress"), Location::PINNED,
+                bytes, lifetime, Category::Staging, "Spark unused registered egress"));
+        }
+        Ok(owners)
+    }
+
+    pub fn components(self, prefix: &str, lifetime: super::planner::Lifetime, maximum_pages: u64)
+        -> Result<Vec<super::planner::Component>, super::planner::Refusal> {
+        use super::planner::{ByteCurve, Component, Refusal};
+        if maximum_pages == 0 {
+            return Err(Refusal::InvalidFact("Spark link requires a positive pool domain".into()));
+        }
+        Ok(self.allocations(prefix, lifetime)?.into_iter().map(|owner| {
+            let bytes = ByteCurve::fixed(owner.bytes, maximum_pages);
+            Component::allocation(owner, bytes, false, maximum_pages)
+        }).collect())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingSetComponent { Always, RtxExperts, SparkExperts }
 
@@ -39,9 +272,12 @@ impl SparkWorkingSet {
         }
         let mut bytes = SparkIoBytes::default();
         for endpoint in endpoints {
+            let rings = endpoint.resolved_rings(rings)
+                .ok_or(PlacementError::Inventory("invalid Spark endpoint ring depth"))?;
             let ring = SparkRingGeometry { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment, endpoints: 1 };
-            let bf16 = endpoint.ingress == cuteafd_core::SparkIngress::Bf16;
+            let bf16 = matches!(endpoint.ingress,
+                cuteafd_core::SparkIngress::Bf16 | cuteafd_core::SparkIngress::Native);
             let io = self.rank_io(rank, geometry, endpoint.capacity, bf16, ring)?;
             bytes.intake = bytes.intake.max(io.intake);
             if let cuteafd_core::SparkIngress::Bf16Decode { rows } = endpoint.ingress {
@@ -111,8 +347,8 @@ impl SparkWorkingSet {
             host_exchange: multiply(routes + hidden * 2)?,
             row_indices: multiply(4)?,
             mapped_rings: mapped as u64,
-            endpoint_staging: cuteafd_core::SparkEndpoint { capacity,
-                ingress: cuteafd_core::SparkIngress::Bf16 }.response_prefix_bytes()
+            endpoint_staging: cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
+                ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None }.response_prefix_bytes()
                 .and_then(|bytes| bytes.checked_mul(rings.endpoints))
                 .ok_or(PlacementError::Overflow("Spark endpoint staging"))? as u64,
         })
@@ -135,17 +371,28 @@ pub struct SparkAssignment {
 pub enum SparkResidentLayout {
     Exl3 { world: usize, rank: usize },
     Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
-    Native { world: usize, rank: usize, stored_width: usize },
+    Native { world: usize, rank: usize },
+    Nvfp4 { world: usize, rank: usize, stored_width: usize },
 }
 
 impl SparkAssignment {
     pub fn from_catalog(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
         rank: usize, layout: SparkResidentLayout, endpoints: &[cuteafd_core::SparkEndpoint],
         rings: cuteafd_core::SparkRings) -> anyhow::Result<Self> {
+        let geometry = catalog.routed_experts().geometry()?;
+        let mut assignment = Self::resident_from_catalog(catalog, working, rank, layout)?;
+        assignment.io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
+        Ok(assignment)
+    }
+
+    /// Header-derived weights only; endpoint transport is charged independently
+    /// by the planner, and added by `from_catalog` for runtime admission.
+    pub(crate) fn resident_from_catalog(catalog: &crate::OfficialV41Catalog,
+        working: &SparkWorkingSet, rank: usize, layout: SparkResidentLayout) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let geometry = catalog.routed_experts().geometry()?;
-        let io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
-        let mut assignment = Self { rank: u32::try_from(rank)?, resident_bytes: 0, slices: vec![], io };
+        let mut assignment = Self { rank: u32::try_from(rank)?, resident_bytes: 0,
+            slices: vec![], io: SparkIoBytes::default() };
         if !working.selected_ranks().contains(&rank) { return Ok(assignment); }
         ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
             "Spark layers must be sorted and unique");
@@ -156,8 +403,8 @@ impl SparkAssignment {
                 width: 0, stored_width: 0, tiers: vec![], projection_counts: vec![] };
             let resident = match layout {
                 SparkResidentLayout::Exl3 { world, rank } => {
-                    let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
-                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    let plan = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
@@ -170,6 +417,15 @@ impl SparkAssignment {
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
                         .for_layer(layer)?;
+                    // Exact-even mixed layers share source ranges, but seal each
+                    // format's native units just as its independent worker group does.
+                    let slicing = match slicing {
+                        crate::formats::fp8_experts::Slicing::Blocks(block)
+                            if world > 0 && geometry.intermediate as usize % (block * world) == 0
+                                && geometry.intermediate as usize % (tensors.block() * world) == 0 =>
+                            tensors.exact_slicing(world),
+                        other => other,
+                    };
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());
                     slice.first = u32::try_from(first)?;
@@ -178,16 +434,30 @@ impl SparkAssignment {
                     (tensors.weight_read_bytes_with(world, rank, slicing)? as u64)
                         .checked_mul(tensors.shape().experts as u64).context("Spark FP8 resident overflow")?
                 }
-                SparkResidentLayout::Native { world, rank, stored_width } => {
+                SparkResidentLayout::Native { world, rank }
+                | SparkResidentLayout::Nvfp4 { world, rank, .. } => {
                     use crate::V41ExpertSelection;
                     ensure!(catalog.exl3().is_none() && catalog.fp8().is_none(),
                         "Spark native layout cannot convert compressed checkpoint headers");
-                    let width = if world == 1 {
-                        ensure!(rank == 0, "single-rank native shard must have rank 0");
-                        geometry.intermediate as usize
+                    use crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry;
+                    let shard = if catalog.nvfp4().is_some() {
+                        V41BackboneTpGeometry::equal(geometry.intermediate as usize,
+                            geometry.hidden as usize, world, rank)?
                     } else {
-                        crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry::new(
-                            geometry.intermediate as usize, geometry.hidden as usize, world, rank)?.intermediate_size()
+                        V41BackboneTpGeometry::new(geometry.intermediate as usize,
+                            geometry.hidden as usize, layer, world, rank)?
+                    };
+                    let width = shard.intermediate_size();
+                    let stored_width = match layout {
+                        SparkResidentLayout::Nvfp4 { stored_width, .. } => {
+                            ensure!(catalog.nvfp4().is_some(), "NVFP4 layout requires NVFP4 headers");
+                            stored_width
+                        }
+                        _ => {
+                            ensure!(catalog.nvfp4().is_none(), "native MXFP4 layout cannot store NVFP4");
+                            cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, width)
+                                .context("invalid native MXFP4 resident geometry")?
+                        }
                     };
                     ensure!(stored_width >= width && stored_width % 32 == 0,
                         "Spark native installed width {stored_width} cannot store logical width {width}");
@@ -202,11 +472,16 @@ impl SparkAssignment {
                         };
                         ensure!(header_width == width, "Spark native header width {header_width}, expected {width}");
                     }
-                    slice.first = u32::try_from(rank * width)?;
+                    slice.first = u32::try_from(shard.first_intermediate())?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
-                    super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
-                        slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {
+                        crate::formats::scale_codes::expert_bytes(geometry.experts as u64,
+                            geometry.hidden as u64, width as u64).context("coded Spark residency overflow")?
+                    } else {
+                        super::families::deepseek_v41::resident_bytes(geometry.hidden as u64,
+                            slice.stored_width as u64, geometry.experts as u64, catalog.nvfp4().is_some())?
+                    }
                 }
             };
             assignment.resident_bytes = assignment.resident_bytes.checked_add(resident)
@@ -248,6 +523,78 @@ impl SparkAssignment {
     }
 }
 
+/// Offline Spark ceiling: exact header arenas and endpoint allocations plus an
+/// explicitly estimated worker reserve. Feeds the existing pool-first solver's
+/// mandatory prefix; it does not choose RTX owners or allocate worker storage.
+#[derive(Debug, Clone)]
+pub struct SparkBudgetInventory {
+    pub layers: Vec<usize>,
+    pub resident: Vec<Vec<u64>>,
+    pub overhead: Vec<u64>,
+    pub budget: u64,
+}
+
+impl SparkBudgetInventory {
+    pub fn exl3(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+        endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
+        budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let mut resident = vec![Vec::with_capacity(working.spark_layers.len()); working.spark_ranks];
+        for &layer in &working.spark_layers {
+            for (costs, bytes) in resident.iter_mut().zip(catalog.exl3_spark_arena_bytes(layer, working.spark_ranks)?) {
+                costs.push(bytes);
+            }
+        }
+        let mut overhead = Vec::new();
+        for rank in 0..working.spark_ranks {
+            let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
+            let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,
+                io.endpoint_staging, estimated_reserve].into_iter().try_fold(0u64, |sum, bytes|
+                    sum.checked_add(bytes).context("Spark estimated overhead overflow"))?;
+            overhead.push(bytes);
+        }
+        Ok(Self { layers: working.spark_layers.clone(), resident, overhead, budget })
+    }
+
+    pub fn rank_bytes(&self, rank: usize, onboard: usize) -> anyhow::Result<u64> {
+        use anyhow::{ensure, Context};
+        ensure!(onboard <= self.layers.len() && self.resident.len() == self.overhead.len()
+            && self.resident.iter().all(|costs| costs.len() == self.layers.len()), "Spark budget inventory extent");
+        let costs = self.resident.get(rank).context("Spark budget rank outside inventory")?;
+        // An empty selected set allocates no worker storage or endpoint rings.
+        if onboard == self.layers.len() { return Ok(0); }
+        costs[onboard..].iter().try_fold(self.overhead[rank], |sum, bytes|
+            sum.checked_add(*bytes).context("Spark estimated retained bytes overflow"))
+    }
+
+    pub fn minimum_rtx_layers(&self) -> anyhow::Result<usize> {
+        anyhow::ensure!(self.budget > 0 && !self.resident.is_empty(), "Spark budget must be positive with selected ranks");
+        for count in 0..=self.layers.len() {
+            let fits = (0..self.resident.len()).map(|rank| self.rank_bytes(rank, count))
+                .collect::<anyhow::Result<Vec<_>>>()?.into_iter().all(|bytes| bytes <= self.budget);
+            if fits { return Ok(count); }
+        }
+        unreachable!("empty Spark working set has zero bytes")
+    }
+
+    pub fn constrain(&self, request: &mut super::PlacementRequest) -> anyhow::Result<()> {
+        let layers = request.layers.iter().enumerate().filter_map(|(layer, demand)|
+            demand.experts.is_some().then_some(layer)).collect::<Vec<_>>();
+        anyhow::ensure!(layers == self.layers, "Spark budget routed inventory differs from coordinator");
+        let minimum = self.minimum_rtx_layers()?;
+        if let super::Onboard::Layers(count) = request.onboard {
+            anyhow::ensure!(count <= layers.len(), "explicit --rtx-expert-layers {count} exceeds {} routed layers", layers.len());
+        }
+        if let Some(count) = request.onboard.layers(layers.len()) {
+            anyhow::ensure!(count >= minimum,
+                "explicit --rtx-expert-layers {count} is below {minimum} required by estimated --spark-budget-gib ({budget} bytes including reserve and I/O)",
+                budget = self.budget);
+        }
+        request.minimum_expert_layers = request.minimum_expert_layers.max(minimum);
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SparkRingGeometry {
     pub max_frame_bytes: usize,
@@ -274,6 +621,214 @@ mod tests {
     use cuteafd_core::memory_layout::{Basis, Category};
 
     #[test]
+    fn compressed_prefill_reply_reuses_raw_bf16_without_scratch() {
+        use super::super::planner::{Facts, Lifetime, PhaseOrder};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkReplyFormat, SparkRings};
+        for geometry in [ExpertGeometry::GLM5, ExpertGeometry::MUSE_SPARK] {
+            for ranks in [1, 6, 8] { for waves in [1, 3, 4] { for rows in [1, 64, 80, 2752] {
+                for prefill in [false, true] {
+                    let base = SparkLinkOwners {
+                        intake: SparkIntakeOwners { gpu: 1, ranks, rows,
+                            row_bytes: u64::from(geometry.hidden) * 2, waves, mode: SparkIntakeMode::Gpu },
+                        waves: SparkWaveOwners { ranks, waves, pinned: 0,
+                            staging: SparkWaveStaging::Registered { slot_bytes: 1 << 20 } },
+                        endpoints: SparkEndpointOwners { ranks, geometry,
+                            endpoint: SparkEndpoint { capacity: rows as u32, ingress: SparkIngress::Bf16,
+                                ring_depth: None, partial_reply_bytes: geometry.partial_reply_bound(rows as u32).map(|b| b as u64) },
+                            rings: SparkRings { max_frame_bytes: 1 << 30, depth: 2, slot_bytes: 256, alignment: 64 } },
+                        spark_reply_format: SparkReplyFormat::Bf16, prefill, unused_egress_bytes: None,
+                    };
+                    let raw = base.allocations("link", Lifetime::TARGET).unwrap();
+                    for format in [SparkReplyFormat::Bf16, SparkReplyFormat::Fp8, SparkReplyFormat::Nvfp4] {
+                        let spec = SparkLinkOwners { spark_reply_format: format, ..base };
+                        let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
+                        assert_eq!(owners, raw, "all formats reuse the same raw BF16 capacity");
+                        if prefill && !geometry.partial_replies() {
+                            let receive_bytes: u64 = owners.iter().filter(|owner|
+                                owner.id.starts_with("link.intake.rank.")).map(|owner| owner.bytes).sum();
+                            assert_eq!(receive_bytes, crate::serving_capacity::prefill_return_bytes_with_format(
+                                waves as u64, rows, ranks as u64, u64::from(geometry.hidden), format).unwrap());
+                        }
+                        let mut contract = super::super::planner::Contract::fixed(64, 1, 2, Facts { resident_weights: vec![],
+                            phase_order: PhaseOrder::DRAFT_THEN_TARGET, allocations: owners.clone(), deferred: vec![],
+                            sequential: vec![], reservations: vec![], allowances: vec![],
+                        });
+                        contract.variables = vec![super::super::planner::Variable::Prefill(vec![
+                            super::super::planner::PrefillShape {rows: 64, waves: 1}]),
+                            super::super::planner::Variable::Lanes(vec![1])];
+                        assert_eq!(contract.facts(&[0, 0], 1).unwrap().allocations, owners);
+                        assert_eq!(spec.components("link", Lifetime::TARGET, 1).unwrap().len(), owners.len());
+                    }
+                    let shrunk = SparkLinkOwners { intake: SparkIntakeOwners {row_bytes: 1, ..base.intake}, ..base };
+                    if !geometry.partial_replies() { assert!(shrunk.allocations("link", Lifetime::TARGET).is_err()); }
+                    let overflow = SparkLinkOwners { intake: SparkIntakeOwners {rows: u64::MAX, ..base.intake},
+                        spark_reply_format: SparkReplyFormat::Fp8, ..base };
+                    assert!(overflow.allocations("link", Lifetime::TARGET).is_err());
+                }
+            } } }
+        }
+    }
+
+    #[test]
+    fn endpoint_owners_charge_each_native_span_without_egress_or_landing_aliases() {
+        use super::super::planner::{Lifetime, Location};
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let geometry = ExpertGeometry::GLM5;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 1 << 20, alignment: 4096 };
+        for ranks in [1, 6, 8] {
+            for rows in [1, 64, 2752, 4096] {
+                for ingress in [SparkIngress::Fp8K32, SparkIngress::Bf16, SparkIngress::Native,
+                    SparkIngress::Bf16Decode { rows: rows.min(21) }] {
+                    for (depth, partial) in [(None, None), (Some(3), None), (Some(4), Some(80 << 20))] {
+                        let endpoint = SparkEndpoint { capacity: rows, ingress, ring_depth: depth, partial_reply_bytes: partial };
+                        let spec = SparkEndpointOwners { ranks, geometry, endpoint, rings };
+                        let owners = spec.allocations("link", Lifetime::TARGET).unwrap();
+                        // Independently spell out the wire layout and aligned physical spans.
+                        let wire_request = |count: u32, bf16: bool| {
+                            let rows = count as usize;
+                            let prefix = (96 + rows * 40 + rows * 8 * 12 + 15) / 16 * 16;
+                            prefix + rows * if bf16 { 6144 * 2 } else { 6144 + 6144 / 32 }
+                        };
+                        let request = match ingress {
+                            SparkIngress::Bf16 | SparkIngress::Native => wire_request(rows, true),
+                            SparkIngress::Fp8K32 => wire_request(rows, false),
+                            SparkIngress::Bf16Decode {rows: decode} => wire_request(rows, false).max(wire_request(decode, true)),
+                        };
+                        let response = partial.map_or(96 + rows as usize * (4 + 6144 * 2), |bytes| bytes as usize + 128);
+                        let frame = if partial.is_some() { rings.max_frame_bytes.max(request).max(response) }
+                            else { rings.max_frame_bytes };
+                        let span = |wire: usize| {
+                            let slot = wire.max(rings.slot_bytes).min(frame);
+                            ((slot + rings.alignment - 1) / rings.alignment * rings.alignment * depth.unwrap_or(rings.depth)) as u64
+                        };
+                        assert_eq!(owners.len(), ranks * 2);
+                        for rank in 0..ranks {
+                            for (index, name, bytes) in [(0, "send", span(request)), (1, "recv", span(response))] {
+                                let owner = &owners[2 * rank + index];
+                                assert_eq!(owner.id, format!("link.rank.{rank}.{name}"));
+                                assert_eq!(owner.location, Location::PINNED);
+                                assert_eq!(owner.bytes, bytes);
+                                assert_eq!(owner.lifetime, Lifetime::TARGET);
+                                assert!(owner.view.is_none());
+                            }
+                        }
+                        assert_eq!(spec.components("link", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_owners_refuse_invalid_or_overflowing_selected_geometry() {
+        use super::super::planner::Lifetime;
+        use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+        let base = SparkEndpointOwners { ranks: 6, geometry: ExpertGeometry::GLM5,
+            endpoint: SparkEndpoint { capacity: 64, ingress: SparkIngress::Fp8K32, ring_depth: None, partial_reply_bytes: None },
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 1 << 20, alignment: 4096 } };
+        for spec in [SparkEndpointOwners {ranks: 0, ..base}, SparkEndpointOwners {ranks: 9, ..base},
+            SparkEndpointOwners {geometry: ExpertGeometry {hidden: 0, ..base.geometry}, ..base},
+            SparkEndpointOwners {geometry: ExpertGeometry {topk: 0, ..base.geometry}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {capacity: 0, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {capacity: 4097, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ring_depth: Some(0), ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ring_depth: Some(9), ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {ingress: SparkIngress::Bf16Decode {rows: 65}, ..base.endpoint}, ..base},
+            SparkEndpointOwners {endpoint: cuteafd_core::SparkEndpoint {partial_reply_bytes: Some(u64::MAX), ..base.endpoint}, ..base},
+            SparkEndpointOwners {rings: SparkRings {max_frame_bytes: 1, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {slot_bytes: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {alignment: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {depth: 0, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {alignment: usize::MAX, ..base.rings}, ..base},
+            SparkEndpointOwners {rings: SparkRings {max_frame_bytes: usize::MAX, slot_bytes: usize::MAX, alignment: 1, ..base.rings}, ..base}] {
+            assert!(spec.allocations("link", Lifetime::TARGET).is_err(), "{spec:?}");
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
+        assert!(base.components("link", Lifetime::TARGET, 0).is_err());
+    }
+
+    #[test]
+    fn intake_owner_geometry_charges_raw_padding_and_one_shared_staging_owner() {
+        use super::super::planner::{Lifetime, Location};
+        let base = SparkIntakeOwners { gpu: 1, ranks: 6, rows: 2752,
+            row_bytes: 6144 * 2, waves: 3, mode: SparkIntakeMode::Gpu };
+        for mode in [SparkIntakeMode::Gpu, SparkIntakeMode::Pinned, SparkIntakeMode::Host] {
+            let spec = SparkIntakeOwners { mode, ..base };
+            let owners = spec.allocations("prefill", Lifetime::TARGET).unwrap();
+            assert_eq!(owners.len(), if mode == SparkIntakeMode::Gpu { 6 } else { 7 });
+            let logical = 3 * 2752 * 6144 * 2;
+            let raw = (logical + 4095) / 4096 * 4096 + 4096;
+            for (rank, owner) in owners[..6].iter().enumerate() {
+                assert_eq!(owner.id, format!("prefill.rank.{rank}.storage"));
+                assert_eq!(owner.location, Location::coordinator(1));
+                assert_eq!(owner.bytes, raw);
+                assert!(owner.view.is_none());
+            }
+            if mode != SparkIntakeMode::Gpu {
+                assert_eq!(owners[6].location, Location::PINNED);
+                assert_eq!(owners[6].bytes, if mode == SparkIntakeMode::Pinned { 1 << 20 }
+                    else { 6 * 2752 * 6144 * 2 });
+            }
+            assert_eq!(spec.components("prefill", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+        }
+        for spec in [SparkIntakeOwners {gpu: 2, ..base}, SparkIntakeOwners {ranks: 0, ..base},
+            SparkIntakeOwners {ranks: 9, ..base}, SparkIntakeOwners {rows: 0, ..base},
+            SparkIntakeOwners {row_bytes: 0, ..base}, SparkIntakeOwners {waves: 0, ..base},
+            SparkIntakeOwners {waves: 5, ..base}, SparkIntakeOwners {rows: u64::MAX, ..base}] {
+            assert!(spec.allocations("prefill", Lifetime::TARGET).is_err());
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
+        assert!(base.components("prefill", Lifetime::TARGET, 0).is_err());
+        let tiny = SparkIntakeOwners {ranks: 1, rows: 1, row_bytes: 1, waves: 1,
+            mode: SparkIntakeMode::Pinned, ..base};
+        let owners = tiny.allocations("tiny", Lifetime::TARGET).unwrap();
+        assert_eq!((owners[0].bytes, owners[1].bytes), (8192, 256));
+        let host = SparkIntakeOwners {mode: SparkIntakeMode::Host, ..tiny};
+        assert_eq!(host.allocations("tiny", Lifetime::TARGET).unwrap()[1].bytes, 1);
+    }
+
+    #[test]
+    fn wave_owners_charge_backings_once_and_preserve_slot_views() {
+        use super::super::planner::{Lifetime, Location};
+        for waves in 1..=4 {
+            for pinned in [0, 1, 0b10_1010] {
+                for registered in [false, true] {
+                    let slot_bytes = 12345;
+                    let staging = if registered { SparkWaveStaging::Registered { slot_bytes } }
+                        else { SparkWaveStaging::Standalone { slot_bytes } };
+                    let spec = SparkWaveOwners { ranks: 6, waves, pinned, staging };
+                    let owners = spec.allocations("wave", Lifetime::TARGET).unwrap();
+                    let physical = owners.iter().filter(|owner| owner.view.is_none()).collect::<Vec<_>>();
+                    assert_eq!(physical.len(), 1 + usize::from(pinned != 0) + if registered { 1 } else { waves });
+                    let expected = (9 + 3 * waves) as u64 * 64
+                        + if pinned == 0 { 0 } else { waves as u64 * 8 * 128 }
+                        + waves as u64 * slot_bytes;
+                    assert_eq!(physical.iter().map(|owner| owner.bytes).sum::<u64>(), expected);
+                    assert!(owners.iter().all(|owner| owner.location == Location::PINNED));
+                    for slot in 0..waves {
+                        let view = owners.iter().find(|owner| owner.id == format!("wave.staging.slot.{slot}")).unwrap();
+                        let alias = view.view.as_ref().unwrap();
+                        assert_eq!(alias.backing, format!("wave.staging.storage.{}", if registered { 0 } else { slot }));
+                        assert_eq!((alias.offset, view.bytes), (if registered { slot as u64 * slot_bytes } else { 0 }, slot_bytes));
+                    }
+                    assert_eq!(spec.components("wave", Lifetime::TARGET, 16).unwrap().len(), owners.len());
+                    assert!(spec.components("wave", Lifetime::TARGET, 0).is_err());
+                }
+            }
+        }
+        let base = SparkWaveOwners { ranks: 1, waves: 1, pinned: 0,
+            staging: SparkWaveStaging::Standalone { slot_bytes: 1 } };
+        for spec in [SparkWaveOwners {ranks: 0, ..base}, SparkWaveOwners {ranks: 9, ..base},
+            SparkWaveOwners {waves: 0, ..base}, SparkWaveOwners {waves: 5, ..base},
+            SparkWaveOwners {pinned: 2, ..base},
+            SparkWaveOwners {staging: SparkWaveStaging::Standalone {slot_bytes: 0}, ..base},
+            SparkWaveOwners {waves: 4, staging: SparkWaveStaging::Registered {slot_bytes: u64::MAX}, ..base}] {
+            assert!(spec.allocations("wave", Lifetime::TARGET).is_err());
+        }
+        assert!(base.allocations("", Lifetime::TARGET).is_err());
+    }
+
+    #[test]
     fn header_assignment_uses_installed_native_width_and_rejects_missing_headers() {
         use crate::plan::testing::{write_v41_snapshot, write_v41_nvfp4_snapshot};
         use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
@@ -283,19 +838,38 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-            for stored_width in [576, 640] {
+            let native_stored = cuteafd_core::mxfp4_layouts::stored_width(5120, 576).unwrap();
+            for stored_width in if nvfp4 { vec![576, 640] } else { vec![native_stored] } {
+                let layout = if nvfp4 { SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width } }
+                    else { SparkResidentLayout::Native { world: 4, rank: 3 } };
                 let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
-                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).unwrap();
+                    layout, &endpoints, rings).unwrap();
                 assert_eq!((assignment.slices[0].first, assignment.slices[0].width, assignment.slices[0].stored_width),
                     (1728, 576, stored_width as u32));
-                assert_eq!(assignment.resident_bytes, super::super::families::deepseek_v41::resident_bytes(
-                    5120, stored_width as u64, 384, nvfp4).unwrap());
+                let expected = if nvfp4 {
+                    super::super::families::deepseek_v41::resident_bytes(
+                        5120, stored_width as u64, 384, true).unwrap()
+                } else {
+                    // Independent coded-plane arithmetic; only storage comes from policy.
+                    let (hidden, logical, stored, experts) = (5120u64, 576u64, native_stored as u64, 384u64);
+                    let payloads = hidden * stored + hidden * stored / 2;
+                    let gate_up = 2 * stored * (1 + 2 * (hidden / 128));
+                    let down = hidden * (1 + 2 * logical.div_ceil(128));
+                    experts * (payloads + gate_up + down)
+                };
+                assert_eq!(assignment.resident_bytes, expected);
+                let resident = SparkAssignment::resident_from_catalog(&catalog, &working, 3, layout).unwrap();
+                assert_eq!(resident.resident_bytes, assignment.resident_bytes);
+                assert_eq!(resident.slices, assignment.slices);
+                assert_eq!(resident.io, SparkIoBytes::default());
+                assert!(SparkAssignment::from_catalog(&catalog, &working, 3, layout, &[], rings).is_err(),
+                    "residency-only planning must not bypass runtime endpoint admission");
             }
             for stored_width in [544, 577] {
                 assert!(SparkAssignment::from_catalog(&catalog, &working, 3,
-                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).is_err());
+                    SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width }, &endpoints, rings).is_err());
             }
             // Config geometry alone must not admit an expert with a missing projection.
             let index_path = dir.path().join("model.safetensors.index.json");
@@ -305,7 +879,8 @@ mod tests {
             weights.remove(&name);
             std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
             let result = crate::read_expert_catalog(dir.path()).and_then(|catalog| SparkAssignment::from_catalog(
-                &catalog, &working, 3, SparkResidentLayout::Native { world: 4, rank: 3, stored_width: 640 }, &endpoints, rings));
+                &catalog, &working, 3, if nvfp4 { SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width: 640 } }
+                    else { SparkResidentLayout::Native { world: 4, rank: 3 } }, &endpoints, rings));
             assert!(result.is_err());
         }
     }
@@ -320,15 +895,16 @@ mod tests {
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
             prefill_lanes: 1, ..Default::default() };
-        let endpoints = [SparkEndpoint { capacity: 80, ingress: SparkIngress::Fp8K32 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
             SparkResidentLayout::Exl3 { world: 4, rank: 3 },
             &endpoints, rings).unwrap();
-        let plan = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
+        let plan = catalog.exl3().unwrap().balanced_residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
         assert_eq!(assignment.resident_bytes, plan.device_arena_layout().unwrap().1 as u64);
         assert!(assignment.resident_bytes > plan.bytes() as u64);
-        assert_eq!((assignment.slices[0].first, assignment.slices[0].width), (512, 128));
+        assert_eq!(assignment.slices[0].unit_map, plan.unit_map.as_ref().map(|map| map.fingerprint()));
+        assert_eq!(assignment.slices[0].width, plan.intermediate as u32);
         assert_eq!(assignment.slices[0].tiers, plan.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
         assert_eq!(assignment.slices[0].projection_counts,
             plan.projection_counts.iter().map(|row| row.map(|count| count as u32)).collect::<Vec<_>>());
@@ -355,13 +931,13 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
             let exact = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Blocks(128) }, &endpoints, rings).unwrap();
             let padded = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Padded }, &endpoints, rings).unwrap();
-            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1792, 256, 256));
+            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1536, 256, 256));
             assert_eq!(padded.slices[0].stored_width, 384);
             assert!(exact.resident_bytes < padded.resident_bytes);
             assert_eq!(exact.io, padded.io);
@@ -397,7 +973,7 @@ mod tests {
         }
         write_snapshot(dir.path(), &config, &tensors, None);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16, partial_reply_bytes: None }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         for world in [4, 6] {
             for rank in 0..world {
@@ -417,8 +993,10 @@ mod tests {
                 assert_eq!(bf16.resident_bytes, 3 * 4096 * u64::from(slice.stored_width) * 2 * 2);
                 assert_eq!(mixed.resident_bytes, fp8.resident_bytes + bf16.resident_bytes);
                 assert_eq!(mixed.slices, [fp8.slices[0].clone(), slice.clone()]);
+                let view = original.for_layer(2).unwrap();
+                let (first, width) = view.rank_range_with(world, rank, Slicing::Blocks(128)).unwrap();
                 assert_eq!((slice.first, slice.width, slice.stored_width),
-                    (fp8.slices[0].first, fp8.slices[0].width, fp8.slices[0].stored_width));
+                    (first as u32, width as u32, width as u32));
                 assert_eq!(mixed.io, bf16.io);
             }
         }
@@ -468,7 +1046,7 @@ mod tests {
         let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
             ..Default::default() };
         let geometry = ExpertGeometry::GLM5;
-        let endpoint = SparkEndpoint { capacity: 64, ingress: SparkIngress::Fp8K32 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
         let rings = SparkRings { max_frame_bytes: 4 << 20, depth: 2,
             slot_bytes: 1 << 20, alignment: 4096 };
         let io = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
@@ -498,8 +1076,8 @@ mod tests {
         let geometry = ExpertGeometry::MIMO_V26_PRO;
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
-        let main = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } };
-        let lane = SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 };
+        let main = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 }, partial_reply_bytes: None };
+        let lane = SparkEndpoint { ring_depth: None, capacity: 1024, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
         let io = set.rank_endpoints_io(0, geometry, &[main, lane], rings).unwrap();
         assert_eq!(io.mapped_rings, (main.ring_bytes(geometry, rings).unwrap()
             + lane.ring_bytes(geometry, rings).unwrap()) as u64);

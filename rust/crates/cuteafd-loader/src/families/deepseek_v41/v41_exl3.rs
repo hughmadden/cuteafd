@@ -1,9 +1,10 @@
 //! Validated routed-only EXL3 metadata for the native V4.1 engine.
+use crate::formats::exl3_contract::{check_gptqmodel_manifest, check_exllamav3_manifest, check_header_widths};
 use crate::formats::exl3_storage::{
-    check_quantization_config, derive_storage_map, mcg_marker_shape, parse_storage_map, verify_storage_map,
+    check_quantization_config, derive_storage_map, mcg_marker_shape,
     Exl3Module, Exl3StorageMap, Exl3StorageSource,
 };
-use crate::{OfficialV41Config, SafetensorsTensorMetadata};
+use crate::SafetensorsTensorMetadata;
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use serde_json::Value;
@@ -15,8 +16,8 @@ use std::{
     path::Path,
 };
 
-pub const V41_EXL3_SCHEMA: &str = "cuteafd.v41-routed-exl3.v1";
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
+// Large MoE publications carry per-tensor maps exceeding 64 MiB.
+const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V41Exl3ProjectionKind {
@@ -93,7 +94,7 @@ impl V41Exl3Projection {
     /// padding and no duplicated boundary block.
     pub fn intermediate_partition(&self, world: usize, rank: usize) -> Result<Range<usize>> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
+            (1..=8).contains(&world) && rank < world,
             "invalid EXL3 TP rank/world"
         );
         let intermediate = match self.kind {
@@ -114,18 +115,8 @@ impl V41Exl3Projection {
     }
 }
 
-/// How the checkpoint stores its MTP (dSpark draft) routed experts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum V41Exl3MtpExperts {
-    /// CUTEAFD-staged snapshots quantize draft experts to EXL3 as well.
-    Exl3,
-    /// Raw publications keep draft experts at the official native FP4
-    /// (MXFP4) source precision; the draft path must load native weights.
-    Source,
-}
-
 /// How a checkpoint names its routed EXL3 projections.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V41Exl3Naming {
     /// DeepSeek V4.1: `layers.{L}.ffn.experts.{E}.w1|w3|w2` and `mtp.{S}.ffn.experts...`.
     CheckpointNative,
@@ -141,11 +132,14 @@ pub enum V41Exl3Naming {
     /// Flash Next): backbone as [`Self::HfLanguageModel`], draft stage `S` at
     /// `mtp.layers.{S}.mlp.experts.{E}.gate_proj|up_proj|down_proj`.
     HfLanguageModelMtp,
+    /// Prefix, routed module (empty for Mistral's `layers.L.experts.E.w1`) and
+    /// gate/up/down stems discovered from tensor names.
+    HeaderDerived { prefix: String, module: String, stems: [String; 3] },
 }
 
 impl V41Exl3Naming {
     /// The projection name (without the `.trellis`/`.suh`/... suffix).
-    pub fn projection(self, draft: bool, layer: usize, expert: usize, kind: V41Exl3ProjectionKind) -> String {
+    pub fn projection(&self, draft: bool, layer: usize, expert: usize, kind: V41Exl3ProjectionKind) -> String {
         match self {
             Self::CheckpointNative => {
                 let stem = match kind {
@@ -183,59 +177,37 @@ impl V41Exl3Naming {
                 let prefix = if draft { "mtp" } else { "model.language_model" };
                 format!("{prefix}.layers.{layer}.mlp.experts.{expert}.{stem}")
             }
+            Self::HeaderDerived { prefix, module, stems } => {
+                let stem = &stems[match kind {
+                    V41Exl3ProjectionKind::Gate => 0,
+                    V41Exl3ProjectionKind::Up => 1,
+                    V41Exl3ProjectionKind::Down => 2,
+                }];
+                let prefix = if draft { "mtp" } else { prefix.as_str() };
+                // Mistral consolidated naming has no module segment (`layers.L.experts.E.w1`).
+                if module.is_empty() { format!("{prefix}.{layer}.experts.{expert}.{stem}") }
+                else { format!("{prefix}.{layer}.{module}.experts.{expert}.{stem}") }
+            }
         }
     }
 }
 
 #[derive(Debug)]
 pub struct V41Exl3Manifest {
-    /// Validated original non-routed model geometry and quantization contract;
-    /// `None` for other families, whose catalogs carry only routed experts.
-    pub config: Option<OfficialV41Config>,
     /// Routed-expert extents of every target and draft layer.
     pub experts: crate::RoutedExpertShape,
     pub naming: V41Exl3Naming,
     pub projections: BTreeMap<String, V41Exl3Projection>,
     /// One checkpoint-wide family, shared by all target and draft layers.
     pub(crate) decoder_tiers: Vec<usize>,
-    /// Retained for validation by the PLE storage path; never silently discarded.
-    pub ple_quantization: Option<Value>,
-    pub(crate) mtp_experts: V41Exl3MtpExperts,
     /// Where the storage layout was read from (always checked against the headers).
     pub storage: Exl3StorageSource,
+    pub(crate) resident_bytes: super::v41_exl3_residency::ResidentBytesCache,
 }
 
 impl V41Exl3Manifest {
-    fn v41(
-        config: OfficialV41Config,
-        projections: BTreeMap<String, V41Exl3Projection>,
-        ple_quantization: Option<Value>,
-        mtp_experts: V41Exl3MtpExperts,
-    ) -> Result<Self> {
-        Ok(Self {
-            experts: crate::RoutedExpertShape::of_v41(&config),
-            config: Some(config),
-            naming: V41Exl3Naming::CheckpointNative,
-            decoder_tiers: decoder_family(&projections)?,
-            projections,
-            ple_quantization,
-            // V4.1 publications either carry a GPTQModel map (EXL3 drafts) or
-            // are raw (source drafts); the catalog checks every header.
-            storage: match mtp_experts {
-                V41Exl3MtpExperts::Exl3 => Exl3StorageSource::GptqModel,
-                V41Exl3MtpExperts::Source => Exl3StorageSource::Headers,
-            },
-            mtp_experts,
-        })
-    }
-
     pub fn decoder_tiers(&self) -> &[usize] {
         &self.decoder_tiers
-    }
-
-    /// True when draft experts stayed at the native FP4 source precision.
-    pub fn mtp_experts_are_source(&self) -> bool {
-        self.mtp_experts == V41Exl3MtpExperts::Source
     }
 }
 
@@ -244,13 +216,17 @@ pub(crate) fn decoder_family(
 ) -> Result<Vec<usize>> {
     let mut bits: BTreeSet<_> = projections.values().map(|p| p.bits).collect();
     ensure!(
-        !bits.is_empty() && bits.iter().all(|b| (2..=5).contains(b)),
-        "EXL3 decoder family must contain K2..K5 projections"
+        !bits.is_empty() && bits.iter().all(|b| (2..=6).contains(b)),
+        "EXL3 decoder family must contain K2..K6 projections"
     );
+    ensure!(bits.len() <= 2,
+        "unsupported: EXL3 with {} expert tiers (2 supported); tensors: {}",
+        bits.len(), bits.iter().filter_map(|bit| projections.values().find(|p| p.bits == *bit))
+            .map(|p| format!("{} (K{})", p.name, p.bits)).collect::<Vec<_>>().join(", "));
     // Native mixed kernels retain an empty adjacent tier for uniform models.
     if bits.len() == 1 {
         let bit = *bits.first().unwrap();
-        bits.insert(if bit == 5 { 4 } else { bit + 1 });
+        bits.insert(if bit == 6 { 5 } else { bit + 1 });
     }
     Ok(bits.into_iter().collect())
 }
@@ -264,22 +240,13 @@ pub(crate) fn decoder_family_preferring(
     let family = decoder_family(projections)?;
     let covered = preferred.len() == 2
         && preferred[0] + 1 == preferred[1]
-        && preferred.iter().all(|bits| (2..=5).contains(bits))
+        && preferred.iter().all(|bits| (2..=6).contains(bits))
         && projections.values().all(|p| preferred.contains(&p.bits));
     Ok(if covered { preferred.to_vec() } else { family })
 }
 
 pub(crate) fn read_json(path: &Path, limit: u64) -> Result<Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= limit,
-        "{} exceeds metadata size limit",
-        path.display()
-    );
+    let bytes = read_bytes(path, limit)?;
     let mut value: Value = serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
     normalize_legacy_names(&mut value);
     Ok(value)
@@ -309,146 +276,34 @@ pub(crate) fn normalize_legacy_names(value: &mut Value) {
     }
 }
 
-pub fn read_v41_exl3_manifest(snapshot: &Path) -> Result<V41Exl3Manifest> {
-    let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let manifest_path = snapshot.join("quantize_config.json");
-    if manifest_path.is_file() {
-        let manifest = read_json(&manifest_path, MAX_MANIFEST_BYTES)?;
-        parse_manifest(config, &manifest)
-    } else {
-        parse_raw_publication(config)
-    }
-}
-
-/// First-class support for raw exllamav3-style V4.1 Flash EXL3 publications
-/// that ship only a compact `config.json` quantization block (no
-/// quantize_config.json staging manifest). The accepted contract is strict:
-/// integer K2..K5 uniform routed experts with the MCG codebook, checkpoint-
-/// native tensor naming, source-precision MTP draft experts, and the
-/// official FP8 block for every non-routed tensor. Tensor payload layouts
-/// are verified against the safetensors headers by the catalog, so the
-/// config only needs to establish geometry-independent facts.
-fn parse_raw_publication(mut config: Value) -> Result<V41Exl3Manifest> {
-    let quant = config["quantization_config"]
-        .as_object()
-        .context("raw EXL3 publication requires a quantization_config object")?;
-    ensure!(
-        quant.get("quant_method").and_then(Value::as_str) == Some("exl3"),
-        "raw EXL3 publication requires quant_method=exl3"
-    );
-    let bits = quant["bits"]
-        .as_u64()
-        .filter(|b| (2..=5).contains(b))
-        .context("raw EXL3 publication requires integer bits in 2..=5")? as usize;
-    ensure!(
-        quant.get("codebook").and_then(Value::as_str) == Some("mcg"),
-        "raw EXL3 publication requires the MCG codebook"
-    );
-    ensure!(
-        quant.get("mtp_experts").and_then(Value::as_str) == Some("source"),
-        "raw EXL3 publication requires mtp_experts=source"
-    );
-    // Optional exllamav3 storage hints, when present, must match the only
-    // layout the engine consumes.
-    for (key, wanted) in [
-        ("out_scales", Value::from("never")),
-        ("group_size", Value::from(-1)),
-        ("desc_act", Value::from(false)),
-        ("pack_dtype", Value::from("int32")),
-    ] {
-        if let Some(found) = quant.get(key) {
-            ensure!(
-                found == &wanted,
-                "raw EXL3 publication has unsupported {key}={found}"
-            );
-        }
-    }
-    let native = quant
-        .get("non_routed_quantization")
-        .context("raw EXL3 publication requires non_routed_quantization")?;
-    ensure!(
-        native["quant_method"] == "deepseek_v4_fp8"
-            && native["fmt"] == "e4m3"
-            && native["activation_scheme"] == "dynamic"
-            && native["scale_fmt"] == "ue8m0"
-            && native["weight_block_size"] == serde_json::json!([32, 32])
-            && native["expert_dtype"] == "fp4",
-        "raw EXL3 publication has an unsupported non-routed FP8 contract"
-    );
-    // Every contract key must be understood; reject silent drift.
-    for key in quant.keys() {
-        ensure!(
-            matches!(
-                key.as_str(),
-                "quant_method"
-                    | "bits"
-                    | "codebook"
-                    | "mtp_experts"
-                    | "mtp_experts_start_layer"
-                    | "weight_block_size"
-                    | "non_routed_quantization"
-                    | "out_scales"
-                    | "group_size"
-                    | "desc_act"
-                    | "pack_dtype"
-            ),
-            "raw EXL3 publication has unexpected quantization_config key {key}"
-        );
-    }
-    let mtp_start_layer = quant
-        .get("mtp_experts_start_layer")
-        .and_then(Value::as_u64);
-    // Substitute the canonical official FP8 block so the strict official
-    // config validation covers every non-quantization field.
-    config["quantization_config"] = serde_json::json!({
-        "quant_method": "fp8",
-        "activation_scheme": "dynamic",
-        "weight_block_size": [32, 32],
-        "scale_fmt": "ue8m0",
-        "expert_dtype": "fp4",
-    });
-    let validated =
-        OfficialV41Config::from_json(&serde_json::to_vec(&config)?)?;
-    let text = validated.text();
-    if let Some(start_layer) = mtp_start_layer {
-        ensure!(
-            start_layer == text.num_hidden_layers as u64,
-            "raw EXL3 mtp_experts_start_layer {start_layer} disagrees with the architecture"
-        );
-    }
-    let mut projections = BTreeMap::new();
-    for layer in 0..text.num_hidden_layers {
-        for expert in 0..text.n_routed_experts {
-            for (stem, kind) in [
-                ("w1", V41Exl3ProjectionKind::Gate),
-                ("w3", V41Exl3ProjectionKind::Up),
-                ("w2", V41Exl3ProjectionKind::Down),
-            ] {
-                let (input, output) = if kind == V41Exl3ProjectionKind::Down {
-                    (text.moe_intermediate_size, text.hidden_size)
-                } else {
-                    (text.hidden_size, text.moe_intermediate_size)
-                };
-                let name = format!("layers.{layer}.ffn.experts.{expert}.{stem}");
-                projections.insert(
-                    name.clone(),
-                    V41Exl3Projection {
-                        name,
-                        kind,
-                        bits,
-                        input_features: input,
-                        output_features: output,
-                    },
-                );
-            }
-        }
-    }
-    V41Exl3Manifest::v41(validated, projections, None, V41Exl3MtpExperts::Source)
-}
-
-/// Hugging Face routed-expert modules (`*.mlp.experts.{E}.*` or `*.ffn.experts.{E}.*`).
 fn is_routed_module(name: &str) -> bool {
-    name.contains(".mlp.experts.") || name.contains(".ffn.experts.")
+    name.split_once(".experts.").is_some_and(|(_, tail)|
+        tail.split_once('.').is_some_and(|(expert, _)| expert.parse::<usize>().is_ok()))
+}
+
+fn header_naming(routed: &BTreeMap<&str, &Exl3Module>) -> Result<V41Exl3Naming> {
+    let mut layouts = BTreeSet::new();
+    let mut stems = BTreeSet::new();
+    for name in routed.keys().filter(|name| !name.starts_with("mtp.")) {
+        let (left, _) = name.split_once(".experts.").context("EXL3 expert ordinal absent")?;
+        // `{prefix}.{L}.{module}.experts` or, with no module, `{prefix}.{L}.experts`.
+        let (layer, module) = match left.rsplit_once('.').context("EXL3 expert module absent")? {
+            (_, last) if last.parse::<usize>().is_ok() => (left, ""),
+            split => split,
+        };
+        let (prefix, ordinal) = layer.rsplit_once('.').context("EXL3 layer prefix absent")?;
+        ordinal.parse::<usize>().context("EXL3 layer ordinal is not an integer")?;
+        ensure!(prefix.ends_with(".layers") || prefix == "layers", "EXL3 layer prefix lacks layers segment");
+        layouts.insert((prefix.to_owned(), module.to_owned()));
+        stems.insert(name.rsplit_once('.').context("EXL3 projection stem absent")?.1);
+    }
+    ensure!(layouts.len() == 1, "EXL3 headers must identify one backbone layer prefix/module: {layouts:?}");
+    // Gate and up have identical shapes; their standard naming convention fixes the roles.
+    let roles = [["gate_proj", "up_proj", "down_proj"], ["w1", "w3", "w2"]]
+        .into_iter().find(|roles| roles.iter().copied().collect::<BTreeSet<_>>() == stems)
+        .with_context(|| format!("EXL3 headers have unsupported or mixed projection stems: {stems:?}"))?;
+    let (prefix, module) = layouts.into_iter().next().unwrap();
+    Ok(V41Exl3Naming::HeaderDerived { prefix, module, stems: roles.map(str::to_owned) })
 }
 
 /// Routed EXL3 experts of a DeepSeek V4, GLM 5.x or Qwen 3.8 checkpoint with
@@ -468,8 +323,18 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
     let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let derived = derive_storage_map(headers)?;
-    let source = check_storage_maps(snapshot, &config, &derived)?;
+    let headers = headers.into_iter().collect::<Vec<_>>();
+    let derived = derive_storage_map(headers.iter().copied())?;
+    // MTP starts after every target layer, which can exceed the routed bound
+    // (Step-5's last target layer is dense).
+    let target_layers = config.get("text_config").unwrap_or(&config)["num_hidden_layers"].as_u64()
+        .map_or(backbone.layers, |layers| (layers as usize).max(backbone.layers));
+    let source = check_storage_maps(snapshot, &config, &derived, target_layers, &headers)?;
+    let compact = &config["quantization_config"];
+    crate::formats::exl3_contract::check_native_quantization_config(compact)?;
+    if compact.get("native_quantization_config").is_some() {
+        crate::plan::families::mistral_large4::check_native_headers(snapshot, &config, &derived, &headers)?;
+    }
     build_deepseek_v4_manifest(source, &derived, backbone, tiers)
 }
 
@@ -477,34 +342,38 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 /// GPTQModel `quantize_config.json` (and its `quantization_config.json`
 /// copy), an exllamav3 `quantization_config.json`, or none (the compact
 /// `config.json` block alone).
-fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap) -> Result<Exl3StorageSource> {
+fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap, backbone_layers: usize,
+    headers: &[&SafetensorsTensorMetadata]) -> Result<Exl3StorageSource> {
     let compact = config.get("quantization_config").context("config.json has no quantization_config")?;
+    use sha2::{Digest, Sha256};
     let mut source = None;
-    let mut first: Option<Vec<u8>> = None;
-    for file in ["quantize_config.json", "quantization_config.json"] {
-        let path = snapshot.join(file);
-        if !path.is_file() {
-            continue;
-        }
-        let bytes = read_bytes(&path, MAX_MANIFEST_BYTES)?;
-        if first.as_ref().is_some_and(|first| *first == bytes) {
-            continue;
-        }
-        let mut manifest: Value =
-            serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let paths = ["quantize_config.json", "quantization_config.json"].map(|file| snapshot.join(file));
+    let present = paths.iter().filter(|path| path.is_file()).collect::<Vec<_>>();
+    let first = present.first().map(|path| read_bytes(path, MAX_MANIFEST_BYTES)).transpose()?;
+    if let [left, right] = present.as_slice() {
+        ensure!(left.metadata()?.len() == right.metadata()?.len(),
+            "quantize_config.json and quantization_config.json differ in size");
+        let other = read_bytes(right, MAX_MANIFEST_BYTES)?;
+        ensure!(Sha256::digest(first.as_ref().unwrap()) == Sha256::digest(&other),
+            "quantize_config.json and quantization_config.json differ in SHA256");
+    }
+    if let Some(path) = present.first() {
+        let file = path.file_name().unwrap().to_string_lossy();
+        let mut manifest = crate::formats::exl3_storage::parse_storage_metadata(
+            path, first.as_ref().unwrap(), Some(derived))?;
         normalize_legacy_names(&mut manifest);
         let flavor = if manifest.get("checkpoint_format").is_some() {
-            check_gptqmodel_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
+            check_gptqmodel_manifest(compact, &manifest, derived, backbone_layers).with_context(|| format!("checking {file}"))?;
+            crate::formats::exl3_contract::check_retained_native_tensors(&manifest, derived, headers)
+                .with_context(|| format!("checking {file}"))?;
             Exl3StorageSource::GptqModel
         } else {
             check_exllamav3_manifest(compact, &manifest).with_context(|| format!("checking {file}"))?;
             Exl3StorageSource::Exllamav3
         };
-        let declared = parse_storage_map(file, &manifest["tensor_storage"])?;
-        verify_storage_map(file, &declared, derived)?;
         source.get_or_insert(flavor);
-        first.get_or_insert(bytes);
     }
+    check_header_widths(compact, derived, backbone_layers)?;
     match source {
         Some(source) => Ok(source),
         None => {
@@ -515,82 +384,16 @@ fn check_storage_maps(snapshot: &Path, config: &Value, derived: &Exl3StorageMap)
 }
 
 fn read_bytes(path: &Path, limit: u64) -> Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
+    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let size = file.metadata()?.len();
+    ensure!(size <= limit, "{} exceeds metadata size limit", path.display());
+    let mut bytes = Vec::with_capacity(usize::try_from(size).context("metadata size exceeds address space")?);
+    // Keep the bounded read too: the file may grow after the metadata check.
+    file.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= limit, "{} exceeds metadata size limit", path.display());
     Ok(bytes)
 }
 
-/// GPTQModel's storage contract: the compact `config.json` block repeated,
-/// the EXL3 layout fields, and nothing else.
-fn check_gptqmodel_manifest(compact: &Value, manifest: &Value) -> Result<()> {
-    for field in ["quant_method", "method", "format", "checkpoint_format"] {
-        ensure!(
-            manifest.get(field).and_then(Value::as_str) == Some("exl3"),
-            "EXL3 manifest requires {field}=exl3"
-        );
-    }
-    // `out_scales` only decides whether the quantizer folded output-channel
-    // scales into `svh`; the kernels always apply `svh` per channel.
-    ensure!(
-        manifest["codebook"] == "mcg"
-            && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
-            && manifest["group_size"] == -1
-            && manifest["desc_act"] == false
-            && manifest["pack_dtype"] == "int32"
-            && manifest.get("lm_head").is_none_or(|v| v == false),
-        "unsupported EXL3 storage contract"
-    );
-    ensure!(
-        manifest["bits"]
-            .as_f64()
-            .is_some_and(|v| v.fract() == 0.0 && (2.0..=5.0).contains(&v)),
-        "EXL3 base bits must be an integer in 2..5"
-    );
-    let object = manifest.as_object().context("EXL3 manifest must be an object")?;
-    for key in object.keys() {
-        ensure!(
-            matches!(
-                key.as_str(),
-                "bits" | "checkpoint_format" | "codebook" | "desc_act" | "format" | "group_size"
-                    | "lm_head" | "meta" | "method" | "module_include" | "out_scales"
-                    | "pack_dtype" | "quant_method" | "tensor_storage"
-            ),
-            "EXL3 manifest has unexpected key {key}"
-        );
-    }
-    let compact = compact.as_object().context("missing compact EXL3 config")?;
-    ensure!(
-        compact.get("quant_method") == Some(&Value::from("exl3")),
-        "config must declare EXL3 quantization"
-    );
-    for (key, value) in compact {
-        ensure!(
-            manifest.get(key) == Some(value),
-            "compact/full EXL3 metadata disagree at {key}"
-        );
-    }
-    Ok(())
-}
-
-/// exllamav3's `quantization_config.json`: the `config.json` block plus
-/// `tensor_storage`, nothing else.
-fn check_exllamav3_manifest(compact: &Value, manifest: &Value) -> Result<()> {
-    let manifest = manifest.as_object().context("EXL3 storage map must be an object")?;
-    let compact_object = compact.as_object().context("missing compact EXL3 config")?;
-    for key in compact_object.keys().chain(manifest.keys()) {
-        ensure!(
-            key == "tensor_storage" || manifest.get(key) == compact_object.get(key),
-            "compact/full EXL3 metadata disagree at {key}"
-        );
-    }
-    ensure!(!compact_object.contains_key("tensor_storage"), "config.json carries an inline tensor_storage");
-    check_quantization_config(compact)?;
-    Ok(())
-}
 
 fn build_deepseek_v4_manifest(
     storage: Exl3StorageSource,
@@ -598,14 +401,15 @@ fn build_deepseek_v4_manifest(
     backbone: crate::RoutedExpertShape,
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
-    if storage == Exl3StorageSource::GptqModel {
-        if let Some(name) = derived.keys().find(|name| !is_routed_module(name)) {
-            anyhow::bail!("EXL3 manifest includes non-routed or unexpected projections: {name}");
-        }
-    }
+    // Header derivation and optional side-map equality validate every module.
+    // Dense core and plain-HF appended MTP belong to coordinator loaders,
+    // just as native FP8 MTP tensors do in the original GLM publication.
+    let coordinator_mtp = |name: &str| name.strip_prefix("model.layers.")
+        .and_then(|tail| tail.split('.').next()?.parse::<usize>().ok())
+        .is_some_and(|layer| layer >= backbone.layers);
     let routed: BTreeMap<&str, &Exl3Module> = derived
         .iter()
-        .filter(|(name, _)| is_routed_module(name))
+        .filter(|(name, _)| is_routed_module(name) && !coordinator_mtp(name))
         .map(|(name, module)| (name.as_str(), module))
         .collect();
     ensure!(!routed.is_empty(), "the checkpoint has no routed EXL3 experts (*.mlp.experts.*.trellis)");
@@ -615,11 +419,13 @@ fn build_deepseek_v4_manifest(
         V41Exl3Naming::HfLanguageModelMtp
     } else if language_model {
         V41Exl3Naming::HfLanguageModel { layers: backbone.layers }
-    } else {
+    } else if routed.keys().filter(|name| !name.starts_with("mtp."))
+        .all(|name| name.starts_with("model.layers.") && name.contains(".mlp.experts.")) {
         V41Exl3Naming::HfMlp
+    } else {
+        header_naming(&routed)?
     };
-    // Draft stages: `mtp.{S}` or `mtp.layers.{S}` names, or language-model
-    // layers past the backbone.
+    // Draft stages use a separate MTP prefix or layers past the backbone.
     let stage_of = |name: &str| -> Option<usize> {
         if mtp_layers {
             name.strip_prefix("mtp.layers.")?.split('.').next()?.parse().ok()
@@ -661,9 +467,11 @@ fn build_deepseek_v4_manifest(
                         module.input_features,
                         module.output_features
                     );
+                    ensure!(module.codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg,
+                        "projection {name}: routed expert kernels require MCG, found {}", module.codebook.marker());
                     ensure!(
-                        (2..=5).contains(&module.bits),
-                        "projection {name} is K{}; the expert kernels run K2..K5",
+                        (2..=6).contains(&module.bits),
+                        "projection {name} is K{}; the expert kernels run K2..K6",
                         module.bits
                     );
                     ensure!(
@@ -687,219 +495,132 @@ fn build_deepseek_v4_manifest(
         );
     }
     Ok(V41Exl3Manifest {
-        config: None,
         experts: crate::RoutedExpertShape { draft_stages, draft_experts, ..backbone },
         naming,
         decoder_tiers: decoder_family_preferring(&projections, tiers)?,
         projections,
-        ple_quantization: None,
-        mtp_experts: V41Exl3MtpExperts::Exl3,
         storage,
+        resident_bytes: Default::default(),
     })
-}
-
-fn parse_manifest(mut config: Value, manifest: &Value) -> Result<V41Exl3Manifest> {
-    for field in ["quant_method", "method", "format", "checkpoint_format"] {
-        ensure!(
-            manifest.get(field).and_then(Value::as_str) == Some("exl3"),
-            "EXL3 manifest requires {field}=exl3"
-        );
-    }
-    ensure!(
-        manifest["codebook"] == "mcg"
-            && manifest["out_scales"] == "never"
-            && manifest["group_size"] == -1
-            && manifest["desc_act"] == false
-            && manifest["pack_dtype"] == "int32",
-        "unsupported EXL3 storage contract"
-    );
-    ensure!(
-        manifest["bits"]
-            .as_u64()
-            .is_some_and(|v| (2..=5).contains(&v)),
-        "EXL3 base bits must be an integer in 2..5"
-    );
-    let meta = manifest
-        .pointer("/meta/cuteafd")
-        .context("missing V4.1 EXL3 metadata")?;
-    ensure!(
-        meta["schema"] == V41_EXL3_SCHEMA && meta["tensor_naming"] == "checkpoint-native",
-        "unsupported V4.1 EXL3 schema or namespace"
-    );
-    let compact = config["quantization_config"]
-        .as_object()
-        .context("missing compact EXL3 config")?;
-    ensure!(
-        !compact.is_empty() && compact.get("quant_method") == Some(&Value::from("exl3")),
-        "config must declare EXL3 quantization"
-    );
-    for (key, value) in compact {
-        ensure!(
-            manifest.get(key) == Some(value),
-            "compact/full EXL3 metadata disagree at {key}"
-        );
-    }
-    config["quantization_config"] = meta["native_quantization_config"].clone();
-    let ple_quantization = config
-        .as_object_mut()
-        .context("config must be an object")?
-        .remove("cuteafd_ple_quantization");
-    let validated =
-        OfficialV41Config::from_json(&serde_json::to_vec(&config)?)?;
-    let text = validated.text();
-    let storage = manifest["tensor_storage"]
-        .as_object()
-        .context("missing EXL3 tensor_storage")?;
-    let mut projections = BTreeMap::new();
-    for (prefix, layers, experts) in [
-        ("layers", text.num_hidden_layers, text.n_routed_experts),
-        (
-            "mtp",
-            validated.dspark_compress_ratios().len(),
-            text.dspark_n_routed_experts,
-        ),
-    ] {
-        for layer in 0..layers {
-            for expert in 0..experts {
-                for (stem, kind) in [
-                    ("w1", V41Exl3ProjectionKind::Gate),
-                    ("w3", V41Exl3ProjectionKind::Up),
-                    ("w2", V41Exl3ProjectionKind::Down),
-                ] {
-                    let name = format!("{prefix}.{layer}.ffn.experts.{expert}.{stem}");
-                    let value = storage
-                        .get(&name)
-                        .with_context(|| format!("missing projection {name}"))?;
-                    let (input, output) = if kind == V41Exl3ProjectionKind::Down {
-                        (text.moe_intermediate_size, text.hidden_size)
-                    } else {
-                        (text.hidden_size, text.moe_intermediate_size)
-                    };
-                    let projection = parse_projection(&name, kind, input, output, value)?;
-                    projections.insert(name, projection);
-                }
-            }
-        }
-    }
-    ensure!(
-        storage.len() == projections.len(),
-        "EXL3 manifest includes non-routed or unexpected projections"
-    );
-    V41Exl3Manifest::v41(validated, projections, ple_quantization, V41Exl3MtpExperts::Exl3)
-}
-
-fn parse_projection(
-    name: &str,
-    kind: V41Exl3ProjectionKind,
-    input: usize,
-    output: usize,
-    value: &Value,
-) -> Result<V41Exl3Projection> {
-    ensure!(
-        value["quant_format"] == "exl3",
-        "projection {name} is not EXL3"
-    );
-    let bits = value["bits_per_weight"]
-        .as_u64()
-        .filter(|b| (2..=5).contains(b))
-        .with_context(|| format!("projection {name} must have integer K2..K5"))?
-        as usize;
-    ensure!(
-        input > 0 && output > 0 && input % 128 == 0 && output % 128 == 0,
-        "projection {name} requires H128-aligned geometry"
-    );
-    let projection = V41Exl3Projection {
-        name: name.to_owned(),
-        kind,
-        bits,
-        input_features: input,
-        output_features: output,
-    };
-    let tensors = value["stored_tensors"]
-        .as_object()
-        .context("missing projection storage")?;
-    ensure!(
-        tensors.len() == 4,
-        "projection {name} must contain exactly trellis/suh/svh/mcg"
-    );
-    for (suffix, dtype, shape) in [
-        ("trellis", "int16", projection.trellis_shape().to_vec()),
-        ("suh", "float16", vec![input]),
-        ("svh", "float16", vec![output]),
-        ("mcg", "int32", vec![]),
-    ] {
-        let key = format!("{name}.{suffix}");
-        let tensor = tensors
-            .get(&key)
-            .with_context(|| format!("missing {key}"))?;
-        let shape_ok = if suffix == "mcg" {
-            tensor["shape"].as_array().is_some_and(|dims| dims.is_empty() || dims == &[Value::from(1)])
-        } else {
-            tensor["shape"] == serde_json::to_value(shape)?
-        };
-        ensure!(
-            tensor["torch_dtype"] == dtype && shape_ok,
-            "invalid EXL3 dtype/shape for {key}"
-        );
-    }
-    Ok(projection)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn raw_publication_config(bits: u64) -> Value {
-        let mut config: Value =
-            serde_json::from_str(include_str!("official-v41-config.json")).unwrap();
-        config["quantization_config"] = serde_json::json!({
-            "quant_method": "exl3",
-            "bits": bits,
-            "codebook": "mcg",
-            "mtp_experts": "source",
-            "mtp_experts_start_layer": 40,
-            "weight_block_size": [32, 32],
-            "non_routed_quantization": {
-                "quant_method": "deepseek_v4_fp8",
-                "fmt": "e4m3",
-                "activation_scheme": "dynamic",
-                "scale_fmt": "ue8m0",
-                "weight_block_size": [32, 32],
-                "expert_dtype": "fp4",
-            },
-        });
-        config
+    #[test]
+    fn published_muse_manifest_key_set_and_native_inventory() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let bytes = include_bytes!("../../../tests/fixtures/muse-89998fb1.json");
+        assert_eq!(format!("{:x}", Sha256::digest(bytes)),
+            "caa8a76058b998e39b70da07c17be8428c4d6344d61eea55f77c964fa0e16715");
+        let fixture: Value = serde_json::from_slice(bytes)?;
+        assert_eq!(fixture["source"]["revision"], "89998fb177acd9a862ac8bd4fb79bfd50e940c97");
+        assert_eq!(fixture["source"]["manifest_sha256"],
+            "e6b88ef785c5d579cd6ade2ea4cd1cf66f887d18082f76e6591593ac336f6655");
+        assert_eq!(fixture["source"]["headers_sha256"],
+            "35f099e6221c3f3fbc46be6dba25478e5766eaae478deceedf138d72c1b1c1ba");
+        assert_eq!(fixture["source"]["config_sha256"],
+            "7cd07bfb249688d1af42216fdf4a934e5e5c50d45d1f655ec9f7eda491666d8a");
+        let manifest = &fixture["manifest"];
+        assert_eq!(manifest.as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["bits", "calibration", "checkpoint_format", "codebook", "core_bits", "desc_act", "format",
+             "fused_expert_layout", "group_size", "head_bits", "lm_head", "meta", "method", "module_include",
+             "out_scales", "per_module_metadata", "quant_method", "retained_native_tensors", "sym", "tensor_storage"]);
+        let headers = fixture["headers"].as_object().unwrap().iter().map(|(name, h)| {
+            let start = h["data_offsets"][0].as_u64().unwrap();
+            SafetensorsTensorMetadata { name: name.clone(), dtype: DType::from_safetensors(h["dtype"].as_str().unwrap()),
+                shape: serde_json::from_value(h["shape"].clone()).unwrap(), byte_offset: start,
+                byte_length: h["data_offsets"][1].as_u64().unwrap() - start }
+        }).collect::<Vec<_>>();
+        assert_eq!(headers.len(), 161);
+        let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&fixture["config"])?;
+        // Miniature routing matches its config; projection geometry, padded K6
+        // vocabulary, MCG markers and audio/vision classes retain source shapes.
+        assert_eq!((cfg.layers, cfg.experts, cfg.topk), (2, 2, 2));
+        let shape = crate::RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts, topk: cfg.topk,
+            hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate, draft_stages: 0, draft_experts: 0 };
+        for layer in 0..cfg.layers {
+            for (leaf, wanted) in [("weight", vec![cfg.experts, cfg.hidden]),
+                ("e_score_correction_bias", vec![cfg.experts])] {
+                let name = format!("model.language_model.layers.{layer}.mlp.gate.{leaf}");
+                assert_eq!(headers.iter().find(|h| h.name == name).unwrap().shape, wanted);
+            }
+        }
+        let parsed = read_publication(&fixture["config"], &[("quantize_config.json", manifest)], shape, &headers, &[4,5])?;
+        assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
+        assert_eq!(parsed.projections.len(), 12);
+        assert!(parsed.projections.values().all(|p| p.bits == 4));
+        let derived = derive_storage_map(&headers)?;
+        assert_eq!(derived.len(), 25);
+        assert_eq!(derived["lm_head"].bits, 6);
+        assert_eq!(derived["lm_head"].output_features, 202112);
+        let check_native = |value: &Value, headers: &[SafetensorsTensorMetadata]| {
+            crate::formats::exl3_contract::check_retained_native_tensors(value, &derived,
+                &headers.iter().collect::<Vec<_>>())
+        };
+        let native = "model.language_model.layers.0.mlp.gate.weight";
+        for (key, wrong) in [("dtype", serde_json::json!("BF16")), ("shape", serde_json::json!([256,4096])),
+            ("extra", serde_json::json!(true))] {
+            let mut bad = manifest.clone(); bad["retained_native_tensors"][native][key] = wrong;
+            assert!(format!("{:#}", check_native(&bad, &headers).unwrap_err()).contains("retained_native_tensors"));
+        }
+        let mut missing = manifest.clone(); missing["retained_native_tensors"].as_object_mut().unwrap().remove(native);
+        assert!(check_native(&missing, &headers).unwrap_err().to_string().contains(native));
+        let mut extra = manifest.clone();
+        extra["retained_native_tensors"]["absent.weight"] = serde_json::json!({"dtype":"BF16", "shape":[1]});
+        assert!(check_native(&extra, &headers).unwrap_err().to_string().contains("absent.weight"));
+        let mut quantized = manifest.clone();
+        quantized["retained_native_tensors"]["lm_head.mcg"] = serde_json::json!({"dtype":"I32", "shape":[]});
+        assert!(check_native(&quantized, &headers).unwrap_err().to_string().contains("EXL3 storage member"));
+        let mut short = headers.clone(); short.iter_mut().find(|h| h.name == native).unwrap().byte_length -= 1;
+        assert!(check_native(manifest, &short).unwrap_err().to_string().contains(native));
+        let mut unknown = manifest.clone(); unknown["future_storage_key"] = Value::Bool(true);
+        assert!(format!("{:#}", read_publication(&fixture["config"], &[("quantize_config.json", &unknown)],
+            shape, &headers, &[4,5]).unwrap_err()).contains("unexpected key future_storage_key"));
+        let mut wrong_storage = manifest.clone();
+        wrong_storage["tensor_storage"]["lm_head"]["stored_tensors"]["lm_head.svh"]["shape"] = serde_json::json!([202048]);
+        assert!(format!("{:#}", read_publication(&fixture["config"], &[("quantize_config.json", &wrong_storage)],
+            shape, &headers, &[4,5]).unwrap_err()).contains("lm_head"));
+        Ok(())
     }
 
     #[test]
-    fn raw_publication_manifest_is_uniform_backbone_only() {
-        let manifest = parse_raw_publication(raw_publication_config(2)).unwrap();
-        assert!(manifest.mtp_experts_are_source());
-        assert!(manifest.ple_quantization.is_none());
-        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
-        assert_eq!(manifest.projections.len(), 40 * 384 * 3);
-        assert!(manifest
-            .projections
-            .keys()
-            .all(|name| name.starts_with("layers.")));
-        let projection = &manifest.projections["layers.39.ffn.experts.383.w1"];
-        assert_eq!(projection.bits, 2);
-        assert_eq!(projection.trellis_shape(), [320, 144, 32]);
-        let down = &manifest.projections["layers.0.ffn.experts.0.w2"];
-        assert_eq!(down.trellis_shape(), [144, 320, 32]);
-        assert!(manifest
-            .config
-            .as_ref()
-            .unwrap()
-            .quantization()
-            .quant_method
-            .eq_ignore_ascii_case("fp8"));
+    #[ignore = "requires the mounted pinned Muse publication index"]
+    fn pinned_muse_publication_index_has_all_routed_modules() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let revision = "89998fb177acd9a862ac8bd4fb79bfd50e940c97";
+        let snapshot = std::env::var_os("CUTEAFD_MUSE_PUBLICATION_SNAPSHOT").map(std::path::PathBuf::from)
+            .context("set CUTEAFD_MUSE_PUBLICATION_SNAPSHOT to the pinned Muse snapshot")?;
+        ensure!(snapshot.file_name().and_then(|n| n.to_str()) == Some(revision),
+            "Muse publication snapshot must be pinned to {revision}");
+        let config_bytes = std::fs::read(snapshot.join("config.json"))?;
+        assert_eq!(format!("{:x}", Sha256::digest(&config_bytes)),
+            "7cd07bfb249688d1af42216fdf4a934e5e5c50d45d1f655ec9f7eda491666d8a");
+        let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&serde_json::from_slice(&config_bytes)?)?;
+        cfg.release_geometry()?;
+        assert_eq!((cfg.layers, cfg.experts), (62, 256));
+        let index_bytes = std::fs::read(snapshot.join("model.safetensors.index.json"))?;
+        assert_eq!(format!("{:x}", Sha256::digest(&index_bytes)),
+            "bb8683b0966c2fcb2a0ff7264bf4c306e227dfd06f2bbce356110c793132183c");
+        let index: Value = serde_json::from_slice(&index_bytes)?;
+        let weights = index["weight_map"].as_object().context("pinned Muse index lacks weight_map")?;
+        let actual = weights.keys().filter(|name| name.contains(".experts.") && name.ends_with(".trellis"))
+            .cloned().collect::<BTreeSet<_>>();
+        let mut expected = BTreeSet::new();
+        for layer in 0..cfg.layers {
+            for expert in 0..cfg.experts {
+                for projection in ["gate_proj", "up_proj", "down_proj"] {
+                    expected.insert(format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{projection}.trellis"));
+                }
+            }
+        }
+        assert_eq!(expected.len(), 47_616);
+        assert_eq!(actual.len(), cfg.layers * cfg.experts * 3);
+        assert!(actual == expected, "pinned Muse index routed layer/expert/projection set disagrees with config");
+        Ok(())
     }
 
-    /// A miniature DeepSeek V4 EXL3 publication: HF-named routed experts, one
-    /// draft stage, `out_scales=auto` and float `bits`, as V4 Pro EXL3 K2 ships.
-    /// Returns the config, the GPTQModel storage map, the shape, and the
-    /// safetensors headers (MCG marker shaped `mcg`).
     fn deepseek_v4_publication_with(
         bits: impl Fn(&str) -> usize,
         mcg: &[usize],
@@ -982,17 +703,260 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_side_maps_match_bytes_before_one_parse() -> Result<()> {
+        let (config, manifest, shape, headers) = deepseek_v4_publication();
+        read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &manifest)], shape, &headers, &[])?;
+        let mut different = manifest.clone();
+        different["unused"] = serde_json::json!(1);
+        let error = read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &different)], shape, &headers, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("differ in size"));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_manifest_over_64_mib_remains_bounded() -> Result<()> {
+        use std::io::Write;
+
+        let (config, manifest, shape, headers) = deepseek_v4_publication();
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
+        let path = dir.path().join("quantize_config.json");
+        let mut file = File::create(&path)?;
+        serde_json::to_writer(&mut file, &manifest)?;
+        let padding = [b' '; 1024 * 1024];
+        for _ in 0..65 {
+            file.write_all(&padding)?;
+        }
+        drop(file);
+        assert!(path.metadata()?.len() > 64 * 1024 * 1024);
+        let parsed = read_deepseek_v4_exl3_manifest(dir.path(), shape, &headers, &[])?;
+        assert_eq!(parsed.projections.len(), headers.len() / 4);
+        assert!(read_json(&path, MAX_MANIFEST_BYTES)?["tensor_storage"].is_object());
+
+        // A sparse oversized file exercises the ceiling without allocating its payload.
+        File::options().write(true).open(&path)?.set_len(MAX_MANIFEST_BYTES + 1)?;
+        let error = read_bytes(&path, MAX_MANIFEST_BYTES).unwrap_err();
+        assert!(error.to_string().contains("exceeds metadata size limit"));
+        assert!(read_json(&path, MAX_MANIFEST_BYTES)
+            .unwrap_err().to_string().contains("exceeds metadata size limit"));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_without_pack_hint_uses_native_header_stems_and_storage() -> Result<()> {
+        let (_, mut manifest, mut shape, headers) = deepseek_v4_publication();
+        shape.draft_stages = 0;
+        shape.draft_experts = 0;
+        manifest.as_object_mut().unwrap().remove("pack_dtype");
+        let config = serde_json::json!({"quantization_config": {
+            "bits": 2.0, "checkpoint_format": "exl3", "format": "exl3", "quant_method": "exl3"}});
+        let rename = |name: &str| name.replacen("model.layers", "language_model.model.layers", 1)
+            .replace(".mlp.experts.", ".block_sparse_moe.experts.")
+            .replace(".gate_proj", ".w1").replace(".up_proj", ".w3").replace(".down_proj", ".w2");
+        let headers = headers.into_iter().filter(|t| t.name.starts_with("model.layers.")).map(|mut t| {
+            t.name = rename(&t.name); t
+        }).collect::<Vec<_>>();
+        let storage = manifest["tensor_storage"].as_object().unwrap().iter()
+            .filter(|(name, _)| name.starts_with("model.layers.")).map(|(name, entry)| {
+                let mut entry = entry.clone();
+                entry["stored_tensors"] = Value::Object(entry["stored_tensors"].as_object().unwrap().iter()
+                    .map(|(name, tensor)| (rename(name), tensor.clone())).collect());
+                (rename(name), entry)
+            }).collect();
+        manifest["tensor_storage"] = Value::Object(storage);
+        manifest["module_include"] = serde_json::json!([
+            r"language_model\.model\.layers\.[0-9]+\.block_sparse_moe\.experts\.[0-9]+\.w[123]$"]);
+        let parsed = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[2, 3])?;
+        assert_eq!(parsed.naming, V41Exl3Naming::HeaderDerived {
+            prefix: "language_model.model.layers".into(), module: "block_sparse_moe".into(),
+            stems: ["w1", "w3", "w2"].map(str::to_owned) });
+        for (stem, kind) in [("w1", V41Exl3ProjectionKind::Gate), ("w3", V41Exl3ProjectionKind::Up),
+            ("w2", V41Exl3ProjectionKind::Down)] {
+            let name = format!("language_model.model.layers.1.block_sparse_moe.experts.2.{stem}");
+            assert_eq!(parsed.projections[&name].kind, kind);
+        }
+        let plan = parsed.residency(crate::V41Exl3Layer::Backbone(1), 2, 1)?;
+        assert_eq!(plan.loads[0].tensor, "language_model.model.layers.1.block_sparse_moe.experts.0.w1.trellis");
+        for hint in [Value::from("int16"), Value::Null] {
+            let mut wrong = manifest.clone();
+            wrong["pack_dtype"] = hint;
+            assert!(read_publication(&config, &[("quantize_config.json", &wrong)], shape, &headers, &[]).is_err());
+        }
+        let mut wrong_headers = headers.clone();
+        let trellis = wrong_headers.iter_mut().find(|t| t.name.ends_with(".trellis")).unwrap();
+        trellis.dtype = DType::I32;
+        trellis.byte_length *= 2;
+        let error = format!("{:#}", read_publication(&config, &[("quantize_config.json", &manifest)],
+            shape, &wrong_headers, &[]).unwrap_err());
+        assert!(error.contains("expected i16"), "{error}");
+        let mut mixed = headers;
+        for tensor in &mut mixed {
+            tensor.name = tensor.name.replace(".experts.0.w3.", ".experts.0.up_proj.");
+        }
+        let error = format!("{:#}", read_publication(&config, &[], shape, &mixed, &[]).unwrap_err());
+        assert!(error.contains("unsupported or mixed projection stems"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn arbitrary_header_wrappers_and_expert_modules_drive_residency() -> Result<()> {
+        let (_, _, shape, headers) = deepseek_v4_publication();
+        let config = serde_json::json!({"quantization_config": {"quant_method": "exl3", "version": "0.0.43",
+            "bits": 2, "head_bits": 16, "codebook": "mcg", "scope": "routed_experts_only"}});
+        for prefix in ["language_model.model.layers", "custom.wrapper.decoder.layers"] {
+            let headers = headers.iter().filter(|tensor| tensor.name.starts_with("model.layers.")).cloned()
+                .map(|mut tensor| {
+                    tensor.name = tensor.name.replacen("model.layers", prefix, 1)
+                        .replace(".mlp.experts.", ".block_sparse_moe.experts.");
+                    tensor
+                }).collect::<Vec<_>>();
+            let parsed = read_publication(&config, &[], shape, &headers, &[2, 3])?;
+            assert_eq!(parsed.naming, V41Exl3Naming::HeaderDerived {
+                prefix: prefix.into(), module: "block_sparse_moe".into(),
+                stems: ["gate_proj", "up_proj", "down_proj"].map(str::to_owned) });
+            assert_eq!(parsed.experts.draft_stages, 0);
+            assert_eq!(parsed.projections.len(), 2 * 3 * 3);
+            let plan = parsed.residency(crate::V41Exl3Layer::Backbone(1), 2, 1)?;
+            assert_eq!(plan.loads[0].tensor,
+                format!("{prefix}.1.block_sparse_moe.experts.0.gate_proj.trellis"));
+            let mut mixed = headers;
+            mixed[0].name = mixed[0].name.replacen(prefix, "different.layers", 1);
+            assert!(read_publication(&config, &[], shape, &mixed, &[2, 3]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_core_k6_and_routed_k2_preserve_catalog_and_side_map_checks() -> Result<()> {
+        for kimi in [false, true] {
+            let (config, mut manifest, shape, mut headers) = deepseek_v4_publication();
+            let rename = |name: &str| if kimi {
+                name.replace("model.layers.", "language_model.model.layers.")
+                    .replace(".mlp.experts.", ".block_sparse_moe.experts.")
+            } else { name.into() };
+            if kimi {
+                headers.retain(|tensor| !tensor.name.starts_with("mtp."));
+                for tensor in &mut headers { tensor.name = rename(&tensor.name); }
+                let entries = manifest["tensor_storage"].as_object().unwrap().iter()
+                    .filter(|(name, _)| !name.starts_with("mtp.")).map(|(name, entry)| {
+                    let mut entry = entry.clone();
+                    entry["stored_tensors"] = serde_json::Value::Object(entry["stored_tensors"].as_object().unwrap()
+                        .iter().map(|(name, tensor)| (rename(name), tensor.clone())).collect());
+                    (rename(name), entry)
+                }).collect();
+                manifest["tensor_storage"] = serde_json::Value::Object(entries);
+            }
+            let core = if kimi { "language_model.model.layers.0.self_attn.q_proj" }
+                else { "model.layers.0.self_attn.q_a_proj" };
+            let mut stored = serde_json::Map::new();
+            for (suffix, dtype, label, dims, width) in [
+                ("trellis", DType::I16, "int16", vec![16, 24, 96], 2),
+                ("suh", DType::F16, "float16", vec![256], 2),
+                ("svh", DType::F16, "float16", vec![384], 2),
+                ("mcg", DType::I32, "int32", vec![], 4),
+            ] {
+                let name = format!("{core}.{suffix}");
+                stored.insert(name.clone(), serde_json::json!({"torch_dtype":label,"shape":dims}));
+                headers.push(SafetensorsTensorMetadata { name, dtype, byte_offset: 0,
+                    byte_length: width * dims.iter().product::<usize>() as u64, shape: dims });
+            }
+            manifest["tensor_storage"][core] = serde_json::json!({"bits_per_weight":6,
+                "mcg_multiplier":3417055213u64,"quant_format":"exl3","stored_tensors":stored});
+            let catalog = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[2,3])?;
+            assert_eq!(catalog.projections.len(), if kimi { 18 } else { 27 });
+            assert!(!catalog.projections.contains_key(core));
+            assert_eq!(catalog.decoder_tiers(), &[2,3]);
+            let mut mismatch = manifest.clone();
+            mismatch["tensor_storage"][core]["bits_per_weight"] = serde_json::json!(5);
+            let error = read_publication(&config, &[("quantize_config.json", &mismatch)], shape, &headers, &[]).unwrap_err();
+            assert!(format!("{error:#}").contains(core));
+            let mut incomplete = headers.clone();
+            incomplete.retain(|tensor| tensor.name != format!("{core}.svh"));
+            assert!(read_publication(&config, &[("quantize_config.json", &manifest)], shape, &incomplete, &[]).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glm_mixed_core_head_and_mtp_catalog_needs_no_side_file() -> Result<()> {
+        let (mut config, mut manifest, shape, mut headers) = deepseek_v4_publication_with(|_| 4, &[]);
+        manifest = serde_json::from_str(&serde_json::to_string(&manifest)?
+            .replace("mtp.0.", "model.layers.2."))?;
+        for header in &mut headers {
+            if let Some(tail) = header.name.strip_prefix("mtp.0.") {
+                header.name = format!("model.layers.2.{tail}");
+            }
+        }
+        let compact = serde_json::json!({"quant_method":"exl3", "bits":4.0, "core_bits":6.0,
+            "head_bits":6.0, "mtp_bits":4.0, "checkpoint_format":"exl3", "format":"exl3",
+            "per_module_metadata":"quantize_config.json:tensor_storage"});
+        config["quantization_config"] = compact.clone();
+        manifest.as_object_mut().unwrap().extend(compact.as_object().unwrap().clone());
+        manifest["lm_head"] = Value::from(true);
+        manifest["sym"] = Value::from(true);
+        manifest["calibration"] = serde_json::json!({"samples":1426,"tokens":1097737});
+        for (stem, bits, n, k) in [("model.layers.0.self_attn.q_a_proj",6,256,256),
+            ("model.layers.0.self_attn.kv_a_proj_with_mqa",6,640,256),
+            ("model.layers.2.self_attn.q_a_proj",4,256,256), ("model.layers.2.eh_proj",4,256,512),
+            ("lm_head",6,512,256)] {
+            let mut stored = serde_json::Map::new();
+            for (suffix,dtype,label,dims,width) in [
+                ("trellis",DType::I16,"int16",vec![k/16,n/16,16*bits],2),
+                ("suh",DType::F16,"float16",vec![k],2),
+                ("svh",DType::F16,"float16",vec![n],2),
+                ("mcg",DType::I32,"int32",vec![1],4)] {
+                let name=format!("{stem}.{suffix}");
+                stored.insert(name.clone(),serde_json::json!({"torch_dtype":label,"shape":dims}));
+                headers.push(SafetensorsTensorMetadata {name,dtype,byte_offset:0,
+                    byte_length:width*dims.iter().product::<usize>() as u64,shape:dims});
+            }
+            manifest["tensor_storage"][stem]=serde_json::json!({"bits_per_weight":bits,
+                "mcg_multiplier":3417055213u64,"quant_format":"exl3","stored_tensors":stored});
+        }
+        let mapped=read_publication(&config,&[("quantize_config.json",&manifest)],shape,&headers,&[3,4])?;
+        let native=read_publication(&config,&[],shape,&headers,&[3,4])?;
+        assert_eq!(mapped.projections,native.projections);
+        assert_eq!(mapped.experts,native.experts);
+        assert_eq!(native.storage,Exl3StorageSource::Headers);
+        assert_eq!(native.naming, V41Exl3Naming::HfMlp);
+        assert_eq!((native.experts.draft_stages, native.experts.draft_experts), (0, 0));
+        assert!(native.residency(crate::V41Exl3Layer::Dspark(0), 1, 0).is_err());
+        assert!(!native.projections.keys().any(|name| name.starts_with("model.layers.2.")));
+        assert_eq!(native.projections.len(),18);
+        assert!(native.projections.values().all(|p|p.bits==4));
+        let mut wrong=manifest.clone();
+        wrong["tensor_storage"]["lm_head"]["bits_per_weight"]=Value::from(4);
+        assert!(read_publication(&config,&[("quantize_config.json",&wrong)],shape,&headers,&[]).is_err());
+        let mut wrong=config;
+        wrong["quantization_config"]["mtp_bits"]=Value::from(6);
+        let error=read_publication(&wrong,&[],shape,&headers,&[]).unwrap_err();
+        assert!(format!("{error:#}").contains("mtp_bits=6"));
+        Ok(())
+    }
+
+    #[test]
+    fn routed_mul1_is_rejected_after_shared_header_derivation() {
+        let (config, _, shape, mut headers) = deepseek_v4_publication();
+        let marker = headers.iter_mut().find(|tensor| tensor.name.ends_with(".mcg")).unwrap();
+        let stem = marker.name.strip_suffix(".mcg").unwrap().to_owned();
+        marker.name = format!("{stem}.mul1");
+        let error = read_publication(&config, &[], shape, &headers, &[]).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains(&stem) && text.contains("routed expert kernels require MCG"), "{text}");
+    }
+
+    #[test]
     fn deepseek_v4_publication_reads_hf_named_experts_and_drafts() {
         let (config, manifest, shape, headers) = deepseek_v4_publication();
         let parsed = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[]).unwrap();
-        assert!(parsed.config.is_none());
         assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
         assert_eq!(parsed.naming, V41Exl3Naming::HfMlp);
         assert_eq!(parsed.experts.draft_stages, 1);
         assert_eq!(parsed.experts.draft_experts, 3);
         assert_eq!(parsed.projections.len(), (2 + 1) * 3 * 3);
         assert_eq!(parsed.decoder_tiers(), &[2, 3]);
-        assert!(!parsed.mtp_experts_are_source());
         let down = &parsed.projections["model.layers.1.mlp.experts.2.down_proj"];
         assert_eq!(down.trellis_shape(), [24, 16, 32]);
         assert_eq!(down.intermediate_partition(2, 1).unwrap(), 256..384);
@@ -1018,7 +982,7 @@ mod tests {
         let mapped = read_publication(&gptq_config, &[("quantize_config.json", &gptq_map)], shape, &scalar, &[]).unwrap();
         assert_eq!(standard.storage, Exl3StorageSource::Headers);
         assert_eq!(standard.projections, mapped.projections);
-        assert_eq!((standard.experts, standard.naming), (mapped.experts, mapped.naming));
+        assert_eq!((standard.experts, &standard.naming), (mapped.experts, &mapped.naming));
         assert_eq!(standard.decoder_tiers(), mapped.decoder_tiers());
         let mcg = vector.iter().find(|t| t.name.ends_with(".mcg")).unwrap();
         standard.projections[mcg.name.rsplit_once('.').unwrap().0].validate_tensor(mcg).unwrap();
@@ -1063,7 +1027,7 @@ mod tests {
         // The checkpoint's markers are [1]; the map says [].
         let (_, _, _, vector) = deepseek_v4_publication_with(|_| 2, &[1]);
         let error = format!("{:#}", read_publication(&config, &maps, shape, &vector, &[]).unwrap_err());
-        assert!(error.contains("quantize_config.json disagrees with the safetensors headers at model.layers.0.mlp.experts.0.down_proj")
+        assert!(error.contains("quantize_config.json disagrees with the safetensors headers at model.layers.0.mlp.experts.0.")
             && error.contains("mcg i32 []") && error.contains("mcg i32 [1]"), "{error}");
         // One projection quantized at K3 in the checkpoint, K2 in the map.
         let target = "model.layers.1.mlp.experts.2.up_proj";
@@ -1089,7 +1053,32 @@ mod tests {
         let error = format!("{:#}", read_publication(&config,
             &[("quantize_config.json", &manifest), ("quantization_config.json", &copy)], shape, &headers, &[])
             .unwrap_err());
-        assert!(error.contains("quantization_config.json") && error.contains("bits_per_weight 3"), "{error}");
+        assert!(error.contains("quantize_config.json and quantization_config.json differ in SHA256"), "{error}");
+    }
+
+    #[test]
+    fn stitched_native_core_metadata_preserves_exl3_contract() {
+        let (mut config, mut manifest, shape, headers) = deepseek_v4_publication();
+        let native = serde_json::json!({"quant_method": "fp8", "fmt": "e4m3",
+            "activation_scheme": "dynamic", "weight_block_size": [128, 128],
+            "modules": ["model.layers.0.self_attn.q_a_proj"]});
+        let meta = serde_json::json!({"native_core_quantization": native});
+        config["quantization_config"]["meta"] = meta.clone();
+        manifest["meta"] = meta;
+        let parsed = read_publication(&config, &[("quantize_config.json", &manifest),
+            ("quantization_config.json", &manifest)], shape, &headers, &[]).unwrap();
+        assert_eq!(parsed.projections.len(), 27);
+        assert_eq!(parsed.storage, Exl3StorageSource::GptqModel);
+        let mut drift = manifest.clone();
+        drift["meta"]["native_core_quantization"]["fmt"] = serde_json::json!("e5m2");
+        let error = read_publication(&config, &[("quantize_config.json", &drift)], shape, &headers, &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("disagree at meta"));
+        // Native format declarations are metadata, not new EXL3 storage keys.
+        manifest["native_core_quantization"] = native;
+        let error = read_publication(&config, &[("quantize_config.json", &manifest)], shape, &headers, &[])
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("unexpected key native_core_quantization"));
     }
 
     #[test]
@@ -1151,150 +1140,6 @@ mod tests {
             shape.experts,
             shape.draft_stages,
             shape.geometry().unwrap()
-        );
-    }
-
-    #[test]
-    fn raw_publication_rejects_contract_drift() {
-        for (pointer, value, expected) in [
-            ("/quantization_config/bits", serde_json::json!(3.25), "integer bits"),
-            (
-                "/quantization_config/codebook",
-                serde_json::json!("gptq"),
-                "MCG codebook",
-            ),
-            (
-                "/quantization_config/mtp_experts",
-                serde_json::json!("exl3"),
-                "mtp_experts=source",
-            ),
-            (
-                "/quantization_config/non_routed_quantization/fmt",
-                serde_json::json!("e5m2"),
-                "non-routed FP8",
-            ),
-        ] {
-            let mut config = raw_publication_config(2);
-            *config.pointer_mut(pointer).unwrap() = value;
-            let error = parse_raw_publication(config).unwrap_err().to_string();
-            assert!(error.contains(expected), "unexpected error: {error}");
-        }
-        let mut extra = raw_publication_config(2);
-        extra["quantization_config"]["surprise"] = serde_json::json!(true);
-        assert!(parse_raw_publication(extra)
-            .unwrap_err()
-            .to_string()
-            .contains("unexpected quantization_config key"));
-        let mut wrong_start = raw_publication_config(2);
-        wrong_start["quantization_config"]["mtp_experts_start_layer"] = serde_json::json!(39);
-        assert!(parse_raw_publication(wrong_start)
-            .unwrap_err()
-            .to_string()
-            .contains("mtp_experts_start_layer"));
-    }
-
-    #[test]
-    #[ignore = "requires CUTEAFD_EXL3_RAW_SNAPSHOT pointing to a raw local publication"]
-    fn raw_publication_checkpoint_manifest() {
-        let path = std::env::var_os("CUTEAFD_EXL3_RAW_SNAPSHOT").expect("CUTEAFD_EXL3_RAW_SNAPSHOT");
-        let manifest = read_v41_exl3_manifest(Path::new(&path)).unwrap();
-        assert!(manifest.mtp_experts_are_source());
-        assert_eq!(manifest.projections.len(), 46_080);
-        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
-        assert!(manifest
-            .projections
-            .values()
-            .all(|projection| projection.bits == 2));
-        let index = read_json(
-            &Path::new(&path).join("model.safetensors.index.json"),
-            MAX_MANIFEST_BYTES,
-        )
-        .unwrap();
-        let shards: std::collections::BTreeSet<_> = index["weight_map"]
-            .as_object()
-            .unwrap()
-            .values()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let mut seen = std::collections::BTreeSet::new();
-        for shard in shards {
-            for tensor in crate::read_safetensors_metadata(&Path::new(&path).join(shard)).unwrap() {
-                if !tensor.name.starts_with("layers.") || !tensor.name.contains(".ffn.experts.") {
-                    continue;
-                }
-                let (prefix, _) = tensor.name.rsplit_once('.').unwrap();
-                manifest
-                    .projections
-                    .get(prefix)
-                    .expect("unexpected routed tensor")
-                    .validate_tensor(&tensor)
-                    .unwrap();
-                assert!(seen.insert(tensor.name), "duplicate routed tensor");
-            }
-        }
-        assert_eq!(seen.len(), 4 * manifest.projections.len());
-        println!(
-            "validated {} raw K2 projections",
-            manifest.projections.len()
-        );
-    }
-
-    #[test]
-    #[ignore = "requires CUTEAFD_EXL3_SNAPSHOT pointing to a published local snapshot"]
-    fn published_checkpoint_manifest() {
-        let path = std::env::var_os("CUTEAFD_EXL3_SNAPSHOT").expect("CUTEAFD_EXL3_SNAPSHOT");
-        let manifest = read_v41_exl3_manifest(Path::new(&path)).unwrap();
-        assert_eq!(manifest.projections.len(), 47_232);
-        assert_eq!(manifest.decoder_tiers(), &[3, 4]);
-        // For the published quant the common family equals every old local
-        // family, so descriptor layouts and allocation sizes remain unchanged.
-        let mut families = BTreeMap::<String, BTreeSet<usize>>::new();
-        for p in manifest.projections.values() {
-            let prefix = p.name.split(".ffn.experts.").next().unwrap();
-            families.entry(prefix.into()).or_default().insert(p.bits);
-        }
-        assert_eq!(families.len(), 43);
-        assert!(families
-            .values()
-            .all(|bits| bits.iter().copied().collect::<Vec<_>>() == [3, 4]));
-        let mut counts = BTreeMap::new();
-        for p in manifest.projections.values() {
-            *counts.entry(p.bits).or_insert(0usize) += 1;
-        }
-        assert_eq!(counts, BTreeMap::from([(3, 35_424), (4, 11_808)]));
-        let index = read_json(
-            &Path::new(&path).join("model.safetensors.index.json"),
-            MAX_MANIFEST_BYTES,
-        )
-        .unwrap();
-        let shards: std::collections::BTreeSet<_> = index["weight_map"]
-            .as_object()
-            .unwrap()
-            .values()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-        let mut seen = std::collections::BTreeSet::new();
-        for shard in shards {
-            for tensor in crate::read_safetensors_metadata(&Path::new(&path).join(shard)).unwrap() {
-                if !tensor.name.contains(".ffn.experts.") {
-                    continue;
-                }
-                let (prefix, _) = tensor.name.rsplit_once('.').unwrap();
-                manifest
-                    .projections
-                    .get(prefix)
-                    .expect("unexpected routed tensor")
-                    .validate_tensor(&tensor)
-                    .unwrap();
-                assert!(seen.insert(tensor.name), "duplicate routed tensor");
-            }
-        }
-        assert_eq!(seen.len(), 4 * manifest.projections.len());
-        println!(
-            "validated {} projections; tiers {:?}; PLE override={}",
-            manifest.projections.len(),
-            counts,
-            manifest.ple_quantization.is_some()
         );
     }
 
@@ -1393,7 +1238,10 @@ mod tests {
                 // six whole blocks with no padding or duplicated boundary.
                 (3, vec![768, 768, 768]),
                 (4, vec![640, 640, 512, 512]),
+                (5, vec![512, 512, 512, 384, 384]),
                 (6, vec![384; 6]),
+                (7, vec![384, 384, 384, 384, 256, 256, 256]),
+                (8, vec![384, 384, 256, 256, 256, 256, 256, 256]),
             ] {
                 let mut cursor = 0;
                 for (rank, width) in widths.into_iter().enumerate() {
@@ -1406,7 +1254,7 @@ mod tests {
                 assert!(p.intermediate_partition(world, world).is_err());
             }
             // Unadmitted worlds and empty shards fail closed.
-            for world in [0usize, 7, 8, 9, 19] {
+            for world in [0usize, 9, 19] {
                 assert!(
                     p.intermediate_partition(world, 0).is_err(),
                     "EXL3 world {world} must stay unadmitted"
@@ -1415,61 +1263,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validates_each_integer_tier_and_rejects_shape_or_rotation_drift() {
-        let name = "layers.0.ffn.experts.0.w1";
-        for bits in 2..=5 {
-            let mut tensors = serde_json::Map::new();
-            for (suffix, dtype, shape) in [
-                ("trellis", "int16", vec![320, 144, 16 * bits]),
-                ("suh", "float16", vec![5120]),
-                ("svh", "float16", vec![2304]),
-                ("mcg", "int32", vec![]),
-            ] {
-                tensors.insert(
-                    format!("{name}.{suffix}"),
-                    serde_json::json!({"torch_dtype": dtype, "shape": shape}),
-                );
-            }
-            let value = serde_json::json!({"quant_format": "exl3", "bits_per_weight": bits, "stored_tensors": tensors});
-            let parse =
-                |v: &Value| parse_projection(name, V41Exl3ProjectionKind::Gate, 5120, 2304, v);
-            assert_eq!(
-                parse(&value).unwrap().trellis_bytes(),
-                5120 * 2304 * bits / 8
-            );
-            for invalid in [
-                serde_json::json!(1),
-                serde_json::json!(6),
-                serde_json::json!(3.25),
-            ] {
-                let mut bad = value.clone();
-                bad["bits_per_weight"] = invalid;
-                assert!(parse(&bad).is_err());
-            }
-            let mut bad = value.clone();
-            bad["stored_tensors"][format!("{name}.suh")]["shape"] = serde_json::json!([2304]);
-            assert!(parse(&bad).is_err());
-            let mut bad = value.clone();
-            bad["stored_tensors"][format!("{name}.trellis")]["shape"] =
-                serde_json::json!([144, 320, 16 * bits]);
-            assert!(parse(&bad).is_err());
-        }
-    }
 }
 
-#[cfg(test)]
-mod legacy_name_tests {
-    #[test]
-    fn ds41rt_publications_read_under_current_names() {
-        let mut value = serde_json::json!({"meta": {"ds41rt": {"schema": "ds41rt.v41-routed-exl3.v1"}},
-            "ds41rt_ple_quantization": {"schema": "ds41rt.nvfp4-ple.v1"}, "other": "ds41rt-free"});
-        super::normalize_legacy_names(&mut value);
-        assert_eq!(value["meta"]["cuteafd"]["schema"], super::V41_EXL3_SCHEMA);
-        assert_eq!(value["cuteafd_ple_quantization"]["schema"], "cuteafd.nvfp4-ple.v1");
-        assert_eq!(value["other"], "ds41rt-free");
-    }
-}
 #[cfg(test)]
 mod qwen_naming_tests {
     use super::*;
@@ -1480,5 +1275,65 @@ mod qwen_naming_tests {
         assert_eq!(naming.projection(false, 47, 511, V41Exl3ProjectionKind::Down),
             "model.language_model.layers.47.mlp.experts.511.down_proj");
         assert_eq!(naming.projection(true, 0, 3, V41Exl3ProjectionKind::Gate), "mtp.layers.0.mlp.experts.3.gate_proj");
+    }
+
+    fn k6_core_storage() -> Exl3StorageMap {
+        let module = |bits| Exl3Module { codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits,
+            input_features: 128, output_features: 128, tensors: BTreeMap::new() };
+        BTreeMap::from([
+            ("language_model.model.layers.1.block_sparse_moe.experts.0.w1".to_owned(), module(2)),
+            ("language_model.model.layers.1.self_attn.q_proj".to_owned(), module(6)),
+            ("language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj".to_owned(), module(6)),
+            ("language_model.lm_head".to_owned(), module(6)),
+        ])
+    }
+
+    /// The published Kimi K3 Core-K6 key set: compact `config.json` block and
+    /// the top-level `quantize_config.json` keys (tensor_storage elided).
+    fn k6_publication() -> (Value, Value) {
+        let compact = serde_json::json!({"bits": 2.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
+            "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3"});
+        let manifest = serde_json::json!({"bits": 2.0, "checkpoint_format": "exl3", "codebook": "mcg",
+            "core_bits": 6.0, "desc_act": false, "format": "exl3", "group_size": -1, "method": "exl3",
+            "module_include": ["^language_model\\.lm_head$"], "out_scales": "auto", "quant_method": "exl3",
+            "meta": {"core_quantization_provenance": {}, "quantization_provenance": {}},
+            "tensor_storage": {}});
+        (compact, manifest)
+    }
+
+    #[test]
+    fn k6_core_bits_is_checked_against_core_headers() {
+        let (compact, manifest) = k6_publication();
+        let storage = k6_core_storage();
+        check_gptqmodel_manifest(&compact, &manifest, &storage, usize::MAX).unwrap();
+        // A core module at another width disagrees with the declared core_bits.
+        let mut wrong = storage.clone();
+        wrong.get_mut("language_model.lm_head").unwrap().bits = 4;
+        let error = format!("{:#}", check_gptqmodel_manifest(&compact, &manifest, &wrong, usize::MAX).unwrap_err());
+        assert!(error.contains("core_bits=6") && error.contains("language_model.lm_head"), "{error}");
+        // core_bits with only routed experts in the headers is not a core quant.
+        let routed: Exl3StorageMap = storage.iter().filter(|(name, _)| is_routed_module(name))
+            .map(|(name, module)| (name.clone(), module.clone())).collect();
+        assert!(check_gptqmodel_manifest(&compact, &manifest, &routed, usize::MAX).is_err());
+        for bad in [Value::from(6.5), Value::from(0), Value::from("6")] {
+            let mut bad_manifest = manifest.clone();
+            bad_manifest["core_bits"] = bad.clone();
+            let mut bad_compact = compact.clone();
+            bad_compact["core_bits"] = bad;
+            assert!(check_gptqmodel_manifest(&bad_compact, &bad_manifest, &storage, usize::MAX).is_err());
+        }
+        // Compact and full metadata still have to agree on core_bits.
+        let mut disagree = compact.clone();
+        disagree["core_bits"] = Value::from(5.0);
+        assert!(check_gptqmodel_manifest(&disagree, &manifest, &storage, usize::MAX).is_err());
+        // The pointer may name only the GPTQModel storage map.
+        let mut pointer = compact.clone();
+        pointer["per_module_metadata"] = Value::from("other.json:tensor_storage");
+        assert!(check_gptqmodel_manifest(&pointer, &manifest, &storage, usize::MAX).is_err());
+        // Unknown keys are still refused.
+        let mut extra = manifest.clone();
+        extra["head_core_bits"] = Value::from(6.0);
+        let error = format!("{:#}", check_gptqmodel_manifest(&compact, &extra, &storage, usize::MAX).unwrap_err());
+        assert!(error.contains("unexpected key head_core_bits"), "{error}");
     }
 }

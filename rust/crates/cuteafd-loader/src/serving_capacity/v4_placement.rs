@@ -1,6 +1,6 @@
 //! V4 expert residency and local-expert workspace without CUDA, the inputs
 //! `placement::families::deepseek_v4` charges (the solver is `placement::solve`).
-use super::CacheGeometryError;
+use super::{CacheGeometryError, Exl3Epilogue};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V4ExpertCost {
@@ -28,7 +28,7 @@ pub fn deepseek_v4_expert_cost(catalog: &crate::OfficialV41Catalog, layer: usize
 }
 
 /// Standard rtx_backbone export scratch: 16-byte-aligned native slots,
-/// ordered route output below 256 rows, atomic token output above it.
+/// ordered slice decode and hardware-qualified original-route STREAM prefill.
 /// Mirrors export_b12x_slices_aot.py and expert_families.cmake without CUDA.
 pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64,
     topk: u64, max_rows: u64) -> Result<u64, CacheGeometryError> {
@@ -41,17 +41,10 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
     let mut scratch = 0;
     for capacity in capacities.into_iter().filter(|&n| n <= maximum)
         .chain(capacities.into_iter().find(|&n| n >= maximum)) {
-        let routes = product("V4 expert routes", &[capacity, topk])?;
-        let atomic = capacity >= 256;
-        let planes = intermediate.div_ceil(128);
-        let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, hidden])? };
-        let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
-        let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
-            routes * 19 * 4, routes * 4, routes * 4, partial, output, experts * 4, experts * 4];
-        let mut bytes = 0_u64;
-        for slot in slots {
-            bytes = sum("V4 aligned expert scratch", &[bytes.div_ceil(16) * 16, slot])?;
-        }
+        let bytes = cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
+            hidden as usize, experts as usize, topk as usize, intermediate as usize,
+            2, capacity as u32, false, 120)
+            .ok_or(CacheGeometryError::Overflow("V4 native scratch"))?;
         scratch = scratch.max(bytes);
     }
     sum("V4 native expert workspace", &[scratch, product("V4 local output/routes", &[maximum, hidden * 2 + topk * 8])?])
@@ -73,7 +66,7 @@ pub fn deepseek_v4_tp2_expert_cost(catalog: &crate::OfficialV41Catalog, layer: u
         * shape.experts as u64, staging_bytes: staging.staging_bytes() as u64 })
 }
 
-/// `rtx_tp2` uses the same slots/atomic threshold as `rtx_backbone`, at I/2,
+/// `rtx_tp2` uses the same hardware-qualified backend as `rtx_backbone`, at I/2,
 /// but its executor output is FP32 and has no TP1 output/route tail.
 pub fn deepseek_v4_tp2_native_workspace(hidden: u64, intermediate: u64, experts: u64,
     topk: u64, max_rows: u64) -> Result<u64, CacheGeometryError> {
@@ -101,7 +94,7 @@ pub fn deepseek_v4_tp2_workspace(catalog: &crate::OfficialV41Catalog,
     let root = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().find(|p| p.join("rtx-tp2").is_dir())
         .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp2 workspace manifests"))?;
-    let capacities = [1u64, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows.max(1))
         .ok_or_else(|| anyhow::anyhow!("TP2 expert capacity exceeds 4096 rows"))?;
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|c| {
@@ -112,7 +105,7 @@ pub fn deepseek_v4_tp2_workspace(catalog: &crate::OfficialV41Catalog,
             && value["experts"].as_u64() == Some(shape.experts as u64), "TP2 EXL3 workspace geometry mismatch");
         Ok(value)
     }).collect::<anyhow::Result<Vec<_>>>()?;
-    Ok(super::exl3_workspace_bytes(&manifests, true)? + max_rows.max(1) * shape.hidden as u64 * 4)
+    Ok(super::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + max_rows.max(1) * shape.hidden as u64 * 4)
 }
 
 #[cfg(test)]
@@ -120,12 +113,35 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // Export widths are 128 at every capacity; ordered output below
-        // m256 dominates the native scratch at m80 for both V4 geometries.
-        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 297139088)] {
+        // SM120 retains ordered Flash and atomic Pro slices after STREAM removal.
+        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 525308944), (7168, 3072, 384, 6, 274701856)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);
         }
         assert!(deepseek_v4_tp2_native_workspace(4096, 2048, 256, 6, 4097).is_err());
+    }
+    #[test]
+    fn ordered_workspace_uses_compact_activation_storage() {
+        // Compare TP1/TP2 arenas at every capacity with the hardware-specific census.
+        for (h, i, experts) in [(4096, 2048, 256), (7168, 3072, 384)] {
+            for capacity in [1, 16, 80, 256, 1024, 4096] {
+                for tp in [1, 2] {
+                    // Ordered decode can need more scratch than a wider atomic export.
+                    let scratch = [1, 16, 80, 256, 1024, 4096].into_iter()
+                        .filter(|&compiled| compiled <= capacity)
+                        .map(|compiled| cuteafd_core::mxfp4_layouts::native_scratch_bytes_for_sm(
+                            h as usize, experts as usize, 6, (i / tp) as usize,
+                            if tp == 1 { 2 } else { 3 }, compiled, false, 120).unwrap())
+                        .max().unwrap();
+                    let rows = u64::from(capacity);
+                    let (actual, tail) = if tp == 1 {
+                        (deepseek_v4_native_workspace(h, i, experts, 6, rows).unwrap(), rows * (h * 2 + 48))
+                    } else {
+                        (deepseek_v4_tp2_native_workspace(h, i, experts, 6, rows).unwrap(), rows * h * 4)
+                    };
+                    assert_eq!(actual, scratch + tail, "H{h}/TP{tp}/C{capacity}");
+                }
+            }
+        }
     }
     #[test]
     fn real_tp2_costs_match_catalog_reference() {
@@ -144,7 +160,20 @@ mod tp2_tests {
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
                 if catalog.exl3().is_some() && !manifest.is_file() { continue; }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
-                assert_eq!(workspace, if family == "flash" { 161453088 } else { 1343287468 });
+                let expected = if family == "flash" {
+                    let shape = catalog.routed_experts();
+                    let (h, e, k) = (shape.hidden as u64, shape.experts as u64, shape.topk as u64);
+                    let pairs = 4096 * k;
+                    let mut arena = 0_u64;
+                    for plane in [4, e * pairs * 4, e * 4, e * 8,
+                        pairs * 19 * 4, pairs * 4, pairs * 4,
+                        (shape.intermediate as u64 / 2).div_ceil(128) * pairs * (128 + 128 / 8),
+                        pairs * h * 4, e * 4, e * 4] {
+                        arena = arena.div_ceil(16) * 16 + plane;
+                    }
+                    arena + 4096 * h * 4
+                } else { 1343287468 };
+                assert_eq!(workspace, expected);
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);
             }
         }

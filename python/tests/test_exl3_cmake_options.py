@@ -33,7 +33,7 @@ def documented_tile_examples():
     A help example is a promise: if it does not configure and parse, the knob ships
     looking usable while being invalid.
     """
-    doc = re.search(r'CUTEAFD_V41_EXL3_TILES[^)]*CACHE STRING "([^"]+)"',
+    doc = re.search(r'CUTEAFD_EXL3_TILES[^)]*CACHE STRING "([^"]+)"',
                     RULES.read_text()).group(1)
     # Match the grammar shape itself so the count cannot drift with the wording.
     # Loose token scan: finding the candidates is this test's job, validating them
@@ -48,6 +48,7 @@ cmake_minimum_required(VERSION 3.24)
 project(exl3_options NONE)
 set(CUTEAFD_ENABLE_CUDA ON)
 set(CUTEAFD_CUDA_ARCHITECTURES {architecture} CACHE STRING "test architecture")
+set(CUTEAFD_EXPERT_FAMILIES "dsv4p:exl3-k23;dsv4p:exl3-k34" CACHE STRING "test families")
 set(CUDAToolkit_INCLUDE_DIRS "${{CMAKE_CURRENT_SOURCE_DIR}}")
 set(Python3_EXECUTABLE python3)
 add_library(CUDA::cudart SHARED IMPORTED)
@@ -55,6 +56,7 @@ set_target_properties(CUDA::cudart PROPERTIES IMPORTED_LOCATION /unused/libcudar
 add_library(CUDA::cuda_driver SHARED IMPORTED)
 set_target_properties(CUDA::cuda_driver PROPERTIES IMPORTED_LOCATION /unused/libcuda.so)
 add_custom_target(cuteafd_verify_sparkinfer_source)
+set(CMAKE_CURRENT_SOURCE_DIR "{RULES.parents[2]}")
 include("{RULES}")
 '''
 
@@ -85,19 +87,17 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
 
     def test_default_families_declare_all_disjoint_layouts(self):
         for architecture, layouts in (
-            ('121', DISJOINT_SPARK_LAYOUTS),
-            ('120', ['rtx-tp1', 'rtx-tp2', 'dspark']),
-            ('120f', ['rtx-tp1', 'rtx-tp2', 'dspark']),
+            ('121', [f'tp{world}-rank{rank}' for world in range(2, 9) for rank in range(world)]),
+            ('120', ['rtx-tp1', 'rtx-tp2']),
+            ('120f', ['rtx-tp1', 'rtx-tp2']),
         ):
             with self.subTest(architecture=architecture):
                 result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 for family, bits in (('23', '2 3'), ('34', '3 4')):
                     self.assertIn(f'--bits {bits}', rules)
-                    for layout in layouts:
-                        for capacity in (1, 16, 80, 256, 1024, 4096):
-                            for name in ('v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so'):
-                                self.assertIn(f'exl3-k{family}/{layout}/m{capacity}/{name}', rules)
+                    self.assertIn('exl3-dsv4p-k' + family + '/manifest.json', rules)
+                    self.assertIn('--require-layout ' + ','.join(layouts), rules)
                 if architecture != '121':
                     self.assertNotIn('/tp2-rank', rules)
                     self.assertNotIn('/tp3-rank', rules)
@@ -110,20 +110,21 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         build: every declared Spark rank, including the exact width-768 TP3 group.
         """
         expected = {
-            '121': ','.join(DISJOINT_SPARK_LAYOUTS),
-            '120': 'rtx-tp1,rtx-tp2,dspark',
+            '121': ','.join([f'tp{world}-rank{rank}' for world in range(2, 9) for rank in range(world)]),
+            '120': 'rtx-tp1,rtx-tp2',
         }
         for architecture, layouts in expected.items():
             with self.subTest(architecture=architecture):
                 result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}')
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 requests = re.findall(r'--require-layout +(\S+)', rules)
-                self.assertEqual(requests, [layouts, layouts], 'one request per tier family')
+                self.assertEqual(requests, [layouts] * 2,
+                                 'one request per tier family')
                 self.assertNotIn('--require-layout tp4-rank0 tp4-rank1', rules)
 
     def test_qwen_tp1_layout_is_required_and_stamped_on_sparks_only(self):
         for architecture, layouts in (
-            ('121', DISJOINT_SPARK_LAYOUTS + ['tp1-rank0']),
+            ('121', [f'tp{world}-rank{rank}' for world in range(1, 5) for rank in range(world)]),
             ('120', ['rtx-tp1']),
         ):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
@@ -140,9 +141,26 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 if architecture != '121':
                     self.assertNotIn('tp1-rank0', stamp)
 
+    def test_compact_companions_reach_selected_spark_worlds_only(self):
+        for architecture in ('120', '121'):
+            with self.subTest(architecture=architecture):
+                result, rules = self.configure(
+                    f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}',
+                    '-DCUTEAFD_EXPERT_FAMILIES=glm:exl3-k45',
+                    '-DCUTEAFD_GENERIC_SPARK_COUNTS=glm:exl3=6')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                commands = [line for line in rules.splitlines() if 'package_exl3_aot.py build' in line]
+                glm = next(line for line in commands if '--geometry glm ' in line)
+                if architecture == '121':
+                    self.assertTrue(all('--compact-companions' in line for line in commands))
+                    self.assertIn('--profile tp6-width384 --profile tp6-width256', glm)
+                    self.assertNotIn('--profile tp3-', glm)
+                else:
+                    self.assertNotIn('--compact-companions', rules)
+
     def test_kimi_only_declares_qualified_roles(self):
-        for architecture, layouts in (('120', ['rtx-tp1']),
-                                      ('121', [f'tp6-rank{i}' for i in range(6)])):
+        for architecture, layouts in (('120', ['rtx-tp1', 'rtx-tp2']),
+                                      ('121', [f'tp{world}-rank{rank}' for world in (6, 7, 8) for rank in range(world)])):
             with self.subTest(architecture=architecture):
                 result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}',
                                                '-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23')
@@ -153,8 +171,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                     self.assertIn('--profile tp6-width512', rules)
         result, _ = self.configure('-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23',
                                    '-DCUTEAFD_GENERIC_SPARK_COUNTS=kimik3:exl3=4')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('supports TP6 only', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_tile_override_reaches_export_and_is_a_build_dependency(self):
         """An A/B override is a dependency, not just a command-line detail.
@@ -162,11 +179,11 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         Make never restates a custom command's line, so a changed capacity/tile
         selection has to move a file the export depends on.
         """
-        result, rules = self.configure('-DCUTEAFD_V41_EXL3_TILES=tp3-width768=16+80:64,256,64,256')
+        result, rules = self.configure('-DCUTEAFD_EXL3_TILES=tp3-width768=16+80:64,256,64,256')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn('--tile tp3-width768=16+80:64,256,64,256', rules)
         for family in ('k23', 'k34'):
-            stamp = f'v41_exl3_{family}_config.stamp'
+            stamp = f'exl3_dsv4p_{family}_config.stamp'
             self.assertIn(stamp, rules, f'{family} export must depend on its config stamp')
 
     def test_reconfiguring_a_tile_rewrites_the_config_stamp(self):
@@ -175,28 +192,28 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
             (root / 'CMakeLists.txt').write_text(harness())
 
             def stamps():
-                return {path.name: path.read_text() for path in build.rglob('v41_exl3_k*_config.stamp')}
+                return {path.name: path.read_text() for path in build.rglob('exl3_dsv4p_k*_config.stamp')}
 
             first = self.cmake(root, build, [])
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             before = stamps()
-            self.assertEqual(sorted(before), ['v41_exl3_k23_config.stamp',
-                                              'v41_exl3_k34_config.stamp'])
+            self.assertEqual(sorted(before), ['exl3_dsv4p_k23_config.stamp',
+                                              'exl3_dsv4p_k34_config.stamp'])
             # Reconfiguring with the same values must not churn the stamp, or every
             # build would pay for a full re-export.
             self.assertEqual(self.cmake(root, build, []).returncode, 0)
             self.assertEqual(stamps(), before)
             changed = self.cmake(root, build,
-                                 ['-DCUTEAFD_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
+                                 ['-DCUTEAFD_EXL3_TILES=tp3-width768=all:128,128,128,128'])
             self.assertEqual(changed.returncode, 0, changed.stdout + changed.stderr)
             after = stamps()
             self.assertNotEqual(after, before, 'a tile change must invalidate the export')
-            self.assertIn('tp3-width768=all:128,128,128,128', after['v41_exl3_k23_config.stamp'])
-            self.assertTrue(before['v41_exl3_k23_config.stamp'].endswith('tiles=\n'),
+            self.assertIn('tp3-width768=all:128,128,128,128', after['exl3_dsv4p_k23_config.stamp'])
+            self.assertTrue(before['exl3_dsv4p_k23_config.stamp'].endswith('tiles=\n'),
                             'a default configuration records no tiles')
             # Capacities and layouts move the stamp for both families too.
-            narrowed = self.cmake(root, build, ['-DCUTEAFD_V41_EXL3_CAPACITIES=1;16;80',
-                                                '-DCUTEAFD_V41_EXL3_TILES=tp3-width768=all:128,128,128,128'])
+            narrowed = self.cmake(root, build, ['-DCUTEAFD_EXL3_CAPACITIES=1;16;80',
+                                                '-DCUTEAFD_EXL3_TILES=tp3-width768=all:128,128,128,128'])
             self.assertEqual(narrowed.returncode, 0, narrowed.stdout + narrowed.stderr)
             self.assertNotEqual(stamps(), after)
 
@@ -211,7 +228,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         for example in documented:
             example = example.rstrip(',').strip('()')
             with self.subTest(example=example):
-                result, rules = self.configure(f'-DCUTEAFD_V41_EXL3_TILES={example}')
+                result, rules = self.configure(f'-DCUTEAFD_EXL3_TILES={example}')
                 self.assertEqual(result.returncode, 0, result.stdout[-500:] + result.stderr[-500:])
                 self.assertIn(f'--tile {example}', rules)
 
@@ -221,7 +238,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         self.assertEqual(len(documented), 2, f'expected both documented examples, got {documented}')
         for example in documented:
             with self.subTest(example=example):
-                parsed = package.tile_overrides([example], [1, 16, 80], 'spark')
+                parsed = package.tile_overrides([example], [1, 16, 80], 'spark', geometry='glm')
                 self.assertEqual(list(parsed), ['tp3-width768'])
                 self.assertIn(int(example.split(':')[0].split('=')[1].split('+')[0]
                                  if example.split(':')[0].split('=')[1] != 'all' else 1), [1, 16, 80])
@@ -230,7 +247,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         for value in ('tp3-width768=16:64,256,64', 'tp3-width768:64,256,64,256',
                       'tp3 width768 all:64,256,64,256', 'nonsense'):
             with self.subTest(value=value):
-                result, _ = self.configure(f'-DCUTEAFD_V41_EXL3_TILES={value}')
+                result, _ = self.configure(f'-DCUTEAFD_EXL3_TILES={value}')
                 self.assertNotEqual(result.returncode, 0, value)
                 self.assertIn('EXL3 tile override must be PROFILE=CAPACITIES', result.stderr)
 

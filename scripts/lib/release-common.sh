@@ -8,7 +8,126 @@ release_die() {
   exit 2
 }
 
-# Resolve total capacity, never free memory. Rust owns the literal default rule.
+# Resolve on the host that will run Docker. Mount the whole hub so snapshot
+# files' ../../blobs links and companion repositories remain visible.
+release_hub_mounts() {
+  local namespace="$1" site="$2" hf="$3" relative="$4" hub
+  RELEASE_HUB_SNAPSHOT="$(readlink -f "$hf/$relative")" || release_die "missing snapshot: $hf/$relative"
+  [[ -d "$RELEASE_HUB_SNAPSHOT" ]] || release_die "missing snapshot: $hf/$relative"
+  if find "$RELEASE_HUB_SNAPSHOT" -xtype l -print -quit | grep -q .; then
+    release_die "model snapshot has dangling links: $hf/$relative"
+  fi
+  if ((site)); then
+    hub="$(readlink -f "$hf/hub")"
+    [[ -d "$hub" ]] || release_die "missing hub: $hf/hub"
+    RELEASE_HUB_MOUNTS=(-v "$hub:$hub:ro")
+    [[ "$hf/hub" == "$hub" ]] || RELEASE_HUB_MOUNTS+=(-v "$hub:$hf/hub:ro")
+  else
+    [[ -d "$namespace/hf-home" ]] || release_die "missing namespace hub: $namespace/hf-home"
+    RELEASE_HUB_MOUNTS=(-v "$namespace:$namespace:ro")
+  fi
+}
+
+# CUDA and NVML can enumerate cards differently. UUID is the only join key;
+# querying the driver here creates no context or device allocation.
+release_cuda_total_bytes() {
+  python3 - "$1" <<'PYCAPACITY'
+import ctypes, sys, uuid
+try:
+    wanted = uuid.UUID(sys.argv[1].removeprefix('GPU-')).bytes
+    cuda = ctypes.CDLL('libcuda.so.1')
+    def checked(name, *args):
+        function = getattr(cuda, name)
+        function.restype = ctypes.c_int
+        code = function(*args)
+        if code:
+            raise ValueError(f'{name} failed with CUDA error {code}')
+    checked('cuInit', ctypes.c_uint(0))
+    count = ctypes.c_int()
+    checked('cuDeviceGetCount', ctypes.byref(count))
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        checked('cuDeviceGet', ctypes.byref(device), ctypes.c_int(ordinal))
+        identity = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid_v2', ctypes.byref(identity), device)
+        if bytes(identity) != wanted:
+            continue
+        total = ctypes.c_size_t()
+        checked('cuDeviceTotalMem_v2', ctypes.byref(total), device)
+        if total.value == 0:
+            raise ValueError('CUDA reported zero device capacity')
+        print(total.value)
+        break
+    else:
+        raise ValueError(f'no CUDA device matches UUID {sys.argv[1]}')
+except (OSError, AttributeError, ValueError) as error:
+    sys.exit(f'coordinator CUDA capacity: {error}')
+PYCAPACITY
+}
+
+# The architecture of the coordinator GPU with this UUID, spelled as
+# `cuteafd plan --coordinator-arch` takes it (sm_89, sm_120, ...), from the driver.
+release_cuda_coordinator_arch() {
+  python3 - "$1" <<'PYARCH'
+import ctypes, sys, uuid
+try:
+    wanted = uuid.UUID(sys.argv[1].removeprefix('GPU-')).bytes
+    cuda = ctypes.CDLL('libcuda.so.1')
+    def checked(name, *args):
+        function = getattr(cuda, name)
+        function.restype = ctypes.c_int
+        code = function(*args)
+        if code:
+            raise ValueError(f'{name} failed with CUDA error {code}')
+    checked('cuInit', ctypes.c_uint(0))
+    count = ctypes.c_int()
+    checked('cuDeviceGetCount', ctypes.byref(count))
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        checked('cuDeviceGet', ctypes.byref(device), ctypes.c_int(ordinal))
+        identity = (ctypes.c_ubyte * 16)()
+        checked('cuDeviceGetUuid_v2', ctypes.byref(identity), device)
+        if bytes(identity) != wanted:
+            continue
+        major, minor = ctypes.c_int(), ctypes.c_int()
+        # CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR (75) and _MINOR (76).
+        checked('cuDeviceGetAttribute', ctypes.byref(major), ctypes.c_int(75), device)
+        checked('cuDeviceGetAttribute', ctypes.byref(minor), ctypes.c_int(76), device)
+        print(f'sm_{major.value}{minor.value}')
+        break
+    else:
+        raise ValueError(f'no CUDA device matches UUID {sys.argv[1]}')
+except (OSError, AttributeError, ValueError) as error:
+    sys.exit(f'coordinator CUDA architecture: {error}')
+PYARCH
+}
+
+# The one architecture of these coordinator GPUs (comma-separated UUIDs), for a
+# deployment plan's `--coordinator-arch`. Fails on a driver error or a mix.
+release_coordinator_arch() {
+  local uuid arch first=""
+  local -a uuids
+  IFS=, read -r -a uuids <<<"$1"
+  ((${#uuids[@]})) || { echo "no coordinator GPU to read an architecture from" >&2; return 1; }
+  for uuid in "${uuids[@]}"; do
+    arch="$(release_cuda_coordinator_arch "$uuid")" || return 1
+    [[ -z "$first" || "$arch" == "$first" ]] || { echo "coordinator GPUs mix $first and $arch" >&2; return 1; }
+    first="$arch"
+  done
+  printf '%s\n' "$first"
+}
+
+# Plan flags for that architecture: none for SM120, the planner's default card
+# class, so its plans and their command lines stay as they were.
+release_coordinator_arch_args() {
+  local -n release_arch_args_out="$2"
+  local arch
+  arch="$(release_coordinator_arch "$1")" || release_die "cannot resolve the coordinator GPU architecture"
+  release_arch_args_out=()
+  [[ "$arch" == sm_120 ]] || release_arch_args_out=(--coordinator-arch "$arch")
+}
+
+# Resolve total capacity in bytes, never free memory. Rust owns the default rule.
 release_coordinator_profile() {
   local registry="${repo_root:?}/rust/crates/cuteafd-core/src/serving_capacity.rs"
   python3 - "$registry" "$1" "${2:-}" <<'PYPROFILE'
@@ -29,7 +148,7 @@ try:
         'LARGE_CARD_DEFAULT_CONCURRENCY'))
     if not (0 < threshold < 2**64 and 0 < small <= large <= 0xffffffff):
         raise ValueError('invalid capacity registry geometry')
-    physical = Decimal(sys.argv[2].strip()) * 2**20
+    physical = Decimal(sys.argv[2].strip())
     budget = Decimal(sys.argv[3]) * 2**30 if sys.argv[3] else physical
     if not all(value.is_finite() and 1 <= value < 2**64 for value in (physical, budget)):
         raise ValueError('GPU capacity must be finite, positive and representable in bytes')
@@ -270,9 +389,21 @@ release_gpu_device_args() {
   cuteafd_cdi_gpu_args "$1" || return 1
   printf '%s\n' "${CUTEAFD_CDI_ARGS[@]}"
 }
-# release_host_has_rdma HOST: HOST has at least one RDMA device (RoCE fabric).
+# LAN-only build seeds: GB10 hosts that compile, export and seal Spark slots but
+# never serve. They sit off the RoCE fabric (10 GbE), so bulk transfers to them go
+# over their LAN address and their sealed slots reach the Sparks through sparknest.
+# Keep in sync with scripts/build/build-resource.py LAN_SEEDS, scripts/hw/hwlock.py
+# ORDER and scripts/bench/wip-cards.py SEED_HOSTS (a script test checks).
+release_lan_seed_hosts=(kakapo cassowary)
+release_is_lan_seed() {
+  [[ " ${release_lan_seed_hosts[*]} " == *" $1 "* ]]
+}
+# release_host_has_rdma HOST: HOST is on the RoCE fabric: at least one RDMA port
+# is ACTIVE. A LAN-only build seed never counts, even with its adapters present
+# (cassowary's are down) or a private seed-to-seed link up.
 release_host_has_rdma() {
-  release_ssh "$1" 'ls /sys/class/infiniband 2>/dev/null | grep -q .'
+  ! release_is_lan_seed "$1" || return 1
+  release_ssh "$1" 'grep -qsx "4: ACTIVE" /sys/class/infiniband/*/ports/*/state'
 }
 # release_bulk_ssh HOST ADDR ARGS...: one bulk ssh leg (ADDR may be empty).
 release_bulk_ssh() {
@@ -281,49 +412,6 @@ release_bulk_ssh() {
   local -a route=()
   [[ -z "$addr" || "$addr" == "$host" ]] || route=(-o "HostName=$addr" -o "HostKeyAlias=$host")
   release_ssh "${release_bulk_ssh_opts[@]}" ${route[@]+"${route[@]}"} "$host" "$@"
-}
-
-# Inference images verify package payload hashes when built. Compare their
-# immutable manifests before changing services so all peers select one layout.
-release_exl3_package_identity() {
-  local revision="$1" manifest layout digest
-  manifest="$(cat)"
-  layout="$(jq -er --arg revision "$revision" '
-    if .schema == "cuteafd.exl3-package.v1" and .role == "spark"
-      and .sparkinfer_revision == $revision
-    then "disjoint"
-    else error("invalid Spark EXL3 package identity") end
-  ' <<<"$manifest")" || release_die "invalid Spark EXL3 package identity"
-  digest="$(printf '%s' "$manifest" | sha256sum | awk '{print $1}')"
-  printf '%s:%s\n' "$layout" "$digest"
-}
-
-# Compact Spark EXL3 package admission. Every physical rank r needs its
-# tp<degree>-rank<r>/m<capacity> package for every worker capacity up to the
-# launch capacity, with the exact shard width 2304/degree (1152 at TP2, 768 at
-# TP3). This runs in the per-host preflight loop, so a missing package fails
-# before any service change. TP2 is the default degree.
-release_validate_exl3_compact_variants() {
-  local capacity="$1" family="$2" tp="${3:-2}"
-  [[ "$tp" == 2 || "$tp" == 3 || "$tp" == 6 ]] || release_die "EXL3 variant admission supports TP2, TP3 or TP6, got TP$tp"
-  local width=$((2304 / tp))
-  [[ "$family" =~ ^k([23])([34])$ && ( "$family" == k23 || "$family" == k34 ) ]] || release_die "cannot resolve compact EXL3 package bit tiers"
-  local low="${BASH_REMATCH[1]}" high="${BASH_REMATCH[2]}"
-  jq -e --argjson capacity "$capacity" --argjson low "$low" --argjson high "$high" --argjson tp "$tp" --argjson width "$width" '
-    . as $manifest | .compute == [12,1] and
-    all([1,16,80,256,1024,4096][] | select(. <= $capacity); . as $m |
-      all(range(0; $tp); . as $rank |
-        [$manifest.variants[]? |
-          select(.directory == ("tp" + ($tp|tostring) + "-rank" + ($rank|tostring) + "/m" + ($m|tostring))) |
-          select(.capacity == $m and .intermediate == $width and .experts == 384
-                 and .top_k == 6 and .output_dtype == "bf16"
-                 and .bits == [$low,$high])] | length == 1))
-  ' >/dev/null || release_die "Spark EXL3 package lacks required TP$tp rank/capacity/shape/bit variants"
-}
-
-# Historical name: the TP2-degree call keeps working for older harnesses.
-release_validate_exl3_tp2_variants() {
-  release_validate_exl3_compact_variants "$1" "$2" 2
 }
 
 release_model_list_matches() {
@@ -435,6 +523,16 @@ release_prepare_api_key() {
   fi
 }
 
+# release_probe_url ADDR: the URL readiness probes reach a server listening on
+# ADDR (HOST:PORT). A wildcard or empty host is reached on loopback; any other
+# host is the only address the server binds, so loopback would never answer.
+release_probe_url() {
+  local addr="$1" host
+  host="${addr%:*}"
+  case "$host" in ""|0.0.0.0|"::"|"[::]") host=127.0.0.1 ;; esac
+  printf 'http://%s:%s' "$host" "${addr##*:}"
+}
+
 release_api_curl() {
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     # Keep the key out of argv/process listings. Health probes do not need it.
@@ -492,7 +590,7 @@ release_serving_docker_args() {
   user="$(id -un)"
   primary_group="$(id -g)"
   read -ra groups <<<"$(id -G)"
-  RELEASE_SERVING_ARGS=(--user "$(id -u):$(id -g)"
+  RELEASE_SERVING_ARGS=(--init --user "$(id -u):$(id -g)"
     -e "USER=$user" -e "LOGNAME=$user" -e HOME=/tmp/cuteafd-home
     -e HF_HOME=/hf -e CUTEAFD_BENCH_DIR=/run/cuteafd/bench
     -e TORCH_EXTENSIONS_DIR=/tmp/cuteafd-home/torch-extensions
@@ -503,6 +601,11 @@ release_serving_docker_args() {
   # Never create it here: absent storage stays unknown without root-owned state.
   if [[ -d /srv/sparknest/run ]]; then
     RELEASE_SERVING_ARGS+=(--mount type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly)
+  fi
+  # FUSE connection limits (max_background): mapped tables read from a remote
+  # FUSE copy keep at most that many reads in flight. Read-only, host uid owned.
+  if [[ -d /sys/fs/fuse/connections ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/sys/fs/fuse/connections,dst=/sys/fs/fuse/connections,readonly)
   fi
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do
@@ -554,17 +657,26 @@ PYSTATE
 # the PROFILE comment in scripts/launch/run-family.sh.
 # release_profile_docker_args sets RELEASE_PROFILE_ARGS (docker environment and
 # mount arguments, for the coordinator and every Spark worker) in the caller's
-# shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST.
-release_profile_switches='census transport-timing expert-timing expert-routes draft-timing nsys ncu'
+# shell, so a bad value stops the launch. Arguments: PROFILE PROFILE_DIR HOST
+# [PROFILE_SPARK].
+release_profile_switches='census transport-timing expert-timing expert-routes route-census draft-timing nsys ncu'
 # nsys sessions are per container; the window is opened and closed with
 # `docker exec <coordinator> nsys start|stop --session=$RELEASE_NSYS_SESSION`.
 RELEASE_NSYS_SESSION=cuteafd-profile
 release_profile_docker_args() {
-  local profile="$1" dir="$2" host="$3" switch
+  local profile="$1" dir="$2" host="$3" spark="${4-}" switch
   local -a switches=()
   RELEASE_PROFILE_ARGS=()
+  if [[ -z "$profile" && -z "$spark" ]]; then
+    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE or PROFILE_SPARK"
+    return 0
+  fi
   if [[ -z "$profile" ]]; then
-    [[ -z "$dir" ]] || release_die "PROFILE_DIR needs PROFILE"
+    # PROFILE_SPARK alone: every container still gets the host name and the
+    # shared PROFILE_DIR mount (release_profile_spark_wrapper checks the rest).
+    [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_SPARK=$spark needs an absolute PROFILE_DIR (the report goes there)"
+    [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+    RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_PROFILE_HOST=$host" -v "$dir:$dir" -e "CUTEAFD_PROFILE_DIR=$dir")
     return 0
   fi
   [[ "$profile" =~ ^[a-z-]+(,[a-z-]+)*$ ]] ||
@@ -578,8 +690,22 @@ release_profile_docker_args() {
       expert-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_TIMING=1) ;;
       expert-routes) [[ -n "$dir" ]] || release_die "PROFILE=expert-routes needs PROFILE_DIR (the route log goes there)"
         RELEASE_PROFILE_ARGS+=(-e CUTEAFD_EXPERT_ROUTES=1) ;;
+      route-census) [[ -n "$dir" ]] || release_die "PROFILE=route-census needs PROFILE_DIR (the census goes there)"
+        RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS=$dir/route-census-$host.json")
+        # Its dump interval in decode steps (default 1000), from the launching environment.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_STEPS:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_STEPS" =~ ^[1-9][0-9]{0,8}$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_STEPS must be a positive decode step count"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_STEPS=$CUTEAFD_V41_ROUTE_CENSUS_STEPS")
+        fi
+        # Its trace window in decode steps (default 64, 0 = no trace), likewise.
+        if [[ -n "${CUTEAFD_V41_ROUTE_CENSUS_WINDOW:-}" ]]; then
+          [[ "$CUTEAFD_V41_ROUTE_CENSUS_WINDOW" =~ ^(0|[1-9][0-9]{0,8})$ ]] ||
+            release_die "CUTEAFD_V41_ROUTE_CENSUS_WINDOW must be a decode step count (0: no trace)"
+          RELEASE_PROFILE_ARGS+=(-e "CUTEAFD_V41_ROUTE_CENSUS_WINDOW=$CUTEAFD_V41_ROUTE_CENSUS_WINDOW")
+        fi ;;
       draft-timing) RELEASE_PROFILE_ARGS+=(-e CUTEAFD_DRAFT_TIMING=1) ;;
-      # Process wrappers (release_profile_wrapper), coordinator only.
+      # Process wrappers (release_profile_wrapper); Spark workers take PROFILE_SPARK.
       nsys|ncu) [[ -n "$dir" ]] || release_die "PROFILE=$switch needs PROFILE_DIR (the report goes there)" ;;
       *) release_die "unknown PROFILE switch $switch (known: ${release_profile_switches// /, })" ;;
     esac
@@ -694,11 +820,13 @@ release_profile_container_wrapper() {
 # ...`), and RELEASE_PROFILE_WRAPPER_DOCKER_ARGS (docker arguments before the
 # image: the profiler replaces the wrapper shell before serving, so `docker stop`
 # sends it SIGINT and waits up to 300 s for the report; the cuteafd.graceful-stop
-# label makes smoke teardown and release_stop_local_container use that stop
-# before removing), both empty unless PROFILE names nsys or ncu. Coordinator
-# only: a Spark worker asked to wrap fails closed (Spark workers still get the
-# environment switches from release_profile_docker_args). Call after that helper,
-# which has validated PROFILE and PROFILE_DIR.
+# label makes smoke teardown, release_stop_local_container and
+# release_stop_remote_containers use that stop before removing), both empty
+# unless PROFILE names nsys or ncu. This is the coordinator's wrapper: a Spark
+# role fails closed here (Spark workers take PROFILE_SPARK through
+# release_profile_spark_wrapper, and the environment switches from
+# release_profile_docker_args). Call after that helper, which has validated
+# PROFILE and PROFILE_DIR.
 # The profiler binary is not chosen here. The host install and the image install
 # differ (the dev image has ncu at /opt/nvidia/nsight-compute/<version>/ncu, which
 # may or may not be linked from /usr/local/bin/ncu). The wrapper command resolves
@@ -707,75 +835,161 @@ release_profile_container_wrapper() {
 # and SM activity): `all` samples every GPU the container sees (use this), or an
 # index list in nsys's own device order, which is not CUDA's or nvidia-smi's
 # (`nsys profile --gpu-metrics-devices=help` lists it).
-# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS.
+# PROFILE_NCU_SKIP=N skips the first N launches that match PROFILE_NCU_KERNEL
+# (`ncu --launch-skip`), so the replayed ones are past readiness.
+# Arguments: PROFILE PROFILE_DIR HOST ROLE NCU_KERNEL NCU_COUNT NCU_SET NSYS_GPU_METRICS NCU_SKIP.
 release_profile_wrapper() {
-  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}"
+  local profile="$1" dir="$2" host="$3" role="$4" kernel="${5:-}" count="${6:-}" set="${7:-}" metrics="${8:-}" skip="${9:-}"
   RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
   local wrapped=
   [[ ",$profile," == *,nsys,* ]] && wrapped=nsys
   [[ ",$profile," == *,ncu,* ]] && wrapped=ncu
   if [[ -z "$wrapped" ]]; then
-    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+    [[ -z "$kernel$count$set$skip" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET/SKIP need PROFILE=ncu"
     [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
     return 0
   fi
   [[ "$role" == coordinator ]] ||
-    release_die "PROFILE=$wrapped wraps the coordinator only; a Spark worker cannot run it (role $role)"
+    release_die "PROFILE=$wrapped wraps the coordinator only; a Spark worker takes PROFILE_SPARK (role $role)"
   [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE=$wrapped needs an absolute PROFILE_DIR"
   [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  _release_profile_tool_wrapper PROFILE "$wrapped" "$dir/$wrapped-$host" "$kernel" "$count" "$set" "$skip" "$metrics"
+}
+
+# Builds RELEASE_PROFILE_WRAPPER(_DOCKER_ARGS) for one container. KEY is the
+# setting family the messages name (PROFILE or PROFILE_SPARK); OUTPUT is the
+# report path without its suffix. Arguments: KEY TOOL OUTPUT NCU_KERNEL NCU_COUNT
+# NCU_SET NCU_SKIP NSYS_GPU_METRICS.
+_release_profile_tool_wrapper() {
+  local key="$1" tool="$2" output="$3" kernel="$4" count="$5" set="$6" skip="$7" metrics="$8"
   RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=(--stop-signal SIGINT --stop-timeout 300 --label cuteafd.graceful-stop=1)
-  if [[ "$wrapped" == nsys ]]; then
-    [[ -z "$kernel$count$set" ]] || release_die "PROFILE_NCU_KERNEL/COUNT/SET need PROFILE=ncu"
+  if [[ "$tool" == nsys ]]; then
+    [[ -z "$kernel$count$set$skip" ]] || release_die "${key}_NCU_KERNEL/COUNT/SET/SKIP need $key=ncu"
     # Collection starts paused (nsys start/stop through docker exec open and
     # close the window); stopping the session or the container writes the report.
-    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt --cuda-graph-trace=node \
-      --sample=none --cpuctxsw=none --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
-      "--output=$dir/nsys-$host" --force-overwrite=true
+    # PROFILE_NSYS_CPU=on adds CPU call-stack sampling and context switches
+    # (host-side stalls: reactor, gather and copy threads); off by default
+    # because sampling perturbs host timing.
+    local graph_trace="${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-node}"
+    case "$graph_trace" in
+      node|graph) ;;
+      *) release_die "${key}_NSYS_GRAPH_TRACE must be node or graph" ;;
+    esac
+    local cpu=(--sample=none --cpuctxsw=none)
+    case "${RELEASE_PROFILE_NSYS_CPU:-}" in
+      ''|off) ;;
+      on) cpu=(--sample=process-tree --cpuctxsw=process-tree --backtrace=dwarf) ;;
+      *) release_die "${key}_NSYS_CPU must be on or off" ;;
+    esac
+    release_profile_container_wrapper nsys profile --trace=cuda,nvtx,osrt "--cuda-graph-trace=$graph_trace" \
+      "${cpu[@]}" --start-later=true "--session-new=$RELEASE_NSYS_SESSION" \
+      "--output=$output" --force-overwrite=true
     if [[ -n "$metrics" ]]; then
       [[ "$metrics" == all || "$metrics" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
-        release_die "PROFILE_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
+        release_die "${key}_NSYS_GPU_METRICS must be all or an nsys GPU index list (e.g. 0 or 0,1)"
       RELEASE_PROFILE_WRAPPER+=("--gpu-metrics-devices=$metrics")
     fi
     return 0
   fi
-  [[ -z "$metrics" ]] || release_die "PROFILE_NSYS_GPU_METRICS needs PROFILE=nsys"
-  [[ -n "$kernel" ]] || release_die "PROFILE=ncu needs PROFILE_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
-  [[ "$kernel" != *[[:space:]]* ]] || release_die "PROFILE_NCU_KERNEL must not contain whitespace"
-  count="${count:-20}" set="${set:-full}"
-  [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "PROFILE_NCU_COUNT must be 1..9999"
-  [[ "$set" =~ ^[a-z_]+$ ]] || release_die "PROFILE_NCU_SET must be an ncu section set name (e.g. full, basic)"
-  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" --launch-count "$count" --set "$set" \
-    --graph-profiling node --target-processes all --export "$dir/ncu-$host" --force-overwrite
+  [[ -z "$metrics" ]] || release_die "${key}_NSYS_GPU_METRICS needs $key=nsys"
+  [[ -z "${RELEASE_PROFILE_NSYS_CPU:-}" ]] || release_die "${key}_NSYS_CPU needs $key=nsys"
+  [[ -z "${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-}" ]] || release_die "${key}_NSYS_GRAPH_TRACE needs $key=nsys"
+  [[ -n "$kernel" ]] || release_die "$key=ncu needs ${key}_NCU_KERNEL (a kernel-name regex); it replays every matched launch"
+  [[ "$kernel" != *[[:space:]]* ]] || release_die "${key}_NCU_KERNEL must not contain whitespace"
+  count="${count:-20}" set="${set:-full}" skip="${skip:-0}"
+  [[ "$count" =~ ^[1-9][0-9]{0,3}$ ]] || release_die "${key}_NCU_COUNT must be 1..9999"
+  [[ "$set" =~ ^[a-z_]+$ ]] || release_die "${key}_NCU_SET must be an ncu section set name (e.g. full, basic)"
+  [[ "$skip" =~ ^(0|[1-9][0-9]{0,8})$ ]] || release_die "${key}_NCU_SKIP must be 0..999999999 matched launches"
+  local -a skip_args=()
+  [[ "$skip" == 0 ]] || skip_args=(--launch-skip "$skip")
+  release_profile_container_wrapper ncu --kernel-name "regex:$kernel" ${skip_args[@]+"${skip_args[@]}"} \
+    --launch-count "$count" --set "$set" \
+    --graph-profiling node --target-processes all --export "$output" --force-overwrite
+}
+
+# PROFILE_SPARK=nsys|ncu wraps the expert worker of each Spark rank listed in
+# PROFILE_SPARK_RANKS (comma list, default 0: every profiled rank perturbs the
+# exchange) the way PROFILE wraps the coordinator, independently of it: same
+# in-container binary resolution, host user, no capabilities, graceful-stop
+# label. Reports are PROFILE_DIR/<tool>-HOST-rankR.<nsys-rep|ncu-rep> on the
+# Spark. nsys starts paused under session cuteafd-profile in the worker container
+# (`ssh HOST docker exec WORKER nsys start|stop --session=cuteafd-profile`);
+# PROFILE_SPARK_NSYS_GPU_METRICS samples the GB10 (all, or nsys's index list).
+# ncu replays PROFILE_SPARK_NCU_COUNT (default 20) launches matching the required
+# regex PROFILE_SPARK_NCU_KERNEL after skipping PROFILE_SPARK_NCU_SKIP matching
+# launches (default 0), collecting PROFILE_SPARK_NCU_SET (default full); its
+# report is written when the worker stops (`docker stop`, never `rm -f`).
+# Sets RELEASE_PROFILE_WRAPPER(_DOCKER_ARGS) for RANK, empty when RANK is not
+# selected; an empty RANK only validates. Every value is checked on every call,
+# so the first call stops a bad launch before any worker starts.
+# Arguments: PROFILE_SPARK RANKS PROFILE_DIR HOST RANK WORLD NCU_KERNEL NCU_COUNT
+# NCU_SET NCU_SKIP NSYS_GPU_METRICS.
+release_profile_spark_wrapper() {
+  local tool="$1" ranks="$2" dir="$3" host="$4" rank="$5" world="$6"
+  local kernel="${7:-}" count="${8:-}" set="${9:-}" skip="${10:-}" metrics="${11:-}" selected listed
+  local -a listed_ranks=()
+  local -A seen=()
+  RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
+  if [[ -z "$tool" ]]; then
+    [[ -z "$ranks$kernel$count$set$skip$metrics" ]] ||
+      release_die "PROFILE_SPARK_RANKS/NCU_*/NSYS_GPU_METRICS need PROFILE_SPARK"
+    return 0
+  fi
+  [[ "$tool" == nsys || "$tool" == ncu ]] || release_die "PROFILE_SPARK must be nsys or ncu"
+  [[ "$dir" =~ ^/[A-Za-z0-9._/-]+$ ]] || release_die "PROFILE_SPARK=$tool needs an absolute PROFILE_DIR (the report goes there)"
+  [[ "$world" =~ ^[0-9]+$ ]] && ((world > 0)) || release_die "PROFILE_SPARK=$tool needs Spark expert workers (SPARK_COUNT=$world)"
+  ranks="${ranks:-0}"
+  [[ "$ranks" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || release_die "PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)"
+  IFS=, read -ra listed_ranks <<<"$ranks"
+  selected=0
+  for listed in "${listed_ranks[@]}"; do
+    [[ "$listed" == 0 || "$listed" != 0* ]] || release_die "PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)"
+    ((10#$listed < world)) || release_die "PROFILE_SPARK_RANKS names rank $listed; this launch has ranks 0..$((world - 1))"
+    [[ -z "${seen[$listed]:-}" ]] || release_die "PROFILE_SPARK_RANKS lists rank $listed twice"
+    seen[$listed]=1
+    [[ "$listed" != "$rank" ]] || selected=1
+  done
+  # Validate the tool's own settings even when this rank is not profiled.
+  _release_profile_tool_wrapper PROFILE_SPARK "$tool" "$dir/$tool-x" "$kernel" "$count" "$set" "$skip" "$metrics"
+  RELEASE_PROFILE_WRAPPER=() RELEASE_PROFILE_WRAPPER_DOCKER_ARGS=()
+  ((selected)) || return 0
+  [[ "$host" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || release_die "invalid profile host: $host"
+  _release_profile_tool_wrapper PROFILE_SPARK "$tool" "$dir/$tool-$host-rank$rank" "$kernel" "$count" "$set" "$skip" "$metrics"
 }
 
 # Shared key grammar for release lifecycle scripts and the family launcher.
 release_known_key() {
   case "$1" in
     FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
-    EXLR8_MANIFEST) return 0 ;; # Published EXLR8 manifest name; builds derive EXLR8 programs from it.
-    EXLR8_DENSE_FROM) return 0 ;;
+    EXLR8_MANIFEST|EXLR8_PREFILL_ACTIVATIONS) return 0 ;; # Published native EXLR8 selection and opt-in prefill numerics.
     SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|SPECULATOR_DRAFTS|SPECULATOR_FP8|SPECULATION_TRACE) return 0 ;;
     DRAFT_SURVIVAL_LENGTHS|DRAFT_POLICY|DRAFT_ROW_COST) return 0 ;;
-    MAPPED_SCALE_PRELOAD_GIB|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
-    GLM5_FLASH_FP8_MODEL_ID|GLM5_FLASH_FP8_MODEL_REVISION|GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_FP8_MODEL_ID|GLMF_FP8_MODEL_REVISION|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
+    CUDA_MODULE_LOADING) return 0 ;; # V4.1 coordinator CUDA module loading (LAZY or EAGER).
+    GPU_EXPERT_TIER|GPU_EXPERT_TIER_PROFILE) return 0 ;; # V4.1 GPU expert tier and its route profile.
+    MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
+    GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|SPARK_STAGING|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
+    EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
     GLM5_FLASH_DRAFT_LINEAR) return 0 ;;
     GLM5_FLASH_TARGET_HEAD) return 0 ;;
     TARGET_HEAD) return 0 ;;
     GLM5_FLASH_EXL3_SCHEDULE) return 0 ;;
-    RDMA_BOND_BALANCE|HOST_ISA|TP_PLACEMENT) return 0 ;;
+    RDMA_BOND_BALANCE|HOST_ISA) return 0 ;;
     GLM5_FLASH_KDA_STATE) return 0 ;;
     GLM5_FLASH_PREFIX_MARKS) return 0 ;;
     GLM5_FLASH_REPLAY_RECORDS) return 0 ;;
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
-    GLM5_FLASH_PREFILL_BATCH) return 0 ;;
+    GLM5_FLASH_PREFILL_BATCH|PREFILL_PACKING) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK|GLM5_FLASH_REMOTE_DRAFTER) return 0 ;;
-    PROBE_DUMP_ROOT|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
-    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NSYS_GPU_METRICS|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
+    DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
+    PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
+    PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|LOOP_ABORT_RUN|LOOP_ABORT_COPIES|LOOP_FAST_SPAN|LOOP_FAST_COPIES|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -794,7 +1008,7 @@ release_spark_host_rows() {
     release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
-    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
+    [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
       release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
   fi
   for host in "${hosts[@]}"; do
@@ -805,7 +1019,7 @@ release_spark_host_rows() {
       kiwi) index=4 ;; rhea) index=5 ;; moa) index=6 ;;
       *)
         lane_a= lane_b=
-        for index in {0..5}; do
+        for index in {0..7}; do
           key="SPARK_${index}_HOST"
           configured_host="${!key:-}"
           if [[ "$configured_host" == "$host" ]]; then
@@ -919,21 +1133,15 @@ except (OSError, ValueError, KeyError, TypeError):
 ' "$index" "$state" "$kda" "$geometry" >/dev/null 2>&1
 }
 
-# Header-only eligibility; the Rust planner validates the complete tower contract.
+# Absence alone disables auto. The planner maps the checkpoint's declared tower
+# kind and refuses unsupported config, headers or geometry rather than hiding it.
 release_resolve_audio_mode() {
   local mode="$1" snapshot="$2"
   [[ "$mode" == auto ]] || { printf '%s' "$mode"; return; }
-  python3 - "$snapshot" <<'PY'
+  python3 -I - "$snapshot" <<'PY'
 import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-try:
-    c = json.loads((p / "config.json").read_text())
-    qualified = (c.get("model_type") == "mimo_v2" and c.get("hidden_size") in (4096, 6144)
-                 and bool(c.get("audio_config")) and (p / "audio_tokenizer/config.json").is_file()
-                 and (p / "audio_tokenizer/model.safetensors").is_file())
-except (OSError, ValueError):
-    qualified = False
-print("auto" if qualified else "off")
+c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
+print("auto" if c.get("audio_config") is not None else "off")
 PY
 }
 
@@ -969,15 +1177,14 @@ release_load_config() {
   TP2_ATTENTION=off
   TP2_QUERY_PROJECTION=off
   TP2_OUTPUT_PROJECTION=off
-  TP2_DSPARK_EXPERTS=off
+  # Resolve the implicit default once the actual RTX count is selected.
+  TP2_DSPARK_EXPERTS=
   DSPARK_DRAFT_POLICY=adaptive
   DSPARK_DRAFT_LIMIT=
   V41_FP8_HEAD=
   RTX_EXPERT_LAYERS=auto
   RTX_GPUS=auto
-  COORDINATOR_GPU=0
-  COORDINATOR_GPU_UUID=
-  COORDINATOR_GPU_PCI_BUS_ID=
+  COORDINATOR_GPUS=
   COORDINATOR_GPU_HEADROOM_GIB=8
   COORDINATOR_GPU_BUDGET_GIB=
   POOL_TOKENS=
@@ -989,12 +1196,19 @@ release_load_config() {
   ENABLE_BENCH=off
   MEMORY_RESERVATION=
   MAX_CONTEXT_TOKENS=1048576
-  MAX_OUTPUT_TOKENS=393216
+  MAX_OUTPUT_TOKENS=131072
+  KV_DECODE_RESERVE_CHUNK=
+  KV_RESERVE_DRAIN_BUFFER=
+  KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS=
+  LOOP_ABORT_RUN=
+  LOOP_ABORT_COPIES=
+  LOOP_FAST_SPAN=
+  LOOP_FAST_COPIES=
   HTTP_QUEUE_DEPTH=
   HTTP_QUEUE_WAIT_MS=25000
   CONCURRENCY=
   RELEASE_CONCURRENCY_EXPLICIT=0
-  PREFIX_CACHE_ENTRIES=20
+  PREFIX_CACHE_ENTRIES=auto
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
   SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -1017,7 +1231,15 @@ release_load_config() {
   PROFILE_NCU_KERNEL=
   PROFILE_NCU_COUNT=
   PROFILE_NCU_SET=
+  PROFILE_NCU_SKIP=
   PROFILE_NSYS_GPU_METRICS=
+  PROFILE_SPARK=
+  PROFILE_SPARK_RANKS=
+  PROFILE_SPARK_NCU_KERNEL=
+  PROFILE_SPARK_NCU_COUNT=
+  PROFILE_SPARK_NCU_SET=
+  PROFILE_SPARK_NCU_SKIP=
+  PROFILE_SPARK_NSYS_GPU_METRICS=
   PROFILE_EXPERT_INPUT_SAMPLE=
   PROFILE_EXPERT_ROUTE_WEIGHTS=
   ADDR=0.0.0.0:8000
@@ -1036,7 +1258,7 @@ release_load_config() {
   local wip_env="${WIP_INSTANCE-}" wip_root_env="${WIP_ROOT-}"
   WIP_ROOT=
   WIP_INSTANCE=
-  for release_i in {0..5}; do
+  for release_i in {0..7}; do
     printf -v "SPARK_${release_i}_HOST" '%s' ""
     printf -v "SPARK_${release_i}_LANE_A" '%s' ""
     printf -v "SPARK_${release_i}_LANE_B" '%s' ""
@@ -1076,7 +1298,7 @@ release_load_config() {
   [[ -z "$hosts_env" ]] || SPARK_HOSTS="$hosts_env"
   [[ -z "$SPARK_COUNT$SPARK_HOSTS" ]] || RELEASE_SPARK_COUNT_EXPLICIT=1
   RELEASE_AVAILABLE_SPARKS=0
-  for release_i in {0..5}; do
+  for release_i in {0..7}; do
     local host_key="SPARK_${release_i}_HOST"
     [[ -n "${!host_key:-}" ]] || break
     RELEASE_AVAILABLE_SPARKS=$((RELEASE_AVAILABLE_SPARKS + 1))
@@ -1139,23 +1361,15 @@ release_load_config() {
     RTX_EXPERT_LAYERS="$(release_onboard "$RTX_EXPERT_LAYERS" "$MODEL_ID" "$MODEL_REVISION")" || return 2
   fi
   case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
-  [[ "$COORDINATOR_GPU" =~ ^[0-9]+$ ]] || release_die "COORDINATOR_GPU must be a non-negative host GPU index"
-  [[ -z "$COORDINATOR_GPU_UUID" || "$COORDINATOR_GPU_UUID" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
-    release_die "COORDINATOR_GPU_UUID must be empty or a physical NVIDIA GPU UUID"
-  [[ -z "$COORDINATOR_GPU_PCI_BUS_ID" || "$COORDINATOR_GPU_PCI_BUS_ID" =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] ||
-    release_die "COORDINATOR_GPU_PCI_BUS_ID must be empty or a full PCI bus ID"
-  [[ -z "$COORDINATOR_GPU_UUID" && -z "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-    [[ -n "$COORDINATOR_GPU_UUID" && -n "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-    release_die "COORDINATOR_GPU_UUID and COORDINATOR_GPU_PCI_BUS_ID must be set together"
   if ((RELEASE_CONCURRENCY_EXPLICIT)); then
     if [[ "$mode" == stop ]]; then
       [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
     else
-      [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+      [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
     fi
   fi
-  [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] ||
-    release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
+  [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] ||
+    release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
   [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] || release_die "PREFILL_BATCH_TOKENS must be non-negative"
   if [[ "$mode" == launch ]]; then
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
@@ -1174,15 +1388,19 @@ release_load_config() {
   release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
-  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS MAX_OUTPUT_TOKENS; do
+  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS KV_DECODE_RESERVE_CHUNK; do
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"
   done
+  # MAX_OUTPUT_TOKENS <= 0: output is bounded only by the context left after the prompt.
+  [[ -z "$MAX_OUTPUT_TOKENS" || "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer"
+  [[ -z "$KV_RESERVE_DRAIN_BUFFER" || "$KV_RESERVE_DRAIN_BUFFER" =~ ^[0-9]+$ ]] ||
+    release_die "KV_RESERVE_DRAIN_BUFFER must be a non-negative integer"
+  [[ -z "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" || "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" =~ ^(-1|[0-9]+)$ ]] ||
+    release_die "KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS must be -1 or a non-negative integer"
   if [[ "$mode" == launch ]]; then
     [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
       release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
-    [[ -z "$MAX_OUTPUT_TOKENS" ]] || ((MAX_OUTPUT_TOKENS <= 393216)) ||
-      release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
   fi
   if [[ "$mode" == launch && -n "$KV_POOL_TOKENS" ]]; then
     ((KV_POOL_TOKENS % 64 == 0)) || release_die "KV_POOL_TOKENS must be a multiple of 64"
@@ -1203,7 +1421,7 @@ release_load_config() {
   if [[ "$mode" == launch ]]; then
     release_validate_spark_topology
 
-    [[ "$SPARK_COUNT" =~ ^[0-6]$ ]] || release_die "SPARK_COUNT must be in 0..6"
+    [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
     for ((release_i = 0; release_i < spark_required; release_i++)); do
@@ -1280,38 +1498,53 @@ release_validate_stop_config() {
   done
 }
 
-release_resolve_coordinator_gpu_identity() {
-  local selector gpu_line observed_index observed_uuid observed_pci
-  selector="${COORDINATOR_GPU_PCI_BUS_ID:-$COORDINATOR_GPU}"
-  gpu_line="$(
-    nvidia-smi --id="$selector" \
-      --query-gpu=index,uuid,pci.bus_id \
-      --format=csv,noheader,nounits
-  )" || release_die "cannot resolve coordinator GPU selector: $selector"
-  [[ -n "$gpu_line" && "$gpu_line" != *$'\n'* ]] ||
-    release_die "coordinator GPU selector did not resolve to exactly one device: $selector"
-  IFS=, read -r observed_index observed_uuid observed_pci <<<"$gpu_line"
-  observed_index="$(release_trim "$observed_index")"
-  observed_uuid="$(release_trim "$observed_uuid")"
-  observed_pci="$(release_trim "$observed_pci")"
-  [[ "$observed_index" =~ ^[0-9]+$ ]] ||
-    release_die "coordinator GPU has an invalid host index: $observed_index"
-  [[ "$observed_uuid" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
-    release_die "coordinator GPU has an invalid physical UUID: $observed_uuid"
-  [[ "$observed_pci" =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] ||
-    release_die "coordinator GPU has an invalid PCI identity: $observed_pci"
-  if [[ -n "$COORDINATOR_GPU_UUID" ]]; then
-    [[ "$observed_uuid" == "$COORDINATOR_GPU_UUID" && "$observed_pci" == "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-      release_die "coordinator GPU PCI selector resolved to another physical device"
-  else
-    [[ "$observed_index" == "$COORDINATOR_GPU" ]] ||
-      release_die "coordinator GPU ordinal resolved to an unexpected device"
-  fi
-  COORDINATOR_GPU_UUID="$observed_uuid"
-  COORDINATOR_GPU_PCI_BUS_ID="$observed_pci"
-  RELEASE_COORDINATOR_GPU_UUID="$observed_uuid"
-  RELEASE_COORDINATOR_GPU_HOST_INDEX="$observed_index"
-  RELEASE_COORDINATOR_GPU_PCI_BUS_ID="$observed_pci"
+# release_resolve_coordinator_gpus SELECTORS COUNT: the coordinator GPUs a
+# launch uses, primary first, for every family and ./wip.sh. SELECTORS is
+# COORDINATOR_GPUS (one or two host indices, PCI bus ids or GPU UUIDs; empty
+# selects by index); COUNT is auto, 1 or 2, and an explicit list must name that
+# many. Each named GPU must exist and the two must differ. Sets the
+# RELEASE_COORDINATOR_GPU_{INDICES,UUIDS} arrays (logical order) and the
+# primary's RELEASE_COORDINATOR_GPU_{UUID,HOST_INDEX}.
+release_resolve_coordinator_gpus() {
+  local resolved index uuid pci
+  local -a extra=()
+  ((${dry_run_total_capacity:-0} == 0)) || extra=(--total-capacity)
+  resolved="$(python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" resolve --selectors "$1" --count "$2" ${extra[@]+"${extra[@]}"})" ||
+    exit 2
+  RELEASE_COORDINATOR_GPU_INDICES=() RELEASE_COORDINATOR_GPU_UUIDS=()
+  while read -r index uuid pci; do
+    RELEASE_COORDINATOR_GPU_INDICES+=("$index")
+    RELEASE_COORDINATOR_GPU_UUIDS+=("$uuid")
+  done <<<"$resolved"
+  ((${#RELEASE_COORDINATOR_GPU_UUIDS[@]})) || release_die "nvidia-smi reported no coordinator GPU"
+  RELEASE_COORDINATOR_GPU_UUID="${RELEASE_COORDINATOR_GPU_UUIDS[0]}"
+  RELEASE_COORDINATOR_GPU_HOST_INDEX="${RELEASE_COORDINATOR_GPU_INDICES[0]}"
+}
+
+# release_admit_coordinator_gpus UUID_CSV DEPLOYMENT_JSON [--reclaim-pid PID]...:
+# each selected GPU holds its logical device's planned fixed owners (the KV pool
+# sizes itself), crediting memory the container being replaced holds. Fails
+# before any container starts.
+release_admit_coordinator_gpus() {
+  local uuids="$1" deployment="$2"
+  shift 2
+  local -a extra=()
+  ((${dry_run_total_capacity:-0} == 0)) || extra=(--total-capacity)
+  python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" admit --uuids "$uuids" --deployment /dev/stdin ${extra[@]+"${extra[@]}"} "$@" \
+    <<<"$deployment" || exit 2
+}
+
+# release_coordinator_reclaim_args CONTAINER: --reclaim-pid for each process of
+# the coordinator a --restart replaces, so GPU memory it holds counts as free.
+release_coordinator_reclaim_args() {
+  local pid
+  RELEASE_RECLAIM_ARGS=()
+  docker container inspect "$1" >/dev/null 2>&1 || return 0
+  while IFS= read -r pid; do
+    pid="$(release_trim "$pid")"
+    [[ "$pid" =~ ^[0-9]+$ ]] && RELEASE_RECLAIM_ARGS+=(--reclaim-pid "$pid")
+  done < <(docker top "$1" -eo pid 2>/dev/null | tail -n +2 || true)
+  return 0
 }
 
 release_resolve_local_model_revision() {
@@ -1363,9 +1596,9 @@ release_spark_values() {
 # ---------------------------------------------------------------------------
 
 # Release and WIP must advertise the same compiled extra Spark roles. TP4 is
-# built separately; keep the qualified default until new roles have exports.
+# built separately; unequal worlds select deduplicated width artifacts.
 release_spark_tp_roles_default() {
-  printf '%s\n' 'tp2;tp3;tp6'
+  printf '%s\n' 'tp2;tp3;tp5;tp6;tp7;tp8'
 }
 
 release_spark_tp_roles_canonical() {
@@ -1378,8 +1611,8 @@ release_spark_tp_roles_canonical() {
   IFS=';' read -ra parts <<<"$raw"
   for entry in "${parts[@]}"; do
     case "$entry" in
-      tp2|tp3|tp6) ;;
-      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
+      tp2|tp3|tp5|tp6|tp7|tp8) ;;
+      *) release_die "$source_name accepts only tp2, tp3, tp5, tp6, tp7 and tp8, got: $entry" ;;
     esac
     for prior in ${selected[@]+"${selected[@]}"}; do
       [[ "$prior" != "$entry" ]] ||
@@ -1427,8 +1660,8 @@ release_spark_rank_map() {
 
 release_validate_spark_topology() {
   case "$SPARK_TP" in
-    ""|[1-6]) ;;
-    *) release_die "SPARK_TP must be in 1..6" ;;
+    ""|[1-8]) ;;
+    *) release_die "SPARK_TP must be in 1..8" ;;
   esac
   case "$SPARK_EP" in
     ""|1|2|3) ;;
@@ -1437,26 +1670,23 @@ release_validate_spark_topology() {
   [[ -n "$SPARK_TP" && -n "$SPARK_EP" || -z "$SPARK_TP" && -z "$SPARK_EP" ]] ||
     release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
   release_spark_topology_explicit || return 0
-
-  [[ "$SPARK_COUNT" =~ ^[1-6]$ ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..6"
-  if [[ "$EXPERT_FORMAT" == exl3 ]]; then
-    [[ "$SPARK_TP" == 3 && "$SPARK_EP" == 1 && "$SPARK_COUNT" == 3 ]] ||
-      release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native except compact EXL3 TP3EP1"
-    [[ "$SPARKINFER_EXL3" != disable ]] ||
-      release_die "compact EXL3 TP3EP1 requires SPARKINFER_EXL3=auto or force"
-    return 0
-  fi
+  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
+    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$SPARKINFER_EXL3" == disable ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARKINFER_EXL3=disable"
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
     release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
-  case "${SPARK_TP}x${SPARK_EP}" in
-    2x1|3x1|4x1|6x1|2x2|3x2|2x3) ;;
-    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP2/TP3/TP4/TP6 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
-  esac
+  local packages="$(dirname "${BASH_SOURCE[0]}")/../../python/tools/lib/spark_packages.py"
+  python3 -I - "$packages" "$SPARK_TP" "$SPARK_EP" <<'PYTOPOLOGY' || release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
+packages = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packages)
+tp, ep = map(int, sys.argv[2:])
+assert packages.ownership_topology(tp, ep), 'no shared width-class ownership topology'
+PYTOPOLOGY
 }
 
 release_hosts_csv() { release_spark_values HOST | paste -sd, -; }
@@ -1621,7 +1851,12 @@ for container in "$@"; do
   fi
   if [[ "$(docker inspect -f '{{.State.Running}}' "$container")" == true ]]; then
     echo "  $host: stopping $container"
-    docker stop -t 30 "$container" >/dev/null
+    # A profiled worker (PROFILE_SPARK) keeps its own stop signal and timeout.
+    if [[ "$(docker inspect -f '{{index .Config.Labels "cuteafd.graceful-stop"}}' "$container")" == 1 ]]; then
+      docker stop "$container" >/dev/null
+    else
+      docker stop -t 30 "$container" >/dev/null
+    fi
   else
     echo "  $host: removing stopped $container"
   fi
@@ -1874,13 +2109,9 @@ release_select_build_hosts() {
   done
 }
 
-# Native per-TP-rank routed weight for one 40-layer backbone layer, in bytes.
-# These are the exact tensor windows from the official checkpoint geometry:
-# 1,804,861,440 B/rank at TP4 raw, padded to a 640-wide kernel extent
-# (2,005,401,600 B); TP6 (384), TP2 (1152) and TP3 (768) need no padding, so
-# their values are the exact 2304/TP window times the uniform per-column cost
-# (1,804,861,440 * TP4/TP = 7,219,445,760 / TP). They are weight arithmetic only
-# and do not include workspace, staging or runtime headroom.
+# V4.1 routed weight per layer and rank, excluding runtime headroom.
+# Native payload and coded scales use the actual artifact resident extents.
+# Unequal worlds return the largest per-layer rank allocation for this bound.
 release_spark_layer_bytes() {
   local tp="$1" format="${2:-native}"
   if [[ "$format" == nvfp4 ]]; then
@@ -1895,22 +2126,42 @@ release_spark_layer_bytes() {
     return
   fi
   [[ "$format" == native ]] || release_die "unsupported Spark weight format: $format"
-  case "$tp" in
-    2) printf '%s\n' 3609722880 ;;
-    3) printf '%s\n' 2406481920 ;;
-    4) printf '%s\n' 2005401600 ;;
-    6) printf '%s\n' 1203240960 ;;
-    *) release_die "unsupported Spark TP degree: $1 (expected 2, 3, 4, or 6)" ;;
-  esac
+  local packages="$(dirname "${BASH_SOURCE[0]}")/../../python/tools/lib/spark_packages.py"
+  python3 -I - "$packages" "$tp" <<'PYWEIGHTS' || release_die "unsupported native Spark TP degree: $tp"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
+packages = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packages)
+def layer_bytes(artifact):
+    hidden, experts = 5120, 384
+    logical, stored = artifact.logical, artifact.stored
+    planes = (hidden * stored, 2 * stored * (2 * ((hidden // 32 + 3) // 4) + 1),
+              hidden * stored // 2, hidden * (2 * ((logical // 32 + 3) // 4) + 1))
+    return experts * sum(planes)
+print(max(map(layer_bytes, packages.native_spark_artifacts()[int(sys.argv[2])])))
+PYWEIGHTS
 }
 
 # Validate booleans independently of resolved GPU selection. Called again after
 # command-line overrides, before launcher operations that change services.
 release_validate_tp2_options() {
   local name
-  for name in TP2_ATTENTION TP2_QUERY_PROJECTION TP2_OUTPUT_PROJECTION TP2_DSPARK_EXPERTS; do
+  for name in TP2_ATTENTION TP2_QUERY_PROJECTION TP2_OUTPUT_PROJECTION; do
     case "${!name}" in on|off) ;; *) release_die "$name must be on or off" ;; esac
   done
+  case "$TP2_DSPARK_EXPERTS" in ''|on|off) ;; *) release_die "TP2_DSPARK_EXPERTS must be on or off" ;; esac
+}
+
+release_resolve_tp2_dspark_experts() {
+  local family="$1" rtx_gpus="$2"
+  if [[ -z "$TP2_DSPARK_EXPERTS" ]]; then
+    TP2_DSPARK_EXPERTS=off
+    if [[ "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
+      TP2_DSPARK_EXPERTS=on
+    fi
+  fi
+  [[ "$TP2_DSPARK_EXPERTS" != on || ( "$family" == deepseek_v41 && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
+    release_die "TP2_DSPARK_EXPERTS requires V4.1, two selected RTX GPUs and dSpark"
 }
 
 release_tp2_enabled() {
@@ -1989,3 +2240,13 @@ release_stage_wip_layout() {
   mv "$layout.tmp" "$layout"
 }
 
+
+# The shared KV reservation flags for whichever keys the configuration sets (issue #951).
+release_kv_reserve_args() {
+  local -n release_kv_out="$1"
+  release_kv_out=()
+  [[ -z "${KV_DECODE_RESERVE_CHUNK:-}" ]] || release_kv_out+=(--kv-decode-reserve-chunk "$KV_DECODE_RESERVE_CHUNK")
+  [[ -z "${KV_RESERVE_DRAIN_BUFFER:-}" ]] || release_kv_out+=(--kv-reserve-drain-buffer "$KV_RESERVE_DRAIN_BUFFER")
+  [[ -z "${KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS:-}" ]] ||
+    release_kv_out+=(--kv-early-termination-min-output-tokens "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS")
+}

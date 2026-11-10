@@ -66,6 +66,50 @@ impl<'de> Deserialize<'de> for MediaKey {
     }
 }
 
+/// Merge-2 image rows shared by processors, encoders and probe admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageTokenGeometry {
+    pub merge: u32,
+    pub row_markers: u32,
+}
+impl ImageTokenGeometry {
+    pub const MERGED: Self = Self { merge: 2, row_markers: 0 };
+    pub const ROW_MARKERS: Self = Self { merge: 2, row_markers: 1 };
+
+    pub fn extent(self, grid: [u32; 3]) -> Option<(usize, usize, usize)> {
+        let [t, h, w] = grid;
+        if t != 1 || self.merge == 0 || self.row_markers > 1 || h == 0 || w == 0
+            || h % self.merge != 0 || w % self.merge != 0 { return None; }
+        let (h, w) = ((h / self.merge) as usize, (w / self.merge) as usize);
+        Some((h, w, h.checked_mul(w.checked_add(self.row_markers as usize)?)?))
+    }
+}
+
+/// The encoder's PCM-to-feature geometry, independent of request batching.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AudioTokenGeometry {
+    #[default]
+    MimoRvq,
+    /// Causal patch stages produce one feature per product of patch strides.
+    PcmPatches { samples_per_token: usize },
+}
+impl AudioTokenGeometry {
+    pub fn is_mimo(&self) -> bool { *self == Self::MimoRvq }
+    pub fn tokens(self, samples: usize) -> Option<usize> {
+        if samples == 0 || samples > 7_200_000 { return None; }
+        match self {
+            Self::MimoRvq => {
+                if samples <= 480 { return None; }
+                let frames = samples / 240 + 1;
+                let codes = (frames / 6000) * 1500 + (frames % 6000).div_ceil(2).div_ceil(2);
+                Some(codes.div_ceil(4))
+            }
+            Self::PcmPatches { samples_per_token: 0 } => None,
+            Self::PcmPatches { samples_per_token } => Some(samples.div_ceil(samples_per_token)),
+        }
+    }
+}
+
 /// A contiguous span of media feature rows in the expanded native prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaSpan {
@@ -83,6 +127,34 @@ impl MediaSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_geometry_preserves_merged_families_and_row_markers() {
+        for h in (2..=110).step_by(2) {
+            for w in (2..=110).step_by(2) {
+                assert_eq!(ImageTokenGeometry::MERGED.extent([1, h, w]),
+                    Some(((h / 2) as usize, (w / 2) as usize, (h * w / 4) as usize)));
+                assert_eq!(ImageTokenGeometry::ROW_MARKERS.extent([1, h, w]),
+                    Some(((h / 2) as usize, (w / 2) as usize, (h / 2 * (w / 2 + 1)) as usize)));
+            }
+        }
+        for grid in [[0, 4, 4], [2, 4, 4], [1, 0, 4], [1, 3, 4], [1, 4, 3]] {
+            assert_eq!(ImageTokenGeometry::MERGED.extent(grid), None);
+            assert_eq!(ImageTokenGeometry::ROW_MARKERS.extent(grid), None);
+        }
+    }
+
+    #[test]
+    fn audio_patch_geometry_matches_all_stage_stride_boundaries() {
+        let patch = AudioTokenGeometry::PcmPatches { samples_per_token: 16 * 6 * 5 * 4 };
+        for samples in [1, 16, 96, 480, 481, 1919, 1920, 1921, 24000, 7_200_000] {
+            assert_eq!(patch.tokens(samples), Some(samples.div_ceil(1920)));
+        }
+        for invalid in [0, 7_200_001, usize::MAX] { assert_eq!(patch.tokens(invalid), None); }
+        assert_eq!(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }.tokens(1), None);
+        assert_eq!(AudioTokenGeometry::MimoRvq.tokens(480), None);
+        assert_eq!(AudioTokenGeometry::MimoRvq.tokens(24000), Some(7));
+    }
 
     #[test]
     fn full_key_and_span_round_trip() {

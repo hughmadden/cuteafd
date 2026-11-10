@@ -6,15 +6,23 @@ use std::collections::BTreeMap;
 
 pub const DEFAULT_POOL_TOKENS: u64 = 2 * 1_048_576;
 
-/// One mode parser for checkpoint residency, startup packing and native execution.
+/// One mode parser for checkpoint residency, startup packing and native execution
+/// (`CUTEAFD_V41_FP8_HEAD`): `off` keeps the BF16 head; `draft` adds an E4M3 copy
+/// for dSpark; `all` (default) keeps only the E4M3 copy, for both; `packed` keeps
+/// only the exact 12-bit copy of the BF16 head (`cuteafd_core::packed_head`):
+/// target logits read it exactly, dSpark its coarse plane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Fp8Head { Off, Draft, All }
+pub enum Fp8Head { Off, Draft, All, Packed }
+
+/// Vocabulary rows are hidden_size (5120) wide.
+const HEAD_WIDTH: u64 = 5120;
 
 impl Fp8Head {
     pub fn parse(mode: &str) -> Self {
         match mode {
             "off" | "0" | "bf16" => Self::Off,
             "draft" => Self::Draft,
+            "packed" => Self::Packed,
             _ => Self::All,
         }
     }
@@ -23,14 +31,28 @@ impl Fp8Head {
         Self::parse(&std::env::var("CUTEAFD_V41_FP8_HEAD").unwrap_or_default())
     }
 
-    pub fn target(self) -> bool { self == Self::All }
+    /// Target logits project through a resident copy (and its scratch), not BF16.
+    pub fn target(self) -> bool { matches!(self, Self::All | Self::Packed) }
+    /// dSpark projects through a resident copy.
     pub fn draft(self) -> bool { self != Self::Off }
 
     /// One E4M3 value and FP32 scales per 128-K block.
     pub fn packed_bytes(source: u64) -> u64 { source / 2 + source / 64 }
 
+    /// The exact 12-bit copy of `source` BF16 bytes: both planes, bases, row
+    /// pointers, an exception table of one entry per 1024 weights and the
+    /// pack's status, as the loader allocates them.
+    pub fn packed12_bytes(source: u64) -> u64 {
+        cuteafd_core::packed_head::PackedHeadLayout::bytes(source / (2 * HEAD_WIDTH), HEAD_WIDTH)
+    }
+
+    /// Peak while packing: the BF16 source and the copy's destination.
     pub fn load_bytes(self, source: u64) -> u64 {
-        source + if self.draft() { Self::packed_bytes(source) } else { 0 }
+        source + match self {
+            Self::Off => 0,
+            Self::Draft | Self::All => Self::packed_bytes(source),
+            Self::Packed => Self::packed12_bytes(source),
+        }
     }
 
     pub fn resident(self, source: u64) -> (u64, &'static str) {
@@ -38,15 +60,16 @@ impl Fp8Head {
             Self::Off => (source, "bf16"),
             Self::Draft => (self.load_bytes(source), "bf16+fp8-row128"),
             Self::All => (Self::packed_bytes(source), "fp8-row128"),
+            Self::Packed => (Self::packed12_bytes(source), "bf16-packed12"),
         }
     }
 }
 
-/// Native MXFP4 packer storage, including the padding of each intermediate
-/// slice. This applies to full RTX experts and each independently packed TP
-/// Spark/RTX slice; dividing a full layer's bytes misses TP4's 576->640 pad.
+/// Native MXFP4 packer storage from the measured storage policy. Full RTX
+/// experts and independently packed TP slices each retain their own scale bases.
 pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 {
-    experts * hidden * intermediate.div_ceil(128) * 128 * 51 / 32
+    crate::formats::scale_codes::expert_bytes(experts, hidden, intermediate)
+        .expect("validated V4.1 coded expert geometry")
 }
 
 /// NVFP4 native planes mirror `Nvfp4Side::plane_sizes`: fused FC1, FC2,
@@ -185,7 +208,7 @@ pub fn prefix_arena_bytes(slots: u64, dspark: bool, ranks: usize) -> Vec<u64> {
 /// Persistent dSpark windows and their prefill source staging, shared across
 /// lane workspaces. All three stages reside on the decoder GPU.
 pub fn dspark_cache_bytes(slots: u64, prefill_rows: u64) -> u64 {
-    3 * (slots * 128 * 528 + prefill_rows * 1024 + 384)
+    3 * (slots * 128 * 528 + prefill_rows * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES as u64)
 }
 
 /// Engram tables themselves remain host-mapped. Each lane retains one device
@@ -264,20 +287,26 @@ mod tests {
 
     #[test]
     fn snapshot_and_expert_placement_keep_physical_owners() {
-        assert_eq!(native_expert_bytes(384, 5120, 576), 2_005_401_600);
+        let (experts, hidden, logical) = (384u64, 5120u64, 576u64);
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
+        let payload = 3 * hidden * stored / 2;
+        let scales = 2 * stored * (1 + 2 * (hidden / 128))
+            + hidden * (1 + 2 * logical.div_ceil(128));
+        assert_eq!(native_expert_bytes(experts, hidden, logical), experts * (payload + scales));
         let one = prefix_bytes(20, true, 1);
         let two = prefix_bytes(20, true, 2);
         assert_eq!(one[0], two.iter().sum::<u64>());
         assert_eq!(two[1], 42 * 3 * 128 * 528);
         assert_eq!(prefix_bytes(0, true, 2), vec![0, 0]);
-        assert_eq!(dspark_cache_bytes(16, 4096), 15_828_096);
+        assert_eq!(dspark_cache_bytes(16, 4096), 15_831_552);
     }
 
     #[test]
     fn tp3_and_tp6_charge_whole_native_and_nvfp4_planes() {
         for (tp, width) in [(3, 768), (6, 384)] {
             let native = native_expert_bytes(384, 5120, width);
-            assert_eq!(native * tp, native_expert_bytes(384, 5120, 2304));
+            // FC2 carries one row base on every rank; gate/up bases partition.
+            assert_eq!(native * tp, native_expert_bytes(384, 5120, 2304) + (tp - 1) * 384 * 5120);
             let nvfp4 = nvfp4_expert_bytes(384, 5120, width);
             assert_eq!(nvfp4, 384 * (3 * 5120 * width * 9 / 16 + 16));
             assert_eq!(nvfp4 * tp, nvfp4_expert_bytes(384, 5120, 2304) + (tp - 1) * 384 * 16);
@@ -289,17 +318,44 @@ mod tests {
     fn vocabulary_modes_share_execution_residency_and_startup_semantics() {
         let source = 1_323_827_200;
         let packed = 682_598_400;
+        let packed12 = 997_395_712;
         for (text, mode) in [("off", Fp8Head::Off), ("0", Fp8Head::Off),
             ("bf16", Fp8Head::Off), ("draft", Fp8Head::Draft),
-            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All)] {
+            ("", Fp8Head::All), ("all", Fp8Head::All), ("other", Fp8Head::All),
+            ("packed", Fp8Head::Packed)] {
             assert_eq!(Fp8Head::parse(text), mode);
-            assert_eq!(mode.target(), mode == Fp8Head::All);
+            assert_eq!(mode.target(), matches!(mode, Fp8Head::All | Fp8Head::Packed));
             assert_eq!(mode.draft(), mode != Fp8Head::Off);
-            assert_eq!(mode.load_bytes(source), source + if mode.draft() { packed } else { 0 });
+            assert_eq!(mode.load_bytes(source), source + match mode {
+                Fp8Head::Off => 0, Fp8Head::Draft | Fp8Head::All => packed, Fp8Head::Packed => packed12,
+            });
             assert_eq!(mode.resident(source).0, match mode {
                 Fp8Head::Off => source, Fp8Head::Draft => source + packed, Fp8Head::All => packed,
+                Fp8Head::Packed => packed12,
             });
         }
+    }
+
+    /// `packed` charges exactly what the loader allocates for each shard: 12 bits
+    /// per weight, bases, row pointers, the exception table (one entry per 1024
+    /// weights) and status, each region 256-byte aligned.
+    #[test]
+    fn packed_head_charges_its_exact_allocation_per_shard() {
+        use cuteafd_core::packed_head::PackedHeadLayout;
+        let source = 129280 * 5120 * 2;
+        for ranks in [1u64, 2] {
+            let rows = 129280 / ranks as usize;
+            let layout = PackedHeadLayout::new(rows, 5120).unwrap();
+            let (bytes, format) = Fp8Head::Packed.resident(source / ranks);
+            assert_eq!((bytes, format), (layout.total_bytes() as u64, "bf16-packed12"));
+            assert_eq!(Fp8Head::Packed.load_bytes(source / ranks), source / ranks + bytes);
+            assert_eq!(layout.capacity as u64, rows as u64 * 5120 / 1024);
+        }
+        assert_eq!(Fp8Head::Packed.resident(source).0, 997_395_712);
+        assert_eq!(Fp8Head::Packed.resident(source / 2).0, 498_698_240);
+        // Between the E4M3 copy and BF16: 1.5 bytes per weight plus under half a percent.
+        let per_weight = Fp8Head::Packed.resident(source).0 as f64 / (129280.0 * 5120.0);
+        assert!(per_weight > 1.5 && per_weight < 1.5 * 1.005, "{per_weight}");
     }
 
     #[test]

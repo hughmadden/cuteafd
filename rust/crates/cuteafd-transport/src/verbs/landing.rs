@@ -7,8 +7,8 @@
 //! slot and the payload into the device range. Native compact-BF16 workers
 //! answer each request with one unindexed frame whose payload directly follows
 //! the header, so a rank's rows land at the start of its range in row order
-//! with no host copy and no upload; workers are unchanged. If registration
-//! fails the session keeps host receives and says why.
+//! with no host copy and no upload; workers are unchanged. Selected device
+//! landing must register successfully or the session fails before posting receives.
 use super::*;
 
 /// A device range one rank's response payloads land in.
@@ -17,62 +17,81 @@ pub struct DeviceLanding {
     /// Device address, carried as an integer so a landing can cross threads.
     pub ptr: usize,
     pub bytes: usize,
+    pub slot_bytes: usize,
+    /// Every request names its own [`LandingSlice`] of the range, and its
+    /// receive is posted with that request: no receive is posted ahead and
+    /// there is no rotation, so the wave geometry inside the range may change
+    /// between waves and a session may (re)open at any wave slot.
+    pub placed: bool,
+}
+
+/// Where one wave's payload lands inside a placed [`DeviceLanding`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LandingSlice {
+    /// Byte offset from the start of the rank's landing range.
+    pub offset: usize,
+    /// Payload bytes the receive accepts there.
+    pub bytes: usize,
 }
 
 impl DeviceLanding {
     pub fn new(buffer: CuteafdDeviceBuffer) -> Self {
-        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes }
+        Self { ptr: buffer.ptr as usize, bytes: buffer.bytes, slot_bytes: buffer.bytes, placed: false }
+    }
+    pub fn with_slots(buffer: CuteafdDeviceBuffer, slots: usize) -> Result<Self> {
+        anyhow::ensure!((1..=4).contains(&slots) && buffer.bytes > 0 && buffer.bytes % slots == 0,
+            "GPU landing requires equally sized slots");
+        Ok(Self { slot_bytes: buffer.bytes / slots, ..Self::new(buffer) })
+    }
+    /// The whole range, registered once; each wave lands at the slice its
+    /// request names ([`LandingSlice`]).
+    pub fn placed(buffer: CuteafdDeviceBuffer) -> Result<Self> {
+        anyhow::ensure!(buffer.bytes > 0, "GPU landing range is empty");
+        Ok(Self { placed: true, ..Self::new(buffer) })
+    }
+    /// Whether `slice` lies inside the range.
+    pub fn holds(&self, slice: LandingSlice) -> bool {
+        slice.bytes > 0 && slice.offset.checked_add(slice.bytes).is_some_and(|end| end <= self.bytes)
     }
     fn buffer(self) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: self.ptr as *mut c_void, bytes: self.bytes, ..Default::default() }
     }
 }
 
-/// Write mode: the peer RDMA-writes each response's rows into
-/// `[base + plane_offset, + plane_bytes)` and then its request id into the
-/// u64 at `base + flag_offset`; `[base, base + bytes)` is one device range the
-/// session exposes (dma-buf, remote write, no relaxed ordering).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DeviceWriteTarget {
-    pub base: usize,
+/// A selected rank allocation could not be registered for GPU landing.
+#[derive(Debug, thiserror::Error)]
+#[error("GPU landing allocation for peer {addr} at {ptr:#x} ({bytes} bytes) failed registration: {source:#}")]
+pub struct GpuLandingRegistrationError {
+    pub addr: SocketAddr,
+    pub ptr: usize,
     pub bytes: usize,
-    pub plane_offset: usize,
-    pub plane_bytes: usize,
-    pub flag_offset: usize,
+    #[source]
+    pub source: anyhow::Error,
 }
 
-/// Exposes `target`'s range on `endpoint` and returns the handshake's view of it.
-pub(super) fn expose(endpoint: &NativeRdmaEndpoint, target: DeviceWriteTarget) -> Result<VerbsHostWriteTarget> {
-    anyhow::ensure!(target.plane_offset + target.plane_bytes <= target.bytes && target.flag_offset + 8 <= target.bytes
-        && target.flag_offset % 8 == 0, "write target ranges exceed the exposed range");
-    let buffer = CuteafdDeviceBuffer { ptr: target.base as *mut c_void, bytes: target.bytes, ..Default::default() };
-    // SAFETY: `SparkExperts::set_write_targets`'s contract keeps the range
-    // allocated while this endpoint (owned by the session) exists.
-    let rkey = unsafe { endpoint.library.rdma_rc_endpoint_expose_device(endpoint.info.handle, Some(buffer))? };
-    Ok(VerbsHostWriteTarget { plane_addr: (target.base + target.plane_offset) as u64, plane_bytes: target.plane_bytes as u64,
-        flag_addr: (target.base + target.flag_offset) as u64, rkey })
+fn registered(landing: DeviceLanding, addr: SocketAddr, result: Result<()>)
+    -> std::result::Result<(), GpuLandingRegistrationError> {
+    result.map_err(|source| GpuLandingRegistrationError { addr, ptr: landing.ptr, bytes: landing.bytes, source })
 }
 
-/// Registers `landing` on `endpoint` before its receives are posted; false
-/// (with the reason logged) keeps the session on host receives.
-pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr: SocketAddr) -> bool {
+/// Registers the selected range before any receive is posted. Failure is
+/// terminal for startup, never an implicit switch to host receives.
+pub(super) fn attach(endpoint: &NativeRdmaEndpoint, landing: DeviceLanding, addr: SocketAddr)
+    -> std::result::Result<(), GpuLandingRegistrationError> {
+    registered(landing, addr, cuteafd_core::serving_capacity::validate_spark_intake_export(
+        landing.ptr as u64, landing.bytes as u64).map_err(Into::into))?;
+    // A placed range is one slot: its receives name their own slices.
+    let slot_bytes = if landing.placed { landing.bytes } else { landing.slot_bytes };
     // SAFETY: `SparkExperts::set_gpu_landing`'s contract makes its caller keep
     // the range allocated, and unread while a receive may write it, for as
     // long as this endpoint (owned by the session) exists.
     let attached = unsafe {
         endpoint.library.rdma_rc_endpoint_set_recv_landing(endpoint.info.handle, Some(landing.buffer()),
-            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN)
+            EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN, slot_bytes)
     };
-    match attached {
-        Ok(()) => {
-            tracing::debug!(%addr, bytes = landing.bytes, "response payloads land in GPU memory (dma-buf)");
-            true
-        }
-        Err(error) => {
-            tracing::warn!(%addr, %error, "GPU landing unavailable; receiving into pinned host memory");
-            false
-        }
-    }
+    registered(landing, addr, attached)?;
+    tracing::debug!(%addr, bytes = landing.bytes, "response payloads land in GPU memory (dma-buf)");
+    Ok(())
 }
 
 impl ProtocolV2ResponseChunkAssembler {
@@ -111,14 +130,18 @@ impl VerbsHostProtocolV2PersistentClientSession {
         anyhow::ensure!(wire_bytes <= config.max_frame_bytes,
             "GPU-landed response of {wire_bytes} bytes exceeds the frame budget");
         self.endpoint.traffic.received(wire_bytes);
-        // The device range is written again only by the response to this
-        // session's next request, which its owner posts after consuming it.
-        self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,
-            VERBS_HOST_RECV_WR_ID + recv_slot as u64)?;
+        // Native posts rotate the N landing slots in request order. The owner
+        // fences a slot's consumer before posting its replacement request.
+        // A placed landing posts each receive with its own request instead.
+        if !self.placed_landing {
+            self.endpoint.post_recv_at(recv_offset, self.response_ring.slot_capacity_bytes,
+                VERBS_HOST_RECV_WR_ID + recv_slot as u64)?;
+        }
         self.response_recv_sequence = self.response_recv_sequence.wrapping_add(1);
         let mut completed = pending.pop_front()
             .context("persistent verbs-host response arrived without a pending request")?;
         completed.assembler.accept_landed(&completed.request, &header)?;
+        trace_arrival(config.timing, self.execution_lane, completed.stream_id, &header);
         completed.chunk_tx.send(VerbsHostProtocolV2ResponseChunk {
             stream_id: completed.stream_id,
             header,
@@ -136,6 +159,16 @@ impl VerbsHostProtocolV2PersistentClientSession {
             response_executor_id,
         }));
         Ok(())
+    }
+}
+
+fn trace_arrival(timing: bool, lane: u32, rank: usize, header: &ExpertProtocolV2ResponseHeader) {
+    if timing {
+        // This is host-observed CQ readiness, not the NIC's wire timestamp.
+        tracing::info!(target: "cuteafd::timing", request_id = header.request_id,
+            layer_id = header.layer_id, execution_lane = lane, rank, rows = header.row_count,
+            payload_bytes = header.output_payload_bytes, landing = "device",
+            "spark exchange rank arrived");
     }
 }
 
@@ -166,12 +199,12 @@ impl GpuLandingProbe {
 }
 
 /// Probes dma-buf landing on the current CUDA device with a loopback QP pair
-/// on the transport's RDMA device, timing `bytes` sends into device and into
-/// pinned host memory.
-pub fn gpu_landing_probe(library: &NativeLibrary, rdma_device: Option<&str>, bytes: usize, iterations: u32)
-    -> Result<GpuLandingProbe> {
-    let port = verbs_host_ib_port_num()?;
-    let (probe, error) = library.rdma_gpu_landing_probe(rdma_device, port, bytes, iterations)?;
+/// on `rdma` (the device, port and source GID that reach the transport's
+/// peers, [`crate::fabric::select_rdma_route`]), timing `bytes` sends into
+/// device and into pinned host memory.
+pub fn gpu_landing_probe(library: &NativeLibrary, rdma: &crate::fabric::RdmaSelection, bytes: usize,
+    iterations: u32) -> Result<GpuLandingProbe> {
+    let (probe, error) = library.rdma_gpu_landing_probe(&rdma.device, rdma.port, rdma.gid_index, bytes, iterations)?;
     Ok(GpuLandingProbe {
         rdma_device: c_char_array_to_string(&probe.device_name),
         cuda_device: probe.cuda_device,
@@ -184,4 +217,121 @@ pub fn gpu_landing_probe(library: &NativeLibrary, rdma_device: Option<&str>, byt
         status: c_char_array_to_string(&probe.status),
         error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gpu_arrival_timing_emits_join_keys_only_when_enabled() {
+        use std::sync::{Arc, Mutex};
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let header = ExpertProtocolV2ResponseHeader {
+            request_id: 42, placement_version: 1, layer_id: 7, row_count: 16,
+            output_dim: 4, output_dtype: ExpertV2Dtype::Bf16, output_row_stride_bytes: 8,
+            output_payload_bytes: 128, status: ExpertProtocolV2Status::Ok,
+            flags: 0, executor_id: 0, pace: None,
+        };
+        for timing in [false, true] {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = bytes.clone();
+            let subscriber = tracing_subscriber::fmt().with_ansi(false).without_time()
+                .with_writer(move || Writer(writer.clone())).finish();
+            tracing::subscriber::with_default(subscriber, || trace_arrival(timing, 3, 2, &header));
+            let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+            if timing {
+                for field in ["spark exchange rank arrived", "request_id=42", "layer_id=7",
+                    "execution_lane=3", "rank=2", "rows=16", "payload_bytes=128"] {
+                    assert!(output.contains(field), "missing {field}: {output}");
+                }
+            } else { assert!(output.is_empty(), "{output}"); }
+        }
+    }
+
+    #[test]
+    fn selected_gpu_registration_failure_is_typed_and_never_becomes_pinned() {
+        let addr = "127.0.0.1:21960".parse().unwrap();
+        let landing = DeviceLanding::new(CuteafdDeviceBuffer {
+            ptr: 4096usize as *mut c_void, bytes: 289_406_976, ..Default::default()
+        });
+        let error: anyhow::Error = registered(landing, addr,
+            Err(anyhow::anyhow!("DMA_BUF export CUDA 1 CUDA_ERROR_INVALID_VALUE")))
+            .unwrap_err().into();
+        let error = error.context("opening Spark rank 2 session");
+        let typed = error.downcast_ref::<GpuLandingRegistrationError>().unwrap();
+        assert_eq!((typed.addr, typed.ptr, typed.bytes), (addr, landing.ptr, landing.bytes));
+        let message = format!("{error:#}");
+        for detail in ["rank 2", "289406976", "0x1000", "CUDA 1", "CUDA_ERROR_INVALID_VALUE"] {
+            assert!(message.contains(detail), "missing {detail}: {message}");
+        }
+        assert!(registered(landing, addr, Ok(())).is_ok());
+    }
+
+    #[test]
+    fn subpage_bases_and_partial_page_lengths_preserve_typed_refusal() {
+        let addr = "127.0.0.1:21960".parse().unwrap();
+        for (ptr, bytes) in [(4608, 655_360), (4096, 287_837_184)] {
+            let landing = DeviceLanding::new(CuteafdDeviceBuffer {
+                ptr: ptr as *mut c_void, bytes, ..Default::default()
+            });
+            let source = cuteafd_core::serving_capacity::validate_spark_intake_export(
+                ptr as u64, bytes as u64).map_err(Into::into);
+            let error = registered(landing, addr, source).unwrap_err();
+            assert_eq!((error.ptr, error.bytes), (ptr, bytes));
+            assert!(error.source.downcast_ref::<cuteafd_core::serving_capacity::SparkIntakeAllocationError>().is_some());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA/RDMA container and an exclusive hardware lease"]
+    fn cuda_malloc_dma_buf_landing_probe() -> Result<()> {
+        let library = load_verbs_host_native_library()?;
+        let peer = std::env::var("CUTEAFD_LANDING_PROBE_PEER")
+            .context("set CUTEAFD_LANDING_PROBE_PEER to a Spark worker address (host:port)")?;
+        let peer = peer.to_socket_addrs()?.next().context("landing probe peer resolved no address")?;
+        let rdma = crate::fabric::select_rdma_route(&crate::fabric::discover()?.ports, peer)?;
+        let probe = gpu_landing_probe(&library, &rdma, 64 << 20, 8)?;
+        println!("GPU landing probe: {}", serde_json::to_string(&probe)?);
+        anyhow::ensure!(probe.usable(), "CUDA-allocated RDMA landing unavailable: {probe:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn placed_landing_registers_the_whole_range_and_checks_slices() {
+        let range = CuteafdDeviceBuffer { ptr: 4096usize as *mut c_void, bytes: 8256 * 128, ..Default::default() };
+        let landing = DeviceLanding::placed(range).unwrap();
+        assert!(landing.placed && landing.slot_bytes == landing.bytes);
+        // 3×2752 and 4×2048 and 2×4096 slots all fit one reserve range.
+        for (waves, rows) in [(3usize, 2752usize), (4, 2048), (2, 4096), (1, 4096)] {
+            for slot in 0..waves {
+                assert!(landing.holds(LandingSlice { offset: slot * rows * 128, bytes: rows * 128 }));
+            }
+        }
+        assert!(!landing.holds(LandingSlice { offset: 8256 * 128 - 64, bytes: 128 }));
+        assert!(!landing.holds(LandingSlice { offset: 0, bytes: 0 }));
+        assert!(!landing.holds(LandingSlice { offset: usize::MAX, bytes: 2 }));
+        assert!(DeviceLanding::placed(CuteafdDeviceBuffer::default()).is_err());
+    }
+
+    #[test]
+    fn landing_slots_partition_the_rank_allocation() {
+        for slots in [1, 2, 3, 4] {
+            let range = CuteafdDeviceBuffer { ptr: 4096usize as *mut c_void,
+                bytes: slots * 12288, ..Default::default() };
+            let landing = DeviceLanding::with_slots(range, slots).unwrap();
+            assert_eq!(landing.slot_bytes, 12288);
+            assert_eq!(landing.bytes, slots * 12288);
+        }
+        for (bytes, slots) in [(0, 2), (4096, 0), (4096, 3), (4096, 5)] {
+            assert!(DeviceLanding::with_slots(CuteafdDeviceBuffer { bytes, ..Default::default() }, slots).is_err());
+        }
+    }
 }

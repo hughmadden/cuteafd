@@ -1,10 +1,32 @@
 #!/usr/bin/env python3
-"""Task-private WIP cards. Smoke alone owns serving locks; dry-run is CPU-only."""
+"""Task-private WIP cards. Build/seal first, then hold one fair serving turn.
+
+The union of the smoke jobs' locks stays held across every arm and repeat, until
+the last smoke has torn down. Children inherit CUTEAFD_HW_LOCKS_HELD, so smoke
+does not take those locks again. Builds (including legacy builds and seed/GPU
+exports) finish before this turn; dry-run prints the turn and is CPU-only.
+
+Stopping: SIGTERM, SIGINT or SIGHUP is forwarded to every running smoke, which
+tears down its coordinator and Spark workers (bounded, 60 s) before it exits;
+wip-cards waits for that (75 s, up to SMOKE_STOP_GRACE_S), starts no further job
+and exits 128 + the signal. This fits hwlock.py's 80 s outer stop grace (if
+wrapped) and systemd's 90 s stop timeout. Launch it as a systemd user unit with
+the defaults (KillMode=control-group, TimeoutStopSec=90 s), e.g.
+  systemd-run --user --unit=TASK --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \\
+    --working-directory=REPO scripts/bench/wip-cards.py ...
+and stop it with `systemctl --user stop TASK`: the locks are released only
+after the containers are gone. Never pass KillMode=mixed or KillMode=process
+(only the main process would be signalled, so smoke would not tear down), a
+TimeoutStopSec below 90 s (systemd would SIGKILL the teardown), and never
+`systemctl kill -s KILL` or `kill -9` a running card.
+"""
 from __future__ import annotations
 
 import argparse
 import base64
 import concurrent.futures
+import contextlib
+import functools
 import itertools
 import hashlib
 import importlib.util
@@ -14,6 +36,8 @@ from pathlib import Path
 import re
 import secrets
 import shlex
+import shutil
+import signal
 import statistics
 import socket
 import threading
@@ -32,18 +56,24 @@ _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
 from wip_aot_scopes import family_scopes
-# PROFILE switches that wrap the coordinator in a profiler, and their report suffix.
+_hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/hwlock.py')
+hwlock = importlib.util.module_from_spec(_hw_spec)
+_hw_spec.loader.exec_module(hwlock)
+# Profilers that wrap a serving process (PROFILE on the coordinator, PROFILE_SPARK
+# on Spark workers), and their report suffix.
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
 NSYS_SESSION = 'cuteafd-profile'  # RELEASE_NSYS_SESSION in scripts/lib/release-common.sh
 HOSTS = ('ostrich', 'dodo', 'emu', 'kiwi', 'rhea', 'moa')
-# Out-of-pool build seeds: compile, export and seal Spark slots, never serve.
-# kakapo has no RoCE (10 GbE only): its staging lanes are its LAN address and
-# wip.sh moves its sealed slots through sparknest.
-SEED_HOSTS = ('kakapo',)
-SEEDS = ('rhea', 'moa', *SEED_HOSTS)
-# kakapo passed its gate 2026-10-13 (mimo26-flash-max: cold build sealed, distributed
-# through sparknest, served at C1 with 0 errors); it isolates seed CPU load from serving.
-DEFAULT_SEED = 'kakapo'
+# LAN-only build seeds: compile, export and seal Spark slots, never serve. They have
+# no RoCE (10 GbE only): their staging lanes are their LAN address and wip.sh moves
+# their sealed slots through sparknest. Keep in sync with release_lan_seed_hosts
+# (scripts/lib/release-common.sh). kakapo passed its gate 2026-10-13 (cold build
+# sealed, distributed through sparknest, served at C1 with 0 errors).
+SEED_HOSTS = ('kakapo', 'cassowary')
+SEEDS = ('auto', 'rhea', 'moa', *SEED_HOSTS)
+# 'auto': wip.sh picks the less-loaded LAN-only seed, then rhea/moa. A named seed
+# is a placement request (wip.sh --seed).
+DEFAULT_SEED = 'auto'
 CORRECTNESS = {'sim-5090', 'fidelity', 'cache', 'image', 'no-fit', 'packed-check'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
@@ -54,13 +84,67 @@ SUMMARY_METRICS = ('C1', 'C8', 'sweep C1', 'sweep C4', 'sweep C8', 'sweep C16', 
 FIDELITY_PANELS = {'fidelity', 'fidelity_full'}
 LOWER_IS_BETTER = {'kl', 'readiness_s'}  # also every 'prefill N TTFT s'
 FAILURE = re.compile(r'(?i)(\berror\b|\bpanicked\b|\bfatal\b|\bfailed\b|undefined symbol|no such file|refus|exited:|timed out|out of memory|traceback)')
-PANELS = {'baseline', 'hardware', 'configuration', 'decode_content', 'concurrency', 'draft_mix', 'prefill', 'retained', 'prefix_cache', 'context_load', 'startup', 'agentic', 'tool_eval', 'structured', 'ifeval', 'code', 'math', 'needle', 'fidelity', 'fidelity_full', 'reasoning_effort', 'spec_lossless_set'}
+@functools.lru_cache(maxsize=None)
+def bench_panels(binary='cuteafd'):
+    """Ask the host cuteafd binary (`cuteafd bench panels --json`) for the selectable panel ids."""
+    cmd = str(binary or shutil.which('cuteafd') or 'cuteafd')
+    try:
+        result = subprocess.run([cmd, 'bench', 'panels', '--json'],
+                                capture_output=True, text=True, timeout=30)
+    except OSError as error:
+        raise ValueError(f'{cmd} bench panels --json failed: {error}') from error
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip().splitlines()[-1:]
+        raise ValueError(f'{cmd} bench panels --json failed: {detail}')
+    try:
+        panels = json.loads(result.stdout)
+    except ValueError as error:
+        raise ValueError(f'{cmd} bench panels --json returned invalid JSON: {error}') from error
+    if not isinstance(panels, list) or not panels or not all(isinstance(p, str) and p for p in panels):
+        raise ValueError(f'{cmd} bench panels --json returned invalid panel list')
+    return frozenset(panels)
 
 
 def short_instance(value):
     if not NAME.fullmatch(value):
         raise ValueError('invalid instance: ' + value)
     return value if len(value) <= 41 else value[:32] + '-' + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def launcher_defaults(repo=REPO):
+    """Read the launcher's default EXPERT_PORT and ADDR from scripts/launch/run-family.sh."""
+    text = (Path(repo) / 'scripts/launch/run-family.sh').read_text()
+    defaults = {match[1]: match[2] for match in re.finditer(r'\$\(get\s+(EXPERT_PORT|ADDR)\s+([^\s")]+)\)', text)}
+    if {'EXPERT_PORT', 'ADDR'} - defaults.keys():
+        raise ValueError('missing EXPERT_PORT/ADDR defaults in scripts/launch/run-family.sh')
+    return defaults
+
+
+LAUNCHER_DEFAULTS = launcher_defaults()
+
+
+def resolve_container_keys(entry):
+    """Resolve and validate the container-name and endpoint keys a launch uses."""
+    values = entry.get('set', {})
+    instance = str(values.get('INSTANCE', ''))
+    if not instance or len(instance) > 41 or not NAME.fullmatch(instance):
+        raise ValueError(f'INSTANCE must be [A-Za-z0-9_.-] (1..41 chars): {instance!r}')
+    port = str(values['EXPERT_PORT']) if 'EXPERT_PORT' in values else LAUNCHER_DEFAULTS['EXPERT_PORT']
+    if not port.isascii() or not port.isdigit() or not 1 <= int(port) <= 65535:
+        raise ValueError(f'EXPERT_PORT must be in 1..65535: {port!r}')
+    addr = str(values['ADDR']) if 'ADDR' in values else LAUNCHER_DEFAULTS['ADDR']
+    sparks = list(entry.get('sparks', []))
+    for host in sparks:
+        if not isinstance(host, str) or not NAME.fullmatch(host) or host not in HOSTS:
+            raise ValueError(f'invalid Spark host: {host!r}')
+    return dict(instance=instance, expert_port=port, addr=addr, sparks=sparks)
+
+
+def container_targets(job):
+    resolved = resolve_container_keys(job['entry'])
+    targets = [('raptor', 'cuteafd-coordinator-' + resolved['instance'])]
+    targets += [(host, f"cuteafd-spark-expert-{host}-{resolved['expert_port']}") for host in resolved['sparks']]
+    return targets
 
 
 def load_lossless_set(path):
@@ -99,11 +183,14 @@ def parse_lossless_dump(text, set_path=None):
     return dict(cases=cases, start=start, end=end)
 
 
-def requested_panels(profile):
+def requested_panels(profile, binary=None):
     if not profile.startswith('panels:'):
         return []
     panels = [p.strip() for p in profile[7:].split(',') if p.strip()]
-    bad = set(panels) - PANELS - {'baseline'}
+    if not panels:
+        return []
+    allowed = bench_panels(binary or shutil.which('cuteafd') or 'cuteafd')
+    bad = set(panels) - allowed - {'baseline'}
     if bad:
         raise ValueError('unknown requested panel: ' + ', '.join(sorted(bad)))
     return panels
@@ -125,7 +212,8 @@ def config(path):
 
 
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=120, **kwargs)
+    timeout = kwargs.pop('timeout', 120)
+    return subprocess.run(cmd, check=True, text=True, capture_output=True, timeout=timeout, **kwargs)
 
 
 def arms_from(values, releases=()):
@@ -159,14 +247,10 @@ def shared_wip(arms, mappings, builds, parallel):
         if 'wip_instance' in arms[name]:
             raise ValueError('duplicate --arm-wip mapping')
         arms[name]['wip_instance'] = instance
-    slots = {}
-    for arm in arms.values():
-        if 'release' in arm:
-            continue
-        instance = arm.get('wip_instance', arm['instance'])
-        if instance in slots and slots[instance] != arm['slot']:
-            raise ValueError('shared WIP instance requires identical slots')
-        slots[instance] = arm['slot']
+    # Arms of one WIP instance may name different sealed slots (e.g. a base and a
+    # candidate source built in the same instance): launches stage per slot and
+    # serving instance (release_wip_serving_layout), and --arm-wip runs one arm
+    # at a time, so slots never swap files under each other.
 
 
 def load_cards(kit, names):
@@ -209,6 +293,22 @@ def overrides_from(items):
     return overrides
 
 
+def arm_env_from(items, arms):
+    """Per-arm private diagnostics, so one sealed binary can run an off/on pair.
+    Only CUTEAFD_DIAG_* names: the launcher forwards exactly those, and nothing
+    else may differ between arms through the environment."""
+    out = {}
+    for item in items:
+        name, setting = item.split(':', 1)
+        key, value = setting.split('=', 1)
+        if name not in arms:
+            raise ValueError('unknown --arm-env arm: ' + name)
+        if not re.fullmatch(r'CUTEAFD_DIAG_[A-Z0-9_]+', key) or '\n' in value or '\r' in value:
+            raise ValueError('--arm-env takes CUTEAFD_DIAG_* names only: ' + key)
+        out.setdefault(name, {})[key] = value
+    return out
+
+
 def probe_selection(items, cards, arms):
     probes = {card['name']: set(card.get('probes', [])) | {'fabric'} for card in cards}
     scoped = {}
@@ -235,9 +335,10 @@ def probe_selection(items, cards, arms):
     return probes, scoped
 
 
-def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None):
+def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_pool, repeat, trace=False, exact_state=None,
+             cold_hosts=None, binary=None):
     entry = json.loads(json.dumps(entry))
-    requested_panels(entry.get('profile', 'smoke'))
+    requested_panels(entry.get('profile', 'smoke'), binary=binary)
     entry['fabric'] = 'fabric' in probes
     values = config(entry['config'])
     values.update(entry.pop('set', {}))
@@ -255,11 +356,9 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if 'CUTEAFD_API_KEY' in values:
         raise ValueError('inline API keys are forbidden')
     # The sanitized base also removes publication-only keys from original configs.
-    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x]
-    if not gpus:
-        first = int(values.get('COORDINATOR_GPU', entry.get('gpus', [0])[0]))
-        gpus = [first] if int(values.get('RTX_GPUS', len(entry.get('gpus', [first])))) == 1 else [0, 1]
-    if len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
+    # The card's GPUs, primary first, unless its config or --set names them.
+    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x] or list(entry.get('gpus', [0]))
+    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
         raise ValueError('invalid coordinator GPUs')
     hosts = list(entry.get('sparks', []))
     values.pop('SPARK_HOSTS', None)
@@ -270,7 +369,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
         raise ValueError('invalid Spark inventory')
     for key in list(values):
-        if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
+        if re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
     # Only V4.1's launcher reads a secondary rail; other families reject the key.
     lane_b = entry.get('family') == 'deepseek_v41'
@@ -279,13 +378,14 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}'})
         if lane_b:
             values[f'SPARK_{i}_LANE_B'] = f'10.55.1.{index}'
-    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
+    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPUS=','.join(map(str, gpus)))
     run_args = ['--wip', arm['slot']]
     if 'release' in arm:
         values.pop('WIP_INSTANCE', None)
         values.pop('WIP_ROOT', None)
         values['COORDINATOR_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-coordinator:' + arm['release']
-        values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
+        if count > 0:
+            values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
         run_args = []
     elif arm.get('root'):
         values['WIP_ROOT'] = arm['root']
@@ -296,23 +396,46 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     label = f'{card}-{arm_name}-r{repeat}' + ('-simulated' if simulated else '')
     dest = state / label
     dest.mkdir(parents=True, exist_ok=True)
-    if values.get('PROFILE'):
+    if values.get('PROFILE') or values.get('PROFILE_SPARK'):
         # One per-job directory, mounted on the coordinator and every Spark at
         # the same path; Spark-side files are collected back after the run.
         values['PROFILE_DIR'] = str(dest / 'profile')
         (dest / 'profile').mkdir(exist_ok=True)
-        if 'nsys' in values['PROFILE'].split(','):
-            # The coordinator's nsys session starts paused; smoke opens it after
-            # the sweep's first warm wave and closes it (writing the report) at
-            # sweep end, or before teardown if the sweep stopped in between.
+        # nsys sessions start paused (the coordinator's under PROFILE=nsys, each
+        # selected Spark rank's under PROFILE_SPARK=nsys); smoke opens them after
+        # the sweep's first warm wave and closes them (writing the reports) at
+        # sweep end, or before teardown if the sweep stopped in between.
+        sessions = []
+        resolved = resolve_container_keys(dict(set=values, sparks=hosts))
+        if 'nsys' in values.get('PROFILE', '').split(','):
+            sessions.append(['docker', 'exec', 'cuteafd-coordinator-' + resolved['instance'], '/usr/local/cuda/bin/nsys'])
+        if values.get('PROFILE_SPARK') == 'nsys':
+            for rank in spark_profile_ranks(values, hosts):
+                worker = f"cuteafd-spark-expert-{hosts[rank]}-{resolved['expert_port']}"
+                sessions.append(['ssh', '-o', 'BatchMode=yes', hosts[rank], 'docker', 'exec', worker, '/usr/local/cuda/bin/nsys'])
+        if sessions:
             if not (entry.get('levels') or entry.get('prefill_lengths')):
-                raise ValueError(card + ': PROFILE=nsys captures the timed sweep; pass --levels or --prefill-lengths')
-            exec_nsys = ['docker', 'exec', 'cuteafd-coordinator-' + values['INSTANCE'], '/usr/local/cuda/bin/nsys']
+                raise ValueError(card + ': PROFILE=nsys and PROFILE_SPARK=nsys capture the timed sweep; pass --levels or --prefill-lengths')
+            # A cold window drops the clean page cache first, so the profiled
+            # timed wave reads cold (warm-up already ran before the window).
+            purge = [cold_purge_argv(cold_hosts)] if cold_hosts else []
             entry['window'] = dict(
-                open=dict(argv=exec_nsys + ['start', '--session=' + NSYS_SESSION], timeout_s=120, required=True),
-                close=dict(argv=exec_nsys + ['stop', '--session=' + NSYS_SESSION], timeout_s=1800, required=True))
+                open=dict(argv=window_argv(purge + [s + ['start', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=300, required=True),
+                close=dict(argv=window_argv([s + ['stop', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
+    if cold_hosts and entry.get('prefill_lengths'):
+        # Every prefill point starts cold: the purge runs before its warm-up and
+        # again before its timed request. Decode levels after them are
+        # post-prefill, not cold.
+        entry['prefill_purge'] = dict(argv=cold_purge_argv(cold_hosts), timeout_s=300, required=True)
+    elif cold_hosts and not entry.get('window'):
+        if not entry.get('levels'):
+            raise ValueError(card + ': --cold-window drops the page cache before the timed sweep; pass --levels or --prefill-lengths')
+        if exact_state:
+            raise ValueError(card + ': --cold-window and --exact-state both use the measurement window')
+        entry['window'] = dict(open=dict(argv=cold_purge_argv(cold_hosts), timeout_s=300, required=True),
+                               close=dict(argv=['true'], timeout_s=10, required=True))
     if exact_state:
         # A family's exact prefix-state golden, run against the live server while
         # smoke holds the card's locks (CUTEAFD_SMOKE_URL); output in the job dir.
@@ -343,7 +466,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     hook = [sys.executable, str(Path(__file__).resolve())]
     timeout = int(entry.get('timeout_s', 900)) + int(entry.get('run_timeout_s', 900)) + 120
     if probes & {'memory', 'console'} or trace:
-        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200), required=True)
+        entry['observer'] = dict(argv=hook + ['--observe', str(dest / 'job.json')], timeout_s=min(timeout, 7200),
+                                 finish_timeout_s=OBSERVER_FINISH_TIMEOUT_S, required=True)
         if 'memory' in probes:
             entry['observer']['cleanup'] = sampler_cleanup(job)
     if expected_pool is not None or 'image' in probes:
@@ -353,6 +477,21 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     save(dest / 'job.json', {**job, 'probes': sorted(probes)})
     save(dest / 'matrix.json', dict(build='wip-cards', profile=entry.get('profile', 'smoke'), entries=[entry]))
     return job
+
+
+def apply_arm_config(job, overrides, unsets):
+    """Apply explicit launch-schema edits after generated defaults, on both copies."""
+    if not overrides and not unsets:
+        return
+    if overrides.keys() & unsets:
+        raise ValueError('arm config key is both set and unset')
+    values = job['entry']['set']
+    values.update(overrides)
+    for key in unsets:
+        values.pop(key, None)
+    dest = Path(job['state'])
+    Path(job['entry']['config']).write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
+    save(dest / 'matrix.json', dict(build='wip-cards', profile=job['entry'].get('profile', 'smoke'), entries=[job['entry']]))
 
 
 def parallel_safe(jobs, parallel):
@@ -371,12 +510,13 @@ def parallel_safe(jobs, parallel):
             raise ValueError('parallel profile is published')
     for a, b in itertools.combinations(jobs, 2):
         ea, eb = a['entry'], b['entry']
-        if set(ea['gpus']) & set(eb['gpus']) or set(ea['sparks']) & set(eb['sparks']):
+        ra, rb = resolve_container_keys(ea), resolve_container_keys(eb)
+        if set(ea['gpus']) & set(eb['gpus']) or set(ra['sparks']) & set(rb['sparks']):
             raise ValueError('parallel cards overlap GPUs or Sparks')
-        for key in ('ADDR', 'EXPERT_PORT'):
-            if ea['set'].get(key) == eb['set'].get(key):
+        for key, field in (('ADDR', 'addr'), ('EXPERT_PORT', 'expert_port')):
+            if ra[field] == rb[field]:
                 raise ValueError('parallel cards overlap ' + key)
-        if ea['set']['INSTANCE'] == eb['set']['INSTANCE']:
+        if ra['instance'] == rb['instance']:
             raise ValueError('parallel cards need separate instances')
 
 
@@ -394,6 +534,106 @@ def smoke_groups(jobs, parallel):
     if parallel > 1 and len({j['arm'] for j in jobs}) == 1:
         return [jobs]
     return [[job] for job in jobs]
+
+
+def serving_locks(jobs):
+    """Match smoke.rs locks_for, including its V4.1 exclusive default."""
+    names = set()
+    for job in jobs:
+        entry = job['entry']
+        gpus = entry.get('gpus', [0])
+        hosts = entry.get('sparks', [])
+        exclusive = entry.get('exclusive')
+        if exclusive is None:
+            exclusive = entry.get('family') == 'deepseek_v41'
+        if 0 in gpus or set(hosts) & set(HOSTS[:4]) or exclusive:
+            names.add('sparks')
+        for gpu in (0, 1):
+            if gpu in gpus or exclusive:
+                names.add(f'gpu{gpu}')
+        names.update(set(hosts) & {'rhea', 'moa'})
+    return hwlock.canonical(names)
+
+
+@contextlib.contextmanager
+def serving_turn(jobs, env, wait):
+    """Hold one post-build turn until every smoke has exited and torn down.
+
+    The caller drains detached smokes before leaving, even on a stop signal:
+    60 s smoke teardown, 75 s here, 80 s outer hwlock if used, 90 s systemd.
+    Never put a build or export inside this scope.
+    """
+    parent = hwlock.canonical(filter(None, env.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+    locks = serving_locks(jobs)
+    wanted = [name for name in locks if name not in parent]
+    with contextlib.ExitStack() as stack:
+        if wanted:
+            stack.enter_context(hwlock.hold(wanted, wait, 'wip-cards arms/repeats',
+                                            cancelled=lambda: STOP['signal'] is not None))
+        env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(hwlock.canonical([*parent, *locks]))
+        yield
+
+
+def adopt_roots(arms):
+    """An existing (not --build) arm's root is its coordinator container's /wip
+    mount source, the same root the seal check reads, so the smoke binary and the
+    launch config's WIP_ROOT name the slot that was checked. A build that used a
+    custom WIP_ROOT otherwise resolved to the default wip-<instance> layout."""
+    for arm in arms.values():
+        if 'release' in arm or arm.get('root'):
+            continue
+        container = 'cuteafd-coordinator-wip-' + arm.get('wip_instance', arm['instance'])
+        try:
+            found = subprocess.run(['docker', 'inspect', '-f',
+                                    '{{range .Mounts}}{{if eq .Destination "/wip"}}{{.Source}}{{end}}{{end}}', container],
+                                   capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if found.returncode == 0 and found.stdout.strip():
+            arm['root'] = found.stdout.strip()
+
+
+def slot_binary(arm):
+    """The smoke runner a sealed WIP slot ships: the arm's own coordinator build."""
+    root = arm.get('root') or str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + arm.get('wip_instance', arm['instance'])))
+    return Path(root) / 'slots' / arm['slot'] / 'coordinator/workspace/.cuteafd-wip/cuteafd'
+
+
+def resolve_binary(binary, arm, dry=False):
+    """The cuteafd that runs one arm's smoke: --binary as given, else the one on
+    PATH, else the arm's own sealed slot binary. An agent shell rarely has cuteafd
+    on PATH, and the slot binary is the runner that arm's build shipped, so it is
+    the right default per arm (an A/B of two builds keeps each arm's own smoke)."""
+    if binary:
+        if not dry and not (Path(binary).is_file() or shutil.which(binary)):
+            raise ValueError(f'--binary {binary} is neither a file nor on PATH')
+        return binary
+    found = shutil.which('cuteafd')
+    if found:
+        return found
+    if dry:
+        return 'cuteafd'
+    if 'release' in arm:
+        raise ValueError('--binary is required for a release arm: it serves published images and ships no host binary')
+    path = slot_binary(arm)
+    if not path.is_file():
+        raise ValueError(f'--binary: cuteafd is not on PATH and this arm\'s sealed slot has no binary at {path}; '
+                         'build the arm (--build) or pass --binary')
+    return str(path)
+
+
+def panel_binary(binary, arms):
+    """The host cuteafd binary for panel queries: --binary, else cuteafd on PATH,
+    else the first arm's sealed slot binary."""
+    if binary:
+        return binary
+    found = shutil.which('cuteafd')
+    if found:
+        return found
+    for arm in (arms or {}).values():
+        if 'release' not in arm and slot_binary(arm).is_file():
+            return str(slot_binary(arm))
+    return 'cuteafd'
 
 
 def binary_supports(binary, repo, job, needs):
@@ -425,16 +665,28 @@ def speculating(values):
     return values.get('SPECULATOR', 'auto') != 'off' and values.get('DSPARK', 'on') != 'off'
 
 
-def preflight_job(job, arm):
-    """Everything about one job that is checkable without hardware: no serving
-    container of ours exists, the arm is sealed on every host it runs on, the
-    slot holds the packages and audio entry the card needs, and the job's
-    trace/profile directories are writable. Returns the artifact record."""
-    values = job['entry']['set']
+def preflight_at_grant(job, arm):
+    """Smoke's prelaunch hook, run once it holds this card's locks: the absence of
+    our containers is only meaningful then. Checked up front it would refuse a job
+    queued behind a running task that still holds a container of the same name."""
     assert_absent(job)
+    return preflight_job(job, arm)
+
+
+def preflight_job(job, arm):
+    """Everything about one job that is checkable before its turn: the arm is
+    sealed on every host it runs on, the slot holds the packages and audio entry
+    the card needs, and the job's trace/profile directories are writable. Container
+    absence is asserted at grant (preflight_at_grant), not here. Returns the
+    artifact record."""
+    values = job['entry']['set']
     needs = job.get('needs') or {'coordinator': [], 'spark': [], 'audio': False}
     artifacts, problems = {}, []
-    for host in ('raptor', *job['entry']['sparks']):
+    try:
+        container_targets(job)
+    except ValueError as error:
+        problems.append(str(error))
+    for host in ('raptor', *(h for h in job['entry']['sparks'] if isinstance(h, str) and h in HOSTS)):
         meta = json.loads(slot_check(arm, host))
         release = 'release' in arm
         keys = ('image', 'image_id', 'repo_digests') if release else ('slot', 'seal_sha256', 'artifact_manifest_sha256')
@@ -529,12 +781,88 @@ def smoke_command(binary, repo, job):
     return [binary, 'bench', 'smoke', '--matrix', str(dest / 'matrix.json'), '--repo', str(repo), '--state', str(dest / 'smoke'), '--out-root', str(dest / 'reports'), '--parallel', '1']
 
 
+# How long a signalled smoke may take to tear down before it is killed: above its
+# own 60 s bound, under hwlock.py's 80 s grace and systemd's 90 s TimeoutStopSec.
+SMOKE_STOP_GRACE_S = 75.0
+# Matches HookChild::spawn's default finish_timeout_s in rust/crates/cuteafd-bench/src/smoke.rs.
+OBSERVER_FINISH_TIMEOUT_S = 5
+
+
+def observer_teardown_budget(job):
+    """Total observer teardown budget, derived from and strictly shorter than finish_timeout_s."""
+    observer = (job.get('entry') or {}).get('observer') or {}
+    finish_timeout = float(observer.get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+    margin = 1.5 if finish_timeout > 2.0 else finish_timeout * 0.3
+    return max(0.1, min(finish_timeout * 0.7, finish_timeout - margin))
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# The first stop signal received, and the detached smoke process groups it reaches.
+STOP = dict(signal=None)
+_LIVE = {}  # id(process) -> process
+_LIVE_LOCK = threading.RLock()  # re-entrant: the handler runs on the main thread
+
+
+def _signal_live(signum):
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for process in live:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signum)
+
+
+def forward_stop(signum, _frame=None):
+    """Signal handler: remember the first stop signal and pass it to every
+    running smoke's process group (smoke ignores repeats)."""
+    if STOP['signal'] is None:
+        STOP['signal'] = signum
+    _signal_live(signum)
+
+
+def install_stop_handlers():
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, forward_stop)
+
+
+def stopped_code():
+    return 128 + STOP['signal'] if STOP['signal'] is not None else None
+
+
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. No flock here: smoke owns all serving locks.
-    script = '"$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
+    # waits for smoke's teardown and still records smoke's exit status. The
+    # parent's serving turn outlives this process and its container teardown.
+    # setsid may fork when its caller is a process-group leader; --wait must
+    # propagate the child status rather than report the successful fork.
+    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
     with Path(log).open('w') as output:
-        return subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+        process = subprocess.Popen(['setsid', '--wait', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+    with _LIVE_LOCK:
+        _LIVE[id(process)] = process
+    if STOP['signal'] is not None:  # arrived while it started
+        _signal_live(STOP['signal'])
+    return process
+
+
+def wait_detached(process, grace=SMOKE_STOP_GRACE_S):
+    """Waits for a detached smoke. After a stop signal it gets `grace` seconds
+    to tear down, then its group is killed."""
+    deadline = None
+    try:
+        while True:
+            try:
+                return process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            if STOP['signal'] is not None:
+                deadline = deadline or time.monotonic() + grace
+                if time.monotonic() >= deadline:
+                    print(f'wip-cards: smoke did not stop within {grace:.0f} s; killing it', file=sys.stderr)
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    return process.wait()
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.pop(id(process), None)
 
 
 def http(url, path, body=None):
@@ -716,7 +1044,7 @@ def observe(job):
             gpu_list = ','.join(map(str, e['gpus']))
             image = e['set'].get('COORDINATOR_DOCKER_DEV', 'cuteafd-coordinator-dev')
             owner = hashlib.sha256(job['state'].encode()).hexdigest()
-            cmd = ['docker', 'run', '--rm', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
+            cmd = ['docker', 'run', '--rm', '--init', '-i', '--name', name, '--label', 'cuteafd.card.owner=' + owner, '--pid=host', '--network=none', *cdi_gpu_args(gpu_list.split(',')), '-e', 'CARD_GPUS=' + gpu_list, '--entrypoint', 'python3', image, '-u', '-c', CUDA_SAMPLER]
             sampler = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=memory, stderr=subprocess.PIPE, text=True)
         trace_path = Path(job['entry']['set']['SPECULATION_TRACE']) if job.get('trace') else None
         trace_due = None
@@ -750,18 +1078,51 @@ def observe(job):
                         policy_sample_at = time.monotonic() + 1.
                 except (OSError, RuntimeError):
                     pass
-            time.sleep(.25)
+            if not stop.exists():
+                time.sleep(.25)
     finally:
-        if sampler:
-            run(sampler_cleanup(job))
-            sampler.wait(timeout=10)
+        teardown_start = time.monotonic()
+        finish_timeout_s = float(((job.get('entry') or {}).get('observer') or {}).get('finish_timeout_s') or OBSERVER_FINISH_TIMEOUT_S)
+        budget_s = observer_teardown_budget(job)
+        deadline = teardown_start + budget_s
+        phases = []
         stop.touch()
+        if sampler:
+            phase_start = time.monotonic()
+            cleanup_timeout = min(budget_s * 0.6, max(0.0, deadline - phase_start))
+            try:
+                run(sampler_cleanup(job), timeout=cleanup_timeout)
+                phases.append(dict(phase='sampler_cleanup', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_cleanup', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                print(f'wip-cards: observer sampler_cleanup timed out after {cleanup_timeout:.2f}s (hook cleanup will retry)', file=sys.stderr, flush=True)
+            phase_start = time.monotonic()
+            wait_timeout = min(budget_s * 0.25, max(0.0, deadline - phase_start))
+            try:
+                sampler.wait(timeout=wait_timeout)
+                phases.append(dict(phase='sampler_wait', status='ok', elapsed_s=round(time.monotonic() - phase_start, 4)))
+            except subprocess.TimeoutExpired:
+                phases.append(dict(phase='sampler_wait', status='timeout', elapsed_s=round(time.monotonic() - phase_start, 4)))
+                with contextlib.suppress(OSError):
+                    sampler.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                    sampler.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic())))
         if reader:
-            reader.join(timeout=3)
+            phase_start = time.monotonic()
+            join_timeout = max(0.0, deadline - phase_start)
+            reader.join(timeout=join_timeout)
+            phases.append(dict(phase='reader_join', status='timeout' if reader.is_alive() else 'ok',
+                               elapsed_s=round(time.monotonic() - phase_start, 4)))
         frames.close()
         policy.close()
         memory.close()
         console.close()
+        save(dest / 'observer-teardown.json', dict(
+            finish_timeout_s=finish_timeout_s,
+            budget_s=round(budget_s, 4),
+            elapsed_s=round(time.monotonic() - teardown_start, 4),
+            phases=phases,
+        ))
     if 'memory' in job['probes'] and not (dest / 'memory.jsonl').stat().st_size:
         raise ValueError('memory probe produced no samples')
     if 'console' in job['probes'] and not (dest / 'console.jsonl').stat().st_size:
@@ -805,6 +1166,49 @@ def ledger(dest):
     return {'lines': lines, 'spark_ring_peak_bytes': rings, 'device_used_peak_bytes': device_peaks}
 
 
+def spark_profile_ranks(values, hosts):
+    """The Spark ranks PROFILE_SPARK wraps (PROFILE_SPARK_RANKS, default rank 0),
+    checked against this card's Spark count; the launcher checks them again."""
+    text = values.get('PROFILE_SPARK_RANKS') or '0'
+    if not re.fullmatch(r'(0|[1-9][0-9]?)(,(0|[1-9][0-9]?))*', text):
+        raise ValueError('PROFILE_SPARK_RANKS must be a comma list of Spark ranks (e.g. 0 or 0,3)')
+    ranks = [int(r) for r in text.split(',')]
+    if len(set(ranks)) != len(ranks):
+        raise ValueError('PROFILE_SPARK_RANKS lists a rank twice')
+    if not hosts:
+        raise ValueError('PROFILE_SPARK needs a card with Spark expert workers')
+    if max(ranks) >= len(hosts):
+        raise ValueError(f'PROFILE_SPARK_RANKS names rank {max(ranks)}; this card has ranks 0..{len(hosts) - 1}')
+    return ranks
+
+
+def cold_purge_argv(hosts):
+    """SparkNest's clean page-cache drop on these hosts (its installed setuid
+    helper; other workloads on them lose cached pages too). The CLI is resolved
+    here, so a hook running under a systemd unit's minimal PATH still finds it."""
+    nest = shutil.which('nest')
+    if not nest:
+        raise ValueError('--cold-window needs the SparkNest `nest` CLI on PATH')
+    return [nest, 'drop-caches', *[arg for host in hosts for arg in ('--host', host)]]
+
+
+def window_argv(commands):
+    """One hook argv for one or more window commands: a single command runs as
+    is; several run in order, every one attempted, failing if any failed."""
+    if len(commands) == 1:
+        return commands[0]
+    script = 'rc=0; ' + ' '.join(shlex.join(c) + ' || rc=1;' for c in commands) + ' exit $rc'
+    return ['sh', '-c', script, 'profile-window']
+
+
+def expected_spark_reports(values, hosts):
+    """Report files PROFILE_SPARK writes, one per selected rank, named by host and rank."""
+    tool = values.get('PROFILE_SPARK')
+    if tool not in PROFILER_REPORTS:
+        return []
+    return [f'{tool}-{hosts[rank]}-rank{rank}{PROFILER_REPORTS[tool]}' for rank in spark_profile_ranks(values, hosts)]
+
+
 def collect_profile(job):
     """Copies Spark-side PROFILE files back into the job's profile directory
     (the coordinator writes there directly). Missing hosts are recorded, not fatal.
@@ -813,7 +1217,9 @@ def collect_profile(job):
     directory = values.get('PROFILE_DIR')
     if not directory:
         return None
-    result = {'dir': directory, 'switches': values.get('PROFILE', '').split(','), 'hosts': {}}
+    result = {'dir': directory, 'switches': [s for s in values.get('PROFILE', '').split(',') if s], 'hosts': {}}
+    if values.get('PROFILE_SPARK'):
+        result['spark'] = {'tool': values['PROFILE_SPARK'], 'expected': expected_spark_reports(values, job['entry']['sparks'])}
     for host in job['entry']['sparks']:
         try:
             subprocess.run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes', f'{host}:{directory}/', directory + '/'],
@@ -876,17 +1282,129 @@ def classify(row, launched):
     return 'measurement'
 
 
-def fabric_assessment(phases):
-    """Assessment hook for timed background traffic; byte evidence stays per port."""
-    caveats = []
+def fabric_rerun_reasons(phases):
+    """Reconcile wire bytes with both endpoints, including older RX meters,
+    and flag coordinator-host contention that makes timings untrustworthy."""
+    reasons = []
     for phase in phases:
         if not phase.get('timed'):
             continue
-        for warning in phase.get('assessments', []):
-            if warning.startswith(('foreign traffic:', 'SparkNest traffic:', 'storage attribution unavailable:', 'fabric health:')):
-                action = 'investigate fabric health and rerun' if warning.startswith('fabric health:') else 'rerun in a quiet window'
-                caveats.append(f"{phase.get('name', '?')}: {warning}; {action} before accepting A/B")
+        name = phase.get('name', '?')
+        load = phase.get('host_load') or {}
+        cpu = load.get('cpu_some_avg10')
+        if cpu is not None and cpu > 10:
+            reasons.append(f"{name}: host load: coordinator CPU pressure {cpu:.1f}% (>10%)")
+        memory = load.get('memory_some_avg10')
+        if memory is not None and memory > 5:
+            reasons.append(f"{name}: host load: coordinator memory pressure {memory:.1f}% (>5%)")
+        scan = load.get('pgscan_pages_per_s')
+        if scan is not None and scan > 1000:
+            reasons.append(f"{name}: host load: coordinator page reclaim {scan:.0f} pages/s (>1000 pages/s)")
+        ports = phase.get('ports', [])
+        for p in ports:
+            label = f"{p.get('host')} {p.get('device')}/{p.get('port')}"
+            if any((p.get(k) or 0) > 0 for k in ('engine_sent_bytes', 'engine_received_bytes')) and 'DOWN' in (p.get('state') or ''):
+                reasons.append(f"{phase.get('name', '?')}: port down while used: {label}")
+            seconds = p.get('seconds') or 0
+            if seconds <= 0:
+                continue
+            # Coordinator GIDs identify each Spark; never borrow unrelated bytes.
+            import ipaddress
+            try:
+                address = p['host'].rsplit(':', 1)[0]
+                gid = '00000000000000000000ffff' + ipaddress.IPv4Address(address).packed.hex()
+            except (ValueError, KeyError):
+                gid = None
+            local_gids = {peer['local_gid'].replace(':', '').lower() for peer in p.get('peers', []) if peer.get('local_gid')}
+            unique_port = sum(bool(other.get('peers')) for other in ports if other.get('host') == p.get('host')) == 1
+            peers = [peer for other in ports if other.get('host') == 'coordinator'
+                     for peer in other.get('peers', [])
+                     if p.get('peers') and ((peer.get('peer', '').replace(':', '').lower() in local_gids) if local_gids
+                         else unique_port and gid and peer.get('peer', '').replace(':', '').lower() == gid)]
+            nic = sum(p.get(k) or 0 for k in ('sent_bytes', 'received_bytes'))
+            storage_bytes = sum(p.get(k) or 0 for k in ('sparknest_sent_bytes', 'sparknest_received_bytes'))
+            if storage_bytes * 8 / seconds / 1e9 > 1 and storage_bytes > nic * 0.05:
+                reasons.append(f"{phase.get('name', '?')}: SparkNest traffic: {label} {storage_bytes * 8 / seconds / 1e9:.2f} Gb/s (>5% and >1 Gb/s)")
+            for side, opposite in [('sent', 'received'), ('received', 'sent')]:
+                physical, local = p.get(side + '_bytes'), p.get('engine_' + side + '_bytes')
+                if physical is None or local is None:
+                    continue
+                storage = p.get('sparknest_' + side + '_bytes')
+                if p.get('sparknest_status') not in (None, '', 'unregistered') and storage is None:
+                    continue
+                own = max(local, sum(peer.get(opposite + '_bytes', 0) for peer in peers))
+                residual = max(0, physical - own - int(own * 0.65) - (p.get('estimated_header_' + side + '_bytes') or 0) - (storage or 0))
+                if residual * 8 / seconds / 1e9 > 1 and residual > nic * 0.05:
+                    reasons.append(f"{phase.get('name', '?')}: foreign traffic: {label} {residual * 8 / seconds / 1e9:.2f} Gb/s {side} (>5% and >1 Gb/s)")
+    return list(dict.fromkeys(reasons))
+
+
+def fabric_assessment(phases):
+    """Fabric recovery is informational; raw counters, not old labels, decide."""
+    caveats = fabric_rerun_reasons(phases)
+    for phase in phases:
+        if not phase.get('timed'):
+            continue
+        for p in phase.get('ports', []):
+            h = p.get('health') or {}
+            share = h.get('retransmit_pct')
+            if h.get('retransmit_judged') and share is not None and share > (h.get('retransmit_warn_pct') or 0.5):
+                caveats.append(f"{phase.get('name', '?')}: retransmits {share:.2g}% of packets; results remain valid, throughput may be lower")
+        caveats.extend(f"{phase.get('name', '?')}: {a}; informational" for a in phase.get('assessments', [])
+                       if a.startswith('storage attribution unavailable:'))
     return list(dict.fromkeys(caveats))
+
+
+FALLBACK_BACKEND = 'mmap-fallback'
+
+
+def table_backend_phases(report):
+    """Every measured phase's mapped tables in run order: each panel pass and
+    the sub-phases it recorded. A pass's own mapped_tables are added after the
+    panel ran, so they read last."""
+    phases = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if key != 'mapped_tables' and isinstance(child, (dict, list)):
+                    walk(child, f'{path}/{key}')
+            tables = node.get('mapped_tables')
+            if isinstance(tables, list):
+                fabric = node.get('fabric')
+                name = fabric.get('name') if isinstance(fabric, dict) else None
+                phases.append((name or path, tables))
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, f'{path}/{index}')
+
+    for panel in report.get('panels') or []:
+        for index, pass_value in enumerate(panel.get('passes') or []):
+            walk(pass_value, f"{panel.get('id', '?')}/pass{index + 1}")
+    return phases
+
+
+def table_backend_findings(phases):
+    """(caveats, contaminated) from raw per-phase stats: a backend change after
+    the table's first phase is contamination, while mmap from startup is one
+    configuration note (io_uring was never available)."""
+    first, caveats, contaminated = {}, [], False
+    for phase, tables in phases:
+        for table in tables or []:
+            name, backend = table.get('name'), table.get('backend')
+            if not name or not backend:
+                continue
+            if name not in first:
+                first[name] = backend
+                if backend == FALLBACK_BACKEND:
+                    caveats.append(f'{name}: read backend {FALLBACK_BACKEND} from startup '
+                                   '(io_uring unavailable); mapped gathers run slower, configuration only')
+                continue
+            if backend != first[name]:
+                contaminated = True
+                caveats.append(f'{phase}: {name} read backend changed from {first[name]} to {backend}; '
+                               'mapped gathers are slower, compare in a quiet window')
+    return caveats, contaminated
 
 
 def summarize_job(job, exit_code):
@@ -912,16 +1430,18 @@ def summarize_job(job, exit_code):
             fail(row, message)
     launched = outcome.get('launch_s') is not None or bool(reports)
     sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels') or job['entry'].get('prefill_lengths'))
-    if sweep_only and not reports:
-        pass  # No server-side profile ran; the sweep below carries the numbers.
+    readiness_only = job['entry'].get('profile') == 'panels:' and job['entry'].get('baseline') is False and not sweep_only
+    if (sweep_only or readiness_only) and not reports:
+        pass  # No server-side profile ran; the sweep or the probes carry the results.
     elif len(reports) != 1:
         fail(row, f'expected one report, found {len(reports)}')
     else:
         report = json.loads(reports[0].read_text())
+        row['table_caveats'], row['table_contaminated'] = table_backend_findings(table_backend_phases(report))
         if not row['fabric']:
             row['fabric'].extend(report.get('fabric') or [])
         present = {p['id'] for p in report.get('panels', [])} | ({'baseline'} if report.get('baseline') else set())
-        missing = set(requested_panels(job['entry'].get('profile', 'smoke'))) - present
+        missing = set(requested_panels(job['entry'].get('profile', 'smoke'), binary=job.get('binary'))) - present
         if missing:
             fail(row, 'requested panels absent from report: ' + ', '.join(sorted(missing)))
         baseline = report.get('baseline') or {}
@@ -959,8 +1479,15 @@ def summarize_job(job, exit_code):
     if profile:
         row['profile'] = profile
         for switch, suffix in PROFILER_REPORTS.items():
-            if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] for r in profile['reports']):
+            # The coordinator's report is named by its host alone; Spark reports add the rank.
+            if switch in profile['switches'] and not any(r['name'].endswith(suffix) and r['bytes'] and '-rank' not in r['name']
+                                                         for r in profile['reports']):
                 fail(row, f'PROFILE={switch} produced no {suffix} report in {profile["dir"]}', 'measurement')
+        if profile.get('spark'):
+            sizes = {r['name']: r['bytes'] for r in profile['reports']}
+            missing = [name for name in profile['spark']['expected'] if not sizes.get(name)]
+            if missing:
+                fail(row, f"PROFILE_SPARK={profile['spark']['tool']} produced no {', '.join(missing)} in {profile['dir']}", 'measurement')
         if 'expert-routes' in profile['switches']:
             logs = sorted(Path(profile['dir']).glob('expert-routes-*.jsonl'))
             profile['expert_routes'] = [{'name': p.name, 'bytes': p.stat().st_size} for p in logs]
@@ -991,6 +1518,10 @@ def summarize_job(job, exit_code):
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
                 row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
+            row['mapped_tables'] = {**{f"prefill {p['length']}": p['mapped_tables'] for p in sweep.get('prefill', [])
+                                       if p.get('mapped_tables')},
+                                    **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
+                                       if p.get('mapped_tables')}}
     row['peaks'] = peaks(dest)
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
@@ -1013,10 +1544,11 @@ def summarize_job(job, exit_code):
         text = '\n'.join(ANSI.sub('', p.read_text(errors='replace')) for p in (dest / 'smoke' / 'logs').glob('*.coordinator.log'))
         hashes = prompt_token_hashes(text)
         # Concurrent admission reorders requests, so pairs match on the whole
-        # set of input-determined prompts; a follow-up prompt is reported but
-        # not compared.
+        # set of shared input-determined prompts; follow-up and arm-local
+        # diagnostic prompts are reported but not compared.
         row.update(nonce_seed=job['nonce_seed'], first_prompt_token_hash=hashes[0] if hashes else None,
                    prompt_token_hashes=sorted(hashes), follow_up_prompts=follow_up_prompts(text),
+                   arm_local_prompts=arm_local_prompts(text),
                    requests=matched_requests(dest), state=str(dest))
         # Prefill-only sweeps (max_tokens 1) emit no decode rounds; the prompt
         # token hash above is what matches their requests.
@@ -1031,7 +1563,9 @@ def summarize_job(job, exit_code):
         if not row['requests'] and not (prefill_only or fidelity_only):
             fail(row, 'matched prompts produced no per-request console rounds')
     row['fabric_caveats'] = fabric_assessment(row['fabric'])
-    row['ab_verdict'] = 'rerun' if row['fabric_caveats'] else 'eligible'
+    row.setdefault('table_caveats', [])
+    row.setdefault('table_contaminated', False)
+    row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row['fabric']) or row['table_contaminated'] else 'eligible'
     row['failure_kind'] = row.get('failure_kind') or classify(row, launched)
     save(dest / 'result.json', row)
     return row
@@ -1062,8 +1596,10 @@ def lossless_set_result(report):
 # re-renders model output (a follow-up turn, or ids taken from a response)
 # logs as an output-dependent prompt with no hash, because two engines
 # legitimately tokenize model text differently.
+# Panel-local diagnostics also log without hashes: not every arm runs them.
 MATCHED_PROMPT = re.compile(r'matched benchmark prompt.*?prompt_token_hash\s*=\s*"?([0-9a-f]{16})')
 FOLLOW_UP_PROMPT = re.compile(r'benchmark output-dependent prompt')
+ARM_LOCAL_PROMPT = re.compile(r'benchmark arm-local prompt')
 
 
 def prompt_token_hashes(text):
@@ -1074,6 +1610,11 @@ def prompt_token_hashes(text):
 def follow_up_prompts(text):
     """Output-dependent prompts reported, which pairs do not compare."""
     return len(FOLLOW_UP_PROMPT.findall(text))
+
+
+def arm_local_prompts(text):
+    """Panel-local diagnostic prompts reported, which pairs do not compare."""
+    return len(ARM_LOCAL_PROMPT.findall(text))
 
 
 def matched_requests(dest):
@@ -1163,9 +1704,16 @@ def write_summary(state, rows, arms):
                    key=lambda k: (int(k.split()[1]), k))
     present = [m for m in (*SUMMARY_METRICS, *extra) if any(isinstance(r.get(m), (int, float)) for r in rows)]
     medians, paired = summary_math(rows, names, present or METRICS)
-    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c) for r in rows for c in r.get('fabric_caveats', [])]
+    for row in rows:
+        row['fabric_caveats'] = fabric_assessment(row.get('fabric', []))
+        row.setdefault('table_caveats', [])
+        row.setdefault('table_contaminated', False)
+        row['ab_verdict'] = 'rerun' if fabric_rerun_reasons(row.get('fabric', [])) or row['table_contaminated'] else 'eligible'
+    rerun = any(row['ab_verdict'] == 'rerun' for row in rows)
+    caveats = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], caveat=c)
+               for r in rows for c in [*r.get('fabric_caveats', []), *r.get('table_caveats', [])]]
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
-                                    ab_verdict='rerun' if caveats else 'eligible', fabric_caveats=caveats))
+                                    ab_verdict='rerun' if rerun else 'eligible', caveats=caveats))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -1198,7 +1746,8 @@ def write_summary(state, rows, arms):
             text += f"| {m['card']} | " + ' | '.join(cell(m.get(k)) for k in present) + ' |\n'
         text += '\n'
     if caveats:
-        text += '## A/B Verdict: Rerun\n\nTimed unhealthy fabric, contamination or unknown attribution prevents accepting this A/B. Request correctness and raw rates remain recorded.\n\n'
+        text += ('## A/B Verdict: Rerun\n\nTimed foreign traffic, a used port down, or a mapped-table backend change: compare in a quiet window.\n\n' if rerun
+                 else '## Measurement Notes\n\nResults remain valid; retransmits may reduce throughput, and mmap from startup is configuration.\n\n')
         for c in caveats:
             text += f"- {c['card']} / {c['arm']} / r{c['repeat']}: {c['caveat']}\n"
         text += '\n'
@@ -1221,11 +1770,12 @@ def write_summary(state, rows, arms):
                 for p in phase.get('ports', []):
                     h = p.get('health') or {}
                     values = [r['card'], r['arm'], phase.get('name'), f"{p.get('host')} {p.get('device')}/{p.get('port')}",
-                              h.get('verdict', 'unknown'), h.get('retransmit_pct', 'unknown'),
+                              ('warn' if h.get('retransmit_judged') and (h.get('retransmit_pct') or 0) > (h.get('retransmit_warn_pct') or 0.5) else 'ok' if h.get('retransmit_judged') and h.get('retransmit_pct') is not None else 'idle / unavailable'), h.get('retransmit_pct', 'unknown'),
                               'yes' if h.get('retransmit_judged') else 'no (under 2 GB)',
-                              '; '.join(h.get('reasons') or ['no continuous observation'])]
+                              'results remain valid']
                     text += '| ' + ' | '.join(map(cell, values)) + ' |\n'
-        text += '\nPause: not collected. Retransmits are go-back-N resends (one per sequence gap or timeout); no data is lost.\n\n'
+        pauses = [p.get('health', {}).get('pause_counters', {}) for r in rows for phase in r.get('fabric', []) for p in phase.get('ports', []) if p.get('health')]
+        text += '\nPFC pause: ' + ('per-priority deltas retained in JSON' if any(pauses) else 'unavailable in this report') + '. Retransmits cost goodput; no data is lost and results remain valid.\n\n'
     text += '## Jobs\n\n| Card | Arm | Repeat | Status | Failure | Spec | Cache | Trace | Profile | Error |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- | --- |\n'
     for r in rows:
         trace = r.get('trace') or {}
@@ -1245,10 +1795,7 @@ def write_summary(state, rows, arms):
 
 
 def assert_absent(job):
-    e = job['entry']
-    targets = [('raptor', 'cuteafd-coordinator-' + e['set']['INSTANCE'])]
-    targets += [(h, f"cuteafd-spark-expert-{h}-{e['set']['EXPERT_PORT']}") for h in e['sparks']]
-    for host, name in targets:
+    for host, name in container_targets(job):
         cmd = ['docker', 'ps', '-a', '--format', '{{.Names}}']
         if host != 'raptor':
             cmd = ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]
@@ -1340,6 +1887,9 @@ print(json.dumps(m))
 def cleanup_script(arm, task):
     # Ownership is durable and explicit. Existing WIP arms are never adopted by
     # running cards; only roots created by this task's build helper can be erased.
+    # An instance may hold several slots (e.g. gate/pre891/at891/devclone), so a
+    # cleanup removes one slot's build root, overlay and registrations, and only
+    # tears down the instance once no slot remains on that host.
     instance, slot = arm['instance'], arm['slot']
     root = arm.get('root', str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + instance)))
     owner = json.dumps({'task': task, 'instance': instance}, sort_keys=True)
@@ -1347,12 +1897,28 @@ def cleanup_script(arm, task):
 home=pathlib.Path.home()
 root=home/'.cache/cuteafd/builds'/ROOT_NAME
 owner=OWNER
+instance=INSTANCE
+slot=SLOT
+names=NAMES
+runs=home/'.cache/cuteafd/wip-run'/instance
+slots=home/'.cache/cuteafd/wip-slots'/instance
+overlay=runs/slot
+registration=slots/(slot+'.json')
+legacy=home/'.cache/cuteafd/wip-slots'/(slot+'.json')
+def remaining_slots():
+    # Any build slot, runtime overlay or per-instance registration still on
+    # this host means the instance root must survive.
+    remaining=set()
+    build_slots=root/'slots'
+    if build_slots.is_dir(): remaining.update(p.name for p in build_slots.iterdir())
+    if runs.is_dir(): remaining.update(p.name for p in runs.iterdir())
+    if slots.is_dir(): remaining.update(p.stem for p in slots.glob('*.json'))
+    remaining.discard(slot)
+    return remaining
+present=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
+residual=[overlay,registration]
+if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==instance: residual.append(legacy)
 if not root.exists():
-    names=NAMES
-    present=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
-    residual=[home/'.cache/cuteafd/wip-run'/INSTANCE/SLOT,home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json')]
-    legacy=home/'.cache/cuteafd/wip-slots'/(SLOT+'.json')
-    if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==INSTANCE: residual.append(legacy)
     if any(name in present for name in names) or any(p.exists() or p.is_symlink() for p in residual):
         raise RuntimeError('unowned cleanup residue without WIP root '+str(root))
     print('verified absent', root); sys.exit(0)
@@ -1360,31 +1926,36 @@ if root.is_symlink(): raise RuntimeError('refusing root symlink')
 marker=root/'.wip-card-owner.json'
 if not marker.is_file() or json.loads(marker.read_text())!=owner:
     raise RuntimeError('refusing unowned WIP root '+str(root))
-names=NAMES
 for name in names:
     ids=subprocess.check_output(['docker','ps','-aq','--filter','name=^'+name+'$'],text=True).split()
     for ident in ids:
         info=json.loads(subprocess.check_output(['docker','inspect',ident],text=True))[0]
         env=info['Config'].get('Env',[])
         mounts=info.get('Mounts',[])
-        if 'WIP_INSTANCE='+INSTANCE not in env or not any(m['Source']==str(root) for m in mounts):
+        if 'WIP_INSTANCE='+instance not in env or not any(m['Source']==str(root) for m in mounts):
             raise RuntimeError('refusing foreign container '+name)
         subprocess.run(['docker','rm','-f',ident],check=True)
     remaining=subprocess.check_output(['docker','ps','-a','--format','{{.Names}}'],text=True).splitlines()
     if name in remaining: raise RuntimeError('container still present '+name)
-overlay=home/'.cache/cuteafd/wip-run'/INSTANCE/SLOT
 if overlay.is_symlink(): raise RuntimeError('refusing overlay symlink')
 if overlay.exists(): shutil.rmtree(overlay)
-for registration, shared in [(home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json'), False),(home/'.cache/cuteafd/wip-slots'/(SLOT+'.json'), True)]:
+for registration, shared in [(slots/(slot+'.json'), False),(legacy, True)]:
     if registration.exists():
         data=json.loads(registration.read_text())
-        if data.get('wip_instance')==INSTANCE and data.get('slot')==SLOT: registration.unlink()
+        if data.get('wip_instance')==instance and data.get('slot')==slot: registration.unlink()
         # The legacy slot-name file is shared by every instance using that slot
         # name; another instance's entry there is not ours to remove or refuse.
         elif not shared: raise RuntimeError('refusing foreign registration '+str(registration))
-if root.is_symlink(): raise RuntimeError('refusing root symlink')
-shutil.rmtree(root)
-for path in [root,overlay,home/'.cache/cuteafd/wip-slots'/INSTANCE/(SLOT+'.json')]:
+build_slot=root/'slots'/slot
+if build_slot.is_symlink(): raise RuntimeError('refusing slot root symlink')
+removed=[overlay,slots/(slot+'.json'),build_slot]
+if legacy.is_file() and json.loads(legacy.read_text()).get('wip_instance')==instance: removed.append(legacy)
+if build_slot.exists(): shutil.rmtree(build_slot)
+if not remaining_slots():
+    # The last slot on this host also releases the instance root.
+    if root.is_symlink(): raise RuntimeError('refusing root symlink')
+    shutil.rmtree(root)
+for path in removed:
     if path.exists() or path.is_symlink(): raise RuntimeError('cleanup failed '+str(path))
 print('verified absent', root, overlay)
 '''
@@ -1392,12 +1963,13 @@ print('verified absent', root, overlay)
     return re.sub(r'\b(ROOT_NAME|OWNER|NAMES|INSTANCE|SLOT)\b', lambda m: replacements[m[0]], script)
 
 
-def cleanup(arms, task, dry):
+def cleanup(arms, task, dry, seed=None):
     for arm in arms.values():
         if 'wip_instance' in arm or 'release' in arm:
             continue  # External sealed builds and release images are never owned by this task.
         script = cleanup_script(arm, task)
-        for host in ('raptor', *HOSTS, *SEED_HOSTS):
+        hosts = dict.fromkeys(('raptor', *HOSTS, *SEED_HOSTS, *arm.get('seed_candidates', []), *arm.get('cleanup_hosts', []), *([seed] if seed and seed != 'auto' else [])))
+        for host in hosts:
             cmd = ['python3', '-c', script] if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(['python3', '-c', script])]
             print(shlex.join(cmd))
             if not dry:
@@ -1416,7 +1988,7 @@ NEST_BUILD_AREA = Path('/mnt/sparknest/build-cache/wip')
 
 def build_scopes(cards):
     env = family_scopes(cards, config)
-    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS='16', RUST_TEST_THREADS='16', CMAKE_BUILD_PARALLEL_LEVEL='16')
+    env.update(CUTEAFD_KACHE_SPARK='1', CUTEAFD_WIP_EXPORT_LOCKS='on', CUTEAFD_KACHE=str(Path.home() / '.cache/cuteafd/tools/x86_64/kache'), CARGO_BUILD_JOBS=os.environ.get('CARGO_BUILD_JOBS', '16'), RUST_TEST_THREADS=os.environ.get('RUST_TEST_THREADS', '16'))
     return env
 
 
@@ -1427,7 +1999,7 @@ def package_dir(scope):
     if fmt == 'fp8':
         return 'fp8/fp8-' + family
     if fmt in ('nvfp4', 'nvfp4a4'):
-        return f'fp8/fp8-{family}-{fmt}'
+        return f'fp8/fp8-{family}-nvfp4a4'
     if fmt.startswith('exl3-k'):
         return f'exl3/exl3-{family}-{fmt[5:]}'
     return None
@@ -1470,7 +2042,7 @@ def v41_tp_role(card, values):
 def checkpoint_is_nvfp4(values):
     """Whether the card's checkpoint ships NVFP4 routed experts (its own
     config.json's moe_quant_algo, as the launcher reads it)."""
-    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash')
+    model = values.get('MODEL_ID', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
     hub = Path(os.environ.get('HF_HOME', Path.home() / '.cache/huggingface')) / 'hub' / ('models--' + model.replace('/', '--'))
     revision = values.get('MODEL_REVISION') or ((hub / 'refs/main').read_text().strip() if (hub / 'refs/main').is_file() else '')
     try:
@@ -1495,10 +2067,12 @@ def toolchain_hash(revision):
 
 
 # Serving-only keys never belong in a build (staging) config.
-BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING', 'COORDINATOR_GPUS',
-              'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
+              'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
+              'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
+              'PROFILE_SPARK_NCU_SET', 'PROFILE_SPARK_NCU_SKIP', 'PROFILE_SPARK_NSYS_GPU_METRICS',
               'PROFILE_EXPERT_INPUT_SAMPLE', 'PROFILE_EXPERT_ROUTE_WEIGHTS', 'COORDINATOR_DOCKER_INFERENCE', 'SPARK_EXPERT_DOCKER_INFERENCE'}
 
 
@@ -1541,12 +2115,39 @@ def staging_hosts(union, seed, separate):
     return hosts if len(hosts) in (2, 3, 4, 6) else hosts + spare[:6 - len(hosts)]
 
 
+def lan_seeds_known(revision):
+    """The LAN-only seeds `revision`'s tooling knows: its release_lan_seed_hosts, or
+    kakapo alone before that set existed (such a wip.sh neither balances nor
+    detects cassowary's down RoCE ports)."""
+    shown = subprocess.run(['git', '-C', str(REPO), 'show', revision + ':scripts/lib/release-common.sh'],
+                           capture_output=True, text=True, timeout=120)
+    found = re.search(r'^release_lan_seed_hosts=\(([^)]*)\)', shown.stdout, re.M) if shown.returncode == 0 else None
+    return tuple(found[1].split()) if found else ('kakapo',)
+
+
+def resolve_seed(seed, revision, separate):
+    """(seed wip.sh starts from, whether it is a placement request, hosts it may build
+    on). 'auto' starts from kakapo and lets wip.sh balance over the LAN-only seeds
+    this revision knows, then fall back to rhea/moa; a named seed is passed as
+    `--seed`, a placement request."""
+    known = lan_seeds_known(revision)
+    if seed == 'auto':
+        return 'kakapo', False, (*known, 'rhea', 'moa') if separate else ('kakapo',)
+    if seed in SEED_HOSTS and seed not in known:
+        raise ValueError(f'{revision} predates the LAN-only seed {seed}; use --seed auto, '
+                         f'{", ".join(known)}, rhea or moa for this arm')
+    return seed, True, (seed,)
+
+
 def seed_env(arm, seed, dry):
     """wip.sh's seed parameters for a Spark build: WIP_SEED_HOST, plus the bulk
-    transfer address of a seed off the RoCE fabric. Legacy wip.sh reads neither."""
+    transfer address of a named seed off the RoCE fabric (an automatic one is
+    resolved by wip.sh after it balances). Legacy wip.sh reads neither."""
     if not arm.get('seed_separate') or arm.get('build_role') != 'both':
         return {}
-    return dict(WIP_SEED_HOST=seed, **({} if seed in HOSTS else {'WIP_SEED_ADDR': seed_lanes(seed, dry)[0]}))
+    if seed in HOSTS or not arm.get('seed_explicit', True):
+        return dict(WIP_SEED_HOST=seed)
+    return dict(WIP_SEED_HOST=seed, WIP_SEED_ADDR=seed_lanes(seed, dry)[0])
 
 
 def seed_lanes(seed, dry):
@@ -1574,6 +2175,62 @@ def resolve_builds(items):
             raise ValueError('duplicate --build arm ' + name)
         builds[name] = run(['git', '-C', str(REPO), 'rev-parse', revision + '^{commit}']).stdout.strip()
     return builds
+
+
+def owner_marker_script(root, task, instance, slot, revision):
+    # A direct WIP retry may predate the cards owner marker. Adopt only a single
+    # slot whose seals, identity and frozen source all match this build task.
+    return """import hashlib,json,pathlib
+p=pathlib.Path.home()/'.cache/cuteafd/builds'/ROOT_NAME
+assert not p.is_symlink(), 'refusing root symlink'
+p.mkdir(parents=True,exist_ok=True)
+m=p/'.wip-card-owner.json'
+owner=OWNER
+if m.exists():
+    assert json.loads(m.read_text())==owner, 'foreign WIP owner'
+elif any(p.iterdir()):
+    slots=p/'slots'
+    assert slots.is_dir() and {d.name for d in slots.iterdir()}=={SLOT}, 'unowned slot set'
+    roles=list((slots/SLOT).iterdir())
+    assert roles, 'no sealed roles'
+    for d in roles:
+        assert d.name in ('coordinator','spark-expert') and not d.is_symlink(), 'invalid role'
+        raw=(d/'META.json').read_bytes()
+        assert hashlib.sha256(raw).hexdigest()==(d/'FINGERPRINT').read_text().strip(), 'META seal mismatch'
+        meta=json.loads(raw)
+        assert (meta['slot'],meta['role'],meta['wip_instance'])==(SLOT,d.name,INSTANCE), 'slot identity mismatch'
+        for relative,key in [('SOURCE_SHA256SUMS','source_manifest_sha256'),('workspace/.cuteafd-wip/ARTIFACT_SHA256SUMS','artifact_manifest_sha256')]:
+            assert hashlib.sha256((d/relative).read_bytes()).hexdigest()==meta[key], 'manifest seal mismatch'
+        revision_path=d/'workspace/.cuteafd-source-revision'
+        revision_bytes=revision_path.read_bytes()
+        assert revision_bytes.decode().strip()==REVISION, 'source revision mismatch'
+        assert hashlib.sha256(revision_bytes).hexdigest()+'  ./.cuteafd-source-revision' in (d/'SOURCE_SHA256SUMS').read_text().splitlines(), 'unsealed source revision'
+m.write_text(json.dumps(owner))
+""".replace('ROOT_NAME', repr(Path(root).name)).replace('OWNER', repr(dict(task=task, instance=instance))).replace('SLOT', repr(slot)).replace('INSTANCE', repr(instance)).replace('REVISION', repr(revision))
+
+
+def claim_root(root, task, arm, revision, seed_candidates, dry=False):
+    """Write this task's owner marker before any build work touches the root: on
+    raptor and, for a both-role build, every host the slot is staged to plus any
+    seed that may compile it. A coordinator-only export claims raptor alone. An
+    unreachable automatic seed is skipped (wip.sh would not choose it either);
+    any other failure stops the build. Claiming first keeps a root that a failed
+    or interrupted run leaves behind owned by this task, so a later --resume never
+    has to adopt an unowned root."""
+    seed_hosts = [h for h in seed_candidates if h not in HOSTS]
+    hosts = ('raptor', *HOSTS, *seed_hosts) if arm['build_role'] == 'both' else ('raptor',)
+    for host in hosts:
+        if dry:
+            continue
+        marker = owner_marker_script(root, task, arm['instance'], arm['slot'], revision)
+        command = ['python3', '-c', marker]
+        try:
+            run(command if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(command)])
+        except subprocess.CalledProcessError as error:
+            # An unreachable automatic seed is skipped by wip.sh too; anything else stops.
+            if arm['seed_explicit'] or host not in seed_hosts or error.returncode != 255:
+                raise
+            print(f'# build seed {host} unreachable; wip.sh will not choose it')
 
 
 def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
@@ -1608,6 +2265,15 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         # unless this revision's wip.sh predates it.
         union = {h for card in cards for h in card.get('sparks', [])}
         arm['seed_separate'] = seed_option_capable(revision)
+        requested = seed
+        seed, arm['seed_explicit'], seed_candidates = resolve_seed(requested, revision, arm['seed_separate'])
+        arm['seed_candidates'] = list(seed_candidates)
+        arm['cleanup_hosts'] = list(dict.fromkeys(('raptor', *HOSTS, *seed_candidates, seed)))
+        if not dry:
+            # Preserve ownership inventory even if compiling/sealing later fails.
+            save(state / 'plan.json', {'task': task, 'arms': arms, 'jobs': []})
+        if build_role == 'both' and arm['seed_separate'] and arm['seed_explicit']:
+            build_cmd += ['--seed', seed]
         # A coordinator-only slot stages to no Spark: SPARK_COUNT=0, no ranks named.
         hosts = staging_hosts(union, seed, arm['seed_separate']) if build_role == 'both' else []
         if build_role == 'both' and len(hosts) > 6:
@@ -1615,8 +2281,9 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                              f'{seed} plus the {len(union)}-Spark union makes {len(hosts)} ranks; use --seed rhea|moa '
                              'for this arm or build a revision with the separate seed (#117)')
         if build_role == 'both':
-            print(f"# build seed {name}: {seed} ({'WIP_SEED_HOST' if arm['seed_separate'] else 'legacy SPARK_0_HOST'}); "
-                  f"Spark targets ({len(hosts)}): {','.join(hosts)}")
+            via = ('--seed' if arm['seed_explicit'] else 'WIP_SEED_HOST') if arm['seed_separate'] else 'legacy SPARK_0_HOST'
+            shown = f"auto: {seed} or least loaded of {','.join(seed_candidates)}" if requested == 'auto' and arm['seed_separate'] else seed
+            print(f"# build seed {name}: {shown} ({via}); Spark targets ({len(hosts)}): {','.join(hosts)}")
         build_config = state / ('build-' + name + '.config')
         # A staging config: the first card's model and its --set/--arm-set
         # overrides, the union of Spark hosts, and no serving topology. Export
@@ -1626,12 +2293,12 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         for key in list(values):
             if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
-        # The staging container binds to the card's own coordinator GPU (default
-        # 1), so a build can stay off a GPU another session holds.
-        gpu = values.get('COORDINATOR_GPU', '1')
+        # The staging container binds to the card's primary coordinator GPU
+        # (default 1), so a build can stay off a GPU another session holds.
+        gpu = values.get('COORDINATOR_GPUS', '1').split(',')[0]
         if gpu not in ('0', '1'):
-            raise ValueError(f'staging COORDINATOR_GPU must be 0 or 1, got {gpu}')
-        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU=gpu, RTX_GPUS='1')
+            raise ValueError(f'staging COORDINATOR_GPUS must start with GPU 0 or 1, got {gpu}')
+        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPUS=gpu, RTX_GPUS='1')
         if len(hosts) in (2, 3):
             # Two or three ranks without explicit keys are the compact EXL3 layout.
             values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')
@@ -1642,6 +2309,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             lane_a, lane_b = seed_lanes(host, dry)
             values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': lane_a, f'SPARK_{i}_LANE_B': lane_b})
         build_config.write_text(''.join(f'{k}={v}\n' for k, v in sorted(values.items())))
+        claim_root(root, task, arm, revision, seed_candidates, dry)
         # Only the submodules a WIP build reads, from the local module stores
         # (scripts/build/wip-source-checkout.sh, verified against the tree locks).
         checkout = REPO / 'scripts/build/wip-source-checkout.sh'
@@ -1675,10 +2343,6 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
                         # A fair turn (hwlock), so a seed wait never overtakes an older queued job.
                         subprocess.run([sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', seed,
                                         '--wait', str(seed_wait), '--', 'true'], check=True, timeout=seed_wait + 60)
-                    for host in (('raptor', *HOSTS, *([seed] if seed not in HOSTS else [])) if build_role == 'both' else ('raptor',)):
-                        marker = 'import pathlib,json; p=pathlib.Path.home()/".cache/cuteafd/builds"/' + repr(root.name) + '; p.mkdir(parents=True,exist_ok=True); m=p/".wip-card-owner.json"; owner=' + repr(dict(task=task, instance=arm['instance'])) + '; assert not m.exists() or json.loads(m.read_text())==owner; assert m.exists() or not any(p.iterdir()); m.write_text(json.dumps(owner))'
-                        mark = ['python3', '-c', marker]
-                        run(mark if host == 'raptor' else ['ssh', '-o', 'BatchMode=yes', host, shlex.join(mark)])
                     env = {**os.environ, **scopes, 'WIP_INSTANCE': arm['instance'], 'WIP_ROOT': str(root)}
                     env.pop('WIP_SEED_HOST', None)
                     env.pop('WIP_SEED_ADDR', None)
@@ -1714,14 +2378,21 @@ def main():
     parser.add_argument('--matched-prompts', action='store_true', help='interleave with one shared nonce sequence per pair and verified prompt token hashes')
     parser.add_argument('--nonce-seed', help='explicit shared nonce seed for every job, overriding matched-prompts auto-seeds')
     parser.add_argument('--parallel', type=int, default=1)
+    parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)),
+                        help='maximum wait for the single serving turn, in seconds (default 21600)')
     parser.add_argument('--task', default='cards-' + time.strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--state', type=Path)
     parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for arms that are neither --build nor --arm-repo')
     parser.add_argument('--arm-repo', action='append', default=[], metavar='ARM=PATH', help='launcher checkout serving this non-built arm '
                         '(a reused slot names its matching source); --build arms serve through their own source-ARM checkout')
-    parser.add_argument('--binary', default='cuteafd')
+    parser.add_argument('--binary', help='the cuteafd that runs smoke; default: cuteafd on PATH, else the arm\'s sealed '
+                        'slot binary (<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd)')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
-    parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:CARD:KEY=VALUE', help='arm-specific setting, overriding --set')
+    parser.add_argument('--arm-set', action='append', default=[], metavar='ARM:[CARD:]KEY=VALUE', help='arm config override; without CARD, applied after generation')
+    parser.add_argument('--arm-unset', action='append', default=[], metavar='ARM:KEY', help='remove an arm config key after generation')
+    parser.add_argument('--arm-env', action='append', default=[], metavar='ARM:CUTEAFD_DIAG_NAME=VALUE',
+                        help='arm-specific private diagnostic in the launch environment (CUTEAFD_DIAG_* only; '
+                        'the launcher forwards those to the coordinator unchanged)')
     parser.add_argument('--probe', action='append', default=[], metavar='[ARM:]CARD:image,memory,console,fabric')
     parser.add_argument('--panels', metavar='LIST', help='run these server panels on every card instead of its profile '
                         '(comma list; "baseline" for the basic card + quick quality alone; "none" for no server profile)')
@@ -1733,15 +2404,24 @@ def main():
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
-                        '(default 192); longer runs give profiled waves more decode steps at every width')
+                        '(default 192); longer runs give profiled waves more decode steps at every width, and 0 omits '
+                        'max_tokens so the server output default bounds each request (KV-reservation admission probes)')
     parser.add_argument('--post-load-repeat', action='store_true', help='make that post-load C1 re-send the levels C1 prompts '
                         '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
     parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
+    parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
+    parser.add_argument('--prefill-repeat', action='store_true', help='each prefill point\'s timed request re-sends its '
+                        'warm-up\'s corpus behind a fresh nonce (nominal warm: the same mapped-table rows, no prefix-cache reuse)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
                         'checked after warm-up and recorded in result.json')
+    parser.add_argument('--cold-window', metavar='HOSTS', help='drop the clean page cache on these comma-separated hosts '
+                        '(nest drop-caches): with --prefill-lengths before every prefill point\'s warm-up and again before '
+                        'its timed request (decode levels after them are post-prefill, not cold); otherwise once when the '
+                        'timed sweep opens, after warm-up. Under the card\'s held locks, so only hosts the card owns; '
+                        'composes with PROFILE=nsys')
     parser.add_argument('--exact-state', metavar='ARGV', help='run this exact prefix-state golden (shell-split argv; gets '
                         '--resume-url URL --output JOB/exact-state) against the live server at the end of the sweep; needs --levels')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
@@ -1752,14 +2432,17 @@ def main():
     parser.add_argument('--build', action='append', default=[], metavar='ARM=REV')
     parser.add_argument('--build-only', action='store_true', help='build and seal selected arms without generating or launching smoke jobs')
     parser.add_argument('--seed', '--seed-host', dest='seed_host', default=DEFAULT_SEED, choices=SEEDS,
-                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}); '
-                        'kakapo is a 10 GbE build-only seed whose slots reach the serving Sparks through sparknest')
+                        help=f'out-of-serving Spark that compiles and seals --build arms (default {DEFAULT_SEED}: the '
+                        'less-loaded LAN-only seed, kakapo or cassowary, then rhea/moa). The LAN-only seeds are 10 GbE '
+                        'build-only hosts whose slots reach the serving Sparks through sparknest; a named seed is a placement request')
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--observe', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not 0 < args.wait < float('inf'):
+        parser.error('--wait must be finite and positive')
     if args.observe or args.precheck:
         job = json.loads((args.observe or args.precheck).read_text())
         (observe if args.observe else precheck)(job)
@@ -1768,7 +2451,7 @@ def main():
         # Smoke's prelaunch hook: the same checks again, now that smoke holds the locks.
         job = json.loads(args.preflight_job.read_text())
         plan = json.loads((args.preflight_job.resolve().parent.parent / 'plan.json').read_text())
-        artifacts = preflight_job(job, plan['arms'][job['arm']])
+        artifacts = preflight_at_grant(job, plan['arms'][job['arm']])
         if job.get('artifacts') and artifacts != job['artifacts']:
             raise ValueError('sealed artifacts changed since enqueue: ' + json.dumps(artifacts, sort_keys=True))
         print('preflight at grant: pass')
@@ -1814,7 +2497,7 @@ def main():
             if recorded['task'] != args.task or set(recorded['arms']) != set(arms) or any(recorded['arms'][name]['instance'] != arm['instance'] or recorded['arms'][name]['slot'] != arm['slot'] or recorded['arms'][name].get('release') != arm.get('release') for name, arm in arms.items()):
                 raise ValueError('cleanup does not match this task plan')
             arms = recorded['arms']
-        cleanup(arms, args.task, args.dry_run)
+        cleanup(arms, args.task, args.dry_run, args.seed_host)
         return 0
     if not args.cards or not (args.matrix or args.interleave):
         parser.error('--cards and --matrix or --interleave required')
@@ -1822,21 +2505,35 @@ def main():
     cards = load_cards(kit.expanduser().resolve(), args.cards)
     overrides = overrides_from(args.set)
     arm_overrides = {}
+    arm_config = {}
+    arm_unsets = {}
+    for item in args.arm_unset:
+        name, key = item.split(':', 1)
+        if name not in arms:
+            raise ValueError('unknown override arm: ' + name)
+        overrides_from(['config:' + key + '='])
+        arm_unsets.setdefault(name, set()).add(key)
     for item in args.arm_set:
         name, setting = item.split(':', 1)
         if name not in arms:
             raise ValueError('unknown override arm: ' + name)
+        if ':' not in setting.split('=', 1)[0]:
+            arm_config.setdefault(name, {}).update(overrides_from(['config:' + setting])['config'])
+            continue
         parsed = overrides_from([setting])
         if set(parsed) - set(args.cards):
             raise ValueError('arm override names must be selected cards')
         for card, values in parsed.items():
             arm_overrides.setdefault(name, {}).setdefault(card, {}).update(values)
+    arm_env = arm_env_from(args.arm_env, arms)
     if args.post_load_c1 and not args.levels:
         parser.error('--post-load-c1 needs --levels')
     if args.post_load_repeat and not args.post_load_c1:
         parser.error('--post-load-repeat needs --post-load-c1')
-    if args.sweep_tokens is not None and not (args.levels and 1 <= args.sweep_tokens <= 8192):
-        parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
+    if args.prefill_repeat and not args.prefill_lengths:
+        parser.error('--prefill-repeat needs --prefill-lengths')
+    if args.sweep_tokens is not None and not (args.levels and 0 <= args.sweep_tokens <= 8192):
+        parser.error('--sweep-tokens needs --levels and 0 (omit max_tokens) or 1..8192 tokens')
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -1854,6 +2551,8 @@ def main():
         if not parts or not all(x.isdigit() and 256 <= int(x) <= 1 << 20 for x in parts):
             parser.error('--context-lengths takes prompt lengths in 256..1048576, e.g. 32768,131072')
         context_lengths = [int(x) for x in parts]
+    if args.context_suffix is not None and not 0 <= args.context_suffix <= 1 << 20:
+        parser.error('--context-suffix takes tokens in 0..1048576')
     context_levels = None
     if args.context_levels is not None:
         parts = [x.strip() for x in args.context_levels.split(',') if x.strip()]
@@ -1862,18 +2561,18 @@ def main():
         context_levels = [int(x) for x in parts]
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not (levels or prefill_lengths):
-            parser.error('--panels none runs nothing without --levels or --prefill-lengths')
+        if not selection and not (levels or prefill_lengths or args.probe):
+            parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
         profile = 'panels:' + selection
-        listed = requested_panels(profile)
+        listed = requested_panels(profile, binary=panel_binary(args.binary, arms))
         for card in cards:
             card['profile'] = profile
-            if listed and 'baseline' not in listed:
-                card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
+            if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
+                card['baseline'] = False  # Explicit panels alone, or a probe-only readiness run; list baseline to keep it.
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--lossless-set needs --panels with spec_lossless_set')
     lossless_dump = None
     if args.dump_lossless_rows is not None:
@@ -1881,19 +2580,23 @@ def main():
             lossless_dump = parse_lossless_dump(args.dump_lossless_rows, lossless_set)
         except ValueError as error:
             parser.error(f'--dump-lossless-rows: {error}')
-        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke')) for card in cards):
+        if not any('spec_lossless_set' in requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms)) for card in cards):
             parser.error('--dump-lossless-rows needs --panels with spec_lossless_set')
     for card in cards:
         if context_lengths is not None:
             card['context_lengths'] = context_lengths
         if context_levels is not None:
             card['context_levels'] = context_levels
+        if args.context_suffix is not None:
+            card['context_suffix'] = args.context_suffix
         if lossless_set:
             card['lossless_set'] = lossless_set
         if lossless_dump:
             card['lossless_dump'] = lossless_dump
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
+            if args.prefill_repeat:
+                card['prefill_repeat'] = True
         if levels:
             card['levels'] = levels
             if args.sweep_tokens is not None:
@@ -1914,7 +2617,7 @@ def main():
             probes[card['name']].add('console')
             if args.matched_prompts and 'image' in probes[card['name']]:
                 raise ValueError('--matched-prompts cannot precede its first benchmark request with an image probe')
-        requested_panels(card.get('profile', 'smoke'))
+        requested_panels(card.get('profile', 'smoke'), binary=panel_binary(args.binary, arms))
         card['set'].update(overrides.get(card['name'], {}))
         values = {**config(card['config']), **card['set']}
         count = int(values.get('SPARK_COUNT', len(card.get('sparks', []))))
@@ -1933,6 +2636,7 @@ def main():
             variant['sparks'] = [values.get(f'SPARK_{i}_HOST', card['sparks'][i] if i < len(card['sparks']) else HOSTS[i]) for i in range(count)]
             build_cards.append(variant)
     build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
+    adopt_roots(arms)
     if args.build_only:
         save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': []})
         return 0
@@ -1954,11 +2658,16 @@ def main():
     bindings = dict(item.split('=', 1) for item in args.card_arm)
     if bindings and (args.interleave or set(bindings) - set(args.cards) or set(bindings.values()) - set(arms)):
         raise ValueError('--card-arm needs selected cards/arms in matrix mode')
-    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
+    jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None, binary=panel_binary(args.binary, arms)) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
+        apply_arm_config(job, arm_config.get(job['arm'], {}), arm_unsets.get(job['arm'], set()))
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
+        # Per arm: an A/B of two builds runs each arm's own smoke runner.
+        job['binary'] = resolve_binary(args.binary, arms[job['arm']], args.dry_run)
+        if arm_env.get(job['arm']):
+            job['arm_env'] = arm_env[job['arm']]
         save(Path(job['state']) / 'job.json', {**job, 'probes': sorted(job['probes'])})
     parallel_safe(jobs, args.parallel)
     for job in jobs:
@@ -1981,16 +2690,21 @@ def main():
         save(group_root / 'matrix.json', dict(build='wip-cards', entries=[job['entry'] for job in jobs]))
     save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': [{**j, 'probes': sorted(j['probes'])} for j in jobs]})
     if args.dry_run:
+        print('# single serving turn after all builds/seals: hwlock --locks ' +
+              ','.join(serving_locks(jobs)) + ' --wait ' + str(args.wait) +
+              '; held through all arms/repeats and final teardown')
         if groups and len(groups[0]) > 1:
-            cmd = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
+            cmd = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
             cmd[-1] = str(args.parallel)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(args.nonce_seed) + ' ') if args.nonce_seed is not None else ''
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # grouped smoke scheduler; numeric exits per card')
             return 0
         for job in jobs:
-            cmd = smoke_command(args.binary, job['launcher']['repo'], job)
+            cmd = smoke_command(job['binary'], job['launcher']['repo'], job)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
+            if args.context_suffix is not None:
+                print('# context_suffix=' + str(job['entry']['context_suffix']))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
             for kind in ('observer', 'precheck'):
                 if kind in job['entry']:
@@ -2017,14 +2731,19 @@ def main():
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+        (['prefill_repeat'] if args.prefill_repeat else []) + \
+        (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
-        (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else [])
+        (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
+        (['context_suffix'] if args.context_suffix is not None else []) + \
+        (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
-        binary_supports(args.binary, job['launcher']['repo'], job, fields)
+        requested_panels(job['entry'].get('profile', 'smoke'), binary=job['binary'])
+        binary_supports(job['binary'], job['launcher']['repo'], job, fields)
     # Everything checkable without hardware, before any queue ticket.
     problems = []
     for job in jobs:
@@ -2044,12 +2763,23 @@ def main():
         return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
+    # From here on a stop signal reaches every running smoke (which tears down)
+    # and no further job starts.
+    install_stop_handlers()
     if args.nonce_seed is not None:
         env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
+    def cancelled_row(job):
+        row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
+        row.update(status='failed', exit_code=stopped_code(), error=f"stopped by signal {STOP['signal']} before it started",
+                   failure_kind='cancelled', state=job['state'])
+        return row
+
     def execute(job):
         dest = Path(job['state'])
         if job['state'] in kept:
             return kept[job['state']]
+        if STOP['signal'] is not None:
+            return cancelled_row(job)
         try:
             # Re-checked right before this job's turn: an earlier job may have
             # left a container, or a slot may have been rebuilt meanwhile.
@@ -2069,8 +2799,22 @@ def main():
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
-        process = detached(smoke_command(args.binary, job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
-        rc = process.wait()
+        for key in [k for k in job_env if k.startswith('CUTEAFD_DIAG_')]:
+            del job_env[key]
+        job_env.update(job.get('arm_env', {}))
+        if STOP['signal'] is not None:
+            return cancelled_row(job)
+        process = detached(smoke_command(job['binary'], job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
+        rc = wait_detached(process)
+        # Cancellation already uses smoke's bounded teardown; remote probes and
+        # profile collection must not extend the 60/75/80/90 s stop chain.
+        if STOP['signal'] is not None:
+            row = cancelled_row(job)
+            row['error'] = f"stopped by signal {STOP['signal']}; smoke exited"
+            exit_file.write_text(str(stopped_code()) + '\n')
+            save(dest / 'result.json', row)
+            return row
+        assert_absent(job)
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
         row = summarize_job(job, code)
@@ -2080,49 +2824,76 @@ def main():
             row['exit_code'] = 81
             save(dest / 'result.json', row)
         return row
-    if groups and len(groups[0]) > 1:
-        group_root = state / 'parallel-smoke'
-        try:
-            for job in jobs:
-                preflight_job(job, arms[job['arm']])
-        except (ValueError, subprocess.SubprocessError) as error:
+    try:
+        # build_arms (including legacy/export turns) completed before job creation;
+        # sealed-slot preflight rejects missing artifacts instead of building lazily.
+        with serving_turn([job for job in jobs if job['state'] not in kept], env, args.wait):
+            if STOP['signal'] is not None:
+                return stopped_code()
+            if groups and len(groups[0]) > 1:
+                group_root = state / 'parallel-smoke'
+                try:
+                    for job in jobs:
+                        preflight_job(job, arms[job['arm']])
+                except (ValueError, subprocess.SubprocessError) as error:
+                    rows = []
+                    for job in jobs:
+                        row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
+                        row.update(status='failed', exit_code=82, error=str(error))
+                        (Path(job['state']) / 'exit').write_text('82\n')
+                        save(Path(job['state']) / 'result.json', row)
+                        rows.append(row)
+                    write_summary(state, rows, arms)
+                    return 1
+                command = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
+                command[-1] = str(args.parallel)
+                if STOP['signal'] is not None:
+                    return stopped_code()
+                process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
+                rc = wait_detached(process)
+                if STOP['signal'] is not None:
+                    for job in jobs:
+                        (Path(job['state']) / 'exit').write_text(str(stopped_code()) + '\n')
+                        save(Path(job['state']) / 'result.json', cancelled_row(job))
+                    return stopped_code()
+                for job in jobs:
+                    assert_absent(job)
+                rows = []
+                for job in jobs:
+                    row = summarize_job(job, rc)
+                    # A different entry's failure does not erase this entry's evidence.
+                    outcomes = row.get('smoke', {})
+                    if isinstance(outcomes, dict) and outcomes.get(job['entry']['name'], {}).get('status') == 'done':
+                        row = summarize_job(job, 0)
+                    code = 0 if row['status'] == 'pass' else (rc or 81)
+                    (Path(job['state']) / 'exit').write_text(str(code) + '\n')
+                    row['exit_code'] = code
+                    rows.append(row)
+                write_summary(state, rows, arms)
+                return stopped_code() or int(any(row['status'] != 'pass' for row in rows))
             rows = []
-            for job in jobs:
-                row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
-                row.update(status='failed', exit_code=82, error=str(error))
-                (Path(job['state']) / 'exit').write_text('82\n')
-                save(Path(job['state']) / 'result.json', row)
-                rows.append(row)
-            write_summary(state, rows, arms)
-            return 1
-        command = smoke_command(args.binary, arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
-        command[-1] = str(args.parallel)
-        process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
-        rc = process.wait()
-        rows = []
-        for job in jobs:
-            row = summarize_job(job, rc)
-            # A different entry's failure does not erase this entry's evidence.
-            outcomes = row.get('smoke', {})
-            if isinstance(outcomes, dict) and outcomes.get(job['entry']['name'], {}).get('status') == 'done':
-                row = summarize_job(job, 0)
-            code = 0 if row['status'] == 'pass' else (rc or 81)
-            (Path(job['state']) / 'exit').write_text(str(code) + '\n')
-            row['exit_code'] = code
-            rows.append(row)
-        write_summary(state, rows, arms)
-        return int(any(row['status'] != 'pass' for row in rows))
-    rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        for row in executor.map(execute, jobs):
-            rows.append(row)
-            write_summary(state, rows, arms)
-    return int(any(r['status'] != 'pass' for r in rows))
+            with contextlib.ExitStack() as stack:
+                # Sequential comparisons stop immediately if teardown left containers.
+                if args.parallel > 1:
+                    executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel))
+                    outcomes = executor.map(execute, jobs)
+                else:
+                    outcomes = map(execute, jobs)
+                for row in outcomes:
+                    rows.append(row)
+                    write_summary(state, rows, arms)
+            return stopped_code() or int(any(r['status'] != 'pass' for r in rows))
+    except hwlock.Cancelled:
+        return stopped_code() or 1
+
+
+def cli():
+    try:
+        return main()
+    except (ValueError, RuntimeError, subprocess.SubprocessError, OSError) as error:
+        print('wip-cards: ' + str(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':
-    try:
-        raise SystemExit(main())
-    except (ValueError, RuntimeError, subprocess.SubprocessError, OSError) as error:
-        print('wip-cards: ' + str(error), file=sys.stderr)
-        raise SystemExit(2)
+    raise SystemExit(cli())

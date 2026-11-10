@@ -99,6 +99,9 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
         arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
     assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
+    assert builder.canonical(result) == builder.canonical(builder.build_vision_set(
+        family="mimo_v2", model="model", checkpoint="model", version="media1", arm=arm,
+        probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64, vision_manifest=None))
     assert all(w["block"] == "vision" and set(w["roles"][w["score_from"]:]) == {"gen"} for w in result["windows"])
     tasks = [body["messages"][1]["content"][1]["text"] for body in requests]
     assert "visible line of code" in tasks[0] and "Python parser" in tasks[2]
@@ -126,9 +129,222 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
             arm=arm, probe=missing, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
 
 
+def test_legacy_vision_canonical_bytes_match_pre_manifest_builder(tmp_path):
+    import json
+    data = b"legacy fixture identity"
+    records = [{"id": f"image_{i}", "path": f"image_{i}.png",
+        "sha256": hashlib.sha256(data).hexdigest(), "kind": kind, "question": "Pinned question"}
+        for i, kind in enumerate(["code", "code", "terminal", "terminal", "chart", "chart", "diagram", "diagram"])]
+    for item in records:
+        (tmp_path / item["path"]).write_bytes(data)
+    (tmp_path / "fixtures.json").write_text(json.dumps({"schema": "cuteafd.media.fixtures/1",
+        "fixtures": records, "quick_windows": ["image_0", "image_1"]}, sort_keys=True))
+    def probe(body):
+        return {"probe": {"engine": "fake", "prompt_ids": [1] + [9] * 4 + [2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 4, "kind": "image",
+                "key": "a" * 64, "grid": [1, 4, 4]}]}, "server": {"model": "model", "family": "mimo_v2"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    builder = load_script("fidelity-set")
+    result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model",
+        version="legacy-contract", arm=arm, probe=probe, fixtures=tmp_path, tokenizer_sha256="c" * 64)
+    # Captured from c30634ea9's original eight-fixture builder on these exact inputs.
+    assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
+        "ebd3ebeac6d05602032865e0c06a9f9e1cd6c4eb8391a719c8d45d11460ca854")
+
+
+@pytest.fixture
+def real_vision_input(tmp_path):
+    import json
+    from PIL import Image
+    root = tmp_path / "sources"
+    snapshot = tmp_path / "snapshot"
+    root.mkdir()
+    snapshot.mkdir()
+    Image.new("RGB", (56, 56), (80, 120, 160)).save(root / "photo.png")
+    digest = hashlib.sha256((root / "photo.png").read_bytes()).hexdigest()
+    manifest = root / "manifest.json"
+    manifest.write_text(json.dumps({"images": [{"file": "photo.png", "sha256": digest}],
+        "resize": ["photo.png@4x4"]}))
+    (snapshot / "config.json").write_text(json.dumps({"text_config": {"vocab_size": 32},
+        "vision_config": {"patch_size": 14}, "spatial_merge_size": 2, "image_token_index": 9}))
+    (snapshot / "processor_config.json").write_text(json.dumps({"spatial_merge_size": 2,
+        "image_processor": {"image_processor_type": "PixtralImageProcessor", "patch_size": 14}}))
+    (snapshot / "params.json").write_text(json.dumps({"vision_encoder": {
+        "image_token_id": 9, "image_break_token_id": 8, "image_end_token_id": 7}}))
+    return manifest, snapshot, tmp_path / "fixtures"
+
+
+@pytest.mark.parametrize("server_family,checkpoint", [("mistral_large4", "model"), ("glm5", "model"),
+    ("mimo_v2", "model"), (None, "model"), ("mistral_large4", "other")])
+def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input, server_family, checkpoint):
+    from fidelity_media import processor_contract
+    manifest, snapshot, destination = real_vision_input
+    builder = load_script("fidelity-set")
+    records, contract = builder.real_vision_fixtures(manifest, destination, snapshot)
+    assert contract == processor_contract(snapshot)
+    assert len(records) == 2 and records[1]["provenance"]["grid"] == [1, 4, 4]
+    assert records[1]["provenance"]["derived_sha256"] == records[1]["fixture"]["sha256"]
+    calls = []
+    def probe(body):
+        calls.append(body)
+        image = body["messages"][0]["content"][0]["type"] == "image_url"
+        return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 8, 9, 9, 7, 2] if image else [1, 2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 6, "grid": [1, 4, 4],
+                "key": "a" * 64, "kind": "image"}] if image else []},
+            "server": {"model": checkpoint, "family": server_family}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    kwargs = dict(family="mistral_large4", model="model", checkpoint="model",
+        version="real1", arm=arm, probe=probe, fixtures=destination, tokenizer_sha256="c" * 64,
+        vision_manifest=manifest, snapshot=snapshot)
+    if server_family != "mistral_large4" or checkpoint != "model":
+        with pytest.raises(ValueError, match="server identity"):
+            builder.build_vision_set(**kwargs)
+        return
+    result = builder.build_vision_set(**kwargs)
+    assert result["family"] == "mistral_large4"
+    assert [w["id"] for w in result["windows"]] == ["real_00", "resize_00", "text_control"]
+    for window in result["windows"]:
+        assert set(window["roles"][window["score_from"]:]) == {"gen"}
+        for image in window.get("media", []):
+            assert image["start"] + image["len"] <= window["score_from"]
+    assert not result["windows"][-1].get("media") and len(calls) == 3
+    assert result["windows"][0]["media"][0]["fixture"] == records[0]["fixture"]
+    assert hashlib.sha256(builder.canonical(result)).hexdigest() == (
+        "a893473148496389421db2e21fb76676d57b1f2c5d263065436f470c54f982fe")
+    identity = {"encoder": "b" * 64, "processor": "c" * 64}
+    def sealed_probe(body):
+        response = probe(body)
+        for span in response["probe"]["media"]:
+            span["identity"] = identity
+        return response
+    sealed = builder.build_vision_set(family="mistral_large4", model="model", checkpoint="model",
+        version="real2", arm=arm, probe=sealed_probe, fixtures=destination, tokenizer_sha256="c" * 64,
+        vision_manifest=manifest, snapshot=snapshot)
+    assert all(span["identity"] == identity for window in sealed["windows"] for span in window.get("media", []))
+
+
+def test_real_manifest_audio_uses_pinned_pcm_and_ordinary_transport(real_vision_input):
+    import base64
+    import json
+    import struct
+    manifest, snapshot, destination = real_vision_input
+    pcm = np.linspace(-0.25, 0.25, 1921, dtype="<f4").tobytes()
+    fmt = struct.pack("<HHIIHH", 3, 1, 24000, 96000, 4, 32)
+    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", len(pcm)) + pcm
+    wav = b"RIFF" + struct.pack("<I", len(chunks) + 4) + b"WAVE" + chunks
+    (manifest.parent / "clip.wav").write_bytes(wav)
+    digest = hashlib.sha256(pcm).hexdigest()
+    document = {"audio": [{"file": "clip.wav", "sha256": hashlib.sha256(wav).hexdigest(),
+        "samples": 1921, "pcm_sha256": digest}]}
+    manifest.write_text(json.dumps(document))
+    processor = json.loads((snapshot / "processor_config.json").read_text())
+    processor["feature_extractor"] = {"sampling_rate": 24000, "samples_per_token": 1920}
+    (snapshot / "processor_config.json").write_text(json.dumps(processor))
+    calls = []
+    def probe(body):
+        calls.append(body)
+        audio = body["messages"][0]["content"][0]
+        is_audio = audio["type"] == "input_audio"
+        if is_audio:
+            assert audio["input_audio"]["format"] == "wav"
+            assert base64.b64decode(audio["input_audio"]["data"]) == wav
+        return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 2] if is_audio else [1, 2],
+            "generated": [3] * 600, "audio": [{"start": 1, "len": 2, "key": "a" * 64,
+                "samples": 1921, "pcm_sha256": digest}] if is_audio else []},
+            "server": {"model": "model", "family": "muse_spark"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    builder = load_script("fidelity-set")
+    kwargs = dict(family="muse_spark", model="model", checkpoint="model", version="audio1", arm=arm,
+        fixtures=destination, tokenizer_sha256="c" * 64, vision_manifest=manifest, snapshot=snapshot)
+    result = builder.build_vision_set(probe=probe, **kwargs)
+    assert [w["id"] for w in result["windows"]] == ["audio_00", "text_control"]
+    span = result["windows"][0]["media"][0]
+    assert span["kind"] == "audio" and span["pcm_sha256"] == digest and "grid" not in span
+    assert result["audio_processor"] == processor["feature_extractor"]
+    assert len(calls) == 2 and not result["windows"][-1].get("media")
+    def wrong_echo(body):
+        result = probe(body)
+        if result["probe"]["audio"]:
+            result["probe"]["audio"][0]["pcm_sha256"] = "0" * 64
+        return result
+    with pytest.raises(ValueError, match="audio echo"):
+        builder.build_vision_set(probe=wrong_echo, **kwargs)
+    def short_output(body):
+        result = probe(body)
+        result["probe"]["generated"] = [3] * 575
+        return result
+    with pytest.raises(ValueError, match="576"):
+        builder.build_vision_set(probe=short_output, **kwargs)
+    document["audio"][0]["pcm_sha256"] = "0" * 64
+    manifest.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match="canonical PCM identity"):
+        builder.real_vision_fixtures(manifest, destination, snapshot)
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ("hash", "pinned media identity"), ("path", "relative path"),
+    ("resize", "pinned FILE"), ("pixels", "geometry"), ("merge", "image merge"),
+])
+def test_real_vision_manifest_rejects_unbound_inputs(real_vision_input, mutation, match):
+    import json
+    manifest, snapshot, destination = real_vision_input
+    document = json.loads(manifest.read_text())
+    if mutation == "hash":
+        document["images"][0]["sha256"] = "0" * 64
+    elif mutation == "path":
+        document["images"][0]["file"] = "../photo.png"
+    elif mutation == "resize":
+        document["resize"] = ["unbound.png@4x4"]
+    elif mutation == "pixels":
+        document["resize"] = ["photo.png@2048x2048"]
+    else:
+        processor = json.loads((snapshot / "processor_config.json").read_text())
+        processor["spatial_merge_size"] = True
+        (snapshot / "processor_config.json").write_text(json.dumps(processor))
+        config = json.loads((snapshot / "config.json").read_text())
+        config["spatial_merge_size"] = True
+        (snapshot / "config.json").write_text(json.dumps(config))
+    manifest.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match=match):
+        load_script("fidelity-set").real_vision_fixtures(manifest, destination, snapshot)
+
+
+def test_shared_processor_contract_supports_legacy_processor_not_family_name(tmp_path):
+    import json
+    from fidelity_media import processor_contract
+    (tmp_path / "config.json").write_text("{}")
+    for kind in ("Qwen2VLImageProcessor", "Glm5NextImageProcessor"):
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+            "image_processor_type": kind, "patch_size": 16, "merge_size": 2}))
+        assert processor_contract(tmp_path) == {"merge": 2, "row_markers": 0}
+
+
 def span():
     return {"start": 1, "len": 4, "kind": "image", "key": "a" * 64,
             "grid": [1, 4, 4], "fixture": {"path": "code.png", "sha256": "b" * 64}}
+
+
+def test_processor_geometry_preserves_merged_counts_and_checks_row_markers():
+    from fidelity_media import image_extent
+    for h in range(2, 112, 2):
+        for w in range(2, 112, 2):
+            assert image_extent([1, h, w]) == (h // 2, w // 2, h * w // 4)
+            assert image_extent([1, h, w], {"merge": 2, "row_markers": 1}) == (
+                h // 2, w // 2, h // 2 * (w // 2 + 1))
+    contract = {"merge": 2, "row_markers": 1, "image_token_id": 9, "row_break_token_id": 8, "end_token_id": 7}
+    s = {**span(), "len": 6}
+    tokens = [1, 9, 9, 8, 9, 9, 7, 2]
+    assert validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7, processor=contract) == [s]
+    for i in range(1, 7):
+        wrong = tokens.copy()
+        wrong[i] = 3
+        with pytest.raises(ValueError, match="row markers"):
+            validate_media([s], wrong, ["ctx"] * 7 + ["gen"], 7, processor=contract)
+    with pytest.raises(ValueError, match="merged token extent"):
+        validate_media([s], tokens, ["ctx"] * 7 + ["gen"], 7)
 
 
 def test_media_contract():
@@ -748,3 +964,144 @@ def test_official_tower_export_family_dispatch_preserves_mimo_default(tmp_path, 
     if family: assert output["family"] == family
     else: assert "family" not in output
     with pytest.raises(ValueError, match="not implemented"): exporter.family_features("deepseek_v4")
+
+
+def test_official_media_registry_discovers_only_present_adapters(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    import fidelity_media as registry
+    import fidelity_windows
+    import golden_media
+    paired = load_script("media-paired-probe")
+    monkeypatch.setattr(registry, "__file__", str(tmp_path / "fidelity_media.py"))
+    assert registry.media_families() == ()
+    assert not registry.has_media_adapter("new_family")
+    for name in ("fidelity_media", "golden_media", "new_family_media"):
+        (tmp_path / (name + ".py")).touch()
+    assert registry.media_families() == ("new_family",)
+    assert registry.has_media_adapter("new_family")
+    assert not registry.has_media_adapter("fidelity")
+    for name in ("../escape", "bad.name", "", None):
+        with pytest.raises(ValueError, match="invalid official media family"):
+            registry.has_media_adapter(name)
+    adapter = SimpleNamespace(window_features=lambda *args: None)
+    monkeypatch.setitem(sys.modules, "new_family_media", adapter)
+    assert golden_media.family_features("new_family") is adapter.window_features
+    monkeypatch.setitem(sys.modules, "new_family_media", SimpleNamespace())
+    with pytest.raises(ValueError, match="lacks window_features"):
+        registry.official_media_adapter("new_family")
+    manifest = {"family": "new_family", "windows": [{"media": [span()]}]}
+    path = tmp_path / "panel.json"
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(fidelity_windows, "validate_set", lambda value: value)
+    assert fidelity_windows.load_set(path, "new_family") == manifest
+    assert paired.load_panel(SimpleNamespace(family="new_family", windows=path)) == manifest
+    (tmp_path / "new_family_media.py").unlink()
+    with pytest.raises(ValueError, match="not support media"):
+        fidelity_windows.load_set(path, "new_family")
+    with pytest.raises(ValueError, match="unsupported paired"):
+        paired.load_panel(SimpleNamespace(family="new_family", windows=path))
+    with pytest.raises(ValueError, match="not implemented"):
+        golden_media.family_features("new_family")
+
+
+def test_declared_processor_geometry_agrees_without_family_whitelist(tmp_path):
+    import json
+    from fidelity_media import processor_contract
+    image = {"image_processor_type": "MuseGlimmerImageProcessor", "merge_size": 2,
+             "patch_size": 14, "temporal_patch_size": 2}
+    vision = {"merge_size": 2, "patch_size": 14, "patch_temporal": 2}
+    (tmp_path / "processor_config.json").write_text(json.dumps({"image_processor": image}))
+    (tmp_path / "config.json").write_text(json.dumps({"vision_config": vision}))
+    assert processor_contract(tmp_path) == {"merge": 2, "row_markers": 0}
+    for field in vision:
+        wrong = {**vision, field: 3}
+        (tmp_path / "config.json").write_text(json.dumps({"vision_config": wrong}))
+        with pytest.raises(ValueError, match="processor_config.*disagrees with vision_config"):
+            processor_contract(tmp_path)
+
+
+@pytest.mark.parametrize("official_stride", [1920, 960])
+def test_muse_official_audio_stride_is_validated_without_mutating_property(monkeypatch, official_stride):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import muse_spark_media
+
+    class AudioConfig:
+        @property
+        def samples_per_token(self):
+            return official_stride
+
+    config = SimpleNamespace(vision_config=SimpleNamespace(), audio_config=AudioConfig())
+    calls = []
+
+    class Tower:
+        def __init__(self, audio):
+            assert audio is config.audio_config
+            calls.append("construct")
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state, *, strict, assign):
+            assert state == {} and strict and assign
+
+        def eval(self):
+            calls.append("eval")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(device=lambda _: nullcontext()))
+    monkeypatch.setitem(sys.modules, "transformers.models.muse_spark.configuration_muse_spark",
+                        SimpleNamespace(MuseSparkConfig=SimpleNamespace(from_pretrained=lambda *a, **k: config)))
+    monkeypatch.setitem(sys.modules, "transformers.models.muse_spark.modeling_muse_spark",
+                        SimpleNamespace(MuseSparkVisionModel=Tower, MuseSparkVisionAdapter=Tower,
+                                        MuseSparkAudioModel=Tower))
+    monkeypatch.setattr(muse_spark_media, "audio_contract", lambda _: {"samples_per_token": 1920})
+    monkeypatch.setattr(muse_spark_media.text, "Checkpoint",
+                        lambda _: SimpleNamespace(index={}, close=lambda: calls.append("close")))
+    if official_stride != 1920:
+        with pytest.raises(ValueError, match="samples_per_token differs"):
+            muse_spark_media.load_modules("unused", "audio", "bf16")
+        assert calls == []
+    else:
+        modules, loaded = muse_spark_media.load_modules("unused", "audio", "bf16")
+        assert len(modules) == 1 and loaded is config
+        assert calls == ["construct", "eval", "close"]
+
+
+def test_pcm_span_identity_geometry_and_feature_metadata(tmp_path):
+    import struct
+    from fidelity_media import read_pcm_fixture
+    pcm = np.linspace(-0.2, 0.2, 1921, dtype="<f4")
+    fmt = struct.pack("<HHIIHH", 3, 1, 24000, 96000, 4, 32)
+    body = b"WAVEfmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", pcm.nbytes) + pcm.tobytes()
+    data = b"RIFF" + struct.pack("<I", len(body)) + body
+    (tmp_path / "audio.wav").write_bytes(data)
+    audio = {"start": 1, "len": 2, "kind": "audio", "key": "a" * 64,
+             "samples": len(pcm), "pcm_sha256": hashlib.sha256(pcm.tobytes()).hexdigest(),
+             "fixture": {"path": "audio.wav", "sha256": hashlib.sha256(data).hexdigest()}}
+    policy = {"sampling_rate": 24000, "samples_per_token": 1920}
+    assert validate_media([audio], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4,
+                          audio_processor=policy) == [audio]
+    assert np.array_equal(read_pcm_fixture(tmp_path, audio), pcm)
+    meta = write_features(tmp_path / "features", audio, np.full((2, 8), 0x3f80, dtype=np.uint16),
+                          tower_dtype="bf16", identity={})
+    assert meta["kind"] == "audio" and meta["pcm_sha256"] == audio["pcm_sha256"] and "grid" not in meta
+    for mutation in ({"samples": 0}, {"samples": 1920}, {"pcm_sha256": "bad"}, {"len": 1}):
+        with pytest.raises(ValueError):
+            validate_media([{**audio, **mutation}], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4,
+                           audio_processor=policy)
+    with pytest.raises(ValueError, match="PCM identity"):
+        read_pcm_fixture(tmp_path, {**audio, "pcm_sha256": "b" * 64})
+    with pytest.raises(ValueError, match="processor geometry"):
+        validate_media([audio], [1, 8, 8, 2, 3], ["ctx"] * 4 + ["gen"], 4)
+
+
+def test_prepared_span_preserves_sealed_encoder_and_processor_ids():
+    from fidelity_media import prepared_span
+    span = {"start": 1, "len": 4, "kind": "image", "key": "a" * 64, "grid": [1, 4, 4],
+            "identity": {"encoder": "b" * 64, "processor": "c" * 64}, "image_url": "not retained"}
+    sealed = prepared_span(span)
+    assert sealed["identity"] == span["identity"] and "image_url" not in sealed
+    span["identity"]["encoder"] = "bad"
+    with pytest.raises(ValueError, match="identity"):
+        prepared_span(span)

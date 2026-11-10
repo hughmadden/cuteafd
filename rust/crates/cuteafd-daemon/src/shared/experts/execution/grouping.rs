@@ -92,11 +92,14 @@ impl InstalledExpertGrouping {
             variants: Vec<NativeVariant>,
         }
         let package = directory.join("v41_experts.json");
-        let manifest: Manifest = Self::read(&package)?;
+        let value: serde_json::Value = Self::read(&package)?;
+        let exports = cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(&value)
+            .map_err(|e| Self::error(&package, e))?;
+        let manifest: Manifest = serde_json::from_value(value).map_err(|e| Self::error(&package, e))?;
         if manifest.schema != 1
             || !matches!(
                 manifest.role.as_str(),
-                "spark" | "spark_tp2" | "spark_tp3" | "spark_tp6"
+                "spark" | "spark_tp2" | "spark_tp3" | "spark_tp6" | "spark_tp8"
             )
             || !(1..=4096).contains(&capacity)
         {
@@ -132,9 +135,8 @@ impl InstalledExpertGrouping {
         if capacity > 1 {
             variants.push(selected(1)?);
         }
-        if capacity > 80 {
-            variants.push(selected(80)?);
-        }
+        let grouped = exports.grouped_decode(capacity as u32).map_err(|e| Self::error(&package, e))? as usize;
+        if capacity > grouped && grouped > 1 { variants.push(selected(grouped)?); }
         variants.sort_by_key(|v| v.capacity_rows);
         Ok(Self {
             package,
@@ -158,7 +160,6 @@ impl InstalledExpertGrouping {
             #[serde(default = "default_route_block")]
             route_block: usize,
             direct: bool,
-            decode_schedule: Option<String>,
         }
         fn default_route_block() -> usize {
             8
@@ -173,17 +174,11 @@ impl InstalledExpertGrouping {
         for c in capacities {
             let package = schedule.directory(directory, c).join("v41_exl3.json");
             let meta: Manifest = Self::read(&package)?;
-            let scheduled = schedule == Exl3Schedule::Gb10 && matches!(c, 1 | 80);
+            schedule.check_export(directory, c).map_err(|e| Self::error(&package, e))?;
             if meta.schema != "cuteafd.v41-exl3-aot.v1"
                 || meta.capacity != c as usize
                 || !matches!(meta.route_block, 8 | 16 | 32 | 64)
                 || (meta.direct && meta.route_block != 8)
-                || meta.decode_schedule.as_deref()
-                    != if scheduled {
-                        Some(schedule.name())
-                    } else {
-                        None
-                    }
             {
                 return Err(Self::error(
                     &package,
@@ -248,7 +243,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(
             root.path().join("v41_experts.json"),
-            json!({"schema":1,"role":"spark","variants":variants}).to_string(),
+            json!({"schema":1,"role":"spark","decode_capacities": variants.as_array().unwrap().iter().filter_map(|v| v["capacity_rows"].as_u64()).filter(|&n| n <= 80).collect::<Vec<_>>(),"variants":variants}).to_string(),
         )
         .unwrap();
         root
@@ -336,6 +331,28 @@ mod tests {
         assert_eq!(installed.group_rows(0).unwrap(), 32);
         assert_eq!(installed.group_rows(2).unwrap(), 16);
         assert_eq!(installed.group_rows(16).unwrap(), 16);
+    }
+    #[test]
+    fn exl3_grouping_uses_the_packaged_default_schedule_identity() {
+        let package = tempfile::tempdir().unwrap();
+        let root = package.path().join("rtx-tp2");
+        exl3_fixture(&root, 1, Some(8), Exl3Schedule::Default);
+        let path = root.join("m1/v41_exl3.json");
+        let mut meta: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let canonical = "l2=2,pf1=0,pf2=0,pdl=1";
+        meta["decode_schedule"] = json!(canonical);
+        std::fs::write(&path, meta.to_string()).unwrap();
+        std::fs::write(package.path().join("manifest.json"), json!({
+            "schema": "cuteafd.exl3-package.v1",
+            "variants": [{"directory": "rtx-tp2/m1", "decode_schedule": canonical}]
+        }).to_string()).unwrap();
+        let installed = InstalledExpertGrouping::exl3(&root, 1, Exl3RowPolicy::Nearest,
+            Exl3Schedule::Default).unwrap();
+        assert_eq!(installed.group_rows(1).unwrap(), 8);
+        meta["decode_schedule"] = json!("other");
+        std::fs::write(path, meta.to_string()).unwrap();
+        assert!(InstalledExpertGrouping::exl3(&root, 1, Exl3RowPolicy::Nearest,
+            Exl3Schedule::Default).is_err());
     }
     #[test]
     fn exl3_worker_policy_and_schedule_select_actual_package() {

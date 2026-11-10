@@ -44,7 +44,7 @@ def main():
             group.add_argument('--body')
     init = sub.add_parser('init')
     init.add_argument('--title', required=True)
-    init.add_argument('--base', default='work/p0')
+    init.add_argument('--base', default='dev')
     init.add_argument('--milestone')
     args = parser.parse_args()
     try:

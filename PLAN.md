@@ -49,7 +49,7 @@ Core (parity tier, must match or beat the parent engines):
 
 | Model | Family | Format | Notes |
 | --- | --- | --- | --- |
-| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. The regression anchor. |
+| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. |
 | wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm5 | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | deepseek_v4 | FP8 block + FP4 experts | compress 4/128 alternating, nextn 1 |
 | wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 | deepseek_v4 | EXL3 K2 experts | 61 layers, 7168 wide, ~96 GiB per Spark rank at TP4 |
@@ -183,20 +183,28 @@ declares its header, speculator, micro-step stages and layer classes in a `conso
 Shared page shell, palette and SVG chart primitives at `/assets/cuteafd-ui.{css,js}` (also used
 by `/bench`); logo and favicon at `/assets/cuteafd-{logo,mark}.svg`.
 
-## Execution engines (decided 2026-09-29)
+## One engine, shared structure (TJ, 2026-10-25)
 
-V4.1's execution stack is specialized to its causal encoder/decoder: KV and
-index sources [2,8,14,20], engram gates at layers 1 and 14, dSpark taps from
-layer 37, encoder/replay stages. Other families share none of that, so there
-are two engines under one scheduler, API, transport, host cache and sampler:
+There is one engine. Every family, V4.1 included, runs on the same shared
+structure: the shared prefill executor (`shared/prefill_pipeline.rs`), the
+shared decode lane contract and owners, the shared Spark exchange, scheduler,
+API, transport, host cache and sampler. A family supplies hooks (attention,
+router, experts, head, speculator taps) and its `LaneSupport` entry; it does
+not own a private prefill or decode loop. Unified prefill and decode is a v4
+feature, and new families (e.g. MiniMax) start on it.
 
-- `deepseek_v41` keeps its specialized path; nothing regresses it.
-- A generic per-layer engine runs every other family: each layer is a block
-  (norm/HC in, family attention with its own window/compressed/index/state
-  cache, router, shared expert, routed experts on Sparks, HC/residual out),
-  plus head and native speculator. DeepSeek V4 is its first tenant, then GLM,
-  MiMo, Qwen. It adopts V4.1's proven optimizations (chained stages, lanes,
-  dual RTX, route packing) as it matures.
+Family specifics are hook parameters, not separate engines. V4.1's causal
+encoder/decoder (KV and index sources [2,8,14,20], engram gates at layers 1
+and 14, dSpark taps from layer 37, encoder/replay ranges) is expressed as
+layer ranges and per-layer attributes of the shared engine. If a feature truly
+cannot fit, name it and the reason on #744 instead of forking the path.
+
+Why: the early "no regression against ds41rt" gate kept V4.1 on its own path
+and pushed every family into separate optimized loops. That hid shared defects
+behind per-family code (the reply-incast traffic problem, the compact-kernel
+prefill regression) and made each fix land once per family. One structure means
+a fix or a measured win lands for every family at once. The 2026-09-29
+two-engine decision is retired.
 
 Kernels are shared by parameterizing dimensions; `cuteafd plan` feeds the
 AOT exporters the geometry each image must carry.
@@ -1428,8 +1436,8 @@ zero cached tokens; smoke primes complete chunks plus the exact measured
 prompt before timing an ordinary request, including normal cache retention.
 The split loader also accepts BF16 block projections from the selected
 checkpoint, quantizing before aligned slicing exactly as the unsplit loader
-does. This makes `GLM5_FLASH_FP8_MODEL_ID=off` valid with NVFP4 head split;
-the companion and precision defaults remain unchanged.
+does. Native NVFP4 dense and routed weights keep their primary-checkpoint
+format; all projections now load from that same checkpoint.
 
 Measurements and conditions belong in the follow-up commit messages. Task
 logs, reproducible configs and exports are under
@@ -2887,18 +2895,22 @@ Reserving the 2M pool first on one RTX moves expert layers to the Sparks.
 | Pro min | 356K -> 2.10M | 5 -> 3 | 0.951 |
 | Flash max | 1.18M -> 2.10M | — | C1 0.979, C8 0.873 |
 
-So V4 keeps v2's experts-first default (`Onboard::ExpertsFirst`,
+So V4 initially kept v2's experts-first default (`Onboard::ExpertsFirst`,
 `RTX_EXPERT_LAYERS=max`), resolved by the shared solver. Pool first (`auto`)
-and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) are opt-in. The way to get
+and the GPU1 EXL3 ranges (`RTX_EXPERT_PEER=on`) were opt-in. The way to get
 both the 2M pool and the RTX experts is TP2 on two RTX (`P4`), not a
 different single-GPU split.
 
 **Decision (TJ, 2026-10-11): pool first is the uniform default, with no
 C1 gate.** `auto` (pool first) is the default on every layout and family.
 A C1 gap against experts-first is a performance bug to fix, not a reason to
-keep experts-first as the default. `max` (experts first) stays a supported
-mode everywhere. This corrects P2, which had kept 1-RTX V4 Pro on
-experts-first after one pair.
+keep experts-first as the default. This corrects P2, which had kept 1-RTX V4
+Pro on experts-first after one pair.
+
+**Decision (TJ, 2026-11-02): RTX onboarding is an automatic default or an
+exact pin.** The experts-first mode (`max`) and the fractional `N%` option
+are removed: `RTX_EXPERT_LAYERS` takes `auto`, `all` (every routed-expert
+layer of the target model, drafter and MTP excluded) or an integer `N`.
 
 **Decision (TJ, 2026-10-10): KV planning is the default rule; TP2 is the only
 dual-RTX expert mode.**
@@ -2908,12 +2920,11 @@ dual-RTX expert mode.**
   - on 1 RTX, the planner's constant over-reservations (`P2`) cost the
     layers.
 
-  `ExpertsFirst` (`RTX_EXPERT_LAYERS=max`) **stays as a supported mode**
-  (TJ, 2026-10-10: "a mode I want … but it is not the default"). Only the
-  default moves: `auto` becomes the V4 default in the steps that recover the
-  layers, `P4` for 2 RTX and `P2` for 1 RTX, both before the first v3 cut.
-  Under TP2, `ExpertsFirst` places TP2 halves first and gives the pool what
-  is left (subject to its floor).
+  Experts-first (`max`) was a supported mode until 2026-11-02 (TJ,
+  2026-10-10: "a mode I want … but it is not the default"); it is removed
+  now, leaving `auto`, `all` and `N`. Only the default moved: `auto` became
+  the V4 default in the steps that recovered the layers, `P4` for 2 RTX and
+  `P2` for 1 RTX, both before the first v3 cut.
 - **In a 2-RTX configuration, routed experts on the RTX cards are always TP2
   halves**, folded into the head split's existing all-reduce. `P4` deletes
   the two placements TP2 replaces, because neither can beat it on PCIe:
@@ -2922,8 +2933,8 @@ dual-RTX expert mode.**
   - the GPU1 whole-layer expert ranges (`RTX_EXPERT_PEER`, a hidden-state
     hop each way per layer, and the path with the two-lane deadlock).
 
-  Every onboard mode (`auto`, `max`/`ExpertsFirst`, `N`, `N%`, `all`) stays
-  and resolves to TP2 halves on 2 RTX.
+  Every onboard mode (`auto`, `all`, `N`) stays and resolves to TP2 halves
+  on 2 RTX.
 - **Single-RTX layouts are TP1 by nature.** Per-layer GPU ownership
   (`Whole{gpu}`: attention, KV and that layer's work on one GPU) stays a
   general capability, and its FFN uses TP2 split or V4.1's owner-reduce per
@@ -2993,11 +3004,13 @@ change.**
 fixed definition: reserve the pool target, then place expert layers in what
 is left. The solver also takes the inverse, for comparison benchmarking and
 the edge cards:
-- `PlacementRequest.onboard: Onboard::{Auto, Layers(n), Fraction(f)}`
-  (`RTX_EXPERT_LAYERS=auto|N|N%`, `--rtx-expert-layers`). `Auto` is today's
+- `PlacementRequest.onboard: Onboard::{Auto, Layers(n)}`
+  (`RTX_EXPERT_LAYERS=auto|all|N`, `--rtx-expert-layers`). `Auto` is today's
   pool-first rule.
-- `Layers(n)`/`Fraction(f)` fixes how many routed-expert layers are
-  resident on the RTX cards. TP2 halves count as one layer. The solver then
+- `Layers(n)` fixes how many routed-expert layers are resident on the RTX
+  cards. TP2 halves count as one layer. The request spelling
+  (`OnboardSetting`) resolves `all` to the target's routed-expert layer
+  count, drafter and MTP layers excluded. The solver then
   fills every remaining byte with KV, so the pool is the output, not the
   input.
   - The pool is rounded to `unit_rows`. It is the total KV shared by all
@@ -3014,8 +3027,8 @@ the edge cards:
     contiguous prefix: GPU0 gets layers `0..k` and GPU1 `k..n`. The solver
     therefore only picks the GPU split, maximizing the pool, and the pin list
     waits for `P7`.
-- `0` means every expert on the Sparks; `all` (or `100%`) means Spark-free
-  where it fits.
+- `0` means every expert on the Sparks; `all` means every routed-expert
+  layer on the RTX cards, refused with the count when it does not fit.
 - The planner (`cuteafd plan --layout --rtx-expert-layers N`) and the runtime
   resolve the same request. The equality test covers a fixed-onboard case for
   each family that has local experts.
@@ -5438,6 +5451,280 @@ Ideas TJ wants kept for later; not v2 work.
   FUSE mincore misses are approximate residency observations, not physical
   I/O, and must not be compared as device reads between implementations.
 
+## Prefill contract (TJ, 2026-10-23)
+
+Every family that sends experts to Sparks prefills the same way.
+
+- **Units (fixed 3, TJ 2026-10-28):** the prompt runs as a continuous
+  stream of row units, three in flight, cut from one reserve: units of
+  roundup64(reserve / 3) rows (3 × 2752 in the standard 8192-row reserve,
+  span 8256). Zero Sparks use one unit; a family whose executor holds fewer
+  units (Qwen 4's two-slot mapped-PLE ring, #717) is capped by that hard
+  capacity, not by a preference. The reserve is sized before KV and never
+  shrunk for KV or onboarded layers (TJ, 2026-10-27/28): 8192 rows, or on a
+  card where that doesn't fit the largest multiple of 64 rows that does, and
+  the depth cuts whatever reserve fits (a reserve too small for three
+  ≥256-row units is reported unfit, never special-cased). Planner, serve and
+  golden consume the same shape. `PREFILL_WAVES`/`PREFILL_ROWS` remain plain
+  config for measurement arms. A short prompt that cannot half-fill units
+  uses fewer waves without reallocating or recapturing.
+  - **Why fixed, not adaptive (#762 removed).** Every measured layout ran
+    best at three: 1 RTX + 4 Sparks (calibration ratios k2 1.24 / k3 1.00 /
+    k4 1.02), sim-5090 (1.15 / 1.00 / 1.02), and 2 RTX with every encoder
+    layer onboarded (ref-tp4 and max, cards47: k3 beat one 4096-row unit by
+    9–13% and k2 lost on max). The adaptive controller lost 5–7% to its own
+    serving re-tests, which locked whole prompts at k2/k4 under the
+    no-wider-mid-prompt rule, and its startup calibration was warm-up
+    biased (k4 measured last) and cost 4–7 s of readiness. The controller,
+    calibration and evidence store, per-call pace reporting, the per-call
+    link re-cut, the fourth admitted slot and the Spark-free one-window rule
+    were all deleted. MiMo still runs its own transport lanes (a lane is a
+    full 4096-row workspace and link, not a cut of the reserve) until #671
+    moves it onto the shared executor.
+- **One transport, N waves:** each unit's expert wave goes out on one
+  transport that admits N outstanding waves, each with its own return slot.
+  The Spark side already pipelines (rings 8 deep, in order); only the
+  coordinator held one wave per link. With N ≥ 2 the next unit's wave is
+  queued on every Spark when the current one finishes.
+- **Row ownership:** each in-flight unit owns its slice of every buffer that
+  stays live across a hook (residual, FFN output, layer input, return slot),
+  at `unit_slot × rows × stride` in one allocation, never at offset 0.
+  Scratch used inside one hook is shared and sized for one unit. Arenas reused
+  across layer kinds keep attention and FFN regions disjoint, with residual
+  and output planes at fixed offsets.
+- **Ordering:** V4.1's `PipelineOrder`, generalized. Unit k+1's attention at
+  layer L waits for unit k's KV at L, and units commit in order. There are no
+  chunk boundaries, so the Sparks don't drain between units.
+- **Head:** logits only for the rows serving needs. Prefix snapshots happen at
+  the unit boundary that carries the prompt or turn end.
+- **Admission:** 3 × unit rows × row-owned bytes, plus one unit of
+  scratch, plus 3 return slots, charged before allocation.
+- **Why units and not windows inside a chunk:** per-row workspace dominates
+  (V4.1 max: 8.0 / 5.8 GiB for 2 × 2048 rows, ~2 MiB/row). Lanes and windows
+  cost the same memory for the same rows in flight. Units keep full-size
+  expert batches and never drain the Sparks at chunk ends.
+- **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
+  prefix cache, and an A/B card against work/p0 with the same config.
+  - Run every N=1 and N arm on the same Spark intake
+    (`CUTEAFD_SPARK_INTAKE=pinned`) when isolating the executor: probed
+    intake is a separate transport arm.
+  - Families whose Spark exports accumulate FP32 with atomics at capacity
+    ≥256 (V4, V4.1: `--atomic-min-capacity 256`; see "Cold prefill is not
+    bit-reproducible") can't be byte-identical in prefill. Gate their N=1
+    vs N on KL, top-1 and greedy-16 within a same-day N=1-vs-N=1 noise
+    envelope; decode stays byte-exact after exact cache restores. Families
+    with ordered FP32 combines (MiMo's FP8 MoE, GLM, Kimi) keep the
+    byte-identity gate.
+  - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
+    64K row, the Spark busy fraction and a per-buffer workspace breakdown.
+  - **Absolute bar (TJ, 2026-10-24).** A same-day ratio against work/p0 is not
+    enough: each family's port must also match or beat its best recorded
+    absolute 8K/64K prefill on the pre-shared path, on the same layout, quant
+    and benchmark corpus, before it lands. Numbers from before #592's
+    realistic corpus (2026-10-21) are not comparable: the old filler routed
+    ~59% of tokens to one expert; re-measure the reference release on the
+    current corpus instead. References: GLM 5.3 K4 max 8K ≥ 3,168 and 64K ≥
+    3,087, min 8K ≥ 2,696 (v3.0.1 release, own launcher and defaults,
+    realistic corpus, 2026-10-24, #703; today's work/p0 does 2,063, so K4
+    regressed between v3.0.1 and the Oct 23 old path, before the shared
+    executor); MiMo Pro max 8K ≥ 3,479 (old 3-lane path, 2026-10-24). Every
+    card reports the absolute numbers next to the family's reference. A
+    family that was good before cannot land slower.
+- **Today (audit 2026-10-23):**
+  - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
+    on `PipelineOrder`;
+  - Kimi runs one lane with windows at 1 wave;
+  - Step-5 and Qwen 4 have no overlap.
+
+  Every family moves onto the shared executor. The full review and per-family
+  checklists are in the executor agent's proposal
+  (codex-runs/v4/prefill-shared-executor/prefill-contract-proposal.md).
+
+### Prefill executor API (shared, 2026-10-23)
+
+`shared/prefill_pipeline.rs` owns the schedule. A family implements
+`PrefillHooks` on its binding and calls `run_prefill_units(hooks, units, waves)`:
+
+- `route(layer)`: `Local` (dense or RTX-resident experts, completed inside one
+  hook) or `Spark` (a wave sent in one hook, landed in a later one);
+- `begin_unit`, `attention(layer, unit)`, `local_ffn(layer, unit)`,
+  `send_experts(layer, unit) -> Ticket`, `land_experts(layer, unit, ticket)`,
+  `end_unit` (exit hops, norm, requested head rows) and `commit_unit` (in
+  order).
+
+`prefill_units(span, unit_rows, waves, 256)` cuts equal, page-aligned units in
+multiples of `waves`. `prefill_schedule` is the pure order the executor and
+the CPU tests share:
+- units enter free slots in order and are served round-robin;
+- unit k+1 attends layer L only after unit k attended L;
+- waves land in dispatch order, and units commit in order;
+- a new unit is served before older units land again, so its first wave
+  queues behind theirs.
+
+Tests: contract rules with a stale-row detector over random routes, units,
+sequences and barriers; Spark occupancy (no idle within a unit; at a boundary
+only the new unit's GPU-only lead beyond one wave); error injection.
+
+Transport: `SparkLink::new_waves(.., waves, wave_rows)` admits `waves`
+outstanding waves on one link:
+- `LocalTp4Client` keeps a per-wave FIFO;
+- `SparkExperts` receives in dispatch order;
+- `SparkIntake` has one return slot per wave, each with its own consumed event;
+- retained receive slots repost in consumption order.
+
+Several waves use the same probed intake as one wave. Each rank registers one
+contiguous N-slot landing allocation; successful receive posts rotate slots in
+FIFO order, and consumed events fence replacement requests. Registered request
+egress likewise owns N independent slots, charged from the widest bootstrap
+request geometry before allocation. Pinned intake remains an explicit mode.
+
+Frames (every Spark link, decode and prefill, both directions): every
+request and every reply is one registered RC SEND into the peer's posted
+receive. A copied request is staged whole in its session's send slot; a
+registered-egress request gathers its header from the slot and its payload
+from its egress slot. RC holds a SEND until its receive is posted (RNR retry
+is infinite), so neither side keeps a credit for the peer's ring beyond its
+own ring depth. Request WRITE chunking (#693) and tail-WRITE replies (#714)
+were removed (TJ 2026-10-25, "keep it simple"): on GLM K4 max, 6 Sparks, two
+waves, request 256 KiB, reply 256 KiB or 1 MiB and no chunking at all landed
+within about 1% lossless; reply chunking never won; lossy three-wave without
+chunking was within 0.4% (8K) and 4.9% (64K) of lossless.
+
+Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
+today only the first lane gathers each layer's history into that layer
+parity's staging view, and later lanes reuse it. Units can run ahead (dense
+leading layers, or a new unit entering mid-call), so another unit's gather for
+the same parity can land before a unit reads the view. Rule: every unit
+records its whole history. At its attention it reuses the parity view only
+when the last attention on that view was its predecessor's at the same layer;
+otherwise it gathers its own history. Steady state keeps the single gather;
+only the ramp re-gathers. Per-unit gather and commit plans are indexed by
+unit, workspaces and exchange lanes by slot. A slot reused mid-call uploads
+its tables in stream order (`copy_h2d_ordered`), and rank 0 waits on rank 1's
+progress before rewriting that slot's peer workspace.
+
+Buffer rule from the Step-5 port: two replicated replies with no head exchange
+between them never share a reply plane. Keep one fixed reply plane per
+replication kind (head-split routed reply, owned-layer reply), sliced per
+unit, and check it in every family with TP2 or head-split replication.
+Admission charges `prefill_return_bytes(waves, unit_rows, ranks, hidden)`;
+`PrefillShape::ladder` steps 2048 → 1024 → 512. Kimi K3 is the reference port
+(`kimi_k3/layers.rs` `UnitHooks`). The per-family checklists are in the
+executor agent's proposal.
+
+### Prefill migration plan (cross-family, TJ 2026-10-23)
+
+Process (TJ, 2026-10-23):
+1. One Opus agent reviews every family's prefill and proposes the contract:
+   the hook trait, ordering, admission, chunk rule, extra hooks for drafter
+   taps, head split, Engram and vision, and a per-family port checklist.
+2. TJ approves the contract.
+3. The Opus agent builds the shared executor with Kimi as the reference port.
+4. One DeepSeek agent per family ports it from the checklist, with a
+   same-config A/B against work/p0 that proves no regression: 8K prefill and
+   TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical, freed memory reported.
+5. The Opus agent reviews each port for conformance.
+
+One owner holds `shared/prefill_pipeline.rs`; each family port is a separate
+task.
+
+| Phase | Work | Families | Bar |
+|---|---|---|---|
+| 0 | Shared executor: per-layer/per-window hook trait, N waves in flight on one transport, return-buffer admission, planner chunk pick, schedule test, byte-identity harness | shared; Kimi first adopter | Kimi N=1 byte-identical; Kimi N=1/2/3 card |
+| 1 | Families with no overlap today | Step-5, Qwen 4 (Spark layout) | 8K prefill ≥ 1.2× at N=1 |
+| 2 | Lane families to one lane | V4.1 (2 lanes), V4 (2) | 8K prefill ≥ 0.98× of today at the measured N, workspace freed |
+| 3 | Lane families to one lane | GLM 5.3 (3), GLM Flash (2), MiMo (3/2) | same bar; freed memory goes to the planner |
+| 4 | Shared defaults | all | the sweep (windows × N × chunk), then one default rule |
+
+Each port:
+1. implements the hook trait;
+2. deletes the family's own lane workspaces, transports and schedule loop;
+3. gates on 1-window/N=1 vs W-window/N byte-identity, exact prefix cache, and one card (8K, TTFT, memory, KL);
+4. reports the onboard layers or pool the freed workspace bought.
+
+Phases 1 and 2 can run in parallel once phase 0's API is fixed. Phases 2
+and 3 are gated on one lane family showing a win on the executor (GLM 5.3,
+#660, TJ 2026-10-23), not on the release: once it does, every lane family
+ports for v4.
+
+## Release v4 cards (TJ, 2026-10-24)
+
+The README results move from one wide table to **one section per active
+family**. Each section shows that family's chosen cards in whatever
+layout explains them best: some compare quants on the same hardware,
+some compare hardware levels for one quant, some both. Every card stays
+a Release-smoke export generated by `cuteafd bench publish`; the
+renderer groups them per family from a `sections` list in the matrix
+file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
+
+| Family | Cards in its section | Compares |
+|---|---|---|
+| DeepSeek V4.1 Flash | min 1 RTX + 3 Sparks; reference 1 RTX + 4 Sparks; max 2 RTX + 6 Sparks | hardware levels |
+| DeepSeek V4 Flash | min; reference 1 RTX + 4 Sparks; max | hardware levels |
+| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6; **EXLR8 max 2 RTX + 6 with A8 prefill (`glm53-exlr8-a8-max`)** | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), A16 vs A8 prefill at max, hardware levels |
+| Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
+| Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
+| Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
+| Qwen 3.8 Flash Next | EXL3 min 1 RTX PRO 6000 (0 Sparks, `qwen38-exl3-min`); EXL3 5090 (1 RTX 5090 + 1 Spark) | hardware levels (both unchanged from v3) |
+
+EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
+(`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
+manifest; ~75 GB of routed experts per rank at TP4), so the family shows
+the up1-vs-bit325 trade at the same hardware.
+
+The EXLR8 A8 max card (TJ, 2026-10-26) is the max card with
+`EXLR8_PREFILL_ACTIVATIONS=a8`: expert prefill quantizes activations to FP8
+on the compressed-weight paths. It shows the A8 prefill speed and its
+fidelity beside the default A16 max card.
+
+**Retired section** (below the family sections): every model that no
+longer ships keeps its last Release-smoke card, one per row with its
+config and the version it ran on. It includes the cards cut from the v3
+matrix (GLM 5.3 NVFP4 max, GLM 5.3 Flash NVFP4 max and TR3 max, MiMo Pro
+min, MiMo Flash max, Qwen 3.8 EXL3 max and NVFP4 min/max/5090, V4 Flash
+max, V4 Pro EXL3 min) and the models retired since: the GLM 5.3 Flash
+non-core FP8 configs (`glm53-flash-fp8-min/max`, last smoke 2026-10-14)
+and the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by
+`GLM-5.3-Flash-EXL3-K3.25-Core-FP8`.
+
+`cuteafd bench publish` needs: the per-family `sections` renderer (layout
+per section from the matrix file), the retired renderer, and example
+configs for EXLR8 min `bit325`, dense Qwen BF16/FP8 min.
+
+## v5: one decode graph strategy (TJ, 2026-10-24)
+
+Decode graph capture is per family today, and the memory it costs varies
+widely. The goal is less wasted memory and one standard strategy, not graphs
+shared across lanes through address tables.
+
+Where it stands (2026-10-24):
+
+| Family | Row shapes per graph key | Other key axes | Cost |
+|---|---|---|---|
+| GLM 5.3 / EXLR8 | 24 to 131K (1–16, 20 … 64), 7 above | 11 page-table widths, one capture per layer + head | 213 shapes, ~3 GiB/GPU (`glm_decode_graph_allowance`, 3 GiB floor) |
+| V4.1 | exact rows 1–64 (8 fixed on cards < 32 GB) | per layer, per lane | not measured; largest after GLM |
+| GLM Flash | 6 (1, 4, 8, 16, 32, 64; spec 2–64) | | |
+| Qwen 4 | 4 plain, 7 spec | | |
+| V4, MiMo, shared `decode_graph` | 4 (1, 4, 16, 64) | | MiMo ~0.9 GiB/GPU |
+| Kimi K3, Step-5 | exact verify rows | | not measured |
+
+Work:
+1. Measure every family's graph memory from the startup ledger, per GPU and
+   per lane, on its max card.
+2. One shared row-bucket rule and one place it lives (`shared/decode_graph`),
+   with a family override only where a measured route crossover needs one.
+   Coarser buckets pad rows; decode is bandwidth-bound, so judge by emitted
+   tok/s at C1/C4/C16, not by padded-row count.
+3. One rule for which axes key a graph (rows, table width, layer) and when a
+   shape runs eagerly instead of capturing (odd prefill tails already do).
+4. Planner admission charges each family's graphs from that same rule.
+5. Bar: graph memory down, freed memory reported as pool or onboard layers,
+   and decode within 0.98× at every concurrency. Zero captures per request
+   stays.
+
+Second decode lanes (MiMo port, 2026-10-24) double a family's graph set,
+so this lands before lanes spread to GLM or V4.1-sized graph sets.
+
 ## Backlog (lowest priority: only when nothing planned is left)
 
 - Qwen 3.8 Flash Next NVFP4 without Sparks, competitive with vLLM on one
@@ -5476,8 +5763,8 @@ Ideas TJ wants kept for later; not v2 work.
 
 - raptor: 2× RTX PRO 6000 (SM120), capped at 325 W while TJ is away.
   Sparks: ostrich, dodo, emu, kiwi, rhea, moa (GB10, SM121, 121 GiB each),
-  fabric 10.55.0.1–6. Six Sparks are the pool now; TP4 stays the qualified
-  V4.1 default until a six-rank layout beats it.
+  fabric 10.55.0.1–6. Six Sparks are the pool now; V4.1 max uses all six
+  (TJ 2026-10-22), with TP4 retained as a reference layout.
 - Never build on `/mnt/scratch` (NTFS kernel bug). Build under
   `~/.cache/cuteafd/builds/<task>` and keep ds41rt's filesystem assertion.
 - Serialize WIP builds and performance runs; one model served at a time.
@@ -5559,3 +5846,942 @@ resolves that revision through hardlinks without another weight copy. Completion
 records remain in the run root. No capture directories, packed candidate tensors
 or rolling frontiers remain. GPU ownership was released. Full-model generation
 and serving qualification remain separate, unperformed work.
+
+## Kimi K3 incremental core K6 (Oliver, 2026-10-20)
+
+The user authorized `wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6`: retain the
+published K2 expert bytes and quantize exactly 926 reviewed dense projections
+to standard EXL3 K6. The inventory is executable in
+`quantization/kimi_k3/core_k6/recipe.py`; all excluded tensors are independently
+compared byte-for-byte during assembly. Expected tensor payload:
+731,275,813,496 bytes (681.05 GiB), 62.50 GiB below the base. The 24 MLA kv_a
+matrices retain native output width 576, with standard 128-channel EXL3 storage
+padded to 640 and cropped only after complete reconstruction.
+
+Use the same full 1,426-prompt, 1,201,086-token native Kimi calibration stream.
+Every new projection sees reconstructed K6 predecessors and the immutable K2
+experts; dense Hessians contain actual observations only, with no identity rows.
+Attention entry, MLA q_b, attention output, MoE entry, shared down, latent up
+and final AttnRes/norm-to-head inputs form separate causal calibration phases.
+Completed phase manifests, serialized projection receipts, an audited layer
+shard and the successor frontier are the successive retirement barriers.
+
+Implementation: `quantization/kimi_k3/core_k6/`. Use its `launch.py` with the
+same path flags and `--publish`; recovery adds `--resume`. Quantization runs
+inside the local SM120 container with the uv `.venv`, bounded gpu1 hardware
+admission, 86 GiB CUDA allocation ceiling, 58 GiB host RSS guard and 64 GiB disk
+reserve. The supervisor releases GPU ownership before CPU-only publication,
+verifies Hub hashes and makes a hardlinked local snapshot. Run root:
+`~/.cache/cuteafd/quantization/kimi-k3-exl3-k2-core-k6/`; export:
+`~/.cache/huggingface/cuteafd-exports/Kimi-K3-EXL3-K2-Core-K6/`.
+
+The base export under `cuteafd-exports/Kimi-K3-EXL3-K2` is fully local on
+Oliver's root NVMe. Its separate default HF hub is now a sparknest symlink;
+this job uses `HF_HUB_CACHE=~/.cache/huggingface/cuteafd-local-hub` for its
+published snapshot so hardlinks remain on NVMe without another checkpoint copy.
+After stable progress, sleep 30 minutes between layer/phase and ETA reports.
+
+Completed and published on 2026-10-22 (Taipei), revision
+`1a28050d2954426a43a3db705e53ca120e5f2b47`. The export contains 94 shards,
+994,590 tensors and 731,275,813,496 payload bytes (681.05 GiB), saving
+62.50 GiB against the K2 base. All 926 core projections used the full calibration
+stream. All 247,296 routed K2 projections and other excluded tensors passed
+the independent byte-preservation audit. Every remote shard checksum passed;
+anonymous Hub access and all local snapshot hardlinks were verified. Both
+completion records and the successful supervisor exit remain in the run root.
+Rolling frontiers and phase captures are retired, the container is stopped,
+and GPU ownership is released. Quantization took about 47 hours; publication
+and remote verification took about 11 minutes. Full-model generation and
+serving qualification remain separate, unperformed work.
+
+Production used GPTQModel `d97ee86801d9315e77ae91de47da061d6e5e6ccf`,
+recorded in its immutable plan and qualification evidence. After publication,
+the fork and pin advance to `2079be3e12f5d62cb82b9f899b521ac705406945` to
+complete the optional Torch-reference loader's logical 576/stored 640 output
+support. It preserves the complete stored Hadamard transforms before cropping.
+Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
+covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
+loader already supported this geometry. Recovery of the completed producer
+uses its recorded commit; a new producer pin requires fresh admission evidence.
+
+## GLM 5.3 BF16 to EXL3 K4 / Core K6 (Oliver, 2026-10-24)
+
+User brief: `~/glm53-k4-core-k6-quant.md`. Work is isolated in
+`~/Developer/cuteafd-glm53-core-k6` on `quant/glm53-k4-core-k6`, based on
+`2000d0826298dcdae14a8d1631300b8489d17651`. Push only the task branch;
+the orchestrator reviews and merges. Step 1 is the bounded format pilot and
+recipe report; stop for TJ's recipe decision before the full quantization.
+Publication also has the explicit confirmation point stated in the brief.
+Only Oliver's RTX is used for quantization and correctness, with no serving
+performance measurements. Raptor qualification and engine work are separate.
+
+Source: `zai-org/GLM-5.3-BF16` at
+`9d2398f478cab2de883137db3a36ad2c96205e24`. All 282 headers match the exact
+59,585-tensor inventory (1,506,659,919,872 payload bytes). The proposed recipe
+in `quantization/glm5/core_k6/recipe.py` selects 547 target core matrices at
+K6, eight MTP core matrices at K4 and 58,368 routed expert matrices at K4.
+All selected formats use standard MCG, seed 787 and sigma 0.025. Retain the
+662 other tensors byte-for-byte, including the F32 router correction biases.
+Expected output: 236,354 tensors, 385,362,552,236 payload bytes (358.90 GiB).
+Non-expert payload is 16.01 GiB; the head-split weight estimate is 10.00 GiB
+on rank 0 and 7.34 GiB on rank 1, with MTP eh_proj replicated and excluding
+runtime overhead. The native 576-output kv_a uses standard stored width 640.
+
+`quantization/glm5/prepare_corpus.py` reuses the Kimi panel attestation and
+flat-token format, with native GLM thinking/max-effort rendering. Same pinned
+panel revision as Kimi; 1,426 calibration prompts yield 1,097,737 GLM tokens.
+Native and Tokenicer boundary probes match exactly. Heldout has 88 prompts,
+68,286 tokens and maximum length 1,049, so it cannot qualify long-context
+sparse-token selection. Only calibration prompt cal-1304 exceeds 2,048
+tokens (2,205); the pilot includes it as a native replay correctness witness.
+
+The bounded pilot uses fixed BF16 source predecessors for fair format
+comparison, 35,229 calibration tokens and 4,691 heldout tokens on layers 1
+and 6. It compares serialized MCG K6/K5/K4, block-128 FP8 RTN and BF16,
+using heldout activation-weighted NMSE and scale-inclusive TP2 storage.
+Candidate weights never affect this reference replay. The head comparison
+is deferred because its true normalized input requires all 78 source layers.
+Capture includes exact shared DSA top-k state in each rolling frontier;
+candidate/Hessian receipts and immutable input/code hashes permit explicit
+recovery. The run reuses Kimi's bounded container, hardware admission,
+container guard and detached supervisor, with a one-hour limit and 50 GiB
+container memory cap. Logs/receipts/results live under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/pilot-v1/`;
+research/header evidence under `~/.cache/cuteafd/builds/glm53-core-k6/research/`.
+
+The approved production ordering is one interleaved causal pass: finish each
+core stage and K4 experts, replay the finished block, then calibrate the next.
+Dense core uses natural observations only; newly quantized cold experts need
+the explicit GLM recovery recipe, not Kimi's router-rank window. MTP requires
+a qualified shifted embedding/target-state input contract, not ordinary
+layer-78 replay. Wait for Oliver's local BF16 copy before full production.
+
+Engine gaps are report-only in this task. Existing GLM native trellis support
+is K4-only and EXLR8-record based; K6 standard-HF discovery, BF16 kv_b/indexer,
+head/shared-FFN execution, padded output handling, DFlash2 head borrowing and
+MTP need scheduling before claiming this checkpoint is served by cuteafd.
+
+Step 1 completed on 2026-10-24: [results and engine audit](https://github.com/tpurtell/cuteafd/issues/713),
+[draft implementation](https://github.com/tpurtell/cuteafd/pull/711), reviewed recipe
+`~/glm53-core-quant.md`. All 110 measurements are durable: K6 selected-core
+heldout projection NMSE is 5.18–66.89 times lower than the block-128 FP8 RTN
+control on the same BF16 weights. This does not compare full-model quality
+against the vendor checkpoint. K5 dense-FFN NMSE is about 3.7 times K6 for
+only 81 MiB saved across the three dense layers; recommend the original K6
+scope. Head K6/K8 and independent long-context quality remain unmeasured.
+
+All native/staged boundaries through layers 0–6, including cal-1304, were
+byte-exact. The capture attempt completed both splits, then stopped on the
+reused E4M3 pilot helper's unsupported optional codebook keyword against the
+pinned MCG codec. Scoring-only recovery uses that codec's standard MCG default,
+requires identical inputs/dependencies and unchanged capture AST, verifies
+all Hessian receipts, and retains the original immutable capture plan. Final
+63 CPU checks pass; successful attempt `1792844246867467726` exits zero.
+Results are under `pilot-v2-score/`, capture evidence under `pilot-v1/`.
+Peak CUDA allocations were 22.02 GiB for native capture and 11.52 GiB for
+scoring, host RSS 3.71 GiB. Both containers are stopped, GPU ownership is
+released, and all rolling activation frontiers are retired. Oliver's complete
+sealed BF16 source replica is now ready. Full production awaits the explicit
+recipe decision required by the brief; the source checkpoint and final K4/K6
+payload together fit the root disk with room for bounded rolling state.
+
+TJ approved the reviewed recipe with "Go" on 2026-10-24. Full production
+started at 22:06 Taipei, attempt `1792850759329904317`, under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/production/`; output is
+`~/.cache/huggingface/cuteafd-exports/GLM-5.3-EXL3-K4-Core-K6/`.
+Use `quantization/glm5/core_k6/launch.py` with source/tokens/root/export;
+explicit recovery adds `--resume`. Publication is a later explicit
+`--publish-only` invocation after the brief's confirmation point. The GPU
+job does not upload automatically. It holds the bounded local gpu1 queue
+admission, uses the architecture-matched container with a 60 GiB memory cap,
+and releases its container before exit. Monitor every 30 minutes after
+stable startup. Full calibration is 1,097,737 rows; MTP uses the 1,096,311
+valid within-prompt shifted pairs.
+
+Fork main and the matching pin/tree lock are pushed at
+`a196a448fb3f76774c31e02b42523997f05385e3`. New core/MTP helpers passed
+50 focused CPU tests, ten K4/K6 CUDA cases and six source-native MTP CUDA
+cases. Coordinator/export/publication/compatibility gates pass 115 CPU cases.
+The real-weight smoke quantized all core matrices in target layers 0–3,
+all 256 experts of layer 3 and MTP EH/KV (798 projections), using unchanged
+cal-1304. Native/staged target boundaries and DSA state were byte-exact at
+2,205 tokens; real MTP and shared-head norm were byte-exact at 2,204 valid
+pairs. Peak GPU allocation was 27.06 GiB. Its final log call duplicated a
+memory keyword after the successful numerical report; the logging fix and
+independent completed-proof audit retain that report's original identity,
+verify all four shard checksums and 798 calibrated evidence records, and
+exit successfully without repeating numerical work. Evidence and audit
+markers remain in `~/.cache/cuteafd/builds/glm53-core-k6/`.
+
+Do not change the producer, fork pin or prepared data during the run: the
+production plan binds numerical code and packages. Documentation, status
+and a future publication-only compatibility fix are separate from that
+numerical identity. CPU-only publication requires the matching durable
+completion marker, exact 80-shard inventory and remote checksum audit.
+
+Recovery on 2026-10-26: the old WSL filesystem failed and its production
+quantization was lost. The rebuilt host is named `maxq`; persistent `/home`
+and Docker's `/srv` now use the native NVMe filesystem rather than the small
+WSL root volume. A 256 MiB write/fsync/read checksum check passed. Rebuilt
+the task worktree's corrupt Git index after verifying its working files;
+the original index is retained in the readiness cache. Git object checks
+pass, and every tracked GPTQModel file matches the existing pinned commit.
+Recovered only the three attested tokenized panel splits from the read-only
+old filesystem: their manifest SHA-256 is unchanged
+(`672455f149d27ff640441e2409d1dc9b1341067bd58f0fdd7136ee503f10add8`).
+New production starts from layer zero, with the same numerical producer.
+
+Restored `cuteafd-coordinator-dev:tc-aa74e55ca2130070` from Raptor using
+compressed Docker save/load; all 86 layers and the toolchain label match,
+as does image ID `fc14e74c6890556cd7d2770d8afe50230a5cdac9342024428bb98cb03060b51c`.
+The preflight accepts only the authorized `oliver`/`maxq` host names and
+requires the complete BF16 source on the current host, never merely on the
+old host name or archive. Explicit `--qualification-only` admits a fresh
+GPU proof without requiring its future report; normal production continues
+to require the completed proof and audit. Launcher/corpus/producer/export
+CPU checks pass 89 cases. Fresh CUDA proof and full local-source integrity
+are required before restarting. This agent session predates the host's FUSE
+mount, so host-side admission runs through a fresh local SSH session that
+sees the mounted source; containers also see the host mount normally.
+
+TJ explicitly requested taking the GPU reservation before the source copy
+finishes, then starting automatically once the original is fully local.
+The local fair-queue `gpu1` lease is held across readiness, qualification and
+production. The launcher supports `--foreground --use-held-lock`: it checks
+the enclosing lease and actual flock, keeps durable attempt records, avoids
+requeueing behind itself and replaces itself with the existing container
+teardown guard. It cannot detach or publish while using that reservation.
+The guard now handles SIGHUP as well as TERM/INT, so SSH hangup cleanup
+precedes reservation release. The expanded CPU gate passes 94 cases.
+
+The source is fully local on MaxQ. `nest fsck --deep` reported corrupt blob
+names, but independently hashing flagged shard 92 matches its published HF
+LFS SHA-256 exactly: Sparknest's global deduplicated blob IDs differ from
+the HF content SHA-256 names. No destructive fsck resolution was applied.
+Readiness therefore verifies all 282 weights and six source/config/tokenizer
+assets directly against the pinned Hugging Face revision's published hashes;
+the two-thread streaming audit and evidence live in the readiness cache.
+Non-login SSH admission also resolves WSL's `/usr/lib/wsl/lib/nvidia-smi`
+when it is absent from PATH. The final CPU gate passes 96 cases, including
+both normal Linux and minimal-PATH WSL admission.
+
+The fresh full run started 2026-10-26 19:53 Taipei, attempt
+`1793015633854537011`, at the same production/export paths above. All 282
+weight shards and six configuration/tokenizer assets (1,403.22 GiB) passed
+direct comparison with the pinned HF revision's published SHA-256/Git-blob
+hashes in a 614-second two-thread streaming audit. Fresh CUDA qualification
+passes 16 cases. The real-weight proof finishes normally with 798 calibrated
+projections, byte-exact native/staged target boundaries at 2,205 tokens and
+byte-exact MTP/shared-head norm at 2,204 valid pairs; peak CUDA allocation is
+27.06 GiB. The separate completed-proof audit also passes. The same reserved
+local GPU lease spans qualification and the foreground production supervisor;
+its container guard runs before the lease releases. The immutable numerical
+producer, source revision, token manifest and fork pin are unchanged. Resume
+an interrupted reserved run explicitly with `--resume --foreground
+--use-held-lock` under a newly acquired enclosing lease; ordinary detached
+recovery without a reservation still uses `--resume`. Publication remains
+separate and requires TJ's confirmation once the completed artifact is ready.
+
+The monitoring server restarted on 2026-10-28 04:40 Taipei. The foreground
+SSH reservation's hangup guard stopped its container cleanly; all 66 completed
+layers and 48,846 projections survived. Resumed at layer 66 (zero-based) as
+detached attempt `1793133687423980344`, using the normal launcher `--resume`
+path and its own fair-queued gpu1 lease. The supervisor owns a separate session,
+independent of the monitoring connection; the actual GPU flock is verified
+held. Only the uncommitted current capture phase is repeated. For production
+that must survive monitoring-session loss, prefer the normal detached launcher
+once advance reservation/preparation has finished; foreground reservation mode
+deliberately tears down on its enclosing session's hangup. The numerical plan,
+producer, source, tokens and fork pin are unchanged.
+
+Quantization completed successfully on 2026-10-28 11:34 Taipei; the detached
+attempt exits zero. Final independent checks pass: 80 shards, 236,354 tensors,
+385,362,552,236 payload bytes (358.896844 GiB), 547 K6 matrices and 58,376 K4
+matrices, all 58,923 error records finite with valid Hessian-LDLQ metrics.
+The 662 retained native tensors have per-shard byte-preservation audits.
+Peak production CUDA allocation is 20.71 GiB and host RSS 15.79 GiB. All
+production frontiers, input stages and packed recovery candidates are retired;
+the GPU container is gone and the actual hardware flock is free. The local
+model card includes per-part source and quantized payload sizes. Source/fork
+and numerical producer identities are unchanged. Completed artifact and
+model card remain at the export path above. Publication is not started:
+the brief explicitly requires TJ's confirmation before upload. Full-model
+quality, long-context behavior and serving qualification remain separate work.
+
+TJ approved publication with "Yep publish it" on 2026-10-28. The completed
+export already organizes all 58,923 diagnostic records into 80 subdirectories
+(at most 776 files each), below the Hub's folder-entry ceiling. Every exported
+record independently matches its original numerical evidence byte-for-byte.
+Publication uses the existing CPU-only publisher and exact completed producer;
+no numerical or weight changes are needed.
+
+The Hub accepted all 80 weight shards but rejected further per-tensor
+diagnostics at its observed 20,000-file repository cap. Publication now bundles
+the complete diagnostics into 80 per-layer/head JSONL files plus a SHA-256/count
+index; the 58,923 individual source records remain local and are excluded from
+upload/cache manifests. Every bundle matches the exact concatenated original
+record bytes. Bundle creation is inode-preserving on retry and frozen after a
+publication marker; incomplete/unsafe inputs fail before Hub writes. Publisher
+checks pass 30 CPU cases. Only our partial remote diagnostic subtree is replaced;
+the already uploaded weight shards are retained. Numerical identity is unchanged.
+
+Published on 2026-10-28 at 14:22 Taipei:
+https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6
+revision `5a4e83a09a11f3145332ed632d28a9894ea88225`, CPU-only attempt
+`1793168087222174043`, exit zero. All 172 remote objects pass checksum/size
+verification, including 80 weight shards and 80 diagnostic JSONL bundles with
+all 58,923 records. Anonymous revision access and an anonymous weight-file HEAD
+match the published SHA, length and commit. The explicit local HF snapshot is
+offline-resolvable and all 172 files hardlink the export on the same filesystem;
+no second weight copy was made. The publication-complete marker records the
+manifest digest and revision. Final CPU checks pass 101 cases; CUDA/native
+qualification remains the 16 CUDA cases and 798-projection real-weight proof.
+GPU ownership is released and production rolling tensors remain retired.
+Full-model quality/long-context/serving qualification is the separately scheduled
+next step; this branch is pushed for orchestrator review, not merged.
+
+
+## GLM 5.3 Flash BF16 to EXL3 K4 / Core K6 (MaxQ, 2026-10-28)
+
+TJ authorized the full job, a shortened pilot, autonomous recipe decisions
+and publication without another approval stop. This supersedes the Flash
+brief's Step 1 and upload confirmation points. Public target:
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6`. Integration stays on the
+`quant/glm53-flash-k4-core-k6` task branch; the implementation checkout is
+`~/Developer/cute-worktrees/flash-quant-integration`. No engine, serving,
+performance or shared infrastructure changes are part of this job.
+
+Pinned source `zai-org/GLM-5.3-Flash-BF16` revision
+`f9fed3bbc82291073373d67452e9f25317ef7577` is managed locally by Sparknest.
+Its 120 weight headers contain 38,770 tensors and 642,646,653,816 payload
+bytes. The fail-closed Flash recipe selects 316 target core/head matrices
+at K6, eight MTP core matrices at K4 and 37,152 routed expert matrices at
+K4. Retain 1,294 native tensors, including all 347 vision tensors, recurrent
+gates/convolutions, DSA indexer, kv_b, mHC, routers, norms and embeddings.
+Output: 151,198 tensors, 165,621,841,672 payload bytes (154.247 GiB) in 47
+shards. Flash kv_a has 512 outputs and no RoPE output padding.
+
+`quantization/glm5_flash/prepare_corpus.py` attests the same pinned public
+panel and native thinking/max-effort rendering: 1,426 calibration prompts,
+1,097,737 tokens. The shorter pilot compares serialized K6, block-128 FP8
+and BF16 on representative layers 1/4/7, with a small calibration/heldout
+subset and the original 2,205-token sparse-indexer witness. Native/staged
+KDA, mHC, MLA/indexer, serialized projection and independently aligned MTP
+checks precede production. The source checksum pass compares every source
+file to its actual Hub LFS/Git hash rather than Sparknest's internal IDs.
+
+`quantization/glm5_flash/core_k6/launch.py` runs the existing fair queue
+helper unchanged on raptor under `maxq.lock`; all GPU work stays on MaxQ.
+A durable systemd user supervisor holds the lease through container
+teardown, releases it, then runs authorized CPU-only publication. Every
+wait/run is bounded. Production retains only rolling front-edge recovery,
+with explicit identity/receipt checks and an 86 GiB GPU allocation ceiling.
+Run/token/pilot state: `~/.cache/cuteafd/quantization/glm53-flash-k4-core-k6/`.
+Output: `~/.cache/huggingface/cuteafd-exports/GLM-5.3-Flash-EXL3-K4-Core-K6/`.
+Report layer progress and ETA every 30 minutes once the full run is stable.
+Raptor quality/serving qualification and engine K6 shape support are separate.
+
+The short pilot is accepted after an audited reporting-only decision change:
+all native/reconstructed KDA, mHC, MLA/indexer and MTP checks passed; the
+absolute K6 activation-weighted NMSE bound is 1e-3. FP8 comparison remains
+informational because actual dense/MLA source weights re-encode to it almost
+losslessly. No numerical producer or observation changed, and no GPU work
+was repeated for this decision. The original capture commit is retained in
+Git ancestry; `finalization-audit.json` binds every historical candidate,
+Hessian, receipt and proof event. Completed pilot activation frontiers,
+proof-input banks and candidate payloads are retired; scalar evidence and
+receipts remain. Production admission still passes after retirement.
+
+Full production started 2026-10-28 11:26:55 UTC under durable user unit
+`glmf-core-k6-1793186791227193462`, with automatic CPU publication enabled.
+The initial launch was rejected before GPU work by a direct-script import
+bug; its regression and corrected launcher are committed. Draft PR #835
+holds current continuation state; issue #836 holds the recipe/research and
+separate engine follow-up. Numerical code/pin and production identity are
+frozen while the job runs. Do not restart a live attempt or change these
+inputs; recover through its existing launcher and latest durable frontier.
+
+Quantization completed at 2026-10-29 07:14:45 UTC after 19h47m50s.
+All 37,476 projection commitments and 46 layer exports completed; the final
+47-shard checkpoint matches the reviewed 151,198-tensor / 154.247-GiB
+inventory. The independent completed-export audit reread and compared all
+1,294 retained native tensors (3,390,684,024 bytes), including 347 vision
+tensors, verified all MCG scalars/scales, calibrated evidence, asset bytes,
+47 diagnostic bundles and retirement barriers, with no findings. Evidence:
+`~/.cache/cuteafd/builds/glmf-core-k6/completed-export-audit.json`.
+
+The GPU container is stopped and the maxq lease released. CPU-only publication
+completed at 2026-10-29 07:43:35 UTC, followed by supervisor exit zero.
+Public checkpoint: https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6
+revision `5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`. All 107 published files
+pass independent remote checksums, including an anonymous weight-file check.
+The model-card license matches the untouched source MIT license; every sealed
+numerical source hash remains unchanged. Publication and exit markers are durable.
+
+Sparknest import completed with zero copied bytes: all 47 weight shards shared
+physical extents through a temporary reflink bridge, then hardlinked into the
+managed store. All 107 files were verified again through the mounted snapshot
+after removing the temporary bridge, standalone export and alternate local HF
+snapshot. `nest where` reports maxq ready. The default HF hub symlink and
+Sparknest-managed copy remain untouched. Audit:
+`~/.cache/cuteafd/builds/glmf-core-k6/sparknest-import-audit.json`.
+The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
+`models--wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K4-Core-K6/snapshots/5d3fffe1df9c4a109bbbdafb60dc19df9fac019d`.
+Do not replay publication against the deliberately retired standalone paths.
+Full-model generation/serving qualification and K6 engine shape support remain
+separate work; this task branch is pushed for review, not merged.
+
+## Step-5 Preview EXL3 K4 / Core K6 release (2026-11-01)
+
+Completed and published:
+https://huggingface.co/wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6
+Revision `83d47a384eabc07ea6fcfaac4779b0e5f013ce89`. Source: Step-5-Preview-BF16 at
+`7734b7ffac118d70d8398bfa3eb0fab007eb45b1`.
+
+The release has 96 shards, 375,913 tensors and 315,357,147,520 indexed
+payload bytes (293.699 GiB). All 93,600 transformed matrices were rebuilt
+from layer 0 with the corrected K128 FP32 XTX accumulator; no predecessor
+lineage or earlier-accumulator matrices remain. GPTQModel main/pin is
+`25dd11c391ce6bf3ceadf8722e8274c3cde7079a`. Sigma=.025, seed=787,
+native FP32 residual/BF16 boundaries and serialized reconstruction are
+unchanged. Calibration is the pinned public panel: 1,426 prompts,
+1,105,269 native tokens, with exact native tokenizer backend preservation.
+
+Target core and main head are K6 (645 matrices); routed experts are K4
+on layers 3–87 (89,760) and K6 on layers 88–90 (3,168). All three MTP
+cores and stage-local heads are K4 (27). The 1,513 native tensors,
+including all 667 vision tensors, both licenses and tokenizer assets are
+preserved byte-for-byte. MTP consumes the raw final target residual with
+successive token/absolute-position shifts, independently checked against
+pinned vLLM source and the bounded native/serialized pilot.
+
+Baseline 217 CPU checks passed in the matching SM120 image. Subsequent
+launcher/handoff fixes pass 27 targeted recovery cases. The 324.35-second
+GPU pilot passed 105 format rows and all six native checks, including an
+actual seven-projection production-layer transaction and byte-exact replay
+from its assembled shard. Independent final managed audit passes all
+headers, layouts/scales, fixed origins, native source bytes, metadata,
+index, diagnostics and publication/import manifests. Its 96 imported
+weight hashes match archived assembly receipts; producer/publisher/import
+checks cover full trellis hashes. No full-model serving/quality claim.
+Engine integration/qualification remains separate (#792, #911).
+
+SparkNest adopted 205 release files with --no-copy (0 copied bytes), then
+placed exactly one managed copy of every file on the six RDMA Sparks:
+ostrich 19 weight shards; dodo, emu and kiwi 15 each; rhea and moa 16 each.
+Weights total about 48.3–49.6 GiB per host. Managed snapshot:
+`/mnt/sparknest/hf-home/hub/models--wrldsuksgo2mars--Step-5-Preview-EXL3-K4-Core-K6/snapshots/83d47a384eabc07ea6fcfaac4779b0e5f013ce89`.
+HF refs/main matches this revision. No off-grid target copy remains.
+
+Standalone export, alternate HF cache leaf, reflink import staging,
+rolling activations and packed recovery weights are removed. Obsolete
+pilot tensor payloads are retired; calibration tokens, code, logs, scalar
+metrics and audit receipts remain. Original source and shared caches were
+untouched. All task services are stopped/disabled and GPU leases released.
+The final CPU-only unit was step5-core-k6-1793519523192738670 (exit 0).
+Do not restart the completed or superseded producers.
+
+Run receipts: `~/.cache/cuteafd/quantization/step5-k4-core-k6/production/`.
+Independent audit: `~/.cache/cuteafd/builds/step5-quant-export/final-managed-audit.json`.
+Placement/cleanup audits: `~/.cache/cuteafd/builds/step5-core-k6/final-*-audit.json`
+and `final-obsolete-payload-retirement.json`. Recipe/final tensor size table:
+`~/step5-core-quant.md`. Implementation: `quantization/step5/core_k6/`.
+The replay-safe handoff tolerates the exact SparkNest mirror notice and
+new+skipped import counts, retaining strict success, zero-copy, complete
+inventory and managed checksum checks. Launcher retries are two minutes
+apart for brief coordinator outages; numerical producer source is sealed.
+
+## Mistral Large 4 K4 experts / Core K6 (2026-11-01)
+
+TJ authorized the complete quant, a short pilot, autonomous numerical-failure
+cache assessment, ordinary-OOM resume, and direct publication without another
+approval stop. This supersedes QUANT_BRIEF.md's pilot and publication pauses.
+Work stays on `quant/mistral-large4-k4-core-k6` in the existing `mistral-quant`
+worktree; no engine changes or integration/release pushes are authorized.
+Only raptor GPU1 (`GPU-95f8f212-9131-df99-fd53-7535965197d7`) is exposed to
+its bounded container, under the existing fair queue. GPU0 and other jobs
+remain untouched. Host RSS admission is 74 GiB; the container caps memory
+and swap together at 78 GiB. Work/output are on the Developer NVMe; builds
+and temporary test/compiler files use the task's root-NVMe build directory.
+
+Pinned source is `mistralai/Mistral-Large-4-1T-A52B` at
+`f12dabdc0c1e99e7f7924461a6f308859b05af4d`. No official BF16 sibling was
+found; execute original block-128 FP8 times its positive power-of-two qscale,
+then BF16. All original payloads are audited against Hub LFS/Git hashes.
+SparkNest downloaded the complete model across physical local raptor disks
+including D2/D3; their union is local readiness, with no loading replicas.
+The native Tekken v15 renderer uses reasoning_effort high and preserves
+special-like user strings as text. Full public-panel calibration is 1,426
+whole prompts and 1,126,268 tokens, without packing, truncation or padding.
+
+Implementation is `quantization/mistral_large4/core_k6/`. Recipe: 424 K6
+core/head and 27,264 K4 routed projections, standard MCG 0xCBAC1FED,
+seed 787, sigma 0.025, automatic scales. Preserve 1,251 original tensors
+byte-for-byte: BF16 kv_b, FP8 indexer including its original qscales,
+routers/norms, embeddings, vision and bundled native dSpark. Self-owned
+NoPE kv_a retains the name wkv_a_with_mqa with width512; RoPE width576 uses
+stored640 padding and crops only after full reconstruction. Nine reused
+layers have no kv_a. Expected export: 73 shards, 112,003 tensors,
+540,617,010,400 payload bytes (503.49 GiB). Routed bytes require about
+79.98 GiB per Spark at TP6; TP4 needs119.97 GiB before runtime overhead.
+
+Calibrate each causal stage against reconstructed quantized predecessors,
+finish K4 experts and replay the whole block before its successor. Every
+frontier carries exact shared DSA selections and layer35's compressed NoPE
+KV through later reuse. Raw dense XTX contains actual corpus rows only;
+cold routed experts use native router ranks5-8 in rank-major/corpus order,
+then missing-count identity rows to reach1024. Phase manifests, projection
+receipts, audited shards and successor frontier are ordered retirement
+barriers. Resume checks numerical identity and hashes; launcher/publisher
+changes do not masquerade as changes to numerical producers. Numerical
+failures require dependency-aware review; never delete valid predecessors
+merely because an uncommitted current phase failed.
+
+The launcher runs a durable user systemd unit. Its guard stops this task's
+container before releasing GPU1, then authorized upload runs CPU-only.
+Independent completed-export validation must pass before publication; remote
+object hashes, anonymous revision and weight HEAD are checked. Publication
+target is `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`. Keep the source
+Mistral Ecosystem Open-Weight License intact. Serving, full-model quality and
+engine-format qualification are separate from projection/native math checks.
+Local run/evidence/export: `~/Developer/cute-worktrees/mistral-quant-work/`.
+
+Tracking: issue #937, draft PR #938. Initial implementation is sealed at
+`e7bb052f9`; 141 focused CPU cases pass and the affected native/pilot26
+pass again after removing a false-positive class-name secret-scanner trigger.
+All68 source files (1,060,613,131,585 bytes including assets) match their
+published Hub hashes. The bounded GPU pilot runs under user unit
+`mistral-core-k6-1793465295342526983`; final pilot/production results are
+not yet claimed.
+
+The CPU finalizer publishes once, then delegates storage to native SparkNest:
+`nest hf import --offline` permits copying, followed by a native placement
+plan at factor1/6 across ostrich,dodo,emu,kiwi,rhea,moa. TJ superseded the
+original no-copy constraint and custom SSH/rsync checks on2026-11-02.
+Trust native import/placement job results and sealed-copy metadata; do not
+add another weight hash pass or remote file checks. Durable job IDs support
+storage retries without replaying the validated publisher. Retire only this
+task's local standalone weights after native completion, retaining evidence.
+
+The short GPU pilot passed in563.50 seconds (2026-10-31T16:57:47UTC), exit0:
+all72 frozen-source layers,24 native byte-exact block proofs,7 separate
+2,205-token sparse/KV proofs and16 serialized candidates. Worst tested K6
+heldout NMSE is3.15245e-4 (<1e-3); routed K4 witness is3.15434e-4 (<0.05).
+No OOM or numerical crash occurred. Keep the proposed K6/core, K4/routed and
+native exclusions. Full production started2026-10-31T17:02:39UTC under unit
+`mistral-core-k6-1793466152658395709`, with authorized CPU upload and
+distributed import enabled (the native copy-permitted path above supersedes it). Producer files/fork/calibration are
+frozen; recover this run explicitly with its existing launcher and --resume.
+
+Production completed2026-11-02T01:20:47UTC:72/72 layers and27,688/27,688
+projections,73 shards,112,003 tensors,540,617,010,400 payload bytes. The
+independent export audit passed and all1,251 retained native tensors matched
+byte-for-byte. No numerical/OOM failures or numerical restarts occurred.
+Published2026-11-02T02:44:39UTC at
+https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6
+revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with remote and anonymous
+checks complete. Native import job3263500808 finished in27.249s; native
+placement job3263500849 moved the remaining89,445,357,508B to moa in22.284s
+and removed redundant managed copies. Numerical producers remain frozen.
+The CPU supervisor was deliberately stopped to replace the custom storage
+path with this user-requested native path; this was not a quant failure.
+Focused finalizer/archive/launcher checks:55 passed. Full-model quality and
+serving qualification remain separate. Production layer15 attention.wo has
+a0.006871 regularized-Hessian relative error; the report preserves this
+outlier separately from the short pilot's unregularized heldout NMSE.
+
+Native storage completion and local weight retirement are durable at
+2026-11-02T03:22:04UTC. All73 sealed shards have exactly one managed Spark
+copy (ostrich/dodo/emu/kiwi/rhea/moa:12/12/12/12/13/12). Final CPU supervisor
+`mistral-core-k6-1793589723765453717` exited0. The30-minute progress timer is
+stopped. A preceding CPU-only retry rejected native refs/main grouping;
+its corrected retry reused the same native jobs without another transfer,
+quantization or publisher pass.56 focused storage/finalizer/launcher cases
+pass. The task's standalone local weight hardlinks are retired; scalar
+proofs, reports, metadata and the managed published revision remain.
+
+
+## Muse Spark Open K4 experts / Core K6 (2026-11-01)
+
+TJ authorized the short pilot, full quantization, direct Hub publication and
+SparkNest placement on `quant/muse-spark-k4-core-k6`; no recipe or upload
+approval stop remains. Existing checkout: `~/Developer/cute-worktrees/muse-quant`.
+GPU work uses raptor GPU 0 alone, by UUID under the unchanged fair queue;
+GPU 1 and serving/default/kernel infrastructure are outside this task.
+
+Pinned BF16 source `meta-models/Muse-Spark-Open-816B-A42B` revision
+`0fb02478b02565b2ce7fc57e6051c91172774ac9` contains 2,000 tensors and
+1,644,333,137,920 payload bytes. Files are sealed and local across raptor,
+raptor (D2) and raptor (D3); readiness checks the local-store union because
+`nest where` reports each store separately. Source hashes are checked against
+the actual Hub LFS/Git hashes before GPU admission, without replication.
+
+Implementation: `quantization/muse_spark/`. Quantize 373 attention/bridge/head
+matrices at K6 and 47,616 individual routed matrices at K4 using the pinned
+MCG codec and FP64-congruence calibrated LDLQ. Gate/up expert fusion splits
+axis 1, gate first. Keep 1,503 native tensors byte for byte, including attention
+output gates and bundled vision/audio. Residual gates ship BF16 but promote
+to FP32 in the official native execution. The head stores 202,112 output rows
+with 202,048 logical rows; all whole operands record side 1. Expected output:
+193,459 tensors, 427,855,788,244 payload bytes, 63 shards.
+
+The native xhigh template renders all 1,426 calibration prompts (1,248,980
+tokens), with date frozen to 2026-10-31 and no sorting/truncation/packing.
+The bounded pilot uses 4,764 calibration / 1,812 heldout tokens, layers
+0/1/61, and a separate 2,345-token sliding-window witness. Expected K6 error
+is below the 1e-3 heldout activation-weighted NMSE stop bar; native/staged
+boundaries must be byte-exact and expert error finite and at most 1e-2.
+One pilot launch is enough unless a specific failure needs diagnosis.
+
+Production stages advance causally: quantized QKV -> O inputs -> attention
+residual -> pre-expert projection -> per-expert gate/up -> down inputs ->
+normalized routed outputs -> post-expert projection -> successor layer.
+The official Transformers 5.22.1 modules own all norms, routing and masking.
+The durable user supervisor caps host memory at 78 GiB and owns GPU0 only
+until its container stops; authorized publication is CPU-only afterward.
+Run/tokens/pilot/export state: `~/Developer/cute-worktrees/muse-quant-work/`.
+Use its launcher with `--resume` after OOM; retain checksum-verified stage
+and projection commitments. A numerical failure requires diagnosis of the
+first affected producer/input and its descendants before invalidation; never
+blindly delete cached work or resume across changed numerical identities.
+The independent completed-export reload and native-byte audit precedes upload
+to `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6`.
+
+The original pilot completed native/staged byte proofs, but its covariance
+producer is superseded. Production attempt `muse-quant-1793466485064710216`
+stopped at layer 1 expert 2 on a Cholesky numerical failure, not OOM. Independent
+FP64 oracles show the original long FP32 covariance product error is 7.97e-6;
+the represented regularized matrix itself is indefinite, so a factorization
+retry or more damping would conceal an inaccurate input. All 785 old quantized
+commitments and their dependent activation stream remain preserved for diagnosis
+and will not seed the clean producer. Source weights, tokens and byte-verified
+original BF16 teacher states are reusable.
+
+Products bounded to 128 real rows pass expert oracles but a full 1,248,980-row
+dense stream still has 1.785e-6 error from the FP32 outer sum. The candidate
+uses unchanged bounded FP32 products with a persistent FP64 outer sum and FP32
+stored covariance. It must clear the unchanged 1e-6 matrix-oracle bar on the
+failed expert, two busy experts and the full dense stream, then a fresh short
+pilot before clean production. Native activation GEMM shapes, row order,
+calibration corpus, damping, Hadamard and packed quantizer are unchanged.
+The GPTQModel helper `05689b25ffc8b27401a4291ab2b8a71c43a83151` is
+published on fork main and pinned here. All 20 independent CPU oracle/boundary
+checks pass. Target GPU witnesses pass all four cases with relative errors
+2.85e-8 (failed expert 2, 1,690 rows), 2.71e-8 (expert 0, 22,028 rows),
+2.67e-8 (expert 56, 152,454 rows) and 3.08e-8 (full dense 1,248,980 rows).
+All four unchanged factorizations pass with the original 0.025 damping.
+Evidence: `muse-quant-work/numerical-1793466485064710216/accurate-sum-witness/`.
+The fresh short pilot exits zero at 2026-10-31 18:36:13 UTC after about
+7.4 minutes. All 21 source outputs match the original teacher byte for byte;
+the three native/staged proofs and separate sliding-window witness also pass.
+Worst selected K6 heldout NMSE is 0.000295418; padded head 0.0000475735;
+worst sampled K4 expert 0.00541509. Existing 1e-3/1e-2 stop bars remain.
+
+Clean production started under durable user unit
+`muse-quant-1793471787847848991` with automatic CPU upload/managed ingest/cleanup.
+Active paths are `muse-quant-work/production-k128` and `export-k128`; the old
+producer/export stay isolated as forensic evidence. Numerical code and fork pin
+are frozen while this producer runs. No upload has occurred yet.
+
+Final CPU continuation now includes publication, supported native SparkNest
+streamed placement directly to six Sparks, verification, and removal of only
+the task-owned local final-weight links. It creates no extra full checkpoint
+on raptor. Source weights, shared stores, receipts and forensic evidence stay.
+Targeted terminal-flow tests pass 54 CPU cases. Issue #940 and draft PR #939
+track continuation; full-model serving qualification remains separate.
+
+TJ requested progress, remaining time and completion status every 30 minutes.
+The user timer `cuteafd-muse-progress.timer` queues an update into this same
+Codex task (`01a192c3-c219-7950-89d1-6efa3f197a15`) through the existing CLI;
+first delivery succeeds at 2026-10-31 21:29 UTC, next at 21:59 UTC. Operational
+script/receipts: `muse-quant-work/progress-updates/`. It reads only task receipts
+and supervisor status; it never probes either GPU or changes numerical source.
+ETA uses the latest six completed layers and elapsed current-layer time; head,
+audit, upload and placement remain separately unestimated until measurable.
+The timer stops after queuing final success only when all completion markers
+match the producer and the durable supervisor exits zero. Failure updates keep
+the original OOM-resume versus numerical-diagnosis recovery instructions.
+At setup, six layers and 5,201/47,989 projections are committed with no new
+crash; remaining layer time is about 23.6 hours (mean 25.61 minutes/layer).
+
+Quantization completed 2026-11-01 20:58:59 UTC (26h22m21s including final
+export/audit) with all 47,989 projections, 63 shards and exact expected payload.
+Independent reload audit passes all 1,503 retained tensors / 16,250,077,184
+bytes and all numerical records. Public upload finished 22:05:40 UTC:
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6` revision
+`89998fb177acd9a862ac8bd4fb79bfd50e940c97`, 142 verified public files.
+
+The CPU continuation stopped before managed writes: SparkNest 0.7.2 returns
+400 with an exact path-specific `invalid argument: PATH not found` for absent
+namespace paths, while the adapter expected 404. Recognize only that exact
+400 body as absence; all other errors still fail. Status-only exception output
+keeps response details private. The adapter fix passes 55 ingest/finish cases
+and a read-only actual missing-ref check. Resume CPU publication/placement
+only; source numerical identity, quantized weights and public revision remain
+unchanged, and no quantization or upload reset is needed.
+
+TJ clarified that managed admission must use hardlink staging and a no-copy
+SparkNest import. Stop the direct upload-API placement continuation while
+resolving that route; do not resume it from scheduled failure prompts.
+The CPU unit was stopped 2026-11-01 22:46:14 UTC. All 63 local final shards
+remain; cleanup has not started. 26 weight shards (175,808,982,704 bytes)
+already have verified Spark copies; retain them for reuse. The managed ref
+was never published, and no managed-complete marker exists. Source quantization
+was a clean layer-0 restart (`resume:false`); the original invalid quantized
+weights and causal activation caches never seeded the repaired producer.
+
+TJ subsequently clarified that the model should be imported and the earlier
+comment was a question about speed, not a requirement to replace the placement
+method. This supersedes the hold above. Resume the existing verified placement,
+reuse all 26 completed Spark weight copies and any checksum-valid owned partial,
+and finish managed verification/cleanup. The hold marker is archived as resolved.
+CPU-only continuation: `muse-quant-1793575200198800108`. No shared SparkNest
+feature/deployment work, requantization or HF reupload is needed.
+
+TJ explicitly requested native SparkNest tools, minimal copies and no further
+weight checksums or SSH verification. This supersedes the extra terminal
+checksum barriers above. The old verifier continuation was stopped; 28 verified
+Spark shards are reused. A filtered hardlink staging view contains only 35
+missing weight shards plus remaining assets (238,777,799,082 bytes). Native
+`nest import --copy --seal all` job 3263500654 handles the unavoidable cross-NVMe
+copy. Per-host metadata aliases batch native RDMA `nest replicate` jobs; the
+coordinator's managed copies are evicted after placement. Existing HF checksums
+are retained as the checksum record; final checks use native job errors/counts,
+sealed sizes, ownership, inventory and offline HF resolution without rehashing
+weight data. Refs are imported last. Native CLI continuation:
+`muse-quant-1793576154865042036`, task-local `native_finish.py`. No SSH is used.
+
+Completed 2026-11-01 23:39:11 UTC (Nov 2 07:39 Taipei), supervisor exit zero.
+Native import job 3263500654 imported the 106 missing files with zero errors;
+six native RDMA jobs placed the remaining data while reusing 28 Spark shards.
+All 142 managed files have the expected sealed sizes/ownership, all 63 weight
+shards have exactly one Spark copy, refs/main names the published revision,
+and offline HF resolution points into the managed hub. Verification followed
+TJ's explicit instruction: use the prior HF checksum record, native job results
+and metadata only; no new weight hashes or SSH checks. Temporary coordinator
+managed copies, export/cache/staging weight links and 122.16 GiB of obsolete
+binary intermediates are retired. Source weights, tokens, scalar receipts,
+all 47,989 error records/CSV, 62 layer timings, logs and numerical failure
+forensics remain. Task-specific compiled staging is removed, GPUs are released,
+and the 30-minute progress timer is disabled. Do not replay the old checksum
+finisher against the intentionally retired local weights; final native command
+sources/results are retained in `muse-quant-work/native_finish.py` and
+`production-k128/native-cli-jobs/`.
+
+## SM89 2x RTX 4090 D 48 GB static optimization review (DSF 4.1, 2026-11-11)
+
+Reviewed cuteafd [`379b26792`](https://github.com/hughmadden/cuteafd/commit/379b26792)
+with SparkInfer pinned at
+[`ce9aec549307cf7736ea296b0e71d190923fc9c1`](https://github.com/hughmadden/sparkinfer-glmrt/commit/ce9aec549307cf7736ea296b0e71d190923fc9c1).
+Scope: inference-engine and kernel changes that improve performance, efficiency
+or KV-cache behavior without regressing accuracy. This was a static review: no
+engine launch, build, benchmark or hardware test ran, and no other agent's
+worktree or report was consulted.
+
+The useful baseline is already strong. SM89 decode experts reach about 95-97%
+of their measured streaming-read ceiling. The exact F16 expert MMA fixes the
+FP8 MMA's recipe mismatch for only 1.8-4.7% on memory-bound waves. Radix
+selection and shared-tile attention have removed large overheads, and copy-
+engine prefill staging improved measured 8K prefill from 4,315 to 4,853 tok/s
+(+12.5%), with 32K improving from 4,066 to 5,588 tok/s (+37.4%). Further
+generic decode-GEMV work is therefore low priority.
+
+### Findings, estimates and accuracy contracts
+
+These are estimates derived from the fork's measurements and traffic models,
+not new measurements on the review branch.
+
+| Priority | Improvement | Practical estimate | Accuracy contract |
+| --- | --- | --- | --- |
+| 1 | Capture the whole verify step | Existing documented ceiling: +10-15% C1, +8-12% C4; likely lower after recent SM89 fusions | Byte-identical graph replay and accepted tokens |
+| 2 | Pipeline FP4 gather with QK on SM89 | 10-25% attention; about 0.5-2% decode and 1-3% prefill | Same BF16 decode, QK order, 64-key softmax and PV |
+| 3 | Mirror Spark reply descriptors into device memory | 20-40% pinned landing; about 1-3% at C16/prefill and 0.5-1% C1 | Byte-identical copies and plane order |
+| 4 | Generate candidate positions inside scorer/top-k | 344 MiB freed per selection store (about 39 TP2 expert halves); 1-3% long-context prefill | Identical positions, scores, masks and tie order |
+| 5 | Session-aware prefix eviction | Avoid about 0.4 ms per 8K or 4.9 ms per 128K host restore; much larger when it prevents a cold prefill | Only victim order changes |
+| 6 | Ordered K64 split-K for wide routers | 20-40% router; about 0.5-1.5% C16 and below 0.5% prefill | Ordered second stage reproduces the existing K64 sum |
+| 7 | Fuse `q_a + wkv` activation production | 0.2-0.5% decode and 0.3-1% prefill; 26.9 MiB less scratch per 2752-row window store | Same activation codes and per-output GEMM order |
+| 8 | Census and bound V4.1 graph shapes | Unknown until measured; each 1 GiB freed buys about 118 TP2 halves or 2M KV tokens | Hot exact shapes stay; cold shapes run eagerly |
+
+#### 1. Whole verify-step capture
+
+V4.1 still captures per component/layer
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/graph_policy.rs`). The
+existing profiling records host launch gaps and projects +10-15% C1 and +8-12%
+C4 from whole-step capture (PLAN lines 459-475). That projection predates the
+latest mHC, dSpark and staging fusions, so it is a ceiling, not an expected
+result. It remains the largest documented decode opportunity.
+
+Capture target verification and its device-ordered Spark/TP2 exchanges as one
+graph per exact row shape, including the post-argmax host gap. Keep the current
+per-component graphs as the reference arm. Gate on byte-identical logits and
+accepted tokens, 10/10 lossless-speculation cases, exact prefix restores, zero
+steady-state captures and graph-memory accounting.
+
+#### 2. Asynchronous FP4 gather and QK overlap
+
+The native SM89 loop resolves references, gathers/decodes the complete KV tile
+into shared BF16, then runs QK, softmax and PV
+(`native/families/deepseek_v41/cuda/v41_sparse_attention.cu`, the tile loop and
+QK/PV sequence). Global gather and tensor-core work are serialized.
+
+Use one 32-key raw FP4 staging buffer: 8 KiB of values plus 1 KiB of scales (9
+KiB total). It fits the roughly 15 KiB left by the four-group prefill layout
+within SM89's approximately 99 KiB shared-memory budget.
+
+1. Load/decode the first 32 keys.
+2. Start asynchronous loading of the next 32.
+3. Compute QK for the first 32 while the second is in flight.
+4. Decode the second group and finish QK.
+5. Preserve the existing full 64-key softmax and PV.
+6. If another tile exists, prefetch its first group during PV.
+
+QK stays per-16-key WMMA tiles in the same column order; softmax and PV stay at
+64 keys. No numerical route change is required. This also helps a decode part
+with only one tile because the second half's load overlaps the first half's QK.
+
+Primary prior art: [TileLang's sparse-MLA
+kernels](https://github.com/tile-ai/tilelang/blob/1cf5a1f004a4a6175748b0316267e8b462e77e02/examples/deepseek_v32/README.md)
+use producer stages and overlap KV-layout work with QK;
+[FlashInfer PR #814](https://github.com/flashinfer-ai/flashinfer/pull/814)
+records SM89's shared-memory constraint; NVIDIA documents CC 8.0+ asynchronous
+global-to-shared copies in [LDGSTS](https://docs.nvidia.com/cuda/archive/13.4.1/cuda-programming-guide/04-special-topics/async-copies.html#using-ldgsts).
+Estimate 10-25% attention improvement, or about 0.5-2% decode and 1-3%
+prefill. Stop if profiling shows raw-gather waiting below 10% of attention
+time.
+
+#### 3. Device-side Spark reply descriptors
+
+Pinned landing lets every pull block read its rank descriptor over PCIe. The
+fork's by-value probe measures the available ceiling: 240 KiB 36.4 -> 26.8 us;
+960 KiB 91.7 -> 55.5 us; 10 MiB rank-by-rank 734.8 -> 438.9 us
+(`rust/crates/cuteafd-daemon/src/shared/spark_waves_tests.rs`,
+`device_ordered_landing_on_this_host`). Queued landing is in
+`rust/crates/cuteafd-daemon/src/shared/spark_waves.rs`.
+
+Changing descriptors cannot be graph-invariant kernel arguments. Mirror each
+rank's final descriptor once into a stable device-memory table instead. The
+pull then uses a device pointer and stops issuing duplicate host-descriptor
+reads. A tiny device-side staging kernel can preserve host-free sequencing.
+For host-ordered rounds, first evaluate the existing
+`CUTEAFD_SPARK_LANDING=auto`; the device table is for device-ordered and
+captured paths where copy-engine landing is currently disallowed. Estimate
+20-40% pinned-landing improvement, about 1-3% at C16/prefill and 0.5-1% C1.
+Reply bytes and reduction order do not change.
+
+#### 4. Eliminate the candidate-position plane
+
+Index selection reserves `WIDTH * 8` bytes per row for positions
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_index_selection.rs`,
+`IndexSelectionWave::sizes`). At 2752 rows this is 360,710,144 B = 344 MiB,
+enough for 39 TP2 expert halves at 9,131,264 B each.
+
+Positions are already derivable without storage:
+
+- contiguous tile: `begin + column`;
+- expanded candidate: `blocks[column / 8] * 8 + column % 8`.
+
+These are the formulas in
+`native/families/deepseek_v41/cuda/v41_candidate_blocks.cu`. Pass a tile-begin
+descriptor or the block-ID array to the scorer and radix selector instead of
+materializing positions. This removes one write and two reads (24 B per
+candidate) plus the generation launches.
+
+Across eight index producers at 2752 rows, that is 8.06 GiB per unit, or 24.2
+GiB across three units of an 8K prompt. At an effective 0.6-1 TB/s it is about
+24-40 ms, or 1-3% long-context prefill. Preserve exact U64 positions, `-inf`
+masking and ascending-position tie-breaking.
+
+#### 5. Session-aware prefix eviction
+
+Snapshots already carry `Entry.session`, but victim selection is global LRU
+(`rust/crates/cuteafd-engine/src/prefix/entry.rs` and `prefix/cache.rs`). Add a
+non-pinning session-aware rank: evict inactive or one-shot sessions before
+snapshots belonging to sessions with continuing turns. Fall back to current
+LRU when no session ID exists.
+
+At about 890 B/token, preventing a device eviction avoids approximately:
+
+- 8K: 7.3 MB plus mark, about 0.4 ms at 24 GB/s;
+- 128K: 114 MB plus mark, about 4.9 ms;
+- 1M: 890 MB plus mark, about 37 ms.
+
+If the host entry was also evicted, it avoids a complete prefill instead.
+[SGLang's session-aware unified radix
+cache](https://www.lmsys.org/blog/2026-08-11-unified-radix-cache/) reports
+2.9-16.6% lower TTFT on its SWE-bench configurations. Those results are
+directional evidence, not a forecast for cuteafd. Snapshot bytes and restore
+semantics do not change.
+
+#### 6. Ordered K64 split-K for wide routers
+
+The SM89 router retains K64 partials and adds them in K order
+(`b12x/moe/_shared/v41_router.py` at the pinned SparkInfer revision). Its own
+measurements show wide-row efficiency as low as 8-29% of roofline at 65-512
+rows. Ordinary split-K would alter the reduction order.
+
+Instead split only at existing K64 boundaries, run the same tile/MMA code on
+each contiguous chunk, write partials without atomics, and use a small ordered
+second stage that adds those partials in the original sequence. Include the
+second launch in the stop bar. Do not apply it to the already efficient skinny
+path. Estimate 20-40% router improvement at wide rows, about 0.5-1.5% at C16
+and below 0.5% prefill.
+
+#### 7. Share `q_a + wkv` activation production
+
+`q_a` and `wkv` have shapes 1280x5120 and 512x5120 and use the same K32/1e-4
+activation recipe (`python/tools/aot/export_b12x_v41_fp8_aot.py`). The window
+path copies `query.hidden` and launches a separate projection
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_window.rs`); dSpark
+also runs `q_a` and `wkv` over the same input.
+
+Quantize the activation once, then run the existing output-specific GEMM
+arithmetic into separate outputs. A jointly scheduled launch can also remove
+the small-projection launch floor. At 2752 rows the hidden-copy buffer alone is
+26.9 MiB; copy plus duplicate activation production is about 40 MiB per layer
+including the FP8 output. Estimate 0.2-0.5% decode and 0.3-1% prefill.
+
+#### 8. Census graph growth before assigning more tier/KV capacity
+
+Above 32 GiB, V4.1 has no fixed exact-shape set, while the planner reserves
+1472 MiB per GPU for graphs
+(`rust/crates/cuteafd-loader/src/placement/families/deepseek_v41.rs`,
+`graph_reserve`). The plan lists V4.1 graph memory as unmeasured.
+
+Collect a shape census and compare actual post-ready graph occupancy with the
+reserve. If it grows materially, retain hot exact shapes and run cold shapes
+eagerly using the existing small-card pattern; padding is optional. Each 1 GiB
+reclaimed buys about 118 TP2 expert halves or 2M additional logical KV tokens
+at the tighter 534 B/token owner.
+
+### Approaches rejected by this review
+
+- Revert to Ada FP8 MMA for experts: the final pin documents a quarter of route
+  outputs leaving the official recipe; exact F16 costs only 1.8-4.7% on
+  memory-bound waves.
+- FP8/NVFP4 decode replies: decode/verify deliberately stays BF16 for lossless
+  speculation.
+- Dynamic expert LRU eviction: GPU/Spark low-bit differences invalidate exact
+  prefixes, and the fork's synthetic replay shows large net losses after
+  re-prefill.
+- More generic decode-GEMV or split-K tuning: the kernels are near their
+  measured memory ceiling, and the existing decode split-K experiment was
+  slower.
+- Further KV quantization presented as a free capacity gain: it needs fresh
+  accuracy qualification and is unnecessary beside the structural wins above.
+
+### Implementation and validation order
+
+1. Position-array elimination: clear memory and traffic win, small correctness
+   surface.
+2. Device-side reply descriptors: directly supported by the fork's by-value
+   ceiling.
+3. FP4 gather/QK pipelining: kernel-local and bit-exact by construction.
+4. Session-aware eviction: small engine change, useful under mixed-session
+   pressure.
+5. Ordered router split-K and `q_a + wkv` fusion: useful but smaller.
+6. Whole verify-step capture: largest ceiling and largest engineering effort.
+
+For each change, run a component bit-exactness oracle first, then one warmed
+identical-config A/B with C1/C16, 8K/32K prefill, exact prefix checks, lossless
+speculation and thermal/power-cap telemetry. No such hardware validation was
+run as part of this review.

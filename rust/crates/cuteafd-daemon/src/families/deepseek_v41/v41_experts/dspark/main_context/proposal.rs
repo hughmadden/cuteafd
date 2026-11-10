@@ -26,8 +26,8 @@ fn groups(rows: &[ExpertRow]) -> Result<Vec<Group>> {
             last.rows += 1;
         } else {
             ensure!(
-                groups.len() < 16 && groups.iter().all(|g| g.request != row.request_id),
-                "main proposal repeats a request or exceeds sixteen requests"
+                groups.len() < cuteafd_core::V41_MAX_REQUESTS && groups.iter().all(|g| g.request != row.request_id),
+                "main proposal repeats a request or exceeds the request limit"
             );
             groups.push(Group {
                 request: row.request_id,
@@ -51,6 +51,29 @@ fn validate_acceptance(groups: &[Group], accepted: &[u32]) -> Result<()> {
     Ok(())
 }
 
+/// Host publication plan shared by packed prefill and decode. Zero prefixes stay
+/// in the plan so every request's GPU lease is validated before any publication.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MainCommitGroup {
+    pub request: u64,
+    pub position: u64,
+    pub source: u32,
+    pub tokens: u32,
+}
+
+fn commit_plan(groups: &[Group], lease_counts: [usize; 3], accepted: &[u32])
+    -> Result<Vec<MainCommitGroup>> {
+    validate_acceptance(groups, accepted)?;
+    ensure!(lease_counts.iter().all(|&n| n == groups.len()),
+        "main proposal lease count differs");
+    Ok(groups.iter().zip(accepted).map(|(group, &tokens)| MainCommitGroup {
+        request: group.request,
+        position: group.position,
+        source: group.source,
+        tokens,
+    }).collect())
+}
+
 /// Holds exclusive producer ownership until publication or discard. The caller
 /// must also prevalidate its target-cache/engram transaction before publication.
 pub(crate) struct MainProposal<'p, 'w, 'a> {
@@ -59,6 +82,11 @@ pub(crate) struct MainProposal<'p, 'w, 'a> {
     groups: Vec<Group>,
 }
 impl<'w, 'a> DsparkMainContext<'w, 'a> {
+    pub(crate) fn prepare_commit_plan(rows: &[ExpertRow], lease_counts: [usize; 3],
+        accepted: &[u32]) -> Result<Vec<MainCommitGroup>> {
+        commit_plan(&groups(rows)?, lease_counts, accepted)
+    }
+
     /// # Safety
     /// Rows and input belong to the given completed target batch. Input obeys
     /// execute_input's device, finite-value and exclusive-access contract.
@@ -127,20 +155,17 @@ impl MainProposal<'_, '_, '_> {
             .main
             .ready
             .ok_or_else(|| anyhow::anyhow!("main proposal consumed"))?;
-        commit_chunks(&self.groups, rows, windows.each_ref().map(|w| &**w), leases, accepted)
+        let plan = commit_plan(&self.groups, leases.map(|l| l.len()), accepted)?;
+        commit_chunks(&plan, rows, windows.each_ref().map(|w| &**w), leases)
     }
 }
 pub(crate) fn prepare_commit_rows(rows: &[ExpertRow], windows: [&DsparkWindow<'_>; 3],
     leases: [&[WindowLease]; 3], accepted: &[u32]) -> Result<[Vec<WindowChunk>; 3]> {
-    commit_chunks(&groups(rows)?, rows.len() as u32, windows, leases, accepted)
+    let plan = DsparkMainContext::prepare_commit_plan(rows, leases.map(|l| l.len()), accepted)?;
+    commit_chunks(&plan, rows.len() as u32, windows, leases)
 }
-fn commit_chunks(groups: &[Group], rows: u32, windows: [&DsparkWindow<'_>; 3],
-    leases: [&[WindowLease]; 3], accepted: &[u32]) -> Result<[Vec<WindowChunk>; 3]> {
-        validate_acceptance(groups, accepted)?;
-        ensure!(
-            leases.iter().all(|l| l.len() == groups.len()),
-            "main proposal lease count differs"
-        );
+fn commit_chunks(groups: &[MainCommitGroup], rows: u32, windows: [&DsparkWindow<'_>; 3],
+    leases: [&[WindowLease]; 3]) -> Result<[Vec<WindowChunk>; 3]> {
         let mut chunks: [Vec<WindowChunk>; 3] = std::array::from_fn(|_| Vec::new());
         for stage in 0..3 {
             for (i, group) in groups.iter().enumerate() {
@@ -158,12 +183,12 @@ fn commit_chunks(groups: &[Group], rows: u32, windows: [&DsparkWindow<'_>; 3],
                     end == windows[0].committed_end(leases[0][i])?,
                     "main proposal stage ends differ"
                 );
-                if accepted[i] != 0 {
+                if group.tokens != 0 {
                     chunks[stage].push(WindowChunk {
                         lease,
                         position: group.position,
                         source_row: group.source,
-                        tokens: accepted[i],
+                        tokens: group.tokens,
                     });
                 }
             }
@@ -188,6 +213,24 @@ mod tests {
             position,
             kind: cuteafd_transport::ExpertV2SourceKind::MtpVerify,
         }
+    }
+    #[test]
+    fn main_proposal_covers_every_request() {
+        for members in [33, 51, 64] {
+            let rows: Vec<_> = (0..members)
+                .flat_map(|id| [row(id as u64, 7), row(id as u64, 8)]).collect();
+            let accepted = vec![2; members];
+            let plan = DsparkMainContext::prepare_commit_plan(&rows, [members; 3], &accepted).unwrap();
+            assert_eq!(plan.len(), members);
+            assert_eq!(plan.last().unwrap().source, (2 * (members - 1)) as u32);
+            assert_eq!(plan.last().unwrap().tokens, 2);
+            assert!(DsparkMainContext::prepare_commit_plan(&rows, [members - 1; 3], &accepted).is_err());
+        }
+        let too_many: Vec<_> = (0..=cuteafd_core::V41_MAX_REQUESTS)
+            .map(|id| row(id as u64, 0)).collect();
+        assert!(DsparkMainContext::prepare_commit_plan(&too_many,
+            [cuteafd_core::V41_MAX_REQUESTS + 1; 3],
+            &[1; cuteafd_core::V41_MAX_REQUESTS + 1]).is_err());
     }
     #[test]
     fn main_prefixes_keep_flattened_offsets_and_reject_ambiguous_rows() {

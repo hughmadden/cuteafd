@@ -53,7 +53,13 @@ impl<'library> DsparkWeights<'library> {
         })
     }
 }
-impl DsparkStage<'_, '_> {
+impl<'a> DsparkStage<'_, 'a> {
+    pub(super) fn peer_stream(&self) -> Option<std::rc::Rc<crate::shared::memory::device::Stream<'a>>> {
+        self.ffn.peer_stream()
+    }
+    pub(super) fn synchronize(&self) -> Result<()> {
+        self.ffn.synchronize()
+    }
     pub(super) fn set_width(&mut self, width: usize, maximum: usize) -> Result<()> {
         if width == self.width { return Ok(()); }
         ensure!(self.graph.is_none(), "cannot change the width of a captured dSpark stage");

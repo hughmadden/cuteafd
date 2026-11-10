@@ -34,11 +34,14 @@ pub enum Action {
         out: Option<PathBuf>,
         /// Pair two quants of one reference root (same pinned set, reference and build);
         /// the checkpoints and a closed list of quant-selection settings may differ.
-        #[arg(long, conflicts_with = "code_ab")]
+        #[arg(long, conflicts_with_all = ["code_ab", "layout_ab"])]
         cross_checkpoint: bool,
         /// Pair two builds of the same checkpoint and server settings (a code A/B).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "layout_ab")]
         code_ab: bool,
+        /// Pair explicit layouts, preserving all differences; precision and speculation stay fixed.
+        #[arg(long)]
+        layout_ab: bool,
     },
     /// Compare candidate A to checkpoint-precision baseline B, paired by position.
     Compare {
@@ -59,11 +62,14 @@ pub enum Action {
         out: Option<PathBuf>,
         /// Pair two quants of one reference root (same pinned set, reference and build);
         /// the checkpoints and a closed list of quant-selection settings may differ.
-        #[arg(long, conflicts_with = "code_ab")]
+        #[arg(long, conflicts_with_all = ["code_ab", "layout_ab"])]
         cross_checkpoint: bool,
         /// Pair two builds of the same checkpoint and server settings (a code A/B).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "layout_ab")]
         code_ab: bool,
+        /// Pair explicit layouts, preserving all differences; precision and speculation stay fixed.
+        #[arg(long)]
+        layout_ab: bool,
     },
 }
 #[derive(Debug, Clone, clap::Args)]
@@ -102,10 +108,14 @@ pub struct RunArgs {
     /// Kernel shape to score; Quick uses decode, Standard automatically scores both admitted paths.
     #[arg(long, value_parser = ["decode", "prefill"], default_value = "decode")]
     pub score_path: String,
-    #[arg(long)]
-    pub verify_rows: Option<usize>,
-    #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
+    /// Decode scoring widths, in order (for example 1,2,4,8,16).
+    #[arg(long, value_delimiter = ',', value_parser = clap::value_parser!(usize))]
+    pub verify_rows: Vec<usize>,
+    #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true, conflicts_with = "api_key_file")]
     pub api_key: Option<String>,
+    /// Read the bearer key from this file, without putting it in argv.
+    #[arg(long, conflicts_with = "api_key")]
+    pub api_key_file: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -162,32 +172,63 @@ fn prepare_dump_dir(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
-    prepare_dump_dir(args)?;
-    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
-    ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
-    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
-        .timeout_read(Duration::from_secs(900)).build();
-    let base = args.url.trim_end_matches('/');
-    let models = get(&agent, &format!("{base}/v1/models"), &args.api_key)?;
-    let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
-    let status = get(&agent, &format!("{base}/v1/bench/status"), &args.api_key)?;
-    let model = status["checkpoint"].as_str().unwrap_or(served);
-    let mut model_record = models["data"][0].clone();
-    model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
-    model_record["snapshot"] = status["snapshot"].clone();
-    let mut runs = vec![run_with(args, model, &model_record, |body| {
-        request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
-    }, |_, _, _| {})?];
-    if args.tier == "standard" && model_record["full_prefill_logits"] == true {
-        let mut prefill_args = args.clone();
-        prefill_args.score_path = "prefill".into();
-        runs.push(run_with(&prefill_args, model, &model_record, |body| {
-            request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
-        }, |_, _, _| {})?);
-        ensure!(runs[0].engine == runs[1].engine && runs[0].settings == runs[1].settings
-            && runs[0].dataset == runs[1].dataset && runs[0].reference_sha256 == runs[1].reference_sha256,
-            "Standard scoring paths use different references or server settings");
+fn api_key(args: &RunArgs) -> Result<Option<String>> {
+    ensure!(args.api_key.is_none() || args.api_key_file.is_none(),
+        "--api-key-file conflicts with --api-key and CUTEAFD_API_KEY");
+    let key = match &args.api_key_file {
+        Some(path) => Some(std::fs::read_to_string(path).context("cannot read --api-key-file")?
+            .trim().to_owned()),
+        None => args.api_key.clone(),
+    };
+    if let Some(key) = &key {
+        ensure!(!key.is_empty() && !key.chars().any(char::is_whitespace)
+            && !key.chars().any(char::is_control), "API key must be non-empty without whitespace or control characters");
+    }
+    Ok(key)
+}
+
+fn validate_widths(args: &RunArgs) -> Result<()> {
+    ensure!(args.verify_rows.iter().all(|&width| width > 0), "--verify-rows widths must be positive");
+    let unique: std::collections::HashSet<_> = args.verify_rows.iter().collect();
+    ensure!(unique.len() == args.verify_rows.len(), "--verify-rows widths must be distinct");
+    ensure!(args.verify_rows.is_empty() || args.score_path == "decode", "--verify-rows requires decode scoring");
+    Ok(())
+}
+
+fn run_series(args: &RunArgs, full_prefill: bool,
+    mut score: impl FnMut(&RunArgs) -> Result<Run>) -> Result<Vec<Run>> {
+    validate_widths(args)?;
+    let widths = if args.verify_rows.is_empty() { vec![None] }
+        else { args.verify_rows.iter().copied().map(Some).collect() };
+    let mut runs = Vec::new();
+    for width in widths {
+        let mut one = args.clone();
+        one.verify_rows = width.into_iter().collect();
+        if args.verify_rows.len() > 1 {
+            if let (Some(root), Some(width)) = (&args.dump_dir, width) {
+                one.dump_dir = Some(root.join(format!("verify-rows-{width}")));
+            }
+        }
+        runs.push(score(&one)?);
+    }
+    if args.tier == "standard" && full_prefill {
+        let mut prefill = args.clone();
+        prefill.score_path = "prefill".into();
+        prefill.verify_rows.clear();
+        runs.push(score(&prefill)?);
+    }
+    for candidate in runs.iter().skip(1) {
+        ensure!(runs[0].engine == candidate.engine && runs[0].settings == candidate.settings
+            && runs[0].dataset == candidate.dataset && runs[0].reference_sha256 == candidate.reference_sha256,
+            "Scoring paths or widths use different references or server settings");
+    }
+    Ok(runs)
+}
+
+fn run_output(args: &RunArgs, runs: &[Run]) -> Value {
+    if args.verify_rows.len() > 1 {
+        return json!({"schema": "cuteafd.fidelity.width-sweep/1", "verify_rows": args.verify_rows,
+            "runs": runs});
     }
     let mut output = if args.tier == "standard" { crate::panels::fidelity::record(&runs[0], None) }
         else { json!(runs[0]) };
@@ -196,7 +237,63 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
             if key.starts_with("prefill") { output[key] = value.clone(); }
         }
     }
-    std::fs::write(&args.out, serde_json::to_vec_pretty(&output)?)?;
+    output
+}
+
+pub(crate) fn discovered_prefill_logits(status: &Value) -> Result<bool> {
+    discovered_prefill_logits_at(status, &cuteafd_loader::default_hf_home())
+}
+
+fn discovered_prefill_logits_at(status: &Value, hf_home: &std::path::Path) -> Result<bool> {
+    use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
+    let advertised = status["snapshot"].as_str().map(PathBuf::from)
+        .context("fidelity family discovery: server did not advertise a snapshot")?;
+    // run.sh mounts the host's HF hub at /hf/hub inside the server container.
+    let snapshot = if advertised.join("config.json").exists() {
+        advertised.clone()
+    } else if let Ok(relative) = advertised.strip_prefix("/hf/hub") {
+        ensure!(relative.components().all(|part| matches!(part, std::path::Component::Normal(_))),
+            "fidelity family discovery: invalid container snapshot path {}", advertised.display());
+        hf_home.join("hub").join(relative)
+    } else {
+        advertised.clone()
+    };
+    let path = snapshot.join("config.json");
+    let config = read_json(&path)
+        .with_context(|| format!("fidelity family discovery: cannot read {} (server advertised {})",
+            path.display(), advertised.display()))?;
+    let checkpoint = Checkpoint { snapshot, config, quantize_config: None,
+        weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+    let detected = family::registry().iter().find(|f| f.detect(&checkpoint))
+        .context("fidelity family discovery: snapshot has no registered family")?;
+    Ok(crate::fidelity_dataset::full_prefill_logits(Some(detected.id()),
+        status["full_prefill_logits"] == true))
+}
+
+pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
+    let key = api_key(args)?;
+    // Validate the whole sweep before discovery or the first probe.
+    validate_widths(args)?;
+    prepare_dump_dir(args)?;
+    ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
+    ensure!(args.tier == "full" || args.score_path == "decode", "Quick and automatic Standard start with decode");
+    let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(900)).build();
+    let base = args.url.trim_end_matches('/');
+    let models = get(&agent, &format!("{base}/v1/models"), &key)?;
+    let served = models["data"][0]["id"].as_str().context("served checkpoint id")?;
+    let status = get(&agent, &format!("{base}/v1/bench/status"), &key)?;
+    let model = status["checkpoint"].as_str().unwrap_or(served);
+    let mut model_record = models["data"][0].clone();
+    model_record["full_prefill_logits"] = json!(discovered_prefill_logits(&status)?);
+    model_record["snapshot"] = status["snapshot"].clone();
+    model_record["settings"] = status["settings"].clone();
+    let runs = run_series(args, model_record["full_prefill_logits"] == true, |one| {
+        run_with(one, model, &model_record, |body| {
+            request(&agent, &format!("{base}/v1/bench/probe"), &key, &body)
+        }, |_, _, _| {})
+    })?;
+    std::fs::write(&args.out, serde_json::to_vec_pretty(&run_output(args, &runs))?)?;
     Ok(runs)
 }
 
@@ -204,6 +301,8 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
 pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
     mut probe_request: impl FnMut(Value) -> Result<Value>,
     mut progress: impl FnMut(usize, usize, &Run)) -> Result<Run> {
+    validate_widths(args)?;
+    ensure!(args.verify_rows.len() <= 1, "run_with scores one width; use run for a width sweep");
     prepare_dump_dir(args)?;
     ensure!(matches!(args.tier.as_str(), "quick" | "standard" | "full"), "unknown tier");
     ensure!(args.tier != "quick" || args.score_path == "decode", "Quick must be decode-shaped");
@@ -234,10 +333,11 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             && d["config"] == s.config && d["revision"] == s.revision));
     if !ancestry_match { validate_served_reference(&reference, model, dataset_identity.is_some())?; }
     if explicit {
-        let root = dataset_identity.as_ref().filter(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY)
-            .and_then(|d| crate::fidelity_match::PUBLICATIONS.iter()
-            .find(|p| d["config"] == p.config && d["revision"] == p.revision))
-            .map(|p| p.root).unwrap_or(&reference.checkpoint).to_owned();
+        let root = dataset_identity.as_ref().and_then(|d| d["root_checkpoint"]["id"].as_str())
+            .or_else(|| dataset_identity.as_ref().filter(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY)
+                .and_then(|d| crate::fidelity_match::PUBLICATIONS.iter()
+                    .find(|p| d["config"] == p.config && d["revision"] == p.revision)).map(|p| p.root))
+            .unwrap_or(&reference.checkpoint).to_owned();
         selection = Some(crate::fidelity_match::Resolution { reference_match: "explicit".into(),
             reference_root: root, text_checkpoint: Some(reference.checkpoint.clone()),
             resolved_chain: selection.map(|s| s.resolved_chain).unwrap_or_default(),
@@ -248,6 +348,8 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         selection.text_checkpoint = Some(dataset_identity.as_ref().and_then(|d| d["text_checkpoint"].as_str())
             .unwrap_or(&reference.checkpoint).to_owned());
     }
+    let precision = crate::fidelity_precision::resolve(model, snapshot, &model_record["settings"],
+        selection.as_ref().map(|s| s.reference_root.as_str()).unwrap_or(&reference.checkpoint), selection.as_ref())?;
     let standard = args.tier == "standard";
     let admitted = model_record["full_prefill_logits"] == true;
     let windows = if standard {
@@ -257,12 +359,15 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         crate::fidelity_dataset::quick_windows(&reference)?
     } else { reference.selected_windows(args.tier != "quick")? };
     if standard {
+        let (decode_ids, prefill_ids) = (crate::fidelity_dataset::standard_ids(&reference, "decode")?,
+                                         crate::fidelity_dataset::standard_ids(&reference, "prefill")?);
+        let split_mode = format!("{} decode / {} prefill", decode_ids.len(), prefill_ids.len());
         dataset_identity.as_mut().unwrap()["standard_subset"] = json!({
             "version": crate::fidelity_dataset::STANDARD_TIER,
             "sha256": crate::fidelity_dataset::STANDARD_SPLIT_SHA256,
-            "mode": if admitted { "32 decode / 32 prefill" } else { crate::fidelity_dataset::STANDARD_FALLBACK },
-            "decode": crate::fidelity_dataset::STANDARD_DECODE,
-            "prefill": crate::fidelity_dataset::STANDARD_PREFILL,
+            "mode": if admitted { split_mode.as_str() } else { crate::fidelity_dataset::STANDARD_FALLBACK },
+            "decode": decode_ids,
+            "prefill": prefill_ids,
         });
     }
     let standard_balance = standard.then(|| crate::fidelity_dataset::standard_balance(&reference));
@@ -304,9 +409,9 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
                 "reference-only-top1024-plus-tail"
             } else if dataset_identity.is_some() { "qualified-top1024-plus-tail" }
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
-            dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
+            dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows.first().copied(), engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
-            floor_kl: reference.expect.kl_max, tripwire_expect: reference.expect.tripwires.clone() }
+            floor_kl: reference.expect.kl_max, precision: Some(precision.clone()), tripwire_expect: reference.expect.tripwires.clone() }
     };
     for (i, window) in windows.iter().enumerate() {
         let end = window.positions.last().context("empty window")?.pos + 1;
@@ -318,7 +423,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             "score_path": args.score_path});
         if !media_payloads[i].is_empty() { spec["media"] = json!(media_payloads[i]); }
         if args.tier != "quick" || dataset_identity.is_some() { spec["dump_rows"] = json!(dump); }
-        if let Some(width) = args.verify_rows { spec["verify_rows"] = json!(width); }
+        if let Some(width) = args.verify_rows.first() { spec["verify_rows"] = json!(width); }
         let response = probe_request(json!({"body": {"messages": [{"role": "user", "content": "fidelity probe"}], "max_tokens": 1,
                 "temperature": 0}, "spec": spec}))?;
         crate::reference::verify_media_echo(window, &response["probe"])?;
@@ -338,6 +443,9 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             "decode" => "decode-shaped",
             _ => bail!("unsupported reported scoring path: {actual_path}"),
         };
+        ensure!(crate::fidelity_precision::selected_manifest(&response["server"]["settings"])
+            == crate::fidelity_precision::selected_manifest(&model_record["settings"]),
+            "active EXLR8 manifest changed since discovery");
         if i == 0 {
             engine = this_engine; settings = response["server"].clone(); shape = this_shape.into();
         } else {
@@ -369,8 +477,9 @@ fn run_pass(run: &Run) -> bool {
     crate::fidelity::verdict(run).pass
 }
 
-fn pairing(cross_checkpoint: bool, code_ab: bool, hub: &std::path::Path) -> Pairing<'_> {
+fn pairing(cross_checkpoint: bool, code_ab: bool, layout_ab: bool, hub: &std::path::Path) -> Pairing<'_> {
     if cross_checkpoint { Pairing::CrossCheckpoint { hub } }
+    else if layout_ab { Pairing::LayoutChange }
     else if code_ab { Pairing::CodeChange } else { Pairing::SameCheckpoint }
 }
 
@@ -393,13 +502,13 @@ pub fn execute(args: Args) -> Result<bool> {
             }
             Ok(runs.iter().all(run_pass))
         }
-        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab } => {
+        Action::CompareFull { a_decode, b_decode, a_prefill, b_prefill, bootstrap, seed, out, cross_checkpoint, code_ab, layout_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
-                Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+                Ok(cuteafd_loader::read_json_file(&path)?)
             };
             let hub = crate::fidelity_match::hub();
             let comparison = compare_full_paired(&load(a_decode)?, &load(b_decode)?,
-                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
+                &load(a_prefill)?, &load(b_prefill)?, bootstrap, seed, pairing(cross_checkpoint, code_ab, layout_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");
@@ -407,9 +516,9 @@ pub fn execute(args: Args) -> Result<bool> {
             eprintln!("Both full-tier statistical paths checked; separate agentic replay remains required.");
             Ok(comparison.pass)
         }
-        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab } => {
+        Action::Compare { a, b, score_path, top1_margin, kl_margin, bootstrap, seed, out, cross_checkpoint, code_ab, layout_ab } => {
             let load = |path: PathBuf| -> Result<Run> {
-                let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
+                let value: Value = cuteafd_loader::read_json_file(&path)?;
                 let value = if value["schema"] == "cuteafd.fidelity.run/2" { value } else { value[&score_path].clone() };
                 serde_json::from_value(value).context("missing selected scoring path")
             };
@@ -418,7 +527,7 @@ pub fn execute(args: Args) -> Result<bool> {
             let margin = if a.tier == "quick" { 0.01 } else { 0.005 };
             let hub = crate::fidelity_match::hub();
             let comparison = compare_paired(&a, &b, top1_margin.unwrap_or(margin), kl_margin.unwrap_or(margin),
-                bootstrap, seed, pairing(cross_checkpoint, code_ab, &hub))?;
+                bootstrap, seed, pairing(cross_checkpoint, code_ab, layout_ab, &hub))?;
             let text = serde_json::to_string_pretty(&comparison)?;
             if let Some(path) = out { std::fs::write(path, &text)?; }
             println!("{text}");
@@ -448,7 +557,182 @@ mod tests {
     }
 
     #[test]
-    fn discovery_sends_api_key_on_models_and_bench_status() {
+    fn discovery_sends_inline_api_key() { discovery_authentication(false); }
+
+    #[test]
+    fn discovery_sends_file_api_key() { discovery_authentication(true); }
+
+    #[test]
+    fn family_discovery_fails_closed_even_when_status_admits_prefill() {
+        assert!(discovered_prefill_logits(&json!({"full_prefill_logits": true}))
+            .unwrap_err().to_string().contains("did not advertise a snapshot"));
+        let snapshot = tempfile::tempdir().unwrap();
+        let status = json!({"snapshot": snapshot.path(), "full_prefill_logits": true});
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.path().join("config.json"), "not json").unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap_err().to_string().contains("no registered family"));
+        std::fs::write(snapshot.path().join("config.json"), r#"{"architectures":["DeepseekV4ForCausalLM"]}"#).unwrap();
+        assert!(discovered_prefill_logits(&status).unwrap());
+        let mut denied = status;
+        denied["full_prefill_logits"] = json!(false);
+        assert!(!discovered_prefill_logits(&denied).unwrap());
+    }
+
+    #[test]
+    fn family_discovery_maps_container_hub_and_still_fails_closed() {
+        let home = tempfile::tempdir().unwrap();
+        let relative = "models--unit--model/snapshots/pinned";
+        let snapshot = home.path().join("hub").join(relative);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let status = json!({"snapshot": format!("/hf/hub/{relative}"), "full_prefill_logits": false});
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.join("config.json"), "not json").unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("cannot read"));
+        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["Unregistered"]}"#).unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap_err().to_string().contains("no registered family"));
+        std::fs::write(snapshot.join("config.json"), r#"{"architectures":["DeepseekV41ForCausalLM"]}"#).unwrap();
+        assert!(discovered_prefill_logits_at(&status, home.path()).unwrap());
+        let local = json!({"snapshot": snapshot, "full_prefill_logits": false});
+        assert!(discovered_prefill_logits_at(&local, &home.path().join("unused")).unwrap());
+        let traversal = json!({"snapshot": "/hf/hub/../escape", "full_prefill_logits": true});
+        assert!(discovered_prefill_logits_at(&traversal, home.path()).unwrap_err().to_string().contains("invalid container snapshot path"));
+        let unrelated = json!({"snapshot": "/other/hub/models--unit--model/snapshots/pinned", "full_prefill_logits": true});
+        assert!(discovered_prefill_logits_at(&unrelated, home.path()).unwrap_err().to_string().contains("cannot read"));
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Muse quant snapshot and its official base model card"]
+    fn family_discovery_real_muse_snapshot_and_reference() {
+        use cuteafd_loader::plan::{checkpoint::{read_json, Checkpoint}, family};
+        let home = cuteafd_loader::default_hf_home();
+        let model = "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6";
+        let relative = "models--wrldsuksgo2mars--Muse-Spark-Open-EXL3-K4-Core-K6/snapshots/89998fb177acd9a862ac8bd4fb79bfd50e940c97";
+        let snapshot = home.join("hub").join(relative);
+        let checkpoint = Checkpoint { snapshot: snapshot.clone(), config: read_json(&snapshot.join("config.json")).unwrap(),
+            quantize_config: None, weight_map: Default::default(), tensors: Vec::new(), missing_shards: Vec::new(), shard_bytes: 0 };
+        let detected = family::registry().iter().find(|f| f.detect(&checkpoint)).unwrap();
+        assert_eq!(detected.id(), "muse_spark");
+        for advertised in [snapshot.clone(), PathBuf::from("/hf/hub").join(relative)] {
+            let mut status = json!({"snapshot": advertised, "full_prefill_logits": true});
+            assert!(discovered_prefill_logits_at(&status, &home).unwrap());
+            status["full_prefill_logits"] = json!(false);
+            assert!(!discovered_prefill_logits_at(&status, &home).unwrap());
+            let reference = crate::fidelity_match::resolve_in(model, Some(&advertised), &home.join("hub")).unwrap();
+            assert_eq!(reference.reference_root, "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!(reference.revision, "d18a3b292cc0a279998123f2ddd16999869bb658");
+            assert_eq!(reference.config, "muse-spark-v1_20261031_own-text-bf16");
+        }
+    }
+
+    fn fixture_run(args: &RunArgs) -> Run {
+        let report = crate::sample::full_report();
+        let panel = report.panel("fidelity").unwrap().latest().unwrap();
+        let mut run: Run = serde_json::from_value(panel["decode"].clone()).unwrap();
+        run.verify_rows = args.verify_rows.first().copied();
+        run.path_shape = format!("{}-shaped", args.score_path);
+        run.tier = args.tier.clone();
+        run
+    }
+
+    #[test]
+    fn verify_widths_parse_and_validate_before_network() {
+        assert!(parse(&[]).verify_rows.is_empty());
+        assert_eq!(parse(&["--verify-rows", "16"]).verify_rows, [16]);
+        assert_eq!(parse(&["--verify-rows", "1,2,4,8,16"]).verify_rows, [1,2,4,8,16]);
+        for (widths, message) in [("0,1", "positive"), ("1,2,1", "distinct")] {
+            let args = parse(&["--verify-rows", widths, "--url", "http://127.0.0.1:1"]);
+            assert!(run(&args).unwrap_err().to_string().contains(message));
+        }
+        let args = parse(&["--tier", "full", "--score-path", "prefill", "--verify-rows", "1"]);
+        assert!(run(&args).unwrap_err().to_string().contains("requires decode"));
+        for widths in ["", "1,,2", "no", "-1"] {
+            assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "a", "--out", "r", "--verify-rows", widths]).is_err());
+        }
+    }
+
+    #[test]
+    fn sweep_runs_ordered_widths_and_prefill_once_with_disjoint_dumps() {
+        let args = parse(&["--tier", "standard", "--verify-rows", "4,1,16", "--dump-dir", "dumps"]);
+        let mut seen = Vec::new();
+        let runs = run_series(&args, true, |one| {
+            seen.push((one.verify_rows.clone(), one.score_path.clone(), one.dump_dir.clone()));
+            Ok(fixture_run(one))
+        }).unwrap();
+        assert_eq!(seen, vec![
+            (vec![4], "decode".into(), Some(PathBuf::from("dumps/verify-rows-4"))),
+            (vec![1], "decode".into(), Some(PathBuf::from("dumps/verify-rows-1"))),
+            (vec![16], "decode".into(), Some(PathBuf::from("dumps/verify-rows-16"))),
+            (vec![], "prefill".into(), Some(PathBuf::from("dumps"))),
+        ]);
+        let output = run_output(&args, &runs);
+        assert_eq!(output["schema"], "cuteafd.fidelity.width-sweep/1");
+        assert_eq!(output["verify_rows"], json!([4,1,16]));
+        assert_eq!(output["runs"].as_array().unwrap().len(), 4);
+        assert!(output["runs"][3]["verify_rows"].is_null());
+    }
+
+    #[test]
+    fn sweep_stops_on_error_and_rejects_changed_settings() {
+        let args = parse(&["--verify-rows", "1,2,4"]);
+        let mut seen = Vec::new();
+        assert!(run_series(&args, false, |one| {
+            seen.push(one.verify_rows[0]);
+            if one.verify_rows == [2] { bail!("probe failed"); }
+            Ok(fixture_run(one))
+        }).unwrap_err().to_string().contains("probe failed"));
+        assert_eq!(seen, [1,2]);
+        assert!(run_series(&args, false, |one| {
+            let mut run = fixture_run(one);
+            run.settings = json!({"changed": one.verify_rows});
+            Ok(run)
+        }).unwrap_err().to_string().contains("different references or server settings"));
+    }
+
+    #[test]
+    fn legacy_single_width_keeps_output_and_dump_shape() {
+        for widths in [vec![], vec!["--verify-rows", "16"]] {
+            let mut args = parse(&widths);
+            args.dump_dir = Some(PathBuf::from("dumps"));
+            let runs = run_series(&args, false, |one| {
+                assert_eq!(one.dump_dir, args.dump_dir);
+                Ok(fixture_run(one))
+            }).unwrap();
+            assert_eq!(runs.len(), 1);
+            assert_eq!(run_output(&args, &runs), json!(runs[0]));
+            args.tier = "standard".into();
+            let runs = run_series(&args, true, |one| Ok(fixture_run(one))).unwrap();
+            let output = run_output(&args, &runs);
+            assert!(output["decode"].is_object());
+            assert!(output["prefill"].is_object());
+            assert!(output["schema"].is_null());
+        }
+    }
+
+    #[test]
+    fn api_key_file_validates_without_disclosing_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("key");
+        let args = parse(&["--api-key-file", path.to_str().unwrap(), "--url", "http://127.0.0.1:1"]);
+        assert!(run(&args).unwrap_err().to_string().contains("cannot read --api-key-file"));
+        std::fs::write(&path, "  unit-test-key\n").unwrap();
+        assert_eq!(api_key(&args).unwrap().as_deref(), Some("unit-test-key"));
+        for invalid in ["", " \n", "secret key", "secret\0key"] {
+            std::fs::write(&path, invalid).unwrap();
+            let error = run(&args).unwrap_err().to_string();
+            assert!(error.contains("API key must be non-empty"));
+            assert!(!error.contains("secret"));
+        }
+        let mut ambiguous = args.clone();
+        ambiguous.api_key = Some("inline-secret".into());
+        assert!(api_key(&ambiguous).unwrap_err().to_string().contains("conflicts"));
+        assert!(Cli::try_parse_from(["fidelity", "run", "--arm", "a", "--out", "r",
+            "--api-key", "inline-secret", "--api-key-file", "key"]).is_err());
+        assert_eq!(api_key(&parse(&[])).unwrap(), None);
+    }
+
+    fn discovery_authentication(file: bool) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -483,10 +767,14 @@ mod tests {
                 write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
             }
         });
-        let args = parse(&["--url", &url, "--api-key", "unit-test-key"]);
+        let temp = tempfile::tempdir().unwrap();
+        let key_file = temp.path().join("key");
+        std::fs::write(&key_file, "unit-test-key\n").unwrap();
+        let args = if file { parse(&["--url", &url, "--api-key-file", key_file.to_str().unwrap()]) }
+            else { parse(&["--url", &url, "--api-key", "unit-test-key"]) };
         let error = run(&args).unwrap_err();
         server.join().unwrap();
-        assert!(error.to_string().contains("no verified published fidelity config for test/model"), "{error:#}");
+        assert!(error.to_string().contains("fidelity family discovery: server did not advertise a snapshot"), "{error:#}");
     }
 
     #[test]
@@ -558,7 +846,7 @@ mod tests {
             checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
             tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
             verify_rows: None, dataset: None, reference_selection: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
-            score, floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None };
+            score, floor_top1: 0.9, floor_kl: 0.06, precision: None, tripwire_expect: None };
         assert!(run_pass(&run));
         run.score.missing = 1; assert!(!run_pass(&run));
         run.score.missing = 0; run.score.non_finite = 1; assert!(!run_pass(&run));
@@ -647,8 +935,8 @@ mod tests {
         for local_flag in ["--reference", "--rows"] {
             assert_eq!(dataset_source(&parse(&["--tier", "full", local_flag, "local"]), model).unwrap(), None);
         }
-        for quant in ["zai-org/GLM-5.3-Flash-BF16", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
-            "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-v1"] {
+        for quant in ["zai-org/GLM-5.3-Flash-BF16", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+            "wrldsuksgo2mars--GLM-5.3-Flash-EXL3-K3.25-Core-FP8"] {
             assert_eq!(dataset_source(&full, quant).unwrap(), dataset_source(&full, model).unwrap());
         }
         for other in ["zai-org/GLM-5.3-Flashlight", "RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"] {
@@ -724,7 +1012,7 @@ mod tests {
         let glm: Reference = serde_json::from_value(json!({"name":"test", "models":["zai-org/GLM-5.3-Flash"],
             "checkpoint":"zai-org/GLM-5.3-Flash", "vocab":154880,
             "expect":{"top1_min":0.93,"kl_max":0.05}})).unwrap();
-        assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1", true).is_ok());
+        assert!(validate_served_reference(&glm, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8", true).is_ok());
         assert!(validate_served_reference(&glm, quant, true).is_err());
     }
 

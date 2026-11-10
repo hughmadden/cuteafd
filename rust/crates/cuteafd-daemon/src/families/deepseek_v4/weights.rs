@@ -144,7 +144,7 @@ impl<'a> WeightLoader<'a, '_> {
             return body(self.stream);
         }
         let peer = self.peers.get(rank - 1).with_context(|| format!("no rank {rank}"))?;
-        crate::shared::peer_split::on_device(self.library, peer.device, self.device, || body(peer.stream))
+        crate::shared::peer_split::on_device(self.library, peer.device, || body(peer.stream))
     }
 
     /// [`Self::scale`] on `stream` (the current device's).

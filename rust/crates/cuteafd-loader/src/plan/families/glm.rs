@@ -9,7 +9,7 @@ use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
 use crate::plan::checkpoint::{opt_usize_field, usize_field, Checkpoint};
 use crate::plan::experts::spark_worlds;
-use crate::plan::family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
+use crate::plan::family::{ConfigError, ExpertContract, Exlr8Execution, Family, FamilyModel, Hint, RuntimeStatus};
 use crate::plan::format::{QuantOperand, ScaleEncoding};
 use crate::plan::names::indexed;
 use crate::plan::spec::*;
@@ -18,14 +18,27 @@ pub struct Glm {
     id: &'static str,
     architecture: &'static str,
     runtime: RuntimeStatus,
+    exlr8: Exlr8Execution,
+    media_cache_headroom: bool,
+    /// Rows of one decode step's Spark request (the engine's decode programs).
+    decode_rows: u32,
+    decode_lanes: crate::plan::decode_lanes::LaneSupport,
 }
 
 /// GLM 5.x: serve-glm / glm-golden on the glm coordinator programs.
 pub static GLM5: Glm =
-    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving };
+    Glm { id: "glm5", architecture: "GlmMoeDsaForCausalLM", runtime: RuntimeStatus::Serving, media_cache_headroom: false,
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[2] },
+        decode_rows: crate::placement::families::glm5::DECODE_ROWS as u32,
+        decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
+            reason: "a second lane needs its own graph set, about 3 GiB per GPU today (213 shapes), more than one onboarded layer (2.26 GiB per GPU), and the big dense core leaves little round trip to hide (predicted loss, #705, #744)" } };
 /// GLM 5.3 Flash: serve-glmf / glmf-golden on the glmf coordinator programs.
 pub static GLM5_FLASH: Glm =
-    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving };
+    Glm { id: "glm5_flash", architecture: "Glm5NextForConditionalGeneration", runtime: RuntimeStatus::Serving, media_cache_headroom: true,
+        exlr8: Exlr8Execution { dense_worlds: &[1, 2], onboard_worlds: &[1, 2] },
+        decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
+        decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
+            reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };
 
 fn str_list(config: &Value, key: &str) -> Vec<String> {
     config
@@ -40,9 +53,15 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 }
 
 impl Family for Glm {
+    fn exlr8_execution(&self) -> Exlr8Execution { self.exlr8 }
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport { self.decode_lanes }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
+    }
     fn id(&self) -> &'static str {
         self.id
     }
+    fn media_cache_headroom(&self) -> bool { self.media_cache_headroom }
     fn runtime(&self) -> RuntimeStatus {
         self.runtime
     }
@@ -66,7 +85,7 @@ impl Family for Glm {
 
     fn classify(&self, spec: &ModelSpec, name: &str) -> Option<TensorRole> {
         use Component::*;
-        if name == "lm_head.weight" {
+        if name.starts_with("lm_head.") {
             return Some(TensorRole::new(LmHead));
         }
         if name.starts_with("model.visual.") || name.starts_with("visual.") || name.starts_with("model.vision") {
@@ -316,7 +335,9 @@ impl Glm {
         }
         let vision = if self.id == "glm5_flash" { glm_flash_vision_resident_weights(checkpoint) }
             else { Err("this GLM family's vision tower is not qualified".into()) };
-        Ok(GlmModel { id: self.id, cache_cfg, vision, spec: ModelSpec {
+        let core_shapes = match &cache_cfg { GlmCacheConfig::Dsa(cfg) => crate::families::glm5::core::expected(cfg),
+            GlmCacheConfig::Flash(cfg) => crate::families::glm5_flash::core::expected(cfg) };
+        Ok(GlmModel { id: self.id, cache_cfg, core_shapes, vision, spec: ModelSpec {
             family: self.id,
             architecture: self.architecture.into(),
             hidden: usize_field(text, "hidden_size")?,
@@ -397,6 +418,7 @@ struct GlmModel {
     id: &'static str,
     spec: ModelSpec,
     cache_cfg: GlmCacheConfig,
+    core_shapes: std::collections::BTreeMap<String, Vec<usize>>,
     vision: Result<u64, String>,
 }
 
@@ -516,7 +538,7 @@ impl FamilyModel for GlmModel {
     }
 
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         Some(Ok(match self.id {
             "glm5" => crate::plan::layout::glm5::layout(report, self, input, options),
@@ -552,6 +574,16 @@ impl FamilyModel for GlmModel {
             // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
+            _ if matches!(self.id, "glm5" | "glm5_flash") && operand.exl3_bits() == Some(6) => {
+                let shape = self.core_shapes.get(&format!("{stem}.weight"))
+                    .ok_or_else(|| format!("{stem}: outside GLM's native K6 core keep-list"))?;
+                let padded = self.id == "glm5" && stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                    && operand.logical == [shape[0].next_multiple_of(128), shape[1]];
+                require(operand.logical == *shape || padded, || format!(
+                    "{stem}: native K6 shape {:?}, expected {shape:?} (kv_a may store N128 padding)", operand.logical))?;
+                operand.logical = shape.clone();
+                Ok(())
+            }
             _ if self.id == "glm5" => self.glm5(stem, operand),
             _ => self.glm5_flash(role, stem, operand),
         }

@@ -2,6 +2,7 @@
 //! each launch only substitutes live inputs/row bounds and enqueues GPU work.
 use super::Exl3Weights;
 use crate::shared::memory::DeviceAllocation;
+pub(crate) use cuteafd_loader::serving_capacity::Exl3Epilogue;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Exl3Kernel, V41Exl3Routes};
 use serde::Deserialize;
@@ -53,8 +54,8 @@ impl Exl3Schedule {
         Ok(())
     }
 
-    /// A scheduled capacity's export must record its decode schedule and a
-    /// default one none, so a mislabelled directory fails at start-up.
+    /// Packaged exports must match their variant's exact schedule identity.
+    /// Standalone explicit directories retain the scheduled/default label check.
     pub(crate) fn check_export(self, root: &Path, capacity: u32) -> Result<()> {
         #[derive(Deserialize)]
         struct Record {
@@ -64,9 +65,38 @@ impl Exl3Schedule {
         let directory = self.directory(root, capacity);
         let meta: Record = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))
             .with_context(|| format!("EXL3 {} schedule export {}", self.name(), directory.display()))?)?;
-        ensure!(meta.decode_schedule.is_some() == self.scheduled(capacity),
-            "EXL3 export {} does not carry the {} decode schedule", directory.display(),
-            if self.scheduled(capacity) { self.name() } else { "default" });
+        let package_root = root.parent().context("EXL3 layout directory has no package parent")?;
+        let package_path = package_root.join("manifest.json");
+        if package_path.try_exists()? {
+            #[derive(Deserialize)]
+            struct Variant {
+                directory: String,
+                schedule: Option<String>,
+                decode_schedule: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Package {
+                schema: String,
+                variants: Vec<Variant>,
+            }
+            let package: Package = serde_json::from_slice(&std::fs::read(&package_path)
+                .with_context(|| format!("EXL3 package {}", package_path.display()))?)?;
+            ensure!(package.schema == "cuteafd.exl3-package.v1", "unknown EXL3 package schema");
+            let relative = directory.strip_prefix(package_root)?.to_str()
+                .context("EXL3 variant directory is not UTF-8")?;
+            let mut variants = package.variants.iter().filter(|v| v.directory == relative);
+            let variant = variants.next().with_context(|| format!("EXL3 package lacks variant {relative}"))?;
+            ensure!(variants.next().is_none(), "duplicate EXL3 package variant {relative}");
+            let expected = self.scheduled(capacity).then_some(self.name());
+            ensure!(variant.schedule.as_deref() == expected
+                && variant.decode_schedule == meta.decode_schedule
+                && (expected.is_none() || meta.decode_schedule.is_some()),
+                "EXL3 export {} differs from its packaged decode schedule", directory.display());
+        } else {
+            ensure!(meta.decode_schedule.is_some() == self.scheduled(capacity),
+                "EXL3 export {} does not carry the {} decode schedule", directory.display(),
+                if self.scheduled(capacity) { self.name() } else { "default" });
+        }
         Ok(())
     }
 }
@@ -123,13 +153,15 @@ impl Exl3ReductionPlan {
         };
         let variants = manifests.iter().enumerate().map(|(index, meta)| {
             let capacity = meta["capacity"].as_u64().context("EXL3 export lacks capacity")? as usize;
-            let signature = if capacity <= 80 {
+            let signature = if meta["decode_capacity"].as_bool().context("EXL3 export lacks decode capacity contract")? {
                 Some(signature(meta)
                     .with_context(|| format!("EXL3 reduction export {}", directories[index].display()))?)
             } else { None };
             Ok((capacity, signature))
         }).collect::<Result<Vec<_>>>()?;
-        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants)
+        let decode_rows = manifests.iter().filter(|meta| meta["decode_capacity"] == true)
+            .filter_map(|meta| meta["capacity"].as_u64()).max().context("EXL3 package lacks decode exports")? as usize;
+        let plan = crate::shared::experts::ExpertReductionPlan::new(&variants, decode_rows)
             .with_context(|| format!("EXL3 package {} canonical m1 K tile, CTA threads and route reduction", package.display()))?;
         Ok(Self { plan })
     }
@@ -177,6 +209,9 @@ struct Manifest {
     bits: Vec<usize>,
     /// `null` for an unclamped SwiGLU (GLM).
     swiglu_limit: Option<f32>,
+    /// Absent for SiLU; otherwise the family's expert arithmetic (`situ`, `silu_post_clamp`).
+    #[serde(default)]
+    activation: Option<String>,
     direct: bool,
     #[serde(default = "default_route_block")]
     route_block: usize,
@@ -195,6 +230,15 @@ struct Manifest {
 }
 fn default_route_block() -> usize { 8 }
 
+/// The exporter's activation name for a family's expert arithmetic.
+fn exl3_activation(activation: cuteafd_core::FfnActivation) -> &'static str {
+    match activation {
+        cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
+        cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
+        cuteafd_core::FfnActivation::Situ { .. } => "situ",
+    }
+}
+
 impl Manifest {
     fn group_rows(&self) -> Result<usize> {
         ensure!(matches!(self.route_block, 8 | 16 | 32 | 64), "unknown EXL3 route_block {}", self.route_block);
@@ -209,15 +253,42 @@ impl Manifest {
         }
     }
     fn validate_native_contract(&self) -> Result<()> {
-        ensure!(self.descriptor_rows.is_none_or(|rows| rows == 3)
-            && self.native_info_version.is_none_or(|version| version == 2),
-            "EXL3 descriptor/version mismatch");
+        let legacy = self.descriptor_rows.is_none_or(|rows| rows == 3)
+            && self.native_info_version.is_none_or(|version| version == 2);
+        let compact = self.descriptor_rows == Some(7) && self.native_info_version == Some(3)
+            && self.bits.len() == 2 && !self.wire_input()?;
+        ensure!(legacy || compact, "EXL3 descriptor/version mismatch");
         Ok(())
     }
-    fn workspace_bytes(&self, format: Exl3InputFormat) -> Result<usize> {
+    fn validate_residency(&self, layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        self.validate_native_contract()?;
+        let rows = self.descriptor_rows.unwrap_or(3);
+        ensure!(layout.unit_map.is_some() == (rows == 7),
+            "EXL3 compact storage/native contract mismatch");
+        let descriptor = layout.buffers.iter().find(|buffer| buffer.name == "descriptor_map")
+            .context("EXL3 residency lacks descriptor map")?;
+        let bytes = rows.checked_mul(self.experts).and_then(|n| n.checked_mul(self.bits.len()))
+            .and_then(|n| n.checked_mul(4)).context("EXL3 descriptor extent overflow")?;
+        ensure!(descriptor.bytes == bytes && descriptor.initial_words.len() == bytes / 4,
+            "EXL3 resident descriptor extent mismatch");
+        ensure!(self.hidden == geometry.hidden as usize
+                && self.intermediate == layout.intermediate
+                && self.experts == layout.experts && self.bits == layout.tiers
+                && self.swiglu_limit == geometry.swiglu_limit(),
+            "EXL3 export/residency geometry mismatch");
+        ensure!(self.activation.as_deref().unwrap_or("silu") == exl3_activation(geometry.activation()),
+            "EXL3 export activation {:?} differs from the checkpoint's {:?}", self.activation, geometry.activation());
+        let topk = if matches!(layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
+            && geometry.family() == Some("v41") { 3 } else { geometry.topk as usize };
+        ensure!(self.top_k == topk, "EXL3 expert top-k mismatch");
+        Ok(())
+    }
+
+    fn workspace_bytes(&self, format: Exl3InputFormat, epilogue: Exl3Epilogue) -> Result<usize> {
         let mut bytes = self.trellis_lut.bytes.max(16);
         for (name, buffer) in &self.buffers {
-            if name == &buffer.allocation {
+            if name == &buffer.allocation && epilogue.allocates(name) {
                 bytes = bytes
                     .checked_add(buffer.bytes.max(16))
                     .context("EXL3 workspace budget overflow")?;
@@ -246,13 +317,13 @@ impl<'a> Exl3Workspace<'a> {
     pub(crate) fn bytes(&self) -> usize {
         self.allocations.values().map(|allocation| allocation.buffer.bytes).sum()
     }
-    fn layout(directories: &[PathBuf]) -> Result<BTreeMap<String, (usize, String)>> {
+    fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
         ensure!(!directories.is_empty(), "empty EXL3 capacity workspace");
         let mut layout: BTreeMap<String, (usize, String)> = BTreeMap::new();
         for directory in directories {
             let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
             for (name, spec) in meta.buffers {
-                if name != spec.allocation || spec.zero_on_create { continue; }
+                if name != spec.allocation || spec.zero_on_create || !epilogue.allocates(&name) { continue; }
                 let entry = layout.entry(name).or_insert((0, spec.dtype.clone()));
                 ensure!(entry.1 == spec.dtype, "EXL3 shared scratch dtype mismatch");
                 entry.0 = entry.0.max(spec.bytes.max(16));
@@ -261,23 +332,48 @@ impl<'a> Exl3Workspace<'a> {
         Ok(layout)
     }
     /// Total allocation payload for all specializations sharing one lane arena.
-    pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat) -> Result<usize> {
+    pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat,
+        epilogue: Exl3Epilogue) -> Result<usize> {
         let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
         }).collect::<Result<Vec<_>>>()?;
         Ok(usize::try_from(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests,
-            format == Exl3InputFormat::Fp8K32)?)?)
+            format == Exl3InputFormat::Fp8K32, epilogue)?)?)
     }
 
-    pub(crate) fn new(library: &'a NativeLibrary, directories: &[PathBuf]) -> Result<Rc<Self>> {
+    pub(crate) fn new(library: &'a NativeLibrary, directories: &[PathBuf],
+        epilogue: Exl3Epilogue) -> Result<Rc<Self>> {
         let mut allocations = BTreeMap::new();
         let mut dtypes = BTreeMap::new();
-        for (name, (bytes, dtype)) in Self::layout(directories)? {
+        for (name, (bytes, dtype)) in Self::layout(directories, epilogue)? {
             allocations.insert(name.clone(), DeviceAllocation::new(library, bytes)?);
             dtypes.insert(name, dtype);
         }
         Ok(Rc::new(Self { allocations, dtypes }))
     }
+}
+
+/// Bind the per-layer pointers an epilogue's objects read: the sum object is
+/// the only reader of the weighted-sum `output` owner, so a partial-reply
+/// family neither allocates nor binds it.
+fn layer_pointers(
+    epilogue: Exl3Epilogue,
+    pointers: &BTreeMap<String, CuteafdDeviceBuffer>,
+) -> Result<BTreeMap<String, CuteafdDeviceBuffer>> {
+    let mut bound = pointers.clone();
+    bound.insert(
+        "fc2_ptr".into(),
+        *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
+    );
+    if epilogue == Exl3Epilogue::Sum {
+        bound.insert(
+            "output_ptr".into(),
+            *pointers
+                .get("output")
+                .context("missing EXL3 output workspace")?,
+        );
+    }
+    Ok(bound)
 }
 
 struct Table {
@@ -345,9 +441,26 @@ impl Table {
 
 struct LayerBinding {
     core: Table,
-    sum: Table,
+    /// The weighted top-k sum; absent for partial-reply families.
+    sum: Option<Table>,
     expert_map: CuteafdDeviceBuffer,
-    output_slot: usize,
+    output_slot: Option<usize>,
+    /// The core's FC2 workspace (rotated F16 down outputs) and the layer's
+    /// down-projection svh: the partial-reply epilogue's sources.
+    fc2: CuteafdDeviceBuffer,
+    svh: CuteafdDeviceBuffer,
+    local_experts: usize,
+}
+
+/// What the per-expert partial-reply epilogue reads after the core ran:
+/// the rotated FC2 rows, the layer's svh, and the global-to-local expert map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartialSources {
+    pub fc2: CuteafdDeviceBuffer,
+    pub svh: CuteafdDeviceBuffer,
+    pub expert_map: CuteafdDeviceBuffer,
+    pub local_experts: usize,
+    pub experts: usize,
 }
 
 /// Native contexts retained from inventory through the last execution/graph.
@@ -391,7 +504,8 @@ impl<'a> Exl3Modules<'a> {
             let kernel = unsafe { V41Exl3Kernel::load(directory.join("libcuteafd_exl3.so"))? };
             let info = kernel.info();
             ensure!(
-                info.hidden == meta.hidden
+                info.version == meta.native_info_version.unwrap_or(2)
+                    && info.hidden == meta.hidden
                     && info.intermediate == meta.intermediate
                     && info.experts == meta.experts
                     && info.capacity == meta.capacity
@@ -445,7 +559,8 @@ pub(crate) struct Exl3Execution<'a> {
     layers: Vec<LayerBinding>,
     route_pointers: [*mut c_void; 7],
     route_bytes: [u64; 7],
-    output: CuteafdDeviceBuffer,
+    /// The weighted sum's token output; absent for partial-reply families.
+    output: Option<CuteafdDeviceBuffer>,
     output_element_bytes: usize,
     device: i32,
     hidden: usize,
@@ -468,12 +583,21 @@ impl<'a> Exl3Execution<'a> {
     }
 
 
+    /// Compare the installed code with header-derived storage before any weight allocation.
+    pub(crate) fn validate_planned_residency(directory: &Path,
+        layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        meta.validate_residency(layout, geometry)
+    }
+
     /// Device allocation payload per lane, including aliases and optional wire
     /// reconstruction. Weight storage and CUDA module/driver reserve are separate.
-    pub(crate) fn plan(directory: &Path, format: Exl3InputFormat) -> Result<usize> {
+    pub(crate) fn plan(directory: &Path, format: Exl3InputFormat,
+        epilogue: Exl3Epilogue) -> Result<usize> {
         let meta: Manifest =
             serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
-        meta.workspace_bytes(format)
+        meta.workspace_bytes(format, epilogue)
     }
 
     /// Trusted build artifacts only. Each owner is exclusive to one decode lane;
@@ -482,8 +606,9 @@ impl<'a> Exl3Execution<'a> {
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
-        Self::with_input_format(library, weights, directory, Exl3InputFormat::Bf16)
+        Self::with_input_format(library, weights, directory, Exl3InputFormat::Bf16, epilogue)
     }
 
     pub(crate) unsafe fn with_input_format(
@@ -491,8 +616,9 @@ impl<'a> Exl3Execution<'a> {
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
         format: Exl3InputFormat,
+        epilogue: Exl3Epilogue,
     ) -> Result<Self> {
-        Self::with_shared_workspace(library, weights, directory, format, None)
+        Self::with_shared_workspace(library, weights, directory, format, epilogue, None)
     }
 
     /// # Safety
@@ -503,12 +629,13 @@ impl<'a> Exl3Execution<'a> {
         weights: Rc<Vec<Exl3Weights<'a>>>,
         directory: &Path,
         format: Exl3InputFormat,
+        epilogue: Exl3Epilogue,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
         // SAFETY: forwards the trusted-package contract; scratch remains lane-local.
         let modules = unsafe { Exl3Modules::load(library, directory, format)? };
         // SAFETY: the caller serializes all users of the shared workspace.
-        unsafe { Self::with_modules(library, weights, modules, shared) }
+        unsafe { Self::with_modules(library, weights, modules, epilogue, shared) }
     }
 
     /// # Safety
@@ -518,6 +645,7 @@ impl<'a> Exl3Execution<'a> {
         library: &'a NativeLibrary,
         weights: Rc<Vec<Exl3Weights<'a>>>,
         modules: Exl3Modules<'a>,
+        epilogue: Exl3Epilogue,
         shared: Option<Rc<Exl3Workspace<'a>>>,
     ) -> Result<Self> {
         ensure!(std::ptr::eq(library, modules.owner.device.library)
@@ -534,33 +662,13 @@ impl<'a> Exl3Execution<'a> {
         meta.validate_native_contract()?;
         let device = library.cuda_get_device()?;
         for weight in weights.iter() {
-            let descriptor_rows = 3;
-            ensure!(weight.buffer("descriptor_map")?.bytes == descriptor_rows * meta.experts * meta.bits.len() * 4,
-                "EXL3 resident descriptor extent mismatch");
+            meta.validate_residency(&weight.layout, cuteafd_core::expert_geometry())?;
             ensure!(
                 weight.layout.world == weights[0].layout.world
                     && weight.layout.rank == weights[0].layout.rank
                     && weight.buffer("global_to_combined")?.device_id == device,
                 "EXL3 resident layers must share one device and TP rank"
             );
-            ensure!(
-                meta.hidden == cuteafd_core::expert_geometry().hidden as usize
-                    && meta.intermediate == weight.layout.intermediate
-                    && meta.experts == weight.layout.experts
-                    && meta.bits == weight.layout.tiers
-                    && meta.swiglu_limit == cuteafd_core::expert_geometry().swiglu_limit(),
-                "EXL3 export/residency geometry mismatch"
-            );
-            // V4.1 dSpark drafts route top-3; DeepSeek V4 stages and every
-            // backbone follow the model.
-            let expected_topk =
-                if matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
-                    && cuteafd_core::expert_geometry().family() == Some("v41") {
-                    3
-                } else {
-                    cuteafd_core::expert_geometry().topk as usize
-                };
-            ensure!(meta.top_k == expected_topk, "EXL3 expert top-k mismatch");
         }
         let info = modules.owner.kernel.info();
         let mut storage = Vec::new();
@@ -568,7 +676,7 @@ impl<'a> Exl3Execution<'a> {
         // Never resize to the current device's SM count: compiled grid barriers
         // retain export-time offsets, even when the bridge caps the launch grid.
         for (name, spec) in &meta.buffers {
-            if name != &spec.allocation {
+            if name != &spec.allocation || !epilogue.allocates(name) {
                 continue;
             }
             if let Some(arena) = shared.as_ref().filter(|_| !spec.zero_on_create) {
@@ -586,6 +694,9 @@ impl<'a> Exl3Execution<'a> {
             storage.push(allocation);
         }
         for (name, spec) in &meta.buffers {
+            if !epilogue.allocates(&spec.allocation) {
+                continue;
+            }
             let mut buffer = *pointers
                 .get(&spec.allocation)
                 .context("missing EXL3 workspace allocation")?;
@@ -620,14 +731,7 @@ impl<'a> Exl3Execution<'a> {
             ] {
                 pointers.insert(target.into(), weight.buffer(source)?);
             }
-            for (target, source) in [("fc2_ptr", "fc2"), ("output_ptr", "output")] {
-                pointers.insert(
-                    target.into(),
-                    *pointers
-                        .get(source)
-                        .context("missing EXL3 output workspace")?,
-                );
-            }
+            let mut pointers = layer_pointers(epilogue, &pointers)?;
             let mut values = BTreeMap::from([
                 ("active_m".into(), 1),
                 (
@@ -663,30 +767,43 @@ impl<'a> Exl3Execution<'a> {
                     values.insert(format!("tier{tier}_{name}"), value as i32);
                 }
             }
+            // Only the object this epilogue runs is bound; a partial-reply
+            // family never builds the weighted sum or reads its output owner.
             ensure!(
-                meta.objects.len() == 2
-                    && meta.objects[0].label == "v41_exl3_core"
-                    && meta.objects[1].label == "v41_exl3_sum",
+                meta.objects.first().is_some_and(|object| object.label == "v41_exl3_core"),
                 "EXL3 object ordering mismatch"
             );
+            if epilogue == Exl3Epilogue::Sum {
+                ensure!(
+                    meta.objects.len() == 2 && meta.objects[1].label == "v41_exl3_sum",
+                    "EXL3 object ordering mismatch"
+                );
+            }
             let core = Table::build(&meta.objects[0], &pointers, &values)?;
-            let sum = Table::build(&meta.objects[1], &pointers, &values)?;
+            let sum = (epilogue == Exl3Epilogue::Sum)
+                .then(|| Table::build(&meta.objects[1], &pointers, &values))
+                .transpose()?;
             ensure!(
                 core.pointers.len() == info.core_pointers
                     && core.scalars.len() == info.core_scalars
-                    && sum.pointers.len() == info.sum_pointers
-                    && sum.scalars.len() == info.sum_scalars,
+                    && sum.as_ref().is_none_or(|sum| sum.pointers.len() == info.sum_pointers
+                        && sum.scalars.len() == info.sum_scalars),
                 "EXL3 native argument lengths disagree"
             );
             layers.push(LayerBinding {
                 core,
                 sum,
                 expert_map: weight.buffer("global_to_combined")?,
-                output_slot: meta.objects[1]
-                    .pointer_slots
-                    .iter()
-                    .position(|name| name == "output_ptr")
-                    .context("missing EXL3 output pointer slot")?,
+                fc2: *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
+                svh: weight.buffer("down_svh")?,
+                local_experts: weight.layout.experts,
+                output_slot: if epilogue == Exl3Epilogue::Sum {
+                    Some(meta.objects[1]
+                        .pointer_slots
+                        .iter()
+                        .position(|name| name == "output_ptr")
+                        .context("missing EXL3 output pointer slot")?)
+                } else { None },
             });
         }
         let mut route_pointers = [std::ptr::null_mut(); 7];
@@ -727,7 +844,7 @@ impl<'a> Exl3Execution<'a> {
             route_pointers,
             route_bytes,
             output_element_bytes: info.output_element_bytes,
-            output: *pointers.get("output").context("missing EXL3 output")?,
+            output: pointers.get("output").copied(),
             device,
             hidden: meta.hidden,
             capacity: meta.capacity,
@@ -781,7 +898,8 @@ impl<'a> Exl3Execution<'a> {
         rows: usize,
         stream: *mut c_void,
     ) -> Result<CuteafdDeviceBuffer> {
-        self.launch_layer_into(layer, inputs, rows, stream, self.output)
+        let output = self.output.context("EXL3 execution has no weighted token output")?;
+        self.launch_layer_into(layer, inputs, rows, stream, output)
     }
 
     /// # Safety
@@ -840,8 +958,10 @@ impl<'a> Exl3Execution<'a> {
             routes.launch(&self.route_pointers, &self.route_bytes, rows as i32, stream)?;
         }
         binding.core.bind(&inputs, rows);
-        binding.sum.bind(&inputs, rows);
-        binding.sum.pointers[binding.output_slot] = output.ptr;
+        let output_slot = binding.output_slot.context("EXL3 execution has no weighted sum epilogue")?;
+        let sum = binding.sum.as_mut().context("EXL3 execution has no weighted sum epilogue")?;
+        sum.bind(&inputs, rows);
+        sum.pointers[output_slot] = output.ptr;
         // The packed core is a full-grid cooperative launch (SMs * blocks_per_sm):
         // fork b12x/moe/_shared/kernels/w4a16/mixed_trellis.py:973-978;
         // its grid barriers are at :1142/:1314. See stream-wait redesign #104.
@@ -851,9 +971,47 @@ impl<'a> Exl3Execution<'a> {
         self.modules.owner.kernel
             .launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
         self.modules.owner.kernel
-            .launch_sum(&binding.sum.pointers, &binding.sum.scalars, stream)?;
+            .launch_sum(&sum.pointers, &sum.scalars, stream)?;
         output.bytes = rows * self.hidden * self.output_element_bytes;
         Ok(output)
+    }
+
+    /// The core only (wire decode, routes, gate/up and down into FC2), for a
+    /// partial-reply or fused compressed-sum epilogue.
+    ///
+    /// # Safety
+    /// Same contract as `launch_layer`; the caller runs the epilogue on `stream`
+    /// before any later launch reuses the FC2 workspace.
+    pub(crate) unsafe fn launch_layer_core(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
+        stream: *mut c_void) -> Result<PartialSources> {
+        let mut inputs = inputs;
+        ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");
+        ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
+        for (buffer, bytes) in inputs.iter().zip([
+            rows * if self.wire_rows { self.hidden + self.hidden / 32 } else { self.hidden * 2 },
+            rows * self.topk * 4,
+            rows * self.topk * 4,
+        ]) {
+            ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 16 == 0
+                && buffer.bytes >= bytes && buffer.device_id == self.device,
+                "EXL3 input buffer contract mismatch");
+        }
+        let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
+        if let Some(decoded) = &self.wire {
+            self.modules.owner.wire.as_ref().context("missing retained EXL3 wire decoder")?.decode(inputs[0], decoded.buffer, rows, stream)?;
+            inputs[0] = decoded.buffer;
+        }
+        if let Some(routes) = &self.modules.owner.routes {
+            self.route_pointers[0] = inputs[1].ptr;
+            self.route_pointers[1] = binding.expert_map.ptr;
+            self.route_bytes[1] = binding.expert_map.bytes as u64;
+            self.route_bytes[0] = inputs[1].bytes as u64;
+            routes.launch(&self.route_pointers, &self.route_bytes, rows as i32, stream)?;
+        }
+        binding.core.bind(&inputs, rows);
+        self.modules.owner.kernel.launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
+        Ok(PartialSources { fc2: binding.fc2, svh: binding.svh, expert_map: binding.expert_map,
+            local_experts: binding.local_experts, experts: binding.expert_map.bytes / 4 })
     }
 }
 
@@ -866,6 +1024,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn planned_residency_refuses_mismatched_code_before_allocation() -> Result<()> {
+        use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
+        use cuteafd_core::tp_units::{RankUnits, UnitRule};
+        let geometry = cuteafd_core::ExpertGeometry::GLM5;
+        let root = tempfile::tempdir()?;
+        for compact in [false, true] {
+            let rows = if compact { 7 } else { 3 };
+            let mut layout = V41Exl3Residency {
+                layer: V41Exl3Layer::Backbone(3), world: 6, rank: 0,
+                intermediate_start: 0, experts: geometry.experts as usize, intermediate: 384,
+                tiers: vec![4, 5], projection_counts: vec![], loads: vec![],
+                unit_map: compact.then(|| RankUnits::new(UnitRule::Rotated,
+                    geometry.experts as usize, geometry.intermediate as usize, 128, 3, 6, 0)).transpose()?,
+                buffers: vec![V41Exl3ResidentBuffer { name: "descriptor_map".into(),
+                    bytes: rows * geometry.experts as usize * 2 * 4,
+                    initial_words: vec![0; rows * geometry.experts as usize * 2] }],
+            };
+            assert_eq!(layout.aot_layout(), if compact { "tp6-compact-rank0" } else { "tp6-rank0" });
+            let metadata = serde_json::json!({
+                "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
+                "hidden":geometry.hidden,"intermediate":384,"experts":geometry.experts,"capacity":16,
+                "top_k":geometry.topk,"bits":[4,5],"swiglu_limit":geometry.swiglu_limit(),
+                "direct":false,"sms":48,"blocks_per_sm":1,"buffers":{},"objects":[],
+                "descriptor_rows":rows,"native_info_version":if compact { 3 } else { 2 },
+                "trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
+            });
+            let path = root.path().join("v41_exl3.json");
+            std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            for (field, value) in [("intermediate", serde_json::json!(256)),
+                ("hidden", serde_json::json!(128)), ("experts", serde_json::json!(1)),
+                ("bits", serde_json::json!([3,4])), ("top_k", serde_json::json!(1)),
+                ("swiglu_limit", serde_json::json!(10.0)),
+                ("descriptor_rows", serde_json::json!(if compact { 3 } else { 7 })),
+                ("native_info_version", serde_json::json!(9))] {
+                let mut changed = metadata.clone();
+                changed[field] = value;
+                std::fs::write(&path, serde_json::to_vec(&changed)?)?;
+                assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err(), "{field}");
+            }
+            std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
+            layout.buffers[0].initial_words.pop();
+            assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
+        }
+        Ok(())
+    }
+
+    /// Muse Spark's per-expert partial-reply epilogue launches the core only,
+    /// so neither the census nor the shared arena may allocate the weighted
+    /// sum's token output; every other owner stays byte-identical.
+    #[test]
+    fn workspace_layout_follows_the_familys_epilogue() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let manifest = |capacity: u64, output: u64| serde_json::json!({
+            "schema": "cuteafd.v41-exl3-aot.v1", "output_dtype": "bf16",
+            "sparkinfer_revision": "test", "hidden": 8, "intermediate": 16,
+            "experts": 1, "capacity": capacity, "top_k": 1, "bits": [4, 5],
+            "swiglu_limit": serde_json::Value::Null, "direct": false, "sms": 48,
+            "blocks_per_sm": 1, "objects": [],
+            "trellis_lut": {"file": "lut", "bytes": 32, "sha256": "test"},
+            "buffers": {
+                "scratch": {"bytes": output * 2, "allocation": "scratch",
+                    "dtype": "f16", "zero_on_create": false},
+                "output": {"bytes": output, "allocation": "output",
+                    "dtype": "bf16", "zero_on_create": false},
+                "state": {"bytes": 0, "allocation": "state",
+                    "dtype": "i32", "zero_on_create": true}}}).to_string();
+        for capacity in [1, 16] {
+            let directory = root.path().join(format!("m{capacity}"));
+            std::fs::create_dir(&directory)?;
+            std::fs::write(directory.join("v41_exl3.json"), manifest(capacity, capacity * 64))?;
+        }
+        let directories = vec![root.path().join("m1"), root.path().join("m16")];
+        let sum = Exl3Workspace::layout(&directories, Exl3Epilogue::Sum)?;
+        let partial = Exl3Workspace::layout(&directories, Exl3Epilogue::PartialReplies)?;
+        assert_eq!(sum.get("output").map(|entry| entry.0), Some(16 * 64));
+        assert!(!partial.contains_key("output"));
+        assert_eq!(sum.get("scratch"), partial.get("scratch"));
+        assert_eq!(Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::PartialReplies)? + 16 * 64,
+            Exl3Workspace::plan(&directories, Exl3InputFormat::Bf16, Exl3Epilogue::Sum)?);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_replies_never_bind_the_sum_output_owner() -> Result<()> {
+        let buffer = |bytes| CuteafdDeviceBuffer { bytes, ..Default::default() };
+        // A partial-reply workspace has no `output` allocation at all, as the
+        // Muse catalog produces: binding must still succeed for its layers.
+        let partial = BTreeMap::from([("fc2".to_string(), buffer(64))]);
+        let bound = layer_pointers(Exl3Epilogue::PartialReplies, &partial)?;
+        assert_eq!(bound.get("fc2_ptr").copied().map(|b| b.bytes), Some(64));
+        assert!(!bound.contains_key("output_ptr"));
+        let error = layer_pointers(Exl3Epilogue::Sum, &partial).unwrap_err().to_string();
+        assert!(error.contains("missing EXL3 output workspace"), "{error}");
+        let sum = BTreeMap::from([("fc2".to_string(), buffer(64)), ("output".to_string(), buffer(32))]);
+        let bound = layer_pointers(Exl3Epilogue::Sum, &sum)?;
+        assert_eq!(bound.get("output_ptr").copied().map(|b| b.bytes), Some(32));
+        Ok(())
+    }
+
+    #[test]
     fn fixed_reduction_plan_follows_m1_not_live_width() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut paths = Vec::new();
@@ -874,7 +1133,7 @@ mod tests {
             std::fs::create_dir(&directory)?;
             let tile = if capacity == 16 { [128, 128, 128, 128] } else { [64, 128, 64, 128] };
             std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-                "capacity": capacity, "tile": tile, "direct": false
+                "capacity": capacity,"decode_capacity":capacity <= 80, "tile": tile, "direct": false
             }))?)?;
             paths.push(directory);
         }
@@ -892,7 +1151,7 @@ mod tests {
         assert!(error.contains(root.path().to_str().unwrap()));
         assert!(error.contains("canonical m1 K tile, CTA threads"));
         std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": 80, "tile": [64, 128, 64, 128], "direct": false, "route_block": 16
+            "capacity": 80,"decode_capacity":true, "tile": [64, 128, 64, 128], "direct": false, "route_block": 16
         }))?)?;
         assert!(Exl3ReductionPlan::new(&paths).is_err());
         for (field, value) in [
@@ -901,7 +1160,7 @@ mod tests {
             ("input_format", serde_json::json!("e4m3_k32")),
             ("warp_specialized", serde_json::json!(true)),
         ] {
-            let mut meta = serde_json::json!({"capacity": 80, "tile": [64, 128, 64, 128], "direct": false});
+            let mut meta = serde_json::json!({"capacity": 80,"decode_capacity":true, "tile": [64, 128, 64, 128], "direct": false});
             meta[field] = value;
             std::fs::write(paths[2].join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
             assert!(Exl3ReductionPlan::new(&paths).is_err(), "must reject {field}");
@@ -910,34 +1169,34 @@ mod tests {
     }
 
     #[test]
-    fn v41_local_and_tp2_exl3_freeze_all_decode_rows_before_module_load() -> Result<()> {
+    fn local_and_tp2_exl3_freeze_all_decode_rows_before_module_load() -> Result<()> {
         use crate::shared::experts::rtx::RtxSelectionPolicy;
-        use cuteafd_loader::placement::families::deepseek_v41::exl3_capacities;
+        use cuteafd_loader::placement::families::deepseek_v41::expert_capacities;
         for (local, tile) in [(true, [64, 256, 64, 256]), (false, [64, 128, 64, 128])] {
             let root = tempfile::tempdir()?;
-            for capacity in [1, 16, 80, 256] {
+            for capacity in [1, 16, 64, 256] {
                 let directory = root.path().join(format!("m{capacity}"));
                 std::fs::create_dir(&directory)?;
                 let recipe = if capacity == 16 { [128, 128, 128, 128] } else { tile };
                 std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-                    "capacity": capacity, "tile": recipe, "bits": [3, 4],
+                    "capacity": capacity,"decode_capacity":capacity <= 64, "tile": recipe, "bits": [3, 4],
                     "output_dtype": "fp32", "direct": false
                 }))?)?;
             }
-            for maximum in [1, 16, 80, 256] {
-                let capacities = exl3_capacities(maximum, local)?;
+            for maximum in [1, 16, 64, 256] {
+                let capacities = expert_capacities(if maximum > 1 && maximum < 64 { 64 } else { maximum }, local)?;
                 let paths: Vec<_> = capacities.iter().map(|c| root.path().join(format!("m{c}"))).collect();
                 let plan = Exl3ReductionPlan::new(&paths)?;
-                for rows in 1..=maximum.min(80) as usize {
+                for rows in 1..=maximum.min(64) as usize {
                     let index = plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize))?;
-                    assert_eq!(capacities[index], if rows == 1 { 1 } else { 80 });
+                    assert_eq!(capacities[index], if rows == 1 { 1 } else { 64 });
                     let tp2_index = RtxSelectionPolicy::CanonicalDecode.execution_index(
                         rows, rows, capacities.iter().map(|&c| c as usize),
                         || plan.execution_index(rows, rows, capacities.iter().map(|&c| c as usize)))?;
                     assert_eq!(tp2_index, index);
                 }
-                if maximum > 80 {
-                    assert_eq!(capacities[plan.execution_index(81, 81,
+                if maximum > 64 {
+                    assert_eq!(capacities[plan.execution_index(65, 65,
                         capacities.iter().map(|&c| c as usize))?], 256);
                 }
             }
@@ -987,7 +1246,7 @@ mod tests {
             let metadata = serde_json::json!({
                 "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16",
                 "sparkinfer_revision":"test", "hidden":16,"intermediate":16,
-                "experts":8,"capacity":capacity,"top_k":2,"bits":[3],
+                "experts":8,"capacity":capacity,"decode_capacity":capacity <= 80,"top_k":2,"bits":[3],
                 "direct":false,"sms":1,"blocks_per_sm":1,
                 "buffers":{
                     "scratch":{"bytes":capacity*64,"dtype":"float32","allocation":"scratch","zero_on_create":false},
@@ -1000,17 +1259,20 @@ mod tests {
         let directories = |policy: Exl3RowPolicy, rows| -> Result<Vec<PathBuf>> {
             Ok(policy.capacities(rows)?.iter().map(|c| root.path().join(format!("m{c}"))).collect())
         };
-        let ordinary = Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32)?;
+        let ordinary = Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)?;
         for maximum in [2, 4, 9, 16] {
             let planned = directories(Exl3RowPolicy::GlmFlashK64, maximum)?;
             // Admission includes the shared arena and private state even though
             // the transport/input limit stays at the real declared maximum.
-            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32)?, 7776);
+            assert_eq!(Exl3Workspace::plan(&planned, Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum)?, 7776);
             assert_eq!(ordinary, 8320);
         }
         std::fs::remove_file(root.path().join("m80/v41_exl3.json"))?;
-        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?, Exl3InputFormat::Fp8K32).is_err());
-        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?, Exl3InputFormat::Fp8K32).is_err());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::GlmFlashK64, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum).is_err());
+        assert!(Exl3Workspace::plan(&directories(Exl3RowPolicy::Nearest, 16)?,
+            Exl3InputFormat::Fp8K32, Exl3Epilogue::Sum).is_err());
         Ok(())
     }
 
@@ -1018,17 +1280,32 @@ mod tests {
     fn grouping_retains_legacy_route_block_and_refuses_unknown_tiles() {
         let original = serde_json::json!({
             "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
-            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"top_k":6,
+            "hidden":5120,"intermediate":640,"experts":384,"capacity":80,"decode_capacity":true,"top_k":6,
             "bits":[3,4],"swiglu_limit":10.0,"direct":false,"sms":48,"blocks_per_sm":1,
             "buffers":{},"objects":[],"trellis_lut":{"file":"lut","bytes":16,"sha256":"test"}
         });
         let parse = |value| serde_json::from_value::<Manifest>(value).unwrap();
         assert!(parse(original.clone()).validate_native_contract().is_ok());
-        for (rows, version, accepted) in [(3, 2, true), (4, 2, false), (3, 3, false)] {
+        for (rows, version, accepted) in [(3, 2, true), (7, 3, true), (4, 2, false), (7, 2, false),
+                (3, 3, false), (7, 4, false)] {
             let mut value = original.clone();
             value["descriptor_rows"] = rows.into();
             value["native_info_version"] = version.into();
             assert_eq!(parse(value).validate_native_contract().is_ok(), accepted);
+        }
+        for (rows, version) in [(Some(7), None), (None, Some(3))] {
+            let mut value = original.clone();
+            value["descriptor_rows"] = serde_json::json!(rows);
+            value["native_info_version"] = serde_json::json!(version);
+            assert!(parse(value).validate_native_contract().is_err());
+        }
+        for (bits, input) in [(vec![2, 3, 4], "bf16"), (vec![3, 4], "e4m3_k32")] {
+            let mut value = original.clone();
+            value["descriptor_rows"] = 7.into();
+            value["native_info_version"] = 3.into();
+            value["bits"] = serde_json::json!(bits);
+            value["input_format"] = input.into();
+            assert!(parse(value).validate_native_contract().is_err());
         }
         assert_eq!(parse(original.clone()).group_rows().unwrap(), 8);
         for block in [8, 16, 32, 64] {
@@ -1044,236 +1321,4 @@ mod tests {
         }
     }
 
-    use crate::shared::experts::layer::ExpertLayer;
-    use crate::shared::memory::LoadStream;
-
-    struct Fixture<'a> {
-        inputs: Vec<DeviceAllocation<'a>>,
-        original_input: Vec<u8>,
-        expected: Vec<u8>,
-    }
-    impl Fixture<'_> {
-        fn inputs(&self) -> [CuteafdDeviceBuffer; 3] {
-            std::array::from_fn(|i| self.inputs[i].buffer)
-        }
-        fn verify(&self, library: &NativeLibrary, output: CuteafdDeviceBuffer) -> Result<()> {
-            let mut actual = vec![0; output.bytes];
-            library.copy_d2h(&mut actual, output)?;
-            ensure!(
-                actual == self.expected[..actual.len()],
-                "EXL3 layer output differs from B12x"
-            );
-            Ok(())
-        }
-    }
-    struct Graph<'a> {
-        library: &'a NativeLibrary,
-        exec: *mut c_void,
-        stream: *mut c_void,
-    }
-    impl Drop for Graph<'_> {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = self.library.cuda_stream_synchronize(self.stream);
-                let _ = self.library.cuda_graph_exec_destroy(self.exec);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires CUDA, CUTEAFD_NATIVE_LIB, CUTEAFD_EXL3_SNAPSHOT, CUTEAFD_EXL3_AOT and CUTEAFD_EXL3_FIXTURE; optional CUTEAFD_EXL3_SECOND_FIXTURE exercises layer 1"]
-    fn native_resident_layer_matches_b12x_fixture() -> Result<()> {
-        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-        library.cuda_set_device(0)?;
-        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_SNAPSHOT")?);
-        let catalog = cuteafd_loader::read_official_v41_catalog(&snapshot,
-        )?;
-        let aot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(aot.join("v41_exl3.json"))?)?;
-        let mut paths = vec![std::path::PathBuf::from(std::env::var(
-            "CUTEAFD_EXL3_FIXTURE",
-        )?)];
-        if let Some(second) = std::env::var_os("CUTEAFD_EXL3_SECOND_FIXTURE") {
-            paths.push(second.into());
-        }
-        let mut fixtures = Vec::new();
-        let mut resident = Vec::new();
-        let mut input_format = None;
-        for (layer, path) in paths.iter().enumerate() {
-            let info: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path.join("fixture.json"))?)?;
-            for key in ["direct", "tile", "output_dtype"] {
-                ensure!(
-                    !info[key].is_null() && info[key] == manifest[key],
-                    "EXL3 fixture policy mismatch: {key}"
-                );
-            }
-            ensure!(
-                info["slice_start"] == 1280
-                    && info["width"] == 512
-                    && info["topk"] == 6
-                    && info["capacity"] == 16
-                    && info["layer"] == format!("layers.{layer}")
-                    && info["snapshot_revision"].as_str()
-                        == snapshot.file_name().and_then(|s| s.to_str()),
-                "unexpected EXL3 fixture geometry or snapshot"
-            );
-            let format = match info["input_format"].as_str() {
-                Some("bf16") => Exl3InputFormat::Bf16,
-                Some("fp8_k32") => Exl3InputFormat::Fp8K32,
-                _ => anyhow::bail!("invalid fixture input format"),
-            };
-            ensure!(
-                input_format.is_none_or(|old| old == format),
-                "fixture input format mismatch"
-            );
-            input_format = Some(format);
-            let layer = ExpertLayer::Backbone { layer, rank: 2 };
-            let budget = Exl3Weights::plan(&catalog, layer)?;
-            let (free, _) = library.cuda_memory_info()?;
-            ensure!(
-                free > budget.resident_bytes + 256 * 1024 * 1024,
-                "insufficient GPU headroom"
-            );
-            resident.push(Exl3Weights::load(
-                &library,
-                &catalog,
-                layer,
-                budget.resident_bytes,
-            )?);
-            let mut fixture = Fixture {
-                inputs: Vec::new(),
-                original_input: Vec::new(),
-                expected: Vec::new(),
-            };
-            for name in ["input", "ids", "weights", "expected"] {
-                let bytes = std::fs::read(path.join(format!("{name}.bin")))?;
-                ensure!(
-                    Some(bytes.len() as u64) == info["artifacts"][name]["bytes"].as_u64()
-                        && Some(format!("{:x}", Sha256::digest(&bytes)).as_str())
-                            == info["artifacts"][name]["sha256"].as_str(),
-                    "corrupt EXL3 fixture {name}"
-                );
-                if name == "expected" {
-                    fixture.expected = bytes;
-                } else {
-                    let allocation = DeviceAllocation::new(&library, bytes.len())?;
-                    library.copy_h2d(allocation.buffer, &bytes)?;
-                    fixture.inputs.push(allocation);
-                    if name == "input" {
-                        fixture.original_input = bytes;
-                    }
-                }
-            }
-            fixtures.push(fixture);
-        }
-        if fixtures.len() == 2 {
-            ensure!(
-                fixtures[0].expected != fixtures[1].expected,
-                "layer fixtures must differ"
-            );
-        }
-        let weights = Rc::new(resident);
-        let mut execution = unsafe {
-            Exl3Execution::with_input_format(
-                &library,
-                weights.clone(),
-                &aot,
-                input_format.unwrap(),
-            )?
-        };
-        let workspace_bytes = execution.workspace_bytes();
-        ensure!(
-            workspace_bytes == Exl3Execution::plan(&aot, input_format.unwrap())?,
-            "EXL3 workspace plan disagrees with allocations"
-        );
-        let mut second_lane = unsafe {
-            Exl3Execution::with_input_format(&library, weights, &aot, input_format.unwrap())?
-        };
-        ensure!(
-            second_lane.workspace_bytes() == workspace_bytes
-                && second_lane.output.ptr != execution.output.ptr,
-            "lanes must own separate equal-sized workspace"
-        );
-        let stream = LoadStream {
-            library: &library,
-            raw: library.cuda_stream_create()?,
-        };
-        let other_stream = LoadStream {
-            library: &library,
-            raw: library.cuda_stream_create()?,
-        };
-        // Different layer orders on two lanes; enqueue both before either host wait.
-        for rows in [16, 3, 1, 16] {
-            for layer in 0..fixtures.len() {
-                let other = fixtures.len() - 1 - layer;
-                let output = unsafe {
-                    execution.launch_layer(layer, fixtures[layer].inputs(), rows, stream.raw)?
-                };
-                let other_output = unsafe {
-                    second_lane.launch_layer(
-                        other,
-                        fixtures[other].inputs(),
-                        rows,
-                        other_stream.raw,
-                    )?
-                };
-                unsafe {
-                    library.cuda_stream_synchronize(stream.raw)?;
-                    library.cuda_stream_synchronize(other_stream.raw)?;
-                }
-                fixtures[layer].verify(&library, output)?;
-                fixtures[other].verify(&library, other_output)?;
-            }
-        }
-        ensure!(
-            unsafe { execution.launch_layer(fixtures.len(), fixtures[0].inputs(), 1, stream.raw) }
-                .is_err(),
-            "invalid layer must reject before launch"
-        );
-        let mut graphs = Vec::new();
-        for (layer, fixture) in fixtures.iter().enumerate() {
-            unsafe {
-                library.cuda_graph_begin_capture(stream.raw)?;
-            }
-            let captured =
-                unsafe { execution.launch_layer(layer, fixture.inputs(), 3, stream.raw) };
-            let graph = Graph {
-                library: &library,
-                exec: unsafe { library.cuda_graph_end_capture(stream.raw)? },
-                stream: stream.raw,
-            };
-            graphs.push((graph, captured?));
-        }
-        // Replay graphs after another layer has used the shared workspace.
-        for layer in (0..fixtures.len()).chain((0..fixtures.len()).rev()) {
-            let fixture = &fixtures[layer];
-            let (graph, output) = &graphs[layer];
-            library.copy_h2d(
-                fixture.inputs[0].buffer,
-                &vec![0; fixture.original_input.len()],
-            )?;
-            library.copy_h2d(*output, &vec![0xff; output.bytes])?;
-            unsafe {
-                library.cuda_graph_launch(graph.exec, stream.raw)?;
-                library.cuda_stream_synchronize(stream.raw)?;
-            }
-            let mut actual = vec![0; output.bytes];
-            library.copy_d2h(&mut actual, *output)?;
-            ensure!(
-                actual.iter().all(|b| *b == 0),
-                "EXL3 graph did not consume changed zero input"
-            );
-            library.copy_h2d(fixture.inputs[0].buffer, &fixture.original_input)?;
-            library.copy_h2d(*output, &vec![0xff; output.bytes])?;
-            unsafe {
-                library.cuda_graph_launch(graph.exec, stream.raw)?;
-                library.cuda_stream_synchronize(stream.raw)?;
-            }
-            fixture.verify(&library, *output)?;
-        }
-        println!("Rust EXL3: {} layers x 384 resident experts, TP4 rank 2; two independent lanes, {} workspace bytes each; alternating layer rows=16/3/1/16 and changed/restored-input graph replay bitwise equal to six-expert B12x references", fixtures.len(), workspace_bytes);
-        Ok(())
-    }
 }

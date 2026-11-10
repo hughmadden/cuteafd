@@ -4,6 +4,8 @@ use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_block::PreparedBlockInput;
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use anyhow::{ensure, Result};
+use std::rc::Rc;
+use crate::shared::memory::row_window::{RowWindow, MAX_RESERVE_ROWS};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 
 #[derive(Default)]
@@ -28,9 +30,26 @@ impl Progress {
     }
 }
 
-pub(crate) struct TargetTapWave<'a> {
+/// Shared taps: values is a row plane, retained across three hooks and read
+/// by dSpark on another stream. No scratch or pinned staging. Batch progress
+/// and row descriptors belong to each slot.
+pub(crate) struct TargetTapStorage<'a> {
     stream: LoadStream<'a>,
     values: DeviceAllocation<'a>,
+    rows: usize,
+    unit: usize,
+}
+impl Drop for TargetTapStorage<'_> {
+    fn drop(&mut self) {
+        // SAFETY: owned stream and values; callers drain external readers.
+        crate::shared::decode_graph::fatal_drain(unsafe {
+            self.stream.library.cuda_stream_synchronize(self.stream.raw)
+        }, "target tap storage");
+    }
+}
+pub(crate) struct TargetTapWave<'a> {
+    storage: Rc<TargetTapStorage<'a>>,
+    window: RowWindow,
     ops: V41AttentionOps<'a>,
     capacity: usize,
     rows: Vec<ExpertRow>,
@@ -65,17 +84,31 @@ impl<'a> TargetTapWave<'a> {
     pub fn new(library: &'a NativeLibrary, capacity: usize, budget: usize) -> Result<Self> {
         let bytes = Self::device_bytes(capacity)?;
         ensure!(bytes <= budget, "target taps exceed device budget");
-        Ok(Self {
-            stream: LoadStream {
-                library,
-                raw: library.cuda_stream_create()?,
-            },
-            values: DeviceAllocation::new(library, bytes)?,
-            ops: library.v41_attention_ops()?,
-            capacity,
-            rows: Vec::with_capacity(capacity),
-            progress: Progress::default(),
-        })
+        Self::on_storage(Self::storage(library, capacity, capacity)?)
+    }
+    pub(crate) fn storage(library: &'a NativeLibrary, rows: usize, unit: usize)
+        -> Result<Rc<TargetTapStorage<'a>>> {
+        ensure!((1..=MAX_RESERVE_ROWS).contains(&rows) && (1..=4096).contains(&unit)
+            && unit <= rows, "invalid target tap storage dimensions");
+        Ok(Rc::new(TargetTapStorage {
+            stream: LoadStream { library, raw: library.cuda_stream_create()? },
+            values: DeviceAllocation::new(library, rows * 30720)?, rows, unit,
+        }))
+    }
+    pub(crate) fn on_storage(storage: Rc<TargetTapStorage<'a>>) -> Result<Self> {
+        Ok(Self { ops: storage.stream.library.v41_attention_ops()?, capacity: storage.unit,
+            rows: Vec::with_capacity(storage.unit), storage, window: RowWindow::NONE,
+            progress: Progress::default() })
+    }
+    /// All readers of the old slot must drain before selecting its next unit.
+    pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
+        if let Some(range) = window.range() {
+            ensure!(range.start < range.end && range.end <= self.storage.rows
+                && range.len() <= self.capacity, "target tap window outside storage or unit");
+        }
+        self.reset();
+        self.window = window;
+        Ok(())
     }
     pub(super) fn reset(&mut self) {
         self.progress = Progress::default();
@@ -85,7 +118,7 @@ impl<'a> TargetTapWave<'a> {
         self.reset();
         let rows = batch.expert_rows();
         ensure!(
-            !rows.is_empty() && rows.len() <= self.capacity,
+            !rows.is_empty() && rows.len() <= self.capacity && self.window.admits(rows.len()),
             "target tap batch exceeds capacity"
         );
         self.rows = rows;
@@ -101,8 +134,8 @@ impl<'a> TargetTapWave<'a> {
         input: &PreparedBlockInput<'_>,
     ) -> Result<()> {
         let queued = unsafe { self.enqueue_capture(batch, input) };
-        let drained = if queued.is_err() { unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) } }
-            else { unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw) } };
+        let drained = if queued.is_err() { unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) } }
+            else { unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) } };
         if let Err(error) = queued.and(drained) { self.reset(); return Err(error); }
         self.progress.next += 1;
         Ok(())
@@ -112,7 +145,7 @@ impl<'a> TargetTapWave<'a> {
     pub(super) async unsafe fn capture_cooperative(&mut self, batch: &CacheBatch,
         input: &PreparedBlockInput<'_>) -> Result<()> {
         unsafe { self.enqueue_capture(batch, input)?; }
-        if let Err(error) = unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream).await } {
+        if let Err(error) = unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await } {
             self.reset(); return Err(error);
         }
         self.progress.next += 1;
@@ -130,7 +163,7 @@ impl<'a> TargetTapWave<'a> {
                         .zip(&self.rows)
                         .all(|(&p, row)| p == row.position)
                     && input.residual.bytes == self.rows.len() * 40960
-                    && input.residual.device_id == self.values.buffer.device_id,
+                    && input.residual.device_id == self.window.apply(self.storage.values.buffer, 30720).device_id,
                 "target tap prepared input differs from its batch"
             );
             #[cfg(test)]
@@ -138,7 +171,7 @@ impl<'a> TargetTapWave<'a> {
                 let dir = std::path::PathBuf::from(dir);
                 std::fs::create_dir_all(&dir)?;
                 let mut bytes = vec![0; input.residual.bytes];
-                self.stream.library.copy_d2h(&mut bytes, input.residual)?;
+                self.storage.stream.library.copy_d2h(&mut bytes, input.residual)?;
                 std::fs::write(
                     dir.join(format!(
                         "batch{}-layer{}-tap-input.bin",
@@ -148,18 +181,10 @@ impl<'a> TargetTapWave<'a> {
                     bytes,
                 )?;
             }
-            let launched = unsafe {
-                crate::shared::memory::chain::join(self.stream.library, self.stream.raw)?;
-                self.ops.tap(
-                    input.residual,
-                    self.values.buffer,
-                    self.rows.len() as u32,
-                    input.layer as u32,
-                    self.stream.raw,
-                )
-            };
+            // SAFETY: prepared input is retained by the caller through drain.
+            let launched = unsafe { self.enqueue_values(input.residual, input.layer) };
             if let Err(error) = launched {
-                unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw)?; }
+                unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw)?; }
                 return Err(error);
             }
             Ok(())
@@ -169,9 +194,19 @@ impl<'a> TargetTapWave<'a> {
         }
         result
     }
+    /// # Safety
+    /// Residual and the selected output window remain live through the chain.
+    unsafe fn enqueue_values(&self, residual: CuteafdDeviceBuffer, layer: usize) -> Result<()> {
+        // SAFETY: input ownership is the caller's contract; values is a row plane.
+        unsafe {
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+            self.ops.tap(residual, self.window.apply(self.storage.values.buffer, 30720),
+                self.rows.len() as u32, layer as u32, self.storage.stream.raw)
+        }
+    }
     pub(super) fn output(&self, batch: &CacheBatch) -> Result<TargetTaps<'_>> {
         self.progress.ready(batch.identity())?;
-        let mut values = self.values.buffer;
+        let mut values = self.window.apply(self.storage.values.buffer, 30720);
         values.bytes = self.rows.len() * 30720;
         Ok(TargetTaps {
             values,
@@ -202,5 +237,80 @@ mod tests {
         assert!(progress.check(7, 39).is_err());
         progress = Progress::default();
         assert!(progress.ready(7).is_err());
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and a GPU"]
+    fn windowed_taps_match_private_runs_behind_a_gated_stream() -> Result<()> {
+        // SAFETY: library outlives all streams and allocations in this test.
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let (reserve, unit, rows) = (48, 16, 13);
+        let storage = TargetTapWave::storage(&library, reserve, unit)?;
+        let mut slots = [TargetTapWave::on_storage(storage.clone())?,
+            TargetTapWave::on_storage(storage.clone())?];
+        let sources = (0..6).map(|seed| -> Result<DeviceAllocation<'_>> {
+            let allocation = DeviceAllocation::new(&library, rows * 40960)?;
+            let host: Vec<u8> = (0..rows * 20480).flat_map(|i| {
+                let value = ((i * 7 + seed * 11) % 29) as f32 / 32.0 - 0.4;
+                ((value.to_bits() >> 16) as u16).to_ne_bytes()
+            }).collect();
+            library.copy_h2d(allocation.buffer, &host)?;
+            Ok(allocation)
+        }).collect::<Result<Vec<_>>>()?;
+        let row = |position| ExpertRow { request_id: 42, position,
+            kind: cuteafd_transport::ExpertV2SourceKind::Prefill };
+        for (seed, slot) in slots.iter_mut().enumerate() {
+            slot.select_window(RowWindow::rows(seed * unit..seed * unit + rows))?;
+            slot.rows = (0..rows).map(|i| row(i as u64)).collect();
+        }
+        // Warm the exact taps on these streams before any gate: first-use CUDA
+        // module loading may synchronize the context. Poison after warm-up.
+        for layer in 37..40 {
+            for seed in 0..2 {
+                // SAFETY: initialized sources and selected planes stay owned.
+                unsafe { slots[seed].enqueue_values(sources[(layer - 37) * 2 + seed].buffer, layer)?;
+                    crate::shared::memory::chain::finish(&library, storage.stream.raw)?; }
+            }
+        }
+        library.copy_h2d(storage.values.buffer, &vec![0xa5; storage.values.buffer.bytes])?;
+        let chain = crate::shared::memory::chain::StageChain::new(&library)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(chain.handle().scope(async {
+            // SAFETY: shared stream remains live until gate release and drain.
+            let gate = unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&library, storage.stream.raw)? };
+            for layer in 37..40 {
+                for seed in 0..2 {
+                    // SAFETY: all input/output allocations are retained until drain.
+                    unsafe { slots[seed].enqueue_values(sources[(layer - 37) * 2 + seed].buffer, layer)?;
+                        crate::shared::memory::chain::finish(&library, storage.stream.raw)?; }
+                }
+            }
+            drop(gate);
+            anyhow::Ok(())
+        }))?;
+        chain.drain()?;
+        let mut entire = vec![0; storage.values.buffer.bytes];
+        library.copy_d2h(&mut entire, storage.values.buffer)?;
+        for seed in 0..2 {
+            let mut private = TargetTapWave::new(&library, unit, usize::MAX)?;
+            private.rows = (0..rows).map(|i| row(i as u64)).collect();
+            for layer in 37..40 {
+                // SAFETY: private inputs are initialized and retained through drain.
+                unsafe { private.enqueue_values(sources[(layer - 37) * 2 + seed].buffer, layer)?;
+                    crate::shared::memory::chain::finish(&library, private.storage.stream.raw)?; }
+            }
+            let mut expected = vec![0; rows * 30720];
+            library.copy_d2h(&mut expected, private.storage.values.buffer)?;
+            assert_eq!(entire[seed * unit * 30720..(seed * unit + rows) * 30720], expected);
+        }
+        for gap in [rows..unit, unit + rows..reserve] {
+            assert!(entire[gap.start * 30720..gap.end * 30720].iter().all(|&v| v == 0xa5),
+                "tap wrote outside selected windows");
+        }
+        Ok(())
     }
 }

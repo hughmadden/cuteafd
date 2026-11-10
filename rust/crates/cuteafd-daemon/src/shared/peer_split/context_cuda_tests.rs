@@ -46,25 +46,24 @@ fn i32s(values: &[i32]) -> Vec<u8> {
     values.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
-/// A device buffer on `device` (current device on return: `home`).
+/// A device buffer that preserves the caller's current device.
 struct Buffer<'a> {
     library: &'a NativeLibrary,
     device: i32,
-    home: i32,
     allocation: Option<DeviceAllocation<'a>>,
 }
 
 impl<'a> Buffer<'a> {
-    fn new(library: &'a NativeLibrary, device: i32, home: i32, bytes: usize) -> Result<Self> {
-        let allocation = on_device(library, device, home, || {
+    fn new(library: &'a NativeLibrary, device: i32, bytes: usize) -> Result<Self> {
+        let allocation = on_device(library, device, || {
             let allocation = DeviceAllocation::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         })?;
-        Ok(Self { library, device, home, allocation: Some(allocation) })
+        Ok(Self { library, device, allocation: Some(allocation) })
     }
-    fn with(library: &'a NativeLibrary, device: i32, home: i32, bytes: &[u8]) -> Result<Self> {
-        let buffer = Self::new(library, device, home, bytes.len())?;
+    fn with(library: &'a NativeLibrary, device: i32, bytes: &[u8]) -> Result<Self> {
+        let buffer = Self::new(library, device, bytes.len())?;
         buffer.write(bytes)?;
         Ok(buffer)
     }
@@ -75,24 +74,24 @@ impl<'a> Buffer<'a> {
         self.buffer().ptr
     }
     fn write(&self, bytes: &[u8]) -> Result<()> {
-        on_device(self.library, self.device, self.home, || self.library.copy_h2d(self.buffer(), bytes))
+        on_device(self.library, self.device, || self.library.copy_h2d(self.buffer(), bytes))
     }
 }
 
 impl Drop for Buffer<'_> {
     fn drop(&mut self) {
-        let (library, device, home) = (self.library, self.device, self.home);
+        let (library, device) = (self.library, self.device);
         let allocation = self.allocation.take();
-        let _ = on_device(library, device, home, || {
+        let _ = on_device(library, device, || {
             drop(allocation);
             Ok(())
         });
     }
 }
 
-fn read(library: &NativeLibrary, device: i32, home: i32, ptr: *mut c_void, bytes: usize) -> Result<Vec<u8>> {
+fn read(library: &NativeLibrary, device: i32, ptr: *mut c_void, bytes: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; bytes];
-    on_device(library, device, home, || library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr, bytes, device_id: device,
+    on_device(library, device, || library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr, bytes, device_id: device,
         flags: 0 }))?;
     Ok(out)
 }
@@ -162,7 +161,7 @@ impl<'a> Ctx<'a> {
         rows: usize) -> Result<()> {
         let [(o0, l0), (o1, l1)] = operands;
         // SAFETY: live buffers of this GPU sized for `rows`; ordered on its stream.
-        on_device(self.library, self.ranks[rank].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[rank].device, || unsafe {
             self.combine[rank].launch(&[o0, l0, o1, l1, sink, out], &[Scalar::I32(rows as i32)], self.ranks[rank].stream)
         })
     }
@@ -172,7 +171,7 @@ impl<'a> Ctx<'a> {
         out_indices: *mut c_void, table: *mut c_void, slots: *mut c_void, lengths: *mut c_void, rows: usize,
         shard: usize) -> Result<()> {
         // SAFETY: as `combine`.
-        on_device(self.library, self.ranks[rank].device, self.ranks[0].device, || unsafe {
+        on_device(self.library, self.ranks[rank].device, || unsafe {
             self.merge[rank].launch(&[scores, indices, out_scores, out_indices, table, slots, lengths],
                 &[Scalar::I32(rows as i32), Scalar::I32(TABLE_STRIDE as i32), Scalar::I32(shard as i32)],
                 self.ranks[rank].stream)
@@ -181,7 +180,7 @@ impl<'a> Ctx<'a> {
     fn sync(&self) -> Result<()> {
         for rank in 0..2 {
             // SAFETY: test-owned streams.
-            on_device(self.library, self.ranks[rank].device, self.ranks[0].device, || unsafe {
+            on_device(self.library, self.ranks[rank].device, || unsafe {
                 self.library.cuda_stream_synchronize(self.ranks[rank].stream)
             })?;
         }
@@ -193,10 +192,9 @@ impl<'a> Ctx<'a> {
 /// returns the per-round time on GPU0's stream (GPU1's graph launched first).
 fn time_rounds(ctx: &Ctx<'_>, rounds: usize, body: &dyn Fn(usize) -> Result<()>) -> Result<f64> {
     let library = ctx.library;
-    let home = ctx.ranks[0].device;
     let mut graphs = [std::ptr::null_mut(); 2];
     for rank in [1, 0] {
-        graphs[rank] = on_device(library, ctx.ranks[rank].device, home, || {
+        graphs[rank] = on_device(library, ctx.ranks[rank].device, || {
             // SAFETY: test-owned stream with no other work queued during capture.
             unsafe { library.cuda_graph_begin_capture(ctx.ranks[rank].stream)? };
             let captured = (0..rounds).try_for_each(|_| body(rank));
@@ -211,7 +209,7 @@ fn time_rounds(ctx: &Ctx<'_>, rounds: usize, body: &dyn Fn(usize) -> Result<()>)
         let (start, stop) = (library.cuda_event_create()?, library.cuda_event_create()?);
         // SAFETY: graphs and events are live; GPU1's graph waits on GPU0's pushes.
         unsafe {
-            on_device(library, ctx.ranks[1].device, home, || library.cuda_graph_launch(graphs[1], ctx.ranks[1].stream))?;
+            on_device(library, ctx.ranks[1].device, || library.cuda_graph_launch(graphs[1], ctx.ranks[1].stream))?;
             library.cuda_event_record(start, ctx.ranks[0].stream)?;
             library.cuda_graph_launch(graphs[0], ctx.ranks[0].stream)?;
             library.cuda_event_record(stop, ctx.ranks[0].stream)?;
@@ -229,7 +227,7 @@ fn time_rounds(ctx: &Ctx<'_>, rounds: usize, body: &dyn Fn(usize) -> Result<()>)
     }
     for rank in 0..2 {
         // SAFETY: the graph's work drained (sync above).
-        on_device(library, ctx.ranks[rank].device, home, || unsafe { library.cuda_graph_exec_destroy(graphs[rank]) })?;
+        on_device(library, ctx.ranks[rank].device, || unsafe { library.cuda_graph_exec_destroy(graphs[rank]) })?;
     }
     samples.sort_by(f64::total_cmp);
     Ok(samples[samples.len() / 2])
@@ -248,11 +246,11 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
     library.cuda_set_device(0)?;
     let mut ranks = [RankDevice { device: 0, stream: std::ptr::null_mut() }, RankDevice { device: 1, stream: std::ptr::null_mut() }];
     for rank in &mut ranks {
-        rank.stream = on_device(&library, rank.device, 0, || library.cuda_stream_create())?;
+        rank.stream = on_device(&library, rank.device, || library.cuda_stream_create())?;
     }
     let programs: Programs<'_> = library.programs()?.with_manifest(&manifest)?;
     let load = |name: &str, pointers: &[&str]| -> Result<[Program<'_>; 2]> {
-        let first = on_device(&library, 1, 0, || programs.program(name, pointers))?;
+        let first = on_device(&library, 1, || programs.program(name, pointers))?;
         Ok([programs.program(name, pointers)?, first])
     };
     let ctx = Ctx {
@@ -268,8 +266,8 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
         let exchange = ContextExchange::new(&library, ranks, &buffers, None)?;
         assert_eq!(exchange.bytes() as u64, buffers.demands()?[1].bytes, "allocation == solver charge");
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-        let dev = |rank: usize, bytes: &[u8]| Buffer::with(&library, ranks[rank].device, 0, bytes);
-        let zeros = |rank: usize, bytes: usize| Buffer::new(&library, ranks[rank].device, 0, bytes);
+        let dev = |rank: usize, bytes: &[u8]| Buffer::with(&library, ranks[rank].device, bytes);
+        let zeros = |rank: usize, bytes: usize| Buffer::new(&library, ranks[rank].device, bytes);
         println!("rows | exchange | bytes/way | measured us | model us");
         for rows in [1usize, 4, 16, 64] {
             for layer in [6usize, 7] {
@@ -285,7 +283,7 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
                 let expected: Vec<u8> = (0..rows).flat_map(|r| q[0][r * Q_HALF..(r + 1) * Q_HALF].iter()
                     .chain(&q[1][r * Q_HALF..(r + 1) * Q_HALF]).copied().collect::<Vec<_>>()).collect();
                 for rank in 0..2 {
-                    assert_eq!(read(&library, ranks[rank].device, 0, assembled[rank], rows * 2 * Q_HALF)?, expected,
+                    assert_eq!(read(&library, ranks[rank].device, assembled[rank], rows * 2 * Q_HALF)?, expected,
                         "assembled query on GPU{rank}, {rows} rows");
                 }
                 // --- candidates: exchanged lists merged on each GPU == host-assembled merge on GPU0.
@@ -322,13 +320,13 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
                     for (out, (reference, what)) in [(0usize, (2usize, "scores")), (1, (3, "indices")), (3, (5, "local slots")),
                         (4, (6, "local lengths"))] {
                         let bytes = if out == 4 { rows * 4 } else { rows * K * 4 };
-                        assert_eq!(read(&library, ranks[rank].device, 0, outputs[rank][out].ptr(), bytes)?,
-                            read(&library, 0, 0, single[reference].ptr(), bytes)?,
+                        assert_eq!(read(&library, ranks[rank].device, outputs[rank][out].ptr(), bytes)?,
+                            read(&library, 0, single[reference].ptr(), bytes)?,
                             "merged {what} on GPU{rank} vs one-GPU merge, {rows} rows");
                     }
-                    assert_eq!(read(&library, ranks[rank].device, 0, outputs[rank][1].ptr(), rows * K * 4)?,
+                    assert_eq!(read(&library, ranks[rank].device, outputs[rank][1].ptr(), rows * K * 4)?,
                         i32s(&host_indices), "merged selection on GPU{rank} vs host total order");
-                    let scores = read(&library, ranks[rank].device, 0, outputs[rank][0].ptr(), rows * K * 4)?;
+                    let scores = read(&library, ranks[rank].device, outputs[rank][0].ptr(), rows * K * 4)?;
                     assert_eq!(scores, f32s(&host_scores), "merged scores on GPU{rank}");
                 }
                 drop(owned);
@@ -359,8 +357,8 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
                     ctx.combine(0, [operand(&o[0]), operand(&o[1])], sink[0].ptr(), reference.ptr(), rows)?;
                     ctx.sync()?;
                     let bytes = rows * HEADS * PARTIAL_DIM * 2;
-                    let combined = read(&library, ranks[rank].device, 0, out[rank].ptr(), bytes)?;
-                    assert_eq!(combined, read(&library, 0, 0, reference.ptr(), bytes)?,
+                    let combined = read(&library, ranks[rank].device, out[rank].ptr(), bytes)?;
+                    assert_eq!(combined, read(&library, 0, reference.ptr(), bytes)?,
                         "combine of exchanged partials on GPU{rank} vs one-GPU combine, {rows} rows");
                     assert!(combined.chunks(2).all(|h| {
                         let v = f32::from_bits(u32::from(u16::from_le_bytes([h[0], h[1]])) << 16);
@@ -428,7 +426,7 @@ fn context_exchange_is_byte_exact_and_timed_against_the_peer_model() -> Result<(
     })();
     drop(ctx);
     for rank in ranks {
-        on_device(&library, rank.device, 0, || {
+        on_device(&library, rank.device, || {
             // SAFETY: nothing else uses the test streams.
             unsafe { library.cuda_stream_synchronize(rank.stream)?; library.cuda_stream_destroy(rank.stream) }
         })?;

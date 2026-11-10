@@ -21,16 +21,15 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     let shards = [devices[0].own(|| VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
         devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?];
     let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
-    let exl3_directory = std::env::var_os("CUTEAFD_EXL3_AOT").map(std::path::PathBuf::from);
     let width = std::env::var("CUTEAFD_DSPARK_TEST_WIDTH").unwrap_or_else(|_| "5".into()).parse::<usize>()?;
     ensure!([5, 7].contains(&width), "draft qualification requires width 5 or 7");
     let capacity = crate::families::deepseek_v41::v41_experts::dspark::DsparkAttentionWave::projection_capacity_with_width(16, width)?;
     let weights = devices[1].own(|| if tp2 {
         DsparkWeights::load_tp2_with_width(&lib,&catalog,capacity,2,[32usize<<30;2],16<<20,width)
     } else {DsparkWeights::load_with_width(&lib, &catalog, capacity,
-        1, 32usize << 30, 16 << 20, width, exl3_directory.as_deref())})?;
+        1, 32usize << 30, 16 << 20, width)})?;
     let full_experts=if tp2 && full_reference {Some(devices[1].own(||DsparkWeights::load_with_width(&lib,&catalog,capacity,
-        1,32usize<<30,16<<20,width,None))?)} else {None};
+        1,32usize<<30,16<<20,width))?)} else {None};
     let reference_weights=full_experts.as_deref().unwrap_or(&weights);
     let compare_raw=|actual:&[u8],expected:&[u8],part:usize|->bool {
         if !tp2 || !full_reference || part==0 {return actual==expected;}
@@ -193,6 +192,35 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     assert!(lanes[0].output().is_err());
     runtime.block_on(unsafe { lanes[0].execute([&windows[0], &windows[1], &windows[2]], refs) })?;
     assert!(lanes[0].output().is_ok());
+    if tp2 {
+        devices[1].run(|| {
+            let chain = lanes[0].chain.get_mut();
+            let reads = chain.prepare([&windows[0], &windows[1], &windows[2]], refs)?;
+            let pending = PendingDraft { count: 3, reads, warming: false, armed: true,
+                library: &lib, stream: chain.stream.raw,
+                peers: chain.stages.each_ref().map(DsparkStage::peer_stream) };
+            let peer = pending.peers[0].as_ref().unwrap().clone();
+            let source = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
+            let destination = crate::shared::memory::device::Allocation::new(peer.device, 1 << 20)?;
+            peer.device.run(|| {
+                // Model a partial submission: peer work exists, but no root
+                // wait on its completion was installed before an error.
+                for _ in 0..128 {
+                    // SAFETY: both allocations and the peer owner outlive the guard drain.
+                    unsafe { lib.copy_d2d_async(destination.buffer, source.buffer, 1 << 20, peer.raw)?; }
+                }
+                Ok(())
+            })?;
+            drop(pending);
+            peer.device.run(|| {
+                // SAFETY: the retained peer stream is still live on its owning device.
+                ensure!(unsafe { lib.cuda_stream_query(peer.raw)? }, "pending guard released readers before peer completion");
+                Ok(())
+            })?;
+            Ok(())
+        })?;
+        eprintln!("PASS partial-submission reader guard drains unjoined peer work");
+    }
     devices[1].run(|| {
         for stage in 0..3 { for lease in &leases[stage] { windows[stage].release(*lease)?; } }
         Ok(())

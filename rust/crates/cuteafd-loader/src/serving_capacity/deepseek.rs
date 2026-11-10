@@ -174,7 +174,7 @@ pub fn deepseek_v41_cache_geometry(
 pub fn deepseek_v41_cache_bytes(config: &Value, ranks: usize, slots: u64, groups: u64,
     replicated: bool) -> Result<Vec<u64>, CacheGeometryError> {
     deepseek_v41_cache_geometry(config, ranks)?;
-    if !(1..=16).contains(&slots) || !(1..=131_072).contains(&groups)
+    if !(1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) || !(1..=131_072).contains(&groups)
         || replicated && ranks != 2 {
         return Err(CacheGeometryError::Unsupported { family: "deepseek_v41",
             what: "active slots, source pool groups or replicated cache placement" });

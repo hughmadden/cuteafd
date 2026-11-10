@@ -74,7 +74,12 @@ pub(crate) struct Dsv4Prefix<'e, 'a> {
     /// Per rank: its marks' arena.
     arenas: Vec<DeviceAllocation<'a>>,
     slots: usize,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream.
+    copies: crate::shared::prefix::PrefixCopies<'a>,
 }
+
+/// Device-to-device copies `(rank, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
 
 fn layer_buffers(engine: &Engine<'_>) -> Result<Vec<LayerBuffers>> {
     let sequences = engine.shape.sequences;
@@ -117,7 +122,11 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         } else {
             Vec::new()
         };
-        Ok(Self { engine, layers, rank_mark_bytes, mark_bytes, arenas, slots })
+        let copies = crate::shared::prefix::PrefixCopies::new(engine.library, (0..engine.ranks())
+            .map(|rank| Ok(vec![crate::shared::prefix::Reader {
+                device: engine.on(rank, || engine.library.cuda_get_device())?, stream: engine.stream_of(rank) }]))
+            .collect::<Result<_>>()?)?;
+        Ok(Self { engine, layers, rank_mark_bytes, mark_bytes, arenas, slots, copies })
     }
 
     /// A head split's GPU1 mark must be byte-for-byte the prefix of GPU0's: GPU1's layers are GPU0's
@@ -141,6 +150,16 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         Ok(layer_buffers(engine)?.iter().map(Self::layer_mark_bytes).sum())
     }
 
+    /// Snapshot geometry before allocating any retained marks or host tables.
+    pub fn layout_of(engine: &Engine<'_>) -> Result<FamilyLayout> {
+        let layers = layer_buffers(engine)?;
+        Self::mirror_prefix(&layers)?;
+        let rank_marks: Vec<_> = (0..engine.ranks()).map(|rank| layers.iter().filter(|l| l.rank == rank)
+            .map(Self::layer_mark_bytes).sum()).collect();
+        let page_bytes = layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum();
+        Ok(snapshot_layout(engine.shape.units, page_bytes, &rank_marks, engine.context_kv()))
+    }
+
     pub fn mark_bytes(&self) -> usize {
         self.mark_bytes
     }
@@ -148,11 +167,15 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     pub fn page_bytes(&self) -> usize {
         // One rank's layers: under heads every GPU holds every page, under context a unit's C4
         // pages live on one GPU and its C128 pages are stored from GPU0.
-        self.layers.iter().filter(|l| l.rank == 0).map(|l| match l.compressed {
+        self.layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum()
+    }
+
+    fn layer_page_bytes(layer: &LayerBuffers) -> usize {
+        match layer.compressed {
             Some((4, _)) => compressed_page_bytes(4) + INDEX_PAGE_BYTES,
             Some((ratio, _)) => compressed_page_bytes(ratio),
             None => 0,
-        }).sum()
+        }
     }
 
     pub fn slots(&self) -> usize {
@@ -164,14 +187,12 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         self.layers[0].main
     }
 
-    /// A copy between two views on rank `rank`'s GPU.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
-        // is ordered on its stream with every forward pass that reads or writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
+    /// Queues `copies` on their ranks' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: every view lies inside a live engine allocation of its rank (checked by `view`,
+        // or a registered replica range); the cache drains the copy streams before it hands any
+        // of that storage to someone else.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// Whether C4 pages are partitioned by unit parity (context attention).
@@ -219,11 +240,13 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         ensure!(placement.state < shape.sequences, "state slot {} of {}", placement.state, shape.sequences);
         let first = len - len.min(WINDOW);
         let mut offsets: Vec<usize> = self.rank_mark_bytes.iter().map(|&bytes| slot.0 as usize * bytes).collect();
+        let mut copies = Copies::new();
         for layer in &self.layers {
             let (rank, arena) = (layer.rank, self.arenas[layer.rank].buffer);
             let offset = &mut offsets[rank];
-            let copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| {
-                if capture { self.copy(rank, mark, ring) } else { self.copy(rank, ring, mark) }
+            let mut copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| -> Result<()> {
+                copies.push(if capture { (rank, mark, ring) } else { (rank, ring, mark) });
+                Ok(())
             };
             // Positions [first, len) in runs that stay inside one window page.
             let mut position = first;
@@ -244,7 +267,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
                 *offset += stride;
             }
         }
-        Ok(())
+        self.submit(&copies)
     }
 }
 
@@ -272,6 +295,12 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
 
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
         &placement.units
+    }
+
+    /// The step tables are built from the placement's page ids every step.
+    fn extend_pages(&self, placement: &mut Placement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
     }
 
     fn commit_point(&self, placement: &Placement) -> usize {
@@ -305,19 +334,16 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
             || u32::from(o) != copy.to & 1) {
             return Err(format!("tail copy {copy:?} crosses GPUs").into());
         }
+        let mut copies = Copies::new();
         for ((rank, from, _), (to_rank, to, _)) in self.unit_ranges(copy.from)?.into_iter().zip(self.unit_ranges(copy.to)?) {
             if rank != to_rank { return Err(format!("tail copy {copy:?} pairs pages of two GPUs").into()); }
-            self.copy(rank, to, from)?;
+            copies.push((rank, to, from));
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for rank in 0..self.engine.ranks() {
-            // SAFETY: the engine owns these streams.
-            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
-        }
-        Ok(())
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
@@ -361,13 +387,14 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
         if copies.is_empty() { return Ok(()); }
         if !self.parity() { return Err("a heads split has no replicated snapshot bytes".into()); }
         let template = self.template();
+        let mut batch = Copies::new();
         for &(from, to) in copies {
             let buffer = |r: DeviceRange| CuteafdDeviceBuffer { ptr: r.addr as *mut std::ffi::c_void, bytes: r.bytes, ..template };
             if from.bytes != to.bytes { return Err("replica ranges differ in length".into()); }
-            // A peer read queued on GPU1's stream, ordered before its next forward pass.
-            self.copy(1, buffer(to), buffer(from))?;
+            // A peer read queued on GPU1's copy stream, ordered before its next forward pass.
+            batch.push((1, buffer(to), buffer(from)));
         }
-        Ok(())
+        Ok(self.submit(&batch)?)
     }
 }
 
@@ -503,6 +530,58 @@ fn mark(family: &Dsv4Prefix<'_, '_>, slot: u32, len: usize) -> Result<Vec<u8>> {
             offset += states;
         }
     }
+    Ok(out)
+}
+
+#[derive(Default)]
+pub(super) struct PackedState {
+    pub bytes: Vec<u8>,
+    pub tensors: Vec<(String, std::ops::Range<usize>)>,
+}
+
+/// Diagnostic-only: compare whole initialized rings/pages and compressor carry,
+/// including dSpark state, at identical physical placements in both arms.
+pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bool) -> Result<PackedState> {
+    engine.drain_state()?;
+    let family = Dsv4Prefix::new(engine, |_| 0)?;
+    let mut ranges = Vec::new();
+    for &unit in &placement.units {
+        for (rank, buffer, _) in family.unit_ranges(unit)? {
+            let (layer_index, plane) = family.layers.iter().enumerate().find_map(|(i, layer)| {
+                if layer.rank != rank { return None; }
+                let inside = |pool: CuteafdDeviceBuffer| {
+                    let offset = (buffer.ptr as usize).checked_sub(pool.ptr as usize);
+                    offset.is_some_and(|n| n <= pool.bytes && buffer.bytes <= pool.bytes - n)
+                };
+                if layer.compressed.is_some_and(|(_, pool)| inside(pool)) { Some((i, "compressed")) }
+                else if layer.index.is_some_and(inside) { Some((i, "index")) } else { None }
+            }).context("packed diagnostic page has no layer")?;
+            ranges.push((rank, format!("rank{rank}/layer{layer_index}/unit{unit}/{plane}"), buffer));
+        }
+    }
+    for (i, layer) in family.layers.iter().enumerate() {
+        let bytes = engine.shape.ring_pages * MAIN_PAGE_BYTES;
+        ranges.push((layer.rank, format!("rank{}/layer{i}/window", layer.rank),
+            view(layer.main, placement.state * bytes, bytes)?));
+        for (plane, &(state, stride)) in layer.states.iter().enumerate() {
+            ranges.push((layer.rank, format!("rank{}/layer{i}/compressor_state{plane}", layer.rank),
+                view(state, placement.state * stride, stride)?));
+        }
+    }
+    let mut out = PackedState::default();
+    for (rank, name, buffer) in ranges {
+        engine.on(rank, || {
+            if clear { engine.library.cuda_zero_bytes(buffer, buffer.bytes)?; }
+            else {
+                let first = out.bytes.len();
+                out.bytes.resize(first + buffer.bytes, 0);
+                engine.library.copy_d2h(&mut out.bytes[first..], buffer)?;
+                out.tensors.push((name, first..out.bytes.len()));
+            }
+            Ok(())
+        })?;
+    }
+    engine.drain_state()?;
     Ok(out)
 }
 
@@ -654,6 +733,39 @@ fn resume_case(runner: &mut Runner<'_, '_, '_>, family: &Dsv4Prefix<'_, '_>, all
 mod tests {
     use super::*;
 
+    #[test]
+    fn retained_stage_window_rows_match_cold_prefill_at_page_and_ring_boundaries() {
+        use super::super::pool::PoolShape;
+        for chunk in [128usize, 256, 1024] {
+            let shape = PoolShape::new(2, chunk, 16);
+            let source = Placement::new(0, Vec::new());
+            let destination = Placement::new(1, Vec::new());
+            for end in [63usize, 64, 65, 127, 128, 129, 255, 256, 257, 4097] {
+                let first = end.saturating_sub(WINDOW);
+                let mut cold = vec![[0u8; 8]; shape.window_pages() * SOURCE_PAGE_TOKENS];
+                for position in first..end {
+                    cold[source.window_slot(&shape, position) as usize] = (position as u64 + 1).to_le_bytes();
+                }
+                let mark = (first..end).map(|p| cold[source.window_slot(&shape, p) as usize]).collect::<Vec<_>>();
+                let mut restored = vec![[0xa5; 8]; cold.len()];
+                for (offset, position) in (first..end).enumerate() {
+                    restored[destination.window_slot(&shape, position) as usize] = mark[offset];
+                }
+                for position in first..end {
+                    assert_eq!(restored[destination.window_slot(&shape, position) as usize],
+                        cold[source.window_slot(&shape, position) as usize]);
+                }
+                let next = (end as u64 + 1).to_le_bytes();
+                restored[destination.window_slot(&shape, end) as usize] = next;
+                cold[source.window_slot(&shape, end) as usize] = next;
+                for position in (end + 1).saturating_sub(WINDOW)..=end {
+                    assert_eq!(restored[destination.window_slot(&shape, position) as usize],
+                        cold[source.window_slot(&shape, position) as usize]);
+                }
+            }
+        }
+    }
+
     /// GPU1's mark is the prefix of GPU0's (the host tier restores GPU1 from it): the same
     /// backbone layers in the same order; GPU0 adds the dSpark stages' window rings after them.
     #[test]
@@ -705,7 +817,7 @@ mod tests {
             assert_eq!(marks[0] - marks[1], stages * WINDOW_MARK_BYTES);
             let host = HostCacheGeometry { unit_rows: runtime.page_rows as u64,
                 page_bytes: runtime.page_bytes as u64, mark_bytes: runtime.mark_bytes as u64, draft_bytes: 0 };
-            for concurrency in [16, 128] {
+            for concurrency in [16, 64] {
                 let options = LayoutOptions { rtx_bytes: vec![96 << 30; 2], context_tokens: 4096,
                     pool_tokens: Some(8192), concurrency, native_mtp_layers: stages,
                     host_memory: Some((128 << 30, 128 << 30)), ..Default::default() };

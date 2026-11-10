@@ -1,6 +1,6 @@
 //! Pre-resolved operations used by asynchronous dual-device chains.
 use crate::{CuteafdDeviceBuffer, NativeLibrary};
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::ffi::c_void;
 
 type AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut u16, usize, *mut c_void) -> i32;
@@ -24,6 +24,110 @@ impl Bf16Add<'_> {
         ensure!(status == 0, "shared TP2 addition failed with CUDA status {status}");
         Ok(())
     }
+}
+
+type F32AddFn = unsafe extern "C" fn(*const f32, *const f32, *mut f32, usize, *mut c_void) -> i32;
+pub struct F32Add<'a> { _library: &'a NativeLibrary, launch: F32AddFn }
+impl NativeLibrary {
+    pub fn f32_add(&self) -> Result<F32Add<'_>> {
+        // SAFETY: the symbol has the native header's F32 residual-add signature.
+        Ok(F32Add { _library: self,
+            launch: unsafe { *self.lib.get(b"cuteafd_cuda_residual_add_f32_async")? } })
+    }
+}
+impl F32Add<'_> {
+    /// # Safety
+    /// All operands are live on the current stream device and ordered after
+    /// their producers. The caller retains storage through completion/replay.
+    pub unsafe fn launch(&self, a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
+        validate_f32_add_buffers(a,b,output,count)?;
+        // SAFETY: validated F32 extents/devices; caller owns stream/lifetimes.
+        let status = unsafe { (self.launch)(a.ptr.cast(),b.ptr.cast(),output.ptr.cast(),count,stream) };
+        ensure!(status == 0, "shared F32 addition failed with CUDA status {status}");
+        Ok(())
+    }
+}
+pub(crate) type Bf16F32AddFn = unsafe extern "C" fn(*const u16, *const u16, *mut f32, usize, i32, *mut c_void) -> i32;
+pub(crate) type NarrowFn = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i32, *mut c_void) -> i32;
+/// Per-device narrowing launch bound once before capture or hot-path execution.
+pub struct F32Bf16Narrow<'a> { _library: &'a NativeLibrary, launch: NarrowFn, sms: i32 }
+impl NativeLibrary {
+    pub fn f32_bf16_narrow(&self) -> Result<F32Bf16Narrow<'_>> {
+        Ok(F32Bf16Narrow { _library: self, launch: self.cuteafd_load_narrow_f32_bf16()?,
+            sms: i32::try_from(self.sm_count()?)? })
+    }
+}
+impl F32Bf16Narrow<'_> {
+    /// # Safety
+    /// Operands and stream belong to the device active at construction and
+    /// remain live and disjoint through the ordered launch.
+    pub unsafe fn launch(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(n > 0 && n <= (i64::MAX - 255) as usize, "invalid F32 narrowing extent");
+        // SAFETY: caller owns typed extents and ordering; owner retains the DSO.
+        let status = unsafe { (self.launch)(src, dst, i64::try_from(n)?, self.sms, stream) };
+        ensure!(status == 0, "F32 load narrowing failed with {status}");
+        Ok(())
+    }
+}
+/// Exact BF16 widening and rank-ordered F32 addition before a single K6 egress.
+pub struct Bf16F32Add<'a> { _library: &'a NativeLibrary, launch: Bf16F32AddFn, sms: i32 }
+impl NativeLibrary {
+    pub fn bf16_f32_add(&self) -> Result<Bf16F32Add<'_>> {
+        Ok(Bf16F32Add { _library: self, launch: self.cuteafd_bf16_f32_add_async()?,
+            sms: i32::try_from(self.sm_count()?)? })
+    }
+}
+impl Bf16F32Add<'_> {
+    /// # Safety
+    /// Producers precede this operation on the current device stream. The
+    /// caller retains all allocations until completion, including graph replay.
+    pub unsafe fn launch(&self, a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+        output: CuteafdDeviceBuffer, count: usize, stream: *mut c_void) -> Result<()> {
+        validate_bf16_f32_add_buffers(a, b, output, count)?;
+        // SAFETY: validated typed extents and disjoint output; caller owns ordering.
+        let status = unsafe { (self.launch)(a.ptr.cast(), b.ptr.cast(), output.ptr.cast(), count, self.sms, stream) };
+        ensure!(status == 0, "shared BF16/F32 addition failed with CUDA status {status}");
+        Ok(())
+    }
+}
+fn validate_bf16_f32_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+    let input_bytes = count.checked_mul(2).filter(|&n| n > 0).context("invalid BF16/F32 addition extent")?;
+    let output_bytes = count.checked_mul(4).context("BF16/F32 addition output overflow")?;
+    ensure!(count <= (i64::MAX - 255) as usize, "BF16/F32 addition exceeds native extent");
+    ensure!(output.device_id >= 0 && a.device_id == output.device_id && b.device_id == output.device_id,
+        "BF16/F32 addition device mismatch");
+    for (buffer, bytes, alignment) in [(a, input_bytes, 2), (b, input_bytes, 2), (output, output_bytes, 4)] {
+        ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % alignment == 0 && buffer.bytes >= bytes
+            && buffer.flags == 0 && (buffer.ptr as usize).checked_add(bytes).is_some(),
+            "invalid BF16/F32 addition buffer");
+    }
+    let out = output.ptr as usize;
+    for source in [a, b] {
+        let start = source.ptr as usize;
+        ensure!(out + output_bytes <= start || start + input_bytes <= out,
+            "BF16/F32 addition output overlaps input");
+    }
+    Ok(())
+}
+
+fn validate_f32_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
+    output: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+    let bytes=count.checked_mul(4).filter(|&n|n>0).ok_or_else(||anyhow::anyhow!("invalid F32 addition extent"))?;
+    ensure!(count.div_ceil(256) <= i32::MAX as usize, "F32 addition grid exceeds native int32");
+    ensure!(output.device_id>=0 && a.device_id==output.device_id && b.device_id==output.device_id,
+        "F32 addition device mismatch");
+    for buffer in [a,b,output] {
+        ensure!(!buffer.ptr.is_null() && buffer.ptr as usize%4==0 && buffer.bytes>=bytes
+            && buffer.flags==0 && (buffer.ptr as usize).checked_add(bytes).is_some(), "invalid F32 addition buffer");
+    }
+    let out=output.ptr as usize;
+    for source in [a,b] {
+        let start=source.ptr as usize;
+        ensure!(out.abs_diff(start)>=bytes,"F32 addition output overlaps input");
+    }
+    Ok(())
 }
 
 fn validate_add_buffers(a: CuteafdDeviceBuffer, b: CuteafdDeviceBuffer,
@@ -74,6 +178,41 @@ mod add_tests {
     }
 
     #[test]
+    fn f32_tp_add_preserves_full_width_extents_and_rejects_aliases() {
+        let [mut a,mut b,mut out]=buffers(7168);
+        a.bytes*=2; b.bytes*=2; out.bytes*=2;
+        a.ptr=0x10000usize as *mut c_void;
+        b.ptr=0x20000usize as *mut c_void;
+        out.ptr=0x30000usize as *mut c_void;
+        validate_f32_add_buffers(a,b,out,7168).unwrap();
+        assert!(validate_f32_add_buffers(a,b,out,7169).is_err());
+        assert!(validate_f32_add_buffers(a,b,a,7168).is_err());
+        assert!(validate_f32_add_buffers(a,b,out,usize::MAX).is_err());
+        assert!(validate_f32_add_buffers(a,CuteafdDeviceBuffer{device_id:1,..b},out,7168).is_err());
+    }
+
+    #[test]
+    fn retained_bf16_inputs_require_full_f32_output_and_disjoint_ranges() {
+        let [a, b, out] = buffers(16);
+        let out = CuteafdDeviceBuffer { bytes: 64, ..out };
+        validate_bf16_f32_add_buffers(a, b, out, 16).unwrap();
+        validate_bf16_f32_add_buffers(a, a, out, 16).unwrap();
+        for count in [0, 17, usize::MAX] {
+            assert!(validate_bf16_f32_add_buffers(a, b, out, count).is_err());
+        }
+        assert!(validate_bf16_f32_add_buffers(a, b, CuteafdDeviceBuffer { bytes: 63, ..out }, 16).is_err());
+        // Output starts before an input but its wider F32 range still overlaps it.
+        let overlap = CuteafdDeviceBuffer { ptr: (a.ptr as usize - 32) as *mut c_void, ..out };
+        assert!(validate_bf16_f32_add_buffers(a, b, overlap, 16).is_err());
+        for bad in [CuteafdDeviceBuffer { flags: 1, ..a },
+            CuteafdDeviceBuffer { device_id: 1, ..a },
+            CuteafdDeviceBuffer { ptr: 1usize as *mut c_void, ..a },
+            CuteafdDeviceBuffer { ptr: (usize::MAX - 1) as *mut c_void, ..a }] {
+            assert!(validate_bf16_f32_add_buffers(bad, b, out, 16).is_err());
+        }
+    }
+
+    #[test]
     fn shared_add_rejects_overflow_aliases_and_invalid_devices() {
         let [a, b, output] = buffers(16);
         for count in [0, usize::MAX / 2 + 1, usize::MAX] {
@@ -106,8 +245,39 @@ impl NativeLibrary {
     }
 }
 impl V41PeerCopy<'_> {
+    /// Interleave independent BF16 gate/up planes on one serialized stream.
+    /// The caller retains allocation owners until the stream drains.
+    pub fn interleave_bf16(&self, destination:CuteafdDeviceBuffer,gate:CuteafdDeviceBuffer,
+        up:CuteafdDeviceBuffer,rows:usize,width:usize,stream:*mut c_void)->Result<()> {
+        ensure!((1..=4096).contains(&rows) && width>0,"invalid gate/up interleave shape");
+        let row_bytes=width.checked_mul(2).context("gate/up row overflow")?;
+        let plane_bytes=rows.checked_mul(row_bytes).context("gate/up plane overflow")?;
+        let total=plane_bytes.checked_mul(2).context("gate/up destination overflow")?;
+        let pitch=row_bytes.checked_mul(2).context("gate/up pitch overflow")?;
+        let mut ranges=[(0,0);3];
+        for (i,(buffer,bytes)) in [(destination,total),(gate,plane_bytes),(up,plane_bytes)].into_iter().enumerate() {
+            ensure!(buffer.device_id>=0 && buffer.device_id==destination.device_id && buffer.flags==0
+                && !buffer.ptr.is_null() && (buffer.ptr as usize)%2==0 && buffer.bytes>=bytes,
+                "gate/up interleave device/extent/alignment");
+            let start=buffer.ptr as usize;
+            let end=start.checked_add(bytes).context("gate/up interleave pointer overflow")?;
+            ranges[i]=(start,end);
+        }
+        ensure!(ranges.iter().enumerate().all(|(i,&(start,end))|ranges[..i].iter()
+            .all(|&(other_start,other_end)|end<=other_start || other_end<=start)),"gate/up planes overlap");
+        let second=CuteafdDeviceBuffer {ptr:destination.ptr.wrapping_byte_add(row_bytes),
+            bytes:destination.bytes-row_bytes,..destination};
+        // SAFETY: disjoint local extents, device, pitches and pointer arithmetic
+        // are checked above; the serialized caller retains all stream owners.
+        unsafe {
+            self.launch_rows(destination,gate,row_bytes,rows,pitch,row_bytes,stream)?;
+            self.launch_rows(second,up,row_bytes,rows,pitch,row_bytes,stream)?;
+        }
+        Ok(())
+    }
     /// # Safety
-    /// Destination is on the current stream device; source peer access is enabled.
+    /// One buffer is on the current stream device; access to the other peer is
+    /// enabled. Either destination-issued reads or source-issued writes are valid.
     /// Producers precede this stream, buffers are disjoint and live through
     /// completion, and no conflicting access occurs. Initialize before capture.
     pub unsafe fn launch(&self,destination: CuteafdDeviceBuffer,source: CuteafdDeviceBuffer,

@@ -61,12 +61,108 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+def test_draft_bf16_group_matches_exported_shapes():
+    exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
+    for scope in ("all", "suspects"):
+        job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")
+        assert job[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "qwen38", "--only", expected])
+
+
+def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
+    path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(path.read_text())
+    packages = compare_sm.load_file("compare_native_packages", ROOT / "python/tools/lib/spark_packages.py")
+    policy = compare_sm.load_file("compare_native_policy", ROOT / "python/tools/lib/mxfp4_layouts.py")
+    artifact, = packages.native_spark_artifacts("dsv4p")[3]
+    assert (artifact.role, artifact.logical, artifact.stored) == (6, 1024, 1024)
+    assert artifact.stored == policy.stored_width(7168, artifact.logical)
+    tp8, = packages.native_spark_artifacts("v41")[8]
+    assert tp8.stored == policy.stored_width(5120, tp8.logical) == 288
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "export")
+    for node in ast.walk(function):
+        test = ast.unparse(node.test).replace("'", '"') if isinstance(node, (ast.If, ast.IfExp)) else ''
+        if isinstance(node, ast.If) and any(isinstance(child, ast.Raise) for child in node.body):
+            assert not ('family != "v41"' in test and 'spark_tp3' in test)
+        if isinstance(node, ast.IfExp) and isinstance(node.body, ast.Call) and isinstance(node.body.func, ast.Name) and node.body.func.id == "launch_geometry":
+            assert 'family == "v41"' in test
+
+
+@pytest.mark.parametrize("role,cmake", [
+    ("rtx_backbone", "v41_local_experts.cmake"),
+    ("rtx_tp2", "v41_tp2_experts.cmake"),
+])
+def test_v41_slice_gate_matches_ordered_serving_recipe(role, cmake):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"v41-slices-{role}")
+    assert job[2] == ["--role", role, "--rows", compare_sm.V41_CAPACITIES,
+                      "--width", "192", "--standard-names"]
+    recipe = (ROOT / "native/cmake/families/deepseek_v41" / cmake).read_text()
+    assert f"--role {role}" in recipe
+    assert "--rows ${CUTEAFD_V41_TARGET_ROWS_ARG} --width 192 --standard-names" in recipe
+    assert "--atomic-min-capacity" not in recipe
+
+
+@pytest.mark.parametrize("family", ("v41", "dsv4f", "dsv4p"))
+def test_native_artifact_gate_uses_the_serving_tile_and_output_recipe(family):
+    packages = compare_sm.load_file("compare_artifact_recipes", ROOT / "python/tools/lib/spark_packages.py")
+    artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                 for artifact in values}
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    for role, artifact in artifacts.items():
+        args = jobs[f"{family}-{role}"]
+        width = 192 if family == "v41" and (
+            not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
+        assert args[args.index("--width") + 1] == ",".join(
+            f"{capacity}:{width}" for capacity in (compare_sm.V41_CAPACITIES if family == "v41" else compare_sm.CAPACITIES).split(","))
+        assert ("--atomic-min-capacity" in args) == (
+            family == "dsv4p" and not role.startswith("spark_w"))
+
+
+@pytest.mark.parametrize("family,hidden", [("v41", 5120), ("dsv4f", 4096), ("dsv4p", 7168)])
+def test_native_compare_jobs_resolve_the_exporters_shared_tile_and_split(family, hidden):
+    packages = compare_sm.load_file("compare_recipe_packages", ROOT / "python/tools/lib/spark_packages.py")
+    policy = compare_sm.load_file("compare_recipe_policy", ROOT / "python/tools/lib/mxfp4_layouts.py")
+    path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(path.read_text())
+    export = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "export")
+    width_assignment, = [node for node in ast.walk(export) if isinstance(node, ast.Assign)
+                         and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                         and node.value.func.id == "native_slice_width"]
+    pipeline, = [node for node in ast.walk(export) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "V41SlicePipeline"]
+    split = next(keyword.value for keyword in pipeline.keywords if keyword.arg == "fc1_k_splits")
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                 for artifact in values}
+    for role, artifact in artifacts.items():
+        args = jobs[f"{family}-{role}"]
+        fallback = dict(tuple(map(int, pair.split(":")))
+                        for pair in args[args.index("--width") + 1].split(","))
+        for capacity, width in fallback.items():
+            namespace = dict(hidden=hidden, intermediate=artifact.logical, capacity=capacity,
+                             selected_width=width, role=role, props=SimpleNamespace(major=12, minor=1),
+                             native_slice_width=policy.native_slice_width,
+                             native_fc1_k_splits=policy.native_fc1_k_splits)
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[width_assignment], type_ignores=[])),
+                         str(path), "exec"), namespace)
+            selected_split = eval(compile(ast.Expression(split), str(path), "eval"), namespace)
+            assert namespace["selected_width"] == policy.native_slice_width(
+                hidden, artifact.logical, 121, capacity, width)
+            assert selected_split == policy.native_fc1_k_splits(hidden, artifact.logical, 121, capacity)
+            if family == "v41" and artifact.logical == 384:
+                assert (namespace["selected_width"], selected_split) == (
+                    (128, 2) if capacity <= 80 else (192, 1))
+
+
 @pytest.mark.parametrize("group,names", [
     ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
                   "attn_res_c4_add", "attn_res_c5_add",
                   "attn_res_c9_add", "attn_res_c9_replace", "attn_res_c9_keep"]),
     ("latent", ["rmsnorm_h3584", "rmsnorm_h7168", "latent_down", "latent_up"]),
     ("situ", [f"situ_i{width}" for width in (3072, 6144, 16896, 33792)]),
+    ("ffn", [f"ffn_{op}_i{width}" for width in (3072, 6144, 16896, 33792)
+             for op in ("gate_up", "down")] +
+            [f"ffn_gate_up_i{width}_comp" for width in (3072, 6144, 16896, 33792)]),
 ])
 def test_kimi_w8_cross_sm_groups(group, names):
     job = next(job for job in compare_sm.jobs("suspects") if job[0] == f"kimi-{group}")
@@ -74,11 +170,120 @@ def test_kimi_w8_cross_sm_groups(group, names):
                    ["--geometry", "kimik3", "--only", ",".join(names)])
 
 
+def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
+    for scope in ("suspects", "all"):
+        job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-draft-context-fc")
+        assert job == ("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "ml4", "--only", "draft_context_fc"])
+
+
+def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
+    names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
+             "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
+             "mla_draft_attention_full_fp8_m64", "mla_draft_attention_w4096_fp8_m64"]
+    job = next(job for job in compare_sm.jobs("suspects") if job[0] == "mla-draft-h64")
+    assert job == ("mla-draft-h64", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "kimik3", "--only", ",".join(names)])
+    source = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(source.read_text())
+    tree.body = [node for node in tree.body
+                 if isinstance(node, ast.FunctionDef) and node.name == "mla_draft_programs"]
+    calls = []
+
+    def compile_fake(g, **kwargs):
+        calls.append((g, kwargs))
+        return kwargs
+
+    module = SimpleNamespace(kimi_mla=SimpleNamespace(
+        MlaDraftGeometry=lambda **kwargs: kwargs,
+        **{f"compile_mla_draft_{op}_aot": compile_fake for op in ("producer", "output", "attention")}))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", module)
+    ns = {}
+    exec(compile(tree, str(source), "exec"), ns)
+    programs = ns["mla_draft_programs"](64, 262144)
+    assert {row[0] for row in programs} == set(names)
+    for row in programs:
+        row[-1]()
+    assert calls == [({"window_size": None, "kv_cache": "bf16"}, {"max_rows": 64})] + [
+        (dict(window_size=window, kv_cache=cache), dict(max_rows=64, **extra))
+        for cache in ("bf16", "fp8")
+        for window, extra in ((None, {}), (None, {"max_context": 262144}),
+                              (4096, {"max_context": 262144}))]
+
+
+
+@pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage"])
+def test_glm_stage_cross_sm_groups(geometry):
+    name = geometry.replace("_", "-")
+    job = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert job == (name, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
+
+
+def test_kimik3_package_and_route_registry_are_both_sm_gated(monkeypatch):
+    jobs = compare_sm.jobs("all")
+    for name, exporter, extra in [
+        ("exl3-kimik3", "package_exl3_aot.py", []),
+        ("exl3-kimik3-k23", "package_exl3_aot.py", ["--bits", "2,3"]),
+        ("exl3-routes-kimik3", "export_b12x_exl3_routes_aot.py", []),
+    ]:
+        # Kimi K3 merges up to three 2752-row wave units, so its gate covers
+        # the 5504/8256 extents the other EXL3 geometries never pack.
+        assert [job for job in jobs if job[0] == name] == [
+            (name, exporter, ["--geometry", "kimik3", "--capacities",
+                              compare_sm.EXL3_CAPACITIES_KIMIK3, *extra])]
+    # Negative control: the old list silently omitted the route registry.
+    monkeypatch.setattr(compare_sm, "EXL3_GEOMETRIES",
+                        tuple(g for g in compare_sm.EXL3_GEOMETRIES if g != "kimik3"))
+    assert not any(job[0] == "exl3-routes-kimik3" for job in compare_sm.jobs("all"))
+
+
 def test_mimop_k32_tp6_uses_production_exact_slice_export():
     job = next(job for job in compare_sm.jobs("all") if job[0] == "routed-mimop-tp6")
     assert job == ("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", compare_sm.CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"])
+
+
+@pytest.mark.parametrize("geometry,bits", [
+    ("qwen4", "45"), ("glm", "45"), ("glmf", "34"),
+])
+def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, geometry, bits):
+    name = f"exl3-compact-{geometry}-k{bits}"
+    _, exporter, args = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert exporter == "package_exl3_aot.py"
+    package = compare_sm.load_file("test_compact_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
+    capacities = package.package_capacities(geometry, compare_sm.EXL3_CAPACITIES)
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    compare_sm._export_exl3(args, tmp_path)
+    assert [(values[0], values[1], values[2], values[3], values[5], values[6], values[7])
+            for values, _ in recorded] == [
+        (tmp_path / profile / f"m{rows}", width, experts, rows, "auto", topk, dtype)
+        for profile, width, experts, topk, dtype, _ in profiles for rows in capacities]
+    for values, options in recorded:
+        assert values[4] == tuple(map(int, bits))
+        assert options["compile_only"] and options["compact_weights"]
+        assert not options.get("wire_input")
+        width, rows = values[1], values[3]
+        # The gate must export exactly the cell the packager claims: FC2 N128
+        # cooperative, or FC2 N256 with dynamic claims on a measured compact
+        # warp-specialized cell (GLM K4/K5 width 384 at 256/1024/2752/4096).
+        ws = package.compact_ws_export(geometry, "spark", width, rows, tuple(map(int, bits)))
+        assert bool(options.get("warp_specialized")) == ws
+        assert bool(options.get("ws_dynamic_tiles")) == ws
+        assert options["tile"] == (
+            package.ws_tile(geometry, "spark", width, rows, compact=True) if ws
+            else (64, 128, 64, 128))
+        assert options.get("route_block", 8) == (
+            package.compact_ws_route_block(geometry, "spark", width, rows) if ws
+            else package.route_block(geometry, rows, 'coordinator'))
+        assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
+    widths = {profile[1] for profile in profiles}
+    assert widths == ({256, 384} if geometry == "qwen4" else
+                      {640} if geometry == "v41" else {384, 512, 768})
 
 
 def test_identical_object_ignores_context_metadata(tmp_path):
@@ -108,6 +313,184 @@ def test_missing_objects_fail_closed(tmp_path):
     (right / "test.o").unlink()
     with pytest.raises(ValueError, match="object set mismatch"):
         compare_sm.compare(left, right)
+
+
+@pytest.mark.parametrize("source_comparison", [False, True])
+def test_inventory_changes_only_allowed_for_source_comparison(tmp_path, source_comparison):
+    left, right = exports(tmp_path)
+    if source_comparison:
+        path = right / "comparison-context.json"
+        context = json.loads(path.read_text())
+        context["sms"] = 188
+        path.write_text(json.dumps(context))
+    (left / "removed.cubin").write_bytes(cuda_elf(b"old-route"))
+    (right / "added.o").write_bytes(cuda_elf(b"new-route"))
+    (right / "added.h").write_text("new ABI\n")
+    if not source_comparison:
+        with pytest.raises(ValueError, match="object set mismatch"):
+            compare_sm.compare(left, right)
+        return
+    report = compare_sm.compare(left, right, source_comparison=True)
+    assert report["added_programs"] == ["added.o"]
+    assert report["removed_programs"] == ["removed.cubin"]
+    assert [row["program"] for row in report["programs"]] == ["test"]
+    assert report["programs"][0]["object_identical"]
+    assert report["headers_changed"] == ["added.h"]
+
+
+@pytest.mark.parametrize("side", ["added", "removed"])
+@pytest.mark.parametrize("invalid", ["cuda", "header"])
+def test_source_inventory_changes_require_cuda_and_object_headers(tmp_path, side, invalid):
+    left, right = exports(tmp_path)
+    path = right / "comparison-context.json"
+    context = json.loads(path.read_text())
+    context["sms"] = 188
+    path.write_text(json.dumps(context))
+    directory = right if side == "added" else left
+    (directory / "route.o").write_bytes(b"not CUDA" if invalid == "cuda" else cuda_elf())
+    if invalid == "cuda":
+        (directory / "route.h").write_text("ABI\n")
+    with pytest.raises(ValueError, match="no CUDA ELF" if invalid == "cuda" else "missing exported ABI"):
+        compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_source_comparison_still_rejects_empty_inventory(tmp_path):
+    left, right = exports(tmp_path)
+    (right / "test.o").unlink()
+    with pytest.raises(ValueError, match="object set mismatch"):
+        compare_sm.compare(left, right, source_comparison=True)
+
+
+def removal_exports(tmp_path):
+    left, right = exports(tmp_path)
+    path = right / "comparison-context.json"
+    context = json.loads(path.read_text())
+    context["sms"] = 188
+    path.write_text(json.dumps(context))
+    (left / "removed.o").write_bytes(cuda_elf(b"old-route"))
+    (left / "removed.h").write_text("old ABI\n")
+    for directory in (left, right):
+        path = directory / "table.json"
+        table = json.loads(path.read_text())
+        if directory == left:
+            table["programs"].insert(0, {"name": "removed", "scratch_bytes_at_capacity": 0})
+        path.write_text(json.dumps(table))
+        names = [row["name"] for row in table["programs"]]
+        (directory / "dsv4_programs.h").write_text("\n".join([
+            "#pragma once", *(f'#include "{name}.h"' for name in names),
+            "#define CUTEAFD_DSV4_CC_MINOR 0",
+            "#define CUTEAFD_DSV4_PROGRAMS " + ", ".join(
+                f'{{"{name}", init_{name}, load_{name}, call_{name}, 5, "iii", 0}}' for name in names), ""]))
+    return left, right
+
+
+@pytest.mark.parametrize("mutation", ["table_abi", "table_order", "macro", "include", "missing_record"])
+def test_expected_removals_aggregate_survivor_changes_fail(tmp_path, mutation):
+    left, right = removal_exports(tmp_path)
+    path = right / "dsv4_programs.h"
+    text = path.read_text()
+    if mutation == "table_abi":
+        text = text.replace('5, "iii", 0', '6, "iii", 0')
+    elif mutation == "table_order":
+        text = text.replace("init_test, load_test", "load_test, init_test")
+    elif mutation == "macro":
+        text = text.replace("CC_MINOR 0", "CC_MINOR 1")
+    elif mutation == "include":
+        text = text.replace('#include "test.h"', '#include "other.h"')
+    else:
+        baseline = left / "dsv4_programs.h"
+        baseline.write_text(baseline.read_text().replace('"removed",', '"not_removed",'))
+    path.write_text(text)
+    with pytest.raises(ValueError, match="changed survivors|aggregate header"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+
+
+def test_expected_removals_exact_set_preserves_survivors(tmp_path):
+    report = compare_sm.compare(*removal_exports(tmp_path), source_comparison=True,
+                                expected_removals={"removed"})
+    compare_sm.validate_expected_removals([report], {"removed"})
+    assert report["removed_programs"] == ["removed.o"]
+    assert report["programs"][0]["object_identical"]
+
+
+@pytest.mark.parametrize("expected", [set(), {"removed", "missing"}])
+def test_expected_removals_extra_or_missing_fails(tmp_path, expected):
+    report = compare_sm.compare(*removal_exports(tmp_path), source_comparison=True,
+                                expected_removals=expected)
+    with pytest.raises(ValueError, match="expected removals mismatch"):
+        compare_sm.validate_expected_removals([report], expected)
+
+
+@pytest.mark.parametrize("mutation", ["object", "header", "metadata", "table", "orphan_header"])
+def test_expected_removals_changed_survivor_fails(tmp_path, mutation):
+    left, right = removal_exports(tmp_path)
+    if mutation == "object":
+        (right / "test.o").write_bytes(cuda_elf(b"changed-route"))
+    elif mutation == "header":
+        (right / "test.h").write_text("changed ABI\n")
+    elif mutation == "orphan_header":
+        (right / "orphan.h").write_text("unrelated ABI\n")
+    else:
+        path = right / "table.json"
+        table = json.loads(path.read_text())
+        if mutation == "metadata":
+            table["programs"][0]["scratch_bytes_at_capacity"] += 1
+        else:
+            table["schema"] = 99
+        path.write_text(json.dumps(table))
+    with pytest.raises(ValueError, match="changed survivors"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+
+
+def test_expected_removals_added_program_fails(tmp_path):
+    left, right = removal_exports(tmp_path)
+    (right / "added.cubin").write_bytes(cuda_elf())
+    report = compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+    with pytest.raises(ValueError, match="added=.*added.cubin"):
+        compare_sm.validate_expected_removals([report], {"removed"})
+
+
+def test_expected_removals_partial_artifact_deletion_fails(tmp_path):
+    left, right = removal_exports(tmp_path)
+    for directory in (left, right):
+        (directory / "removed.cubin").write_bytes(cuda_elf(b"old-route"))
+    with pytest.raises(ValueError, match="partially removed"):
+        compare_sm.compare(left, right, source_comparison=True, expected_removals={"removed"})
+
+
+@pytest.mark.parametrize("contents", ["", "same\nsame\n", "bad.o\n", "../bad\n", "/bad\n", " bad\n"])
+def test_expected_removals_file_rejects_invalid_names(tmp_path, contents):
+    path = tmp_path / "removals.txt"
+    path.write_text(contents)
+    with pytest.raises(ValueError, match="expected removal"):
+        compare_sm.read_expected_removals(path)
+
+
+def test_expected_removals_main_gates_exact_aggregate_and_baseline(tmp_path, monkeypatch):
+    left, right = removal_exports(tmp_path)
+    group = tmp_path / "group"
+    group.mkdir()
+    left.rename(group / "baseline")
+    right.rename(group / "candidate")
+    baseline = tmp_path / "source"
+    (baseline / "third_party").mkdir(parents=True)
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    expected = tmp_path / "removals.txt"
+    expected.write_text("removed\n")
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("group", "export.py", [])])
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+        SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+    argv = ["compare-sm-exports.py", "--compare-only", "--require-identical", "--output-dir", str(tmp_path),
+            "--expected-removals", str(expected), "--baseline-source", str(baseline)]
+    monkeypatch.setattr(compare_sm.sys, "argv", argv)
+    assert compare_sm.main() == 0
+    expected.write_text("removed\nmissing\n")
+    assert compare_sm.main() == 1
+    monkeypatch.setattr(compare_sm.sys, "argv", argv[:-2])
+    with pytest.raises(SystemExit) as error:
+        compare_sm.main()
+    assert error.value.code == 2
 
 
 def test_missing_cubins_fail_closed(tmp_path):
@@ -203,6 +586,37 @@ def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
     assert job == (f"step5-{group}{suffix}", "export_b12x_step5_aot.py", expected)
 
 
+@pytest.mark.parametrize("heads,suffix", [(128, ""), (64, "-tp2")])
+@pytest.mark.parametrize("group", ["pointwise", "projections", "attention"])
+def test_muse_export_groups_bind_native_geometry(heads, suffix, group):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"muse-{group}{suffix}")
+    assert job == (f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                   ["--heads", str(heads), "--group", group])
+    dense = next(job for job in compare_sm.jobs("all") if job[0] == "muse-k6-dense")
+    assert dense[2] == ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]
+
+
+def test_tp_partial_groups_are_generic_and_combine_ranks_are_runtime():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert jobs["expert-partial"] == ("export_b12x_expert_partial_aot.py", [])
+    assert jobs["muse-tp-combine"] == ("export_b12x_muse_aot.py", ["--group", "tp-combine"])
+
+
+def test_muse_tp_combine_exports_only_once(monkeypatch):
+    module_path = ROOT / "python/tools/aot/export_b12x_muse_aot.py"
+    spec = importlib.util.spec_from_file_location("muse_unique_combine_exports", module_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "builders", lambda heads, group, max_rows=4096:
+                        {group: lambda: None})
+    whole = [name for name, *_ in module.programs(128)]
+    tp2 = [name for name, *_ in module.programs(64)]
+    assert whole.count("tp-combine") == 1
+    assert "tp-combine" not in tp2
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
     import types
@@ -218,7 +632,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = {name: build() for name, build in module.builders(heads, "projections").items()}
-    assert len(calls) == 12
+    assert len(calls) == 13
     for name, (width, outputs, dtype) in {
         "attn_q": (4096, heads * 192, "bf16"),
         "attn_kv": (4096, heads // 16 * 192, "bf16"),
@@ -232,6 +646,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
         "dense_down": (13824, 4096, "bf16"),
         "shared_gate_up": (4096, 3072, "bf16"),
         "shared_down": (1536, 4096, "bf16"),
+        "mtp_eh": (8192, 4096, "bf16"),
     }.items():
         assert calls[name] == dict(width=width, outputs=outputs, output_dtype=dtype)
 
@@ -253,7 +668,10 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     assert {f"exl3-routes-{name}" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
     assert {"audio", "vision-attention"} <= set(names)
     assert {f"exl3-{name}-k23" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
-    assert {"exl3-glm-k45", "exl3-qwen4-k45", "exl3-qwen4-k345", "exl3-qwen4-k2345"} <= set(names)
+    assert {"exl3-glm-k45", "exl3-qwen4-k45", "exl3-ml4-k45"} <= set(names)
+    ml4_args = next(args for name, _, args in jobs if name == "exl3-ml4-k45")
+    assert ml4_args[ml4_args.index("--bits") + 1] == "4,5"
+    assert not {"exl3-qwen4-k345", "exl3-qwen4-k2345"} & set(names)
     assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf")} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)
     assert {"suspect-flash-m1", "suspect-flash-m16", "suspect-glm-mla", "suspect-glmf-mla"} <= set(names)
@@ -265,7 +683,9 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             args = next(args for name, _, args in jobs if name == f"{family}-slices{suffix}")
             assert args[args.index("--geometry") + 1] == family
             assert args[args.index("--role") + 1] == role
-            assert args[args.index("--atomic-min-capacity") + 1] == "256"
+            assert ("--atomic-min-capacity" in args) == (family == "dsv4p")
+            if family == "dsv4p":
+                assert args[args.index("--atomic-min-capacity") + 1] == "256"
 
 
 @pytest.mark.parametrize("geometry", ["glmf", "glmf2", "kimik3"])
@@ -326,14 +746,16 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         route_block=lambda *_: 8, swiglu_limit=lambda *_: 10.0,
         wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
-        decode_tile=lambda *_: None,
+        decode_tile=lambda *_: None, activation=lambda *_: "silu",
+        default_decode_schedule=lambda *_: None,
+        decode_schedule_variants=lambda *_: [],
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *args, **kwargs: recorded.append((args, kwargs))))
-    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024", "--role", "spark",
                             "--bits", ",".join(map(str, bits))], tmp_path)
     assert len(recorded) == 1
     assert recorded[0][0][4] == bits
@@ -352,12 +774,133 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
     assert [module._trellis256_execution_lut for module in (first, fourth)] == originals
 
 
-def test_production_package_limits_special_rotation_to_two_tiers():
-    source = (ROOT / "python/tools/aot/package_exl3_aot.py").read_text()
-    for policy in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
-        matches = [line for line in source.splitlines()
-                   if f"{policy}(geometry," in line and line.startswith("                ")]
-        assert matches and all("len(args.bits) == 2" in line for line in matches)
+@pytest.mark.parametrize("geometry,compact,role,bits", [
+    ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
+    ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
+    ("glmf", False, "spark", (3, 4)), ("glmf", False, "coordinator", (3, 4)),
+    ("glmf", False, "coordinator", (4, 5)),
+])
+def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
+    fixture = compare_sm.load_file(
+        "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    package = fixture.package
+    # Compare decode and prefill options against the real packager.
+    capacities = (1, 80, 256, 1024, 2752, 4096)
+    build_root = tmp_path / "build-fixture"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, role, bits, geometry=geometry,
+        capacities=capacities, compact=compact,
+        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
+    expected = [(call.args[1], call.args[3], call.kwargs) for call in calls
+                if bool(call.kwargs.get("compact_weights")) == compact]
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
+            "--capacities", ",".join(map(str, capacities))]
+    if compact:
+        args.append("--compact-companions")
+    compare_sm._export_exl3(args, tmp_path / "gate")
+    assert recorded
+    if geometry == "glmf" and role == "spark" and not compact:
+        assert any(str(values[0]).endswith("m1-gb10") for values, _ in recorded)
+        assert any(options.get("decode_schedule") == "gb10" for _, options in recorded)
+    for values, options in recorded:
+        assert options.pop("compile_only") is True
+        assert (values[1], values[3], options) in expected
+    if compact:
+        # Qwen4 compact now carries measured warp-specialized cells at the
+        # served capacities and keeps the cooperative kernel at decode ones;
+        # the gate must reproduce both streams.
+        assert any(options.get("warp_specialized") for _, options in recorded)
+        assert any(not options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
+    else:
+        assert any(options.get("warp_specialized") for _, options in recorded)
+
+
+def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypatch):
+    package = compare_sm.load_file("test_routes_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    for geometry, expected in (
+        ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
+        ("glmf", [("m80", 80, 288, 8, 8), ("m256", 256, 288, 8, 64),
+                  ("m1024", 1024, 288, 8, 64)]),
+        ("dsv4p", [("m80", 80, 384, 6, 8), ("m256-b8", 256, 384, 6, 8),
+                   ("m256-b64", 256, 384, 6, 64), ("m1024", 1024, 384, 6, 64)]),
+        ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 64), ("m1024", 1024, 896, 16, 64)]),
+    ):
+        recorded = []
+        monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(
+            export=lambda out, rows, experts, topk, block, rec=recorded:
+                rec.append((out.name, rows, experts, topk, block))))
+        compare_sm.export_exl3_routes(["--geometry", geometry, "--capacities", "80,256,1024"],
+                                      tmp_path / geometry)
+        assert recorded == expected
+
+
+# Measured quant of each family's coordinator warp-specialized exports: another
+# tier pair of the same geometry is a different kernel cost and stays
+# cooperative until it is measured (`WS_TIER_PAIRS`).
+COORDINATOR_TIERS = {"glm": (4, 5), "glmf": (3, 4), "qwen4": (4, 5),
+                     "dsv4p": (2, 3), "kimik3": (2, 3)}
+CELL_OPTIONS = {"route_block", "wire", "stages", "dynamic", "tile"}
+
+
+def coordinator_package():
+    return compare_sm.load_file("test_coordinator_package",
+                                ROOT / "python/tools/aot/package_exl3_aot.py")
+
+
+def test_coordinator_ws_cells_are_exportable():
+    package = coordinator_package()
+    assert package.COORDINATOR_WS_CELLS
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        assert set(cell) <= CELL_OPTIONS and "route_block" in cell
+        assert package.warp_specialized(geometry, "coordinator", width, capacity)
+        # A cell no shipped coordinator profile or capacity can name never runs.
+        assert width in {profile[1] for profile in package.profiles_for_role("coordinator", geometry)}
+        assert capacity in package.package_capacities(geometry, str(capacity))
+
+
+def test_coordinator_ws_options_follow_the_measured_cell():
+    package = coordinator_package()
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        role = "coordinator"
+        assert package.warp_specialized(geometry, role, width, capacity)
+        assert package.ws_route_block(geometry, role, width, capacity) == cell["route_block"]
+        assert package.wire_input(geometry, role, width, capacity) == bool(cell.get("wire"))
+        assert package.ws_input_stages(geometry, role, width, capacity) == cell.get("stages")
+        assert package.ws_dynamic_tiles(geometry, role, width, capacity) == bool(cell.get("dynamic"))
+        assert package.ws_tile(geometry, role, width, capacity) == cell.get("tile")
+
+
+def test_coordinator_ws_policy_preserves_decode_and_kimi_recipes():
+    package = coordinator_package()
+    capacities = (1, 80, 256, 1024, 2752, 4096)
+    for geometry in COORDINATOR_TIERS:
+        for _, width, *_ in package.profiles_for_role("coordinator", geometry):
+            for capacity in capacities:
+                expected = ((geometry, width, capacity) in package.COORDINATOR_WS_CELLS
+                            if geometry == "kimik3" else capacity > 80 and
+                            (geometry, width, capacity) not in package.COOPERATIVE_PREFILL_CELLS)
+                assert package.warp_specialized(geometry, "coordinator", width, capacity) == expected
+
+
+@pytest.mark.parametrize("bits", [(2, 3), (2, 4), (2, 5), (3, 4), (3, 5), (4, 5)])
+def test_coordinator_all_two_tier_pairs_export_ws(tmp_path, bits):
+    fixture = compare_sm.load_file(
+        "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    # Tier selection must not silently fall back to cooperative prefill.
+    build_root = tmp_path / "build-fixture"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, "coordinator", bits, geometry="glm", capacities=(1024,),
+        profiles=("rtx-tp2",))
+    assert calls
+    assert all(call.kwargs.get("warp_specialized") for call in calls)
 
 
 def residency_gate(name="validate_table_residency"):
@@ -428,7 +971,7 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     def compare(left, right):
         if left.parent.name == "bad":
             raise ValueError("missing pair")
-        return {"programs": []}
+        return {"programs": [], "added_programs": [], "removed_programs": []}
 
     monkeypatch.setattr(compare_sm, "compare", compare)
     assert compare_sm.main() == 1
@@ -449,6 +992,8 @@ def test_step5_norms_take_runtime_epsilon_and_keep_final_bf16_boundary(monkeypat
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=pointwise))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.dsv4_ffn", SimpleNamespace(
+        compile_dsv4_expert_input_quant_aot=lambda geometry: geometry))
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = {name: build() for name, build in module.builders(heads, "pointwise").items()
@@ -479,6 +1024,8 @@ def test_step5_rope_builders_cover_all_policy_modes_without_recipe_specializatio
     monkeypatch.setitem(sys.modules, "b12x", types.ModuleType("b12x"))
     monkeypatch.setitem(sys.modules, "b12x.integration", types.ModuleType("b12x.integration"))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(pointwise=SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.dsv4_ffn", SimpleNamespace(
+        compile_dsv4_expert_input_quant_aot=lambda geometry: geometry))
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.rope", SimpleNamespace(
         compile_rope_tables_aot=lambda **kwargs: kwargs))
     module = importlib.util.module_from_spec(spec)
@@ -502,3 +1049,302 @@ def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_p
     context_file.write_text(json.dumps(context))
     with pytest.raises(ValueError, match="toolchain"):
         compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_indirect_fp8_and_mxfp4_streams_are_in_the_sm_gate():
+    cases = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    for geometry in ("mimo", "mimof"):
+        exporter, args = cases[f"routed-{geometry}-row-addresses"]
+        assert exporter == "package_fp8_moe_aot.py"
+        assert "--row-addresses" in args
+        assert args[args.index("--capacities") + 1] == "2752"
+    ordinary = cases["routed-mimo"][1]
+    assert "--row-addresses" not in ordinary
+
+
+def test_source_routed_layouts_use_checkout_policy_not_candidate_worlds(tmp_path, monkeypatch):
+    source = tmp_path / 'package.py'
+    source.write_text('''
+def build(args):
+    capacities = []
+    layouts = args.layouts.split(',')
+    if args.exact_slices:
+        layouts += [name + '-w128' for name in list(layouts)]
+    wire = False
+    raise AssertionError('must not enter compilation')
+''')
+    monkeypatch.setattr(compare_sm, 'ROOT', tmp_path)
+    scope = SimpleNamespace(PREVIOUS_RELEASE_FLOOR={'GENERIC_SPARK_COUNTS': {'mimo=2', 'mimo=4'}})
+    monkeypatch.setattr(compare_sm, 'load_file', lambda *args: scope)
+    package = SimpleNamespace(__file__=str(source))
+    assert compare_sm.routed_package_layouts(package, 'mimo', None, 'spark') == [
+        'tp2', 'tp4', 'tp2-w128', 'tp4-w128']
+
+
+def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
+    cases = {name: args for name, _, args in compare_sm.jobs("all")}
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+        args = cases[f"routed-{geometry}-spark-bf16"]
+        assert args[args.index("--role") + 1] == "spark"
+        assert args[args.index("--input") + 1] == "bf16"
+        assert "--exact-slices" in args
+    qwen = cases["routed-qwen4-spark-bf16"]
+    assert "tp5" in qwen[qwen.index("--layouts") + 1].split(",")
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5"):
+        args = cases[f"routed-{geometry}-spark-wire"]
+        assert args[args.index("--input") + 1] == "wire"
+    for geometry in ("dsv4p", "kimik3"):
+        assert "--compact-companions" in cases[f"exl3-compact-{geometry}-k23"]
+
+
+@pytest.mark.parametrize("indirect", [False, True])
+def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
+    from contextlib import nullcontext
+
+    geometry = SimpleNamespace(weights="fp8")
+    calls = []
+    program = SimpleNamespace(export_to_c=lambda *args: None)
+
+    # This signature matches a baseline fork without the segmented API.
+    def ordinary_compile(g, *, route, max_rows, wire, prefill):
+        calls.append((g, route, max_rows, wire, prefill))
+        return program
+
+    def segment_compile(g, *, route, max_rows, wire, prefill, row_addresses):
+        assert row_addresses is True
+        return ordinary_compile(g, route=route, max_rows=max_rows, wire=wire, prefill=prefill)
+
+    module = SimpleNamespace(
+        GEOMETRIES={"mimo": geometry},
+        compile_fp8_moe_aot=segment_compile if indirect else ordinary_compile,
+        fp8_moe_scratch_bytes=lambda *args: 64,
+        prefill_forms=lambda *args: [],
+    )
+    if indirect:
+        module.fp8_moe_segment_scratch_bytes = lambda *args: 128
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", SimpleNamespace(
+        exportable_compilation=nullcontext,
+        validate_exported_header=lambda *args: {"argument_count": 13},
+    ))
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
+    monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
+        layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
+    ))
+    args = ["--geometry", "mimo", "--capacities", "2752"]
+    compare_sm.export_routed(args + (["--row-addresses"] if indirect else []), tmp_path)
+    assert calls == [(geometry, "stream" if indirect else "auto", 16384 if indirect else 2752,
+                      indirect, "auto")]
+    records = json.loads((tmp_path / "routed.json").read_text())["programs"]
+    assert len(records) == 1
+    assert records[0]["scratch_bytes"] == (128 if indirect else 64)
+
+
+def test_default_source_root_resolves_worktree_alias_and_preserves_override(tmp_path, monkeypatch):
+    wt_git = tmp_path / "home/user/Developer/cuteafd/.git/worktrees/feature"
+    sub_git = wt_git / "modules/third_party/sparkinfer"
+    sub_git.mkdir(parents=True)
+    real_wt = tmp_path / "home/user/Developer/cute-worktrees/feature"
+    alias = tmp_path / "workspace/cuteafd"
+    for checkout in (real_wt, alias):
+        (checkout / "scripts/build").mkdir(parents=True)
+        (checkout / "python/tools/lib").mkdir(parents=True)
+        (checkout / "third_party/sparkinfer").mkdir(parents=True)
+        (checkout / ".git").write_text(f"gitdir: {wt_git}\n")
+        (checkout / "third_party/sparkinfer/.git").write_text(
+            "gitdir: ../../../../cuteafd/.git/worktrees/feature/modules/third_party/sparkinfer\n"
+        )
+        (checkout / "scripts/build/compare-sm-exports.py").write_text(
+            (ROOT / "scripts/build/compare-sm-exports.py").read_text()
+        )
+    (real_wt / "python/tools/lib/v41_capacities.py").write_text(
+        "TARGET_CAPACITIES = (1, 16)\nDRAFT_CAPACITIES = (1, 16)\nPROJECTION_CAPACITIES = (1, 16)\n"
+    )
+    (wt_git / "gitdir").write_text(f"{real_wt / '.git'}\n")
+
+    assert not compare_sm._gitdir_from_file(alias / "third_party/sparkinfer/.git").exists()
+    assert compare_sm._gitdir_from_file(real_wt / "third_party/sparkinfer/.git") == sub_git.resolve()
+    assert compare_sm.resolve_source_root(alias, env={}) == real_wt.resolve()
+
+    monkeypatch.delenv("CUTEAFD_SOURCE_ROOT", raising=False)
+    monkeypatch.delenv("CUTEAFD_SPARKINFER_SOURCE_DIR", raising=False)
+    alias_spec = importlib.util.spec_from_file_location(
+        "compare_sm_exports_alias", alias / "scripts/build/compare-sm-exports.py"
+    )
+    alias_module = importlib.util.module_from_spec(alias_spec)
+    alias_spec.loader.exec_module(alias_module)
+    assert alias_module.ROOT == real_wt.resolve()
+
+    override = tmp_path / "explicit-override"
+    override.mkdir()
+    assert compare_sm.resolve_source_root(alias, env={"CUTEAFD_SOURCE_ROOT": str(override)}) == real_wt.resolve()
+    assert compare_sm.resolve_source_root(env={"CUTEAFD_SOURCE_ROOT": str(override)}) == override.resolve()
+
+
+def sm89_exports(tmp_path, kernels, headers=(b"same ABI\n", b"same ABI\n"), toolchain="4.6.2"):
+    """Two exports of one program on the SM89 target; kernels share a section name."""
+    left, right = exports(tmp_path, kernels=kernels)
+    for directory, header in zip((left, right), headers):
+        context = json.loads((directory / "comparison-context.json").read_text())
+        context.update(capability=[8, 9], toolchain={**context["toolchain"], "nvidia-cutlass-dsl": toolchain})
+        (directory / "comparison-context.json").write_text(json.dumps(context))
+        (directory / "test.h").write_bytes(header)
+    return left, right
+
+
+VARIATION = {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/test"]}
+
+
+def test_sm89_mode_exports_the_sm89_build_groups():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert set(compare_sm.SM89_GROUPS) <= set(jobs)
+    assert compare_sm.ARCHES["sm89"] == {"sms": (128, 114), "capability": [8, 9]}
+    # The SM120-only candidate groups are not part of an sm_89 build.
+    assert not {"v41-attention", "v41-attention-tp2"} & set(compare_sm.SM89_GROUPS)
+    assert not any(name.startswith("v41-nvfp4") for name in compare_sm.SM89_GROUPS)
+
+
+def test_sm89_recorded_variation_allows_device_code_only(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "recorded-variation"
+    assert not record["cubins_identical"] and record["header_identical"]
+
+
+@pytest.mark.parametrize("change", ["unlisted", "header", "toolchain", "kernel-set"])
+def test_sm89_variation_fails_closed(tmp_path, change):
+    kernels = (b"kern\x00first", b"other\x00kern" if change == "kernel-set" else b"kern\x00other")
+    headers = (b"same ABI\n", b"changed ABI\n" if change == "header" else b"same ABI\n")
+    left, right = sm89_exports(tmp_path, kernels=kernels, headers=headers,
+                               toolchain="4.7.0" if change == "toolchain" else "4.6.2")
+    group = "v41-router" if change == "unlisted" else "v41-fp8"
+    record, = compare_sm.compare(left, right, variation=VARIATION, group=group)["programs"]
+    assert record["classification"] == "cubin-bytes"
+
+
+def test_unrecorded_device_code_variation_is_named_but_still_differs(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00first", b"kern\x00other"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and record["variation_candidate"]
+    (tmp_path / "header").mkdir()
+    left, right = sm89_exports(tmp_path / "header", kernels=(b"kern\x00first", b"kern\x00other"),
+                               headers=(b"same ABI\n", b"changed ABI\n"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-router")["programs"]
+    assert record["classification"] == "cubin-bytes" and not record["variation_candidate"]
+
+
+def test_identical_sm89_exports_stay_identical_with_variation(tmp_path):
+    left, right = sm89_exports(tmp_path, kernels=(b"kern\x00same", b"kern\x00same"))
+    record, = compare_sm.compare(left, right, variation=VARIATION, group="v41-fp8")["programs"]
+    assert record["classification"] == "identical"
+
+
+def test_recorded_sm89_variation_names_sm89_groups():
+    record = compare_sm.read_variation(compare_sm.SM89_VARIATION)
+    assert record["toolchain"] == {"nvidia-cutlass-dsl": "4.6.2"}
+    assert all(name.split("/")[0] in compare_sm.SM89_GROUPS for name in record["programs"])
+
+
+@pytest.mark.parametrize("record", [
+    {"programs": ["v41-fp8/a"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": []},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["no-group"]},
+    {"toolchain": {"nvidia-cutlass-dsl": "4.6.2"}, "programs": ["v41-fp8/a", "v41-fp8/a"]},
+])
+def test_malformed_variation_is_refused(tmp_path, record):
+    path = tmp_path / "variation.json"
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="recorded variation"):
+        compare_sm.read_variation(path)
+def test_combined_exl3_reply_exports_cover_supported_geometries_without_sm_sizing():
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "exl3_reply_programs")
+    shapes = next(ast.literal_eval(node.value) for node in function.body
+                  if isinstance(node, ast.Assign)
+                  and any(isinstance(t, ast.Name) and t.id == "shapes" for t in node.targets))
+    assert set(shapes) == {(2560, 10), (3584, 16), (4096, 6), (4096, 8),
+                           (5120, 6), (6144, 4), (6144, 8), (7168, 6)}
+    assert len(shapes) == len(set(shapes))
+    source = ast.get_source_segment(path.read_text(), function)
+    assert "sm_count" not in source and "multi_processor_count" not in source
+    assert 'Scalar(n) for n in ("weight_num_experts", "route_num_experts", "active_m")' in source
+    worker = (ROOT / "rust/crates/cuteafd-daemon/src/shared/experts/exl3/worker.rs").read_text()
+    assert "(Some(output), None) if compressed" in worker
+    assert "self.reply_fused.launch(request, sources, inputs, output" in worker
+    assert "reply_codec" not in worker
+
+
+def test_combined_exl3_reply_export_operand_and_scalar_abi(monkeypatch):
+    exporter = compare_sm.load_file("test_reply_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    def record(*args, **kwargs):
+        return SimpleNamespace(args=args, **kwargs)
+    def operand(name, dtype, shape, role="in", align=16):
+        return SimpleNamespace(name=name, dtype=dtype, shape=shape, role=role, align=align)
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd._common",
+                        SimpleNamespace(Operand=operand, Scalar=lambda name: name,
+                                        compile_program=lambda kernel, **kw: record(kernel, **kw)))
+    monkeypatch.setitem(sys.modules, "b12x.moe._shared.kernels.w4a16.kernel",
+                        SimpleNamespace(W4A16TopKSumKernel=lambda **kw: record(**kw)))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        float16="fp16", uint8="u8", float32="fp32", int32="i32"))
+    jobs = exporter.exl3_reply_programs(8256)
+    assert len(jobs) == 16
+    for suffix, op, params, thunk in jobs:
+        program = thunk()
+        kernel, = program.args
+        width, topk, format = program.key
+        row_bytes = width * 33 // 32 if format == 1 else width * 9 // 16
+        assert program.name == "expert_reply_" + suffix
+        assert op == "expert_reply_exl3" and params == {"max_rows": 8256}
+        assert [p.name for p in program.operands] == ["fc2_ptr", "output_ptr",
+            "topk_weights_ptr", "route_expert_ids_ptr", "expert_map_ptr", "svh_ptr"]
+        assert [p.dtype for p in program.operands] == ["fp16", "u8", "fp32", "i32", "i32", "fp16"]
+        assert program.operands[1].role == "out"
+        assert program.operands[1].shape == f"[rows,{row_bytes}]"
+        assert program.scalars == ("weight_num_experts", "route_num_experts", "active_m")
+        assert kernel.full_rotation and kernel.use_expert_map
+        assert kernel.full_rotation_output_dtype == "bf16"
+        assert kernel.element_dtype == "fp16" and kernel.reply_format == format
+
+
+def test_combined_reply_reduce_export_has_runtime_geometry_and_no_scratch():
+    source = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a16/expert_reply.py").read_text()
+    tree = ast.parse(source)
+    record = lambda *args, **kwargs: SimpleNamespace(args=args, **kwargs)
+    namespace = dict(compile_program=record, ExpertReplyReduce=lambda: "kernel",
+                     ExpertReplyReduceTier=lambda: "tier kernel",
+                     Operand=record, Scalar=lambda name: name,
+                     torch=SimpleNamespace(uint8="u8", bfloat16="bf16", uint32="u32"))
+    names = ("compile_expert_reply_reduce_aot", "compile_expert_reply_reduce_tier_aot")
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert sorted(function.name for function in functions) == sorted(names)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), "reply_reduce_abi", "exec"), namespace)
+    program, tier = (namespace[name]() for name in names)
+    assert program.name == "expert_reply_reduce" and program.key == ()
+    assert [operand.args[0] for operand in program.operands] == [
+        *(f"p{rank}" for rank in range(8)), "shared", "out", "mode"]
+    assert program.scalars == ("rows", "width", "ranks", "has_shared", "format")
+    assert program.geometry == dict(max_ranks=8, fp8_block=32, nvfp4_block=16,
+                                    rank_rounding="bf16", accumulation="ordered_fp32")
+    assert "scratch" not in vars(program)
+    # The GPU expert tier's variant: one more BF16 plane, after the ranks and
+    # before shared, with the reduce's scalars and no scratch.
+    assert tier.name == "expert_reply_reduce_tier" and tier.key == () and tier.args == ("tier kernel",)
+    assert [operand.args[0] for operand in tier.operands] == [
+        *(f"p{rank}" for rank in range(8)), "tier", "shared", "out", "mode"]
+    assert tier.operands[8].args[1:] == ("bf16", "[rows,width]")
+    assert tier.scalars == program.scalars
+    assert tier.geometry == dict(program.geometry, tier_plane="after_ranks")
+    assert "scratch" not in vars(tier)
+    exporter = (ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text()
+    assert 'work.append((name, "reduce", "expert_reply", {"max_rows": args.prefill_rows},' in exporter
+    assert "compile_expert_reply_reduce_aot))" in exporter
+    # Coordinators (SM120, sm_89) add the tier variant last; an sm_89
+    # coordinator exports only the two reducers.
+    reply = exporter[exporter.index('if name == "expert_reply":'):]
+    reply = reply[:reply.index("continue")]
+    assert reply.index('"reduce"') < reply.index('"reduce_tier"')
+    assert 'if capability != (12, 1):' in reply and 'if capability != (8, 9):' in reply
+    assert 'an sm_89 coordinator exports only the expert_reply geometry' in exporter

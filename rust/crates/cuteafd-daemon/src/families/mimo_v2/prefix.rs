@@ -1,15 +1,15 @@
 //! MiMo V2 (Flash, V2.6 Pro) as a prefix-cache family (`cuteafd_engine::prefix`).
 //!
-//! Paged state: the full-attention layers' BF16 records, 64 rows per page; one page index
-//! spans every full layer (Flash 9 x 64 x 2,560 B = 1.47 MB, Pro 10 x 64 x 5,120 B = 3.28 MB).
+//! Paged state: the selected full-attention records, 64 rows per page; one page index
+//! spans every full layer. Codes and FP32 descales are copied without conversion.
 //! Full pages are shared by reference; nobody writes them again (every sequence appends past
 //! its own length), so only a partial tail page is copied.
 //!
 //! Mark: the sliding-window layers keep a 256-slot ring per sequence that the next step
 //! overwrites, and their attention reads keys `p - window + 1 ..= p`, so a sequence continuing
 //! at `P` needs ring rows `P - window + 1 .. P`; the mark keeps the last `window` rows of
-//! every SWA layer in position order (Flash 39 x 128 x 5,120 B = 25.6 MB, Pro 60 layers =
-//! 39.3 MB). With MTP (Flash) it also keeps the last `window + stages + 1` rows of the MTP
+//! every SWA layer in position order, using its selected record bytes. With MTP it
+//! also keeps the last `window + stages + 1` rows of the MTP
 //! hidden ring: `mtp_reset` at the restored length makes every stage recompute its own ring
 //! from them, exactly as after a full prefill (~1 MiB). Rows go back to the same `position %
 //! 256` slots of the new sequence's ring, so the restored ring reads exactly as the captured
@@ -59,6 +59,16 @@ struct RingState {
     draft: bool,
 }
 
+impl RingState {
+    fn mark_views(&self, arena: CuteafdDeviceBuffer, base: usize, ring: usize, len: usize)
+        -> Result<Vec<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
+        runs(ring, self.ring_rows, self.rows, len).into_iter().map(|(ring_row, mark_row, rows)| {
+            Ok((view(self.buffer, ring_row * self.row, rows * self.row)?,
+                view(arena, base + self.offset + mark_row * self.row, rows * self.row)?))
+        }).collect()
+    }
+}
+
 pub(crate) struct MimoPrefix<'e, 'a> {
     engine: &'e MimoEngine<'a>,
     /// Full-attention record pools: (rank, buffer, record bytes).
@@ -75,6 +85,19 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     draft_floors: RefCell<Vec<usize>>,
     draft_metadata: Option<Rc<Allocation<'a>>>,
     draft_offset: usize,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream (the
+    /// drafter and MTP run on rank 0's).
+    copies: crate::shared::prefix::PrefixCopies<'a>,
+}
+
+/// Device copies `(rank, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
+
+fn copy_readers<'a>(engine: &MimoEngine<'a>) -> Result<crate::shared::prefix::PrefixCopies<'a>> {
+    crate::shared::prefix::PrefixCopies::new(engine.library, (0..engine.ranks())
+        .map(|rank| Ok(vec![crate::shared::prefix::Reader {
+            device: engine.on(rank, || engine.library.cuda_get_device())?, stream: engine.stream_of(rank) }]))
+        .collect::<Result<_>>()?)
 }
 
 /// A byte range inside `buffer` (bounds-checked; pointer arithmetic only).
@@ -123,7 +146,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         let draft_metadata = if let Some(drafter) = engine.drafter.as_ref().filter(|_| warm_draft) {
             // Leave room for speculative writes and the target mark's capture reach.
             let rows = draft_mark_rows(window);
-            let row = drafter.cfg.kv_width() * 2;
+            let row = drafter.kv_cache.plane_record_bytes(drafter.cfg.kv_heads, drafter.cfg.head_dim);
             for buffer in drafter.context_rings() {
                 states.push(RingState { rank: 0, buffer, row, ring_rows: super::dflash::RING,
                     rows, offset: offsets[0], draft: true });
@@ -132,7 +155,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
             offsets[0] += 8;
             debug_assert_eq!((offsets[0] - draft_offset) as u64,
                 cuteafd_loader::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(
-                    drafter.cfg.layers as u64, drafter.cfg.kv_width() as u64)?);
+                    drafter.cfg.layers as u64, drafter.cfg.kv_heads as u64, drafter.cfg.head_dim as u64, drafter.kv_cache)?);
             Some(Rc::new(Allocation::new(Device { library: engine.library, id: engine.kv_layer_on(0, 0).1.device_id }, engine.rings * 8)?))
         } else { None };
         let mark_bytes: usize = offsets.iter().sum();
@@ -149,7 +172,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         Ok(Self { engine, full, states, rank_mark_bytes: offsets, mark_bytes, arenas, slots, partial,
             draft_slots: RefCell::new(if draft_metadata.is_some() { vec![None; engine.rings] } else { Vec::new() }),
             draft_floors: RefCell::new(if draft_metadata.is_some() { vec![0; engine.rings] } else { Vec::new() }),
-            draft_metadata, draft_offset })
+            draft_metadata, draft_offset, copies: copy_readers(engine)? })
     }
 
     pub fn bind_drafter(&self, ring: i32, slot: Option<usize>) {
@@ -199,53 +222,54 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         Ok(Self { engine, full: Vec::new(), states: Vec::new(),
             rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),
             arenas, slots: 1, partial: false, draft_slots: RefCell::new(vec![None; engine.rings]),
-            draft_floors: RefCell::new(vec![0; engine.rings]), draft_metadata: None, draft_offset: 0 })
+            draft_floors: RefCell::new(vec![0; engine.rings]), draft_metadata: None, draft_offset: 0,
+            copies: copy_readers(engine)? })
     }
 
     /// Zero every state's rows before `len` (a partial restore's empty window).
     fn empty_window(&self, ring: usize, len: usize) -> Result<()> {
-        for state in &self.states {
-            let Some(ring) = self.state_ring(state, ring) else { continue };
-            for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
-                let target = view(state.buffer, ring_row * state.row, rows * state.row)?;
-                // SAFETY: the view lies inside a live allocation of the state's GPU; ordered on its stream.
-                self.engine.on(state.rank, || unsafe {
-                    self.engine.library.cuda_zero_bytes_async(target, target.bytes, self.engine.stream_of(state.rank))
-                })?;
+        for rank in 0..self.copies.ranks() {
+            let mut targets = Vec::new();
+            for state in self.states.iter().filter(|state| state.rank == rank) {
+                let Some(ring) = self.state_ring(state, ring) else { continue };
+                for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
+                    targets.push(view(state.buffer, ring_row * state.row, rows * state.row)?);
+                }
             }
+            if targets.is_empty() { continue; }
+            self.copies.ordered(rank, |stream| {
+                for target in targets {
+                    // SAFETY: the view lies inside a live allocation of the state's GPU; the copy
+                    // stream is fenced against every forward pass on both sides.
+                    unsafe { self.engine.library.cuda_zero_bytes_async(target, target.bytes, stream)? };
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
-    /// A copy between two views on rank `rank`'s GPU.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
-        // is ordered on its stream with every forward pass that reads or writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
+    /// Queues `copies` on their ranks' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: every view lies inside a live allocation of its rank (checked by `view`); the
+        // cache drains the copy streams before it hands any of that storage to someone else.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// Copy every state's last rows before `len` between ring `ring` and mark `slot`.
     fn move_mark(&self, slot: MarkSlot, ring: usize, len: usize, capture: bool) -> Result<()> {
         ensure!(!self.arenas.is_empty(), "no mark arena");
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+        let mut copies = Copies::new();
         for state in &self.states {
             let arena = self.arenas[state.rank].buffer;
             let base = slot.0 as usize * self.rank_mark_bytes[state.rank];
             let Some(state_ring) = self.state_ring(state, ring) else { continue };
-            for (ring_row, mark_row, rows) in runs(state_ring, state.ring_rows, state.rows, len) {
-                let ring_view = view(state.buffer, ring_row * state.row, rows * state.row)?;
-                let mark_view = view(arena, base + state.offset + mark_row * state.row, rows * state.row)?;
-                if capture {
-                    self.copy(state.rank, mark_view, ring_view)?;
-                } else {
-                    self.copy(state.rank, ring_view, mark_view)?;
-                }
+            for (ring_view, mark_view) in state.mark_views(arena, base, state_ring, len)? {
+                copies.push(if capture { (state.rank, mark_view, ring_view) } else { (state.rank, ring_view, mark_view) });
             }
         }
-        Ok(())
+        self.submit(&copies)
     }
 }
 
@@ -270,6 +294,13 @@ fn runs(ring: usize, ring_rows: usize, rows: usize, len: usize) -> Vec<(usize, u
 
 impl PrefixFamily for MimoPrefix<'_, '_> {
     type Placement = MimoPlacement;
+
+    fn record_format(&self) -> &'static str {
+        let draft = self.engine.drafter.as_ref().filter(|_| self.draft_metadata.is_some())
+            .map(|drafter| drafter.kv_cache);
+        self.engine.kv_cache().snapshot_record_format(draft)
+    }
+
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout {
@@ -297,6 +328,12 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
         &placement.pages
     }
 
+    /// Verify copies the placement's pages into its page table every step.
+    fn extend_pages(&self, placement: &mut MimoPlacement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &MimoPlacement) -> usize {
         placement.len
     }
@@ -313,12 +350,13 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
                 self.draft_floors.borrow()[ring].max(len.saturating_sub(rows))
             } else { len };
             let source = view(metadata.buffer, ring * 8, 8)?;
-            // Synchronous host writes must not race a previous snapshot's async read.
-            self.drain()?;
+            // Only the copy stream reads the metadata words: a synchronous host write must not
+            // race a previous snapshot's queued read of them.
+            self.copies.synchronize(0)?;
             self.engine.library.copy_h2d(source, &(floor as u64).to_le_bytes())?;
             let target = view(self.arenas[0].buffer,
                 slot.0 as usize * self.rank_mark_bytes[0] + self.draft_metadata_offset(), 8)?;
-            self.copy(0, target, source)?;
+            self.submit(&vec![(0, target, source)])?;
         }
         Ok(())
     }
@@ -338,8 +376,9 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             let source = view(self.arenas[0].buffer,
                 slot.0 as usize * self.rank_mark_bytes[0] + self.draft_metadata_offset(), 8)?;
             let target = view(metadata.buffer, ring * 8, 8)?;
-            self.copy(0, target, source)?;
-            self.drain()?;
+            self.submit(&vec![(0, target, source)])?;
+            // The metadata words are written only by the copy stream.
+            self.copies.synchronize(0)?;
             let mut bytes = [0u8; 8];
             self.engine.library.copy_d2h(&mut bytes, target)?;
             self.draft_floors.borrow_mut()[ring] = usize::try_from(u64::from_le_bytes(bytes))?;
@@ -349,22 +388,17 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
+        let mut copies = Copies::new();
         for &(rank, buffer, record) in &self.full {
             let page = PAGE_ROWS * record;
-            self.copy(rank, view(buffer, copy.to as usize * page, copy.rows * record)?,
-                view(buffer, copy.from as usize * page, copy.rows * record)?)?;
+            copies.push((rank, view(buffer, copy.to as usize * page, copy.rows * record)?,
+                view(buffer, copy.from as usize * page, copy.rows * record)?));
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for rank in 0..self.engine.ranks() {
-            self.engine.on(rank, || {
-                // SAFETY: the engine owns this stream on the selected rank.
-                unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank)) }
-            })?;
-        }
-        Ok(())
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
@@ -397,6 +431,58 @@ mod tests {
         }
         assert_eq!(draft_mark_rows(128), 896);
         assert_eq!(runs(3, ring, 896, 64), vec![(3 * ring, 0, 64)]);
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
+    fn native_draft_marks_preserve_record_bytes_at_page_and_ring_frontiers() -> anyhow::Result<()> {
+        use super::{RingState, view};
+        use crate::shared::memory::device::{Allocation, Stream, cache_test_device};
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        // SAFETY: the explicitly selected test library implements the native CUDA ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = cache_test_device(&library)?;
+        device.run(|| {
+            let stream = Stream::new(device)?;
+            for format in [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8] {
+                for (heads, dim, ring_rows) in [(1, 64, 1024), (2, 128, 1024), (8, 128, 2048)] {
+                    let row = format.plane_record_bytes(heads, dim);
+                    let ring = Allocation::new(device, 3 * ring_rows * row)?;
+                    let arena = Allocation::new(device, ring_rows * row + 32)?;
+                    let state = RingState { rank: 0, buffer: ring.buffer, row, ring_rows,
+                        rows: ring_rows - 128, offset: 16, draft: true };
+                    for len in [1, 63, 64, 65, ring_rows - 1, ring_rows, ring_rows + 1,
+                        2 * ring_rows - 1, 2 * ring_rows + 1] {
+                        let source: Vec<u8> = (0..ring.buffer.bytes).map(|i| ((i * 37 + len) % 251) as u8).collect();
+                        library.copy_h2d(ring.buffer, &source)?;
+                        // Exercise the production mark range generator for capture on slot 1.
+                        for (src, dst) in state.mark_views(arena.buffer, 0, 1, len)? {
+                            // SAFETY: checked views are live on this device and ordered on the owned stream.
+                            unsafe { library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
+                        }
+                        // Restore into another ring after poisoning every destination byte.
+                        let destination = view(ring.buffer, 2 * ring_rows * row, ring_rows * row)?;
+                        // SAFETY: the destination and prior copies are on this owned stream.
+                        unsafe { library.cuda_zero_bytes_async(destination, destination.bytes, stream.raw)?; }
+                        for (dst, src) in state.mark_views(arena.buffer, 0, 2, len)? {
+                            // SAFETY: checked views are live on this device and ordered on the owned stream.
+                            unsafe { library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
+                        }
+                        // SAFETY: retire every queued copy before host inspection or storage release.
+                        unsafe { library.cuda_stream_synchronize(stream.raw)?; }
+                        let mut actual = vec![0; destination.bytes];
+                        library.copy_d2h(&mut actual, destination)?;
+                        let mut expected = vec![0; destination.bytes];
+                        for (ring_row, _, rows) in runs(1, ring_rows, state.rows, len) {
+                            let at = (ring_row % ring_rows) * row;
+                            expected[at..at + rows * row].copy_from_slice(&source[ring_row * row..(ring_row + rows) * row]);
+                        }
+                        assert_eq!(actual, expected, "{format} H{heads} D{dim} frontier {len}");
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     #[test]

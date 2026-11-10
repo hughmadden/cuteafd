@@ -31,7 +31,7 @@ def load_tool():
     return module
 
 
-@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4"])
 def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
     tool = load_tool()
     intermediate = tool.GEOMETRIES[geometry][1]
@@ -45,7 +45,7 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
                     rank = int(destination.split("rank")[1])
                     assert rank not in ranks
                     ranks[rank] = width
-        if tp > 6 or tp > intermediate // 128:
+        if tp > intermediate // 128:
             assert not ranks
         else:
             assert sorted(ranks) == list(range(tp))
@@ -54,13 +54,60 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
             assert max(ranks.values()) - min(ranks.values()) <= 128
 
 
-@pytest.mark.parametrize("geometry", ["dsv4f", "dsv4p", "glm", "glmf", "qwen4"])
-def test_all_counts_are_opt_in_and_legacy_build_profiles_remain(geometry):
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4"])
+def test_default_profiles_follow_checkpoint_package_ranges(geometry):
     tool = load_tool()
     legacy = tool.build_profiles("spark", geometry)
     worlds = {int(profile[0].split("-")[0][2:]) for profile in legacy}
-    assert worlds == ({1, 2, 3, 4} if geometry == "qwen4" else {2, 3, 4, 6})
+    ranges = json.loads((REPO / "scripts/build/spark-package-ranges.json").read_text())
+    assert worlds == set(ranges["entries"][f"{geometry}:exl3"]["worlds"])
     assert tool.build_profiles("spark", geometry, all_spark_counts=True) == tool.profiles_for_role("spark", geometry)
+
+
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4", "kimik3"])
+def test_cmake_spark_profiles_exist_in_production_package(tmp_path, geometry):
+    import subprocess
+    tool = load_tool()
+    script = tmp_path / 'profiles.cmake'
+    output = tmp_path / 'profiles.txt'
+    script.write_text(f'''
+cmake_minimum_required(VERSION 3.20)
+function(add_custom_command)
+  file(WRITE "{output}" "${{CUTEAFD_EXL3_PROFILE_ARGS}}")
+endfunction()
+function(add_custom_target)
+endfunction()
+function(add_dependencies)
+endfunction()
+set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")
+set(CUTEAFD_ENABLE_CUDA ON)
+set(CUTEAFD_CUDA_ARCHITECTURES 121)
+set(CUDAToolkit_INCLUDE_DIRS unused)
+set(CUTEAFD_EXPERT_FAMILIES "{geometry}:exl3-k23")
+include("{REPO}/native/cmake/shared/exl3.cmake")
+''')
+    subprocess.run(['cmake', '-P', str(script)], check=True, capture_output=True, text=True)
+    args = output.read_text().split(';')
+    requested = set(args[1::2])
+    expected = {profile[0] for profile in tool.build_profiles('spark', geometry)}
+    assert requested == expected
+    ranges = json.loads((REPO / 'scripts/build/spark-package-ranges.json').read_text())
+    assert ranges['entries'][f'{geometry}:exl3']['intermediate'] == tool.GEOMETRIES[geometry][1]
+
+
+def test_kimi_coordinator_exports_whole_and_tp2_fp32_latent_experts():
+    tool = load_tool()
+    assert tool.GEOMETRIES["kimik3"] == (3584, 3072, 896, 16)
+    assert tool.activation("kimik3") == "situ"
+    assert tool.build_profiles("coordinator", "kimik3") == [
+        ("rtx-tp1", 3072, 896, 16, "fp32", ["rtx-tp1"]),
+        ("rtx-tp2", 1536, 896, 16, "fp32", ["rtx-tp2"]),
+    ]
+    assert tool.parse_requested_layouts(["rtx-tp2"], "coordinator", "kimik3") == ["rtx-tp2"]
+    assert tool.package_capacities("kimik3", "1,16,80,256,1024,4096") == [1, 80, 256, 1024, 4096]
+    profiles = tool.build_profiles("spark", "kimik3")
+    assert {p[0].split("-")[0] for p in profiles} == {"tp6", "tp7", "tp8"}
+    assert ("tp6-width512", 512, 896, 16, "bf16", [f"tp6-rank{rank}" for rank in range(6)]) in profiles
 
 
 def _manifest(path: Path, role: str = "coordinator") -> None:
@@ -208,3 +255,71 @@ def test_verification_checks_every_packaged_dso_including_routes(tmp_path):
         'variants': [], 'files': files, 'compute': [12, 1]}))
     with pytest.raises(ValueError, match='metadata.so'):
         tool.verify(tmp_path)
+
+
+@pytest.mark.parametrize("geometry,profile,bits", [
+    ("glm", "tp6-compact-width384", [4, 5]),
+    ("glmf", "tp4-width512", [3, 4]),
+    ("qwen4", "tp4-compact-width256", [4, 5]),
+    ("kimik3", "tp6-width512", [2, 3]),
+])
+def test_only_measured_spark_decode_profiles_default_to_pure_hint(geometry, profile, bits):
+    tool = load_tool()
+    measured = [1, 16, 80] if geometry in ("glm", "qwen4") else [1, 80]
+    for capacity in measured:
+        assert tool.default_decode_schedule(geometry, "spark", profile, capacity, bits) == tool.PURE_EVICT_FIRST
+    for capacity in set([1, 16, 80, 256, 1024, 4096]) - set(measured):
+        assert tool.default_decode_schedule(geometry, "spark", profile, capacity, bits) is None
+    assert tool.default_decode_schedule(geometry, "coordinator", profile, 1, bits) is None
+    assert tool.default_decode_schedule(geometry, "spark", profile + "-other", 1, bits) is None
+    assert tool.default_decode_schedule(geometry, "spark", profile, 1, [2, 3, 4]) is None
+
+
+@pytest.mark.parametrize("geometry,bits", [("glm", [4, 5]), ("glmf", [3, 4])])
+def test_only_measured_coordinator_capacities_default_to_pure_hint(geometry, bits):
+    tool = load_tool()
+    for capacity in [1, 16, 80, 256, 1024, 4096]:
+        expected = tool.PURE_EVICT_FIRST if capacity in [1, 80] else None
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, bits) == expected
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp1", capacity, bits) is None
+        for other_bits in ([2, 3], [3, 4], [4, 5], [3, 4, 5]):
+            if other_bits != bits:
+                assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, other_bits) is None
+
+
+@pytest.mark.parametrize("schedule,allowed", [(None, True), ("l2=2,pf1=0,pf2=0,pdl=1", True),
+                                               ("l2=2,pf1=1,pf2=0,pdl=1", False)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_compact_package_accepts_only_pure_l2_schedule(tmp_path, monkeypatch, schedule, allowed, explicit):
+    tool = load_tool()
+    monkeypatch.setattr(tool, "verify_object_target", lambda *args: None)
+    suffix = "-hint" if schedule and explicit else ""
+    directory = f"tp6-compact-rank0/m80{suffix}"
+    variant = dict(directory=directory, capacity=80, intermediate=384, experts=256,
+                   top_k=8, output_dtype="bf16", bits=[4, 5], descriptor_rows=7, native_info_version=3)
+    meta = {**variant, "hidden": 6144, "compute": [12, 1], "tile": [64, 128, 64, 128],
+            "requires_route_preparation": False, "sparkinfer_revision": "test"}
+    if schedule:
+        variant["decode_schedule"] = schedule
+        if explicit:
+            variant["schedule"] = "hint"
+        meta["decode_schedule"] = schedule
+    dest = tmp_path / directory
+    dest.mkdir(parents=True)
+    (dest / "v41_exl3.json").write_text(json.dumps(meta))
+    (dest / "trellis_lut.bin").write_bytes(b"test")
+    (dest / "libcuteafd_exl3.so").write_bytes(b"test")
+    files = {str(p.relative_to(tmp_path)): dict(bytes=p.stat().st_size, sha256=tool.digest(p))
+             for p in dest.iterdir()}
+    manifest = dict(schema="cuteafd.exl3-package.v1", role="spark", geometry="glm",
+                    compute=[12, 1], sparkinfer_revision="test", variants=[variant], files=files)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    if allowed:
+        assert tool.verify(tmp_path) == manifest
+        variant["decode_schedule"] = "mismatched-package-identity"
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="variant decode schedule mismatch"):
+            tool.verify(tmp_path)
+    else:
+        with pytest.raises(ValueError, match="invalid compact geometry or execution contract"):
+            tool.verify(tmp_path)

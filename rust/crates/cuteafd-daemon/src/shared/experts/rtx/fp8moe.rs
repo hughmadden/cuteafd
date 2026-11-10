@@ -1,7 +1,7 @@
 //! Geometry-generic FP8/MXFP4/NVFP4 RTX TP2, with BF16 input and rank partials.
 use super::native::RankCompletion;
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxShard};
-use crate::shared::experts::fp8::{exact_layout, Fp8Experts, Fp8Layer};
+use crate::shared::experts::fp8::{exact_layout, Fp8Weights, Fp8Layer};
 use crate::shared::memory::device::{Allocation, Device, DeviceOwner, Event};
 use anyhow::{bail, ensure, Context, Result};
 use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeMetadata, Fp8MoeWeights};
@@ -70,16 +70,23 @@ pub(crate) struct Fp8MoeTp2<'a> {
     layers: Vec<usize>,
     max_rows: usize,
     workspace_bytes: usize,
-    experts: DeviceOwner<'a, Fp8Experts<'a>>,
+    experts: DeviceOwner<'a, Fp8Weights<'a>>,
+    scratch: Allocation<'a>,
     output: Allocation<'a>,
 }
 
 impl<'a> Fp8MoeTp2<'a> {
+    pub(crate) fn packed_row_cap(&self, rows: usize) -> Result<usize> {
+        self.experts.packed_row_cap(true, rows)
+    }
+
     /// Static package ABI only: no CUDA initialization or device allocation.
     /// The directory is the padded tp2 layout; exact_layout selects its sibling.
     pub(crate) fn plan(tensors: &Fp8ExpertTensors, directory: &Path, rank: usize,
         max_rows: usize) -> Result<Fp8MoeTp2Plan> {
         ensure!(rank < 2, "invalid FP8 MoE TP2 rank");
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         let (directory, slicing) = exact_layout(directory, tensors, 2, rank);
         // SAFETY: the engine selects a trusted, generated package; the read
         // calls only its static geometry and scratch ABI, not CUDA creation.
@@ -94,6 +101,31 @@ impl<'a> Fp8MoeTp2<'a> {
 
     pub(crate) fn load(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
+        Self::bind_rank(device, tensors, directory, layers, rank, max_rows, budget, None)
+    }
+
+    /// Committed rank payloads use the same package, workspace and output admission as mount loading.
+    pub(crate) fn pushed_pair(devices: [Device<'a>; 2], tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: Vec<usize>, max_rows: usize, budgets: [usize; 2], pushed: [Vec<Fp8Layer<'a>>; 2]) -> Result<[Self; 2]> {
+        ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
+            "invalid pushed FP8 MoE TP2 device pair");
+        validate_layers(&layers, tensors.shape(), 0)?;
+        for rank in 0..2 {
+            let plan = Self::plan(tensors, directory, rank, max_rows)?;
+            let required = plan.resident_layer_bytes.checked_mul(layers.len())
+                .and_then(|bytes| bytes.checked_add(plan.workspace_bytes)).context("FP8 TP2 admission overflow")?;
+            ensure!(required <= budgets[rank], "pushed FP8 TP2 rank {rank} exceeds admitted budget");
+        }
+        let [left, right] = pushed;
+        Ok([Self::bind_rank(devices[0], tensors, directory, layers.clone(), 0, max_rows, budgets[0], Some(left))?,
+            Self::bind_rank(devices[1], tensors, directory, layers, 1, max_rows, budgets[1], Some(right))?])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_rank(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
+        layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize, pushed: Option<Vec<Fp8Layer<'a>>>) -> Result<Self> {
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), rank)?;
         let plan = Self::plan(tensors, directory, rank, max_rows)?;
         let resident = plan.resident_layer_bytes.checked_mul(layers.len())
@@ -103,14 +135,22 @@ impl<'a> Fp8MoeTp2<'a> {
             plan.workspace_bytes);
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
         let completion = RankCompletion::new(Event::new(device)?);
-        let experts = device.own(|| Fp8Experts::load(device.library, tensors, &plan.directory, &layers,
-            2, rank, max_rows, budget - plan.output_bytes))?;
+        let experts = device.own(|| match pushed {
+            Some(pushed) => Fp8Weights::from_pushed(device.library, tensors, &plan.directory, &layers,
+                2, rank, max_rows, budget - plan.output_bytes, pushed),
+            None => Fp8Weights::load(device.library, tensors, &plan.directory, &layers,
+                2, rank, max_rows, budget - plan.output_bytes),
+        })?;
         validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
-        ensure!(experts.resident_bytes() == resident && experts.scratch_bytes() == plan.scratch_bytes,
+        ensure!(experts.resident_bytes() == resident && experts.slot_scratch_bytes(max_rows)? == plan.scratch_bytes,
             "FP8 MoE TP2 static allocation plan disagrees with runtime");
+        let scratch = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("experts/workspace/native_scratch");
+            Allocation::new(device, plan.scratch_bytes)?
+        };
         let output = Allocation::new(device, plan.output_bytes)?;
         Ok(Self { completion, device, rank: rank as u8, layers, max_rows,
-            workspace_bytes: plan.workspace_bytes, experts, output })
+            workspace_bytes: plan.workspace_bytes, experts, scratch, output })
     }
 
     /// Both halves are admitted before either allocates; P4's shared pinned
@@ -119,6 +159,8 @@ impl<'a> Fp8MoeTp2<'a> {
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), 0)?;
         let started = std::time::Instant::now();
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");
@@ -137,17 +179,21 @@ impl<'a> Fp8MoeTp2<'a> {
             return Ok(ranks);
         }
         let completions = [RankCompletion::new(Event::new(devices[0])?), RankCompletion::new(Event::new(devices[1])?)];
-        let experts = Fp8Experts::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
+        let experts = Fp8Weights::load_pair(devices, tensors, [&plans[0].directory, &plans[1].directory],
             plans.each_ref().map(|p| p.slicing), &layers, max_rows,
             [budgets[0] - plans[0].output_bytes, budgets[1] - plans[1].output_bytes])?;
-        let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Experts<'a>>| -> Result<Self> {
+        let make = |rank: usize, completion, experts: DeviceOwner<'a, Fp8Weights<'a>>| -> Result<Self> {
             validate_installed(&layers, experts.layers.iter().map(|layer| layer.layer))?;
             ensure!(experts.resident_bytes() == plans[rank].resident_layer_bytes * layers.len()
-                && experts.scratch_bytes() == plans[rank].scratch_bytes,
+                && experts.slot_scratch_bytes(max_rows)? == plans[rank].scratch_bytes,
                 "FP8 MoE TP2 static pair allocation plan disagrees with runtime");
+            let scratch = {
+                let _scope = cuteafd_ffi::memory_ledger::scope("experts/workspace/native_scratch");
+                Allocation::new(devices[rank], plans[rank].scratch_bytes)?
+            };
             let output = Allocation::new(devices[rank], plans[rank].output_bytes)?;
             Ok(Self { completion, device: devices[rank], rank: rank as u8, layers: layers.clone(), max_rows,
-                workspace_bytes: plans[rank].workspace_bytes, experts, output })
+                workspace_bytes: plans[rank].workspace_bytes, experts, scratch, output })
         };
         let [left_completion, right_completion] = completions;
         let [left, right] = experts;
@@ -202,6 +248,7 @@ impl<'a> Fp8MoeTp2<'a> {
 impl RtxExpertLayer for Fp8MoeTp2<'_> {
     fn shard(&self) -> RtxShard { RtxShard::Tp2 { rank: self.rank } }
     fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+    fn uses_fp8_input(&self) -> bool { false }
     fn layers(&self) -> &[usize] { &self.layers }
     fn device(&self) -> i32 { self.device.id }
     fn workspace_bytes(&self) -> usize { self.workspace_bytes }
@@ -224,7 +271,7 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
             self.device.run(|| {
                 // SAFETY: caller retains rank-local input, routes and stream through
                 // completion, and serializes reuse of this owner's scratch/output.
-                unsafe { self.experts.run(index, rows, input, routes.ids, routes.weights, self.output(), stream) }
+                unsafe { self.experts.run_with(&self.experts.module, self.scratch.buffer, index, rows, input, routes.ids, routes.weights, self.output(), stream) }
             })
         })();
         self.completion.finish(result, stream, abort)

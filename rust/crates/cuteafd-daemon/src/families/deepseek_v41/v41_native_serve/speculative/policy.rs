@@ -20,7 +20,7 @@ pub(super) const TOPK: usize = 6;
 /// Rows per weight-read group of the grouped slice kernels.
 const GROUP_ROWS: u8 = 16;
 /// Requests per lane round: the draft runtime's request limit.
-const MAX_REQUESTS: usize = 16;
+const MAX_REQUESTS: usize = cuteafd_core::V41_MAX_LANE_MEMBERS;
 /// The dSpark drafter's trained block; a width-7 load can also draft 5.
 const NATIVE_WIDTH: usize = 5;
 /// Resource classes: coordinator RTX (TP1 or TP2) and Spark expert ranks.
@@ -158,10 +158,10 @@ pub(super) fn publish(policy: &DraftPolicy, draft_limit: usize) {
     let fit = |shared: bool| {
         serde_json::json!({
             "warm": policy.warm(shared, 1),
-            "concurrency_buckets": ([1, 4, 8, 16].into_iter().map(|requests| {
+            "concurrency_buckets": ([1, 4, 8, 16, 32, 64].into_iter().map(|requests| {
                 let (timed, error) = policy.prediction_health(shared, requests);
-                serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, _ => 9 },
-                    "requests_up_to": if requests == 16 { None } else { Some(requests) },
+                serde_json::json!({"requests_from": match requests { 1 => 1, 4 => 2, 8 => 5, 16 => 9, 32 => 17, _ => 33 },
+                    "requests_up_to": if requests == 64 { None } else { Some(requests) },
                     "warm": policy.warm(shared, requests), "engaged": policy.engaged(shared, requests),
                     "timed_rounds": timed, "relative_error": error,
                     "cost": policy.cost_snapshot(shared, requests).to_json(&labels),
@@ -328,7 +328,7 @@ mod tests {
         let geometry = geometry(|layer| layer < 20, |layer| if layer < 3 { expert_slice_bytes(2, false) }
             else if layer < 20 { expert_slice_bytes(1, false) } else { expert_slice_bytes(4, true) }, 7);
         assert_eq!((geometry.layers.len(), geometry.experts, geometry.topk), (40, 384, 6));
-        assert_eq!((geometry.max_requests, geometry.max_positions, geometry.regimes), (16, 7, 2));
+        assert_eq!((geometry.max_requests, geometry.max_positions, geometry.regimes), (cuteafd_core::V41_MAX_LANE_MEMBERS, 7, 2));
         assert_eq!(geometry.widths, [5, 7]);
         assert_eq!(super::geometry(|_| false, |_| 1., 5).widths, [5]);
         assert!(geometry.layers.iter().all(|layer| layer.group_rows == 16));

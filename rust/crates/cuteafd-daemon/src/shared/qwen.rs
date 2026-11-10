@@ -1,6 +1,7 @@
 //! Owner-local recurrent state and exact verify replay for hybrid Qwen families.
 pub(crate) mod weights;
 pub(crate) mod scheduler;
+pub(crate) mod packed_check;
 use crate::shared::memory::device::{Allocation, Device};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Programs, Scalar};
@@ -11,27 +12,79 @@ use std::{ffi::c_void, rc::Rc};
 pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
     Remote(crate::shared::vision::remote::RemoteEncoder),
+    Split { image: Box<Encoder>, audio: Box<Encoder> },
+    #[cfg(test)]
+    Fixture(cuteafd_engine::media::FakeEncoder, std::sync::Arc<std::sync::atomic::AtomicBool>),
     Off,
 }
 impl Encoder {
+    pub(crate) fn split(image: Self, audio: Self) -> Self {
+        Self::Split { image: Box::new(image), audio: Box::new(audio) }
+    }
+    pub fn health_handle_for(&self, audio_job: bool) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        match self {
+            Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()),
+            Self::Split { image, audio } => if audio_job { audio } else { image }.health_handle_for(audio_job),
+            #[cfg(test)]
+            Self::Fixture(_, health) => Some(health.clone()),
+            Self::Off => None,
+        }
+    }
+    pub fn available_for(&self, audio_job: bool) -> bool {
+        match self {
+            Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(),
+            Self::Split { image, audio } => if audio_job { audio } else { image }.available_for(audio_job),
+            #[cfg(test)]
+            Self::Fixture(_, health) => health.load(std::sync::atomic::Ordering::Acquire),
+            Self::Off => false,
+        }
+    }
+}
+impl Encoder {
     pub fn health_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        match self { Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()), Self::Off => None }
+        self.health_handle_for(false).or_else(|| self.health_handle_for(true))
     }
-    pub fn available(&self) -> bool {
-        match self { Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(), Self::Off => false }
-    }
+    pub fn available(&self) -> bool { self.available_for(false) || self.available_for(true) }
 }
 impl cuteafd_engine::media::EncoderClient for Encoder {
     fn submit(&mut self, job: cuteafd_engine::media::EncodeJob) -> std::result::Result<cuteafd_engine::media::EncoderTicket, cuteafd_engine::media::MediaError> {
         use cuteafd_engine::media::MediaError;
-        match self { Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
-            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())) }
+        match self {
+            Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
+            Self::Split { image, audio } => {
+                let is_audio = job.key.is_audio();
+                let owner = if is_audio { audio } else { image };
+                let ticket = owner.submit(job)?;
+                // Each owner starts at ticket zero. Reserve the low bit for modality.
+                match ticket.0.checked_mul(2).and_then(|id| id.checked_add(u64::from(is_audio))) {
+                    Some(id) => Ok(cuteafd_engine::media::EncoderTicket(id)),
+                    None => { owner.cancel(ticket); Err(MediaError::QueueFull) },
+                }
+            },
+            #[cfg(test)]
+            Self::Fixture(client, _) => client.submit(job),
+            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())),
+        }
     }
     fn poll(&mut self, ticket: cuteafd_engine::media::EncoderTicket) -> Option<std::result::Result<cuteafd_engine::media::EncodeOutput, cuteafd_engine::media::MediaError>> {
-        match self { Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket), Self::Off => None }
+        match self {
+            Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket),
+            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
+                .poll(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
+            #[cfg(test)]
+            Self::Fixture(client, _) => client.poll(ticket),
+            Self::Off => None,
+        }
     }
     fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
-        match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
+        match self {
+            Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket),
+            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
+                .cancel(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
+            #[cfg(test)]
+            Self::Fixture(client, _) => client.cancel(ticket),
+            Self::Off => (),
+        }
     }
 }
 impl scheduler::Encoder for Encoder {
@@ -162,8 +215,12 @@ impl<'a> GdnBank<'a> {
         let (conv, state, replay) = if layers > 0 {
             (Some(zeroed(conv_bytes)?), Some(zeroed(state_bytes)?), Some(zeroed(replay_bytes)?))
         } else { (None, None, None) };
+        let commit_tables = zeroed(3 * REPLAY_ROWS * 4)?;
+        // SAFETY: the bank's live table and stream; reserving before readiness keeps
+        // every later ordered commit upload free of pinned allocation.
+        unsafe { library.reserve_h2d_ordered(commit_tables.buffer, stream)? };
         Ok(Self { library, programs, stream, layers, slots, layout, commit_program, conv, state, replay,
-            commit_tables: zeroed(3 * REPLAY_ROWS * 4)? })
+            commit_tables })
     }
 
     pub(crate) fn allocated_bytes(&self) -> [usize; 3] {
@@ -203,14 +260,11 @@ impl<'a> GdnBank<'a> {
             ensure!(slot < self.slots && first.checked_add(keep).is_some_and(|end| end <= REPLAY_ROWS),
                 "Qwen GDN commit outside replay or state pool");
         }
-        // SAFETY: this bank owns the stream; previous table readers retire before upload.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        crate::shared::memory::staging::with_staging(std::mem::size_of_val(table), |bytes| {
-            for (out, value) in bytes.chunks_exact_mut(4).zip(table) {
-                out.copy_from_slice(&value.to_ne_bytes());
-            }
-            self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..self.commit_tables.buffer }, bytes)
-        })?;
+        let bytes: Vec<u8> = table.iter().flat_map(|value| value.to_ne_bytes()).collect();
+        // SAFETY: every reader of the commit table (this commit, Qwen4's PLE commit)
+        // runs on this bank's stream, so the ordered upload follows the previous
+        // step's readers and precedes this launch without a host wait.
+        unsafe { self.library.copy_h2d_ordered(self.commit_tables.buffer, &bytes, self.stream)? };
         if let (Some(conv), Some(state), Some(replay)) = (&self.conv, &self.state, &self.replay) {
             let program = self.programs.program(self.commit_program, &["state", "conv_state", "replay", "tables"])?;
             let scalars = [sequences, self.layers, self.slots].map(|n| i32::try_from(n).map(Scalar::I32));

@@ -1,16 +1,53 @@
-//! Bounded gathered native rows; run page-faulting gathers on an I/O worker.
+//! Bounded gathered native rows: a lookup in the layer's row cache, then a copy
+//! into the pinned upload staging. Rows the cache does not hold are read here
+//! (and cached when the class has room); rows another reader is filling are waited for.
+use super::engram_prefetch::RowRead;
+use crate::formats::mapped_table::row_cache::{Lookup, Pins, RowClass};
+use crate::formats::mapped_table::{GatherMode, ReadPriority};
 use crate::{EngramEncoding, EngramTable};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, ENGRAM_ROWS};
 
+enum StagingBytes {
+    Host(Vec<u8>),
+    Pinned(cuteafd_ffi::PinnedBytes),
+}
+impl StagingBytes {
+    fn bytes(&self) -> &[u8] { match self { Self::Host(v) => v, Self::Pinned(v) => v.bytes() } }
+    fn bytes_mut(&mut self) -> &mut [u8] { match self { Self::Host(v) => v, Self::Pinned(v) => v.bytes_mut() } }
+}
+
 pub struct EngramBatchStaging {
     capacity: usize,
-    weights: Vec<u8>,
-    scales: Vec<u8>,
-    text_mask: Vec<u8>,
-    order: Vec<(u64, usize)>,
+    payload: StagingBytes,
+    /// Per gather: each distinct row's first (canonical) slot, and the
+    /// (canonical, duplicate) slot pairs copied after the rows land.
+    first: std::collections::HashMap<u64, usize>,
+    dups: Vec<(usize, usize)>,
     ready: Option<(usize, usize, EngramEncoding, f32)>,
 }
+/// One layer's gather between preparation and completion: the row-cache pins,
+/// rows still being filled elsewhere, and this gather's own reads.
+pub(crate) struct PreparedEngram {
+    pins: Pins,
+    /// (cache slot, canonical staging slot, row) of rows another reader is filling.
+    pending: Vec<(u32, usize, u64)>,
+    /// Rows this gather reads itself (row-cache misses), with each one's cache
+    /// slot when it reserved one and its canonical staging slot.
+    read: Option<(RowRead, Vec<(Option<u32>, usize)>)>,
+    rows: usize, layer: usize,
+    /// The gather's read priority (layer 0's first-layer rank included).
+    priority: ReadPriority,
+    encoding: EngramEncoding, global_scale: f32,
+}
+/// Copy one cached row (weight bytes then scale bytes) into its canonical slot.
+fn place(weights: &mut [u8], scales: &mut [u8], scale_base: usize, encoding: EngramEncoding, slot: usize, row: &[u8]) {
+    let (w, s) = (encoding.weight_bytes(), encoding.scale_bytes());
+    weights[slot * w..(slot + 1) * w].copy_from_slice(&row[..w]);
+    if encoding == EngramEncoding::Fp8 { scales[slot * s..(slot + 1) * s].copy_from_slice(&row[w..w + s]); }
+    else { weights[scale_base + slot * s..scale_base + (slot + 1) * s].copy_from_slice(&row[w..w + s]); }
+}
+
 /// Token-major native rows: 24 embeddings of width 256 per token.
 /// Image embeddings are zero, scales are one, and the text mask is zero.
 pub struct EngramGatherView<'a> {
@@ -40,15 +77,53 @@ impl EngramBatchStaging {
         );
         Ok(Self {
             capacity,
-            weights: vec![0; capacity * 24 * 256],
-            scales: vec![127; capacity * 24 * 8],
-            text_mask: vec![0; capacity],
-            order: Vec::with_capacity(capacity * 24),
+            payload: StagingBytes::Host(vec![0; Self::payload_bytes(capacity)]),
+            first: std::collections::HashMap::with_capacity(capacity * 24),
+            dups: Vec::with_capacity(capacity * 24),
             ready: None,
         })
     }
+    /// Peak per gather worker, not per staging lease. At most 24 distinct table
+    /// rows per token. Charge 1024 bytes per lookup for the address/slot vectors,
+    /// mapped-table validation tree + read descriptors, selected/unsupported
+    /// rows, residency flags and retained TLS page vectors, and io_uring's slot
+    /// hash set. This conservative bound includes vector growth (at most 2x),
+    /// two pages per <=264-byte table row, and tree/hash allocation slack.
+    ///
+    /// The fixed 1 MiB covers caller-side residency scratch and metadata.
+    /// The process-wide reactor budget is charged separately by the staging
+    /// shape, once rather than once per prefill/decode worker. Thread stacks,
+    /// request batches, allocator bookkeeping and OS page cache are excluded.
+    pub fn worker_bytes(rows: usize) -> Result<usize> {
+        Self::storage_bytes(rows)?;
+        Ok(rows * 24 * 1024 + (1 << 20))
+    }
+    pub fn payload_bytes(rows: usize) -> usize { rows * (24 * (256 + 8) + 1) }
+    pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, capacity: usize) -> Result<Self> {
+        Self::storage_bytes(capacity)?;
+        Ok(Self { capacity, payload: StagingBytes::Pinned(library.pinned_bytes(Self::payload_bytes(capacity))?),
+            first: std::collections::HashMap::with_capacity(capacity * 24),
+            dups: Vec::with_capacity(capacity * 24), ready: None })
+    }
+    pub fn host_buffer(&self) -> Option<cuteafd_ffi::CuteafdHostBuffer> {
+        match &self.payload { StagingBytes::Pinned(p) => Some(p.buffer()), _ => None }
+    }
+    /// # Safety
+    /// The copy stream contains every H2D reader of this slot's pinned bytes.
+    pub unsafe fn copied_on(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        match &mut self.payload {
+            StagingBytes::Pinned(p) => {
+                // SAFETY: forwarded from this method's stream ownership contract.
+                unsafe { p.copied_on(stream) }
+            },
+            _ => anyhow::bail!("asynchronous gather upload requires pinned staging"),
+        }
+    }
+    pub fn copy_ready(&mut self) -> Result<bool> {
+        match &mut self.payload { StagingBytes::Pinned(p) => p.copy_ready(), _ => Ok(true) }
+    }
     /// Concatenate request-owned batches without committing their histories.
-    /// Read each distinct table row once, in address order, then scatter duplicates
+    /// Read each distinct table row once, in token order, then copy duplicates
     /// back to their canonical token/head slots using preallocated storage.
     /// Any failure invalidates the view; no eager table load is performed.
     pub fn gather(
@@ -57,10 +132,18 @@ impl EngramBatchStaging {
         batches: &[&EngramBatch],
         layer_index: usize,
     ) -> Result<EngramGatherView<'_>> {
+        let prepared = self.prepare(table, batches, layer_index, ReadPriority::Prefill)?;
+        self.finish(table, prepared)?;
+        self.view()
+    }
+    /// Look up every distinct row of the batches: copy published rows now,
+    /// start reading the rows the cache lacks, and pin rows being filled elsewhere.
+    pub(crate) fn prepare(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
+        priority: ReadPriority) -> Result<PreparedEngram> {
         self.ready = None;
         ensure!(
-            !batches.is_empty() && batches.len() <= 16,
-            "engram wave requires 1..16 request batches"
+            !batches.is_empty() && batches.len() <= cuteafd_core::V41_MAX_REQUESTS,
+            "engram wave requires 1..={} request batches", cuteafd_core::V41_MAX_REQUESTS
         );
         let expected_rows = *ENGRAM_ROWS
             .get(layer_index)
@@ -77,76 +160,154 @@ impl EngramBatchStaging {
             rows > 0 && rows <= self.capacity,
             "engram wave exceeds staging capacity"
         );
-        self.order.clear();
+        let encoding = table.encoding();
+        let (weight_bytes, scale_bytes) = (encoding.weight_bytes(), encoding.scale_bytes());
+        ensure!(table.row_width() == weight_bytes + scale_bytes, "engram row cache width differs from its encoding");
+        let capacity = self.capacity;
+        let payload = self.payload.bytes_mut();
+        let (weights, rest) = payload.split_at_mut(capacity * 24 * 256);
+        let (scales, text_mask) = rest.split_at_mut(capacity * 24 * 8);
+        // FP4's packed weights and scales fit in the original FP8 weight arena.
+        // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
+        let scale_base = capacity * 24 * 128;
+        // Distinct rows in token order (staging writes stay sequential); every
+        // text slot is written by its row or its duplicate copy, so only image
+        // rows take the defaults (zero embeddings, unit scales).
+        self.first.clear();
+        self.dups.clear();
+        let mut addresses = Vec::with_capacity(rows * 24);
+        let mut slots = Vec::with_capacity(rows * 24);
         let mut token = 0;
         for batch in batches {
             for (row, hashes) in batch.hashes().iter().enumerate() {
                 let text = batch.is_image(row) == Some(false);
-                self.text_mask[token] = u8::from(text);
+                text_mask[token] = u8::from(text);
                 if text {
                     for (head, &address) in hashes[layer_index].iter().enumerate() {
                         ensure!(address < expected_rows, "engram hash is outside its table");
-                        self.order.push((address, token * 24 + head));
+                        let slot = token * 24 + head;
+                        match self.first.entry(address) {
+                            std::collections::hash_map::Entry::Occupied(canonical) => self.dups.push((*canonical.get(), slot)),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(slot);
+                                addresses.push(address);
+                                slots.push(slot);
+                            }
+                        }
+                    }
+                } else {
+                    let span = token * 24..(token + 1) * 24;
+                    weights[span.start * weight_bytes..span.end * weight_bytes].fill(0);
+                    if encoding == EngramEncoding::Fp8 {
+                        scales[span.start * scale_bytes..span.end * scale_bytes].fill(127);
+                    } else {
+                        weights[scale_base + span.start * scale_bytes..scale_base + span.end * scale_bytes].fill(0x38);
                     }
                 }
                 token += 1;
             }
         }
-        let encoding = table.encoding();
-        let weight_bytes = encoding.weight_bytes();
-        let scale_bytes = encoding.scale_bytes();
-        // FP4's packed weights and scales fit in the original FP8 weight arena.
-        // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
-        let scale_base = self.capacity * 24 * 128;
-        self.weights[..rows * 24 * weight_bytes].fill(0);
-        if encoding == EngramEncoding::Fp8 {
-            self.scales[..rows * 24 * scale_bytes].fill(127);
-        } else {
-            self.weights[scale_base..scale_base + rows * 24 * scale_bytes].fill(0x38);
-        }
-        self.order.sort_unstable();
-        let mut addresses = Vec::with_capacity(self.order.len());
-        let mut slots = Vec::with_capacity(self.order.len());
-        for &(address, slot) in &self.order {
-            if addresses.last() != Some(&address) {
-                addresses.push(address);
-                slots.push(slot);
+        let class = if priority.is_decode() { RowClass::Decode } else { RowClass::Prefill };
+        let (pins, lookups) = table.cache().acquire(&addresses, class);
+        let mut pending = Vec::new();
+        let mut misses = Vec::new();
+        for ((lookup, &address), &slot) in lookups.iter().zip(&addresses).zip(&slots) {
+            match *lookup {
+                Lookup::Ready(cached) => place(weights, scales, scale_base, encoding, slot, pins.row(cached)),
+                // Prefill and decode both join a row another reader is filling
+                // rather than read it again (its pages are already in flight).
+                Lookup::Wait(cached) => pending.push((cached, slot, address)),
+                Lookup::Fill(cached) => misses.push((address, Some(cached), slot)),
+                Lookup::Uncached => misses.push((address, None, slot)),
             }
         }
-        // Both backends read the same distinct rows into the same canonical
-        // slots; batching is not an io_uring-only optimization.
-        table.weights().gather_slots(&addresses, &slots, &mut self.weights[..rows * 24 * weight_bytes])?;
-        let scales = if encoding == EngramEncoding::Fp8 { &mut self.scales[..rows * 24 * scale_bytes] }
-            else { &mut self.weights[scale_base..scale_base + rows * 24 * scale_bytes] };
-        table.scales().gather_slots(&addresses, &slots, scales)?;
-        let mut previous = None;
-        for &(address, slot) in &self.order {
-            if let Some((last_address, source)) = previous {
-                if last_address == address {
-                    self.weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
-                    if encoding == EngramEncoding::Fp8 {
-                        self.scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
-                    } else {
-                        self.weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
-                            scale_base + slot * scale_bytes);
-                    }
-                    continue;
+        let priority = if layer_index == 0 { priority.first() } else { priority };
+        let read = if misses.is_empty() { None } else {
+            let ids: Vec<u64> = misses.iter().map(|m| m.0).collect();
+            Some((table.start_read(&ids, priority, GatherMode::default())?,
+                misses.into_iter().map(|(_, cached, slot)| (cached, slot)).collect()))
+        };
+        Ok(PreparedEngram { pins, pending, read, rows, layer: layer_index, priority, encoding,
+            global_scale: table.global_scale() })
+    }
+    /// Land this gather's reads (publishing the ones it reserved), wait for rows
+    /// filled elsewhere, then scatter duplicates to their token/head slots.
+    pub(crate) fn finish(&mut self, table: &EngramTable, prepared: PreparedEngram) -> Result<()> {
+        let PreparedEngram { mut pins, pending, read, rows, layer, priority, encoding, global_scale } = prepared;
+        let (weight_bytes, scale_bytes) = (encoding.weight_bytes(), encoding.scale_bytes());
+        let scale_base = self.capacity * 24 * 128;
+        let (weights, rest) = self.payload.bytes_mut().split_at_mut(self.capacity * 24 * 256);
+        let (scales, _) = rest.split_at_mut(self.capacity * 24 * 8);
+        let (mut fallback, mut device) = (0, 0);
+        if let Some((mut read, targets)) = read {
+            read.finish(table)?;
+            fallback = targets.len();
+            device = read.misses();
+            let mut row = [0u8; 280];
+            pins.publish_all(targets.iter().enumerate().filter_map(|(i, (cached, _))| cached.map(|c| (c, read.row(i)))))?;
+            for (i, &(_, slot)) in targets.iter().enumerate() {
+                let [w, s] = read.row(i);
+                row[..w.len()].copy_from_slice(w);
+                row[w.len()..w.len() + s.len()].copy_from_slice(s);
+                place(weights, scales, scale_base, encoding, slot, &row[..w.len() + s.len()]);
+            }
+        }
+        let mut failed = Vec::new();
+        for &(cached, slot, address) in &pending {
+            if pins.wait(cached) { place(weights, scales, scale_base, encoding, slot, pins.row(cached)); }
+            else { failed.push((slot, address)); }
+        }
+        if !failed.is_empty() {
+            // Their filler stopped (cancelled request or failed read): read them here.
+            let ids: Vec<u64> = failed.iter().map(|f| f.1).collect();
+            let mut read = table.start_read(&ids, priority, GatherMode::default())?;
+            read.finish(table)?;
+            let mut row = [0u8; 280];
+            for (i, &(slot, _)) in failed.iter().enumerate() {
+                let [w, s] = read.row(i);
+                row[..w.len()].copy_from_slice(w);
+                row[w.len()..w.len() + s.len()].copy_from_slice(s);
+                place(weights, scales, scale_base, encoding, slot, &row[..w.len() + s.len()]);
+            }
+            fallback += failed.len();
+            device += read.misses();
+        }
+        let waited = pending.len() - failed.len();
+        if fallback > 0 || waited > 0 {
+            let decode = pins.class() == RowClass::Decode;
+            table.weights().stats().record_gather_misses(decode, fallback, waited);
+            if device > 0 && !decode {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(layer, rows = device, "Engram prefill gather read rows the look-ahead had not \
+                        fetched; later ones are counted in stall_prefill_fallback_rows");
                 }
             }
-            previous = Some((address, slot));
         }
-        self.ready = Some((rows, layer_index, encoding, table.global_scale()));
-        self.view()
+        drop(pins);
+        for &(source, slot) in &self.dups {
+            weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
+            if encoding == EngramEncoding::Fp8 {
+                scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
+            } else {
+                weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
+                    scale_base + slot * scale_bytes);
+            }
+        }
+        self.ready = Some((rows, layer, encoding, global_scale));
+        Ok(())
     }
     pub fn view(&self) -> Result<EngramGatherView<'_>> {
         let (rows, layer_index, encoding, global_scale) = self.ready.context("engram staging is not complete")?;
         let scale_base = self.capacity * 24 * 128;
+        let (weights, rest) = self.payload.bytes().split_at(self.capacity * 24 * 256);
+        let (scales, text_mask) = rest.split_at(self.capacity * 24 * 8);
         Ok(EngramGatherView {
             encoding, global_scale,
-            weights: &self.weights[..rows * 24 * encoding.weight_bytes()],
-            scales: if encoding == EngramEncoding::Fp8 { &self.scales[..rows * 24 * 8] }
-                else { &self.weights[scale_base..scale_base + rows * 24 * 16] },
-            text_mask: &self.text_mask[..rows],
+            weights: &weights[..rows * 24 * encoding.weight_bytes()],
+            scales: if encoding == EngramEncoding::Fp8 { &scales[..rows * 24 * 8] }
+                else { &weights[scale_base..scale_base + rows * 24 * 16] },
+            text_mask: &text_mask[..rows],
             rows,
             layer_index,
         })
@@ -159,11 +320,141 @@ mod tests {
     use std::os::unix::fs::FileExt;
 
     #[test]
+    fn staging_and_gather_jobs_cover_c33_c64_without_relaxing_row_capacity() -> Result<()> {
+        use std::sync::Arc;
+        let history = cuteafd_core::EngramHistory::new(0)?;
+        // Repeated text and image rows check member order as well as duplicate lookup reuse.
+        let batches: Vec<_> = (0..65).map(|i| history.prepare(0,
+            &[if i % 3 == 0 { None } else { Some((i % 7) as u32) }], 1).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        let weights = tempfile::NamedTempFile::new()?;
+        let scales = tempfile::NamedTempFile::new()?;
+        weights.as_file().set_len(ENGRAM_ROWS[0] * 256)?;
+        scales.as_file().set_len(ENGRAM_ROWS[0] * 8)?;
+        for batch in &batches {
+            for hashes in batch.hashes() {
+                for &address in &hashes[0] {
+                    weights.as_file().write_all_at(&vec![(address % 251) as u8; 256], address * 256)?;
+                    scales.as_file().write_all_at(&vec![(address % 127) as u8; 8], address * 8)?;
+                }
+            }
+        }
+        let map = |file: &tempfile::NamedTempFile, width| {
+            // SAFETY: the test retains immutable sparse files for every gather.
+            unsafe { crate::MappedTable::single(file.path(), 0, ENGRAM_ROWS[0],
+                crate::RowFormat::of(cuteafd_core::DType::U8, width)?) }
+        };
+        let table = Arc::new(EngramTable::new(map(&weights, 256)?, map(&scales, 8)?)?);
+        let mut packed = EngramBatchStaging::new(64)?;
+        let mut singleton = EngramBatchStaging::new(1)?;
+        for count in [33, 64] {
+            let refs: Vec<_> = batches[..count].iter().map(Arc::as_ref).collect();
+            let view = packed.gather(&table, &refs, 0)?;
+            assert_eq!(view.rows, count);
+            for (i, batch) in refs.iter().enumerate() {
+                let expected = singleton.gather(&table, &[*batch], 0)?;
+                assert_eq!(&view.weights[i * 24 * 256..(i + 1) * 24 * 256], expected.weights);
+                assert_eq!(&view.scales[i * 24 * 8..(i + 1) * 24 * 8], expected.scales);
+                assert_eq!(view.text_mask[i], expected.text_mask[0]);
+            }
+            // Exercise the gatherer's own synchronous validation before worker admission.
+            let gatherer = crate::EngramGatherer::new(1, 64, EngramBatchStaging::storage_bytes(64)?)?;
+            let mut ticket = gatherer.try_submit(table.clone(), &batches[..count], 0)?.expect("free staging slot");
+            ticket.cancel();
+        }
+        let gatherer = crate::EngramGatherer::new(1, 64, EngramBatchStaging::storage_bytes(64)?)?;
+        let refs: Vec<_> = batches.iter().map(Arc::as_ref).collect();
+        assert!(packed.gather(&table, &refs, 0).is_err());
+        assert!(gatherer.try_submit(table.clone(), &batches, 0).is_err());
+        // A legal member count still cannot overflow the separately admitted row count.
+        let two = Arc::new(history.prepare(0, &[Some(7), Some(8)], 2)?);
+        let wide = vec![two; 33];
+        let refs: Vec<_> = wide.iter().map(Arc::as_ref).collect();
+        assert!(packed.gather(&table, &refs, 0).is_err());
+        assert!(gatherer.try_submit(table, &wide, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn engram_worker_bound_covers_row_scaled_and_fixed_backend_scratch() -> Result<()> {
+        let word = std::mem::size_of::<usize>();
+        // Sum simultaneous capacities (including geometric growth), rather than
+        // multiplying a transient worker allocation by the number of leases.
+        let per_lookup = 8 + word // distinct addresses and canonical slots
+            + 256 + 2 * (std::mem::size_of::<u64>() + 2 * word) // validation tree, reads
+            + 264 // optional interleaved readback, split after gathering
+            + 2 * word + 2 * 8 + 2 // unsupported indices, selected rows, hit flags
+            + 2 * (2 * 2 * word + 2) + 2 // TLS pages/residency and returned hits
+            + 2 * (8 + 2 * word) + 2 + 64; // pending reads/hits and hash slots
+        let fixed = 4096 * (64 + 4 + 2 * 16 + 18) + 3 * 65536 + 4096 + 16 * word;
+        assert!(per_lookup <= 1024);
+        assert!(fixed <= 1 << 20);
+        for rows in [1, 256, 2048, 2752, 4096] {
+            assert_eq!(EngramBatchStaging::worker_bytes(rows)?, rows * 24 * 1024 + (1 << 20));
+            assert!(EngramBatchStaging::worker_bytes(rows)? >= rows * 24 * per_lookup + fixed);
+        }
+        assert!(EngramBatchStaging::worker_bytes(0).is_err());
+        assert!(EngramBatchStaging::worker_bytes(4097).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn strided_gather_matches_paired_bytes_across_parts_duplicates_images_and_gather_interfaces() -> Result<()> {
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &[Some(7), None, Some(31)], 3)?;
+        let weight = tempfile::NamedTempFile::new()?;
+        let scale = tempfile::NamedTempFile::new()?;
+        let packed = tempfile::NamedTempFile::new()?;
+        weight.as_file().set_len(ENGRAM_ROWS[0] * 256)?;
+        scale.as_file().set_len(ENGRAM_ROWS[0] * 8)?;
+        packed.as_file().set_len(ENGRAM_ROWS[0] * 264)?;
+        for hashes in batch.hashes() {
+            for &address in &hashes[0] {
+                let row: Vec<_> = (0..264).map(|col| ((address + col) % 251) as u8).collect();
+                weight.as_file().write_all_at(&row[..256], address * 256)?;
+                scale.as_file().write_all_at(&row[256..], address * 8)?;
+                packed.as_file().write_all_at(&row, address * 264)?;
+            }
+        }
+        let map = |file: &tempfile::NamedTempFile, width| {
+            // SAFETY: test owns immutable files throughout all gathers.
+            unsafe { crate::MappedTable::single(file.path(), 0, ENGRAM_ROWS[0],
+                crate::RowFormat::of(cuteafd_core::DType::U8, width)?) }
+        };
+        let paired = EngramTable::new(map(&weight, 256)?, map(&scale, 8)?)?;
+        let boundary = batch.hashes().iter().flat_map(|hashes| hashes[0].iter()).copied().min().unwrap() + 1;
+        let parts = [crate::TablePart { path: packed.path().into(), offset: 0, rows: boundary },
+            crate::TablePart { path: packed.path().into(), offset: boundary * 264, rows: ENGRAM_ROWS[0] - boundary }];
+        // SAFETY: test owns the immutable packed file throughout both parts' lifetime.
+        let strided = EngramTable::new_strided(unsafe { crate::MappedTable::open(&parts,
+            crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? })?;
+        assert!(strided.scales().is_none());
+        let mut before = EngramBatchStaging::new(8)?;
+        let mut after = EngramBatchStaging::new(8)?;
+        for copies in [2, 1, 2] {
+            let batches = vec![&batch; copies];
+            let expected = before.gather(&paired, &batches, 0)?;
+            for _ in 0..2 {
+                let actual = after.gather(&strided, &batches, 0)?;
+                assert_eq!(actual.weights, expected.weights);
+                assert_eq!(actual.scales, expected.scales);
+                assert_eq!(actual.text_mask, expected.text_mask);
+                assert_eq!(actual.global_scale.to_bits(), expected.global_scale.to_bits());
+                assert_eq!(actual.encoding, expected.encoding);
+                assert_eq!(strided.weights().stats().snapshot().gathers, 0,
+                    "staging must leave logical gather accounting to its owner");
+                assert_eq!(actual.weights.len(), expected.weights.len());
+            }
+        }
+        assert!(EngramTable::new_strided(map(&weight, 256)?).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn packed_ple_gather_preserves_rows_duplicates_masks_and_reuse() -> Result<()> {
         let history = cuteafd_core::EngramHistory::new(0)?;
         let batch = history.prepare(0, &[Some(7), None, Some(31)], 3)?;
         let mut staging = EngramBatchStaging::new(8)?;
-        let addresses_before = (staging.weights.as_ptr(), staging.scales.as_ptr());
+        let addresses_before = staging.payload.bytes().as_ptr();
         for encoding in [EngramEncoding::Fp8, EngramEncoding::Nvfp4, EngramEncoding::Fp8] {
             let weights = tempfile::NamedTempFile::new()?;
             let scales = tempfile::NamedTempFile::new()?;
@@ -213,8 +504,271 @@ mod tests {
             }
             assert!(staging.gather(&table, &[],0).is_err());
             assert!(staging.view().is_err());
-            assert_eq!(addresses_before,(staging.weights.as_ptr(),staging.scales.as_ptr()));
+            assert_eq!(addresses_before,staging.payload.bytes().as_ptr());
         }
+        Ok(())
+    }
+
+    /// Microbench of one prefill-unit gather (2,752 tokens x 24 rows, strided
+    /// 264 B rows): `cached` = every row already in the row cache (the look-ahead
+    /// landed it); otherwise the row cache misses and the rows are page-cache
+    /// hot (the 64K warm path). Run in release:
+    /// `cargo test --release -p cuteafd-loader --lib engram_gather_microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "CPU microbench, run in release"]
+    fn engram_gather_microbench() -> Result<()> {
+        let tokens = 2752usize;
+        let repeats: usize = std::env::var("ENGRAM_BENCH_REPEATS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let ids: Vec<Option<u32>> = (0..tokens).map(|_| {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            Some((rng % 99_000) as u32)
+        }).collect();
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?;
+        let dir = tempfile::tempdir_in(std::env::var("ENGRAM_BENCH_DIR").unwrap_or_else(|_| ".".into()))?;
+        let path = dir.path().join("strided.bin");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(ENGRAM_ROWS[0] * 264)?;
+        for hashes in batch.hashes() {
+            for &address in &hashes[0] {
+                file.write_all_at(&[(address % 251) as u8; 264], address * 264)?;
+            }
+        }
+        drop(file);
+        // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
+        let rows = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
+        let mut table = EngramTable::new_strided(rows)?;
+        let mut staging = EngramBatchStaging::new(tokens)?;
+        let cold = std::env::var_os("ENGRAM_BENCH_COLD").is_some();
+        for (label, shares) in [("row-cache hit", [2 * tokens * 24, 1024]), ("page-cache hot", [24, 1024])] {
+            if cold && label == "row-cache hit" { continue; }
+            table.set_cache_shares(shares)?;
+            // Warm: the page cache (and, when it fits, the row cache).
+            for _ in 0..2 { staging.gather(&table, &[&batch], 0)?; }
+            let mut times = Vec::new();
+            let mut cold_left = 0;
+            let before = table.weights().stats().snapshot();
+            for _ in 0..repeats {
+                if cold {
+                    // Evict the fixture's pages (including our own mapping's): every
+                    // row is a device read.
+                    let left = table.weights().evict_for_test();
+                    cold_left = cold_left.max(left);
+                }
+                let started = std::time::Instant::now();
+                let view = staging.gather(&table, &[&batch], 0)?;
+                std::hint::black_box(view.weights.len());
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(f64::total_cmp);
+            let mode = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() {
+                if std::env::var_os("MAPPED_BENCH_INLINE").is_some() { " (all rows via reactor, no ASYNC)" } else { " (all rows via reactor, ASYNC)" }
+            } else { " (mincore)" };
+            let after = table.weights().stats().snapshot().since(&before);
+            println!("engram gather {label}{}{mode}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, \
+                late faults/gather {:.0}, pages left resident after eviction <= {cold_left}",
+                if cold { " COLD" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
+                after.late_major_faults as f64 / repeats as f64);
+        }
+        Ok(())
+    }
+
+    /// Phase split of the page-cache-hot gather (see `engram_gather_microbench`).
+    #[test]
+    #[ignore = "CPU microbench, run in release"]
+    fn engram_gather_phase_microbench() -> Result<()> {
+        use crate::formats::mapped_table::row_cache::RowClass;
+        let tokens = 2752usize;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let ids: Vec<Option<u32>> = (0..tokens).map(|_| {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            Some((rng % 99_000) as u32)
+        }).collect();
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?;
+        let dir = tempfile::tempdir_in(std::env::var("ENGRAM_BENCH_DIR").unwrap_or_else(|_| ".".into()))?;
+        let path = dir.path().join("strided.bin");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(ENGRAM_ROWS[0] * 264)?;
+        let mut rows: Vec<u64> = batch.hashes().iter().flat_map(|h| h[0]).collect();
+        for &address in &rows { file.write_all_at(&[(address % 251) as u8; 264], address * 264)?; }
+        drop(file);
+        rows.sort_unstable(); rows.dedup();
+        // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
+        let table = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
+        let mut table = EngramTable::new_strided(table)?;
+        table.set_cache_shares([24, 1024])?;
+        let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill, GatherMode::default())?;
+        read.finish(&table)?;
+        let mut t = [0f64; 4];
+        for _ in 0..10 {
+            let a = std::time::Instant::now();
+            let (pins, _) = table.cache().acquire(&rows, RowClass::Prefill);
+            drop(pins);
+            let b = std::time::Instant::now();
+            let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill, GatherMode::default())?;
+            let c = std::time::Instant::now();
+            read.finish(&table)?;
+            let d = std::time::Instant::now();
+            std::hint::black_box(read.misses());
+            let mut out = vec![0u8; rows.len() * 264];
+            for i in 0..rows.len() { let [w, sc] = read.row(i); out[i*264..i*264+w.len()].copy_from_slice(w); out[i*264+w.len()..(i+1)*264].copy_from_slice(sc); }
+            let e = std::time::Instant::now();
+            std::hint::black_box(out.len());
+            for (slot, span) in t.iter_mut().zip([b - a, c - b, d - c, e - d]) { *slot += span.as_secs_f64() * 100.0; }
+        }
+        println!("engram gather phases ({} distinct rows), mean ms: acquire+release {:.2}, start_read (mincore + resident copy) {:.2}, finish {:.2}, place copy {:.2}; residency (mincore) total over all calls {:.1} ms",
+            rows.len(), t[0], t[1], t[2], t[3], table.weights().stats().snapshot().residency_ns as f64 / 1e6);
+        Ok(())
+    }
+
+    /// Cold/warm gather on the real official layer-1 table (ENGRAM_BENCH_SNAPSHOT):
+    /// (a) rows copied straight from the mappings by K threads (page faults do the
+    /// I/O, no mincore), and (b) the hybrid gather (mincore split, misses through
+    /// the reactor). Cold evicts both tables' pages (MADV_PAGEOUT + DONTNEED)
+    /// before every gather.
+    #[test]
+    #[ignore = "CPU/IO microbench on a real snapshot, run in release"]
+    fn engram_real_table_cold_microbench() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("ENGRAM_BENCH_SNAPSHOT") else { return Ok(()) };
+        let tokens = 2752usize;
+        let repeats: usize = std::env::var("ENGRAM_BENCH_REPEATS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let cold = std::env::var_os("ENGRAM_BENCH_COLD").is_some();
+        let catalog = crate::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
+        // SAFETY: the snapshot is immutable for the bench's lifetime.
+        let mut table = unsafe { catalog.map_engram(1)? };
+        table.set_cache_shares([24, 1024])?;
+        let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64 | 1;
+        let mut batch = || -> Result<cuteafd_core::EngramBatch> {
+            let ids: Vec<Option<u32>> = (0..tokens).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                Some((rng % 99_000) as u32) }).collect();
+            Ok(cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?)
+        };
+        let evict = |table: &EngramTable| -> usize {
+            table.weights().evict_for_test() + table.scales().map_or(0, |s| s.evict_for_test())
+        };
+        let mode = std::env::var("ENGRAM_BENCH_MODE").unwrap_or_else(|_| "hybrid".into());
+        let fraction = std::env::var("ENGRAM_BENCH_WARM_FRACTION").unwrap_or_default();
+        let threads: usize = std::env::var("ENGRAM_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut times = Vec::new();
+        let mut rows_read = 0usize;
+        for _ in 0..repeats {
+            // A fresh random batch each time: warm runs reuse its rows once first.
+            let b = batch()?;
+            let mut rows: Vec<u64> = b.hashes().iter().flat_map(|h| h[0]).collect();
+            rows.sort_unstable(); rows.dedup();
+            if cold {
+                evict(&table);
+                // A true cold drop (e.g. `nest drop-caches --host raptor`): a FUSE
+                // passthrough backing file keeps its page cache across our eviction.
+                if let Ok(command) = std::env::var("ENGRAM_BENCH_DROP") {
+                    let status = std::process::Command::new("sh").arg("-c").arg(&command).status()?;
+                    anyhow::ensure!(status.success(), "drop command failed: {command}");
+                }
+                // Partly resident: re-read a random fraction of the batch's rows.
+                if let Some(fraction) = std::env::var("ENGRAM_BENCH_WARM_FRACTION").ok().and_then(|v| v.parse::<f64>().ok()) {
+                    let scales = table.scales().context("paired official table")?;
+                    let mut pick = 0x2545_F491_4F6C_DD1Du64;
+                    for &row in &rows {
+                        pick ^= pick << 13; pick ^= pick >> 7; pick ^= pick << 17;
+                        if (pick % 1000) as f64 / 1000.0 < fraction {
+                            std::hint::black_box((table.weights().row(row)?[0], scales.row(row)?[0]));
+                        }
+                    }
+                }
+            } else {
+                // Warm: both tables' pages of this batch (every byte of each row,
+                // rows straddling a page included) are in the page cache.
+                let scales = table.scales().context("paired official table")?;
+                let mut sum = 0u64;
+                for &row in &rows {
+                    sum += table.weights().row(row)?.iter().map(|&b| u64::from(b)).sum::<u64>();
+                    sum += scales.row(row)?.iter().map(|&b| u64::from(b)).sum::<u64>();
+                }
+                std::hint::black_box(sum);
+            }
+            let started = std::time::Instant::now();
+            if mode == "mmap" {
+                let chunk = rows.len().div_ceil(threads);
+                let scales = table.scales().context("paired official table")?;
+                std::thread::scope(|scope| {
+                    for part in rows.chunks(chunk) {
+                        let (weights, scales) = (table.weights(), scales);
+                        scope.spawn(move || {
+                            let mut out = vec![0u8; part.len() * 264];
+                            for (i, &row) in part.iter().enumerate() {
+                                out[i * 264..i * 264 + 256].copy_from_slice(weights.row(row).expect("row"));
+                                out[i * 264 + 256..(i + 1) * 264].copy_from_slice(scales.row(row).expect("row"));
+                            }
+                            std::hint::black_box(out.len());
+                        });
+                    }
+                });
+            } else {
+                let mut staging = EngramBatchStaging::new(tokens)?;
+                std::hint::black_box(staging.gather(&table, &[&b], 0)?.weights.len());
+            }
+            times.push(started.elapsed().as_secs_f64() * 1e3);
+            rows_read += rows.len();
+        }
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        let distinct = rows_read / repeats;
+        // Cold, each distinct row costs one 4 KiB weight page and one 4 KiB scale page from the device.
+        let switches = table.weights().stats().snapshot().copy_switches;
+        println!("real table {}{} {} K={threads}: {distinct} distinct rows, median {median:.1} ms (min {:.1}, max {:.1}), {:.2} GB/s of 4 KiB pages, copy switches {switches}",
+            if cold { "COLD" } else { "warm" }, if fraction.is_empty() { String::new() } else { format!(" ({fraction} resident)") },
+            if mode == "hybrid" && std::env::var_os("MAPPED_BENCH_SPLIT").is_some() { "split-first (cand5)".to_string() }
+                else if mode == "hybrid" { "copy-first".to_string() }
+                else { mode.clone() },
+            times[0], times[times.len() - 1],
+            distinct as f64 * 2.0 * 4096.0 / (median / 1e3) / 1e9);
+        Ok(())
+    }
+
+    /// Per-group copy time distribution (8 rows) warm vs cold on the real table,
+    /// and the cost of one clock read: picks the copy-first fault threshold.
+    #[test]
+    #[ignore = "CPU/IO microbench on a real snapshot, run in release"]
+    fn engram_copy_group_timing() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("ENGRAM_BENCH_SNAPSHOT") else { return Ok(()) };
+        let catalog = crate::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
+        // SAFETY: the snapshot is immutable for the bench's lifetime.
+        let table = unsafe { catalog.map_engram(1)? };
+        let scales = table.scales().context("paired official table")?;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rows: Vec<u64> = (0..65536).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng % table.weights().rows() }).collect();
+        rows.sort_unstable(); rows.dedup();
+        let started = std::time::Instant::now();
+        let mut sink = std::time::Instant::now();
+        for _ in 0..1_000_000 { sink = std::hint::black_box(std::time::Instant::now()); }
+        let clock_ns = started.elapsed().as_nanos() as f64 / 1e6;
+        let _ = sink;
+        let mut out = [0u8; 264];
+        let mut time_groups = |label: &str| -> Result<()> {
+            let mut groups = Vec::new();
+            for group in rows.chunks(8) {
+                let start = std::time::Instant::now();
+                for &row in group {
+                    out[..256].copy_from_slice(table.weights().row(row)?);
+                    out[256..].copy_from_slice(scales.row(row)?);
+                }
+                std::hint::black_box(&out);
+                groups.push(start.elapsed().as_nanos() as u64);
+            }
+            groups.sort_unstable();
+            let q = |p: f64| groups[((groups.len() - 1) as f64 * p) as usize];
+            let over = groups.iter().filter(|&&t| t > 5_000).count();
+            println!("copy groups of 8 rows {label}: p50 {} ns, p99 {} ns, p99.9 {} ns, max {} ns; {} of {} groups over 5 us",
+                q(0.5), q(0.99), q(0.999), groups[groups.len() - 1], over, groups.len());
+            Ok(())
+        };
+        if let Ok(command) = std::env::var("ENGRAM_BENCH_DROP") {
+            table.weights().evict_for_test(); scales.evict_for_test();
+            anyhow::ensure!(std::process::Command::new("sh").arg("-c").arg(&command).status()?.success(), "drop failed");
+            time_groups("cold")?;
+        }
+        time_groups("warm")?;
+        println!("clock read: {clock_ns:.1} ns ({:.1} ns per row at groups of 8)", clock_ns / 8.0);
         Ok(())
     }
 }

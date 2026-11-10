@@ -1,10 +1,14 @@
 //! Native GPU resources and inference QPs share one owning thread.
-mod local;
+pub(super) mod local;
 mod backend;
 mod census;
 mod modules;
-mod routes;
+pub(super) mod routes;
 mod exlr8;
+mod push;
+mod push_fp8;
+mod push_native;
+mod push_exlr8;
 
 use crate::shared::experts::execution::HostExpertExchange;
 use crate::shared::experts::layer::{ExpertLayer, ExpertWeights};
@@ -57,6 +61,12 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
             topology.ep()
         );
     }
+    if args.exlr8_manifest.is_none() {
+        ensure!(
+            args.exlr8_prefill_activations == crate::shared::experts::exlr8::Exlr8PrefillActivations::A16,
+            "EXLR8 options require --exlr8-manifest"
+        );
+    }
     let config = NativeExpertServiceConfig {
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
@@ -64,6 +74,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         fp8_package: args.fp8_package,
         snapshot: args.snapshot,
         exlr8_manifest: args.exlr8_manifest,
+        exlr8_prefill_activations: args.exlr8_prefill_activations,
         rank: args.rank as usize,
         world: args.world as usize,
         model_admission: None,
@@ -73,7 +84,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         max_frame_bytes: 0,
         rdma_endpoints: 0,
         declared_world: crate::shared::spark_topology::world(topology, args.world as usize)?,
-        native_spark_tp2: false,
+        native_spark_roles: false,
         bf16_ingress: false,
         encoder,
         audio_encoder,
@@ -83,6 +94,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         .context("native local RoCE owner failed")?
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeExpertServiceConfig {
     pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
     pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
@@ -95,6 +107,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
     pub exlr8_manifest: Option<String>,
+    pub exlr8_prefill_activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
     pub rank: usize,
     pub world: usize,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
@@ -108,7 +121,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub declared_world: SparkWorld,
     /// Native Flash's TP2 kernel uses the Spark shard role with legacy wire
     /// requests. Set only after catalog validation, never from a CLI override.
-    native_spark_tp2: bool,
+    native_spark_roles: bool,
     bf16_ingress: bool,
 }
 
@@ -125,17 +138,20 @@ fn load_weights<'a>(
     catalog: &OfficialV41Catalog,
     config: &NativeExpertServiceConfig,
     modules: &mut modules::WarmModules<'a>,
+    push: Option<&mut std::net::TcpStream>,
 ) -> Result<(backend::Weights<'a>, usize)> {
     let layers = config.resident_layers(catalog.routed_experts().layers)?;
     let first = catalog.routed_experts().first_layer;
     ensure!(layers.iter().all(|&layer| layer >= first),
         "coordinator selected experts before this checkpoint's routed boundary {first}");
     validate_topology(config, catalog)?;
+    // Release metadata temporaries after the final topology recheck, before admission.
+    cuteafd_ffi::trim_startup_metadata();
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
-        return exlr8::load(library, catalog, config, modules.exlr8()?);
+        return exlr8::load(library, catalog, config, modules.exlr8()?, push);
     }
-    if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config); }
-    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?); }
+    if catalog.exl3().is_some() { return backend::load_exl3(library, catalog, config, push); }
+    if catalog.fp8().is_some() { return backend::load_fp8(library, catalog, config, modules.take_fp8()?, push); }
     log_spark_memory_if_enabled(library, config, "worker startup", None, None);
     // NVFP4 backbone experts load through the format-aware ExpertWeights path.
     let nvfp4 = catalog.nvfp4().is_some();
@@ -161,14 +177,18 @@ fn load_weights<'a>(
     );
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
-    let workspace = ExpertWeights::plan_execution(
-        config.selection(0)?,
-        library,
-        config.compiled_capacity()?,
-        config.capacity,
-        nvfp4,
-    )?
-    .total()?;
+    let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
+        let selections = layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
+        let budget = ExpertWeights::plan_execution_layers(selections, library, compiled, live, nvfp4)?;
+        let device = budget.total()?;
+        let scratch = budget.scratch_bytes.checked_add(budget.decode_scratch_bytes)
+            .and_then(|bytes| bytes.checked_add(budget.small_scratch_bytes))
+            .context("native Spark scratch overflow")?;
+        let staging = (staging_rows as usize).checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
+            .context("native Spark route staging overflow")?;
+        Ok((scratch, device - scratch, staging))
+    })?;
+    let workspace = usize::try_from(workspace.total().context("native Spark workspace overflow")?)?;
     ensure!(
         resident
             .checked_add(workspace)
@@ -226,9 +246,13 @@ fn load_weights<'a>(
             "explicit Spark replicas admission"
         );
     }
-    let mut weights = Vec::with_capacity(layers.len());
+    if let Some(stream) = push {
+        if let Some(weights) = push_native::load(library, catalog, config, resident, stream)? {
+            return Ok((backend::Weights::Full(weights), config.device_budget - resident));
+        }
+    }
     let mut remaining = config.device_budget;
-    for &layer in &layers {
+    let weights = super::load_in_rank_order(&layers, config.rank, |_, layer| {
         let started = std::time::Instant::now();
         let weight = ExpertWeights::load(
             library,
@@ -246,8 +270,8 @@ fn load_weights<'a>(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "native expert layer loaded"
         );
-        weights.push(weight);
-    }
+        Ok(weight)
+    })?;
     log_spark_memory_if_enabled(library, config, "weights resident", None, None);
     Ok((backend::Weights::Full(weights), remaining))
 }
@@ -334,6 +358,15 @@ fn selected_spark_io(config: &NativeExpertServiceConfig, geometry: cuteafd_core:
     Ok(working.rank_endpoints_io(config.rank, geometry, &model.endpoints, model.rings)?)
 }
 
+/// The fallback exchange is shared across endpoints, not sized from the
+/// prefill owner's larger scratch/export extent.
+fn worker_host_exchange(config: &NativeExpertServiceConfig) -> Result<(HostExpertExchange, Vec<u32>)> {
+    let model = config.model_admission.as_ref().context("Spark exchange requires coordinator model admission")?;
+    let rows = model.endpoints.iter().map(|endpoint| endpoint.capacity).max()
+        .context("Spark exchange requires an admitted endpoint")?;
+    Ok((HostExpertExchange::new(rows)?, vec![0; rows as usize]))
+}
+
 fn worker_ring_geometry(config: &NativeExpertServiceConfig)
     -> Result<cuteafd_loader::placement::SparkRingGeometry> {
     let model = config.model_admission.as_ref().context("Spark rings require coordinator model admission")?;
@@ -366,6 +399,21 @@ fn spark_runtime_headroom() -> Result<usize> {
         usize::try_from(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES)?)
 }
 
+/// Query installed packages at each owner's live/export extent. The tuple is
+/// device scratch, stream-ordered device I/O and pinned staging per queued unit.
+fn spark_execution_workspace(config: &NativeExpertServiceConfig,
+    mut plan: impl FnMut(u32, u32, u32, cuteafd_core::OwnerExtent) -> Result<(usize, usize, usize)>)
+    -> Result<cuteafd_core::expert_geometry::SparkWorkspaceBytes> {
+    let executions = &config.model_admission.as_ref()
+        .context("Spark workspace requires typed execution admission")?.executions;
+    executions.validate()?;
+    executions.workspace_bytes(|extent| {
+        let (scratch, io, pinned) = plan(extent.capacity, extent.compiled, extent.staging_rows, extent)?;
+        Ok::<_, anyhow::Error>(cuteafd_core::OwnerBytes { scratch: u64::try_from(scratch)?,
+            io: u64::try_from(io)?, pinned_staging: u64::try_from(pinned)? })
+    })?.context("Spark execution workspace overflow")
+}
+
 fn spark_admission_budget(
     config: &NativeExpertServiceConfig,
     resident: usize,
@@ -382,12 +430,12 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     geometry: cuteafd_core::ExpertGeometry, resident: usize, staging: usize,
     pinned_host: usize, read_scratch: usize, workspace: usize) -> Result<SparkAdmissionBudget> {
     let io = selected_spark_io(config, geometry, worker_ring_geometry(config)?)?;
-    let (exchange, row_indices) = if config.bf16_ingress || config.exlr8_manifest.is_some() {
-        (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?)
-    } else { (HostExpertExchange::bytes_for(config.capacity)?, config.capacity as usize * 4) };
+    let (exchange, row_indices) = (usize::try_from(io.host_exchange)?, usize::try_from(io.row_indices)?);
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
+    // Backend preflight already sums capacity-specific execution owners,
+    // including retained pinned staging; weights and rings stay shared.
     // The loader's pinned buffers and read scratch live only for one layer load;
     // the exchange, row-index scratch and registered rings live while serving.
     let load_peak = resident
@@ -480,7 +528,7 @@ mod tests {
     /// The planner's Spark I/O (`plan --layout`) against the worker's own
     /// sample: the expert service's selected rank I/O (per-endpoint rings,
     /// shared intake/exchange/indices) for the typed admission the
-    /// coordinator sends it: capacity, one endpoint per MiMo prefill lane,
+    /// coordinator sends it: a bounded decode endpoint and an N-wave prefill endpoint,
     /// and the wire format. MiMo Flash/Pro on their natural minimum
     /// Spark counts, FP8 and BF16 wires.
     #[test]
@@ -498,24 +546,25 @@ mod tests {
                 cuteafd_loader::families::mimo_v2::MimoExpertInput::Bf16] {
                 let report = cuteafd_loader::plan::plan(dir.path(), &PlanOptions {
                     placement: ExpertPlacement::Sparks { ranks },
-                    layout: Some(LayoutOptions { pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
-                        onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
+                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), pool_tokens: Some(32768), concurrency: 4, mimo_expert_input: input,
+                        onboard: Some(cuteafd_loader::placement::OnboardSetting::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
+                let capacity = u32::try_from(report.prefill_unit_rows.unwrap()).unwrap();
                 let layout = report.memory_layout.unwrap();
-                let lanes = cuteafd_loader::families::mimo_v2::admission::resolve_transport_lanes(true,
-                    if pro { "mimop" } else { "mimo" }, None).unwrap();
                 let sparks = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
                 assert_eq!(sparks.len(), ranks, "pro={pro} {input:?}: {}", layout.render());
                 for device in sparks {
                     let planned = |group: &str| device.items.iter().find(|i| i.group == group)
                         .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
-                    // The worker's typed admission as the coordinator selects it: one endpoint per
-                    // MiMo prefill lane (the runtime's own lane resolution), at its wire format.
+                    // Match the coordinator's heterogeneous decode/prefill endpoint admission.
                     let mut worker = config(ranks, device.index as usize, None);
-                    worker.capacity = 4096;
-                    worker.rdma_endpoints = lanes;
+                    worker.capacity = capacity;
+                    worker.rdma_endpoints = 2;
                     worker.bf16_ingress = input.bf16(false);
-                    set_model(&mut worker, 4096, input.bf16(false), lanes);
+                    set_model(&mut worker, capacity, input.bf16(false), 2);
+                    worker.model_admission.as_mut().unwrap().endpoints =
+                        cuteafd_loader::families::mimo_v2::admission::spark_endpoints(capacity as usize, input)
+                            .unwrap().to_vec();
                     let rings = worker_ring_geometry(&worker).unwrap();
                     let sample = selected_spark_io(&worker, geometry, rings).unwrap();
                     assert_eq!(planned("rdma rings"), sample.mapped_rings, "pro={pro} {input:?} {}", device.name());
@@ -527,6 +576,14 @@ mod tests {
         }
     }
 
+    fn test_executions(capacity: u32, compiled_capacity: u32) -> cuteafd_core::SparkExecutions {
+        cuteafd_core::SparkExecutions {
+            decode: vec![cuteafd_core::DecodeExecution { capacity: capacity.min(80), compiled_capacity }],
+            prefill: cuteafd_core::PrefillExecution { capacity, compiled_capacity,
+                unit_rows: capacity, buffered_units: 1 },
+        }
+    }
+
     fn config(world: usize, rank: usize, topology: Option<SparkTopology>) -> NativeExpertServiceConfig {
         NativeExpertServiceConfig {
             library: PathBuf::from("/native.so"),
@@ -535,14 +592,15 @@ mod tests {
             fp8_package: None,
             snapshot: PathBuf::from("/model"),
             exlr8_manifest: None,
+            exlr8_prefill_activations: Default::default(),
             rank,
             world,
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
-                capacity: 16, compiled_capacity: 16,
-                endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 16,
-                    ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
+                executions: test_executions(16, 16),
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 16,
+                    ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }; 2],
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
             }),
             selected_layers: None,
             capacity: 16,
@@ -550,11 +608,118 @@ mod tests {
             max_frame_bytes: 64 << 20,
             rdma_endpoints: 2,
             declared_world: crate::shared::spark_topology::world(topology, world).unwrap(),
-            native_spark_tp2: false,
+            native_spark_roles: false,
             bf16_ingress: false,
             encoder: None,
             audio_encoder: None,
         }
+    }
+
+    #[test]
+    #[ignore = "CPU-only isolated metadata startup RSS; requires CUTEAFD_KIMI_EXL3_SNAPSHOT"]
+    fn mounted_worker_metadata_host_rss() -> Result<()> {
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint")?);
+        let sample = |phase: &str| -> Result<(usize, usize)> {
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let value = |key| -> Result<usize> {
+                Ok(status.lines().find_map(|line| line.strip_prefix(key)).context("missing RSS")?
+                    .split_whitespace().next().context("empty RSS")?.parse::<usize>()? * 1024)
+            };
+            let (rss, peak) = (value("VmRSS:")?, value("VmHWM:")?);
+            eprintln!("worker metadata CPU RSS: phase={phase} rss={rss} peak={peak}");
+            Ok((rss, peak))
+        };
+        sample("start")?;
+        let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
+        sample("inventory")?;
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let geometry = catalog.routed_experts().geometry()?;
+        cuteafd_core::set_expert_geometry(geometry).map_err(|_| anyhow::anyhow!("run alone"))?;
+        drop(inventory);
+        sample("catalog_before_native")?;
+        let _identity = cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(&snapshot,
+            geometry, SparkWorld::canonical(6)?)?;
+        sample("identity")?;
+        let mut worker = config(6, 0, None);
+        worker.snapshot = snapshot;
+        worker.selected_layers = Some((6..93).collect());
+        validate_topology(&worker, &catalog)?;
+        sample("topology")?;
+        // Worker selection validates once; load_weights validates again immediately before trimming.
+        validate_topology(&worker, &catalog)?;
+        cuteafd_ffi::trim_startup_metadata();
+        let (rss, peak) = sample("startup_complete_trimmed")?;
+        ensure!(peak < 2usize << 30, "worker metadata peak exceeds 2 GiB: {peak}");
+        ensure!(rss < 512usize << 20, "retained worker metadata exceeds 512 MiB: {rss}");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only mounted Kimi checkpoint/package planning; run alone with CUTEAFD_KIMI_EXL3_SNAPSHOT and CUTEAFD_KIMI_SPARK_PACKAGE"]
+    fn mounted_kimi_all_spark_golden_demand() -> Result<()> {
+        use crate::shared::experts::exl3::{execution::Exl3Epilogue, Exl3Weights, worker::Exl3Worker};
+        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
+            .map_err(|_| anyhow::anyhow!("run Kimi demand test alone"))?;
+        let snapshot = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot")?);
+        let package = PathBuf::from(std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE").context("Kimi Spark package")?);
+        let mut catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+        catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+        let available = std::env::var("CUTEAFD_KIMI_MIN_AVAILABLE").ok().map(|s| s.parse::<usize>()).transpose()?;
+        let measured_host = std::env::var("CUTEAFD_KIMI_MEASURED_HOST_BYTES").ok()
+            .map(|s| s.parse::<usize>()).transpose()?;
+        let mut minimum_onboard = None;
+        for onboard in 0..=6 {
+            let layers = (1 + onboard..93).collect::<Vec<_>>();
+            let mut worst_peak = 0;
+            for rank in 0..6 {
+                for capacity in [512, 4096] {
+                    let mut worker = config(6, rank, None);
+                    worker.capacity = capacity;
+                    worker.rdma_endpoints = 1;
+                    worker.selected_layers = Some(layers.clone());
+                    let model = worker.model_admission.as_mut().unwrap();
+                    model.executions = test_executions(capacity, 4096);
+                    model.endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
+                        ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }];
+                    let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
+                        Default::default(), Exl3Epilogue::Sum)?;
+                    let mut resident = 0;
+                    let (mut staging, mut pinned, mut scratch) = (0, 0, 0);
+                    for &layer in &layers {
+                        let plan = Exl3Weights::plan(&catalog, worker.exl3_selection(layer)?)?;
+                        resident += plan.resident_bytes;
+                        staging = staging.max(plan.device_staging_bytes);
+                        pinned = pinned.max(plan.pinned_host_bytes);
+                        scratch = scratch.max(plan.read_scratch_bytes);
+                    }
+                    let peak = spark_admission_budget(&worker, resident, staging, pinned, scratch, workspace)?;
+                    let planned_peak = peak.serve_peak.max(peak.load_peak);
+                    let measured_host_peak = if let Some(host) = measured_host {
+                        planned_peak.checked_sub(peak.headroom).and_then(|bytes| bytes.checked_add(host))
+                            .context("measured host forecast overflow")?
+                    } else { planned_peak };
+                    worst_peak = worst_peak.max(measured_host_peak);
+                    eprintln!("Kimi CPU golden demand: onboard={onboard} rank={rank} rows={capacity} layers={} resident={resident} workspace={workspace} exchange={} indices={} rings={} estimated_runtime={} load_peak={} serve_peak={} staging={staging} pinned={pinned} read_scratch={scratch}",
+                        layers.len(), peak.exchange, peak.row_indices, peak.rings, peak.headroom, peak.load_peak, peak.serve_peak);
+                    assert!(peak.serve_peak >= resident + workspace && peak.load_peak >= resident);
+                }
+            }
+            if let Some(host) = measured_host {
+                eprintln!("Kimi CPU measured-host forecast: onboard={onboard} host_bytes={host} worst_peak={worst_peak}");
+            }
+            if let Some(available) = available {
+                let fits = worst_peak.checked_add(4usize << 30).is_some_and(|required| required <= available);
+                eprintln!("Kimi CPU fit: onboard={onboard} worst_peak={worst_peak} available={available} margin={} fits_4gib={fits}",
+                    available.saturating_sub(worst_peak));
+                if fits && minimum_onboard.is_none() { minimum_onboard = Some(onboard); }
+            }
+        }
+        if available.is_some() {
+            assert!(minimum_onboard.is_some(), "no proposed onboard count preserves 4 GiB");
+            eprintln!("Kimi CPU minimum onboard at sampled availability: {}", minimum_onboard.unwrap());
+        }
+        Ok(())
     }
 
     #[test]
@@ -620,12 +785,12 @@ mod tests {
 
     fn set_model(config: &mut NativeExpertServiceConfig, capacity: u32, bf16: bool, endpoints: usize) {
         config.model_admission = Some(cuteafd_transport::worker_selection::ModelAdmission {
-            capacity, compiled_capacity: capacity,
-            endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress: if bf16 {
+            executions: test_executions(capacity, capacity),
+            endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress: if bf16 {
                 cuteafd_core::SparkIngress::Bf16
-            } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
+            } else { cuteafd_core::SparkIngress::Fp8K32 }, partial_reply_bytes: None }; endpoints],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
         });
     }
 
@@ -672,22 +837,38 @@ mod tests {
     }
 
     #[test]
+    fn spark_exl3_uses_compressed_shards_for_every_registered_world() {
+        for world in [1, 2, 3, 4, 6] {
+            for rank in 0..world {
+                assert_eq!(config(world, rank, None).exl3_selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
+            }
+        }
+    }
+
+    #[test]
     fn canonical_tp1_selects_whole_exl3_experts_and_rank_package() {
         let one = config(1, 0, None);
         assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
         assert!(one.selection(7).unwrap().role() > 7);
         assert_eq!(one.native_group().unwrap(), None);
-        assert!(one.exl3_directory_for(&[4, 5]).ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp1-rank0").ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
+        let mut explicit = one;
+        explicit.exl3_aot_dir = Some("/custom-export".into());
+        assert_eq!(explicit.exl3_directory_for(&[4, 5], "tp6-compact-rank0"), PathBuf::from("/custom-export"));
     }
 
     #[test]
     fn unqualified_transport_worlds_are_rejected_before_shard_selection() {
-        for world in [0, 7, 8, 9] {
+        for world in [0, cuteafd_core::MAX_SPARK_WORLD + 1] {
             assert!(crate::shared::spark_topology::world(None, world).is_err(), "TP{world}");
         }
-        for rank in 0..5 {
-            assert_eq!(config(5, rank, None).selection(7).unwrap(),
-                ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 5 });
+        for world in [5, 7, 8] {
+            for rank in 0..world {
+                assert_eq!(config(world, rank, None).selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
+            }
         }
     }
 
@@ -718,28 +899,42 @@ mod tests {
     }
 
     #[test]
-    fn compact_exl3_topology_keeps_shards_packages_and_group_zero() {
+    fn canonical_exl3_keeps_shards_packages_and_rejects_ownership_wire() {
         for rank in 0..3 {
-            let config = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
-            assert_eq!(config.exl3_selection(7).unwrap(),
+            let canonical = config(3, rank, None);
+            assert_eq!(canonical.exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(config.exl3_directory_for(&[2, 3]).ends_with(format!("tp3-rank{rank}")));
-            assert_eq!(config.native_group().unwrap(), Some(0));
+            assert!(canonical.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
+            assert_eq!(canonical.native_group().unwrap(), None);
+            let owned = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
+            assert!(owned.exl3_selection(7).unwrap_err().to_string().contains("canonical Spark wire"));
+            assert_eq!(owned.native_group().unwrap(), Some(0));
         }
         let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
         assert!(config.exl3_selection(7).is_err());
     }
 
     #[test]
-    fn flash_native_tp2_selects_spark_role_without_changing_wire_protocol() {
-        for rank in 0..2 {
-            let mut flash = config(2, rank, None);
-            flash.native_spark_tp2 = true;
-            let layer = flash.selection(7).unwrap();
-            assert_eq!(layer, ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world: 2 });
-            assert_eq!(layer.role(), crate::shared::spark_topology::SPARK_TP2_ROLE);
-            assert!(flash.declared_world.ownership_topology().is_none());
-            assert_eq!(flash.native_group().unwrap(), None);
+    fn native_canonical_worlds_select_native_roles_without_changing_wire_protocol() {
+        for family in ["v41", "dsv4f", "dsv4p"] {
+            for world in cuteafd_core::tp_units::spark_package_worlds(family, "mxfp4") {
+                for rank in 0..world {
+                    let mut native = config(world, rank, None);
+                    native.native_spark_roles = true;
+                    let layer = native.selection(7).unwrap();
+                    let expected = if world == 4 { ExpertLayer::Backbone { layer: 7, rank } }
+                        else { ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world } };
+                    assert_eq!(layer, expected, "{family} TP{world} rank {rank}");
+                    let geometry = cuteafd_core::expert_geometry();
+                    let shard = layer.native_shard().unwrap();
+                    let artifacts = cuteafd_core::tp_units::native_spark_artifacts(
+                        geometry.hidden as usize, geometry.intermediate as usize, world).unwrap();
+                    let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width).unwrap();
+                    assert_eq!(layer.role(), artifact.role);
+                    assert!(native.declared_world.ownership_topology().is_none());
+                    assert_eq!(native.native_group().unwrap(), None);
+                }
+            }
         }
     }
 
@@ -791,9 +986,28 @@ mod tests {
         assert_eq!(HostExpertExchange::bytes_for(16).unwrap(), 16 * (48 + 10240));
     }
 
-    /// The ring term mirrors the transport's own sizing rule: minimum 8 MiB per
-    /// slot, `depth` slots per ring, one request and one response ring per
-    /// persistent endpoint, rounded up to the verbs-host alignment.
+    #[test]
+    fn typed_owner_workspace_charges_one_prefill_scratch_and_retained_staging() -> Result<()> {
+        let mut config = config(4, 0, None);
+        let model = config.model_admission.as_mut().unwrap();
+        model.executions = cuteafd_core::SparkExecutions::admit(&[64, 80], 4096, 2752, 3,
+            &[1, 80, 4096])?;
+        let mut queried = Vec::new();
+        let workspace = spark_execution_workspace(&config, |live, compiled, staging_rows, _| {
+            queried.push((live, compiled, staging_rows));
+            Ok((compiled as usize * 10, live as usize * 2, staging_rows as usize * 8))
+        })?;
+        assert_eq!(queried, [(64, 80, 64), (80, 80, 80), (4096, 4096, 2752)]);
+        assert_eq!(workspace.device_bytes, (80 + 80 + 4096) * 10 + (64 + 80 + 4096) * 2);
+        assert_eq!(workspace.pinned_bytes, (64 + 80 + 3 * 2752) * 8);
+        let one = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+        config.model_admission.as_mut().unwrap().executions.prefill.buffered_units = 4;
+        let four = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+        assert_eq!(one.serve_peak, four.serve_peak,
+            "already-summed execution workspace must not be multiplied by buffered units");
+        Ok(())
+    }
+
     #[test]
     fn registered_ring_bytes_match_the_transport_sizing_rule() {
         let alignment = 4096;
@@ -857,12 +1071,55 @@ mod tests {
     }
 
     #[test]
+    fn narrow_prefill_units_allocate_the_planned_host_exchange() -> Result<()> {
+        use cuteafd_core::{SparkEndpoint, SparkIngress};
+        use cuteafd_loader::placement::SparkWorkingSet;
+        let geometry = cuteafd_core::expert_geometry();
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 1, ..Default::default() };
+        for (unit_rows, waves) in [(256, 3), (2752, 3), (2048, 4)] {
+            for bf16 in [false, true] {
+                let mut config = config(6, 0, None);
+                config.capacity = 4096;
+                config.bf16_ingress = bf16;
+                let model = config.model_admission.as_mut().unwrap();
+                model.executions = cuteafd_core::SparkExecutions::admit(&[80, 80], 4096,
+                    unit_rows, waves, &[80, 4096])?;
+                let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+                model.endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 80, ingress, partial_reply_bytes: None },
+                    SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress, partial_reply_bytes: None }];
+                model.validate(geometry)?;
+                let planned = working.rank_endpoints_io(0, geometry, &model.endpoints, model.rings)?;
+                let (exchange, indices) = worker_host_exchange(&config)?;
+                let actual = exchange.ids.capacity() * std::mem::size_of::<i32>()
+                    + exchange.routing.capacity() * std::mem::size_of::<f32>()
+                    + exchange.partials.capacity();
+                assert_eq!(actual as u64, planned.host_exchange);
+                assert_eq!((indices.capacity() * std::mem::size_of::<u32>()) as u64, planned.row_indices);
+                assert_eq!(indices.len(), unit_rows as usize);
+                assert!(actual < HostExpertExchange::bytes_for(config.capacity)?);
+                let budget = spark_admission_budget(&config, 10, 1, 2, 3, 4)?;
+                assert_eq!(budget.exchange, actual);
+                assert_eq!(budget.row_indices, indices.capacity() * std::mem::size_of::<u32>());
+                let mut extents = Vec::new();
+                spark_execution_workspace(&config, |live, compiled, staging, _| {
+                    extents.push((live, compiled, staging));
+                    Ok((compiled as usize, live as usize, staging as usize))
+                })?;
+                assert_eq!(extents.last(), Some(&(4096, 4096, unit_rows)),
+                    "narrow exchange must not shrink the scratch owner");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn step5_two_rank_clients_admit_all_rings_and_shared_staging_before_allocation() -> Result<()> {
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
         use cuteafd_loader::placement::SparkWorkingSet;
         use cuteafd_transport::worker_selection::ModelAdmission;
         let geometry = ExpertGeometry::STEP5;
-        let endpoint = SparkEndpoint { capacity: 640, ingress: SparkIngress::Bf16 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
         let working = SparkWorkingSet { spark_layers: (3..91).collect(), spark_ranks: 6,
@@ -874,7 +1131,7 @@ mod tests {
             config.device_budget = 104 << 30;
             let mut previous = None;
             for clients in [1, 2] {
-                let model = ModelAdmission::for_clients(geometry, endpoint, 4096, rings, clients)?;
+                let model = ModelAdmission::for_clients(geometry, endpoint, rings, clients, test_executions(endpoint.capacity, 4096))?;
                 let forecast = working.rank_endpoints_io(rank, geometry, &model.endpoints, rings)?;
                 config.rdma_endpoints = clients;
                 config.model_admission = Some(model);
@@ -918,14 +1175,14 @@ mod tests {
         let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
         for device in [1, 2] {
             let mut config = config(4, 0, None);
-            let mut endpoints = vec![cuteafd_core::SparkEndpoint { capacity: 1024,
-                ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2];
-            endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { capacity: 80,
-                ingress: cuteafd_core::SparkIngress::Fp8K32 }, device));
+            let mut endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 1024,
+                ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }; 2];
+            endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
+                ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }, device));
             let model = cuteafd_transport::worker_selection::ModelAdmission {
-                capacity: 1024, compiled_capacity: 1024, endpoints,
+                executions: test_executions(1024, 1024), endpoints,
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }
             };
             model.validate(geometry).unwrap();
             let exact = model.ring_bytes(geometry).unwrap();
@@ -1007,14 +1264,13 @@ mod tests {
                 for rtx in [1, 2] {
                     let mut config = config(world, 0, None);
                     config.capacity = 4096;
-                    let mut endpoints = vec![SparkEndpoint { capacity: 4096,
-                        ingress: SparkIngress::Bf16Decode { rows: 80 } }];
-                    endpoints.extend(std::iter::repeat_n(SparkEndpoint { capacity: 80,
-                        ingress: SparkIngress::Fp8K32 }, rtx));
-                    endpoints.push(SparkEndpoint { capacity: 1024, ingress: SparkIngress::Fp8K32 });
+                    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096,
+                        ingress: SparkIngress::Bf16Decode { rows: 80 }, partial_reply_bytes: None }];
+                    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: 80,
+                        ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }, rtx));
+                    endpoints.push(SparkEndpoint { ring_depth: Some(2), capacity: 1024, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None });
                     config.model_admission.as_mut().unwrap().endpoints = endpoints.clone();
-                    config.model_admission.as_mut().unwrap().capacity = 4096;
-                    config.model_admission.as_mut().unwrap().compiled_capacity = 4096;
+                    config.model_admission.as_mut().unwrap().executions = test_executions(4096, 4096);
                     let model = config.model_admission.as_ref().unwrap();
                     model.validate(geometry).unwrap();
                     let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: world,
@@ -1024,9 +1280,10 @@ mod tests {
                     let mut reservations = Vec::new();
                     for endpoint in endpoints {
                         let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                        let rings = endpoint.resolved_rings(model.rings).unwrap();
                         let actual = cuteafd_transport::verbs_host_persistent_ring_bytes(
-                            model.rings.max_frame_bytes, request, response, model.rings.slot_bytes,
-                            model.rings.alignment, model.rings.depth).unwrap();
+                            rings.max_frame_bytes, request, response, rings.slot_bytes,
+                            rings.alignment, rings.depth).unwrap();
                         reservations.push(budget.reserve(actual).unwrap());
                     }
                     assert_eq!(budget.limit() as u64, planned.mapped_rings);
@@ -1119,12 +1376,18 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
     crate::shared::spark_topology::require_world(world, catalog, &layers)?;
     ensure!(config.world == world.topology().world_size() && config.rank < config.world,
         "Spark worker rank/world differs from its declared topology");
+    if catalog.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        ensure!(
+            config.exlr8_prefill_activations == crate::shared::experts::exlr8::Exlr8PrefillActivations::A16,
+            "EXLR8 prefill activations require an EXLR8 checkpoint"
+        );
+    }
     Ok(())
 }
 
 impl NativeExpertServiceConfig {
     fn compiled_capacity(&self) -> Result<u32> {
-        Ok(self.model_admission.as_ref().context("expert extent requires coordinator model admission")?.compiled_capacity)
+        Ok(self.model_admission.as_ref().context("expert extent requires coordinator model admission")?.compiled_capacity())
     }
 
     /// Only exact coordinator-selected absolute IDs may become resident.
@@ -1149,45 +1412,54 @@ impl NativeExpertServiceConfig {
         let rank = topology.tp_rank(self.rank)? as usize;
         Ok(match (topology.tp(), world.wire()) {
             (4, _) => ExpertLayer::Backbone { layer, rank },
-            (2, cuteafd_transport::expert::SparkWire::Canonical) if !self.native_spark_tp2 =>
+            (2, cuteafd_transport::expert::SparkWire::Canonical) if !self.native_spark_roles =>
                 ExpertLayer::BackboneTp2 { layer, rank },
             (tp, cuteafd_transport::expert::SparkWire::NativeOwnership) =>
                 ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
-            (2, _) if self.native_spark_tp2 =>
-                ExpertLayer::BackboneReplicatedTp { layer, rank, world: 2 },
+            (tp, _) if self.native_spark_roles =>
+                ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
             (tp, _) => ExpertLayer::BackboneExl3Tp { layer, rank, world: tp as usize },
         })
     }
 
     fn exl3_selection(&self, layer: usize) -> Result<ExpertLayer> {
         let world = self.spark_world()?;
-        if world.ownership_topology().is_some() {
-            ensure!(world.topology() == SparkTopology::NATIVE_TP3_EP1,
-                "compact EXL3 ownership wire requires TP3EP1");
-        }
+        ensure!(world.ownership_topology().is_none(),
+            "EXL3 experts require canonical Spark wire");
         let topology = world.topology();
-        // TP4 and TP2 preserve their existing storage selectors; compact TP3
-        // uses compressed shards rather than the native replicated role.
-        if topology.tp() == 3 {
-            return Ok(ExpertLayer::BackboneExl3Tp { layer,
-                rank: topology.tp_rank(self.rank)? as usize, world: 3 });
-        }
-        self.selection(layer)
+        // Spark EXL3 always uses the compressed-shard variant. Coordinator
+        // BackboneTp2 keeps its separate legacy layout and arithmetic.
+        Ok(ExpertLayer::BackboneExl3Tp { layer,
+            rank: topology.tp_rank(self.rank)? as usize, world: topology.tp() as usize })
     }
 
     fn native_group(&self) -> Result<Option<u8>> {
         self.spark_world()?.ownership_topology().map(|topology| topology.group(self.rank)).transpose()
     }
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
-    /// decoder tiers (multi-family images) with the legacy single-family
-    /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
-    fn exl3_directory_for(&self, tiers: &[usize]) -> PathBuf {
+    /// decoder tiers and family. An explicit --exl3-aot-dir is used verbatim.
+    fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::shared::experts::exl3::aot_layout_directory(
-                &self.library,
-                tiers,
-                &format!("tp{}-rank{}", self.world, self.rank),
-            )
+            crate::shared::experts::exl3::aot_layout_directory(&self.library, tiers, layout)
         })
+    }
+
+    fn exl3_directory(&self, catalog: &OfficialV41Catalog) -> Result<PathBuf> {
+        let layer = *self.resident_layers(catalog.routed_experts().layers)?.first()
+            .context("EXL3 package selection requires a resident layer")?;
+        let plan = crate::shared::experts::exl3::planned_residency(catalog,
+            self.exl3_selection(layer)?)?;
+        Ok(self.exl3_directory_for(&plan.tiers, &plan.aot_layout()))
+    }
+
+    fn validate_exl3_residency(&self, catalog: &OfficialV41Catalog, directory: &std::path::Path) -> Result<()> {
+        let geometry = catalog.routed_experts().geometry()?;
+        for layer in self.resident_layers(catalog.routed_experts().layers)? {
+            let plan = crate::shared::experts::exl3::planned_residency(catalog,
+                self.exl3_selection(layer)?)?;
+            crate::shared::experts::exl3::worker::Exl3Worker::validate_planned_residency(
+                directory, self.capacity, self.exl3_schedule, &plan, geometry)?;
+        }
+        Ok(())
     }
 }

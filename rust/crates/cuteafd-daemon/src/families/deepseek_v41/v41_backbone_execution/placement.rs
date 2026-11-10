@@ -3,10 +3,36 @@ use super::*;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;
 
 /// One lane's per-layer producer workspaces, owned by the assigned GPUs.
+/// One storage set per GPU for every prefill slot's placed producers: the
+/// GPU's window layers on one window storage (one shared stream) and its
+/// source layers on one compressor storage (`shared::memory::row_window`).
+pub(crate) struct PlacedProducerStorage<'a> {
+    windows: [Option<DeviceOwner<'a, std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>>>; 2],
+    sources: [Option<DeviceOwner<'a, std::rc::Rc<crate::families::deepseek_v41::v41_compressor::CompressorStorage<'a>>>>; 2],
+}
+impl<'a> PlacedProducerStorage<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary, placement: CachePlacement, rows: usize, unit: usize) -> Result<Self> {
+        let windows = PlacedProducerWaves::window_layers(placement)?;
+        let sources = PlacedProducerWaves::source_layers(placement)?;
+        let device = |gpu: usize| Device { library, id: gpu as i32 };
+        let mut storage = Self { windows: [None, None], sources: [None, None] };
+        for gpu in 0..2 {
+            if !windows[gpu].is_empty() {
+                storage.windows[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_window::WindowStorage::new(
+                    library, rows, unit, &windows[gpu], true))?);
+            }
+            if !sources[gpu].is_empty() {
+                storage.sources[gpu] = Some(device(gpu).own(|| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+                    library, rows, unit, &sources[gpu]))?);
+            }
+        }
+        Ok(storage)
+    }
+}
 pub(crate) struct PlacedProducerWaves<'w, 'a> {
     pub windows: Vec<DeviceOwner<'a, WindowWave<'w, 'a>>>,
     pub sources: Vec<DeviceOwner<'a, CompressorWave<'w, 'a>>>,
-    pending_commit: Option<(u64, [u32; 16], usize)>,
+    pending_commit: Option<(u64, [u32; cuteafd_core::V41_MAX_REQUESTS], usize)>,
 }
 /// Borrows only this lane. The caller retains the query and admitted bank
 /// storage until completion; cancellation drains only this layer's producers.
@@ -58,6 +84,12 @@ impl PendingPlacedProduction<'_, '_, '_, '_> {
             return Ok(false);
         }
         if let Some(i) = self.source {
+            if !self.source_published && crate::shared::memory::chain::deferred() {
+                // Device-ordered prefill units (#815 option (i)): a chained
+                // direct commit, ordered after the producer on the device.
+                bank.publish_encoder_source(batch, self.layer, &mut self.waves.sources[i])?;
+                self.source_published = true;
+            }
             if !self.source_published {
                 if !self.publication_started {
                     self.publication_started = true;
@@ -250,17 +282,25 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         device.run(|| unsafe { index.get_mut().enqueue_projection(query) })?;
         Ok(pending)
     }
+    /// Window layers per attention GPU.
+    fn window_layers(placement: CachePlacement) -> Result<[Vec<usize>; 2]> {
+        let mut layers = [Vec::new(), Vec::new()];
+        for layer in 0..40 { layers[placement.attention(layer)?.min(1)].push(layer); }
+        Ok(layers)
+    }
     pub fn device_bytes(
         library: &NativeLibrary,
         placement: CachePlacement,
         capacity: u32,
     ) -> Result<[usize; 2]> {
         let mut bytes = [0usize; 2];
-        let window = WindowWave::device_bytes(library, capacity)?;
-        for layer in 0..40 {
-            let gpu = placement.attention(layer)?;
+        // One window storage per GPU that owns window layers: shared producer
+        // scratch and each layer's proposal plane.
+        for (gpu, layers) in Self::window_layers(placement)?.iter().enumerate() {
+            if layers.is_empty() { continue; }
             bytes[gpu] = bytes[gpu]
-                .checked_add(window)
+                .checked_add(crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+                    library, capacity as usize, capacity, layers.len())?)
                 .context("placed SWA workspace overflow")?;
         }
         for layer in SOURCES {
@@ -270,6 +310,55 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                 .context("placed compressor workspace overflow")?;
         }
         Ok(bytes)
+    }
+    /// Bytes of one prefill slot set's placed producer storage per GPU
+    /// ([`PlacedProducerStorage::new`]): each GPU's window layers and source
+    /// layers with planes at the `rows` reserve and scratch at the `unit` cap.
+    pub fn storage_bytes(library: &NativeLibrary, placement: CachePlacement, rows: u32, unit: u32) -> Result<[usize; 2]> {
+        let mut bytes = [0usize; 2];
+        for (gpu, layers) in Self::window_layers(placement)?.iter().enumerate() {
+            if layers.is_empty() { continue; }
+            bytes[gpu] += crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+                library, rows as usize, unit, layers.len())?;
+        }
+        for (gpu, layers) in Self::source_layers(placement)?.iter().enumerate() {
+            if layers.is_empty() { continue; }
+            bytes[gpu] += crate::families::deepseek_v41::v41_compressor::CompressorStorage::device_bytes(
+                layers, rows as usize, unit as usize)?;
+        }
+        Ok(bytes)
+    }
+    fn source_layers(placement: CachePlacement) -> Result<[Vec<usize>; 2]> {
+        let mut layers = [Vec::new(), Vec::new()];
+        for layer in SOURCES { layers[placement.attention(layer)?.min(1)].push(layer); }
+        Ok(layers)
+    }
+    /// Every prefill slot's placed producers on one storage set per GPU.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: &PlacedProducerStorage<'a>) -> Result<Self> {
+        ensure!(weights.placement.is_some(), "placed producers need a placement map");
+        let windows = weights.windows.iter().map(|weights| weights.device.own(|| {
+            let gpu = usize::try_from(weights.device.id)?.min(1);
+            let shared = storage.windows[gpu].as_ref().context("window storage absent on the layer's GPU")?;
+            weights.on_storage(shared.get().clone())
+        })).collect::<Result<Vec<_>>>()?;
+        let sources = weights.sources.iter().map(|weights| weights.device.own(|| {
+            let gpu = usize::try_from(weights.device.id)?.min(1);
+            let shared = storage.sources[gpu].as_ref().context("source storage absent on the layer's GPU")?;
+            weights.on_storage(shared.get().clone())
+        })).collect::<Result<Vec<_>>>()?;
+        Ok(Self { windows, sources, pending_commit: None })
+    }
+    /// Selects a prefill slot's rows in every placed producer's shared planes, at rest.
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        for wave in &mut self.windows {
+            let device = wave.device;
+            device.run(|| wave.get_mut().select_window(window.clone()))?;
+        }
+        for wave in &mut self.sources {
+            let device = wave.device;
+            device.run(|| wave.get_mut().select_window(window.clone()))?;
+        }
+        Ok(())
     }
     pub fn new(
         weights: &'w CacheProducerWeights<'a>,
@@ -287,15 +376,21 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                 .all(|(need, budget)| need <= budget),
             "cache producer workspaces exceed a GPU budget"
         );
+        let layers = Self::window_layers(placement)?;
+        let mut storage: [Option<std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>>; 2] = [None, None];
         let windows = weights
             .windows
             .iter()
             .map(|weights| {
                 weights.device.own(|| {
-                    weights.wave(
-                        capacity,
-                        WindowWave::device_bytes(weights.device.library, capacity)?,
-                    )
+                    let gpu = usize::try_from(weights.device.id)?.min(1);
+                    let shared = match &storage[gpu] {
+                        Some(shared) => shared.clone(),
+                        None => crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.device.library,
+                            capacity as usize, capacity as usize, &layers[gpu], false)?,
+                    };
+                    storage[gpu] = Some(shared.clone());
+                    weights.on_storage(shared)
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -327,14 +422,18 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         batch: &CacheBatch,
         accepted: &[u32],
     ) -> Result<()> {
+        self.stage_cache_commit(batch.identity(), accepted)?;
+        unsafe { bank.enqueue_cache_commit(batch, &mut self.windows, &mut self.sources, accepted) }
+    }
+    fn stage_cache_commit(&mut self, identity: u64, accepted: &[u32]) -> Result<()> {
         ensure!(
-            self.pending_commit.is_none() && accepted.len() <= 16,
+            self.pending_commit.is_none() && accepted.len() <= cuteafd_core::V41_MAX_REQUESTS,
             "placed commit already pending or too many requests"
         );
-        let mut counts = [0; 16];
+        let mut counts = [0; cuteafd_core::V41_MAX_REQUESTS];
         counts[..accepted.len()].copy_from_slice(accepted);
-        self.pending_commit = Some((batch.identity(), counts, accepted.len()));
-        unsafe { bank.enqueue_cache_commit(batch, &mut self.windows, &mut self.sources, accepted) }
+        self.pending_commit = Some((identity, counts, accepted.len()));
+        Ok(())
     }
     pub fn poll_cache_commit(&self) -> Result<bool> {
         ensure!(self.pending_commit.is_some(), "placed commit not enqueued");
@@ -519,6 +618,94 @@ impl<'a> CacheProducerWeights<'a> {
 mod tests {
     use super::*;
     use crate::families::deepseek_v41::v41_window::{WindowChunk, WindowState};
+
+    #[test]
+    fn wide_lane_commit_vocabulary_and_drafter_admission() -> Result<()> {
+        use crate::families::deepseek_v41::{
+            v41_experts::dspark::{DsparkTerminal, DistributedDsparkTerminal},
+            v41_target_head::distributed::DistributedVocabularyWave,
+        };
+        for concurrency in [33usize, 64] {
+            let members = concurrency.div_ceil(2);
+            let accepted = (0..members).map(|i| (i % 8 + 1) as u32).collect::<Vec<_>>();
+            let mut waves = PlacedProducerWaves { windows: vec![], sources: vec![], pending_commit: None };
+            waves.stage_cache_commit(42, &accepted)?;
+            let (identity, counts, len) = waves.pending_commit.unwrap();
+            assert_eq!((identity, len), (42, members));
+            assert_eq!(&counts[..len], accepted);
+            assert!(waves.stage_cache_commit(43, &accepted).is_err());
+            waves.pending_commit = None;
+            assert!(waves.stage_cache_commit(43, &[1; cuteafd_core::V41_MAX_REQUESTS + 1]).is_err());
+            for width in [5, 7] {
+                let live = members * width;
+                let head = DistributedVocabularyWave::device_bytes(live, 64640)?;
+                let local = DsparkTerminal::device_bytes_with_width(members, width)?;
+                let distributed = DistributedDsparkTerminal::device_bytes_with_width(members, 64640, width)?;
+                assert_eq!(distributed[0], head[0]);
+                assert_eq!(distributed[1], head[1] + local - cuteafd_ffi::V41VocabularyProjection::WORKSPACE_BYTES);
+                assert!(local > members * width * 129280 * 8);
+            }
+        }
+        assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS, 64640).is_ok());
+        assert!(DistributedVocabularyWave::device_bytes(cuteafd_core::V41_VOCAB_ROWS + 1, 64640).is_err());
+        Ok(())
+    }
+    #[test]
+    fn packed_prefill_commit_host_path_covers_all_requests() -> Result<()> {
+        use crate::families::deepseek_v41::{
+            v41_backbone_router::ExpertRow,
+            v41_experts::dspark::DsparkMainContext,
+        };
+        use crate::shared::prefill_packing::{plan, Limits};
+        use cuteafd_transport::ExpertV2SourceKind;
+
+        for members in [33usize, 51, 64, 65] {
+            let chunks = (0..members).map(|i| (i * 3, 32)).collect::<Vec<_>>();
+            let segments = plan(&chunks, &Limits {
+                rows: 2752, chunk_rows: 2752, max_context: 1048576, taps: Some(2752),
+            })?;
+            let rows = segments.iter().enumerate().flat_map(|(i, segment)| {
+                (0..segment.rows).map(move |offset| ExpertRow {
+                    request_id: 1000 + i as u64 * 7,
+                    position: (segment.start + offset) as u64,
+                    kind: ExpertV2SourceKind::Prefill,
+                })
+            }).collect::<Vec<_>>();
+            for partial in [false, true] {
+                let accepted = segments.iter().enumerate().map(|(i, segment)| {
+                    if partial { (i % (segment.rows + 1)) as u32 } else { segment.rows as u32 }
+                }).collect::<Vec<_>>();
+                let mut waves = PlacedProducerWaves {
+                    windows: vec![], sources: vec![], pending_commit: None,
+                };
+                // These are the production host planners; CUDA leases are validated later.
+                if members > cuteafd_core::V41_MAX_REQUESTS {
+                    assert!(waves.stage_cache_commit(42, &accepted).is_err());
+                    assert!(waves.pending_commit.is_none());
+                    assert!(DsparkMainContext::prepare_commit_plan(&rows, [members; 3], &accepted).is_err());
+                    continue;
+                }
+                waves.stage_cache_commit(42, &accepted)?;
+                let (identity, counts, len) = waves.pending_commit.unwrap();
+                let publication = DsparkMainContext::prepare_commit_plan(&rows, [len; 3], &counts[..len])?;
+                assert_eq!((identity, len, publication.len()), (42, members, members));
+                assert_eq!(&counts[..len], accepted);
+                assert!(counts[len..].iter().all(|&n| n == 0));
+                for (i, group) in publication.iter().enumerate() {
+                    assert_eq!(group.request, 1000 + i as u64 * 7);
+                    assert_eq!(group.position, segments[i].start as u64);
+                    assert_eq!(group.source, segments[i].first as u32);
+                    assert_eq!(group.tokens, accepted[i]);
+                }
+                assert!(waves.stage_cache_commit(43, &accepted).is_err());
+                assert_eq!(waves.pending_commit, Some((identity, counts, len)));
+                waves.pending_commit = None;
+                waves.stage_cache_commit(43, &accepted)?;
+                assert_eq!(waves.pending_commit.unwrap().0, 43);
+            }
+        }
+        Ok(())
+    }
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, and two CUDA GPUs"]
     fn placed_query_production_poll_cancel_and_reuse() -> Result<()> {
@@ -712,9 +899,15 @@ mod tests {
             )
         })?;
         let workspace = PlacedProducerWaves::device_bytes(&lib, placement, 16)?;
+        // Placed: each GPU that owns window layers keeps its own producer
+        // scratch; the single-GPU execution keeps one, plus the window batch
+        // table that only single-RTX execution uses.
+        let window_gpus = (0..2).filter(|&gpu| (0..40).any(|layer| placement.attention(layer).unwrap().min(1) == gpu)).count();
+        let scratch = crate::families::deepseek_v41::v41_window::WindowStorage::scratch_bytes(&lib, 16)?;
         assert_eq!(
             workspace.iter().sum::<usize>(),
-            BackboneExecution::workspace_bytes(&lib, 16)?
+            BackboneExecution::workspace_bytes(&lib, 16)? + (window_gpus - 1) * scratch
+                - if BackboneExecution::window_batch_enabled() { WindowBatch::bytes(16) } else { 0 }
         );
         let mut placed = PlacedProducerWaves::new(&weights, 16, workspace)?;
         for layer in 0..40 {

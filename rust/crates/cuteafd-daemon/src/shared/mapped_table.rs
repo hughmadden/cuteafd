@@ -1,233 +1,285 @@
-//! Device side of mapped lookup tables (`cuteafd_loader::MappedTable`): the
-//! gather options, a pinned staging ring with stream-ordered H2D uploads,
-//! and the gather/prefetch/stats bundle a family engine holds per table.
-//!
-//! A step's rows are known when its inputs are: `begin` gathers them on the
-//! host pool into the next pinned ring slot while the engine enqueues the GPU
-//! work that precedes their use (embedding, earlier layers), `finish` waits
-//! (stall time) and copies them into the step's device rows on the engine
-//! stream; a slot is refilled only after its copy's event completed. Kernels
-//! read the gathered rows (`[rows, row_bytes]`, request order) from device
-//! memory. Rows known a step ahead (the next prefill chunk) are advised to
-//! the page cache by the table's prefetcher.
+//! Token-table adapter: rows read ahead into the table's bounded row cache
+//! (from admission for prompts, as soon as decode tokens are known), each step's
+//! gather a cache lookup plus copy into pinned staging, and a host-triggered
+//! H2D at the consumer.
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
-use cuteafd_loader::{GatherPool, MappedTable, PendingGather, TablePrefetcher, TableStatsSnapshot};
-use std::cell::{Cell, RefCell};
-use std::ffi::c_void;
-use std::sync::Arc;
-use std::time::Instant;
-
-use super::memory::HostAllocation;
-
-/// Mapped-table options a family engine takes.
-#[derive(Debug, Clone, clap::Args)]
-pub(crate) struct MappedTableArgs {
-    /// Host threads gathering mapped rows.
-    #[arg(long = "table-threads", alias = "ple-threads", default_value_t = 16)]
-    pub threads: usize,
-    /// Advise the page cache about rows known ahead of their step (the next
-    /// prefill chunk).
-    #[arg(long = "table-prefetch", default_value_t = true, action = clap::ArgAction::Set)]
-    pub prefetch: bool,
+use super::memory::device::{Device, Stream};
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, PinnedBytes};
+use cuteafd_loader::{GatherFailure, GatherPoll, GatherTicket, MappedTable, TableStatsSnapshot};
+use cuteafd_loader::formats::mapped_table::ReadPriority;
+use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, RowSource as AheadSource, UnitPlan};
+use cuteafd_loader::formats::mapped_table::token_table::{TokenTable, TokenTableLookahead};
+use cuteafd_loader::shared::token_table::TablePipeline;
+use std::{cell::{Cell, RefCell}, ffi::c_void, sync::{Arc, Mutex}, time::Duration};
+pub(crate) trait RowSource: Send + Sync {
+    fn units(&self) -> usize;
+    fn rows(&self, unit: usize) -> &[i64];
 }
-
-struct RingSlot<'a> {
-    host: HostAllocation<'a>,
-    /// Records the slot's last upload; reuse waits for it.
-    event: *mut c_void,
-    pending: bool,
+impl RowSource for Vec<i64> {
+    fn units(&self) -> usize { 1 }
+    fn rows(&self, unit: usize) -> &[i64] { assert_eq!(unit, 0); self }
 }
+pub(crate) struct RowBatch { source: Arc<dyn RowSource>, begun: Mutex<Vec<bool>> }
+#[derive(Clone)]
+struct RowJob { batch: Arc<RowBatch>, unit: usize }
+struct RowSlot { bytes: PinnedBytes }
+type Pipeline = TablePipeline<RowSlot, RowJob>;
+type Ticket = GatherTicket<RowSlot, RowJob, anyhow::Error>;
+pub(crate) struct PendingRows { ticket: Option<Ticket>, job: RowJob, pipeline: Arc<Pipeline>, bytes: usize }
 
-/// Pinned host slots for stream-ordered uploads of gathered rows: a slot is
-/// filled on the host, copied on a stream, and refilled only after the copy's
-/// event completed.
-pub(crate) struct PinnedRowRing<'a> {
+struct Destination { pointer: usize, consumed: *mut c_void, recorded: bool }
+pub(crate) struct MappedTableDevice<'a> {
     library: &'a NativeLibrary,
-    slots: Vec<RingSlot<'a>>,
-    next: usize,
+    device: i32,
+    name: &'static str,
+    lookahead: TokenTableLookahead,
+    prefill: Arc<Pipeline>,
+    decode: Arc<Pipeline>,
+    prefill_rows: usize,
+    decode_rows: usize,
+    prefill_slots: usize,
+    host_workspace_bytes: usize,
+    cache_bytes: usize,
+    logged: Cell<TableStatsSnapshot>,
+    destinations: RefCell<Vec<Destination>>,
+    active_destination: Cell<usize>,
+    upload: Stream<'a>,
+    landed: *mut c_void,
 }
-
-impl<'a> PinnedRowRing<'a> {
-    pub fn new(library: &'a NativeLibrary, slot_bytes: usize, slots: usize) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
-        ensure!(slot_bytes > 0 && slots > 0, "an empty pinned row ring");
-        let slots = (0..slots)
-            .map(|_| -> Result<RingSlot<'a>> {
-                Ok(RingSlot { host: HostAllocation::new(library, slot_bytes)?, event: library.cuda_event_create_ordering()?,
-                    pending: false })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self { library, slots, next: 0 })
+impl<'a> MappedTableDevice<'a> {
+    /// `prefill_rows`/`decode_rows` are table rows per staged prefill unit and
+    /// decode step; `prefill_slots` units run in flight; `rows_per_token`
+    /// table rows per token size the row cache.
+    pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable,
+        prefill_rows: usize, prefill_slots: usize, decode_rows: usize, rows_per_token: usize) -> Result<Self> {
+        table.prepare_reads();
+        let _scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
+        let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(prefill_rows, prefill_slots, decode_rows, table.row_bytes())?;
+        let shares = TokenTable::shares(prefill_rows / rows_per_token.max(1), prefill_slots,
+            decode_rows / rows_per_token.max(1), rows_per_token);
+        let cache_bytes = TokenTable::cache_bytes(table.row_bytes(), shares);
+        super::memory::budget::admit_host_memory(0, &[("staging/mapped-table", staging.total_bytes as u64),
+            ("mapped-table/row-cache", cache_bytes as u64)], 0, 0)?;
+        let device = library.cuda_get_device()?;
+        table.name_stats(name);
+        let logged = Cell::new(table.stats().snapshot());
+        let table = TokenTable::new(table, shares, rows_per_token)?;
+        let pipeline = |rows: usize, slots: usize, suffix: &str, priority: ReadPriority| -> Result<Arc<Pipeline>> {
+            let table = Arc::clone(&table);
+            let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes())? }))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(TablePipeline::new(&format!("{name}-{suffix}"), storage, move |slot: &mut RowSlot, job: &RowJob| {
+                let ids = job.batch.source.rows(job.unit);
+                let rows = ids.iter().map(|&id| u64::try_from(id)).collect::<std::result::Result<Vec<_>, _>>()?;
+                let bytes = rows.len() * table.row_bytes();
+                table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)
+            }, |slot| Ok(slot.bytes.copy_ready()?))?))
+        };
+        let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill", ReadPriority::Prefill)?;
+        let decode = pipeline(decode_rows, 2, "decode", ReadPriority::Decode)?;
+        let lookahead = TokenTableLookahead::new(name, table)?;
+        Ok(Self { library, device, name, logged, lookahead,
+            prefill, decode, prefill_rows, decode_rows, prefill_slots, host_workspace_bytes: staging.workspace_bytes,
+            cache_bytes,
+            destinations: RefCell::new(Vec::new()), active_destination: Cell::new(0),
+            upload: Stream::new(Device { library, id: device })?,
+            landed: library.cuda_event_create_ordering()? })
     }
-
-    pub fn slot_bytes(&self) -> usize {
-        self.slots[0].host.buffer.bytes
+    pub fn host_workspace_bytes(&self) -> usize { self.host_workspace_bytes }
+    /// The row cache's host bytes (admitted at construction).
+    pub fn cache_bytes(&self) -> usize { self.cache_bytes }
+    /// Prefill units staged ahead of the one running.
+    pub fn depth(&self) -> usize { self.prefill_slots }
+    /// Read a prompt's rows (`source`, from absolute position `start`) into the
+    /// row cache ahead of its gathers, in its prefill units.
+    pub fn start_lookahead(&self, tag: u64, start: u64, source: Box<dyn AheadSource>, units: UnitPlan) -> LookaheadHandle {
+        self.lookahead.start(tag, start, source, units)
     }
-
-    /// The next slot, once its previous upload completed: (index, pinned bytes).
-    pub fn acquire(&mut self) -> Result<(usize, *mut u8)> {
-        let index = self.next;
-        self.next = (index + 1) % self.slots.len();
-        let slot = &mut self.slots[index];
-        if slot.pending {
-            // SAFETY: the event was created by this ring and recorded after the slot's copy.
-            unsafe { self.library.cuda_event_synchronize(slot.event)? };
-            slot.pending = false;
-        }
-        Ok((index, slot.host.buffer.ptr.cast()))
-    }
-
-    /// Queues the copy of `bytes` of slot `index` into `dst` on `stream`.
-    ///
-    /// # Safety
-    /// The slot's bytes must be filled (no writer left), `stream` must be a
-    /// live stream of the current device, and `dst` must stay allocated until
-    /// the copy completes (stream order).
-    pub unsafe fn submit(&mut self, index: usize, dst: CuteafdDeviceBuffer, bytes: usize, stream: *mut c_void)
-        -> Result<()> {
-        ensure!(bytes <= self.slot_bytes() && bytes <= dst.bytes, "{bytes} gathered bytes exceed the ring or device rows");
-        let slot = &mut self.slots[index];
-        if bytes == 0 {
-            return Ok(());
-        }
-        let source = CuteafdHostBuffer { bytes, ..slot.host.buffer };
-        // SAFETY: per this function's contract; the event guards the slot's reuse.
-        unsafe {
-            self.library.copy_host_buffer_h2d_async(dst, source, bytes, stream)?;
-            self.library.cuda_event_record(slot.event, stream)?;
-        }
-        slot.pending = true;
+    /// Read a decode step's rows into the row cache now. Never blocks.
+    pub fn prefetch_decode(&self, ids: &[i64]) -> Result<()> {
+        let rows = ids.iter().map(|&id| u64::try_from(id).context("negative table row")).collect::<Result<Vec<_>>>()?;
+        self.lookahead.decode(rows);
         Ok(())
     }
-}
-
-impl Drop for PinnedRowRing<'_> {
-    fn drop(&mut self) {
-        for slot in &self.slots {
-            // SAFETY: each event belongs to this ring; waiting first keeps the
-            // pinned slot alive until its copy completes.
-            unsafe {
-                if slot.pending {
-                    if let Err(error) = self.library.cuda_event_synchronize(slot.event) {
-                        tracing::error!(%error, "draining a mapped-table upload");
-                    }
-                }
-                if let Err(error) = self.library.cuda_event_destroy(slot.event) {
-                    tracing::error!(%error, "destroying a mapped-table upload event");
-                }
+    pub fn batch(&self, source: Arc<dyn RowSource>) -> Arc<RowBatch> {
+        Arc::new(RowBatch { begun: Mutex::new(vec![false; source.units()]), source })
+    }
+    pub fn begin_unit(&self, batch: &Arc<RowBatch>, unit: usize, decode: bool) -> Result<PendingRows> {
+        let _device = Device { library: self.library, id: self.device }.enter()?;
+        let mut begun = batch.begun.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = begun.get_mut(unit).context("invalid table unit")?;
+        ensure!(!*entry, "table unit already begun");
+        let ids = batch.source.rows(unit);
+        let capacity = if decode { self.decode_rows } else { self.prefill_rows };
+        let table = self.lookahead.table();
+        ensure!(ids.len() <= capacity && ids.iter().all(|&id| id >= 0 && (id as u64) < table.table().rows()), "invalid table rows");
+        let pipeline = Arc::clone(if decode { &self.decode } else { &self.prefill });
+        let job = RowJob { batch: Arc::clone(batch), unit };
+        let ticket = pipeline.try_submit(job.clone(), true)?;
+        *entry = true;
+        Ok(PendingRows { ticket, job, pipeline, bytes: ids.len() * table.row_bytes() })
+    }
+    pub fn begin(&self, source: Arc<dyn RowSource>, decode: bool) -> Result<PendingRows> {
+        self.begin_unit(&self.batch(source), 0, decode)
+    }
+    /// Called after independent preceding-layer work is enqueued, immediately
+    /// before PLE. No copy-engine operation waits behind a host readiness flag.
+    /// # Safety
+    /// dst and stream are on this device and remain live until consumption.
+    pub unsafe fn finish(&self, mut pending: PendingRows, dst: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<usize> {
+        let _device = Device { library: self.library, id: self.device }.enter()?;
+        ensure!(!self.library.is_quarantined_after_failed_drain(), "token-table device is quarantined");
+        ensure!(dst.device_id == self.device && dst.bytes >= pending.bytes, "token-table destination geometry");
+        let started = std::time::Instant::now();
+        let mut ticket = match pending.ticket.take() {
+            Some(ticket) => ticket,
+            None => pending.pipeline.submit_timeout(pending.job.clone(), true, Duration::from_secs(120))?,
+        };
+        let mut lease = match ticket.wait_timeout(Duration::from_secs(120)) {
+            Ok(GatherPoll::Ready(lease)) => lease,
+            Ok(_) => anyhow::bail!("token-table gather cancelled"),
+            Err(GatherFailure::Job(error)) => return Err(error),
+            Err(GatherFailure::Worker(error)) => return Err(error.into()),
+        };
+        self.lookahead.table().table().stats().record_stall(started.elapsed());
+        let slot = lease.slot_mut().context("empty table lease")?;
+        let mut destinations = self.destinations.borrow_mut();
+        let index = match destinations.iter().position(|entry| entry.pointer == dst.ptr as usize) {
+            Some(index) => index,
+            None => { destinations.push(Destination { pointer: dst.ptr as usize,
+                consumed: self.library.cuda_event_create_ordering()?, recorded: false }); destinations.len() - 1 }
+        };
+        let destination = &destinations[index];
+        if destination.recorded {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            // Only the previous PLE reader, never unrelated execution-stream work.
+            // SAFETY: destination owns this event on the current device.
+            while !unsafe { self.library.cuda_event_query(destination.consumed)? } {
+                ensure!(std::time::Instant::now() < deadline, "token-table consumer gate timed out");
+                std::thread::sleep(Duration::from_micros(50));
             }
         }
-    }
-}
-
-/// A step's rows gathering into a ring slot; [`MappedTableDevice::finish`]
-/// queues their upload. Dropping it waits for the gather (no upload).
-pub(crate) struct PendingRows {
-    gather: Option<PendingGather>,
-    slot: usize,
-    bytes: usize,
-    decode: bool,
-}
-
-/// One mapped table with its gather pool, prefetcher, and the staging ring that uploads each step's rows.
-pub(crate) struct MappedTableDevice<'a> {
-    name: &'static str,
-    table: Arc<MappedTable>,
-    pool: Arc<GatherPool>,
-    prefetcher: Option<TablePrefetcher>,
-    ring: RefCell<PinnedRowRing<'a>>,
-    logged: Cell<TableStatsSnapshot>,
-}
-
-impl<'a> MappedTableDevice<'a> {
-    /// `max_rows` bounds one step's gather (the ring slot size).
-    pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
-        max_rows: usize) -> Result<Self> {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
-        table.name_stats(name);
-        let row_bytes = table.row_bytes();
-        let prefetcher = if args.prefetch {
-            // Prefill chunks and every decode row's next token; a row spans at most two pages.
-            Some(TablePrefetcher::new(&format!("{name}-prefetch"), 16, max_rows, 2 * max_rows)?)
-        } else {
-            None
+        self.active_destination.set(index);
+        // SAFETY: the lease owns the pinned source, and remains retained through
+        // copied_on even when a partially enqueued copy fails.
+        let copied = unsafe { super::token_table::enqueue(self.library, slot.bytes.buffer(),
+            &[super::token_table::CopyPlane { destination: dst, offset: 0, bytes: pending.bytes }], self.upload.raw) };
+        // SAFETY: this stream contains all reads from the source.
+        let fenced = unsafe { slot.bytes.copied_on(self.upload.raw) };
+        pending.pipeline.retain_copy(lease);
+        if copied.is_err() || fenced.is_err() {
+            // SAFETY: failed enqueues must drain before destination teardown.
+            if unsafe { self.library.cuda_stream_synchronize(self.upload.raw) }.is_err() { self.library.quarantine_module_after_failed_drain(); }
+        }
+        copied?; fenced?;
+        // SAFETY: upload is already issued on a stream with no pending gate.
+        // The consuming stream alone joins its landing, after earlier work.
+        let landed = unsafe {
+            self.library.cuda_event_record(self.landed, self.upload.raw)
+                .and_then(|()| self.library.cuda_stream_wait_event(stream, self.landed))
         };
-        let table = Arc::new(table);
-        Ok(Self {
-            name,
-            pool: Arc::new(GatherPool::new(&format!("{name}-gather"), args.threads)?),
-            prefetcher,
-            ring: RefCell::new(PinnedRowRing::new(library, max_rows * row_bytes, 2)?),
-            logged: Cell::new(table.stats().snapshot()),
-            table,
-        })
-    }
-
-    pub fn max_rows(&self) -> usize {
-        self.ring.borrow().slot_bytes() / self.table.row_bytes()
-    }
-
-    fn rows(ids: &[i64]) -> Result<Vec<u64>> {
-        ids.iter().map(|&id| u64::try_from(id).context("negative table row")).collect()
-    }
-
-    /// Starts gathering `ids` (in order, duplicates kept) into the next ring
-    /// slot on the gather pool; the caller enqueues GPU work that precedes
-    /// the rows' use, then [`Self::finish`]es.
-    pub fn begin(&self, ids: &[i64], decode: bool) -> Result<PendingRows> {
-        ensure!(ids.len() <= self.max_rows(), "{} {} rows exceed the step's {}", ids.len(), self.name, self.max_rows());
-        let rows = Self::rows(ids)?;
-        let bytes = rows.len() * self.table.row_bytes();
-        let (slot, host) = self.ring.borrow_mut().acquire()?;
-        // SAFETY: the slot holds `bytes`; the ring hands it out again only
-        // after this PendingRows is finished (its copy event) or dropped (the
-        // gather waited), and nothing else touches it meanwhile.
-        let gather = unsafe { self.pool.spawn_gather(self.table.clone(), rows, host, bytes) };
-        Ok(PendingRows { gather: Some(gather), slot, bytes, decode })
-    }
-
-    /// Waits for the gather (the wait counts as stall) and queues the rows'
-    /// copy into `dst` on `stream`; returns the uploaded bytes.
-    ///
-    /// # Safety
-    /// As [`PinnedRowRing::submit`] for `dst` and `stream`.
-    pub unsafe fn finish(&self, mut pending: PendingRows, dst: CuteafdDeviceBuffer, stream: *mut c_void)
-        -> Result<usize> {
-        let waited = Instant::now();
-        pending.gather.take().context("rows already finished")?.wait()?;
-        let elapsed = waited.elapsed();
-        self.table.stats().record_stall(elapsed);
-        if pending.decode { self.table.stats().record_decode_stall(elapsed); }
-        // SAFETY: the gather completed; dst/stream per this function's contract.
-        unsafe { self.ring.borrow_mut().submit(pending.slot, dst, pending.bytes, stream)? };
+        if landed.is_err() && self.upload.drain().is_err() {
+            self.library.quarantine_module_after_failed_drain();
+        }
+        landed?;
         Ok(pending.bytes)
     }
-
-    /// Best-effort page-cache advice for rows a later step will gather
-    /// (truncated to one step's rows; dropped when the queue is full).
-    pub fn prefetch(&self, ids: &[i64]) -> Result<()> {
-        let Some(prefetcher) = &self.prefetcher else { return Ok(()) };
-        if ids.is_empty() {
-            return Ok(());
+    /// Record immediately after the PLE reader (or its captured segment).
+    /// # Safety
+    /// stream contains the reader of the most recently landed destination.
+    pub unsafe fn consumed(&self, stream: *mut c_void) -> Result<()> {
+        let _device = Device { library: self.library, id: self.device }.enter()?;
+        let mut destinations = self.destinations.borrow_mut();
+        let destination = destinations.get_mut(self.active_destination.get()).context("PLE consumption without landing")?;
+        // SAFETY: event and stream belong to this device and outlive queued work.
+        if let Err(error) = unsafe { self.library.cuda_event_record(destination.consumed, stream) } {
+            // An unproved reader must never permit another destination overwrite.
+            self.library.quarantine_module_after_failed_drain();
+            return Err(error);
         }
-        if !prefetcher.submit_detached(self.table.clone(), &Self::rows(ids)?)? {
-            self.table.stats().record_prefetch_dropped();
-        }
+        destination.recorded = true;
         Ok(())
     }
-
-    /// Logs the stats since the previous call (`event` names the interval).
     pub fn log_interval(&self, event: &str) {
-        let now = self.table.stats().snapshot();
+        let now = self.lookahead.table().table().stats().snapshot();
         let d = now.since(&self.logged.replace(now));
-        if d.rows == 0 && d.prefetch_jobs == 0 {
+        if d.cache_hit_rows + d.cache_wait_rows + d.lookahead_rows + d.stall_prefill_fallback_rows
+            + d.stall_decode_fallback_rows == 0 { return; }
+        // Gather side: rows the gathers read themselves (fallback) or waited for
+        // another reader to fill (pending); cache_wait_rows also counts the
+        // look-ahead finding a gather ahead of it. Device side: rows read from
+        // the table and their summed service time.
+        tracing::info!(table = self.name, event, cache_hit_rows = d.cache_hit_rows, cache_wait_rows = d.cache_wait_rows,
+            lookahead_rows = d.lookahead_rows, prefill_fallback_rows = d.stall_prefill_fallback_rows,
+            prefill_pending_rows = d.stall_prefill_pending_rows, decode_fallback_rows = d.stall_decode_fallback_rows,
+            decode_pending_rows = d.stall_decode_pending_rows, device_rows = d.page_misses,
+            device_ms = d.miss_ns as f64 / 1e6, stall_ms = d.stall_ns as f64 / 1e6, "mapped table");
+    }
+}
+
+impl Drop for MappedTableDevice<'_> {
+    fn drop(&mut self) {
+        let Ok(_device) = (Device { library: self.library, id: self.device }).enter() else {
+            self.library.quarantine_module_after_failed_drain();
             return;
+        };
+        let drained = (|| -> Result<()> {
+            // SAFETY: owner retains upload stream and all destination events.
+            unsafe {
+                self.library.cuda_stream_synchronize(self.upload.raw)?;
+                for destination in self.destinations.get_mut().iter().filter(|d| d.recorded) {
+                    self.library.cuda_event_synchronize(destination.consumed)?;
+                }
+            }
+            Ok(())
+        })();
+        if drained.is_err() { self.library.quarantine_module_after_failed_drain(); return; }
+        // SAFETY: all producers/readers have drained.
+        unsafe {
+            let _ = self.library.cuda_event_destroy(self.landed);
+            for destination in self.destinations.get_mut() { let _ = self.library.cuda_event_destroy(destination.consumed); }
         }
-        tracing::info!(table = self.name, event, rows = d.rows, gathers = d.gathers, mib = d.bytes as f64 / (1 << 20) as f64,
-            gather_ms = d.gather_ns as f64 / 1e6, stall_ms = d.stall_ns as f64 / 1e6, major_faults = d.major_faults,
-            minor_faults = d.minor_faults, resident = d.resident_rate(), prefetch_pages = d.prefetch_pages,
-            prefetch_dropped = d.prefetch_dropped,
-            "mapped table");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn qwen_host_admission_retains_mapped_worker_workspace() {
+        let source = include_str!("mapped_table.rs");
+        let constructor = source.split("pub fn new(library:").nth(1).unwrap()
+            .split("pub fn host_workspace_bytes").next().unwrap();
+        assert!(constructor.contains("host_workspace_bytes: staging.workspace_bytes"));
+        let engine = include_str!("../families/qwen4/engine.rs");
+        let demands = engine.split("fn future_host_workspaces(&self").nth(1).unwrap()
+            .split("/// Size every unit-table upload").next().unwrap();
+        assert!(demands.contains("ple.mapped().host_workspace_bytes() as u64"));
+        assert!(demands.contains("staging/mapped-table-worker"));
+        assert!(demands.contains("(\"mapped-table/row-cache\".to_owned(), ple.mapped().cache_bytes() as u64)"));
+    }
+
+    #[test]
+    fn prompts_read_ahead_from_admission_and_gathers_go_through_the_row_cache() {
+        let scheduler = include_str!("qwen/scheduler.rs");
+        let admit = scheduler.split("// Family table rows for the whole prompt are read from admission").nth(1).unwrap();
+        assert!(admit.find("engine.read_ahead(&placement, &tokens, resume, &plan.chunks)").unwrap()
+            < admit.find("prefills.push(Prefill {").unwrap());
+        assert!(!scheduler.contains("engine.prefetch("), "per-chunk bursts are gone");
+        let source = include_str!("mapped_table.rs");
+        let new = source.split("pub fn new(library:").nth(1).unwrap().split("pub fn host_workspace_bytes").next().unwrap();
+        assert!(new.contains("table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)"));
+        assert!(new.contains("(\"mapped-table/row-cache\", cache_bytes as u64)"));
+    }
+
+    #[test]
+    fn landing_gates_previous_consumer_not_execution_tail() {
+        let source = include_str!("mapped_table.rs");
+        let finish = source.split("pub unsafe fn finish(").nth(1).unwrap().split("pub unsafe fn consumed(").next().unwrap();
+        assert!(finish.contains("cuda_event_query(destination.consumed)"));
+        assert!(!finish.contains("cuda_stream_synchronize(stream)"));
+        assert!(finish.contains("cuda_stream_wait_event(stream, self.landed)"));
+        let engine = include_str!("../families/qwen4/engine.rs");
+        let ple = engine.split("    fn ple(").nth(1).unwrap().split("    fn w8(").next().unwrap();
+        assert!(ple.contains("table.mapped().consumed(self.execution_stream())"));
     }
 }

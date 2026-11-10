@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize('value', [None, 'ON', 'OFF', 'on', 'ON; touch /bad'])
 def test_wip_audio_aot_reaches_both_native_architectures(role, arch, value):
     script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
-    options = 'exl3_aot=' + script.split('exl3_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
+    options = 'v41_expert_aot=' + script.split('v41_expert_aot=', 1)[1].split('[[ "$cuda_arch"', 1)[0]
     cmake = 'cmake \\\n' + script.split('\ncmake \\\n', 1)[1].split('\ncmake --build', 1)[0]
     env = {key: val for key, val in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
     if value is not None:
@@ -46,7 +46,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
     if value is not None:
         env['CUTEAFD_WIP_AUDIO_AOT'] = value
     coordinator = 'build_coordinator() {' + script.split('build_coordinator() {', 1)[1].split('\nbuild_expert()', 1)[0]
-    expert = 'build_expert() (' + script.split('build_expert() (', 1)[1].split('\nwip_build_coordinator=0', 1)[0]
+    expert = 'build_expert() (' + script.split('build_expert() (', 1)[1].split('\n# Role builders end here.', 1)[0]
     # The native-store helpers both builders call (wip.sh defines them just before).
     helpers = script[script.index('# Native/AOT outputs are cached by input key'):script.index('build_coordinator() {')]
     command = ('set -euo pipefail\nrelease_die() { printf "%s\\n" "$*" >&2; exit 2; }\n' + validation + '\n'
@@ -79,6 +79,7 @@ def test_wip_audio_opt_in_is_validated_before_operations_and_forwarded(value):
 def check_readiness(tmp_path, role, present, from_slot=''):
     text = (ROOT / 'wip.sh').read_text()
     block = text.split('# wip-slot-readiness:start', 1)[1].split('# wip-slot-readiness:end', 1)[0]
+    block += text.split('wip_check_expert_readiness() {', 1)[1].split('\n}\n', 1)[0]
     slots = tmp_path / 'slots'
     for part in present:
         workspace = slots / 'test' / part / 'workspace'
@@ -202,6 +203,39 @@ def test_transformers_requires_include_bytes_inputs_and_confined_links(tmp_path)
         module.verify(source, lock)
 
 
+@pytest.mark.parametrize('scope', ['glm:exl3-k45', 'glm:fp8'])
+def test_expert_codec_scope_installs_nonempty_program_manifest(tmp_path, scope):
+    cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    logic = cmake[:cmake.index('set(CUTEAFD_DSV4_EXPORT_ARGS')]
+    configure = tmp_path / 'codec.cmake'
+    configure.write_text('set(CUTEAFD_CUDA_ARCHITECTURES 121)\n'
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)\n'
+        f'set(CUTEAFD_EXPERT_FAMILIES "{scope}")\n' + logic
+        + '\nmessage(STATUS "GEOMETRY=${CUTEAFD_PROGRAM_GEOMETRY}")\n')
+    result = subprocess.run(['cmake', '-P', str(configure)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'GEOMETRY=expert_reply' in result.stdout
+    build, output = tmp_path / 'build', tmp_path / 'output'
+    generated = build / 'native/dsv4_programs/dsv4_programs.json'
+    generated.parent.mkdir(parents=True)
+    generated.write_text(json.dumps(dict(schema=1, programs=[dict(name='expert_reply_quantize')])))
+    output.mkdir()
+    script = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    block = '# Generic-family tables' + script.split('# Generic-family tables', 1)[1].split(
+        '# Publish this build', 1)[0]
+    env = dict(PATH=os.environ['PATH'], role='expert', expert_families=scope,
+               build_dir=str(build), output_dir=str(output))
+    for hit in ['0', '1']:
+        result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+            env={**env, 'native_hit': hit}, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        assert json.loads((output / 'PROGRAMS.json').read_text())['programs'] == [dict(name='expert_reply_quantize')]
+    generated.unlink()
+    result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block],
+        env=env, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize('role', ['coordinator', 'expert'])
 @pytest.mark.parametrize('enabled', [False, True])
 @pytest.mark.parametrize('family', ['GLMF', 'QWEN_DENSE'])
@@ -220,7 +254,7 @@ def test_wip_programs_stage_current_table_or_empty_even_after_previous_opt_in(tm
     (output / 'V41_EXPERT_WORKSPACES').mkdir()
     (output / 'PROGRAMS.json').write_text('stale table')
     env = {key: value for key, value in os.environ.items() if not key.startswith('CUTEAFD_WIP_')}
-    env.update(role=role, build_dir=str(build), output_dir=str(output))
+    env.update(role=role, build_dir=str(build), output_dir=str(output), v41_expert_aot='OFF')
     env[f'CUTEAFD_WIP_{family}_AOT'] = 'ON' if enabled else 'OFF'
     result = subprocess.run(['bash', '-c', 'set -euo pipefail\n' + block], env=env,
                             capture_output=True, text=True, timeout=10)
@@ -361,10 +395,11 @@ def test_zero_spark_expert_role_still_refused():
     ("build-release-artifacts.sh", "build_root"),
 ])
 @pytest.mark.parametrize("coordinator,nvfp4", [(True, True), (True, False), (False, True)])
-def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script_name, source_var, coordinator, nvfp4):
+@pytest.mark.parametrize("draft_tp2", [False, True])
+def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script_name, source_var, coordinator, nvfp4, draft_tp2):
     text = (ROOT / "scripts/build" / script_name).read_text()
     start = text.index("# Keep planner workspace inputs identical")
-    end = text.index("\nfi\n", start) + len("\nfi\n")
+    end = text.index("\n# Always", start)
     block = text[start:end]
     build = tmp_path / "build"
     output = tmp_path / "output"
@@ -383,6 +418,13 @@ def test_v41_exact_workspace_manifests_survive_artifact_staging(tmp_path, script
             path.write_bytes(payload)
             if coordinator:
                 expected[f"{fmt}_{role}.json"] = payload
+    if draft_tp2:
+        path = build / "native/v41_dspark_tp2_experts/v41_experts.json"
+        path.parent.mkdir(parents=True)
+        payload = json.dumps({"role": "dspark_tp2", "variants": [{"core_scratch_nbytes": 7654321}]}).encode()
+        path.write_bytes(payload)
+        if coordinator:
+            expected["mxfp4_dspark_tp2.json"] = payload
     env = {**os.environ, source_var: str(build), "output_dir": str(output),
            "coordinator_aot": "ON" if coordinator else "OFF", "nvfp4_aot": "ON" if nvfp4 else "OFF",
            "CUTEAFD_RELEASE_NVFP4_AOT": "ON" if nvfp4 else "OFF"}
@@ -406,3 +448,106 @@ def test_v41_workspace_manifests_reach_sealed_slots_and_release_images():
     assert "find bin-variants lib-variants V41_EXPERT_WORKSPACES -type f" in wip
     release = (ROOT / "build.sh").read_text()
     assert 'find coordinator/V41_EXPERT_WORKSPACES spark-expert/V41_EXPERT_WORKSPACES -type f' in release
+
+
+@pytest.mark.parametrize('role,export_status', [('both', 0), ('both', 23), ('coordinator', 0)])
+def test_distribution_precedes_export_even_on_failure_or_coordinator_retry(tmp_path, role, export_status):
+    text = (ROOT / 'wip.sh').read_text()
+    flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
+    trace = tmp_path / 'trace'
+    script = f"""set -euo pipefail
+role={role}; wip_reused_coordinator=0; wip_reused_expert=0
+build_coordinator() {{ echo coordinator-$1 >> '{trace}'; [[ $1 != native ]] || return {export_status}; }}
+wip_build_resource_acquire() {{ echo lease >> '{trace}'; }}
+build_expert() {{ echo sealed >> '{trace}'; }}
+wip_retain_counterpart() {{ :; }}
+wip_build_resource_release() {{ echo release >> '{trace}'; }}
+wip_distribute_sealed_expert() {{ echo distribute >> '{trace}'; }}
+{flow}
+"""
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
+    assert result.returncode == export_status, result.stderr
+    expected = ['coordinator-rust'] + (['lease', 'sealed'] if role == 'both' else [])
+    assert trace.read_text().splitlines() == expected + ['release', 'distribute', 'coordinator-native']
+
+
+def test_coordinator_retry_discovers_sealed_seed_slot_after_dry_run():
+    text = (ROOT / 'wip.sh').read_text()
+    probe = text.split('# A coordinator-only retry repairs', 1)[1].split('# Probe only after', 1)[0]
+    assert text.index('# A coordinator-only retry repairs') > text.index('if ((dry_run)); then')
+    assert 'docker inspect' in probe and 'FINGERPRINT' in probe and 'wip_spark_leg=1' in probe
+
+
+@pytest.mark.parametrize('running', ['true', 'false'])
+def test_distribution_stops_only_seed_it_restarted(tmp_path, running):
+    text = (ROOT / 'wip.sh').read_text()
+    helper = 'wip_distribute_sealed_expert() (' + text.split('wip_distribute_sealed_expert() (', 1)[1].split('\n)\n', 1)[0] + '\n)\n'
+    trace = tmp_path / 'trace'
+    setup = f"""set -euo pipefail
+wip_spark_leg=1 seed_host=fixture spark_container=owned
+ssh() {{ echo "$*" >> '{trace}'; [[ $* != *inspect* ]] || echo {running}; }}
+wip_check_expert_readiness() {{ :; }}
+wip_distribute_locks() {{ :; }}
+distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
+"""
+    result = subprocess.run(['bash', '-c', setup + helper + '\nwip_distribute_sealed_expert'], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    calls = trace.read_text()
+    assert 'distribute' in calls
+    assert ('docker stop' in calls) == (running == 'false')
+    assert ('docker start' in calls) == (running == 'false')
+
+
+def _distribution_script(tmp_path, held, targets):
+    text = (ROOT / 'wip.sh').read_text()
+    start = text.index('wip_distribute_locks() {')
+    helpers = text[start:text.index('\nwip_build_selected_roles() {')]
+    seed_lock = text[text.index('wip_seed_lock() {'):text.index('# Try a configured remote exporter first')]
+    trace = tmp_path / 'trace'
+    hw = tmp_path / 'scripts/hw'
+    hw.mkdir(parents=True)
+    # A fake fair queue: record the requested locks, grant at once.
+    (hw / 'hwlock.py').write_text(f"""import sys
+open({str(trace)!r}, 'a').write('turn ' + sys.argv[sys.argv.index('--locks') + 1] + '\\n')
+""")
+    home = tmp_path / 'home'
+    (home / '.cache/cuteafd').mkdir(parents=True)
+    probe = (f"flock -n {home}/.cache/cuteafd/sparks.lock true && echo sparks-free >> '{trace}' "
+             f"|| echo sparks-held >> '{trace}'")
+    return trace, home, f"""set -euo pipefail
+repo_root='{tmp_path}' wip_spark_leg=1 seed_host=kakapo spark_container=owned
+wip_target_hosts=({' '.join(targets)})
+CUTEAFD_HW_LOCKS_HELD='{held}'
+release_is_lan_seed() {{ [[ $1 == kakapo || $1 == cassowary ]]; }}
+release_die() {{ echo "die: $*" >> '{trace}'; exit 1; }}
+ssh() {{ echo true; }}
+wip_check_expert_readiness() {{ :; }}
+distribute_expert_slot() {{ {probe}; echo distribute >> '{trace}'; }}
+{seed_lock}
+{helpers}
+wip_distribute_sealed_expert
+"""
+
+
+@pytest.mark.parametrize('targets, locks', [
+    (['ostrich', 'dodo', 'emu'], 'sparks'),
+    (['ostrich', 'rhea', 'moa'], 'moa,rhea,sparks'),
+    (['rhea'], 'rhea'),
+])
+def test_distribution_takes_a_fair_turn_on_the_targets_serving_locks(tmp_path, targets, locks):
+    trace, home, script = _distribution_script(tmp_path, '', targets)
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
+                            env={**os.environ, 'HOME': str(home)})
+    assert result.returncode == 0, result.stderr
+    calls = trace.read_text().splitlines()
+    assert calls[0] == 'turn ' + locks
+    # The flock is held across the transfer, and only there.
+    assert calls[1:] == (['sparks-held'] if 'sparks' in locks else ['sparks-free']) + ['distribute']
+
+
+def test_distribution_under_held_locks_takes_no_second_turn(tmp_path):
+    trace, home, script = _distribution_script(tmp_path, 'sparks,gpu1', ['ostrich', 'dodo'])
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
+                            env={**os.environ, 'HOME': str(home)})
+    assert result.returncode == 0, result.stderr
+    assert trace.read_text().splitlines() == ['sparks-free', 'distribute']

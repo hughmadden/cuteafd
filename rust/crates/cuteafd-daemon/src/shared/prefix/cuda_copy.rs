@@ -92,6 +92,11 @@ impl Drop for StreamState<'_> {
     }
 }
 
+/// An aggregate native owner whose registered buffers must survive queued host DMA.
+pub(crate) trait SnapshotOwner {
+    fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>>;
+}
+
 pub(crate) struct CudaCopyEngine<'a> {
     library: &'a NativeLibrary,
     template: CuteafdDeviceBuffer,
@@ -111,6 +116,7 @@ pub(crate) struct CudaCopyEngine<'a> {
     /// Registered allocation owners outlive every stream and pinned chunk.
     /// A failed drain deliberately retains these references through shutdown.
     owners: Vec<Rc<Allocation<'a>>>,
+    retained: Vec<Rc<dyn SnapshotOwner + 'a>>,
 }
 
 impl<'a> CudaCopyEngine<'a> {
@@ -146,6 +152,14 @@ impl<'a> CudaCopyEngine<'a> {
         engine.owners = owners;
         Ok(engine)
     }
+    pub fn registered_retained(library: &'a NativeLibrary, owners: Vec<Rc<Allocation<'a>>>,
+        retained: Vec<Rc<dyn SnapshotOwner + 'a>>) -> Result<Self> {
+        let buffers = retained.iter().map(|owner| owner.snapshot_buffers()).collect::<Result<Vec<_>>>()?
+            .into_iter().flatten().collect::<Vec<_>>();
+        let mut engine = Self::registered_with_owners(library, &buffers, owners)?;
+        engine.retained = retained;
+        Ok(engine)
+    }
     fn create(library: &'a NativeLibrary, template: CuteafdDeviceBuffer, regions: Option<Regions>) -> Result<Self> {
         let ids = regions.as_ref().map(|r| r.devices.clone()).unwrap_or_else(|| vec![template.device_id]);
         let mut streams = Vec::with_capacity(ids.len());
@@ -160,7 +174,7 @@ impl<'a> CudaCopyEngine<'a> {
             "host snapshot cache copy mechanism");
         Ok(Self { library, template, regions, chunks: Vec::new(), streams, next_event: 0,
             started: Instant::now(), runtime, submissions: 0, batch_dsts: Vec::new(),
-            batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new() })
+            batch_srcs: Vec::new(), batch_sizes: Vec::new(), ordered: Vec::new(), routed: Vec::new(), owners: Vec::new(), retained: Vec::new() })
     }
     fn resolve_host(chunks: &[Option<CuteafdHostBuffer>], range: HostRange) -> Result<CuteafdHostBuffer> {
         let chunk = chunks.get(range.chunk as usize).and_then(Option::as_ref).context("host cache chunk released")?;
@@ -331,6 +345,7 @@ impl Drop for CudaCopyEngine<'_> {
             // Descriptors and page refs do not own memory. Retain the strong
             // allocation references too, so family/engine drop cannot free it.
             std::mem::forget(std::mem::take(&mut self.owners));
+            std::mem::forget(std::mem::take(&mut self.retained));
             tracing::error!(%error, "host cache drain failed; retaining pinned and device copy storage");
             return;
         }
@@ -350,6 +365,26 @@ mod cuda_tests {
     use cuteafd_hostcache::snapshot::{DevicePageId, SnapshotMeta};
     use cuteafd_hostcache::COMPRESSORS;
     use crate::shared::memory::device::{Allocation, Device};
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn aggregate_registered_owner_survives_external_drop() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        struct Aggregate<'a>(Allocation<'a>);
+        impl SnapshotOwner for Aggregate<'_> {
+            fn snapshot_buffers(&self) -> Result<Vec<CuteafdDeviceBuffer>> { Ok(vec![self.0.buffer]) }
+        }
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        let owner = Rc::new(Aggregate(Allocation::new(Device { library: &library, id: 1 }, 256)?));
+        let weak = Rc::downgrade(&owner);
+        let engine = CudaCopyEngine::registered_retained(&library, Vec::new(), vec![owner.clone()])?;
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        drop(engine);
+        assert!(weak.upgrade().is_none());
+        Ok(())
+    }
 
     fn queued_rank_release(drop_engine: bool) -> Result<()> {
         use crate::shared::memory::device::{Event as DeviceEvent, Stream as DeviceStream};
@@ -386,7 +421,7 @@ mod cuda_tests {
             })?;
             let half = |buffer: CuteafdDeviceBuffer, offset| DeviceRange {
                 addr: buffer.ptr as u64 + offset, bytes: 2048 };
-            let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
             pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round as u32 },
                 segments: vec![half(buffers[0], 0), half(buffers[1], 0)] });
             let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,
@@ -514,7 +549,7 @@ mod cuda_tests {
                 for (allocation, bytes) in allocations.iter().zip(&expected) {
                     allocation.device.run(|| lib.copy_h2d(allocation.buffer, bytes))?;
                 }
-                let mut pages: [Vec<DevicePage>; COMPRESSORS] = Default::default();
+                let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
                 pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 0, generation: round },
                     segments: vec![range(buffers[0]), range(buffers[2])] });
                 let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind: cuteafd_hostcache::SnapshotKind::Prompt,

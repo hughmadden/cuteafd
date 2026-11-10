@@ -13,7 +13,7 @@ fn native_request_image_masks_features_and_history() -> Result<()> {
     let catalog =
         cuteafd_loader::read_official_v41_catalog(&model)?;
     let map = cuteafd_loader::EngramTokenMap::from_file(&model.join("tokenizer.json"))?;
-    let pipeline = unsafe { EngramPipeline::new(&catalog, map, 4096, 2, 1 << 30, 0)? };
+    let pipeline = unsafe { EngramPipeline::new(&lib, &catalog, map, cuteafd_loader::EngramStagingShape::new(4096, 2)?, 0)? };
     let mut requests = Requests::new(
         &lib,
         pipeline,

@@ -25,11 +25,12 @@ enhanced build.
 
 | Who | Does | Doesn't |
 |---|---|---|
-| **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `work/p0`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
+| **Orchestrator** (one Claude Opus session) | Plans, writes briefs, picks the model per task, makes default and policy calls, reviews every branch, resolves merge conflicts, merges into `dev`, cuts releases, talks to TJ | Long hardware runs, bulk implementation |
 | **Codex Sol 6.1** | The workhorse: kernels, ports, measurements, A/B campaigns, release builds and smoke matrices, investigations | Merging, tagging, pushing images, changing defaults without passing gates |
-| **Astra 6** (`high`) | Hard kernel and optimization work: new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Simple kernels, investigation, profiling, probes, harnesses, integration, gates (Sol does these) |
-| **DeepSeek 4.1 Flash** | Fast structural work: renames, mechanical refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts | Numerics, kernels, judgment calls |
+| **Astra 6** (`high`) | Kernel duels and targeted judgment calls, always tightly scoped (expensive): new kernel structures, tiling and fusion ideas, roofline gaps, and coding those kernels | Open-ended tasks, simple kernels, investigation, probes, harnesses, integration, gates (Sol does these) |
+| **DeepSeek 4.1 Flash** | Fast mechanical work and kernel duels: renames, refactors, doc and table edits, sweeps across many files, log/report digests, simple scripts, duel rounds against Sol or Gemini | Judgment calls, numerics outside a duel's bitwise gate |
 | **Claude Opus subagents** | Judgment-heavy cross-cutting work: engine design changes (e.g. the device-driven exchange), hard merges, investigations needing many decisions, independent reviews | Work Sol can do from a clear brief |
+| **Gemini** (`agy`, external) | Kernel duels; slower judgment-oriented work: second opinions, design reviews, research | Bulk implementation, merging |
 | **Claude Fable** | Extremely rarely: important design or planning, front-end design, a special kernel insight | Anything else |
 | **MiMo** | Only when every other option is exhausted | — |
 
@@ -45,7 +46,7 @@ Budget drives the split. Claude is the scarcest: eight parallel Opus agents
 once used ~60% of a week's capacity in under a day. Codex Sol has had ample
 budget (under 1% of a weekly subscription after a full day of work). With a
 larger Claude budget now, Opus can take somewhat more of the judgment work,
-but bounded engineering still goes to Sol.
+but bounded engineering still goes to Sol. TJ (2026-10-25): Sol is the primary agent for every task unless judgment is crucial.
 
 | Task | Model | Effort |
 |---|---|---|
@@ -58,21 +59,19 @@ but bounded engineering still goes to Sol.
 | Important design/planning, front-end design | Claude Fable | default; extremely rarely |
 | Everything else exhausted | MiMo | default |
 
-- **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol `-backup` stays the default for everything else.
-- **Astra for hard kernels (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts and can code those kernels itself. Don't spend it on simple kernels or on probes, harnesses and integration, which Sol does. Astra burned a backup week mostly on probe plumbing in one investigation.
+- **Judgment calls and shared tooling go to Claude (TJ, 2026-10-13).** Use Opus agents for important judgment calls, and Opus or Sonnet for shared build-system work done in response to another agent's tooling request: every agent depends on that tooling, so a mistake there costs everyone. Sol stays the default for everything else.
+- **Astra for hard kernels (TJ, 2026-10-13):** Astra `high` is good for kernel and optimization concepts and can code those kernels itself. Don't spend it on simple kernels or on probes, harnesses and integration, which Sol does. Astra once burned a subscription week mostly on probe plumbing in one investigation.
 - **Rotate models on repeated kernel ideas (TJ, 2026-10-13):** when a kernel or optimization idea needs several iterations, don't give every round to the same model. Rotate the strong models (Astra `high`, Opus, Fable, Sol `xhigh`), each taking a turn with the previous rounds' results and measurements, and pick who goes first at random. Different smart friends see different things. One round per model per turn, then the measured result goes to the next.
 - **Fable is rare.** It costs far more per task; use it at a critical minimum (TJ, 2026-10-05). Opus 5.5 and Sol 6.1 are strong, and in some ways better, so default to them for hard problems.
-- **Codex subscriptions:** start new agents on the `-backup` models (TJ's
-  second subscription); when backup hits its weekly limit, start new agents
-  on primary. TJ can reset backup's usage; after a reset, new agents go
-  back to backup while running agents stay where they are (don't cancel
-  them to move them). Astra burns budget faster than Sol but less
-  than Fable.
+- **Codex subscription:** there is one Codex subscription (TJ cancelled the
+  backup one, 2026-10-22). Start agents on the plain `claude/chatgpt/...`
+  models; the `-backup` model names no longer authenticate. Astra burns
+  budget faster than Sol but less than Fable.
 - **Read the error body, not the headline.** The gateway prints "Server is
   temporarily limiting requests (not your usage limit)" for both cases. A
   body with `usage_limit_reached` and `resets_in_seconds` in days is the
-  subscription's weekly limit: every agent on that subscription stops at
-  its next call. Relaunch each on the other subscription as a fresh agent
+  subscription's weekly limit: every Codex agent stops at its next call.
+  Relaunch each on another model (Opus, DeepSeek) as a fresh agent
   with a resume note pointing at its PR (`pr-sync pull` restores STATUS.md;
   its background jobs keep running and must not be duplicated). Keep a shared
   `codex-runs/resume-note.md` for this.
@@ -84,8 +83,8 @@ but bounded engineering still goes to Sol.
 - **Capacity vs limit:** "Selected model is at capacity" (or a similar
   overload error) is the provider being busy, not our quota. Retry after a
   few minutes; pushed commits survive, so resume with a note. A usage-limit
-  error means switch subscription (backup ↔ primary) or model.
-- **Budget pacing:** a backup subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
+  error means switch model.
+- **Budget pacing:** a Codex subscription's week lasted a few hours with six Sol `xhigh`/`high` agents plus Astra `high` in parallel. Keep about three `xhigh` agents at once, default to `high`, and don't let an agent spawn sub-agents at `xhigh` without reason.
 - **Parallelism:** run several Sol agents at once on independent tasks
   (separate branches and worktrees, disjoint hardware); serialize only what
   shares a GPU or build cache. Queue Codex work early, it is slower per task
@@ -112,10 +111,10 @@ build and cleanup contract. Two commands cover most briefs; paste them:
 # A/B two commits on cards: builds both arms, preflights on the CPU, queues fairly,
 # interleaves, and writes summary.md (before -> after per card and metric, first real error).
 python3 scripts/bench/wip-cards.py --kit gate --interleave --repeats 1 --cards qwen38-exl3-min \
-  --arm base=<task>-b:<slot> --arm cand=<task>-c:<slot> --build base=origin/work/p0 --build cand=HEAD \
+  --arm base=<task>-b:<slot> --arm cand=<task>-c:<slot> --build base=origin/dev --build cand=HEAD \
   --panels baseline --levels 1,16 --post-load-c1 --trace --binary <cuteafd built from HEAD> --task <task>
 # CPU gate: cargo + script suite, verdict from parsed summaries, optional new-failure diff against a base.
-scripts/dev/cpu-gate --task <task> [--cargo] [--scripts] [--skip-live-planners] [--base origin/work/p0]
+scripts/dev/cpu-gate --task <task> [--cargo] [--scripts] [--skip-live-planners] [--base origin/dev]
 ```
 
 Same build, two configurations: `--arm-wip` both arms to one sealed WIP
@@ -140,9 +139,10 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
   A shared-build toggle (`--arm-wip`) isolates a flag from the build.
 - **Judge on the paired median**, not on the ratio of arm medians, and report
   the raw pairs and their order.
-- **Builds:** `--build` arms seed on kakapo by default (`--seed rhea|moa` to
-  override). kakapo only builds (10 GbE; its slots reach the Sparks through
-  sparknest), so its CPU load never skews a serving card; rhea and
+- **Builds:** `--build` arms seed on the less-loaded LAN-only seed (kakapo or
+  cassowary) by default (`--seed kakapo|cassowary|rhea|moa` places it). LAN-only
+  seeds only build (10 GbE; their slots reach the Sparks through sparknest),
+  so their CPU load never skews a serving card; rhea and
   moa serve cards too, so wait for an idle one without holding locks; never
   wrap `wip.sh` in a Spark lock yourself.
 - **Page cache:** GB10 CUDA allocations reclaim Linux page cache. Keep caches
@@ -157,9 +157,13 @@ nice 19 with 16 jobs (`CARGO_BUILD_JOBS=16`, `RUST_TEST_THREADS=16`).
 The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
-1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
-   outside the repo (the preamble covers this). Name the PR/issue number and
-   the preflight command (`hwlock.py --preflight`) for any hardware run.
+1. **Branch and base:** `work/<task>` off `origin/dev`, in a worktree
+   under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
+   and SparkInfer worktrees both go in this folder, not directly in
+   `~/Developer`; use distinct names such as `cuteafd-<task>` and
+   `sparkinfer-<task>`. Leave existing worktrees where they are. Name the
+   PR/issue number and the preflight command (`hwlock.py --preflight`) for
+   any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
    the `PLAN.md` item, what was already tried. Point at earlier reports
    rather than restating them.
@@ -175,6 +179,15 @@ agent needs to finish without asking:
    leave opt-in.
 6. **Report:** before → after tables with conditions, gate results, commits,
    open issues.
+
+Create the parent once, then create each task's worktree from its owning
+checkout (SparkInfer branches use that fork's base, not CuteAFD's):
+
+```sh
+mkdir -p ~/Developer/cute-worktrees
+git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/dev
+git -C ~/Developer/sparkinfer-glmrt worktree add ~/Developer/cute-worktrees/sparkinfer-<task> -b work/<task> origin/master
+```
 
 Start every cluster brief with `scripts/agents/codex-preamble.md` (worktree,
 build, lock, sudo, frugality and no-merge rules). `codex-launch.sh` prepends
@@ -194,7 +207,7 @@ tool returns at once and a completion notification wakes the orchestrator):
 
 ```text
 Agent(subagent_type="general-purpose",
-      model="claude/chatgpt/gpt-6.1-sol-backup",   # see table below
+      model="claude/chatgpt/gpt-6.1-sol",   # see table below
       effort="high",                               # per-launch reasoning effort
       description="<3-5 words>",
       prompt="Read and follow scripts/agents/codex-preamble.md. <brief>")
@@ -202,8 +215,8 @@ Agent(subagent_type="general-purpose",
 
 | Model id | Use |
 |---|---|
-| `claude/chatgpt/gpt-6.1-sol-backup`, `claude/chatgpt/gpt-6.1-sol` | Sol 6.1 (backup first); effort `high`/`xhigh` |
-| `claude/chatgpt/gpt-6-astra-backup`, `claude/chatgpt/gpt-6-astra` | Astra 6; effort `medium`/`high` |
+| `claude/chatgpt/gpt-6.1-sol` | Sol 6.1; effort `high`/`xhigh` |
+| `claude/chatgpt/gpt-6-astra` | Astra 6; effort `medium`/`high` |
 | `claude/deepseek/deepseek-flash` | DeepSeek 4.1 Flash; effort `high`/`max` |
 | `opus`, `fable` | Claude subagents |
 | `claude/xiaomi/mimo-v2.6-pro` | last resort; no graded effort |
@@ -274,7 +287,7 @@ orchestrator's to use; TJ isn't using these subscriptions.
 
 | CLI | Model | Launch flags | Expected strengths |
 |---|---|---|---|
-| `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota (the backup Codex subscription expires in a few weeks) |
+| `grok` (X Premium+) | `grok-4.7` (default), `grok-4.7-build-fast` | `--always-approve`, `--prompt-file`, `--reasoning-effort` | mechanical work; a fallback when Codex is down or out of quota |
 | `agy` (Google Antigravity) | `gemini-4-argon-high`/`-medium`/`-low`, `gemini-3.8-flash-*` | `--dangerously-skip-permissions`, `-p`, `--effort`, `--add-dir` | second opinions on hard kernel and technical problems, vision, deep research and search |
 
 Use the interactive stdlib driver for a worker that needs steering or answers:
@@ -322,9 +335,24 @@ patterns:
 
 The same gates and rules apply as for every agent: no tooling extensions, no
 sudo, no power changes, the fair queue for hardware, public-text hygiene. An
-external agent never merges, and never pushes to work/p0 or the fork's master.
+external agent never merges, and never pushes to dev or the fork's master.
 Compact the scorecard log into its summary table every ~10 entries, and
 update this section's table as the picture firms up.
+
+## Gate execution
+
+The agent Bash tool can evaluate commands in a non-final `&&` operand, where
+Bash ignores inline `set -e`. Never run a multi-step gate as an inline
+`set -e; build; tests; echo PASS` command. Invoke the standalone entry point
+(`scripts/dev/cpu-gate`, or `bash path/to/gate.sh`), or explicitly chain every
+required step with `&&` / `|| exit 1`. Do not source a gate or call its shell
+function from an `if`/`&&` condition: that also suppresses errexit.
+
+The canonical CPU gate requires Cargo's JSON `build-finished.success` before
+running tests, then parses test-result failure counts (or nextest's JUnit
+report). Missing/empty reports, timeouts and moved HEADs fail closed, including
+with `--base`. Report failing test IDs, not merely exit codes or counts. Commit
+before starting the gate; never move HEAD during it.
 
 ## Running agents
 
@@ -353,6 +381,30 @@ update this section's table as the picture firms up.
   Background shells and their completion watchers die with the session, so
   finished jobs must be collected by hand.
 - A session limit stops every agent at once; resume each with a short note.
+- **Launch every hardware run, golden and long build as a systemd user
+  unit:** `systemd-run --user --unit=<task-name> --collect
+  --setenv=PATH="$PATH" --setenv=HOME="$HOME" --working-directory=<dir>
+  bash -c '<cmd> > <log> 2>&1; echo exit $? >> <log>'`. `nohup setsid`
+  is not enough: the job stays in the Claude session's `tmux-spawn-*.scope`
+  cgroup and dies with it, queued hwlock tickets included (twice on
+  2026-10-22). Check `/proc/<pid>/cgroup` reads `app.slice/<name>.service`.
+  Pass PATH and HOME explicitly: a user unit otherwise gets systemd's
+  minimal PATH, and host-side Cargo exits 127. Transient units live only in
+  `/run` and unload when the command exits, so they leave nothing behind.
+  systemd expands `$VAR`/`${...}` in the unit command line itself, which
+  mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
+  `--expand-environment=no`, or put the commands in a script file and run
+  `bash /path/script.sh`.
+- Keep systemd's stop defaults on those units (KillMode=control-group,
+  TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
+  `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
+  and Spark workers (bounded, 60 s) and `hwlock.py` / `wip-cards.py` forward
+  the signal and keep the locks until it has, so the next lock holder finds
+  clean hardware.
+- Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
+  `pkill -f` (the pattern can match your own Bash command line and kill it),
+  `kill -9` or `systemctl kill -s KILL` (no teardown runs; the containers
+  outlive the released locks).
 
 ### Known Codex behavior
 
@@ -398,21 +450,34 @@ These apply to every agent and are also in `AGENTS.md`.
 ## Reviewing and merging
 
 1. Read the report, then check the branch: `git merge-base --is-ancestor
-   origin/work/p0 origin/<branch>` and `git diff --stat origin/work/p0...origin/<branch>`.
+   origin/dev origin/<branch>` and `git diff --stat origin/dev...origin/<branch>`.
 2. Merge in a temporary worktree. On conflicts, keep both sides' intent; if
    an agent wrote the branch and the conflict is substantial, send it back to
-   that agent to merge `origin/work/p0` and re-verify.
+   that agent to merge `origin/dev` and re-verify.
 3. Check launcher keys: every key `run-family.sh` reads must be in
    `release_known_key` (`scripts/lib/release-common.sh`).
 4. Tests: `cargo test --workspace`, and compare failing script-test ids
-   against `origin/work/p0` (add none).
-5. Push to `work/p0` (fast-forward when possible).
+   against `origin/dev` (add none).
+5. Push to `dev` (fast-forward when possible).
 6. Override a conservative call when the measurements justify it, and record
    the reason in the commit (e.g. the V4.1 FP8 vocabulary head default).
 
 For a second opinion on a risky branch, have a different model review it
 than the one that wrote it (Opus or Astra reviewing Sol), given the diff and
 the gates, not the author's conclusion.
+
+Every big integration, port or shared-mechanism change gets a Gemini 4 Argon
+review before merge, as a standing step (TJ, 2026-10-28). Run it read-only on
+pinned SHAs, give it the problem classes seen so far as examples rather than
+limits, and run it alongside the A/B cards, not after them. It always runs
+through a DeepSeek Flash driver that checks every finding at the pinned SHA
+(VERIFIED, WRONG or UNVERIFIABLE) before reporting: about one finding in eight
+is wrong and line references are sometimes off. Gemini reads differently from
+the rest of the roster, finding dead callers, unread copies and code that
+contradicts its own comments. On the V4.1 shared-prefill port it found a 2-RTX
+TP2 FFN that never received its row window and decode transports built about
+500 MB too large, both missed by an Astra review of the same SHA. Pair it with a
+second viewpoint (Astra or Sol) on the riskiest changes.
 
 ## Keeping this guide current
 
@@ -445,4 +510,4 @@ duplicating it. Record the lesson in the table below.
 | Orchestrator's `git commit -a` in its own worktree swept a sub-agent's uncommitted edits (the harness had placed the agent there) into a pushed commit | Orchestrator merges and commits in a dedicated throwaway worktree, stages files by name, and checks `git status` first; agent briefs name an explicit worktree outside `.claude/` |
 | "Model at capacity" ended a run | Retry after a few minutes; resume with a note |
 | ~2,700 hand-written driver scripts; most of one day's failures came from them (wrong container prefix, stale markers, dropped trace, missing --interleave) | The preamble's two commands; wip-cards preflights before queuing, `--resume` replaces retries, and agents ask for tooling instead of writing drivers |
-| Backup subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on the other subscription from STATUS.md |
+| Codex subscription hit its weekly limit; 6 agents stopped at once | Read `usage_limit_reached`; relaunch on another model from STATUS.md |

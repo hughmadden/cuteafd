@@ -19,6 +19,37 @@ fn preparer() -> MediaPreparer {
     .unwrap()
 }
 #[test]
+fn standard_api_fixture_preserves_each_legacy_family_token_count() {
+    use crate::openai::probe::{ProbeImageUrl, ProbeMedia, ProbeSpec};
+    // The existing 1x1 PNG exercises each processor's different minimum resize.
+    for (family, old_count, old_grid) in [
+        (ImageFamily::Mimo, 4, [1, 4, 4]),
+        (ImageFamily::Qwen, 64, [1, 16, 16]),
+        (ImageFamily::GlmFlash, 16, [1, 8, 8]),
+    ] {
+        let processor = ProcessorConfig::for_family(family);
+        let preparer = MediaPreparer::for_loaded_encoder(processor.clone(), EncoderId([1; 32]), 1).unwrap();
+        let prepared = preparer.prepare(&[source()]).unwrap();
+        let image = &prepared.images[0];
+        let grid = [image.grid.t, image.grid.h, image.grid.w];
+        let legacy_rows = grid.iter().map(|v| *v as usize).product::<usize>() / 4;
+        assert_eq!(grid, old_grid, "{family:?} fixture resize changed");
+        assert_eq!(legacy_rows, old_count, "{family:?} legacy fixture count");
+        assert_eq!(image.tokens, old_count, "{family:?} API old -> new count");
+        let spec = ProbeSpec {
+            prompt_ids: Some(vec![9; image.tokens]),
+            media: vec![ProbeMedia { start: 0, len: image.tokens, kind: "image".into(),
+                key: format!("{:x}", Sha256::digest(image.key.0)), grid, identity: None, input_key: None, fixture: None,
+                image_url: Some(ProbeImageUrl { url: source().url, detail: None }) }],
+            ..ProbeSpec::default()
+        };
+        spec.validate_media_geometry(processor.token_geometry()).unwrap();
+        let mut wrong = spec;
+        wrong.media[0].len -= 1;
+        assert!(wrong.validate_media_geometry(processor.token_geometry()).is_err());
+    }
+}
+#[test]
 fn qwen_startup_policy_cannot_exceed_qualified_family_cap() {
     let config = ProcessorConfig::for_family(ImageFamily::Qwen);
     let preparer = MediaPreparer::for_loaded_encoder(config, EncoderId([1; 32]), 1).unwrap();

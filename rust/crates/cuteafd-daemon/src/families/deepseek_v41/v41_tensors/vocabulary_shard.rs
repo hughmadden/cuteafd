@@ -7,6 +7,7 @@ pub(crate) struct VocabularyShard<'a> {
     device_id: i32,
     tokens: Range<usize>,
     fp8: Option<crate::shared::fp8_linear::Fp8Weight<'a>>,
+    packed: Option<crate::shared::packed_head::PackedHead<'a>>,
 }
 impl<'a> VocabularyShard<'a> {
     const VOCAB: usize = 129280;
@@ -20,13 +21,32 @@ impl<'a> VocabularyShard<'a> {
         Ok(tokens.len() * Self::ROW_BYTES)
     }
 
-    /// Peak GPU allocation while packing. Final residency is smaller in `all`.
+    /// Peak GPU allocation while packing. Final residency is smaller in `all` and `packed`.
     pub fn load_bytes(catalog: &OfficialV41Catalog, tokens: Range<usize>) -> Result<usize> {
         let source = Self::device_bytes(catalog, tokens)?;
         Ok(Self::peak_bytes(source, super::fp8_head()))
     }
     fn peak_bytes(source: usize, mode: super::Fp8Head) -> usize {
         mode.load_bytes(source as u64) as usize
+    }
+
+    /// Device-free recipe shared with header-only startup admission checks.
+    pub(crate) fn pack_steps(whole: crate::shared::experts::rtx::dense::Rect, device: i32,
+        values: CuteafdDeviceBuffer, scale: CuteafdDeviceBuffer,
+    ) -> Result<Vec<crate::shared::experts::rtx::dense::Step>> {
+        use crate::shared::experts::rtx::dense::{Job, Step};
+        let rows = whole.rows.len();
+        ensure!(whole.width() == Self::ROW_BYTES && rows % 16 == 0,
+            "vocabulary rows are not whole 16-row tiles");
+        let per = 16;
+        Ok((0..rows).step_by(per).map(|first| Step { device,
+            rects: vec![whole.sub(first..first + per)], jobs: vec![Job::W8a16Pack { n: per, k: 5120,
+                rule: crate::shared::fp8_linear::Fp8Scales::Best,
+                packed: CuteafdDeviceBuffer { ptr: values.ptr.cast::<u8>().wrapping_add(first * 5120).cast(),
+                    bytes: per * 5120, ..values },
+                scale: CuteafdDeviceBuffer { ptr: scale.ptr.cast::<u8>().wrapping_add(first * 160).cast(),
+                    bytes: per * 160, ..scale },
+            }] }).collect())
     }
 
     /// The caller scopes construction/destruction to the owning GPU. Admission
@@ -37,38 +57,59 @@ impl<'a> VocabularyShard<'a> {
         ensure!(Self::load_bytes(catalog, tokens.clone())? <= budget, "vocabulary shard peak load exceeds device budget");
         ensure!((1..=64 * 1024 * 1024).contains(&staging_bytes),
             "vocabulary pinned staging must be 1 byte through 64 MiB");
-        let reader = catalog.coordinator_tensor_reader("head.weight")?;
-        let mut staging = HostAllocation::new(library, staging_bytes.min(bytes))?;
-        let allocation = DeviceAllocation::new(library, bytes)?;
-        let source_start = tokens.start * Self::ROW_BYTES;
-        let mut offset = 0;
-        while offset < bytes {
-            let count = staging_bytes.min(bytes - offset);
-            let source = &mut staging.bytes_mut()[..count];
-            reader.read_into((source_start + offset) as u64, source)?;
-            let destination = CuteafdDeviceBuffer {
-                // SAFETY: offset/count stay inside the admitted source allocation.
-                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset).cast() },
-                bytes: count, ..allocation.buffer
-            };
-            library.copy_h2d(destination, source)?;
-            offset += count;
-        }
-        let device_id = allocation.buffer.device_id;
-        let (allocation, fp8) = if super::fp8_head() == super::Fp8Head::Off {
-            (Some(allocation), None)
+        let device_id = library.cuda_get_device()?;
+        let dense = crate::shared::experts::rtx::dense::DenseLoad::mount(library);
+        let rows = tokens.len();
+        let whole = super::rect(catalog, "head.weight", Some(tokens.clone()))?;
+        let mut packed = None;
+        let (allocation, fp8) = if super::fp8_head() == super::Fp8Head::All {
+            // The FP8 copy is the only resident one: pack 16-row windows of the
+            // staged BF16 rows straight into it (tiles are independent).
+            let packed = crate::shared::fp8_linear::Fp8Weight::allocate(library, rows, 5120)?;
+            let (values, scale) = packed.buffers();
+            let steps = Self::pack_steps(whole, device_id, values, scale)?;
+            let stream = library.cuda_stream_create()?;
+            let staged = (|| -> Result<()> {
+                for step in steps { dense.step(step, stream)?; }
+                Ok(())
+            })();
+            // SAFETY: every job drained before returning; the stream has no other users.
+            unsafe { library.cuda_stream_destroy(stream)?; }
+            staged?;
+            (None, Some(packed))
         } else {
-            let (source, packed) = super::pack_fp8(library, allocation, tokens.len())?;
-            (source, Some(packed))
+            let allocation = DeviceAllocation::new(library, bytes)?;
+            dense.operand(crate::shared::experts::rtx::dense::Operand { device: device_id, buffer: allocation.buffer,
+                lands: vec![(whole, 0)], bytes })?;
+            match super::fp8_head() {
+                super::Fp8Head::Off => (Some(allocation), None),
+                super::Fp8Head::Packed => {
+                    // The exact copy packs (and verifies) from the whole landed
+                    // BF16 shard, which it then releases.
+                    ensure!(!crate::shared::experts::rtx::dense::is_recording(), "the packed head loads through the mount");
+                    packed = Some(super::pack_packed(library, allocation, rows)?);
+                    (None, None)
+                }
+                _ => {
+                    ensure!(!crate::shared::experts::rtx::dense::is_recording(), "the draft-only FP8 head loads through the mount");
+                    let (source, packed) = super::pack_fp8(library, allocation, rows)?;
+                    (source, Some(packed))
+                }
+            }
         };
+        let _ = staging_bytes;
+        let (exceptions, row_exceptions) = packed.as_ref().map_or((0, 0), |head| head.exceptions());
         tracing::info!(device_id, rows = tokens.len(), bf16_bytes = allocation.as_ref().map_or(0, |a| a.buffer.bytes),
-            fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), "V4.1 vocabulary residency");
-        Ok(Self { allocation, device_id, tokens, fp8 })
+            fp8_bytes = fp8.as_ref().map_or(0, |w| w.bytes()), packed12_bytes = packed.as_ref().map_or(0, |h| h.bytes()),
+            exceptions, row_exceptions, "V4.1 vocabulary residency");
+        Ok(Self { allocation, device_id, tokens, fp8, packed })
     }
     pub fn weight(&self) -> Option<CuteafdDeviceBuffer> { self.allocation.as_ref().map(|a| a.buffer) }
     pub fn device_id(&self) -> i32 { self.device_id }
-    /// The FP8 copy (`CUTEAFD_V41_FP8_HEAD`), when one was packed.
-    pub fn fp8(&self) -> Option<&crate::shared::fp8_linear::Fp8Weight<'a>> { self.fp8.as_ref() }
+    /// The resident copy (`CUTEAFD_V41_FP8_HEAD`), when one was packed.
+    pub fn copy(&self) -> Option<super::HeadCopy<'_, 'a>> {
+        self.packed.as_ref().map(super::HeadCopy::Packed).or(self.fp8.as_ref().map(super::HeadCopy::Fp8))
+    }
     pub fn tokens(&self) -> Range<usize> { self.tokens.clone() }
 }
 
@@ -83,6 +124,11 @@ mod tests {
         assert_eq!(VocabularyShard::peak_bytes(source, Fp8Head::Off), source);
         for mode in [Fp8Head::Draft, Fp8Head::All] {
             assert_eq!(VocabularyShard::peak_bytes(source, mode), source + 129280 * (5120 + 160));
+        }
+        // The exact copy's single allocation lands beside the whole BF16 source.
+        for rows in [129280, 64640] {
+            let layout = cuteafd_core::packed_head::PackedHeadLayout::new(rows, 5120).unwrap();
+            assert_eq!(VocabularyShard::peak_bytes(rows * 10240, Fp8Head::Packed), rows * 10240 + layout.total_bytes());
         }
     }
 
@@ -124,5 +170,14 @@ mod tests {
         drop(shards);
         assert_eq!(lib.cuda_get_device()?, 0);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl VocabularyShard<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        if let Some(a) = &self.allocation { f(format!("{prefix}bf16"), a.buffer); }
+        if let Some(w) = &self.fp8 { w.visit(&format!("{prefix}fp8."), f); }
+        if let Some(head) = &self.packed { head.visit(prefix, f); }
     }
 }

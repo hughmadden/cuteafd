@@ -1,6 +1,7 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod decode_lanes;
 pub mod deployment;
 pub mod experts;
 pub mod exlr8;
@@ -14,13 +15,16 @@ pub mod layout;
 pub mod names;
 pub mod rope;
 pub mod spec;
+pub mod spark_range;
+pub mod spark_executions;
 #[doc(hidden)]
 pub mod testing;
 
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock, atomic::{AtomicBool, AtomicU64, Ordering}};
+use std::time::{Duration, Instant};
 
 pub use checkpoint::Checkpoint;
 pub use family::{ConfigError, ExpertContract, Family, FamilyModel, Hint, RuntimeStatus};
@@ -47,15 +51,33 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
-/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Resolve a checkpoint's bundled native audio tower before placement.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
-    match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
-        crate::media::audio_tower::AudioStorage::Fp32) {
-        Ok(_) => Ok(mode),
-        Err(_) if mode == MediaMode::Auto => Ok(MediaMode::Off),
-        Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
+    let config: serde_json::Value = crate::read_json_file(&snapshot.join("config.json"))
+        .map_err(|error| PlanError::InvalidOption { option: "audio placement", reason: error.to_string() })?;
+    resolve_audio_config(mode, snapshot, &config)
+}
+
+pub(crate) fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value)
+    -> Result<MediaMode, PlanError> {
+    if mode == MediaMode::Off { return Ok(mode); }
+    let kind = crate::media::AudioTowerKind::from_config(config)
+        .map_err(|reason| PlanError::InvalidOption { option: "audio placement", reason })?;
+    if let Some(kind) = kind {
+        let validation = match kind {
+            crate::media::AudioTowerKind::MusePcm => crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ()),
+            crate::media::AudioTowerKind::MimoRvq => crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+                crate::media::audio_tower::AudioStorage::Fp32).map(|_| ()),
+        };
+        return validation.map(|_| mode).map_err(|error| PlanError::InvalidOption {
+            option: "audio placement", reason: format!("{kind:?}: {error}") });
+    }
+    match mode {
+        MediaMode::Auto => Ok(MediaMode::Off),
+        _ => Err(PlanError::InvalidOption { option: "audio placement",
+            reason: "checkpoint has no declared bundled audio tower".into() }),
     }
 }
 
@@ -146,10 +168,21 @@ impl ExpertPlacement {
 /// Planning options that cannot describe a deployment.
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
+    #[error(transparent)]
+    SparkRange(#[from] spark_range::RangeRefusal),
     #[error("invalid {option}: {reason}")]
     InvalidOption { option: &'static str, reason: String },
+    #[error("unsupported {option}={value} for {family}: {reason}")]
+    UnsupportedOption { option: &'static str, value: u8, family: String, reason: &'static str },
     #[error(transparent)]
     Checkpoint(#[from] anyhow::Error),
+}
+
+/// Resolve the decode-lane count before layout or CUDA allocation
+/// ([`decode_lanes::resolve`]).
+pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+    let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
+    decode_lanes::resolve(descriptor, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,14 +253,33 @@ pub struct PlanReport {
     /// A single diagnostic when an unspecified Spark count falls back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spark_count_warning: Option<String>,
-    /// Resolved prefill shape, including V4.1 automatic capacity admission.
+    /// Policy refusal, distinct from absent executable packages.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_rows: Option<u64>,
-    /// Solver-selected GLM prefill lanes, shared by device and host admission.
+    pub spark_range_refusal: Option<spark_range::RangeRefusal>,
+    /// Resolved retained prefill span, not the row count of an individual unit.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_lanes: Option<u64>,
+    pub prefill_span_rows: Option<u64>,
+    /// Family-resolved rows per unit; never inferred from the retained span.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefill_selection: Option<String>,
+    pub prefill_unit_rows: Option<u64>,
+    /// Family-resolved units in flight on each transport.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_waves: Option<u64>,
+    /// The admitted pool's RTX expert layers and the pool the same solve
+    /// admits with none onboarded (bench cards read both beside the pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboard_layers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pool_tokens_no_onboard: Option<u64>,
+    /// Resolved decode views, independent of prefill units in flight.
+    pub decode_lanes: u8,
+    /// Solver-selected transport count, independent of units in flight.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_transports: Option<u64>,
+    /// The shared prefill reserve the units split (8192, or the largest
+    /// standard reserve that fits the card); `None` when pinned explicitly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_reserve_rows: Option<u64>,
     /// The package and layouts that serve this checkpoint's routed experts.
     pub experts: Option<ExpertContract>,
     /// Whether this build has a layout for the requested placement.
@@ -244,6 +296,9 @@ pub struct PlanReport {
     /// Where the expert service read the routed EXL3 storage layout from.
     pub expert_storage: Option<crate::formats::exl3_storage::Exl3StorageSource>,
     pub hints: Vec<Hint>,
+    /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -274,6 +329,10 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// None preserves each family's qualified decode-view default.
+    pub decode_lanes: Option<u8>,
+    /// Host RAM cap for mapped tables: every table (rows and scales) when all fit,
+    /// else the separate per-row scales when they fit; 0 keeps all mapped.
     pub mapped_scale_preload_bytes: u64,
     /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
     pub mapped_scale_host_budget_bytes: Option<u64>,
@@ -296,6 +355,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            decode_lanes: None,
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
@@ -320,15 +380,17 @@ impl PlanOptions {
         }
     }
 
-    /// Rejects options that describe no deployment: Spark worlds the
-    /// transport does not run (it runs 1 through 6; 0 is the local-only
-    /// placement) and empty budgets.
+    /// Rejects counts outside the shared world ceiling and empty budgets.
+    /// Zero is the local-only placement.
     pub fn validate(&self) -> Result<(), PlanError> {
+        if self.decode_lanes.is_some_and(|lanes| !(1..=2).contains(&lanes)) {
+            return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
+        }
         if let ExpertPlacement::Sparks { ranks } = self.placement {
-            if !experts::TRANSPORT_WORLDS.contains(&ranks) {
+            if !(1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) {
                 return Err(PlanError::InvalidOption {
                     option: "spark ranks",
-                    reason: format!("{ranks}: the expert transport runs 1 through 6 Spark ranks \
+                    reason: format!("{ranks}: the expert transport runs 1 through 8 Spark ranks \
                         (0 places every routed expert on the coordinator)"),
                 });
             }
@@ -346,6 +408,7 @@ impl PlanOptions {
 pub fn mapped_scale_preload_bytes(gib: f64) -> Result<u64, PlanError> {
     if gib == 0.0 { Ok(0) } else { budget_bytes("--mapped-scale-preload-gib", gib) }
 }
+
 
 /// The shared routed-expert weight budget per Spark rank, for families
 /// without their own (`FamilyModel::spark_budget_bytes`).
@@ -410,26 +473,131 @@ fn numerics_deviations(family: &str, modules: &BTreeMap<String, checkpoint::Modu
     } else { Vec::new() }
 }
 
-/// A checkpoint opened once, with the routed-expert catalog parsed from it:
-/// what a plan is built from. Reading every shard header and building the
-/// expert catalog dominate planning and neither changes between layouts, so
-/// a caller that evaluates many plans over one snapshot opens it once and
-/// asks `PlanInput` for each report (`plan_spark_count` walks one per
-/// candidate Spark count; `cuteafd plan --layout` adds more).
+/// Exclusive elapsed phases for one plan, including first-use metadata work.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PlanTimings {
+    pub open: Duration,
+    pub catalog: Duration,
+    pub report: Duration,
+    pub layout: Duration,
+    pub admission: Duration,
+}
+
+impl PlanTimings {
+    pub fn total(self) -> Duration { self.open + self.catalog + self.report + self.layout + self.admission }
+}
+
+#[derive(Default)]
+struct PhaseCounters { catalog: AtomicU64, layout: AtomicU64, admission: AtomicU64 }
+impl PhaseCounters {
+    fn snapshot(&self) -> [u64; 3] {
+        [&self.catalog, &self.layout, &self.admission].map(|counter| counter.load(Ordering::Relaxed))
+    }
+}
+
+struct PhaseTimer<'a> { start: Instant, counter: &'a AtomicU64, nested: Vec<(&'a AtomicU64, u64)> }
+impl<'a> PhaseTimer<'a> {
+    fn new(counter: &'a AtomicU64, nested: &[&'a AtomicU64]) -> Self {
+        Self { start: Instant::now(), counter,
+            nested: nested.iter().map(|counter| (*counter, counter.load(Ordering::Relaxed))).collect() }
+    }
+}
+impl Drop for PhaseTimer<'_> {
+    fn drop(&mut self) {
+        let nested = self.nested.iter().map(|(counter, before)| counter.load(Ordering::Relaxed).saturating_sub(*before)).sum::<u64>();
+        self.counter.fetch_add((self.start.elapsed().as_nanos().min(u64::MAX as u128) as u64).saturating_sub(nested), Ordering::Relaxed);
+    }
+}
+
+/// A checkpoint opened once, with its routed-expert catalog initialized on first use.
+/// Reuse an input when evaluating multiple layouts over the same snapshot and
+/// installed artifact set. Manifest paths are snapshotted on first read; create a
+/// new input after replacing artifacts, including after a WIP slot rebuild.
 pub struct PlanInput {
     checkpoint: Checkpoint,
+    header_validation: Option<Result<(), String>>,
+    open_time: Duration,
+    open_reported: AtomicBool,
+    phases: PhaseCounters,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
+    manifests: ManifestCache,
+    /// Source headers do not change when placement searches worlds or prefill shapes.
+    native_spark_headers: OnceLock<Vec<OnceLock<Result<(), String>>>>,
+    module_numerics: OnceLock<anyhow::Result<BTreeMap<String, checkpoint::ModuleNumerics>>>,
+    modelopt: OnceLock<Result<Option<crate::formats::modelopt::ModelOpt>, crate::formats::modelopt::ModelOptError>>,
+    model: OnceLock<Result<Box<dyn FamilyModel>, ConfigError>>,
+    census: OnceLock<ReportCensus>,
+}
+
+/// Immutable installed artifacts are shared across every candidate of one input.
+#[derive(Default)]
+struct ManifestCache {
+    values: Mutex<BTreeMap<std::path::PathBuf, Result<Arc<serde_json::Value>, String>>>,
+    #[cfg(test)]
+    parses: Mutex<BTreeMap<std::path::PathBuf, usize>>,
+}
+
+impl ManifestCache {
+    fn read(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        use anyhow::Context;
+        let mut values = self.values.lock().expect("plan manifest cache poisoned");
+        match values.entry(path.to_path_buf()).or_insert_with(|| {
+            #[cfg(test)]
+            { *self.parses.lock().unwrap().entry(path.to_path_buf()).or_default() += 1; }
+            (|| -> anyhow::Result<_> {
+                let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+                Ok(Arc::new(serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parse {}", path.display()))?))
+            })().map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(value) => Ok(Arc::clone(value)),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+}
+
+// Only checkpoint facts live here. Ownership, media policy and all admission
+// decisions are resolved again for each candidate over this input.
+struct ReportCensus {
+    components: BTreeMap<Component, ComponentCensus>,
+    unclassified: Vec<String>,
+    mapped_names: usize,
+    scales: usize,
+    scale_bytes: u64,
+    table_bytes: u64,
+    routed_operands: BTreeMap<String, QuantOperand>,
+}
+
+struct ComponentCensus {
+    tensors: usize,
+    groups: usize,
+    source_bytes: u64,
+    formats: BTreeMap<String, usize>,
+    rejected: usize,
+    rejections: Vec<Rejection>,
 }
 
 impl PlanInput {
     pub fn open(snapshot: &Path) -> anyhow::Result<Self> {
-        Ok(Self::from_checkpoint(Checkpoint::open(snapshot)?))
+        let start = Instant::now();
+        let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
+        Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(), manifests: ManifestCache::default(),
+            open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
+            native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
+            modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() })
     }
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
-        Self { checkpoint, catalog: OnceLock::new() }
+        Self { checkpoint, header_validation: None, catalog: OnceLock::new(), manifests: ManifestCache::default(),
+            open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
+            native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
+            modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() }
+    }
+
+    pub(crate) fn manifest(&self, path: &Path) -> anyhow::Result<Arc<serde_json::Value>> {
+        self.manifests.read(path)
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -440,15 +608,108 @@ impl PlanInput {
     /// kept for the lifetime of the input. Families that stage no routed
     /// experts never ask for it, so no read happens for them.
     pub fn expert_catalog(&self) -> anyhow::Result<&crate::OfficialV41Catalog> {
-        match self.catalog.get_or_init(|| crate::read_expert_catalog(&self.checkpoint.snapshot)) {
+        match self.catalog.get_or_init(|| {
+            let _timer = PhaseTimer::new(&self.phases.catalog, &[]);
+            if let Some(validation) = &self.header_validation {
+                crate::families::deepseek_v41::v41_catalog::expert_catalog_from_checkpoint(&self.checkpoint, validation)
+            } else {
+                crate::read_expert_catalog(&self.checkpoint.snapshot)
+            }
+        }) {
             Ok(catalog) => Ok(catalog),
             Err(error) => Err(anyhow::anyhow!("{error:#}")),
         }
     }
 
+    fn native_spark_resident(&self, working: &crate::placement::SparkWorkingSet, rank: usize)
+        -> anyhow::Result<Option<u64>> {
+        use anyhow::Context;
+        let catalog = self.expert_catalog()?;
+        if !spark_executions::SparkBackend::for_catalog(catalog)?.is_native_census()
+            || catalog.nvfp4().is_some() { return Ok(None); }
+        if !working.selected_ranks().contains(&rank) { return Ok(Some(0)); }
+        anyhow::ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "Spark layers must be sorted and unique");
+        let shape = catalog.routed_experts();
+        let headers = self.native_spark_headers.get_or_init(||
+            (0..shape.layers).map(|_| OnceLock::new()).collect());
+        let mut total = 0u64;
+        for &layer in &working.spark_layers {
+            let checked = headers.get(layer).context("Spark layer is outside routed checkpoint headers")?;
+            if let Err(error) = checked.get_or_init(||
+                catalog.validate_native_spark_layer(layer).map_err(|error| format!("{error:#}"))) {
+                anyhow::bail!("{error}");
+            }
+            let shard = crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry::new(
+                shape.intermediate, shape.hidden, layer, working.spark_ranks, rank)?;
+            let logical = shard.intermediate_size();
+            let stored = cuteafd_core::mxfp4_layouts::stored_width(shape.hidden, logical)
+                .context("invalid native MXFP4 resident geometry")?;
+            let bytes = if catalog.mxfp4_scale_codes() {
+                crate::formats::scale_codes::expert_bytes(shape.experts as u64,
+                    shape.hidden as u64, logical as u64).context("coded Spark residency overflow")?
+            } else {
+                crate::placement::families::deepseek_v41::resident_bytes(shape.hidden as u64,
+                    stored as u64, shape.experts as u64, false)?
+            };
+            total = total.checked_add(bytes).context("Spark resident sum overflow")?;
+        }
+        Ok(Some(total))
+    }
+
+    pub(crate) fn family_model(&self) -> Result<&dyn FamilyModel, ConfigError> {
+        let family = family::detect(&self.checkpoint).ok_or_else(|| ConfigError("missing model family".into()))?;
+        match self.model.get_or_init(|| family.open(&self.checkpoint).and_then(|mut model| {
+            model.configure()?;
+            Ok(model)
+        })) {
+            Ok(model) => Ok(model.as_ref()),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
     /// The plan for `options` over this checkpoint.
     pub fn plan(&self, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-        plan_of(self, options)
+        self.plan_with_timings(options).0
+    }
+
+    /// Resolve Spark-count candidates without reopening the CLI's preflight checkpoint.
+    pub fn plan_spark_count(&self, options: &PlanOptions, available: usize,
+        explicit: Option<usize>) -> Result<PlanReport, PlanError> {
+        plan_spark_count_of(self, options, available, explicit)
+    }
+
+    /// Exclusive wall times; first-use checkpoint/catalog work is charged once.
+    pub fn plan_with_timings(&self, options: &PlanOptions) -> (Result<PlanReport, PlanError>, PlanTimings) {
+        self.with_timings(options, || plan_of(self, options))
+    }
+
+    pub fn exlr8_native_plan(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> anyhow::Result<exlr8::NativePlan> {
+        self.exlr8_native_plan_with_timings(selected, options, speculator).0
+    }
+
+    pub fn exlr8_native_plan_with_timings(&self, selected: &str, options: &PlanOptions,
+        speculator: &str) -> (anyhow::Result<exlr8::NativePlan>, PlanTimings) {
+        self.with_timings(options, || exlr8::native_plan_of(self, selected, options, speculator))
+    }
+
+    fn with_timings<T>(&self, options: &PlanOptions, operation: impl FnOnce() -> T) -> (T, PlanTimings) {
+        let before = self.phases.snapshot();
+        let start = Instant::now();
+        let result = operation();
+        let elapsed = start.elapsed();
+        let after = self.phases.snapshot();
+        let [catalog, layout, admission] = std::array::from_fn(|i| Duration::from_nanos(after[i].saturating_sub(before[i])));
+        let timings = PlanTimings {
+            open: if self.open_reported.swap(true, Ordering::Relaxed) { Duration::ZERO } else { self.open_time },
+            catalog, layout, admission, report: elapsed.saturating_sub(catalog + layout + admission),
+        };
+        tracing::info!(snapshot = %self.checkpoint.snapshot.display(), ranks = options.placement.spark_ranks(),
+            open_s = timings.open.as_secs_f64(), catalog_s = timings.catalog.as_secs_f64(),
+            report_s = timings.report.as_secs_f64(), layout_s = timings.layout.as_secs_f64(),
+            admission_s = timings.admission.as_secs_f64(), "planner phase durations");
+        (result, timings)
     }
 }
 
@@ -459,8 +720,34 @@ pub fn plan(snapshot: &Path, options: &PlanOptions) -> Result<PlanReport, PlanEr
 }
 
 fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanReport,
-    options: &layout::LayoutOptions, requested: ExpertPlacement)
+    options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
+    let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
+    let family = report.family.as_deref().unwrap_or("unknown");
+    let concurrency = options.resolved_concurrency(family);
+    if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
+        report.fits = false;
+        report.placement_supported = false;
+        let reason = error.to_string();
+        report.hints.push(Hint { what: reason.clone(), how: "Use a supported boot-time concurrency or add the named program capacity.".into() });
+        return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![reason] });
+    }
+    if options.mimo_prefix_entries == u64::MAX {
+        options.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
+    }
+    if let Some(cache) = report.cache_requirements.as_mut() {
+        cache.concurrency = u32::try_from(concurrency)?;
+        cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
+    }
+    if (options.expert_tier.enabled() || options.expert_tier_profile.is_some()) && family != "deepseek_v41" {
+        report.fits = false;
+        report.placement_supported = false;
+        let what = format!("{family}: --gpu-expert-tier is implemented for deepseek_v41 only");
+        report.hints.push(Hint { what: what.clone(), how: "Build the family's expert tier request \
+            (placement::expert_tier: an admission order over its routed layers) in its layout, as \
+            plan/layout/v41.rs does, before claiming a tier.".into() });
+        return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![what] });
+    }
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();
@@ -495,9 +782,24 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
 }
 
 fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
-    options.validate()?;
+    let mut report = plan_unrestricted(input, options)?;
+    let _timer = PhaseTimer::new(&input.phases.admission, &[&input.phases.catalog, &input.phases.layout]);
+    match spark_range::admit(input, options, &report) {
+        Ok(()) => {},
+        Err(PlanError::SparkRange(refusal)) => {
+            report.placement_supported = false;
+            report.hints.push(Hint { what: refusal.to_string(),
+                how: "Choose a Spark count within the checkpoint's supported range.".into() });
+            report.spark_range_refusal = Some(refusal);
+        },
+        Err(error) => return Err(error),
+    }
+    Ok(report)
+}
+
+pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::Result<PlanReport> {
     let checkpoint = input.checkpoint();
-    let mut report = PlanReport {
+    Ok(PlanReport {
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
         host_ledger: None,
@@ -505,7 +807,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
         vision: options.vision,
-        audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
+        audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
@@ -515,7 +817,10 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         family: None,
         architectures: checkpoint.architectures(),
         quantization: None,
-        module_numerics: checkpoint.declared_module_numerics()?,
+        module_numerics: match input.module_numerics.get_or_init(|| checkpoint.declared_module_numerics()) {
+            Ok(numerics) => numerics.clone(),
+            Err(error) => return Err(anyhow::anyhow!("{error:#}")),
+        },
         precision_optimizations: Vec::new(),
         numerics_deviations: Vec::new(),
         runtime: None,
@@ -532,9 +837,15 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         placement: options.placement,
         spark_ranks: options.placement.spark_ranks(),
         spark_count_warning: None,
-        prefill_rows: None,
-        prefill_lanes: None,
-        prefill_selection: None,
+        spark_range_refusal: None,
+        prefill_span_rows: None,
+        prefill_unit_rows: None,
+        prefill_waves: None,
+        onboard_layers: None,
+        max_pool_tokens_no_onboard: None,
+        decode_lanes: 1,
+        prefill_transports: None,
+        prefill_reserve_rows: None,
         experts: None,
         placement_supported: true,
         min_spark_ranks: None,
@@ -543,13 +854,102 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         launch: launch::describe(&checkpoint.config).ok(),
         expert_storage: None,
         hints: Vec::new(),
+        exlr8_prefill_activations: None,
         memory_layout: None,
         solver_placement: None,
-    };
+    })
+}
+
+fn report_census(checkpoint: &Checkpoint, family: &dyn Family, model: &dyn FamilyModel,
+    modelopt: Option<&crate::formats::modelopt::ModelOpt>) -> ReportCensus {
+    let spec = model.spec();
+    let mut unclassified = Vec::new();
+    // Classify every tensor, then group each component's tensors by stem: one
+    // operand per logical weight, checked against the family's contract.
+    let mut by_component: BTreeMap<Component, Vec<&checkpoint::CheckpointTensor>> = BTreeMap::new();
+    let mut roles: std::collections::HashMap<&str, TensorRole> = std::collections::HashMap::new();
+    for tensor in &checkpoint.tensors {
+        match family.classify(spec, &tensor.meta.name) {
+            Some(role) => {
+                roles.insert(format::split_stem(&tensor.meta.name).0, role.clone());
+                by_component.entry(role.component).or_default().push(tensor);
+            }
+            None => unclassified.push(tensor.meta.name.clone()),
+        }
+    }
+    // Count logical random-read tensors, not storage shards or global scalars.
+    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
+    let mut names = BTreeSet::new();
+    let mut scales = 0;
+    let mut scale_bytes = 0;
+    let mut table_bytes = 0;
+    for tensor in mapped {
+        let meta = &tensor.meta;
+        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
+        let (stem, suffix) = format::split_stem(&meta.name);
+        let suffix = if suffix.starts_with("strided_") { "strided" } else { suffix };
+        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv" | "strided") { continue }
+        // Qwen splits one row space into shard_N tensors.
+        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
+        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
+            scales += 1;
+        }
+        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
+        table_bytes += meta.byte_length;
+    }
+    // Rows join the scales only where the runtime preloads every table.
+    let table_bytes = if model.mapped_table_preload() { table_bytes } else { 0 };
+    let mut components = BTreeMap::new();
+    // Routed-expert operands by label, for the placement contract.
+    let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
+    for (component, tensors) in &by_component {
+        let groups = format::group_tensor_refs(tensors.iter().copied());
+        let mut formats: BTreeMap<String, usize> = BTreeMap::new();
+        let mut rejected = 0usize;
+        let mut rejections = Vec::new();
+        for (stem, members) in &groups {
+            let role = roles.get(stem.as_str()).cloned().unwrap_or_else(|| TensorRole::new(*component));
+            let verdict = match format::detect(members) {
+                Ok(mut operand) => {
+                    let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
+                    let accepted = declared.and_then(|()| model.accepts(&role, stem, &mut operand));
+                    *formats.entry(operand.label()).or_default() += 1;
+                    if accepted.is_ok() && *component == Component::RoutedExpert {
+                        routed_operands.entry(operand.label()).or_insert(operand);
+                    }
+                    accepted.map_err(|reason| Rejection { tensor: stem.clone(), reason })
+                }
+                Err(malformed) => {
+                    *formats.entry("malformed".into()).or_default() += 1;
+                    Err(Rejection { tensor: malformed.tensor, reason: malformed.reason })
+                }
+            };
+            if let Err(rejection) = verdict {
+                rejected += 1;
+                if rejections.len() < REJECTIONS_KEPT {
+                    rejections.push(rejection);
+                }
+            }
+        }
+        components.insert(*component, ComponentCensus {
+            tensors: tensors.len(), groups: groups.len(),
+            source_bytes: tensors.iter().map(|tensor| tensor.meta.byte_length).sum(),
+            formats, rejected, rejections,
+        });
+    }
+    ReportCensus { components, unclassified, mapped_names: names.len(), scales,
+        scale_bytes, table_bytes, routed_operands }
+}
+
+fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
+    options.validate()?;
+    let checkpoint = input.checkpoint();
+    let mut report = empty_report(input, options)?;
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
-    let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {
-        Ok(modelopt) => modelopt,
+    let modelopt = match input.modelopt.get_or_init(||
+        crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config)) {
+        Ok(modelopt) => modelopt.as_ref(),
         Err(error) => {
             report.hints.push(Hint {
                 what: format!("unreadable quantization metadata: {error}"),
@@ -581,6 +981,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
+        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
@@ -590,6 +992,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         match executor.check_attention(options.attention_placement, gpus, peer) {
             Ok(mode) => report.attention_placement = mode,
             Err(error) => {
+                report.fits = false;
+                report.placement_supported = false;
                 report.config_error = Some(error.to_string());
                 report.hints.push(Hint { what: error.to_string(),
                     how: format!("Implement the {} attention executor before enabling this placement; use --attention-placement heads today.", family.id()) });
@@ -600,8 +1004,14 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     if family.id() == "qwen4" && checkpoint.config.get("vision_config").is_some() {
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
+    // Mistral Large 4: its processor's span cap (merged rows plus one marker row each),
+    // which the coordinator's preparer and every Spark replica's tower are built to.
+    if family.id() == "mistral_large4" && checkpoint.config.get("vision_config").is_some() {
+        report.max_image_tokens = crate::media::ProcessorConfig::from_snapshot(&checkpoint.snapshot,
+            crate::media::ImageFamily::Mistral).ok().map(|config| config.max_image_tokens);
+    }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint) {
+    let model = match input.family_model() {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {
@@ -610,7 +1020,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
                     (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
                     family.id(), family.id()),
             });
-            report.config_error.get_or_insert(error.0);
+            report.config_error.get_or_insert_with(|| error.0.clone());
             return Ok(report);
         }
     };
@@ -618,6 +1028,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
     let mut resolved = options.clone();
+    if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
     resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
     let options = &resolved;
@@ -659,7 +1070,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             .filter(|shard| !needed.contains(*shard)).cloned().collect();
         report.missing_shards.retain(|shard| needed.contains(shard));
     }
-    match crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config) {
+    match crate::serving_capacity::cache_requirements(model, &checkpoint.config) {
         Ok(requirements) => report.cache_requirements = requirements,
         Err(error) => report.hints.push(Hint {
             what: format!("cache capacity cannot be described: {error}"),
@@ -668,82 +1079,29 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         }),
     }
 
-    // Classify every tensor, then group each component's tensors by stem: one
-    // operand per logical weight, checked against the family's contract.
-    let mut by_component: BTreeMap<Component, Vec<checkpoint::CheckpointTensor>> = BTreeMap::new();
-    let mut roles: BTreeMap<String, TensorRole> = BTreeMap::new();
-    for tensor in &checkpoint.tensors {
-        match family.classify(spec, &tensor.meta.name) {
-            Some(role) => {
-                roles.insert(format::split_stem(&tensor.meta.name).0.to_owned(), role.clone());
-                by_component.entry(role.component).or_default().push(tensor.clone());
-            }
-            None => report.unclassified.push(tensor.meta.name.clone()),
-        }
-    }
-    // Count logical random-read tensors, not storage shards or global scalars.
-    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
-    let mut names = BTreeSet::new();
-    let mut scales = 0;
-    let mut scale_bytes = 0;
-    for tensor in mapped {
-        let meta = &tensor.meta;
-        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
-        let (stem, suffix) = format::split_stem(&meta.name);
-        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv") { continue }
-        // Qwen splits one row space into shard_N tensors.
-        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
-        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
-            scales += 1;
-        }
-        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
-    }
-    let host_budget = if scales == 0 { 0 } else {
+    let census = input.census.get_or_init(|| report_census(checkpoint, family, model, modelopt));
+    report.unclassified = census.unclassified.clone();
+    let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
+    let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
         options.mapped_scale_host_budget_bytes.unwrap_or_else(||
             crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
     };
     report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget);
+        mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget)
+        .admit_tables(table_bytes);
     if report.mapped_placement.preloaded_bytes > 0 {
         report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
     }
     // The expert staging's own verdict on the routed experts.
-    let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
+    let catalog = (family.expert_catalog() && census.components.contains_key(&Component::RoutedExpert))
         .then(|| input.expert_catalog());
     report.expert_storage = catalog.as_ref().and_then(|catalog| catalog.as_ref().ok()?.exl3().map(|m| m.storage));
     let catalog_error = catalog.and_then(Result::err).map(|error| format!("{error:#}"));
     let mut hinted = BTreeSet::new();
-    // Routed-expert operands by label, for the placement contract.
-    let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
-    for (component, tensors) in &by_component {
-        let groups = format::group_by_stem(tensors);
-        let mut formats: BTreeMap<String, usize> = BTreeMap::new();
-        let mut rejected = 0usize;
-        let mut rejections = Vec::new();
-        for (stem, members) in &groups {
-            let role = roles.get(stem).cloned().unwrap_or_else(|| TensorRole::new(*component));
-            let verdict = match format::detect(members) {
-                Ok(mut operand) => {
-                    let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
-                    let accepted = declared.and_then(|()| model.accepts(&role, stem, &mut operand));
-                    *formats.entry(operand.label()).or_default() += 1;
-                    if accepted.is_ok() && *component == Component::RoutedExpert {
-                        routed_operands.entry(operand.label()).or_insert(operand);
-                    }
-                    accepted.map_err(|reason| Rejection { tensor: stem.clone(), reason })
-                }
-                Err(malformed) => {
-                    *formats.entry("malformed".into()).or_default() += 1;
-                    Err(Rejection { tensor: malformed.tensor, reason: malformed.reason })
-                }
-            };
-            if let Err(rejection) = verdict {
-                rejected += 1;
-                if rejections.len() < REJECTIONS_KEPT {
-                    rejections.push(rejection);
-                }
-            }
-        }
+    for (component, facts) in &census.components {
+        let mut rejected = facts.rejected;
+        let mut rejections = facts.rejections.clone();
+        let formats = &facts.formats;
         if let (Component::RoutedExpert, Some(error)) = (component, &catalog_error) {
             rejected += 1;
             rejections.insert(0, Rejection { tensor: "routed experts (read_expert_catalog)".into(), reason: error.clone() });
@@ -762,7 +1120,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
             if let Some(first) = rejections.first() {
                 report.hints.push(Hint {
                     what: format!("{}: {rejected} of {} weights not executable, e.g. {}: {}", component.label(),
-                        groups.len(), first.tensor, first.reason),
+                        facts.groups, first.tensor, first.reason),
                     how: "The family's tensor contract (plan/families/) mirrors its loaders; a new format needs \
                         the loader staging and kernels first, then the contract."
                         .into(),
@@ -775,7 +1133,7 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
                 }
             }
         }
-        let source_bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
+        let source_bytes = facts.source_bytes;
         if disabled && matches!(component, Component::Vision | Component::Audio) {
             report.disabled_media_bytes += source_bytes;
         }
@@ -784,20 +1142,42 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         report.components.push(ComponentPlan {
             component: *component,
             owner,
-            tensors: tensors.len(),
+            tensors: facts.tensors,
             bytes,
-            formats,
+            formats: formats.clone(),
             status,
             rejected,
             rejections,
         });
     }
-    place(&mut report, options, spec, model.as_ref(), &routed_operands);
+    place(&mut report, options, spec, model, &census.routed_operands);
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
-        let memory = family_layout(model.as_ref(), input, &mut report, &layout_options, options.placement)?;
+        let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;
+        report.prefill_unit_rows = layout_options.prefill_unit_rows;
+        report.prefill_waves = Some(layout_options.prefill_waves);
+        if family.id() == "deepseek_v41" && !memory.devices.is_empty() {
+            let shape = (|| -> anyhow::Result<crate::EngramStagingShape> {
+                use anyhow::Context;
+                Ok(crate::EngramStagingShape::new(
+                    usize::try_from(layout_options.prefill_unit_rows.context("V4.1 prefill unit missing")?)?,
+                    usize::try_from(layout_options.prefill_waves)?)?)
+            })()?;
+            report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
+                mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes,
+                shape.preload_budget(host_budget, layout::engram_row_bytes(input.checkpoint())?)).admit_tables(table_bytes);
+            report.bytes_by_owner.remove("host-preloaded");
+            if report.mapped_placement.preloaded_bytes > 0 {
+                report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
+            }
+            layout::mapped_table_note(&report, &mut memory.notes);
+        }
+        if let Some(placement) = &report.solver_placement {
+            report.onboard_layers = Some(placement.onboard_layers);
+            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+        }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -816,8 +1196,9 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
                 });
             }
         }
+        let refused = !report.placement_supported && memory.devices.is_empty();
         report.memory_layout = Some(memory);
-        layout::charge_host(&mut report, &layout_options, checkpoint, false)?;
+        if !refused { layout::charge_host(&mut report, &layout_options, input, false)?; }
     }
     if !report.unclassified.is_empty() {
         report.hints.push(Hint {
@@ -838,11 +1219,13 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     }
     if options.layout.is_none() {
         // A tensor-only inventory does not request an external speculation checkpoint.
-        let inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
+        let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
-        let _ = family_layout(model.as_ref(), input, &mut report, &inventory, options.placement)?;
+        let _ = family_layout(model, input, &mut report, &mut inventory, options.placement)?;
+        report.prefill_unit_rows = inventory.prefill_unit_rows;
+        report.prefill_waves = Some(inventory.prefill_waves);
     }
     if let Some(encoder) = &report.encoder {
         let owner = match &encoder.kind {
@@ -863,9 +1246,31 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
     use sha2::{Digest, Sha256};
+    let selected_tower = |name: &str| family.classify(spec, name).is_some_and(|r|
+        matches!(r.component, Component::Vision | Component::Audio));
+    // A coordinator's role view omits remote towers. Hash the selected headers
+    // from their own shards too, independently of which rank owns the encoder.
+    let present: std::collections::BTreeSet<_> = checkpoint.tensors.iter().map(|t| &t.meta.name).collect();
+    let mut additional = Vec::new();
+    let shards: BTreeSet<_> = checkpoint.weight_map.iter()
+        .filter(|(name, shard)| selected_tower(name) && !present.contains(name)
+            && !checkpoint.missing_shards.contains(shard))
+        .map(|(_, shard)| shard).collect();
+    // Reuse the opened inventory: re-reading config/index breaks preflight
+    // reuse and loses synthetic or partial-checkpoint facts.
+    for shard in shards {
+        for meta in crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))? {
+            if selected_tower(&meta.name) && !present.contains(&meta.name) {
+                if checkpoint.weight_map.get(&meta.name) != Some(shard) {
+                    return Err(anyhow::anyhow!("media tensor {} appears in unexpected shard {shard}", meta.name).into());
+                }
+                additional.push(checkpoint::CheckpointTensor { shard: shard.clone(), meta });
+            }
+        }
+    }
     let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
-            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
+        .chain(&additional)
+        .filter(|t| selected_tower(&t.meta.name))
         .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
     // Preserve the vision-only peer contract exactly while audio is disabled.
     let contract = if report.audio == MediaMode::Off {
@@ -945,12 +1350,26 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
-            // New generic counts require nonempty H128 ownership; a 16-row
-            // NVFP4 fallback remains valid only for previously calibrated layouts.
-            if matches!(ranks, 1 | 5) && (i % 128 != 0 || i / 128 < ranks) {
-                return None;
+            let recipe = match experts::spark_recipe(&contract.package, i, ranks) {
+                Ok(recipe) => recipe,
+                Err(_) => return experts::stored_slice(i, contract.block, ranks)
+                    .map(|slice| slice as f64 / i as f64),
+            };
+            if !recipe.native_artifacts.is_empty() {
+                let hidden = spec.hidden as u64;
+                let source = hidden * i as u64 * 51 / 32;
+                let widest = recipe.native_artifacts.iter().filter_map(|artifact| {
+                    if contract.package.starts_with("v41:") {
+                        crate::formats::scale_codes::expert_bytes(1, hidden, artifact.logical as u64)
+                    } else {
+                        crate::placement::families::deepseek_v41::resident_bytes(hidden,
+                            artifact.stored as u64, 1, false).ok()
+                    }
+                }).max()?;
+                Some(widest as f64 / source as f64)
+            } else {
+                recipe.stored_widths.iter().max().map(|&slice| slice as f64 / i as f64)
             }
-            experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));
@@ -962,35 +1381,44 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
-                if share(ranks).is_none() {
+                if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
+                    // Frozen formats admit only the worlds they shipped on, for every family.
+                    report.placement_supported = false;
+                    report.fits = false;
+                    report.hints.push(Hint {
+                        what: worlds.to_string(),
+                        how: format!("{advice}; choose a supported quantization for other Spark counts."),
+                    });
+                } else if share(ranks).is_none() {
                     report.placement_supported = false;
                     report.fits = false;
                     report.hints.push(Hint {
                         what: format!("geometry-invalid: {} intermediate {} cannot give each of {ranks} Spark ranks a nonempty whole-{} row slice",
-                            contract.package, intermediate.unwrap_or(0), if matches!(ranks, 1 | 5) { 128 } else { contract.block }),
+                            contract.package, intermediate.unwrap_or(0), contract.block),
                         how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
-                    });
-                } else if !contract.spark_worlds.contains(&ranks) {
-                    report.placement_supported = false;
-                    report.hints.push(Hint {
-                        what: format!("no {} layout for {ranks} Spark ranks (this build packages {:?}{})",
-                            contract.package, contract.spark_worlds,
-                            intermediate.map_or(String::new(), |i| format!(", intermediate {i} in {}-row blocks", contract.block))),
-                        how: match share(ranks) {
-                            Some(_) => format!("{advice}, or build a tp{ranks} layout (python/tools/aot/\
-                                package_fp8_moe_aot.py --layouts / package_exl3_aot.py)."),
-                            None => format!("{advice}: {ranks} ranks cannot each own whole {}-row blocks.",
-                                contract.block),
-                        },
                     });
                 } else if !fits_on(ranks) {
                     report.fits = false;
+                    report.placement_supported &= contract.spark_worlds.contains(&ranks);
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
                             {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
                             gib(options.spark_budget() as f64)),
                         how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
                             the experts further (EXL3 K2-K3)."),
+                    });
+                } else if !contract.spark_worlds.contains(&ranks) {
+                    report.placement_supported = false;
+                    let refusal = intermediate.and_then(|i| experts::spark_recipe(&contract.package, i, ranks).err());
+                    report.hints.push(Hint {
+                        what: refusal.as_ref().map(ToString::to_string).unwrap_or_else(||
+                            format!("no {} layout for {ranks} Spark ranks (this build packages {:?})",
+                                contract.package, contract.spark_worlds)),
+                        how: if matches!(refusal, Some(experts::SparkRecipeRefusal::Deprecated { .. })) {
+                            format!("{advice}; choose a supported quantization for other Spark counts.")
+                        } else {
+                            format!("{advice}; add the native geometry or width-class export named by the refusal.")
+                        },
                     });
                 }
             }
@@ -1034,6 +1462,20 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
     report.experts = contract;
 }
 
+/// Descending reserve candidates; a failed smallest candidate ends admission.
+fn largest_fitting_prefill<T>(candidates: &[u64], mut admit: impl FnMut(u64)
+    -> Result<Option<T>, PlanError>) -> Result<Option<T>, PlanError> {
+    let Some(&full) = candidates.first() else { return Ok(None); };
+    if let Some(result) = admit(full)? { return Ok(Some(result)); }
+    let Some(mut best) = admit(*candidates.last().unwrap())? else { return Ok(None); };
+    let (mut lo, mut hi) = (candidates.len() - 1, 0);
+    while lo - hi > 1 {
+        let mid = (lo + hi) / 2;
+        if let Some(result) = admit(candidates[mid])? { lo = mid; best = result; } else { hi = mid; }
+    }
+    Ok(Some(best))
+}
+
 /// Plan an exact count, or the widest feasible count in the available inventory.
 /// Count policy never depends on card size; each candidate uses the same admission.
 pub fn plan_spark_count(snapshot: &Path, options: &PlanOptions, available: usize,
@@ -1056,39 +1498,65 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             placement: ExpertPlacement::from_spark_ranks(ranks), ..options.clone()
         };
         let mut report = input.plan(&candidate)?;
-        if report.family.as_deref() != Some("deepseek_v41") || candidate.layout.is_none() {
+        if ranks == 0 || candidate.layout.is_none() {
             return Ok(report);
         }
-        let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_rows = Some(if rows == 0 { 2048 } else { rows });
-        if rows != 0 {
-            if !report.executable() {
+        // The prefill reserve is sized first (TJ 2026-10-27): the largest
+        // standard reserve that fits the card, split into k units; the KV
+        // pool takes what remains and never shrinks the reserve. Explicit
+        // PREFILL_ROWS / PREFILL_WAVES pin the shape.
+        let layout = candidate.layout.as_ref().unwrap();
+        // An explicit reserve (a resolved deployment's, or a pin) plans at it.
+        if let Some(reserve) = layout.prefill_reserve_rows {
+            report.prefill_reserve_rows = Some(reserve);
+            return Ok(report);
+        }
+        // An explicit shape (PREFILL_ROWS, or a depth: PREFILL_WAVES pins even
+        // without rows) plans exactly as given, ahead of every automatic rule.
+        if layout.prefill_rows != 0 || layout.prefill_unit_rows.is_some()
+            || layout.prefill_waves > 1 || layout.prefill_lanes > 0 {
+            if !report.wip_launchable() {
+                let (rows, waves) = (report.prefill_unit_rows.unwrap_or(0), report.prefill_waves.unwrap_or(0));
                 report.hints.push(Hint {
-                    what: format!("explicit V4.1 prefill capacity {rows} refused by checkpoint or memory admission"),
-                    how: "Keep the requested shape with more memory, or omit prefill rows for automatic admission.".into(),
+                    what: format!("explicit prefill shape {waves} x {rows} rows refused by checkpoint or memory admission"),
+                    how: "Keep the requested shape with more memory, or omit PREFILL_ROWS for the automatic reserve.".into(),
                 });
             }
             return Ok(report);
         }
-        // Count candidates each solve their largest executable default shape.
-        let reason = report.hints.iter().map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; ");
-        if !report.executable() {
-            for rows in [1024, 256] {
-                let layout = candidate.layout.as_mut().unwrap();
-                layout.prefill_rows = rows;
-                layout.spark_capacity_rows = rows;
-                let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_rows = Some(rows);
-                if smaller.executable() {
-                    smaller.prefill_selection = Some(format!(
-                        "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));
-                    return Ok(smaller);
-                }
-            }
-        } else {
-            report.prefill_selection = Some("V4.1 automatic prefill selected 2048 rows".into());
-        }
-        Ok(report)
+        // The reserve rule: the standard 8192 rows, capped only when the card
+        // cannot fit it beside its fixed owners (the largest page-multiple
+        // reserve that fits; fit is monotone in the reserve, so a bisection
+        // finds it). It is never shrunk to buy onboarded layers or KV (TJ
+        // 2026-10-28). The fixed depth cuts it: 3 x roundup64(reserve / 3).
+        use crate::serving_capacity::prefill_waves::{unit_rows_in, RESERVE_ROWS, ROW_PAGE};
+        let mut at = |reserve: u64| -> Result<PlanReport, PlanError> {
+            let mut report = if reserve == RESERVE_ROWS { report.clone() } else {
+                candidate.layout.as_mut().unwrap().prefill_reserve_rows = Some(reserve);
+                input.plan(&candidate)?
+            };
+            report.prefill_reserve_rows = Some(reserve);
+            Ok(report)
+        };
+        let limits = family::registry().iter().find(|family| Some(family.id()) == report.family.as_deref())
+            .map(|family| family.prefill_limits()).unwrap_or_default();
+        let waves = report.prefill_waves.unwrap_or(crate::serving_capacity::prefill_waves::DEPTH);
+        let candidates: Vec<u64> = (1..=RESERVE_ROWS / ROW_PAGE).rev().map(|n| n * ROW_PAGE)
+            .filter(|&reserve| unit_rows_in(waves, reserve) >= limits.min_unit_rows)
+            .collect();
+        if let Some(best) = largest_fitting_prefill(&candidates, |reserve| {
+            let report = at(reserve)?;
+            // Reserve admission must accept native WIP runtimes just like
+            // the Spark-count selector; release readiness is a separate gate.
+            Ok(report.wip_launchable().then_some(report))
+        })? { return Ok(best); }
+        let mut refused = at(RESERVE_ROWS)?;
+        refused.hints.push(Hint {
+            what: format!("prefill reserve does not fit beside its fixed owners at any reserve down to {} rows (from {waves} x {})",
+                candidates.last().unwrap(), unit_rows_in(waves, *candidates.last().unwrap())),
+            how: "Add coordinator memory, or pin a smaller shape explicitly with PREFILL_ROWS / PREFILL_WAVES.".into(),
+        });
+        Ok(refused)
     };
     let mut requested = candidate(count)?;
     if count > available {
@@ -1135,6 +1603,22 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
+    match report.family.as_deref() {
+        Some("deepseek_v41") => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
+            let reserve = report.prefill_reserve_rows.map_or("pinned".into(), |rows| format!("{rows}-row"));
+            let _ = writeln!(out, "prefill shape: {reserve} reserve, {waves} waves x {unit} unit rows; {} Spark transport(s)",
+                report.prefill_transports.unwrap_or(0));
+        },
+        Some("mimo_v2") => {
+            let _ = writeln!(out, "prefill shape: family executor (shared units pending #671 / #709)");
+        }
+        _ => if let (Some(unit), Some(waves)) = (report.prefill_unit_rows, report.prefill_waves) {
+            let _ = writeln!(out, "prefill shape: {waves} waves x {unit} unit rows; intake {} rows; {} Spark transport(s)",
+                report.prefill_span_rows.unwrap_or(unit * waves),
+                report.prefill_transports.unwrap_or(0));
+        },
+    }
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
@@ -1147,8 +1631,11 @@ pub fn render(report: &PlanReport) -> String {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
     }
+    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+        let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
+    }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
-    if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }
     if report.disabled_media_bytes > 0 { out.push_str(&format!("media disabled: {} bytes saved\n", report.disabled_media_bytes)); }
     if let Some(cap) = report.max_image_tokens {
         let _ = writeln!(out, "image cap  {cap} merged tokens per image (detail=low 256); BF16 residual");
@@ -1158,6 +1645,8 @@ pub fn render(report: &PlanReport) -> String {
         let attention = match report.family.as_deref() {
             Some("qwen4") => "Qwen full-image head72 attention",
             Some("glm5_flash") => "GLM Flash full-image head64 attention",
+            Some("muse_spark") => "Muse axial/window attention",
+            Some("mistral_large4") => "Pixtral full-image head128 attention",
             _ => "MiMo key-0 attention",
         };
         let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} ({attention}); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);
@@ -1170,6 +1659,12 @@ pub fn render(report: &PlanReport) -> String {
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
+    if let Some(activations) = report.exlr8_prefill_activations {
+        let _ = writeln!(out, "exlr8      prefill activations {activations}{}", match activations {
+            exlr8::PrefillActivations::A16 => " (BF16)",
+            exlr8::PrefillActivations::A8 => " (MXFP8 lane records charged)",
+        });
+    }
     if let Some(quantization) = &report.quantization {
         let _ = writeln!(out, "quant      {quantization}");
     }

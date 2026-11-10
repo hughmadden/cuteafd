@@ -268,7 +268,7 @@ mod tests {
     use crate::report::{RunStatus, ServerInfo, SCHEMA};
 
     fn report(id: &str, fingerprint: &str, created: &str) -> Report {
-        Report { schema: SCHEMA.into(), id: id.into(), created: created.into(), finished: None,
+        Report { schema: SCHEMA.into(), prompt_content: Some(crate::text::PROMPT_CONTENT.into()), id: id.into(), created: created.into(), finished: None,
             status: RunStatus::Done, profile: "share".into(), plan: vec![],
             server: ServerInfo { model: "m".into(), ..ServerInfo::default() }, fingerprint: fingerprint.into(),
             baseline: None, panels: vec![], fabric: vec![], error: None }

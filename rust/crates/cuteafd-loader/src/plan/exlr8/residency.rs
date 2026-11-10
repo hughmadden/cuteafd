@@ -1,7 +1,7 @@
-//! Checkpoint-native, unit-major EXLR8 residency and verified range reads.
+//! Checkpoint-native, unit-major EXLR8 residency and bounded range reads.
 //! Arena offsets are independent of a CUDA address; the owner binds them only
 //! after exact weight/workspace admission and retains the arena for graph life.
-use super::{Header, Layer, manifest, number, owner};
+use super::{Header, Layer, number, owner};
 use crate::plan::checkpoint::read_json;
 use anyhow::{Context, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -11,6 +11,181 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, ResidencyError>;
+
+fn number_string(metadata: &serde_json::Value, key: &str) -> anyhow::Result<usize> {
+    metadata[key].as_str().with_context(|| format!("EXLR8 slice {key} missing"))?
+        .parse().with_context(|| format!("EXLR8 slice {key} invalid"))
+}
+
+#[derive(serde::Deserialize)]
+struct SelectedManifest {
+    format: String,
+    name: String,
+    #[serde(rename = "version")]
+    _version: String,
+    set_id: String,
+    layers: BTreeMap<String, SelectedLayer>,
+}
+#[derive(serde::Deserialize)]
+struct SelectedLayer {
+    gate: Vec<Vec<usize>>,
+    up: Vec<Vec<usize>>,
+    down: Vec<usize>,
+    shared: SelectedShared,
+}
+#[derive(serde::Deserialize)]
+struct SelectedShared { gate: Vec<usize>, up: Vec<usize>, down: usize }
+
+/// One invocation's immutable native metadata; payload/header checks still run per arena.
+pub struct MetadataInput {
+    snapshot: PathBuf,
+    selected: String,
+    pub(super) config: serde_json::Value,
+    manifest: SelectedManifest,
+    pub(crate) identity: String,
+}
+impl MetadataInput {
+    pub fn open(snapshot: &Path, selected: &str) -> anyhow::Result<Self> {
+        use sha2::{Digest, Sha256};
+        ensure!(!selected.is_empty() && selected.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+            "manifest must be a published name, not a path");
+        let mut bytes = Vec::new();
+        File::open(snapshot.join(format!("manifests/exlr8-manifest-{selected}.json")))?
+            .take((64 << 20) + 1).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 64 << 20, "oversized EXLR8 manifest");
+        let manifest: SelectedManifest = serde_json::from_slice(&bytes)?;
+        ensure!(manifest.format == "exlr8-v2-manifest" && manifest.name == selected,
+            "invalid EXLR8 manifest identity");
+        ensure!(manifest.set_id.len() == 64 && manifest.set_id.bytes().all(|c| c.is_ascii_hexdigit()),
+            "invalid EXLR8 set_id");
+        Ok(Self { snapshot: snapshot.into(), selected: selected.into(), config: read_json(&snapshot.join("config.json"))?,
+            manifest, identity: format!("{:x}", Sha256::digest(&bytes)) })
+    }
+
+    pub fn plan(&self, layer: usize, world: usize, rank: usize, set: ExpertSet) -> Result<Residency> {
+        Residency::plan_inner(self, layer, world, rank, set).map_err(Into::into)
+    }
+
+    /// Cross-check optional published rank slices against canonical residency.
+    /// Slices never supply runtime ownership or become a loading prerequisite.
+    pub fn cross_check_index_slices(&self) -> anyhow::Result<usize> {
+        let mut checked = 0;
+        for world in 1..=8 {
+            let directory = self.snapshot.join(format!("index-slices/tp{world}/{}", self.selected));
+            if !directory.exists() { continue; }
+            for rank in 0..world {
+                let path = directory.join(format!("rank{rank}.safetensors"));
+                if !path.exists() { continue; }
+                self.cross_check_index_slice(&path, world, rank)?;
+                checked += 1;
+            }
+        }
+        Ok(checked)
+    }
+
+    fn cross_check_index_slice(&self, path: &Path, world: usize, rank: usize) -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+        let slice = Header::open(path)?;
+        let metadata = &slice.value["__metadata__"];
+        ensure!(metadata["format"] == "exlr8-v2-index-slice" && metadata["version"] == "1"
+            && number_string(metadata, "tp")? == world && number_string(metadata, "rank")? == rank
+            && metadata["set_id"] == self.manifest.set_id, "EXLR8 slice identity mismatch");
+        let bits = number_string(metadata, "k")?;
+        ensure!((2..=4).contains(&bits), "EXLR8 slice width unsupported");
+        let config = self.config.get("text_config").unwrap_or(&self.config);
+        let hidden = number(config, "hidden_size")?;
+        let experts = number(config, "n_routed_experts")?;
+        let units = number(config, "moe_intermediate_size")? / 128;
+        ensure!(number_string(metadata, "hidden_size")? == hidden
+            && number_string(metadata, "n_routed_experts")? == experts
+            && number_string(metadata, "half_bytes")? == hidden * 16 * bits,
+            "EXLR8 slice geometry mismatch");
+        let layers = metadata["layers"].as_str().context("EXLR8 slice layers missing")?
+            .split(',').map(|layer| layer.parse::<usize>().context("EXLR8 slice layer invalid"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let first = number(config, "first_k_dense_replace")?;
+        let end = number(config, "num_hidden_layers")?.checked_add(config.get("num_nextn_predict_layers")
+            .map(|_| number(config, "num_nextn_predict_layers")).transpose()?.unwrap_or(0))
+            .context("EXLR8 slice layer overflow")?;
+        ensure!(layers.iter().copied().eq(first..end), "EXLR8 slice layer extent mismatch");
+        let hashes: BTreeMap<String, String> = serde_json::from_str(metadata["index_sha256"]
+            .as_str().context("EXLR8 slice index hashes missing")?)?;
+        ensure!(hashes.len() == layers.len(), "EXLR8 slice index hash extent mismatch");
+        for layer in layers {
+            let canonical_path = self.snapshot.join(format!("experts/exlr8-layer-{layer:03}.index.safetensors"));
+            let canonical = Header::open(&canonical_path)?;
+            let hash = format!("{:x}", Sha256::digest(std::fs::read(&canonical_path)?));
+            ensure!(hashes.get(&layer.to_string()) == Some(&hash), "EXLR8 slice index hash mismatch");
+            let count = (0..=experts).map(|expert| (0..units)
+                .filter(|&unit| owner(units, expert, unit, layer, world) == rank).count()).sum::<usize>();
+            let root = format!("L{layer:03}");
+            let read = |suffix: &str, dtype: &str, shape: &[usize], bytes: usize| -> anyhow::Result<Vec<u8>> {
+                let source = range(&slice, path, &format!("{root}.{suffix}"), dtype, shape, 0, bytes)?;
+                let mut out = vec![0; bytes]; source.read(&mut out)?; Ok(out)
+            };
+            let owned = read("units", "I16", &[count, 2], count * 4)?;
+            let offsets = read("offset", "I64", &[count, 3], count * 24)?;
+            let checksums = read("checksum", "U64", &[count, 3], count * 24)?;
+            let channels = read("chan", "F16", &[count, 3, 128], count * 3 * 256)?;
+            let blocks = read("block", "F16", &[experts + 1, 3, hidden / 128], (experts + 1) * 3 * hidden / 128 * 2)?;
+            let signs = read("signs", "I8", &[2, hidden], hidden * 2)?;
+            let mut ordinal = 0;
+            for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                let plan = self.plan(layer, world, rank, set)?;
+                let prefix = if set == ExpertSet::Shared { "shared." } else { "" };
+                let expected_checksums = canonical.read(&canonical_path, &format!("{prefix}k{bits}.checksum"))?;
+                ensure!(signs == plan.signs.concat(), "EXLR8 slice signs mismatch");
+                for group in plan.loads.chunks_exact(3) {
+                    let expert = if set == ExpertSet::Shared { experts } else { group[0].expert };
+                    ensure!(owned[ordinal * 4..ordinal * 4 + 2] == (expert as i16).to_le_bytes()
+                        && owned[ordinal * 4 + 2..ordinal * 4 + 4] == (group[0].unit as i16).to_le_bytes(),
+                        "EXLR8 slice ownership mismatch");
+                    for load in group {
+                        ensure!(load.bits == bits as i32, "EXLR8 slice disagrees with selected manifest width");
+                        let slot = ordinal * 3 + load.projection;
+                        ensure!(offsets[slot * 8..slot * 8 + 8] == load.source[0].offset.to_le_bytes(),
+                            "EXLR8 slice payload offset mismatch");
+                        let at = ((load.expert * 3 + load.projection) * units + load.unit) * 8;
+                        ensure!(checksums[slot * 8..slot * 8 + 8] == expected_checksums[at..at + 8],
+                            "EXLR8 slice checksum mismatch");
+                        for (source, bytes, label) in [(&load.source[1], &channels[slot * 256..slot * 256 + 256], "channel"),
+                            (&load.source[2], &blocks[(expert * 3 + load.projection) * hidden / 64..
+                                (expert * 3 + load.projection + 1) * hidden / 64], "block")] {
+                            let mut expected = vec![0; source.bytes]; source.read(&mut expected)?;
+                            ensure!(bytes == expected, "EXLR8 slice {label} mismatch");
+                        }
+                    }
+                    ordinal += 1;
+                }
+            }
+            ensure!(ordinal == count, "EXLR8 slice owned unit count mismatch");
+        }
+        Ok(())
+    }
+
+    fn layer(&self, layer: &Layer, units: usize, experts: usize) -> anyhow::Result<&SelectedLayer> {
+        let choices = self.manifest.layers.get(&layer.id.to_string()).context("missing manifest layer")?;
+        let width = |k: usize, widths: &BTreeSet<usize>| -> anyhow::Result<()> {
+            ensure!((2..=4).contains(&k) && widths.contains(&k), "manifest requests absent K{k}");
+            Ok(())
+        };
+        for rows in [&choices.gate, &choices.up] {
+            ensure!(rows.len() == experts, "manifest expert count mismatch");
+            for row in rows {
+                ensure!(row.len() == units, "manifest unit count mismatch");
+                for &k in row { width(k, &layer.widths)?; }
+            }
+        }
+        ensure!(choices.down.len() == experts, "manifest expert count mismatch");
+        for &k in &choices.down { width(k, &layer.widths)?; }
+        for row in [&choices.shared.gate, &choices.shared.up] {
+            ensure!(row.len() == units, "manifest shared unit count mismatch");
+            for &k in row { width(k, &layer.shared_widths)?; }
+        }
+        width(choices.shared.down, &layer.shared_widths)?;
+        Ok(choices)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("EXLR8 residency: {0:#}")]
@@ -53,16 +228,14 @@ pub struct Unit {
     pub bits: i32,
     pub source: [Range; 3],
     pub destination: [usize; 3],
-    pub checksum: u64,
 }
 impl Unit {
     pub fn staging_bytes(&self) -> usize {
         self.source.iter().map(|r| r.bytes).sum()
     }
 
-    /// One bounded range read per component; checksum order is payload, channel,
-    /// blocks. A checksum failure must never publish this unit to a live arena.
-    pub fn read_verified(&self, staging: &mut [u8]) -> Result<()> {
+    /// Read each component into its bounded staging range.
+    pub fn read(&self, staging: &mut [u8]) -> Result<()> {
         self.read_inner(staging).map_err(Into::into)
     }
     fn read_inner(&self, staging: &mut [u8]) -> anyhow::Result<()> {
@@ -75,16 +248,6 @@ impl Unit {
             source.read(&mut staging[at..at + source.bytes])?;
             at += source.bytes;
         }
-        let actual = xxhash64(staging);
-        ensure!(
-            actual == self.checksum,
-            "checksum mismatch e{} u{} p{} K{}: {actual:016x} != {:016x}",
-            self.expert,
-            self.unit,
-            self.projection,
-            self.bits,
-            self.checksum
-        );
         Ok(())
     }
 }
@@ -169,7 +332,7 @@ fn range(
     );
     let element = match dtype {
         "I8" | "U8" => 1,
-        "F16" => 2,
+        "F16" | "I16" => 2,
         "I64" | "U64" => 8,
         _ => unreachable!(),
     };
@@ -217,37 +380,43 @@ impl Residency {
         rank: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        Self::plan_inner(snapshot, selected, layer, world, rank, set).map_err(Into::into)
+        if !(1..=8).contains(&world) || rank >= world {
+            return Err(anyhow::anyhow!("expected TP1..8 and rank below world").into());
+        }
+        MetadataInput::open(snapshot, selected)?.plan(layer, world, rank, set)
     }
 
     fn plan_inner(
-        snapshot: &Path,
-        selected: &str,
+        input: &MetadataInput,
         layer: usize,
         world: usize,
         rank: usize,
         set: ExpertSet,
     ) -> anyhow::Result<Self> {
         ensure!(
-            (1..=6).contains(&world) && rank < world,
-            "expected TP1..6 and rank below world"
+            (1..=8).contains(&world) && rank < world,
+            "expected TP1..8 and rank below world"
         );
-        let config = read_json(&snapshot.join("config.json"))?;
-        ensure!(
-            config["architectures"] == serde_json::json!(["GlmMoeDsaForCausalLM"]),
-            "unsupported architecture"
-        );
-        let hidden = number(&config, "hidden_size")?;
-        let intermediate = number(&config, "moe_intermediate_size")?;
-        let routed = number(&config, "n_routed_experts")?;
+        let snapshot = &input.snapshot;
+        let selected = &input.selected;
+        let config = &input.config;
+        super::architecture(config)?;
+        let config = config.get("text_config").unwrap_or(config);
+        let hidden = number(config, "hidden_size")?;
+        let intermediate = number(config, "moe_intermediate_size")?;
+        let routed = number(config, "n_routed_experts")?;
+        let layers = number(config, "num_hidden_layers")?
+            .checked_add(config.get("num_nextn_predict_layers")
+                .map(|_| number(config, "num_nextn_predict_layers")).transpose()?.unwrap_or(0))
+            .context("EXLR8 layer extent overflow")?;
         ensure!(
             hidden > 0
                 && hidden % 128 == 0
                 && intermediate > 0
                 && intermediate % 128 == 0
                 && routed > 0
-                && layer >= number(&config, "first_k_dense_replace")?
-                && layer < number(&config, "num_hidden_layers")?,
+                && layer >= number(config, "first_k_dense_replace")?
+                && layer < layers,
             "invalid EXLR8 layer or geometry"
         );
         let units = intermediate / 128;
@@ -288,9 +457,7 @@ impl Residency {
             widths: widths("widths")?,
             shared_widths: widths("shared_widths")?,
         };
-        let checked = manifest(snapshot, selected, hidden, units, routed, &[layer_spec])?;
-        let value = read_json(&snapshot.join(format!("manifests/exlr8-manifest-{selected}.json")))?;
-        let choices = &value["layers"][layer.to_string()];
+        let choices = input.layer(&layer_spec, units, routed)?;
         let experts = if set == ExpertSet::Shared { 1 } else { routed };
         let prefix = if set == ExpertSet::Shared {
             "shared."
@@ -334,14 +501,14 @@ impl Residency {
                     continue;
                 }
                 for (p, projection) in ["gate", "up", "down"].iter().enumerate() {
-                    let chosen = if set == ExpertSet::Shared {
-                        &choices["shared"][projection]
-                    } else {
-                        &choices[projection][e]
+                    let k = match (set, p) {
+                        (ExpertSet::Shared, 0) => choices.shared.gate[u],
+                        (ExpertSet::Shared, 1) => choices.shared.up[u],
+                        (ExpertSet::Shared, _) => choices.shared.down,
+                        (ExpertSet::Routed, 0) => choices.gate[e][u],
+                        (ExpertSet::Routed, 1) => choices.up[e][u],
+                        (ExpertSet::Routed, _) => choices.down[e],
                     };
-                    let k = (if p == 2 { chosen } else { &chosen[u] })
-                        .as_u64()
-                        .context("missing manifest width")? as usize;
                     let stem = format!("{prefix}k{k}");
                     let offset_at = ((e * 3 + p) * units + u) * 16;
                     let offset = read_u64(
@@ -447,17 +614,14 @@ impl Residency {
                     )?;
                     let channel = cache_range(channel, &index_bytes)?;
                     let block = cache_range(block, &index_bytes)?;
-                    let checksum = read_u64(
-                        range(
-                            &index,
-                            &index_path,
-                            &format!("{stem}.checksum"),
-                            "U64",
-                            &[experts, 3, units],
-                            ((e * 3 + p) * units + u) * 8,
-                            8,
-                        )?,
-                        &index_bytes,
+                    range(
+                        &index,
+                        &index_path,
+                        &format!("{stem}.checksum"),
+                        "U64",
+                        &[experts, 3, units],
+                        ((e * 3 + p) * units + u) * 8,
+                        8,
                     )?;
                     let payload_dest = reserve(&mut cursor, bytes)?;
                     let channel_dest = reserve(&mut cursor, 256)?;
@@ -487,7 +651,6 @@ impl Residency {
                             block,
                         ],
                         destination: [payload_dest, channel_dest, block_dest],
-                        checksum,
                     });
                 }
             }
@@ -502,8 +665,8 @@ impl Residency {
             experts,
             units,
             set,
-            set_id: checked.set_id,
-            manifest: selected.into(),
+            set_id: input.manifest.set_id.clone(),
+            manifest: selected.clone(),
             loads,
             signs,
             signs_offsets,
@@ -538,6 +701,18 @@ impl Residency {
 
     pub fn compact_unit_limit(&self) -> usize {
         self.units.div_ceil(self.world).max(1)
+    }
+
+    /// Peak temporary host images while relocating ordinary and compact descriptors.
+    pub fn descriptor_host_bytes(&self) -> anyhow::Result<usize> {
+        let descriptors = self.experts.checked_mul(self.units)
+            .and_then(|n| n.checked_mul(3 * (3 * 8 + 4) * 2))
+            .context("EXLR8 descriptor staging overflow")?;
+        let compact = if self.set == ExpertSet::Routed {
+            self.experts.checked_mul(self.units.checked_add(1).context("compact unit overflow")?)
+                .and_then(|n| n.checked_mul(8)).context("compact descriptor overflow")?
+        } else { 0 };
+        descriptors.checked_add(compact).context("EXLR8 descriptor host overflow")
     }
 
     /// Host payload retained by this plan, excluding allocator bookkeeping.
@@ -613,74 +788,11 @@ fn ensure_inner(plan: &Residency, address: u64) -> anyhow::Result<(Vec<u64>, Vec
     Ok((pointers, bits))
 }
 
-// XXH64, seed zero, canonical little-endian arithmetic from the published
-// algorithm. Keeping it here avoids depending on an optional native library.
-fn xxhash64(data: &[u8]) -> u64 {
-    const P1: u64 = 11400714785074694791;
-    const P2: u64 = 14029467366897019727;
-    const P3: u64 = 1609587929392839161;
-    const P4: u64 = 9650029242287828579;
-    const P5: u64 = 2870177450012600261;
-    fn lane(a: u64, v: u64) -> u64 {
-        a.wrapping_add(v.wrapping_mul(P2))
-            .rotate_left(31)
-            .wrapping_mul(P1)
-    }
-    let word = |at: usize| u64::from_le_bytes(data[at..at + 8].try_into().unwrap());
-    let mut at = 0;
-    let mut h;
-    if data.len() >= 32 {
-        let mut v = [P1.wrapping_add(P2), P2, 0, 0u64.wrapping_sub(P1)];
-        while at + 32 <= data.len() {
-            for (i, value) in v.iter_mut().enumerate() {
-                *value = lane(*value, word(at + i * 8));
-            }
-            at += 32;
-        }
-        h = v[0]
-            .rotate_left(1)
-            .wrapping_add(v[1].rotate_left(7))
-            .wrapping_add(v[2].rotate_left(12))
-            .wrapping_add(v[3].rotate_left(18));
-        for value in v {
-            h = (h ^ lane(0, value)).wrapping_mul(P1).wrapping_add(P4);
-        }
-    } else {
-        h = P5;
-    }
-    h = h.wrapping_add(data.len() as u64);
-    while at + 8 <= data.len() {
-        h = (h ^ lane(0, word(at)))
-            .rotate_left(27)
-            .wrapping_mul(P1)
-            .wrapping_add(P4);
-        at += 8;
-    }
-    if at + 4 <= data.len() {
-        h = (h
-            ^ (u32::from_le_bytes(data[at..at + 4].try_into().unwrap()) as u64).wrapping_mul(P1))
-        .rotate_left(23)
-        .wrapping_mul(P2)
-        .wrapping_add(P3);
-        at += 4;
-    }
-    for &byte in &data[at..] {
-        h = (h ^ (byte as u64).wrapping_mul(P5))
-            .rotate_left(11)
-            .wrapping_mul(P1);
-    }
-    h ^= h >> 33;
-    h = h.wrapping_mul(P2);
-    h ^= h >> 29;
-    h = h.wrapping_mul(P3);
-    h ^ (h >> 32)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use super::*;
     use serde_json::{Value, json};
-    use std::io::Write;
 
     #[test]
     fn execution_workspace_is_exact_aligned_and_checked() {
@@ -707,169 +819,120 @@ mod tests {
         }
     }
 
-    fn write(
-        path: &Path,
-        metadata: Value,
-        tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)>,
-    ) {
-        let mut header = serde_json::Map::from_iter([("__metadata__".into(), metadata)]);
-        let mut offset = 0;
-        for (name, dtype, shape, bytes) in &tensors {
-            header.insert(
-                name.clone(),
-                json!({"dtype":dtype,"shape":shape,
-                "data_offsets":[offset,offset+bytes.len()]}),
-            );
-            offset += bytes.len();
-        }
-        let header = serde_json::to_vec(&header).unwrap();
-        assert!(header.len() < 65528);
-        let mut out = File::create(path).unwrap();
-        out.write_all(&65528u64.to_le_bytes()).unwrap();
-        out.write_all(&header).unwrap();
-        out.write_all(&vec![b' '; 65528 - header.len()]).unwrap();
-        for (_, _, _, bytes) in tensors {
-            out.write_all(&bytes).unwrap();
-        }
-    }
+    use crate::plan::testing::exlr8::fixture;
 
-    fn fixture(root: &Path, padded: bool) {
-        std::fs::create_dir(root.join("experts")).unwrap();
-        std::fs::create_dir(root.join("manifests")).unwrap();
-        std::fs::write(
-            root.join("config.json"),
-            json!({
-            "architectures":["GlmMoeDsaForCausalLM"], "hidden_size":128,
-            "moe_intermediate_size":384,"n_routed_experts":2,"num_hidden_layers":4,
-            "first_k_dense_replace":3})
-            .to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("manifests/exlr8-manifest-mixed.json"),
-            json!({
-            "format":"exlr8-v2-manifest","name":"mixed","version":"test","set_id":"b".repeat(64),
-            "layers":{"3":{"gate":[[2,3,4],[4,2,3]],"up":[[4,3,2],[2,3,4]],"down":[3,4],
-            "shared":{"gate":[3,4,3],"up":[4,3,4],"down":4}}}})
-            .to_string(),
-        )
-        .unwrap();
-        let mut tensors = vec![
-            ("signs.in".into(), "I8", vec![128], vec![1; 128]),
-            ("signs.out".into(), "I8", vec![128], vec![255; 128]),
-        ];
-        for k in 2..=4 {
-            let bytes: usize = 128 * 16 * k;
-            let stride = if padded {
-                bytes.div_ceil(65536) * 65536
-            } else {
-                bytes
-            };
-            let mut weights = Vec::new();
-            let mut base = 65536usize;
-            for (prefix, es) in [("", 2), ("shared.", 1)] {
-                if k == 2 && es == 1 {
-                    continue;
-                }
+    #[test]
+    fn optional_rank_slices_cross_check_canonical_residency_and_reject_corruption() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let manifest_path = root.path().join("manifests/exlr8-manifest-mixed.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["name"] = json!("k3");
+        manifest["layers"]["3"] = json!({"gate":vec![vec![3;3];2], "up":vec![vec![3;3];2], "down":vec![3;2],
+            "shared":{"gate":vec![3;3],"up":vec![3;3],"down":3}});
+        std::fs::write(root.path().join("manifests/exlr8-manifest-k3.json"), manifest.to_string()).unwrap();
+        let input = MetadataInput::open(root.path(), "k3").unwrap();
+        assert_eq!(input.cross_check_index_slices().unwrap(), 0);
+        let index_hash = format!("{:x}", Sha256::digest(std::fs::read(root.path()
+            .join("experts/exlr8-layer-003.index.safetensors")).unwrap()));
+        let mut last = None;
+        for world in 1..=4 {
+            for rank in 0..world {
+                let mut owned = Vec::new();
                 let mut offsets = Vec::new();
-                let mut checksums = Vec::new();
-                for e in 0..es {
-                    for p in 0..3 {
-                        for u in 0..3 {
-                            offsets.extend_from_slice(
-                                &((base + (p * es * 3 + e * 3 + u) * stride) as u64).to_le_bytes(),
-                            );
-                            offsets.extend_from_slice(&(bytes as u64).to_le_bytes());
-                            let mut data = vec![(k * 10 + e * 3 + p + u) as u8; bytes];
-                            data.extend(vec![(e + p + u) as u8; 256]);
-                            data.extend(vec![k as u8; 2]);
-                            checksums.extend_from_slice(&xxhash64(&data).to_le_bytes());
+                let mut channels = Vec::new();
+                let mut blocks = vec![0; 3 * 3 * 2];
+                let mut signs = Vec::new();
+                for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                    let plan = input.plan(3, world, rank, set).unwrap();
+                    signs = plan.signs.concat();
+                    for group in plan.loads.chunks_exact(3) {
+                        let expert = if set == ExpertSet::Shared { 2 } else { group[0].expert };
+                        owned.extend_from_slice(&(expert as i16).to_le_bytes());
+                        owned.extend_from_slice(&(group[0].unit as i16).to_le_bytes());
+                        for unit in group {
+                            offsets.extend_from_slice(&unit.source[0].offset.to_le_bytes());
+                            let mut bytes = vec![0; 256]; unit.source[1].read(&mut bytes).unwrap();
+                            channels.extend(bytes);
+                            unit.source[2].read(&mut blocks[(expert * 3 + unit.projection) * 2..
+                                (expert * 3 + unit.projection + 1) * 2]).unwrap();
                         }
                     }
                 }
-                tensors.push((
-                    format!("{prefix}k{k}.index"),
-                    "I64",
-                    vec![es, 3, 3, 2],
-                    offsets,
-                ));
-                tensors.push((
-                    format!("{prefix}k{k}.checksum"),
-                    "U64",
-                    vec![es, 3, 3],
-                    checksums,
-                ));
-                for (p, (projection, channel, block)) in [
-                    ("gate", "svh", "su_block"),
-                    ("up", "svh", "su_block"),
-                    ("down", "suh", "sv_block"),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    let mut payload = Vec::new();
-                    let mut channels = Vec::new();
-                    for e in 0..es {
-                        for u in 0..3 {
-                            payload.extend(vec![(k * 10 + e * 3 + p + u) as u8; bytes]);
-                            payload.extend(vec![0; stride - bytes]);
-                            channels.extend(vec![(e + p + u) as u8; 256]);
-                        }
-                    }
-                    let len = payload.len();
-                    weights.push((
-                        format!("{prefix}trellis.{projection}"),
-                        "U8",
-                        vec![len],
-                        payload,
-                    ));
-                    tensors.push((
-                        format!("{prefix}k{k}.{projection}.{channel}"),
-                        "F16",
-                        vec![es, 384],
-                        channels,
-                    ));
-                    tensors.push((
-                        format!("{prefix}k{k}.{projection}.{block}"),
-                        "F16",
-                        vec![es, 1],
-                        vec![k as u8; es * 2],
-                    ));
+                let count = owned.len() / 4;
+                let tensors = vec![("units", "I16", vec![count,2], owned),
+                    ("offset", "I64", vec![count,3], offsets),
+                    ("checksum", "U64", vec![count,3], vec![0;count*24]),
+                    ("chan", "F16", vec![count,3,128], channels),
+                    ("block", "F16", vec![3,3,1], blocks),
+                    ("signs", "I8", vec![2,128], signs)];
+                let metadata = json!({"format":"exlr8-v2-index-slice","version":"1",
+                    "tp":world.to_string(),"rank":rank.to_string(),"k":"3","set_id":"b".repeat(64),
+                    "hidden_size":"128","n_routed_experts":"2","half_bytes":"6144","layers":"3",
+                    "index_sha256":json!({"3":index_hash}).to_string()});
+                let mut header = serde_json::Map::from_iter([("__metadata__".into(),metadata)]);
+                let mut payload = Vec::new();
+                for (name,dtype,shape,bytes) in tensors {
+                    header.insert(format!("L003.{name}"), json!({"dtype":dtype,"shape":shape,
+                        "data_offsets":[payload.len(),payload.len()+bytes.len()]}));
+                    payload.extend(bytes);
                 }
-                base += 3 * es * 3 * stride;
+                let header_bytes = serde_json::to_vec(&header).unwrap();
+                let mut bytes = (header_bytes.len() as u64).to_le_bytes().to_vec();
+                bytes.extend(&header_bytes); bytes.extend(payload);
+                let directory = root.path().join(format!("index-slices/tp{world}/k3"));
+                std::fs::create_dir_all(&directory).unwrap();
+                let path = directory.join(format!("rank{rank}.safetensors"));
+                std::fs::write(&path, &bytes).unwrap();
+                last = Some((path, bytes, header, 8 + header_bytes.len()));
             }
-            write(
-                &root.join(format!("experts/exlr8-layer-003.k{k}.safetensors")),
-                json!({"format":"exlr8-v2","scheme":"exlr8-e4m3-v2","layer":"3","k":k.to_string(),
-                    "gate_up_order":"grouped","down_order":"item128","pad_halves":padded.to_string()}),
-                weights,
-            );
         }
-        write(
-            &root.join("experts/exlr8-layer-003.index.safetensors"),
-            json!({"format":"exlr8-v2","scheme":"exlr8-e4m3-v2","layer":"3",
-                "gate_up_order":"grouped","down_order":"item128","widths":"2,3,4","shared_widths":"3,4"}),
-            tensors,
-        );
+        assert_eq!(input.cross_check_index_slices().unwrap(), 10);
+        let (path, original, header, base) = last.unwrap();
+        for tensor in ["units", "offset", "checksum", "chan", "block", "signs"] {
+            let mut corrupt = original.clone();
+            let offset = header[&format!("L003.{tensor}")]["data_offsets"][0].as_u64().unwrap() as usize;
+            corrupt[base + offset] ^= 1;
+            std::fs::write(&path, corrupt).unwrap();
+            assert!(input.cross_check_index_slices().is_err(), "{tensor}");
+        }
+        std::fs::write(&path, original).unwrap();
+        let index_path = root.path().join("experts/exlr8-layer-003.index.safetensors");
+        std::fs::OpenOptions::new().append(true).open(index_path).unwrap().write_all(&[0]).unwrap();
+        assert!(input.cross_check_index_slices().unwrap_err().to_string().contains("hash mismatch"));
     }
 
     #[test]
-    fn checksum_matches_independent_e1_vectors() {
-        for (n, expected) in [
-            (0, 0xef46db3751d8e999),
-            (1, 0xe934a84adb052768),
-            (4, 0xffced8604453cc1e),
-            (8, 0x884a173614b81b8d),
-            (31, 0xc346d2b59b4d8ee1),
-            (32, 0xcbf59c5116ff32b4),
-            (33, 0x0c535d1acafb8ead),
-            (1000, 0xf306f04aa88b54d3),
-        ] {
-            assert_eq!(
-                xxhash64(&(0..n).map(|i| (i % 251) as u8).collect::<Vec<_>>()),
-                expected
-            );
+    fn published_index_slices_when_explicitly_supplied() {
+        let Some(root) = std::env::var_os("CUTEAFD_EXLR8_SLICE_SNAPSHOT") else { return; };
+        for manifest in super::super::manifest_names(Path::new(&root)).unwrap() {
+            let input = MetadataInput::open(Path::new(&root), &manifest).unwrap();
+            let count = input.cross_check_index_slices().unwrap();
+            assert!(count > 0, "expected published slices for {manifest}");
+            println!("{manifest}: {count} published rank slices agree with canonical residency");
         }
+    }
+
+    #[test]
+    fn metadata_input_reuses_selection_but_rechecks_payload_headers() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
+        let input = MetadataInput::open(root.path(), "mixed").unwrap();
+        for world in 1..=8 {
+            for rank in 0..world {
+                for set in [ExpertSet::Routed, ExpertSet::Shared] {
+                    let cached = input.plan(3, world, rank, set).unwrap();
+                    let fresh = Residency::plan(root.path(), "mixed", 3, world, rank, set).unwrap();
+                    assert_eq!((cached.resident_bytes, cached.payload_bytes, cached.staging_bytes),
+                        (fresh.resident_bytes, fresh.payload_bytes, fresh.staging_bytes));
+                    assert_eq!(format!("{cached:?}"), format!("{fresh:?}"));
+                }
+            }
+        }
+        let path = root.path().join("experts/exlr8-layer-003.k2.safetensors");
+        std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(8).unwrap();
+        assert!(input.plan(3, 1, 0, ExpertSet::Routed).is_err());
     }
 
     #[test]
@@ -877,7 +940,7 @@ mod tests {
         for padded in [false, true] {
             let root = tempfile::tempdir().unwrap();
             fixture(root.path(), padded);
-            for world in 1..=6 {
+            for world in 1..=8 {
                 for set in [ExpertSet::Routed, ExpertSet::Shared] {
                     let mut owners = BTreeSet::new();
                     for rank in 0..world {
@@ -943,8 +1006,8 @@ mod tests {
                                 assert_eq!(ptrs[slot * 3 + i], 0x10000 + dest as u64);
                             }
                             let mut staging = vec![0; unit.staging_bytes()];
-                            unit.read_verified(&mut staging).unwrap();
-                            assert!(unit.read_verified(&mut staging[1..]).is_err());
+                            unit.read(&mut staging).unwrap();
+                            assert!(unit.read(&mut staging[1..]).is_err());
                         }
                         for (slot, &width) in bits.iter().enumerate() {
                             if width == 0 {
@@ -968,23 +1031,21 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_checksum_and_index_are_refused() {
+    fn truncated_native_source_is_refused() {
         let root = tempfile::tempdir().unwrap();
         fixture(root.path(), false);
         let plan = Residency::plan(root.path(), "mixed", 3, 1, 0, ExpertSet::Routed).unwrap();
         let unit = &plan.loads[0];
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&unit.source[0].path)
-            .unwrap();
-        file.seek(SeekFrom::Start(unit.source[0].offset)).unwrap();
-        file.write_all(&[0]).unwrap();
-        assert!(
-            unit.read_verified(&mut vec![0; unit.staging_bytes()])
-                .unwrap_err()
-                .to_string()
-                .contains("checksum mismatch")
-        );
+        let source = &unit.source[0];
+        std::fs::OpenOptions::new().write(true).open(&source.path).unwrap()
+            .set_len(source.offset + source.bytes as u64 - 1).unwrap();
+        assert!(unit.read(&mut vec![0; unit.staging_bytes()]).is_err());
+    }
+
+    #[test]
+    fn corrupt_index_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        fixture(root.path(), false);
         let path = root
             .path()
             .join("experts/exlr8-layer-003.index.safetensors");
@@ -1000,7 +1061,7 @@ mod tests {
                 .contains("outside its projection")
         );
         assert!(Residency::plan(root.path(), "../mixed", 3, 1, 0, ExpertSet::Routed).is_err());
-        assert!(Residency::plan(root.path(), "mixed", 3, 7, 0, ExpertSet::Routed).is_err());
+        assert!(Residency::plan(root.path(), "mixed", 3, 9, 0, ExpertSet::Routed).is_err());
     }
 
     #[test]
@@ -1047,7 +1108,7 @@ mod tests {
                 assert_eq!(plan.loads.len() % 3, 0);
                 plan.descriptors(0x10000).unwrap();
                 for unit in plan.loads.iter().take(3) {
-                    unit.read_verified(&mut vec![0; unit.staging_bytes()])
+                    unit.read(&mut vec![0; unit.staging_bytes()])
                         .unwrap();
                 }
             }

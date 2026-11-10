@@ -67,6 +67,7 @@ impl DflashConfig {
     pub fn read(dir: &Path) -> Result<Self> {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)
             .context("parsing dflash/config.json")?;
+        crate::formats::dflash::validate_topk_vocab(raw.vocab_size as u64)?;
         let d = &raw.dflash_config;
         let rope_dim = (raw.head_dim as f64 * raw.partial_rotary_factor) as usize;
         ensure!(raw.head_dim == 128 && raw.v_head_dim.unwrap_or(128) == 128 && matches!(rope_dim, 64 | 128)

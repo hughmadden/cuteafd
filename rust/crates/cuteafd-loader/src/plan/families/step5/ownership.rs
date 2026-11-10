@@ -20,6 +20,8 @@ pub struct ExecutionOwnership {
     execution: LayerExecutionPlan,
     full: Vec<bool>,
     moe: Vec<bool>,
+    /// Onboarded routed layers: whole on the one GPU, or TP2 halves over two.
+    onboarded: Vec<usize>,
 }
 
 impl ExecutionOwnership {
@@ -36,8 +38,10 @@ impl ExecutionOwnership {
             "Step-5 execution entry/head rank");
         ensure!(execution.spec().row_bytes == 4096 * 4 && execution.spec().rows <= 4096,
             "Step-5 residual hop geometry");
-        crate::placement::validate_layer_pipeline_lanes(execution.spec().lanes,
-            usize::try_from(execution.spec().lanes)?)?;
+        // One execution lane; with prefill units in flight each unit slot owns
+        // its hop receive slots (a hop lane per slot), so no unit's hop lands
+        // in a slot another unit has not yet consumed.
+        ensure!((1..=4).contains(&execution.spec().lanes), "Step-5 hop lanes are one per prefill wave (1..=4)");
         for (layer, mode) in execution.modes().iter().enumerate() {
             match mode {
                 LayerMode::Whole { gpu, ffn: FfnMode::Owner } =>
@@ -49,29 +53,66 @@ impl ExecutionOwnership {
                     anyhow::bail!("Step-5 split FFN has no qualified native half-width executor"),
             }
         }
-        let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone() };
-        for lane in 0..owners.execution.spec().lanes as usize {
-            owners.execution.validate_routed_replications(&owners.routed_replications(lane)?)?;
-        }
+        let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone(), onboarded: vec![] };
+        owners.execution.validate_routed_replications(&owners.routed_replications()?)?;
         Ok(owners)
     }
 
-    /// Publication flags 0..4 belong exclusively to head partials. Routed
-    /// copies use 4..8, with one full native receive allocation per layer/lane.
-    /// The ordinal counts actual routed copies, not physical layer parity.
-    pub fn routed_replications(&self, lane: usize) -> Result<Vec<Option<RoutedReplication>>> {
-        ensure!(lane < self.execution.spec().lanes as usize, "Step-5 routed lane outside admission");
-        let mut ordinal = 0;
+    /// Routed replies use the entry GPU intake and existing peer publication.
+    /// Head exchanges between layers order reuse of the reply receive planes.
+    /// TP2-onboarded layers need none: the pair's combine leaves the routed sum
+    /// on every rank that holds the layer's FFN.
+    pub fn routed_replications(&self) -> Result<Vec<Option<RoutedReplication>>> {
+        let entry = self.execution.spec().entry_gpu;
         Ok(self.execution.modes().iter().enumerate().map(|(layer, mode)| {
-            if *mode != LayerMode::HeadSplit || !self.moe[layer] { return None; }
-            let copy = RoutedReplication { source: 0, slot: 4 + 2 * lane + ordinal % 2,
-                storage: 1 + lane * self.execution.modes().len() + layer };
-            ordinal += 1;
-            Some(copy)
+            if !self.moe[layer] || self.ranks == 1 || self.onboarded(layer) { return None; }
+            let slot = match mode {
+                LayerMode::HeadSplit => 4,
+                LayerMode::Whole { gpu, .. } if *gpu != entry => 5,
+                _ => return None,
+            };
+            Some(RoutedReplication { source: entry, slot, storage: 1 + layer })
         }).collect())
     }
 
     pub fn ranks(&self) -> usize { self.ranks }
+
+    /// Binds the solved onboarded routed layers (whole on one GPU, TP2 over two).
+    pub fn with_onboarded(mut self, layers: Vec<usize>) -> Result<Self> {
+        ensure!(layers.windows(2).all(|p| p[0] < p[1]) && layers.iter().all(|&l| self.moe.get(l) == Some(&true)),
+            "Step-5 onboarded layers must be sorted routed target layers");
+        self.onboarded = layers;
+        self.execution.validate_routed_replications(&self.routed_replications()?)?;
+        // Two RTX: each direction of the TP2 partial exchange reuses its
+        // receive plane and flag under the same head-exchange ordering a
+        // routed replication needs (slot 4 head split, slot 5 to a whole owner).
+        if self.ranks == 2 {
+            for from in 0..2u8 {
+                let copies = self.execution.modes().iter().enumerate().map(|(layer, mode)| {
+                    if !self.onboarded(layer) { return Ok(None); }
+                    Ok(match (mode, self.routed_source(layer)?) {
+                        (LayerMode::HeadSplit, None) => Some(RoutedReplication { source: from, slot: 4, storage: 1 }),
+                        (_, Some(owner)) if usize::from(from) != owner =>
+                            Some(RoutedReplication { source: from, slot: 5, storage: 2 }),
+                        _ => None,
+                    })
+                }).collect::<Result<Vec<_>>>()?;
+                self.execution.validate_routed_replications(&copies)?;
+            }
+        }
+        Ok(self)
+    }
+    /// The rank whose router, routes and wire rows a TP2-onboarded layer
+    /// broadcasts (a whole-owned layer's owner), or None when every FFN rank
+    /// routes itself (head split).
+    pub fn routed_source(&self, layer: usize) -> Result<Option<usize>> {
+        Ok(match self.execution.mode(layer)? {
+            LayerMode::Whole { gpu, .. } if self.ranks == 2 => Some(usize::from(gpu)),
+            _ => None,
+        })
+    }
+    pub fn onboarded(&self, layer: usize) -> bool { self.onboarded.binary_search(&layer).is_ok() }
+    pub fn onboarded_layers(&self) -> &[usize] { &self.onboarded }
     pub fn execution(&self) -> &LayerExecutionPlan { &self.execution }
 
     pub fn validate_config(&self, cfg: &Config) -> Result<()> {
@@ -81,24 +122,8 @@ impl ExecutionOwnership {
         Ok(())
     }
 
-    /// Every persistent lane connects once for each routed-wave owning rank.
-    pub fn routed_endpoints(&self) -> Result<usize> {
-        self.routed_wave_ranks()?.len().checked_mul(usize::try_from(self.execution.spec().lanes)?)
-            .ok_or_else(|| anyhow::anyhow!("Step-5 routed endpoint count overflow"))
-    }
-
-    /// Owning ranks within a lane, not the total number of persistent transports.
-    pub fn routed_wave_ranks(&self) -> Result<Vec<usize>> {
-        let mut ranks = Vec::new();
-        for rank in 0..self.ranks {
-            let mut owns = false;
-            for layer in 0..self.execution.modes().len() {
-                owns |= self.layer(layer, rank)?.routed_wave;
-            }
-            if owns { ranks.push(rank); }
-        }
-        Ok(ranks)
-    }
+    /// The engine owns one Spark-world transport, with intake on its entry GPU.
+    pub fn routed_endpoints(&self) -> Result<usize> { Ok(1) }
 
     pub fn layer(&self, layer: usize, rank: usize) -> Result<LayerRank> {
         ensure!(rank < self.ranks, "Step-5 execution rank");
@@ -124,9 +149,9 @@ pub(crate) fn plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPl
         terminal: if matches!(modes.last(), Some(LayerMode::Whole { ffn: FfnMode::Owner, .. })) {
             TerminalHome::AttentionOwner
         } else { TerminalHome::Replicated } };
-    let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
+    let placement = Placement { expert_tier: None, pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
-        peer_row_bytes: 0, onboard_layers: 0,
+        peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
         layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
         movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
         hops: plan_hops(modes, &spec).unwrap(), tp2: None, items: vec![] };

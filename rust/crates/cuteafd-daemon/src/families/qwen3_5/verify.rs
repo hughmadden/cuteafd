@@ -13,6 +13,14 @@ pub(crate) struct DenseMark<'a> {
     generation: u64,
     slots: Vec<(usize, rows::Slot)>,
     storage: Rc<Allocation<'a>>,
+    fresh: FreshMark,
+}
+
+struct FreshMark(std::cell::Cell<bool>);
+
+impl FreshMark {
+    fn needs_restore(&self) -> bool { !self.0.replace(false) }
+    fn used(&self) { self.0.set(false); }
 }
 
 pub(super) struct Verification<'a> {
@@ -153,6 +161,8 @@ impl<'a> DenseEngine<'a> {
             let mark = self.checkpoint(&[0])?;
             self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: keep }])?;
+            // The commit stays queued on the target stream; host reads use the default stream.
+            self.stream.drain()?;
             let mut replay = Vec::new();
             for region in self.mark_regions() {
                 let mut bytes = vec![0; region.bytes];
@@ -251,8 +261,43 @@ impl<'a> DenseEngine<'a> {
             }
             ensure!(state(self)? == actual, "dense multislot accepted-input state differs for {kept:?}");
         }
+        let kv = |engine: &Self| -> Result<Vec<Vec<u8>>> {
+            let record = engine.kv_format.record_bytes(engine.cfg.kv_heads, engine.cfg.head_dim);
+            let mut output = Vec::new();
+            for slot in &engine.slots {
+                for position in 0..slot.position {
+                    let offset = (slot.pages[position / 64] as usize * 64 + position % 64) * record;
+                    for pool in engine.kv.iter().flatten() {
+                        let mut bytes = vec![0; record];
+                        library.copy_d2h(&mut bytes, view(pool.buffer, offset, record)?)?;
+                        output.push(bytes);
+                    }
+                }
+            }
+            Ok(output)
+        };
+        reset(self)?;
+        let mark = self.checkpoint(&[1, 0])?;
+        let expected_logits = self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?
+            .logits.to_host(library)?;
+        self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: 4 }, AcceptedPrefix { slot: 1, rows: 3 }])?;
+        let expected_state = state(self)?;
+        let expected_kv = kv(self)?;
+        reset(self)?;
+        let stale = self.checkpoint(&[1, 0])?;
+        let actual = self.decode_device(&[1, 0], VerifyRequest { rows: &rows, tap_layers: &[] })?.to_host(library)?;
+        ensure!(actual.iter().map(|v| v.to_bits()).eq(expected_logits.iter().map(|v| v.to_bits()))
+            && state(self)? == expected_state && kv(self)? == expected_kv,
+            "dense direct multislot logits, KV or recurrent state differ from full speculative commit");
+        ensure!(self.slots[0].position == 7 && self.slots[1].position == 6
+            && self.verification.pending.is_none(), "dense direct decode did not retire committed inputs");
+        ensure!(self.restore(&stale).is_err(), "dense direct decode retained a stale transactional mark");
+        let invalid = [VerifyRow { slot: 0, position: 6, token: Some(tokens[0]) }];
+        ensure!(self.decode_device(&[0], VerifyRequest { rows: &invalid, tap_layers: &[] }).is_err()
+            && self.healthy && state(self)? == expected_state && kv(self)? == expected_kv,
+            "dense invalid direct decode changed committed state");
         for slot in 0..self.slots.len() { self.reset_slot(slot)?; }
-        println!("dense multislot verify: interleaved logits, sentinel padding and independent accepted-input state byte-exact");
+        println!("dense multislot verify: interleaved logits, sentinel padding, accepted-input replay and direct-commit logits/KV/state byte-exact");
         Ok(())
     }
 
@@ -272,14 +317,15 @@ impl<'a> DenseEngine<'a> {
             let saved = view(mark.storage.buffer, offset, bytes)?;
             let (dst, src) = if capture { (saved, region) } else { (region, saved) };
             // SAFETY: mark storage and the live bank are retained until the enclosing drain.
-            unsafe { self.stream.device.library.copy_d2d_async(dst, src, bytes, self.stream.raw)?; }
+            unsafe { crate::shared::memory::device::copy_device_ordered(self.stream.device.library, dst, src, bytes, self.stream.raw)?; }
         }
-        self.stream.drain()
+        // Every reader and writer of the mark and the live bank runs on this stream.
+        Ok(())
     }
 
     fn restore_mark(&mut self, mark: &DenseMark<'_>) -> Result<()> {
         self.verification.validate(mark)?;
-        self.stream.drain()?;
+        mark.fresh.used();
         self.healthy = false;
         self.move_mark(mark, false)?;
         // Append-only records beyond each saved frontier are unreachable and overwritten.
@@ -291,13 +337,31 @@ impl<'a> DenseEngine<'a> {
         Ok(())
     }
 
-    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize]) -> Result<()> {
-        self.stream.drain()?;
+    /// Plain decode commits every input in place; only speculative rows need a
+    /// checkpoint and replay. Retained prefix snapshots own a separate arena.
+    pub(crate) fn decode_device(&mut self, slots: &[usize], request: VerifyRequest<'_>) -> Result<DeviceLogits> {
+        ensure!(self.healthy && self.verification.pending.is_none(), "dense decode requires committed healthy state");
+        ensure!(!slots.is_empty(), "dense decode requires active slots");
+        let marked = slots.iter().map(|&slot| {
+            self.slots.get(slot).cloned().map(|state| (slot, state))
+                .context("dense decode slot outside admission")
+        }).collect::<Result<Vec<_>>>()?;
+        let plan = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &marked,
+            self.cfg.max_context, self.pool_tokens)?;
+        self.verification.invalidate()?;
+        self.verify_rows(plan, request.rows.len(), request.tap_layers, false)?;
+        Ok(DeviceLogits { ptr: self.verification.logits.buffer.ptr, rows: request.rows.len(),
+            vocab: self.cfg.vocab, stride: self.cfg.vocab, stream: self.stream.raw, greedy: None })
+    }
+
+    pub(crate) fn verify_taps(&self) -> &[HiddenTap] { &self.verification.taps }
+
+    fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.healthy = false;
         let tokens = &plan.tokens;
         let physical = &plan.physical;
         let library = self.stream.device.library;
-        // SAFETY: output arenas are admitted and no prior consumer remains after the drain.
+        // SAFETY: output arenas are admitted; their prior consumers precede this on the one stream.
         unsafe {
             library.cuda_zero_bytes_async(self.verification.logits.buffer, rows * self.cfg.vocab * 4, self.stream.raw)?;
             library.cuda_zero_bytes_async(self.verification.hidden.buffer, layers.len() * rows * self.cfg.hidden * 2,
@@ -309,7 +373,7 @@ impl<'a> DenseEngine<'a> {
         if !tokens.is_empty() {
             self.row_tables(&plan)?;
             self.embedding.embed(tokens, self.ids.buffer, 1, self.planes.residual, self.stream.raw)?;
-            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative: true };
+            let step = Step { rows: tokens.len(), capacity: REPLAY_ROWS, table_stride: plan.stride, splits: 1, speculative };
             let blocks = Blocks { programs: self.programs, admitted: &self.admitted, cfg: &self.cfg,
                 homes: &self.homes, bank: &self.bank, stream: self.stream.raw };
             for (index, layer) in self.weights.layers.iter().enumerate() {
@@ -320,7 +384,7 @@ impl<'a> DenseEngine<'a> {
                         let dst = view(self.verification.hidden.buffer, (tap * rows + row) * width, width)?;
                         let src = view(self.planes.residual, active * width, width)?;
                         // SAFETY: both admitted row slices outlive this ordered stream copy.
-                        unsafe { library.copy_d2d_async(dst, src, width, self.stream.raw)?; }
+                        unsafe { crate::shared::memory::device::copy_device_ordered(library, dst, src, width, self.stream.raw)?; }
                     }
                 }
             }
@@ -337,11 +401,16 @@ impl<'a> DenseEngine<'a> {
                 let dst = view(self.verification.logits.buffer, row * width, width)?;
                 let src = view(self.logits.buffer, active * width, width)?;
                 // SAFETY: admitted source and physical output rows remain live through the drain.
-                unsafe { library.copy_d2d_async(dst, src, width, self.stream.raw)?; }
+                unsafe { crate::shared::memory::device::copy_device_ordered(library, dst, src, width, self.stream.raw)?; }
             }
         }
-        self.stream.drain()?;
-        self.verification.pending = Some(plan);
+        // The logits and taps carry this stream; selection and drafting wait on it.
+        if speculative {
+            self.verification.pending = Some(plan);
+        } else {
+            for group in &plan.groups { self.slots[group.slot].position += group.rows; }
+            self.position = self.slots[0].position;
+        }
         self.healthy = true;
         Ok(())
     }
@@ -356,10 +425,10 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
             ensure!(slot < self.slots.len() && !slots[..index].contains(&slot), "duplicate or unadmitted dense checkpoint slot");
         }
         ensure!(self.healthy && self.verification.pending.is_none(), "dense checkpoint requires committed healthy state");
-        self.stream.drain()?;
         self.verification.invalidate()?;
         let mark = DenseMark { owner: self.verification.owner, generation: self.verification.generation,
-            slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone() };
+            slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone(),
+            fresh: FreshMark(std::cell::Cell::new(true)) };
         self.move_mark(&mark, true)?;
         Ok(mark)
     }
@@ -368,9 +437,11 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         self.verification.validate(mark)?;
         let active = rows::Rows::new(&request, self.cfg.attention.len(), self.cfg.vocab, &mark.slots,
             self.cfg.max_context, self.pool_tokens);
-        self.restore_mark(mark)?;
+        // No target mutation can retain this generation between checkpoint and
+        // its first verify. Reused marks still restore, including invalid requests.
+        if mark.fresh.needs_restore() { self.restore_mark(mark)?; }
         let plan = active?;
-        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers) {
+        if let Err(error) = self.verify_rows(plan, request.rows.len(), request.tap_layers, true) {
             self.restore_mark(mark).context("restoring dense checkpoint after failed verify")?;
             return Err(error);
         }
@@ -387,7 +458,7 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         let table = verified.accepted(accepted)?;
         self.restore_mark(mark)?;
         self.healthy = false;
-        let result = self.bank.commit(&table, accepted.len()).and_then(|()| self.stream.drain());
+        let result = self.bank.commit(&table, accepted.len());
         if let Err(error) = result {
             self.restore_mark(mark).context("restoring dense checkpoint after failed commit")?;
             return Err(error);
@@ -417,6 +488,17 @@ mod tests {
             "rms_norm_eps":1e-6, "rope_parameters":{"rope_type":"default", "rope_theta":10000000.0,
                 "partial_rotary_factor":0.25, "mrope_section":[11,11,10], "mrope_interleaved":true}}});
         Qwen35Config::from_hf(&value).unwrap()
+    }
+
+    #[test]
+    fn only_the_first_fresh_verify_elides_checkpoint_restore() {
+        let fresh = FreshMark(std::cell::Cell::new(true));
+        assert!(!fresh.needs_restore());
+        assert!(fresh.needs_restore());
+        assert!(fresh.needs_restore());
+        let explicitly_restored = FreshMark(std::cell::Cell::new(true));
+        explicitly_restored.used();
+        assert!(explicitly_restored.needs_restore());
     }
 
     #[test]
@@ -459,7 +541,7 @@ mod tests {
         assert_eq!(Verification::bytes(&cfg, 16).unwrap(), 16 * layout.bytes + 64 * cfg.vocab * 4
             + 32 * 64 * cfg.hidden * 2);
         for slots in [1, 4, 16, 64] {
-            let native = placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10).unwrap();
+            let native = placement::families::qwen3_5::NativeBuffers::new(&cfg, 1024, slots, 10, false).unwrap();
             assert_eq!(native.verify.iter().sum::<usize>(), Verification::bytes(&cfg, slots).unwrap());
             assert_eq!(native.verify[0], Verification::layout(&cfg, slots).unwrap().bytes);
             let gdn = GdnLayout::new(cfg.gdn).unwrap();

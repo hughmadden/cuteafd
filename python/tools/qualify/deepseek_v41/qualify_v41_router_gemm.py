@@ -132,20 +132,14 @@ def main():
                     oracle_id_differences=int((candidate_ids!=ref_ids).sum()),
                     baseline_id_differences=int((candidate_ids!=ids).sum())))
                 if serving is not None:
-                    from b12x.moe._shared.v41_router import v41_router_gemm_min_rows
-                    if rows >= v41_router_gemm_min_rows(experts=n):
-                        py_scores=torch.empty_like(candidate_scores)
-                        py_ids=torch.empty_like(candidate_ids)
-                        py_routing=torch.empty_like(candidate_routing)
-                        compiled[n](xp,wp,ptr(py_scores,cutlass.Float32),cutlass.Int32(rows),current_cuda_stream())
-                        assert select(*[t.data_ptr() for t in (py_scores,b,bv,mask,py_ids,py_routing)],rows,n,torch.cuda.current_stream().cuda_stream)==0
-                        assert torch.equal(candidate_scores,py_scores)
-                        assert torch.equal(candidate_ids,py_ids)
-                        assert torch.equal(candidate_routing,py_routing)
-                    else:
-                        assert torch.equal(candidate_scores,scores)
-                        assert torch.equal(candidate_ids,ids)
-                        assert torch.equal(candidate_routing,routing)
+                    py_scores=torch.empty_like(candidate_scores)
+                    py_ids=torch.empty_like(candidate_ids)
+                    py_routing=torch.empty_like(candidate_routing)
+                    compiled[n](xp,wp,ptr(py_scores,cutlass.Float32),cutlass.Int32(rows),current_cuda_stream())
+                    assert select(*[t.data_ptr() for t in (py_scores,b,bv,mask,py_ids,py_routing)],rows,n,torch.cuda.current_stream().cuda_stream)==0
+                    assert torch.equal(candidate_scores,py_scores)
+                    assert torch.equal(candidate_ids,py_ids)
+                    assert torch.equal(candidate_routing,py_routing)
                     record['mutations'][-1]['native_dispatch_exact']=True
                 if not ids_exact:
                     changed=(candidate_ids!=ref_ids).any(dim=1).nonzero().flatten()

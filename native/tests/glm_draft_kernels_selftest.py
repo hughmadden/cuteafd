@@ -4,6 +4,11 @@ Usage: python native/tests/glm_draft_kernels_selftest.py /path/to/libcuteafd_nat
            [--head SHARD.safetensors] [--head-shape VOCAB WIDTH] [--head-only]
            [--head-rows 8,64] [--profile-head] [--quick]
            [--mimo-forward SNAPSHOT/dflash --fp8-rows 8,64 --profile-mimo --fp8-baseline LIB]
+           [--attention-only --attention-partition-arm LABEL=LIB ...]
+
+The opt-in partition profile expects d128 and d64 DFlash2 attention/workspace
+symbols in every library. It reports launch-inclusive eager CUDA-event medians
+for a bounded geometry/concurrency/context matrix; it does not change policy.
 
 Run with Python containing CUDA PyTorch, on one GPU.
 
@@ -105,6 +110,67 @@ def top16(logits):
     key = rounded.double() * 2.0 ** 20 - index / 2.0 ** 18
     return torch.topk(key, 16, dim=1).indices
 
+
+
+def topk_check(lib, args):
+    """Exact old-library bytes, row invariance, tails, ties and bounded timing."""
+    baseline = bind(args.topk_baseline) if args.topk_baseline else None
+    stream = torch.cuda.current_stream().cuda_stream
+    torch.manual_seed(923)
+    results = []
+    # GLM/Flash, Kimi, MiMo, Muse, then enough entries/thread to exercise
+    # discarding local candidates beyond the register top-16.
+    for vocab in (154880, 163840, 152576, 196608, 196609, 202048, 1000000, 16, 17):
+        logits = torch.randint(-128, 129, (16, vocab), device="cuda").float() / 16
+        logits[:, -1] = 32
+        logits[:, max(0, vocab - 257)] = 32
+        if vocab == 1000000:
+            # More than 16 winners owned by one thread in one chunk.
+            logits[:, torch.arange(31, device="cuda") * 256] = 40
+        wanted = torch.argsort(logits[1::2].to(torch.bfloat16).float(), dim=1,
+                               descending=True, stable=True)[:, :16]
+        singleton = []
+        for row in range(8):
+            values, ids, _ = launch_topk(lib, logits[row * 2:row * 2 + 2], 1, vocab, stream)
+            singleton.append((values.clone(), ids.clone()))
+        for rows in (1, 4, 8):
+            values, ids, launch = launch_topk(lib, logits, rows, vocab, stream)
+            torch.cuda.synchronize()
+            assert torch.equal(ids.long(), wanted[:rows]), ("top-k oracle", vocab, rows)
+            assert torch.equal(values, logits[1:2 * rows:2].gather(1, ids.long()).to(torch.bfloat16).float())
+            for row in range(rows):
+                assert torch.equal(ids[row], singleton[row][1][0]), ("row ids", vocab, rows, row)
+                assert torch.equal(values[row].view(torch.int32), singleton[row][0][0].view(torch.int32)), (
+                    "row bytes", vocab, rows, row)
+            entry = dict(vocab=vocab, rows=rows, oracle=True, row_invariant=True)
+            if baseline is not None and vocab <= 196608:
+                old_values, old_ids, old_launch = launch_topk(baseline, logits, rows, vocab, stream)
+                torch.cuda.synchronize()
+                assert torch.equal(ids, old_ids), ("old/new ids", vocab, rows)
+                assert torch.equal(values.view(torch.int32), old_values.view(torch.int32)), (
+                    "old/new value bytes", vocab, rows)
+                entry["old_byte_identical"] = True
+            if vocab in (154880, 202048):
+                entry["candidate_ms"] = timed(launch, 20)
+                if baseline is not None and vocab <= 196608:
+                    entry["old_ms"] = timed(old_launch, 20)
+                    entry["candidate_over_old"] = entry["candidate_ms"] / entry["old_ms"]
+            results.append(entry)
+            print("topk:", json.dumps(entry, sort_keys=True), flush=True)
+    print("topk-summary:", json.dumps(results, sort_keys=True), flush=True)
+
+
+def launch_topk(lib, logits, rows, vocab, stream):
+    values = torch.empty((rows, 16), device="cuda", dtype=torch.float32)
+    ids = torch.empty((rows, 16), device="cuda", dtype=torch.int32)
+    workspace = torch.empty(lib.cuteafd_glm_dflash_topk_workspace(rows), device="cuda", dtype=torch.uint8)
+
+    def launch():
+        assert lib.cuteafd_glm_dflash_topk(logits.data_ptr(), values.data_ptr(), ids.data_ptr(),
+            workspace.data_ptr(), rows, 2, 1, vocab, stream) == 0
+
+    launch()
+    return values, ids, launch
 
 def head_bf16_interval(value, epsilon):
     """Possible selector values at a BF16 midpoint within the FP64 error bound."""
@@ -840,9 +906,73 @@ def attention_check(lib, args):
                   f"median_ms={median:.6f} baseline_ms={old_median} arena_bytes={arena}")
 
 
+def partition_profile(args):
+    """Opt-in bounded CUDA-event timing; production partition policy is not modified."""
+    from draft_kv_selftest import pack
+    arms = [("baseline", args.library)] + [item.split("=", 1) for item in args.attention_partition_arm]
+    libraries = []
+    for label, path in arms:
+        lib = C.CDLL(path)
+        for dim in (64, 128):
+            suffix = "_d64" if dim == 64 else ""
+            fn = getattr(lib, "cuteafd_glm_dflash_attention" + suffix + "_fp8")
+            fn.argtypes, fn.restype = [P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32
+            ws = getattr(lib, "cuteafd_glm_dflash_attention_workspace" + suffix)
+            ws.argtypes, ws.restype = [C.c_int32] * 3, C.c_uint64
+        libraries.append((label, lib))
+    torch.manual_seed(945)
+    print("dim,heads,kv_heads,sequences,context,window,arm,median_us,cost_pct", flush=True)
+    for dim, heads, kvh in ((128, 64, 8), (64, 128, 16)):
+        suffix = "_d64" if dim == 64 else ""
+        for sequences in (1, 4, 16):
+            for context in (0, 32, 128, 512, 1024, 2048):
+                block, ring = 8, max(64, context + 17)
+                q = torch.randn(sequences, block, heads, dim, device="cuda").bfloat16()
+                k = torch.randn(sequences, block, kvh, dim, device="cuda").bfloat16()
+                v = torch.randn_like(k)
+                kr = pack(torch.randn(sequences * ring, kvh, dim, device="cuda").bfloat16())
+                vr = pack(torch.randn(sequences * ring, kvh, dim, device="cuda").bfloat16())
+                slots = torch.arange(sequences, device="cuda", dtype=torch.int32)
+                lengths = torch.full_like(slots, context)
+                ends = torch.full_like(slots, 2 * ring + context + 13)
+                launches, storage = [], []
+                native_stream = torch.cuda.current_stream().cuda_stream
+                for label, lib in libraries:
+                    fn = getattr(lib, "cuteafd_glm_dflash_attention" + suffix + "_fp8")
+                    size = getattr(lib, "cuteafd_glm_dflash_attention_workspace" + suffix)(sequences, kvh, context + block)
+                    scratch = torch.empty(size, device="cuda", dtype=torch.uint8)
+                    out = torch.empty_like(q)
+                    def launch(fn=fn, out=out, scratch=scratch, label=label):
+                        status = fn(q.data_ptr(), k.data_ptr(), v.data_ptr(), kr.data_ptr(), vr.data_ptr(),
+                            slots.data_ptr(), lengths.data_ptr(), ends.data_ptr(), out.data_ptr(), scratch.data_ptr(),
+                            sequences, block, heads, kvh, ring, context + block, 2048, dim ** -.5,
+                            native_stream)
+                        assert status == 0, (label, status)
+                    launch()
+                    torch.cuda.synchronize()
+                    launches.append((label, launch))
+                    storage.append((scratch, out))
+                # Interleave event-timed native launches within one session.
+                samples = {label: [] for label, _ in launches}
+                for repeat in range(7):
+                    for label, launch in (launches if repeat % 2 == 0 else launches[::-1]):
+                        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        a.record()
+                        for _ in range(32):
+                            launch()
+                        b.record()
+                        b.synchronize()
+                        samples[label].append(a.elapsed_time(b) * 1000 / 32)
+                baseline = sorted(samples["baseline"])[3]
+                for label, _ in launches:
+                    median = sorted(samples[label])[3]
+                    print(f"{dim},{heads},{kvh},{sequences},{context},2048,{label},{median:.6f},{100*(median/baseline-1):.3f}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
+    parser.add_argument("--topk-baseline", help="sealed old library for exact top-k byte comparison")
     parser.add_argument("--head", help="checkpoint shard holding lm_head.weight (default: a synthetic head)")
     parser.add_argument("--head-input", action="append", help="actual BF16 final-norm row dump; may repeat")
     parser.add_argument("--head-shape", nargs=2, type=int, metavar=("VOCAB", "WIDTH"),
@@ -862,10 +992,22 @@ def main():
     parser.add_argument("--profile-mimo", action="store_true", help="NVTX-labelled native forward after checks")
     parser.add_argument("--quick", action="store_true", help="three GEMM shapes, fewer timing runs")
     group = parser.add_mutually_exclusive_group()
+    group.add_argument("--topk-only", action="store_true", help="shared selector oracle, old-library bytes and timing")
     group.add_argument("--skip-head", action="store_true")
     group.add_argument("--head-only", action="store_true", help="skip unrelated FP8 checks")
     group.add_argument("--attention-only", action="store_true", help="shared attention FP64 masks/tails and capacity gate")
+    parser.add_argument("--attention-partition-arm", action="append", default=[], metavar="LABEL=LIB",
+                        help="opt-in bounded partition timing; repeat for at most three candidate libraries")
     args = parser.parse_args()
+    if args.attention_partition_arm:
+        if not args.attention_only or len(args.attention_partition_arm) > 3 or any(
+                "=" not in item or not all(item.split("=", 1)) for item in args.attention_partition_arm):
+            parser.error("partition timing requires --attention-only and one to three LABEL=LIB arms")
+        labels = [item.split("=", 1)[0] for item in args.attention_partition_arm]
+        if "baseline" in labels or len(set(labels)) != len(labels):
+            parser.error("partition arm labels must be distinct and not baseline")
+        partition_profile(args)
+        return
     try:
         args.head_rows = [int(value) for value in args.head_rows.split(",")]
     except ValueError:
@@ -873,7 +1015,7 @@ def main():
     if not args.head_rows or any(rows < 1 or rows > 128 for rows in args.head_rows):
         parser.error("--head-rows must be in [1,128]")
     vocab, width = args.head_shape
-    if vocab < 1 or vocab > 64 * 12 * 256 or width < 256 or width > 6336 or width % 256:
+    if vocab < 16 or vocab > 2147483647 or width < 256 or width > 6336 or width % 256:
         parser.error("head shape requires a supported vocabulary and width: multiple of 256, at most 6336")
     if args.attention_only and (args.profile_head or args.profile_fp8 or args.profile_mimo or args.mimo_forward):
         parser.error("--attention-only cannot combine with another profile or forward gate")
@@ -898,7 +1040,9 @@ def main():
         parser.error("--mimo-forward has its own profile range and cannot run separate head/FP8 checks")
     lib = bind(args.library)
     print(torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).multi_processor_count, "SMs")
-    if args.attention_only:
+    if args.topk_only:
+        topk_check(lib, args)
+    elif args.attention_only:
         attention_check(lib, args)
     elif args.mimo_forward:
         mimo_forward_check(lib, args)

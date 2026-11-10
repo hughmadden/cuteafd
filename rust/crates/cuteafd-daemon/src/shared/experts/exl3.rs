@@ -9,29 +9,18 @@ use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Residency};
 const JOBS_PER_EXPERT: usize = 9;
 const BANKS: usize = 2;
 pub(crate) mod execution;
+pub(crate) mod partial;
+#[cfg(test)]
+mod partial_screen;
 pub(crate) mod worker;
 
-/// EXL3 package directory name for one decoder-tier family: V4.1 keeps
-/// `exl3-k<tiers>`; other expert geometries ship as `exl3-<family>-k<tiers>`
-/// (for example `exl3-dsv4p-k23`), so one image can carry several models.
+/// Family-qualified package name for one decoder-tier pair.
 pub(crate) fn package_name(family: &str, tiers: &[usize]) -> String {
     let tag: String = tiers.iter().map(usize::to_string).collect();
-    if family == "v41" {
-        format!("exl3-k{tag}")
-    } else {
-        format!("exl3-{family}-k{tag}")
-    }
+    format!("exl3-{family}-k{tag}")
 }
 
-/// Resolve one EXL3 AOT layout directory for the running checkpoint.
-///
-/// v7 images ship decoder-tier families side by side under
-/// `<libdir>/exl3/exl3-k<tiers>/<layout>`; older images keep a single
-/// family at the legacy `<libdir>/exl3/<layout>`. The checkpoint's decoder
-/// tiers select the matching family first; otherwise the legacy location
-/// is returned and the downstream module-info bits check reports any
-/// mismatch with the checkpoint. Other expert geometries resolve only their
-/// own `exl3-<family>-k<tiers>` package, never the legacy V4.1 location.
+/// Resolve the checkpoint family's exact decoder-tier package and layout.
 pub(crate) fn aot_layout_directory(
     native_lib: &std::path::Path,
     tiers: &[usize],
@@ -42,20 +31,19 @@ pub(crate) fn aot_layout_directory(
         .unwrap_or(std::path::Path::new("."))
         .join("exl3");
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
-    if !tiers.is_empty() {
-        let package = root.join(package_name(family, tiers)).join(layout);
-        if package.is_dir() || family != "v41" {
-            return package;
-        }
-    }
-    root.join(layout)
+    root.join(package_name(family, tiers)).join(layout)
 }
 
 pub(crate) struct Exl3Weights<'a> {
     buffers: Vec<WeightBuffer>,
-    _arena: DeviceAllocation<'a>,
+    _arena: ArenaOwner<'a>,
     pub(crate) layout: V41Exl3Residency,
     pub(crate) budget: ExpertLoadBudget,
+}
+
+enum ArenaOwner<'a> {
+    Mount(DeviceAllocation<'a>),
+    Push { _rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>> },
 }
 
 struct WeightBuffer { buffer: CuteafdDeviceBuffer }
@@ -76,8 +64,8 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
         // directly. The two- and four-rank native layers stay untouched above.
         ExpertLayer::BackboneExl3Tp { layer, rank, world } => {
             ensure!(
-                (1..=6).contains(&world) && rank < world,
-                "EXL3 Spark shards require TP1..6 and rank below world, got TP{world} rank {rank}"
+                (1..=8).contains(&world) && rank < world,
+                "EXL3 Spark shards require TP1..8 and rank below world, got TP{world} rank {rank}"
             );
             (V41Exl3Layer::Backbone(layer), world, rank)
         }
@@ -91,12 +79,12 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
     })
 }
 
-fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
+pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
+    let spark = matches!(layer, ExpertLayer::BackboneExl3Tp { .. });
     let (layer, world, rank) = residency_selection(layer)?;
-    catalog
-        .exl3()
-        .context("EXL3 residency requires a routed EXL3 checkpoint")?
-        .residency(layer, world, rank)
+    let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
+    if spark { catalog.exl3_spark_residency(layer, world, rank) }
+        else { manifest.residency(layer, world, rank) }
 }
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
@@ -116,11 +104,12 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
         .map(|b| b.initial_words.len() * 4)
         .max()
         .unwrap_or(0);
-    // Batch 64 source rows per pread, matching the native FP4 loader policy.
+    // Admit a fabric-bandwidth-delay window in pageable host RAM.
     let scratch = plan
         .scratch_bytes(catalog)?
         .checked_mul(64)
-        .context("EXL3 scratch overflow")?;
+        .context("EXL3 scratch overflow")?
+        .max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES);
     Ok(ExpertLoadBudget {
         resident_bytes: arena_layout(plan)?.1,
         device_staging_bytes: 0,
@@ -130,13 +119,36 @@ fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<Exper
 }
 
 impl<'a> Exl3Weights<'a> {
-    pub(crate) fn resident_bytes(&self) -> usize { self._arena.buffer.bytes }
+    pub(crate) fn resident_bytes(&self) -> usize {
+        match &self._arena {
+            ArenaOwner::Mount(arena) => arena.buffer.bytes,
+            ArenaOwner::Push { .. } => self.budget.resident_bytes,
+        }
+    }
+
+    pub(crate) fn from_push(
+        rank: std::rc::Rc<crate::shared::memory::weight_arena::ReadyArena<'a>>,
+        region: usize, layout: V41Exl3Residency, mut budget: ExpertLoadBudget,
+    ) -> Result<Self> {
+        let owner = rank.region(region)?;
+        let (offsets, bytes) = layout.device_arena_layout()?;
+        ensure!(bytes == budget.resident_bytes && owner.buffer().bytes == bytes,
+            "pushed EXL3 region differs from admission");
+        let buffers = layout.buffers.iter().zip(offsets).map(|(spec, offset)| {
+            Ok(WeightBuffer { buffer: owner.subregion(offset, spec.bytes.max(16))?.buffer() })
+        }).collect::<Result<Vec<_>>>()?;
+        // The push ring and validation image are gone before execution inventory.
+        budget.device_staging_bytes = 0;
+        budget.pinned_host_bytes = 0;
+        budget.read_scratch_bytes = 0;
+        Ok(Self { buffers, _arena: ArenaOwner::Push { _rank: rank }, layout, budget })
+    }
 
     pub(crate) fn plan(
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
     ) -> Result<ExpertLoadBudget> {
-        budget(catalog, &layout(catalog, layer)?)
+        budget(catalog, &planned_residency(catalog, layer)?)
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -166,7 +178,7 @@ impl<'a> Exl3Weights<'a> {
         for &layer in layers {
             let mut pinned = 0;
             for rank in 0..2 {
-                let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
+                let plan = planned_residency(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
                 let budget = budget(catalog, &plan)?;
                 ensure!(budget.peak_device_bytes()? <= remaining[rank], "paired EXL3 admission exceeded");
                 remaining[rank] -= budget.resident_bytes;
@@ -188,7 +200,7 @@ impl<'a> Exl3Weights<'a> {
                         buffer.bytes = spec.bytes.max(16);
                         WeightBuffer { buffer }
                     }).collect();
-                    weights[rank].push(Self { buffers, _arena: arena, layout: plan, budget });
+                    weights[rank].push(Self { buffers, _arena: ArenaOwner::Mount(arena), layout: plan, budget });
                     Ok(())
                 })?;
             }
@@ -290,7 +302,7 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
-        let layout = layout(catalog, layer)?;
+        let layout = planned_residency(catalog, layer)?;
         let budget = budget(catalog, &layout)?;
         ensure!(
             budget.peak_device_bytes()? <= available_device_bytes,
@@ -435,7 +447,7 @@ impl<'a> Exl3Weights<'a> {
             "EXL3 expert load timeline");
         Ok(Self {
             buffers,
-            _arena: arena,
+            _arena: ArenaOwner::Mount(arena),
             layout,
             budget,
         })
@@ -447,8 +459,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn larger_read_windows_preserve_device_and_pinned_admission() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(1, 4);
+        let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+            || tensor.0.contains(".experts.0.")).collect();
+        let mut config = qwen4_config(1);
+        config["text_config"]["num_experts"] = serde_json::json!(1);
+        config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+        write_snapshot(root.path(), &config, &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for rank in 0..2 {
+            let plan = planned_residency(&catalog,
+                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 2 })?;
+            let actual = budget(&catalog, &plan)?;
+            let staging = plan.loads.chunks(JOBS_PER_EXPERT)
+                .map(|jobs| jobs.iter().map(|job| job.bytes).sum::<usize>()).max().unwrap_or(0);
+            let init = plan.buffers.iter().map(|buffer| buffer.initial_words.len() * 4).max().unwrap_or(0);
+            assert_eq!(actual.resident_bytes, arena_layout(&plan)?.1);
+            assert_eq!(actual.device_staging_bytes, 0);
+            assert_eq!(actual.pinned_host_bytes, staging.max(init) * EXPERT_READ_LANES * BANKS);
+            let previous = plan.scratch_bytes(&catalog)? * 64 * EXPERT_READ_LANES * BANKS;
+            assert_eq!(actual.read_scratch_bytes,
+                previous.max(cuteafd_loader::EXPERT_READ_WINDOW_BYTES * EXPERT_READ_LANES * BANKS));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn declared_shard_residency_selection_admits_whole_experts() -> Result<()> {
-        for world in 1..=6 {
+        for world in 1..=8 {
             for rank in 0..world {
                 let (layer, selected_world, selected_rank) = residency_selection(
                     ExpertLayer::BackboneExl3Tp { layer: 7, rank, world })?;
@@ -457,7 +498,7 @@ mod tests {
             }
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: world, world }).is_err());
         }
-        for world in [0, 7, 8, 9] {
+        for world in [0, 9] {
             assert!(residency_selection(ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world }).is_err());
         }
         assert!(matches!(residency_selection(ExpertLayer::BackboneTp2 { layer: 7, rank: 1 })?,
@@ -468,12 +509,31 @@ mod tests {
     }
 
     #[test]
+    fn qwen_coordinator_tp2_keeps_legacy_residency_while_sparks_use_compact() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(1, 4);
+        write_snapshot(root.path(), &qwen4_config(1), &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for rank in 0..2 {
+            let coordinator = planned_residency(&catalog, ExpertLayer::BackboneTp2 { layer: 0, rank })?;
+            let legacy = catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 2, rank)?;
+            assert_eq!(serde_json::to_value(&coordinator)?, serde_json::to_value(&legacy)?);
+            assert!(coordinator.unit_map.is_none());
+            let spark = planned_residency(&catalog,
+                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 2 })?;
+            assert!(spark.unit_map.is_some());
+            assert_eq!(spark.aot_layout(), format!("tp2-compact-rank{rank}"));
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_EXL3_SNAPSHOT and CUDA memory for one TP4 layer"]
     fn compressed_layer_uploads_match_staged_bytes() -> Result<()> {
         let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
         library.cuda_set_device(0)?;
-        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?),
-        )?;
+        let catalog = cuteafd_loader::read_expert_catalog(std::path::Path::new(&std::env::var("CUTEAFD_EXL3_SNAPSHOT")?))?;
         let rank = std::env::var("CUTEAFD_EXL3_TEST_RANK").unwrap_or_else(|_| "2".into()).parse()?;
         let layer = ExpertLayer::Backbone { layer: 0, rank };
         let planned = Exl3Weights::plan(&catalog, layer)?;

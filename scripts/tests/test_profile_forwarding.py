@@ -86,15 +86,14 @@ def test_census_carries_the_startup_memory_probe_and_nothing_else_does():
 
 def test_family_launch_census_probe_reaches_coordinator_and_workers_only_when_asked(tmp_path):
     prof = tmp_path / 'prof'
-    config = 'GLM5_FLASH_FP8_MODEL_ID=off\n'
     (tmp_path / 'plain').mkdir()
     (tmp_path / 'census').mkdir()
-    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', config)
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', '')
     assert plain.returncode == 0, plain.stderr
     assert 'CUTEAFD_STARTUP_MEMORY_PROBE' not in plain.stderr
     assert 'CUTEAFD_PROFILE' not in plain.stderr
     census = _family_launch_result(tmp_path / 'census', GLMF_TWO_LAYER, 'test/glmf',
-                                   config + f'PROFILE=census\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=census\nPROFILE_DIR={prof}\n')
     assert census.returncode == 0, census.stderr
     lines = census.stderr.splitlines()
     coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
@@ -114,7 +113,7 @@ def test_v41_native_census_probes_cover_all_card_sizes():
     assert phase.index('crate::shared::inventory::startup_probe(') < phase.index('if device_total <= 32usize << 30')
     assert 'if small_card { admission::startup_phase(' not in single
     for stage in ('context', 'before native preload', 'after native preload', 'startup',
-                  'workspace:backbone-lanes', 'weights:head', 'drafter', 'vision',
+                  'workspace:decode-lanes', 'workspace:prefill-slots', 'weights:head', 'drafter', 'vision',
                   'prefix-snapshots', 'kv', 'local-experts', 'ready'):
         assert f'admission::startup_phase(&lib, "v41/{stage}", device_total)?;' in single
     assert single.index('"v41/before native preload"') < single.index('RuntimeInventory::measure(')
@@ -183,6 +182,43 @@ def test_nsys_wraps_the_coordinator_paused_into_profile_dir():
     assert docker == ['--stop-signal', 'SIGINT', '--stop-timeout', '300', '--label', 'cuteafd.graceful-stop=1']
 
 
+def test_nsys_cpu_sampling_is_opt_in(monkeypatch):
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'on')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert '--sample=process-tree' in wrapper and '--cpuctxsw=process-tree' in wrapper and '--sample=none' not in wrapper
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_CPU', 'maybe')
+    out, _, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode != 0 and 'PROFILE_NSYS_CPU must be on or off' in out.stderr
+
+
+def test_nsys_graph_trace_defaults_to_nodes_and_accepts_graphs(monkeypatch):
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', raising=False)
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert '--cuda-graph-trace=node' in wrapper
+    for value in ('node', 'graph'):
+        monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', value)
+        out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+        assert out.returncode == 0, out.stderr
+        assert [arg for arg in wrapper if arg.startswith('--cuda-graph-trace=')] == [f'--cuda-graph-trace={value}']
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'maybe')
+    out, _, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE must be node or graph' in out.stderr
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'graph')
+    out, _, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE needs PROFILE=nsys' in out.stderr
+
+
+def test_family_launch_forwards_nsys_graph_trace(tmp_path):
+    prof = tmp_path / 'prof'
+    out = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
+                               f'PROFILE=nsys\nPROFILE_DIR={prof}\nPROFILE_NSYS_GRAPH_TRACE=graph\n')
+    assert out.returncode == 0, out.stderr
+    assert '--cuda-graph-trace=graph' in out.stderr
+    assert '--cuda-graph-trace=node' not in out.stderr
+
+
 def test_nsys_gpu_metrics_samples_the_named_devices():
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
     assert out.returncode == 0, out.stderr
@@ -217,13 +253,13 @@ def test_ncu_wraps_with_filter_count_and_set():
 
 
 @pytest.mark.parametrize('args,message', [
-    (('nsys', '/data/prof', 'kiwi', 'spark'), 'wraps the coordinator only'),
-    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'wraps the coordinator only'),
+    (('nsys', '/data/prof', 'kiwi', 'spark'), 'a Spark worker takes PROFILE_SPARK'),
+    (('ncu', '/data/prof', 'kiwi', 'spark', 'gemm'), 'a Spark worker takes PROFILE_SPARK'),
     (('ncu', '/data/prof', 'raptor', 'coordinator'), 'PROFILE=ncu needs PROFILE_NCU_KERNEL'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'a b'), 'must not contain whitespace'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '0'), 'PROFILE_NCU_COUNT must be'),
     (('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm', '5', 'Full;x'), 'PROFILE_NCU_SET must be'),
-    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
+    (('nsys', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'NCU_KERNEL/COUNT/SET/SKIP need PROFILE=ncu'),
     (('census', '/data/prof', 'raptor', 'coordinator', 'gemm'), 'need PROFILE=ncu'),
 ])
 def test_wrapper_refuses_bad_values(args, message):
@@ -316,12 +352,13 @@ release_profile_exec "$@"
 @pytest.mark.parametrize('profile,directory,message', [
     ('census,flamegraph', '', 'unknown PROFILE switch flamegraph'),
     ('census;rm', '', 'PROFILE must be a comma list'),
-    ('', '/data/prof', 'PROFILE_DIR needs PROFILE'),
+    ('', '/data/prof', 'PROFILE_DIR needs PROFILE or PROFILE_SPARK'),
     ('census', 'relative', 'PROFILE_DIR must be an absolute directory'),
     ('nsys', '', 'PROFILE=nsys needs PROFILE_DIR'),
     ('ncu', '', 'PROFILE=ncu needs PROFILE_DIR'),
     ('nsys,ncu', '/data/prof', 'nsys or ncu, not both'),
     ('expert-routes', '', 'PROFILE=expert-routes needs PROFILE_DIR'),
+    ('route-census', '', 'PROFILE=route-census needs PROFILE_DIR'),
 ])
 def test_helper_refuses_bad_values(profile, directory, message):
     out = _helper(profile, directory, 'kiwi')
@@ -331,7 +368,7 @@ def test_helper_refuses_bad_values(profile, directory, message):
 def test_family_launch_forwards_profile_to_coordinator_and_each_worker(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=transport-timing,expert-timing,draft-timing\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=transport-timing,expert-timing,draft-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     coordinator = next(line for line in lines if 'cuteafd serve-glmf' in line)
@@ -348,7 +385,7 @@ def test_family_launch_forwards_profile_to_coordinator_and_each_worker(tmp_path)
 def test_family_launch_wraps_only_the_coordinator_under_nsys(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=nsys,expert-timing\nPROFILE_DIR={prof}\n')
+                                   f'PROFILE=nsys,expert-timing\nPROFILE_DIR={prof}\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     workers = [line for line in lines if 'cuteafd expertd-native' in line]
@@ -369,13 +406,13 @@ def test_family_launch_wraps_only_the_coordinator_under_nsys(tmp_path):
 
 def test_family_launch_ncu_without_filter_fails_closed(tmp_path):
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=ncu\nPROFILE_DIR={tmp_path / "prof"}\n')
+                                   f'PROFILE=ncu\nPROFILE_DIR={tmp_path / "prof"}\n')
     assert result.returncode != 0 and 'PROFILE=ncu needs PROFILE_NCU_KERNEL' in result.stderr
     assert 'cuteafd serve-glmf' not in result.stderr
 
 
 def test_family_launch_without_profile_adds_nothing(tmp_path):
-    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', 'GLM5_FLASH_FP8_MODEL_ID=off\n')
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf', '')
     assert result.returncode == 0, result.stderr
     assert 'CUTEAFD_PROFILE' not in result.stderr and 'CUTEAFD_EXPERT_TIMING' not in result.stderr
 
@@ -391,7 +428,7 @@ def test_v41_worker_takes_profile_args_after_every_positional():
     assert len(positional) == 16
     for tail, expected in [([], []), (['--profile-args', '-e', 'CUTEAFD_EXPERT_TIMING=1', '-e', 'CUTEAFD_PROFILE_HOST=emu'],
                                       ['CUTEAFD_EXPERT_TIMING=1', 'CUTEAFD_PROFILE_HOST=emu'])]:
-        result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote.replace(' >/dev/null', ''),
+        result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote.replace(' >/dev/null', ''),
                                  'test', *positional, *tail], cwd=ROOT, text=True, capture_output=True)
         assert result.returncode == 0, result.stderr
         arguments = result.stdout.splitlines()
@@ -441,10 +478,38 @@ def test_expert_routes_switch_and_its_sample_cap():
         assert out.returncode != 0 and message in out.stderr, (profile, sample, out.stderr)
 
 
+def test_route_census_switch_names_the_census_file(monkeypatch):
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', raising=False)
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', raising=False)
+    out = _helper('route-census', '/data/prof', 'host0')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[:-1] == ['-e', 'CUTEAFD_V41_ROUTE_CENSUS=/data/prof/route-census-host0.json',
+        '-e', 'CUTEAFD_PROFILE_HOST=host0', '-v', '/data/prof:/data/prof', '-e', 'CUTEAFD_PROFILE_DIR=/data/prof']
+    monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', '200')
+    out = _helper('route-census', '/data/prof', 'host0')
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split('\n')[2:4] == ['-e', 'CUTEAFD_V41_ROUTE_CENSUS_STEPS=200']
+    for steps in ('0', '-5', 'ten'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', steps)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode != 0 and 'must be a positive decode step count' in out.stderr, steps
+    # The trace window is forwarded likewise; 0 turns the trace off.
+    monkeypatch.delenv('CUTEAFD_V41_ROUTE_CENSUS_STEPS', raising=False)
+    for window in ('0', '16'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', window)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode == 0, out.stderr
+        assert out.stdout.split('\n')[2:4] == ['-e', f'CUTEAFD_V41_ROUTE_CENSUS_WINDOW={window}']
+    for window in ('-1', '08', 'many'):
+        monkeypatch.setenv('CUTEAFD_V41_ROUTE_CENSUS_WINDOW', window)
+        out = _helper('route-census', '/data/prof', 'host0')
+        assert out.returncode != 0 and 'must be a decode step count' in out.stderr, window
+
+
 def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_path):
     prof = tmp_path / 'prof'
     result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, 'test/glmf',
-                                   f'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE=expert-routes\nPROFILE_DIR={prof}\n'
+                                   f'PROFILE=expert-routes\nPROFILE_DIR={prof}\n'
                                    'PROFILE_EXPERT_INPUT_SAMPLE=16\n')
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
@@ -455,5 +520,5 @@ def test_family_launch_expert_routes_sample_reaches_only_the_coordinator(tmp_pat
     assert all('CUTEAFD_EXPERT_INPUT_SAMPLE' not in w for w in workers)
     (tmp_path / 'refused').mkdir()
     refused = _family_launch_result(tmp_path / 'refused', GLMF_TWO_LAYER, 'test/glmf',
-                                    'GLM5_FLASH_FP8_MODEL_ID=off\nPROFILE_EXPERT_INPUT_SAMPLE=16\n')
+                                    'PROFILE_EXPERT_INPUT_SAMPLE=16\n')
     assert refused.returncode != 0 and 'PROFILE_EXPERT_INPUT_SAMPLE needs PROFILE=expert-routes' in refused.stderr

@@ -7,18 +7,29 @@
 # (CUTEAFD_ENABLE_QWEN4_AOT, geometry "qwen4") share one table and manifest.
 # EXLR8 (CUTEAFD_ENABLE_EXLR8_AOT, geometry "exlr8") joins the same table last:
 # on SM120 the fork's coordinator programs beside the family programs, on SM121
-# (the Spark expert build) its routed serving programs alone.
+# (the Spark expert build) its routed serving programs.
+# SM121 builds the Spark programs only: the union of what the enabled expert
+# families need (EXLR8's routed serving programs, and the partial-reply
+# epilogue `expert_partial` for families listed in CUTEAFD_PARTIAL_REPLY_FAMILIES).
+# An sm_89 coordinator (DeepSeek V4.1, whose programs have their own exporters)
+# builds only the Spark reply reducers (`expert_reply`).
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
-   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT)
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
+   CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_ML4_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
 endif()
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_EXLR8_ROLE coordinator)
-elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS)
+elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND (CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS OR CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
+       AND NOT CUTEAFD_FAMILY_PROGRAMS)
   set(CUTEAFD_EXLR8_ROLE spark)
+elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "89" AND NOT CUTEAFD_FAMILY_PROGRAMS AND NOT CUTEAFD_ENABLE_EXLR8_AOT
+       AND NOT CUTEAFD_PARTIAL_REPLY_PROGRAMS)
+  set(CUTEAFD_EXLR8_ROLE coordinator)
 else()
-  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the EXLR8 Spark programs)")
+  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the Spark programs, "
+    "an sm_89 coordinator only the Spark reply reducers)")
 endif()
 set(CUTEAFD_PROGRAM_GEOMETRY "")
 if(CUTEAFD_ENABLE_DSV4_AOT)
@@ -72,11 +83,58 @@ if(CUTEAFD_ENABLE_STEP5_AOT)
   endif()
 endif()
 if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  # Kimi always packages the native K6 core programs; the runtime selects them
+  # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")
   endif()
+endif()
+if(CUTEAFD_ENABLE_MUSE_AOT)
+  # Muse: whole and head-split coordinator programs, the shared K6 core (by
+  # geometry) and the partial-reply epilogue (RTX-onboarded expert layers).
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "muse,muse2,expert_partial")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},muse,muse2,expert_partial")
+  endif()
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+endif()
+if(CUTEAFD_ENABLE_ML4_AOT)
+  # Mistral Large 4 (the GLM engine's ml4 variant): its own stage programs and
+  # the shared K6 core at its shapes (dense_trellis_k6 below).
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "ml4")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},ml4")
+  endif()
+endif()
+set(CUTEAFD_DENSE_TRELLIS_FAMILIES "")
+if(CUTEAFD_ENABLE_MUSE_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES muse)
+endif()
+if(CUTEAFD_ENABLE_KIMIK3_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES kimik3)
+endif()
+if(CUTEAFD_ENABLE_GLM_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES glm)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+  set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm_stage,glm2_stage")
+endif()
+if(CUTEAFD_ENABLE_ML4_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES ml4)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_GLM_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+endif()
+if(CUTEAFD_EXLR8_ROLE STREQUAL "spark" AND CUTEAFD_PARTIAL_REPLY_PROGRAMS)
+  # The Spark partial-reply epilogue (before EXLR8, which stays last).
+  set(CUTEAFD_PROGRAM_GEOMETRY "expert_partial")
 endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Last: every family program keeps its object and table index.
@@ -85,19 +143,75 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8")
   endif()
+  if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense")
+    if(NOT CUTEAFD_ENABLE_GLM_AOT)
+      set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm_stage,glm2_stage")
+    endif()
+  endif()
+endif()
+if(CUTEAFD_ENABLE_GLMF_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES glmf)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_GLM_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT AND NOT CUTEAFD_ENABLE_ML4_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+  set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glmf_stage,glmf2_stage")
+endif()
+if(CUTEAFD_ENABLE_STEP5_AOT)
+  # Step-5 EXL3 runs its K6 core and K4 MTP through the shared dense trellis
+  # programs; official FP8/NVFP4 releases select BF16 from their own headers.
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES step5)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_GLM_AOT AND NOT CUTEAFD_ENABLE_GLMF_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT AND NOT CUTEAFD_ENABLE_ML4_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
 string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
 if(NOT context_split_aot MATCHES "^(off|on|only)$")
   message(FATAL_ERROR "CUTEAFD_CONTEXT_SPLIT_AOT must be OFF, ON or ONLY")
 endif()
+if(context_split_aot STREQUAL "only")
+  # ONLY has no family/TP2/native companions; the exporter accepts K1 bases.
+  string(REPLACE "," ";" context_geometries "${CUTEAFD_PROGRAM_GEOMETRY}")
+  list(FILTER context_geometries INCLUDE REGEX "^(flash|pro|glm|glmf)$")
+  if(NOT context_geometries)
+    message(FATAL_ERROR "context-split ONLY requires flash, pro, glm or glmf")
+  endif()
+  list(JOIN context_geometries "," CUTEAFD_PROGRAM_GEOMETRY)
+endif()
+if(NOT context_split_aot STREQUAL "only")
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    if(CUTEAFD_EXPERT_FAMILIES OR CUTEAFD_FP8_EXPERT_FAMILIES OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR
+       CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES)
+      set(CUTEAFD_PROGRAM_GEOMETRY "expert_reply")
+    else()
+      message(FATAL_ERROR "Coordinator program geometry is empty")
+    endif()
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},expert_reply")
+  endif()
+endif()
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"
   --max-context "${CUTEAFD_DSV4_MAX_CONTEXT}" --context-split "${context_split_aot}")
+if(CUTEAFD_DENSE_TRELLIS_FAMILIES)
+  string(REPLACE ";" "," dense_trellis_families "${CUTEAFD_DENSE_TRELLIS_FAMILIES}")
+  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --dense-trellis-families "${dense_trellis_families}")
+endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Without EXLR8 the export arguments (and the stamp) are unchanged.
-  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")
+  if(NOT CUTEAFD_EXLR8_FAMILIES)
+    message(FATAL_ERROR "EXLR8 enabled without explicit family scope")
+  endif()
+  foreach(family IN LISTS CUTEAFD_EXLR8_FAMILIES)
+    if(NOT family MATCHES "^(glm|glmf)$")
+      message(FATAL_ERROR "unsupported EXLR8 family scope: ${family}")
+    endif()
+  endforeach()
+  string(REPLACE ";" "," exlr8_families "${CUTEAFD_EXLR8_FAMILIES}")
+  list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}"
+    --exlr8-family "${exlr8_families}")
 endif()
 set(stamp "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs.stamp")
 file(GENERATE OUTPUT "${stamp}" CONTENT "${CUTEAFD_DSV4_EXPORT_ARGS}\n")
@@ -116,6 +230,9 @@ add_custom_command(
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_dense_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dense_trellis_k6_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting coordinator programs (${CUTEAFD_PROGRAM_GEOMETRY})"
   VERBATIM)

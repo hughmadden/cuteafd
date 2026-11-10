@@ -1,6 +1,6 @@
 //! MiMo admission over its exact allocation profile. Both planner and runtime
 //! supply the same retained representations; only the GPU baseline differs.
-use crate::families::mimo_v2::{admission::headroom_bytes, MimoAttention, MimoKvCache, MimoV2Config};
+use crate::families::mimo_v2::{admission::headroom_bytes, MimoAttention, MimoKvFormats, MimoV2Config};
 use crate::placement::*;
 use crate::serving_capacity::{mimo_cache_geometry, CacheGeometryError};
 use cuteafd_core::memory_layout::{Basis, Category, Item};
@@ -13,7 +13,7 @@ pub struct MimoInputs<'a> {
     pub cfg: &'a MimoV2Config,
     pub profile: &'a CapacityProfile,
     pub layers: usize,
-    pub kv: MimoKvCache,
+    pub kv: MimoKvFormats,
     pub mtp_stages: usize,
     /// Physical totals and baselines, in logical rank order. MiMo samples
     /// before weights, so every retained representation is still a demand.
@@ -45,7 +45,7 @@ impl<'a> MimoInputs<'a> {
         let remote = working_set.includes(WorkingSetComponent::SparkExperts);
         MimoInputs { profile: if remote { self.profile } else { no_spark },
             spark_ranks: working_set.selected_ranks().len(),
-            lanes: if remote { working_set.prefill_lanes } else { 1 },
+            lanes: working_set.prefill_lanes,
             startup_probe_bytes: if remote { self.startup_probe_bytes } else { 0 },
             ..self.clone() }
     }
@@ -79,28 +79,16 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
         let remote = !spark_layers.is_empty();
         let working_set = SparkWorkingSet { rtx_layers: routed[..n].to_vec(), spark_layers,
             spark_ranks: if remote { inputs.spark_ranks } else { 0 },
-            prefill_lanes: if remote { inputs.lanes } else { 1 } };
+            prefill_lanes: inputs.lanes };
         let selected = inputs.selected(no_spark, &working_set);
         let result = (|| {
             let mut request = request(&selected)?;
             request.onboard = Onboard::Layers(n);
-            match inputs.onboard {
-                Onboard::Auto if inputs.spark_ranks > 0 => {
-                    request.pool.ceiling = request.pool.target;
-                    // Spark Auto may clamp serving context to a smaller pool;
-                    // fixed candidates must not introduce a new context floor.
-                    if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
-                }
-                Onboard::ExpertsFirst { pool_floor } => {
-                    request.pool.floor = request.pool.floor.max(request.pool.requested.unwrap_or(pool_floor));
-                    request.pool.ceiling = request.pool.target;
-                    // Preserve the shared solver's remote zero-prefix fallback
-                    // when context is larger than the experts-first floor.
-                    if remote && n == 0 && request.pool.requested.is_none() {
-                        request.pool.floor = pool_floor;
-                    }
-                }
-                _ => {}
+            if inputs.onboard == Onboard::Auto && inputs.spark_ranks > 0 {
+                request.pool.ceiling = request.pool.target;
+                // Spark Auto may clamp serving context to a smaller pool;
+                // fixed candidates must not introduce a new context floor.
+                if remote && request.pool.requested.is_none() { request.pool.floor = 0; }
             }
             if inputs.pool_ceiling_at_target && request.pool.requested.is_none() {
                 request.pool.ceiling = request.pool.target;
@@ -119,12 +107,9 @@ pub fn solve_working_set(inputs: &MimoInputs<'_>, no_spark: &CapacityProfile)
         })();
         match result {
             Ok(candidate) => {
-                let score = |solution: &MimoSolution| match inputs.onboard {
-                    Onboard::ExpertsFirst { .. } => (solution.placement.onboard_layers as u64,
-                        solution.placement.pool_tokens),
-                    _ => (solution.placement.pool_tokens.min(solution.request.pool.target),
-                        solution.placement.onboard_layers as u64),
-                };
+                let score = |solution: &MimoSolution| (
+                    solution.placement.pool_tokens.min(solution.request.pool.target),
+                    solution.placement.onboard_layers as u64);
                 if best.as_ref().is_none_or(|current| score(&candidate) > score(current)) {
                     best = Some(candidate);
                 }
@@ -168,11 +153,7 @@ pub fn spark_package_directory(lib: &std::path::Path, cfg: &MimoV2Config,
         ("mimo", ExpertFormat::Mxfp4) => "mimof",
         (family, _) => family,
     };
-    let root = lib.join("fp8");
-    let a4 = root.join(format!("fp8-{family}-nvfp4a4"));
-    let package = if format == ExpertFormat::Nvfp4
-        && std::env::var("CUTEAFD_NVFP4_ACTIVATIONS").as_deref() != Ok("a16") && a4.join(format!("tp{tp}")).is_dir() { a4 }
-        else { root.join(format!("fp8-{family}{}", format.package_suffix())) };
+    let package = lib.join("fp8").join(format.package_name(family));
     Ok(package.join(format!("tp{tp}")))
 }
 
@@ -205,7 +186,7 @@ mod tests {
             for lanes in [1, 2, 3] {
                 let payload = (rows * 8 * 4u64).div_ceil(16) * 32;
                 assert_eq!(route_exchange_bytes(rows, 8, lanes).unwrap(),
-                    lanes * 2 * payload.max(256) + ((lanes * 2 + 1) * 16).max(256) + 256);
+                    lanes * 2 * payload.max(256) + 2 * 64 * 8 * 8 + ((lanes * 2 + 3) * 16).max(256) + 256);
             }
         }
         for (rows, topk, lanes) in [(u64::MAX, 8, 3), (64, u64::MAX, 3), (64, 8, u64::MAX)] {
@@ -221,7 +202,7 @@ mod tests {
         cfg.dense = vec![true, false, false, false];
         cfg.attention = vec![MimoAttention::Full; 4];
         for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
             let profile = |spark| CapacityProfile {
                 context: ContextLimits { checkpoint_max_tokens: 1 << 20, compiled_index_max_tokens: None },
                 pool_unit_rows: cache.logical_unit_rows, host_prefix_bytes: 0,
@@ -235,7 +216,7 @@ mod tests {
             let local = profile(false);
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
-            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvCache::Int8,
+            let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &spark, layers: 4, kv: MimoKvFormats::default(),
                 mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
@@ -244,7 +225,7 @@ mod tests {
             let all = solve_working_set(&inputs, &local).unwrap();
             assert_eq!(all.placement.onboard_layers, 3);
             assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
-                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 1 });
+                spark_layers: vec![], spark_ranks: 0, prefill_lanes: 3 });
             assert!(all.working_set.includes(WorkingSetComponent::RtxExperts));
             assert!(!all.working_set.includes(WorkingSetComponent::SparkExperts));
             assert!(all.working_set.selected_ranks().is_empty());
@@ -262,11 +243,11 @@ mod tests {
             let configured_only = inputs.selected(&local, &SparkWorkingSet { spark_ranks: 6,
                 prefill_lanes: 3, ..SparkWorkingSet::default() });
             assert_eq!((configured_only.spark_ranks, configured_only.lanes,
-                configured_only.startup_probe_bytes), (0, 1, 0));
+                configured_only.startup_probe_bytes), (0, 3, 0));
             assert!(std::ptr::eq(configured_only.profile, &local));
             assert_eq!(resolved_capacity(&selected, &all.request, &all.placement, 16, 16).unwrap().devices[0]
                 .reservations[0].name, "workspace.local");
-            for onboard in [Onboard::Layers(2), Onboard::Fraction(2.0 / 3.0)] {
+            for onboard in [Onboard::Layers(2)] {
                 let partial = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
                 assert_eq!(partial.working_set.rtx_layers, vec![1, 2]);
                 assert_eq!(partial.working_set.spark_layers, vec![3]);
@@ -278,7 +259,7 @@ mod tests {
                 assert_eq!(partial.request.inventory.gpus[0].headroom_bytes, (96u64 << 30)
                     - (96u64 << 30) * 97 / 100 + (64 << 20));
             }
-            for onboard in [Onboard::Layers(3), Onboard::Fraction(1.0), Onboard::ExpertsFirst { pool_floor: 262144 }] {
+            for onboard in [Onboard::Layers(3)] {
                 let result = solve_working_set(&MimoInputs { onboard, ..inputs.clone() }, &local).unwrap();
                 assert_eq!(result.placement.onboard_layers, 3);
                 assert_eq!(result.working_set.spark_ranks, 0);
@@ -332,7 +313,7 @@ mod tests {
         cfg.dense = vec![true, false, false, false];
         cfg.attention = vec![MimoAttention::Full; 4];
         for ranks in [1, 2] {
-            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvCache::Int8, 0).unwrap();
+            let cache = mimo_cache_geometry(&cfg, 4, ranks, MimoKvFormats::default(), 0).unwrap();
             let mut drafts = vec![("draft.weights.fp8_values", 1400u64 << 20), ("draft.fp8_scratch", 16 << 20),
                 ("draft.layer0.k_ring", 32 << 20), ("workspace.local", 1 << 30)];
             let profile = CapacityProfile {
@@ -347,7 +328,7 @@ mod tests {
             let cost = ExpertCost { whole: Bytes2 { resident: 1 << 30, staging: 0 },
                 half: [Bytes2 { resident: 512 << 20, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true };
             for onboard in [Onboard::Auto, Onboard::Layers(2)] {
-                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvCache::Int8,
+                let inputs = MimoInputs { automatic_context: false, cfg: &cfg, profile: &profile, layers: 4, kv: MimoKvFormats::default(),
                     mtp_stages: 0, gpus: vec![(96 << 30, Baseline::Measured { free_bytes: 90 << 30 }); ranks],
                     headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
@@ -383,14 +364,19 @@ mod tests {
 
 /// Ready route exchange includes receive slots, control and abort words on each rank.
 pub fn route_exchange_bytes(rows: u64, topk: u64, lanes: u64) -> anyhow::Result<u64> {
-    let section = rows.checked_mul(topk).and_then(|bytes| bytes.checked_mul(4))
-        .ok_or_else(|| anyhow::anyhow!("MiMo route exchange overflow"))?;
-    let slots = lanes.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
-    let slot = section.div_ceil(16).checked_mul(32).ok_or_else(|| anyhow::anyhow!("MiMo route slot overflow"))?;
+    let slot = |rows: u64| -> anyhow::Result<u64> {
+        rows.checked_mul(topk).and_then(|n| n.checked_mul(4)).map(|n| n.div_ceil(16))
+            .and_then(|n| n.checked_mul(32)).map(|n| n.max(256))
+            .ok_or_else(|| anyhow::anyhow!("MiMo route slot overflow"))
+    };
+    let prefill_slots = lanes.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
+    let slots = prefill_slots.checked_add(2).ok_or_else(|| anyhow::anyhow!("MiMo route slots overflow"))?;
     let control = slots.checked_add(1).and_then(|words| words.checked_mul(16))
         .ok_or_else(|| anyhow::anyhow!("MiMo route control overflow"))?;
-    slots.checked_mul(slot.max(256)).and_then(|bytes| bytes.checked_add(control.max(256)))
-        .and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
+    let decode = slot(64)?.checked_mul(2).ok_or_else(|| anyhow::anyhow!("MiMo decode routes overflow"))?;
+    prefill_slots.checked_mul(slot(rows)?).and_then(|bytes| bytes.checked_add(decode))
+        .and_then(|bytes| bytes.checked_add(control.max(256))).and_then(|bytes| bytes.checked_add(256))
+        .ok_or_else(|| anyhow::anyhow!("MiMo route exchange bytes overflow"))
 }
 
 /// Keep the allocation names in the ready ledger; category mapping is shared
@@ -502,7 +488,7 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
             .max(if rank == 0 { inputs.startup_probe_bytes.saturating_add(capacity_bytes - capacity_bytes * 97 / 100) } else { 0 })
             .max(inputs.headroom_floor),
     }).collect();
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         pool_bounded: Vec::new(),
         inventory: Inventory { gpus, spark_ranks: inputs.spark_ranks, peer_access: ranks == 2 },
         pool,

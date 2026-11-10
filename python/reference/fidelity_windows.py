@@ -360,7 +360,8 @@ def validate_set(manifest: dict) -> dict:
         if w["bucket"] != bucket(start):
             raise ValueError("context bucket does not match first scored position")
         from fidelity_media import validate_media
-        validate_media(w.get("media", []), tokens, roles, start)
+        validate_media(w.get("media", []), tokens, roles, start, processor=manifest.get("image_processor"),
+                       audio_processor=manifest.get("audio_processor"))
     if not seen or len(set(manifest["quick_windows"])) != len(manifest["quick_windows"]) or not set(manifest["quick_windows"]) <= seen:
         raise ValueError("invalid quick subset")
     return manifest
@@ -370,7 +371,8 @@ def load_set(path: Path, family: str | None = None) -> dict:
     manifest = validate_set(json.loads(path.read_text()))
     if family is not None and manifest["family"] != family:
         raise ValueError(f"set family {manifest['family']} does not match {family}")
-    if (family is not None and family not in ("mimo_v2", "qwen4", "glm5_flash")
+    from fidelity_media import has_media_adapter
+    if (family is not None and not has_media_adapter(family)
             and any(w.get("media") for w in manifest["windows"])):
         raise ValueError(f"{family} golden does not support media; refusing text-only scoring")
     return manifest
@@ -516,6 +518,37 @@ def validate_qualification(proof: dict | None, manifest: dict, identity: dict) -
         required.update(score_from=start, lengths=[start + 512, start + 576])
     if any(proof.get(k) != v for k, v in required.items()):
         raise ValueError("reference prefix-invariance qualification failed or mismatched provenance")
+
+
+def validate_reference(meta: dict, manifest: dict) -> int:
+    """Admit either qualified tiled replay or explicit full-sequence official arithmetic."""
+    identity = meta.get("snapshot_identity")
+    if meta.get("geometry", "tiled") != "official-full":
+        if "official_full" in meta:
+            raise ValueError("official-full evidence requires explicit geometry")
+        validate_qualification(meta.get("prefix_qualification"), manifest, identity)
+        return meta["prefix_qualification"]["vocab"]
+    if any(k in meta for k in ("prefix_qualification", "fixed_rows", "official_forward")):
+        raise ValueError("official-full must not claim tiled qualification")
+    proof = meta.get("official_full")
+    if not isinstance(identity, dict) or not identity.get("snapshot_revision") or not isinstance(proof, dict):
+        raise ValueError("official-full lacks snapshot or geometry evidence")
+    expected = {"schema": "cuteafd.reference.official-full/1", "family": manifest["family"],
+                "set_sha256": manifest["set_sha256"], "snapshot_identity": identity,
+                "tiling": False, "head": "full-length",
+                "windows": {w["id"]: {"tokens": len(w["tokens"]),
+                    "tokens_sha256": hashlib.sha256(canonical(w["tokens"])).hexdigest()}
+                            for w in manifest["windows"]}}
+    layers = proof.get("layers")
+    if (type(layers) is not int or layers <= 0 or proof.get("completed_layers") != layers
+            or any(proof.get(k) != v for k, v in expected.items())
+            or not meta.get("source_pin") or meta.get("attention") != "eager"
+            or meta.get("use_cache") is not False or meta.get("mtp") is not False):
+        raise ValueError("official-full evidence is incomplete or mismatched")
+    vocabularies = {w.get("vocab") for w in meta.get("windows", [])}
+    if len(vocabularies) != 1 or not all(type(v) is int and v > 0 for v in vocabularies):
+        raise ValueError("official-full vocabulary differs")
+    return vocabularies.pop()
 
 
 def scored_logits_nll(logits: np.ndarray, tokens, positions, *, chunk_rows: int = 32) -> dict:

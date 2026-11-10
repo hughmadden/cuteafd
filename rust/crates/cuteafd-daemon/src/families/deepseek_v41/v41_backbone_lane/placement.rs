@@ -110,6 +110,28 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.tp2_output=Some(crate::families::deepseek_v41::v41_projection_tp2::Wave::new(weights,self.capacity as u32,owner,budgets)?);
         Ok(())
     }
+    pub(crate) fn enable_tp2_query_on_storage(&mut self,
+        weights: [&'w [crate::families::deepseek_v41::v41_projection_tp2::Weights<'a>]; 2],
+        storage: std::rc::Rc<crate::families::deepseek_v41::v41_projection_tp2::Storage<'a>>) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && self.weights.split_query_b && self.tp2_query.is_none(),
+            "query split storage requires an unused split lane");
+        let wave = crate::families::deepseek_v41::v41_projection_tp2::Wave::on_storage(weights, storage)?;
+        ensure!(wave.kind() == crate::families::deepseek_v41::v41_projection_tp2::Kind::QueryB
+            && wave.output_device().id == self.query.input().device_id
+            && wave.capacity() as usize == self.capacity, "query split storage geometry differs");
+        self.tp2_query = Some(wave); Ok(())
+    }
+    pub(crate) fn enable_tp2_output_on_storage(&mut self,
+        weights: [&'w [crate::families::deepseek_v41::v41_projection_tp2::Weights<'a>]; 2],
+        storage: std::rc::Rc<crate::families::deepseek_v41::v41_projection_tp2::Storage<'a>>) -> Result<()> {
+        ensure!(self.phase == Phase::Idle && self.weights.split_output_b && self.tp2_output.is_none(),
+            "output split storage requires an unused split lane");
+        let wave = crate::families::deepseek_v41::v41_projection_tp2::Wave::on_storage(weights, storage)?;
+        ensure!(wave.kind() == crate::families::deepseek_v41::v41_projection_tp2::Kind::OutputB
+            && wave.output_device().id == self.projection.input().device_id
+            && wave.capacity() as usize == self.capacity, "output split storage geometry differs");
+        self.tp2_output = Some(wave); Ok(())
+    }
     pub fn placed_workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         Self::placed_workspace_bytes_with_split(library,capacity,false,false)
     }

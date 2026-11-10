@@ -155,6 +155,7 @@ impl QuantOperand {
     /// and its tiling. E4M3 and E5M2, FP32 and E8M0 scales, uniform and
     /// segmented grids all label differently.
     pub fn label(&self) -> String {
+        if self.companions.iter().any(|s| s == "strided") { return "fp8-strided264/ue8m0".into(); }
         let element = match self.encoding {
             Encoding::Bf16 => return "bf16".into(),
             Encoding::F16 => return "f16".into(),
@@ -235,10 +236,11 @@ impl QuantOperand {
             })
     }
 
-    /// The EXL3 trellis bits per weight, if this is a (complete) EXL3 operand.
+    /// MCG trellis bits for the existing routed-expert kernel contracts.
+    /// Dense native loaders select their codebook independently from headers.
     pub fn exl3_bits(&self) -> Option<usize> {
         match self.encoding {
-            Encoding::Exl3 { bits } => Some(bits),
+            Encoding::Exl3 { bits } if !self.companions.iter().any(|s|s=="mul1") => Some(bits),
             _ => None,
         }
     }
@@ -283,6 +285,8 @@ fn scale_label(encoding: ScaleEncoding) -> &'static str {
 /// Suffixes that belong to the logical weight named by the stem before them.
 const SUFFIXES: &[&str] = &[
     "weight_scale_inv",
+    // Mistral consolidated checkpoints: FP32 block scales, w = q * s.
+    "qscale_weight",
     "weight_scale_2",
     "weight_scale",
     "input_scale",
@@ -302,7 +306,7 @@ const SUFFIXES: &[&str] = &[
 /// known suffix are their own stem.
 pub fn split_stem(name: &str) -> (&str, &str) {
     if let Some((stem, suffix)) = name.rsplit_once('.') {
-        if SUFFIXES.contains(&suffix) {
+        if SUFFIXES.contains(&suffix) || (suffix.strip_prefix("strided_").is_some_and(|part| part.len() == 5 && part.bytes().all(|b| b.is_ascii_digit())) && stem.ends_with(".engram.embed")) {
             return (stem, suffix);
         }
     }
@@ -311,6 +315,11 @@ pub fn split_stem(name: &str) -> (&str, &str) {
 
 /// Groups tensors by stem, keeping each group's members keyed by suffix.
 pub fn group_by_stem(tensors: &[CheckpointTensor]) -> BTreeMap<String, BTreeMap<String, &CheckpointTensor>> {
+    group_tensor_refs(tensors.iter())
+}
+
+pub(crate) fn group_tensor_refs<'a>(tensors: impl IntoIterator<Item = &'a CheckpointTensor>)
+    -> BTreeMap<String, BTreeMap<String, &'a CheckpointTensor>> {
     let mut groups: BTreeMap<String, BTreeMap<String, &CheckpointTensor>> = BTreeMap::new();
     for tensor in tensors {
         let (stem, suffix) = split_stem(&tensor.meta.name);
@@ -353,6 +362,27 @@ fn block_edge(dim: usize, scales: usize) -> Option<usize> {
 pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     let get = |suffix: &str| members.get(suffix).map(|tensor| &tensor.meta);
     let malformed = |tensor: &str, reason: String| Malformed { tensor: tensor.to_owned(), reason };
+    if members.keys().any(|suffix| suffix.starts_with("strided_")) {
+        let first = &members.values().next().expect("nonempty strided group").meta;
+        let mut rows = 0usize;
+        for (number, (suffix, tensor)) in members.iter().enumerate() {
+            let meta = &tensor.meta;
+            if suffix != &format!("strided_{number:05}") || meta.dtype != DType::U8
+                || meta.shape.len() != 2 || meta.shape[0] == 0 || meta.shape[1] != 264
+                || meta.byte_length != meta.shape[0] as u64 * 264 {
+                return Err(malformed(&meta.name, "strided engram requires contiguous U8 [part_rows, 264] parts".into()));
+            }
+            rows = rows.checked_add(meta.shape[0]).ok_or_else(|| malformed(&meta.name, "strided engram row overflow".into()))?;
+        }
+        let mut operand = QuantOperand::plain(Encoding::E4m3, first);
+        operand.logical = vec![rows, 256];
+        operand.stored = vec![rows, 264];
+        operand.scale = Some(BlockScale { tensor: "strided".into(), encoding: ScaleEncoding::Ue8m0,
+            direction: ScaleDirection::Multiply, rows: RowTiling::Uniform { rows: 1 },
+            cols: 32, grid: vec![rows, 8] });
+        operand.companions.push("strided".into());
+        return Ok(operand);
+    }
     if crate::formats::exl3_storage::EXL3_SUFFIXES.iter().any(|suffix| members.contains_key(*suffix)) {
         return detect_exl3(members);
     }
@@ -370,7 +400,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     };
     // A stacked projection has independent quantization grids/scalars per expert.
     // Validate the expert axis before applying the existing matrix contract.
-    if weight.shape.len() == 3 && ["weight_scale_inv", "weight_scale", "scale"].iter().any(|suffix|
+    if weight.shape.len() == 3 && ["weight_scale_inv", "qscale_weight", "weight_scale", "scale"].iter().any(|suffix|
         members.get(*suffix).is_some_and(|scale| scale.meta.shape.iter().product::<usize>() != 1)) {
         let experts = &weight.shape[0];
         if *experts == 0 {
@@ -403,7 +433,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
         DType::F8E4M3 | DType::F8E5M2 => {
             let encoding = if weight.dtype == DType::F8E4M3 { Encoding::E4m3 } else { Encoding::E5m2 };
             let mut operand = QuantOperand::plain(encoding, weight);
-            let scale = ["weight_scale_inv", "scale", "weight_scale"].into_iter().find_map(|s| get(s).map(|m| (s, m)));
+            let scale = ["weight_scale_inv", "qscale_weight", "scale", "weight_scale"].into_iter().find_map(|s| get(s).map(|m| (s, m)));
             if let Some((suffix, scale)) = scale {
                 operand.scale = Some(fp8_scale(weight, suffix, scale)?);
             }
@@ -424,13 +454,13 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     }
     operand.companions = companions;
     if operand.scale.is_none() && !matches!(operand.encoding, Encoding::E4m3 | Encoding::E5m2 | Encoding::E2m1) {
-        if let Some(suffix) = ["weight_scale_inv", "weight_scale", "scale", "weight_scale_2"].into_iter()
+        if let Some(suffix) = ["weight_scale_inv", "qscale_weight", "weight_scale", "scale", "weight_scale_2"].into_iter()
             .find(|s| members.contains_key(*s) && members.len() > 1) {
             return Err(malformed(&members[suffix].meta.name, format!("a scale beside the unquantized {} weight {}",
                 operand.label(), weight.name)));
         }
     }
-    let known = ["weight", "weight_scale_inv", "weight_scale", "scale", "weight_scale_2", "input_scale", "bias", ""];
+    let known = ["weight", "weight_scale_inv", "qscale_weight", "weight_scale", "scale", "weight_scale_2", "input_scale", "bias", ""];
     if let Some((suffix, tensor)) = members.iter().find(|(s, _)| !known.contains(&s.as_str())) {
         return Err(malformed(&tensor.meta.name, format!("unexpected member .{suffix} beside {}", weight.name)));
     }
@@ -530,10 +560,9 @@ fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::Safetensor
 }
 
 /// An EXL3 projection: `trellis` I16 `[K/16, N/16, 16 * bits]`, `suh` F16
-/// `[K]`, `svh` F16 `[N]` and the MCG codebook marker `mcg` I32 `[]` or `[1]`
-/// — the contract the expert catalog derives its storage map with
-/// (`formats::exl3_storage::exl3_module`). MUL1, 3INST and packed `su`/`sv`
-/// stay unsupported, named by tensor.
+/// `[K]`, `svh` F16 `[N]` and one `mcg`/`mul1` I32 `[]` or `[1]` marker.
+/// The marker remains in companions so routed contracts can require MCG.
+/// 3INST and packed `su`/`sv` stay unsupported, named by tensor.
 fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOperand, Malformed> {
     use crate::formats::exl3_storage::{exl3_module, Exl3StorageError};
     let anchor = members.values().next().map_or(String::new(), |t| t.meta.name.clone());
@@ -543,7 +572,7 @@ fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOpe
         .map_err(|error| match error {
             Exl3StorageError::Malformed { tensor, reason } => Malformed { tensor, reason },
             Exl3StorageError::Unsupported { tensor, variant } => {
-                Malformed { tensor, reason: format!("{variant} (this build runs the MCG codebook with unpacked suh/svh)") }
+                Malformed { tensor, reason: format!("{variant} (expected MCG/MUL1 with unpacked suh/svh)") }
             }
             other => Malformed { tensor: stem.clone(), reason: other.to_string() },
         })?;
@@ -557,6 +586,6 @@ fn detect_exl3(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOpe
         scale: None,
         global_scale: None,
         input_scale: None,
-        companions: vec!["mcg".into(), "suh".into(), "svh".into()],
+        companions: vec![module.codebook.marker().into(), "suh".into(), "svh".into()],
     })
 }

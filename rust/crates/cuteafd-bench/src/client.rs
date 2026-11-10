@@ -17,6 +17,7 @@ pub const BENCH_HEADER: &str = "x-cuteafd-bench";
 pub struct Client {
     pub base: String,
     pub model: String,
+    pub configuration: crate::report::Configuration,
     agent: ureq::Agent,
     fabric_enabled: bool,
     token: Option<String>,
@@ -65,7 +66,7 @@ impl Client {
     pub fn new(base: &str, token: Option<String>, cancel: Arc<AtomicBool>) -> Self {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(10))
             .timeout_read(Duration::from_secs(900)).build();
-        Self { base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
+        Self { configuration: crate::report::Configuration::default(), base: base.trim_end_matches('/').to_string(), model: String::new(), agent, token, cancel, api_key: None, fabric_enabled: false }
     }
 
     pub fn with_api_key(mut self, key: Option<cuteafd_api::openai::auth::ApiKey>) -> Self {
@@ -105,6 +106,7 @@ impl Client {
     pub fn discover(&mut self) -> Result<Value> {
         let models = self.get("/v1/models")?;
         let record = models["data"].get(0).cloned().context("/v1/models lists no model")?;
+        self.configuration.supports_thinking_off = record["supports_thinking_off"].as_bool();
         self.model = record["id"].as_str().context("model id")?.to_string();
         Ok(record)
     }
@@ -119,6 +121,7 @@ impl Client {
     /// HTTP media probes bypass the older in-process ProbeSpec registration shape.
     pub fn media_probe(&self, mut body: Value, spec: Value) -> Result<Value> {
         self.check()?;
+        crate::request::validate(&self.configuration, &body)?;
         body["model"] = json!(self.model);
         body["stream"] = json!(false);
         let mut request = self.agent.post(&format!("{}/v1/bench/probe", self.base))
@@ -170,6 +173,11 @@ impl Client {
         let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_millis(200))
             .timeout_read(Duration::from_millis(300)).build();
         self.authorize(agent.get(&format!("{}/v1/fabric", self.base))).call().ok()?.into_json().ok()
+    }
+
+    /// Decode counters are sampled outside the timed request.
+    pub fn decode_counters(&self) -> Option<Value> {
+        self.get("/v1/console/snapshot").ok()?.get("g")?.get("totals").cloned()
     }
 
     /// Wait outside request timing for a new 1 Hz observation on each known
@@ -233,6 +241,7 @@ impl Client {
     /// `probe` registers benchmark diagnostics for this request.
     pub fn chat(&self, mut body: Value, probe: Option<ProbeSpec>) -> Result<Chat> {
         self.check()?;
+        crate::request::validate(&self.configuration, &body)?;
         body["model"] = json!(self.model);
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});

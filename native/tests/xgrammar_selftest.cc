@@ -3,6 +3,9 @@
 #include <cassert>
 #include <cstdint>
 #include <iostream>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 #ifndef CUTEAFD_XGRAMMAR_TEST_TOKENIZER
 #error "CUTEAFD_XGRAMMAR_TEST_TOKENIZER is required"
@@ -23,6 +26,13 @@ int main() {
   assert(cuteafd_xgrammar_compiler_create(
              CUTEAFD_XGRAMMAR_TEST_TOKENIZER, 8, stops, 1, &compiler, error, sizeof(error)) ==
          CUTEAFD_STATUS_OK);
+  assert(compiler != nullptr);
+  assert(cuteafd_xgrammar_compiler_destroy(compiler) == CUTEAFD_STATUS_OK);
+  compiler = nullptr;
+  std::ifstream input(CUTEAFD_XGRAMMAR_TEST_TOKENIZER);
+  const std::string document{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  assert(cuteafd_xgrammar_compiler_create_json(
+             document.c_str(), 8, stops, 1, &compiler, error, sizeof(error)) == CUTEAFD_STATUS_OK);
   assert(compiler != nullptr);
 
   void* grammar = nullptr;

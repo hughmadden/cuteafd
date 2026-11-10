@@ -413,6 +413,22 @@ impl PortCounters for EthtoolCounters {
     }
 }
 
+/// Read all per-priority PFC frame counters in one ioctl snapshot.
+/// Aliased netdevs on a physical port are sampled once, never summed.
+pub(crate) fn pause_counters(netdev: &str) -> Result<std::collections::BTreeMap<String, u64>> {
+    let socket = ethtool::Socket::open()?;
+    let count = socket.stats_count(netdev)?;
+    let (names, count) = socket.strings(netdev, count)?;
+    let values = socket.stats(netdev, count)?;
+    anyhow::ensure!(values.len() == count, "ethtool table changed while sampling {netdev}");
+    Ok(names.chunks_exact(ETH_GSTRING_LEN).zip(values).filter_map(|(name, value)| {
+        let name = std::str::from_utf8(name).ok()?.trim_end_matches('\0');
+        (name.starts_with("rx_prio") || name.starts_with("tx_prio"))
+            .then_some(())?;
+        name.ends_with("_pause").then(|| (format!("pfc/{name}"), value))
+    }).collect())
+}
+
 mod ethtool {
     //! The three `SIOCETHTOOL` requests `ethtool -S` makes.
     use super::{stat_index, ETH_GSTRING_LEN};
@@ -478,7 +494,7 @@ mod ethtool {
             Ok(())
         }
 
-        fn stats_count(&self, netdev: &str) -> Result<usize> {
+        pub(super) fn stats_count(&self, netdev: &str) -> Result<usize> {
             // struct ethtool_sset_info { u32 cmd; u32 reserved; u64 sset_mask; u32 data[1]; }
             let mut info = [pair(ETHTOOL_GSSET_INFO, 0), 1 << ETH_SS_STATS, 0];
             // SAFETY: 24 bytes hold the header and the one count asked for.
@@ -487,7 +503,7 @@ mod ethtool {
             Ok(low(info[2]) as usize)
         }
 
-        fn strings(&self, netdev: &str, count: usize) -> Result<(Vec<u8>, usize)> {
+        pub(super) fn strings(&self, netdev: &str, count: usize) -> Result<(Vec<u8>, usize)> {
             // struct ethtool_gstrings { u32 cmd; u32 string_set; u32 len; u8 data[]; }
             let capacity = count + SLACK;
             let mut words = vec![0_u64; 2 + capacity * ETH_GSTRING_LEN / 8];
@@ -503,7 +519,7 @@ mod ethtool {
             Ok((bytes[12..12 + returned * ETH_GSTRING_LEN].to_vec(), returned))
         }
 
-        fn stats(&self, netdev: &str, count: usize) -> Result<Vec<u64>> {
+        pub(super) fn stats(&self, netdev: &str, count: usize) -> Result<Vec<u64>> {
             // struct ethtool_stats { u32 cmd; u32 n_stats; u64 data[]; }
             let capacity = count + SLACK;
             let mut words = vec![0_u64; 1 + capacity];

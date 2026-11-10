@@ -41,6 +41,9 @@ pub const GROUP_TOKENS: usize = 512;
 pub const PAGES_PER_GROUP: usize = 5;
 /// Compressor banks per snapshot; page lists are indexed by bank.
 pub const COMPRESSORS: usize = 4;
+/// Full-context drafter pages have an independent size and identity namespace.
+pub const DRAFT_PAGE_BANK: usize = COMPRESSORS;
+pub const PAGE_BANKS: usize = COMPRESSORS + 1;
 /// Bytes per token of source pages, the number the capacity arithmetic uses.
 pub const KV_BYTES_PER_TOKEN: usize = PAGES_PER_GROUP * PAGE_BYTES / GROUP_TOKENS;
 /// One backbone window prefix and how many a tail carries.
@@ -76,6 +79,6 @@ mod constants {
         let layout = pool::Layout::engine(0);
         assert_eq!((layout.page, layout.tail, layout.draft, layout.scores), (91_136, 2_720_064, 202_752, 0));
         assert_eq!(pool::Layout::family(1_474_560, 26_624_000, 0),
-            pool::Layout { page: 1_474_560, tail: 26_624_000, draft: 0, scores: 0 });
+            pool::Layout { page: 1_474_560, tail: 26_624_000, draft: 0, scores: 0, draft_page: 0 });
     }
 }

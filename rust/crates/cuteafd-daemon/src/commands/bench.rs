@@ -45,6 +45,11 @@ pub(crate) enum BenchAction {
         #[arg(long, env = "CUTEAFD_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
     },
+    /// List every panel id selectable by --panels or profile `panels:...`.
+    Panels {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, clap::Args)]
@@ -80,6 +85,9 @@ pub(crate) struct RunArgs {
     /// Decode concurrency levels for context_load (distinct values in 1..256).
     #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_levels_arg)]
     pub(crate) context_levels: Option<String>,
+    /// Additional fresh suffix tokens per context_load request (0..1048576; default 0).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1048576))]
+    pub(crate) context_suffix: Option<u64>,
     /// Exports to write: svg (report, card, panels), png (report, card), json.
     #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
     pub(crate) export: Vec<String>,
@@ -124,8 +132,27 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             eprintln!("{count} reports: updated {} and {}", readme.display(), index.display());
             Ok(())
         }
-        Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
+        Some(BenchAction::Smoke(smoke)) => match cuteafd_bench::smoke::run(smoke) {
+            // Torn down after SIGTERM/SIGINT/SIGHUP: exit as the signal would have.
+            Err(error) if error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().is_some() => {
+                let signal = error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().map_or(15, |c| c.0);
+                eprintln!("smoke: {error:#}");
+                std::process::exit(128 + signal);
+            }
+            other => other,
+        },
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
+        Some(BenchAction::Panels { json }) => {
+            let ids = cuteafd_bench::profiles::selectable_panel_ids();
+            if json {
+                println!("{}", serde_json::to_string(&ids)?);
+            } else {
+                for id in ids {
+                    println!("{id}");
+                }
+            }
+            Ok(())
+        }
         Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
             // The exports re-render under the rule in force now (an nvidia NVFP4
@@ -147,7 +174,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
-                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
+                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {
@@ -248,7 +275,7 @@ fn serve_context(matches: &ArgMatches, coordinator_budget_gib: Option<f64>)
     settings.extend(cuteafd_bench::context::env_settings().into_iter()
         .filter(|setting| setting.name != "CUTEAFD_ATTENTION_PLACEMENT"));
     Ok(Some(cuteafd_bench::context::ServerContext { command: name.to_string(),
-        family: Some(family.to_string()), snapshot, settings }))
+        family: None, snapshot, settings, supports_thinking_off: None }))
 }
 
 /// The attention placement `requested` resolves to for a serve command: two coordinator GPUs
@@ -290,6 +317,21 @@ mod tests {
     }
 
     #[test]
+    fn step5_context_uses_registered_native_attention_placement() {
+        for extra in [vec![], vec!["--split-device", "1"]] {
+            let argv = ["cuteafd", "serve-step5", "--snapshot", "/s", "--native-lib", "/l", "--peers", "127.0.0.1:19000"]
+                .into_iter().chain(extra).collect::<Vec<_>>();
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("Step-5 serve context");
+            assert_eq!(context.family, None);
+            let placement = context.settings.iter().find(|s| s.name == "attention-placement").unwrap();
+            assert_eq!(placement.value.as_deref(), Some("heads"));
+            assert_eq!(placement.default.as_deref(), Some("heads"));
+            assert!(attention_mode("step5", matches.subcommand().unwrap().1, "context").is_err());
+        }
+    }
+
+    #[test]
     fn context_load_arguments_parse_and_validate() {
         let args = |lengths: &str, levels: &str| crate::cli::Cli::command().try_get_matches_from([
             "cuteafd", "bench", "--panels", "context_load", "--context-lengths", lengths, "--context-levels", levels]);
@@ -297,6 +339,12 @@ mod tests {
         let bench = BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap();
         assert_eq!(bench.run.context_lengths.as_deref(), Some("32768,131072"));
         assert_eq!(bench.run.context_levels.as_deref(), Some("1,8,16"));
+        let suffix = |n: &str| crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "bench", "--panels", "context_load", "--context-suffix", n]);
+        let parsed = suffix("512").unwrap();
+        assert_eq!(BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap().run.context_suffix, Some(512));
+        assert!(suffix("0").is_ok());
+        for n in ["-1", "1048577", "abc"] { assert!(suffix(n).is_err()); }
         for (l, c) in [("255", "1"), ("1048577", "1"), ("abc", "1"), ("32768", "0"), ("32768", "8,8")] {
             assert!(args(l, c).is_err());
         }
@@ -322,6 +370,24 @@ mod tests {
     }
 
     #[test]
+    fn dense_qwen_context_leaves_family_to_loader_and_reports_active_draft_settings() {
+        for draft in [None, Some("/model/dspark")] {
+            let mut argv = vec!["cuteafd", "serve-qwen35", "--snapshot", "/target", "--native-lib", "/native.so"];
+            if let Some(snapshot) = draft { argv.extend(["--draft", snapshot, "--draft-fixed", "7"]); }
+            let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
+            let context = serve_context(&matches, None).unwrap().expect("dense serve context");
+            assert_eq!(context.family, None);
+            assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/target")));
+            let configuration = cuteafd_bench::server::configuration(&context, &Default::default());
+            assert_eq!(configuration.speculator.is_some(), draft.is_some());
+            if draft.is_some() {
+                assert_eq!(configuration.speculator.as_deref(), Some("dSpark (dspark)"));
+                assert_eq!(context.settings.iter().find(|s| s.name == "draft-fixed").unwrap().value.as_deref(), Some("7"));
+            }
+        }
+    }
+
+    #[test]
     fn serve_options_are_captured_with_defaults_and_sources() {
         let argv = ["cuteafd", "--coordinator-gpu-budget-gib", "32", "serve-qwen4", "--snapshot", "/hub/models--Qwen--Q/snapshots/abc", "--native-lib",
             "/opt/lib.so", "--max-sequences", "2"];
@@ -329,7 +395,7 @@ mod tests {
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
         capture(&matches, cli.coordinator_gpu_budget_gib).unwrap();
         let context = cuteafd_bench::context::get();
-        assert_eq!(context.family.as_deref(), Some("qwen4"));
+        assert_eq!(context.family, None);
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));
         let find = |name: &str| context.settings.iter().find(|s| s.name == name).cloned()
             .unwrap_or_else(|| panic!("{name} missing"));
@@ -341,7 +407,7 @@ mod tests {
         assert_eq!((sequences.value.as_deref(), sequences.default.as_deref(), sequences.source.as_str()),
             (Some("2"), Some("4"), "cli"));
         assert!(sequences.differs());
-        let output = find("max-output");
+        let output = find("max-output-tokens");
         assert_eq!(output.source, "default");
         assert!(!output.differs());
         assert!(!context.settings.iter().any(|s| s.name == "no-copy-drafts"));
@@ -367,5 +433,12 @@ mod tests {
         let placed = placement(&one);
         assert_eq!(placed.len(), 1, "{placed:?}");
         assert_eq!(placed[0].value.as_deref(), Some("heads"));
+    }
+
+    #[test]
+    fn bench_panels_subcommand_parses_json_flag() {
+        let matches = crate::cli::Cli::command().try_get_matches_from(["cuteafd", "bench", "panels", "--json"]).unwrap();
+        let bench = BenchArgs::from_arg_matches(matches.subcommand().unwrap().1).unwrap();
+        assert!(matches!(bench.action, Some(BenchAction::Panels { json: true })));
     }
 }

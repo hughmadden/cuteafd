@@ -211,6 +211,7 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
     let settings = context.settings.clone();
     let quant = context.snapshot.as_deref().map(|s| quant(s, hardware.sparks.len())).unwrap_or_default();
     Configuration {
+        supports_thinking_off: context.supports_thinking_off,
         snapshot: context.snapshot.as_ref().map(|p| p.display().to_string()),
         quant,
         speculator: speculator(context.family.as_deref(), &settings),
@@ -223,10 +224,14 @@ pub fn configuration(context: &ServerContext, hardware: &Hardware) -> Configurat
 /// Everything a report says about the server (`model` from `/v1/models`).
 pub fn server_info(model: &str) -> ServerInfo {
     let context = context::get();
-    let hardware = hardware(&context.settings);
-    let configuration = configuration(&context, &hardware);
+    server_info_from_context(model, &context, hardware(&context.settings))
+}
+
+fn server_info_from_context(model: &str, context: &ServerContext, hardware: Hardware) -> ServerInfo {
+    let configuration = configuration(context, &hardware);
     ServerInfo {
         model: model.to_string(),
+        executor: (!context.command.is_empty()).then(|| context.command.clone()),
         family: context.family.clone(),
         revision: context.snapshot.as_deref().and_then(revision),
         build: build_info(),
@@ -253,6 +258,8 @@ pub fn fingerprint(info: &ServerInfo) -> String {
         hasher.update(value.as_bytes());
         hasher.update(b"\n");
     };
+    if !info.configuration.supports_thinking_off() { line("thinking", info.configuration.thinking_label()); }
+    line("prompt_content", crate::text::PROMPT_CONTENT);
     line("model", &info.model);
     line("revision", info.revision.as_deref().unwrap_or(""));
     line("build", &info.build.label());
@@ -276,6 +283,81 @@ pub fn fingerprint(info: &ServerInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loaded_config_identity_is_independent_of_executor_in_reports_and_probes() {
+        let glm = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
+            &cuteafd_loader::plan::testing::glm5_config()).unwrap();
+        let mimo = cuteafd_loader::families::mimo_v2::MimoV2Config::from_hf(
+            &cuteafd_loader::plan::testing::mimo_flash_config()).unwrap();
+        assert_eq!(glm.family_id(), "glm5");
+        assert_eq!(mimo.family_id(), "mimo_v2");
+        for (executor, loaded_family) in [("serve-glm", glm.family_id()), ("serve-mimo", mimo.family_id())] {
+            let mut context = ServerContext { command: executor.into(), ..Default::default() };
+            assert!(context.family.is_none());
+            context.set_family(loaded_family);
+            let report = server_info_from_context("served-alias", &context, Hardware::default());
+            assert_eq!(report.family.as_deref(), Some(loaded_family));
+            assert_eq!(report.executor.as_deref(), Some(executor));
+            let probe = crate::runner::probe_server("served-alias", &context);
+            assert_eq!(probe["family"], loaded_family);
+            assert_eq!(probe["executor"], executor);
+            assert_eq!(probe["model"], "served-alias");
+            // A shared executor can serve a different canonical checkpoint family.
+            context.set_family("other_checkpoint_family");
+            assert_eq!(server_info_from_context("served-alias", &context, Hardware::default())
+                .family.as_deref(), Some("other_checkpoint_family"));
+            assert_eq!(crate::runner::probe_server("served-alias", &context)["executor"], executor);
+        }
+    }
+
+    #[test]
+    fn muse_loaded_identity_is_published_through_the_serving_context() {
+        let config = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
+            &cuteafd_loader::plan::testing::muse_spark_config()).unwrap();
+        config.release_geometry().unwrap();
+        assert_eq!(config.family_id(), "muse_spark");
+        struct RestoreContext(ServerContext);
+        impl Drop for RestoreContext {
+            fn drop(&mut self) { crate::context::set(self.0.clone()); }
+        }
+        let _restore = RestoreContext(crate::context::get());
+        crate::context::set(ServerContext { command: "serve-muse".into(), ..Default::default() });
+        assert!(crate::context::get().family.is_none());
+        crate::context::set_family(config.family_id());
+        let context = crate::context::get();
+        let report = server_info_from_context("served-muse-alias", &context, Hardware::default());
+        assert_eq!(report.family.as_deref(), Some("muse_spark"));
+        assert_eq!(report.executor.as_deref(), Some("serve-muse"));
+        let probe = crate::runner::probe_server("served-muse-alias", &context);
+        assert_eq!(probe["family"], "muse_spark");
+        assert_eq!(probe["executor"], "serve-muse");
+        assert_eq!(probe["model"], "served-muse-alias");
+    }
+
+    #[test]
+    fn ml4_loaded_identity_uses_glm_executor_without_relabeling_the_checkpoint() {
+        let config = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(
+            &cuteafd_loader::plan::testing::mistral_large4_config()).unwrap();
+        assert_eq!(config.family_id(), "mistral_large4");
+        let mut context = ServerContext { command: "serve-glm".into(), ..Default::default() };
+        context.set_family(config.family_id());
+        let report = server_info_from_context("mistralai/Mistral-Large-4-1T-A52B", &context, Hardware::default());
+        assert_eq!(report.family.as_deref(), Some("mistral_large4"));
+        assert_eq!(report.executor.as_deref(), Some("serve-glm"));
+        let probe = crate::runner::probe_server(&report.model, &context);
+        assert_eq!(probe["family"], "mistral_large4");
+        assert_eq!(probe["executor"], "serve-glm");
+    }
+
+    #[test]
+    fn legacy_reports_without_executor_still_deserialize() {
+        let report = ServerInfo { model: "legacy".into(), ..Default::default() };
+        let mut value = serde_json::to_value(report).unwrap();
+        value.as_object_mut().unwrap().remove("executor");
+        let loaded: ServerInfo = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.executor, None);
+    }
 
     fn s(name: &str, value: &str, default: Option<&str>, source: &str) -> Setting {
         Setting { name: name.into(), value: Some(value.into()), default: default.map(str::to_string), source: source.into() }
@@ -306,6 +388,19 @@ mod tests {
         info.configuration.settings[0].value = Some("4096".into());
         assert_ne!(fingerprint(&info), base);
         assert_eq!(base.len(), 16);
+    }
+
+    #[test]
+    fn renderer_capability_reaches_configuration_and_separates_baselines() {
+        let context = ServerContext { supports_thinking_off: Some(false), ..Default::default() };
+        let config = configuration(&context, &Hardware::default());
+        assert_eq!(config.supports_thinking_off, Some(false));
+        let mut info = ServerInfo::default();
+        let legacy = fingerprint(&info);
+        info.configuration.supports_thinking_off = Some(true);
+        assert_eq!(fingerprint(&info), legacy);
+        info.configuration = config;
+        assert_ne!(fingerprint(&info), legacy);
     }
 
     #[test]

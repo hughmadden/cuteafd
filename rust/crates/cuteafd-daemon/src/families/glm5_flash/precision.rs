@@ -7,6 +7,8 @@ use cuteafd_loader::plan::checkpoint::Checkpoint;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProjectionInputError {
+    #[error("native K6 header contract: {0}")]
+    Native(String),
     #[error("GLMF checkpoint has no selected projection tensor {name}")]
     Missing { name: String },
     #[error("{name}: GLMF {consumer} reads {expected:?}, found {actual:?}")]
@@ -78,12 +80,12 @@ fn scalar(checkpoint: &Checkpoint, name: String) -> Result<(), ProjectionInputEr
 
 /// The MLA and dense/shared FFN block programs consume one E4M3
 /// representation: the checkpoint's own blocks, or BF16 quantized at load.
-/// A selected side checkpoint is authoritative, with no fallback to the primary.
 /// Existing ModelOpt packed dense MLPs retain their native NVFP4 route.
-pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&Checkpoint>,
+pub(crate) fn check_projection_inputs(primary: &Checkpoint,
     cfg: &GlmNextConfig, layers: usize) -> Result<(), ProjectionInputError> {
-    let source = fp8_source.unwrap_or(primary);
     let h = cfg.hidden;
+    let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, primary)
+        .map_err(|e| ProjectionInputError::Native(format!("{e:#}")))?;
     for layer in 0..layers.min(cfg.layers) {
         let prefix = format!("model.language_model.layers.{layer}");
         if cfg.attention[layer] == GlmNextAttention::Mla {
@@ -97,7 +99,8 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&
                 ("q_b_proj.weight", q_width, cfg.q_lora_rank),
                 ("o_proj.weight", h, v_width),
             ] {
-                block(source, format!("{prefix}.self_attn.{suffix}"), rows, cols, "MLA FP8 block projection")?;
+                let name = format!("{prefix}.self_attn.{suffix}");
+                if core.get_weight(&name).is_none() { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
             }
         }
         let dense = cfg.dense[layer];
@@ -107,6 +110,7 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&
             t.meta.name == format!("{mlp}.gate_proj.weight") && t.meta.dtype == DType::U8);
         for (projection, rows, cols) in [("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)] {
             let name = format!("{mlp}.{projection}");
+            if core.get_weight(&name).is_some() { continue; }
             if packed_dense {
                 require(primary, format!("{name}.weight"), DType::U8, vec![rows, cols / 2], 1, "NVFP4 dense MLP")?;
                 require(primary, format!("{name}.weight_scale"), DType::F8E4M3, vec![rows, cols / 16], 1, "NVFP4 dense MLP")?;
@@ -114,7 +118,7 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&
                     self::scalar(primary, format!("{name}.{scalar}"))?;
                 }
             } else {
-                block(source, format!("{name}.weight"), rows, cols, "dense/shared FP8 block MLP")?;
+                block(primary, format!("{name}.weight"), rows, cols, "dense/shared FP8 block MLP")?;
             }
         }
     }
@@ -125,6 +129,31 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint, fp8_source: Option<&
 mod tests {
     use super::*;
     use cuteafd_loader::{plan::checkpoint::CheckpointTensor, SafetensorsTensorMetadata};
+
+    #[test]
+    fn native_core_projection_headers_skip_only_the_validated_native_operands() {
+        let (mut checkpoint, cfg) = fixture();
+        let expected = cuteafd_loader::families::glm5_flash::core::expected(&cfg);
+        let mut native = Vec::new();
+        checkpoint.tensors.retain(|tensor| {
+            if let Some(shape) = expected.get(&tensor.meta.name) {
+                let stem = tensor.meta.name.strip_suffix(".weight").unwrap();
+                let (n,k) = (shape[0],shape[1]);
+                for (suffix,dtype,shape,width) in [("trellis",DType::I16,vec![k/16,n/16,96],2),
+                    ("suh",DType::F16,vec![k],2),("svh",DType::F16,vec![n],2),("mcg",DType::I32,vec![1],4)] {
+                    native.push(CheckpointTensor { shard:"no-payload.safetensors".into(), meta:SafetensorsTensorMetadata {
+                        name:format!("{stem}.{suffix}"),dtype,byte_offset:0,
+                        byte_length:width*shape.iter().product::<usize>() as u64,shape } });
+                }
+                false
+            } else { !tensor.meta.name.ends_with(".weight_scale_inv") }
+        });
+        checkpoint.tensors.extend(native);
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        check_projection_inputs(&checkpoint,&cfg,cfg.layers).unwrap();
+        checkpoint.tensors.retain(|t| !t.meta.name.ends_with("q_a_proj.svh"));
+        assert!(matches!(check_projection_inputs(&checkpoint,&cfg,cfg.layers),Err(ProjectionInputError::Native(_))));
+    }
 
     fn input(name: String, dtype: DType, shape: Vec<usize>, width: u64) -> CheckpointTensor {
         CheckpointTensor { shard: "no-payload.safetensors".into(), meta: SafetensorsTensorMetadata {
@@ -175,14 +204,14 @@ mod tests {
     #[test]
     fn direct_cli_native_fp8_needs_no_conversion_or_side_checkpoint() {
         let (checkpoint, cfg) = fixture();
-        check_projection_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap();
+        check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]
     fn direct_cli_bf16_is_admitted_for_block_quantization_at_load() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
-        check_projection_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap();
+        check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]
@@ -191,7 +220,7 @@ mod tests {
         widen_sources(&mut checkpoint);
         let name = "model.language_model.layers.0.mlp.gate_proj.weight";
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::F16;
-        let error = check_projection_inputs(&checkpoint, None, &cfg, cfg.layers).unwrap_err();
+        let error = check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap_err();
         assert!(matches!(error, ProjectionInputError::Source { ref name, actual: DType::F16, .. }
             if name == "model.language_model.layers.0.mlp.gate_proj.weight"), "{error}");
         let (mut checkpoint, mut cfg) = fixture();
@@ -204,31 +233,15 @@ mod tests {
                 t.meta.byte_length = s.iter().map(|&n| n as u64).product::<u64>() * 2;
             }
         }
-        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
             Err(ProjectionInputError::Blocks { .. })));
-    }
-
-    #[test]
-    fn explicit_native_source_is_authoritative_without_a_primary_fallback() {
-        let (mut primary, cfg) = fixture();
-        let (native, _) = fixture();
-        widen_sources(&mut primary);
-        check_projection_inputs(&primary, Some(&native), &cfg, cfg.layers).unwrap();
-        // The selected side checkpoint is read even when the primary is native.
-        let (mut selected, _) = fixture();
-        for t in &mut selected.tensors {
-            if t.meta.dtype == DType::F8E4M3 { t.meta.dtype = DType::F16; t.meta.byte_length *= 2; }
-        }
-        let (native_primary, _) = fixture();
-        assert!(matches!(check_projection_inputs(&native_primary, Some(&selected), &cfg, cfg.layers),
-            Err(ProjectionInputError::Source { actual: DType::F16, .. })));
     }
 
     #[test]
     fn zero_layer_drafter_diagnostics_do_not_admit_unused_target_projections() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
-        check_projection_inputs(&checkpoint, None, &cfg, 0).unwrap();
+        check_projection_inputs(&checkpoint, &cfg, 0).unwrap();
     }
 
     #[test]
@@ -236,10 +249,10 @@ mod tests {
         let (mut checkpoint, cfg) = fixture();
         let name = "model.language_model.layers.1.self_attn.q_b_proj.weight_scale_inv";
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::Bf16;
-        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
             Err(ProjectionInputError::Dtype { ref name, actual: DType::Bf16, .. }) if name.ends_with("_scale_inv")));
         checkpoint.tensors.retain(|t| t.meta.name != name);
-        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
             Err(ProjectionInputError::Missing { name: missing }) if missing == name));
     }
 
@@ -249,18 +262,17 @@ mod tests {
         let name = "model.language_model.layers.1.self_attn.q_a_proj.weight";
         let tensor = &mut checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta;
         tensor.shape = vec![4096, 1536];
-        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
             Err(ProjectionInputError::Shape { .. })));
         let (mut checkpoint, _) = fixture();
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.byte_length -= 1;
-        assert!(matches!(check_projection_inputs(&checkpoint, None, &cfg, cfg.layers),
+        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
             Err(ProjectionInputError::Bytes { .. })));
     }
 
     #[test]
-    fn existing_nvfp4_dense_uses_primary_checkpoint_even_with_native_fp8_side() {
+    fn native_nvfp4_dense_and_fp8_shared_use_the_primary_checkpoint() {
         let (mut primary, cfg) = fixture();
-        let (native, _) = fixture();
         primary.tensors.retain(|t| !t.meta.name.starts_with("model.language_model.layers.0.mlp."));
         for (projection, rows, cols) in [("gate_proj", 12288, 4096), ("up_proj", 12288, 4096),
             ("down_proj", 4096, 12288)] {
@@ -271,8 +283,7 @@ mod tests {
             primary.tensors.push(input(format!("{p}.input_scale"), DType::F32, vec![], 4));
         }
         primary.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-        check_projection_inputs(&primary, None, &cfg, cfg.layers).unwrap();
-        check_projection_inputs(&primary, Some(&native), &cfg, cfg.layers).unwrap();
+        check_projection_inputs(&primary, &cfg, cfg.layers).unwrap();
     }
 
     #[test]

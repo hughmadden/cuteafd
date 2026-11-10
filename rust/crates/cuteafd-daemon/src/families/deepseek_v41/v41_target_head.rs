@@ -99,7 +99,7 @@ impl<'a> TargetHeadWeights<'a> {
             head,
             capacity,
             graphs: crate::shared::decode_graph::RowGraphs::new(self.library, "target_head", capacity),
-            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.fp8(), capacity,
+            fp8_scratch: crate::families::deepseek_v41::v41_tensors::fp8_scratch(self.library, head.copy(), capacity,
                 crate::families::deepseek_v41::v41_tensors::Fp8Head::All)?,
             ready: None,
             origin: None,
@@ -140,8 +140,8 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     /// Captured head graphs by row count (index rows - 1), kept while serving:
     /// verification widths vary round to round.
     graphs: crate::shared::decode_graph::RowGraphs<'a>,
-    /// Scratch of the FP8 head copy when the target head projects through it.
-    fp8_scratch: Option<DeviceAllocation<'a>>,
+    /// Scratch of the head copy (E4M3 or exact 12-bit) when the target head projects through it.
+    fp8_scratch: Option<crate::families::deepseek_v41::v41_tensors::HeadScratch<'a>>,
     ready: Option<usize>,
     origin: Option<QueryBinding>,
     selected: Vec<usize>,
@@ -151,7 +151,7 @@ pub(crate) struct TargetHeadWave<'w, 'a> {
     sampling: TargetSamplingWave<'a>,
 }
 impl TargetHeadWave<'_, '_> {
-    /// Up to 16 decode/prefill-last rows or 80 verification rows per head wave.
+    /// Target verification rows are bounded by the shared V4.1 verifier budget.
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
             (1..=80).contains(&capacity),
@@ -199,7 +199,7 @@ impl TargetHeadWave<'_, '_> {
                 self.stream.raw,
             )?;
             crate::families::deepseek_v41::v41_tensors::project_target_vocabulary(self.stream.library, &self.projection,
-                self.head.weight(), self.head.fp8().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
+                self.head.weight(), self.head.copy().zip(self.fp8_scratch.as_ref()), self.b(3), self.b(4), rows,
                 self.stream.raw)?;
             Ok(())
         }
@@ -2696,5 +2696,12 @@ mod sampler_device_tests {
             "the device error must be the CPU path's own message");
         println!("chunk4b empty mask: status={:?}", sampled.status);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl TargetHeadWeights<'_> {
+    pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        self.norm.visit(prefix, f);
     }
 }

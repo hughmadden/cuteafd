@@ -42,17 +42,20 @@ pub(crate) struct WindowRead {
     pub owner: u64,
     pub ring: CuteafdDeviceBuffer,
     pub slots: u32,
-    pub descriptors: [V41AttentionWindow; 16],
+    pub descriptors: [V41AttentionWindow; cuteafd_core::V41_MAX_REQUESTS],
     _reservation: ReadReservation,
 }
 // Reservations outlive the short host borrow while a chain reads ring slots.
 // Other request slots may be committed, but a live read slot cannot be rewritten
 // or recycled until the chain has drained its GPU work.
-#[derive(Clone, Default)]
-struct SlotAccess(Rc<Cell<[u32; 16]>>);
-struct ReadReservation { slots: SlotAccess, used: [bool; 16] }
+#[derive(Clone)]
+struct SlotAccess(Rc<Cell<[u32; cuteafd_core::V41_MAX_REQUESTS]>>);
+impl Default for SlotAccess {
+    fn default() -> Self { Self(Rc::new(Cell::new([0; cuteafd_core::V41_MAX_REQUESTS]))) }
+}
+struct ReadReservation { slots: SlotAccess, used: [bool; cuteafd_core::V41_MAX_REQUESTS] }
 const WRITE_RESERVED: u32 = u32::MAX;
-struct WriteReservation { slots: SlotAccess, used: [bool; 16] }
+struct WriteReservation { slots: SlotAccess, used: [bool; cuteafd_core::V41_MAX_REQUESTS] }
 impl SlotAccess {
     fn writable(&self, slot: usize) -> Result<()> {
         ensure!(self.0.get()[slot] == 0, "dSpark cache slot has outstanding access");
@@ -62,7 +65,7 @@ impl SlotAccess {
         ensure!(self.0.get()[slot] != WRITE_RESERVED, "dSpark cache write is unpublished");
         Ok(())
     }
-    fn reserve_write(&self, used: [bool; 16]) -> Result<WriteReservation> {
+    fn reserve_write(&self, used: [bool; cuteafd_core::V41_MAX_REQUESTS]) -> Result<WriteReservation> {
         let mut counts = self.0.get();
         for (i, active) in used.iter().enumerate() {
             if *active { self.writable(i)?; counts[i] = WRITE_RESERVED; }
@@ -70,7 +73,7 @@ impl SlotAccess {
         self.0.set(counts);
         Ok(WriteReservation { slots: self.clone(), used })
     }
-    fn reserve(&self, used: [bool; 16]) -> Result<ReadReservation> {
+    fn reserve(&self, used: [bool; cuteafd_core::V41_MAX_REQUESTS]) -> Result<ReadReservation> {
         let mut counts = self.0.get();
         for (i, active) in used.iter().enumerate() {
             if *active {
@@ -111,7 +114,7 @@ pub(crate) struct DsparkWindow<'a> {
     descriptors: DeviceAllocation<'a>,
     staging: HostAllocation<'a>,
     graph: Option<*mut c_void>,
-    slots: [Slot; 16],
+    slots: [Slot; cuteafd_core::V41_MAX_REQUESTS],
     access: SlotAccess,
     slot_count: usize,
     source_rows: u32,
@@ -123,10 +126,10 @@ impl<'a> DsparkWindow<'a> {
     }
     pub fn device_bytes(slots: usize, source_rows: u32) -> Result<usize> {
         ensure!(
-            (1..=16).contains(&slots) && (1..=4096).contains(&source_rows),
+            (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots) && (1..=4096).contains(&source_rows),
             "invalid dSpark window capacity"
         );
-        Ok(slots * V41DsparkCache::SLOT_BYTES + source_rows as usize * 1024 + 384)
+        Ok(slots * V41DsparkCache::SLOT_BYTES + source_rows as usize * 1024 + cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -151,10 +154,10 @@ impl<'a> DsparkWindow<'a> {
             kernel: library.v41_dspark_cache()?,
             source: DeviceAllocation::new(library, source_rows as usize * 1024)?,
             ring: DeviceAllocation::new(library, slots * V41DsparkCache::SLOT_BYTES)?,
-            descriptors: DeviceAllocation::new(library, 384)?,
-            staging: HostAllocation::new(library, 384)?,
+            descriptors: DeviceAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
+            staging: HostAllocation::new(library, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?,
             graph: None,
-            slots: [Slot::default(); 16],
+            slots: [Slot::default(); cuteafd_core::V41_MAX_REQUESTS],
             access: SlotAccess::default(),
             slot_count: slots,
             source_rows,
@@ -258,16 +261,16 @@ impl<'a> DsparkWindow<'a> {
         self.source.buffer
     }
     fn prepare_write(&self, chunks: &[WindowChunk], source_rows: u32)
-        -> Result<([V41KvWrite; 16], [bool; 16], [Option<u64>; 16])>
+        -> Result<([V41KvWrite; cuteafd_core::V41_MAX_REQUESTS], [bool; cuteafd_core::V41_MAX_REQUESTS], [Option<u64>; cuteafd_core::V41_MAX_REQUESTS])>
     {
         ensure!(source_rows > 0 && source_rows <= self.source_rows, "invalid produced cache rows");
         ensure!(
             !chunks.is_empty() && chunks.len() <= self.slot_count,
             "invalid cache chunk count"
         );
-        let mut seen = [false; 16];
-        let mut descriptors = [V41KvWrite::default(); 16];
-        let mut ends = [None; 16];
+        let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
+        let mut descriptors = [V41KvWrite::default(); cuteafd_core::V41_MAX_REQUESTS];
+        let mut ends = [None; cuteafd_core::V41_MAX_REQUESTS];
         for (i, chunk) in chunks.iter().enumerate() {
             let slot = self.validate(chunk.lease)?;
             self.access.writable(slot)?;
@@ -316,7 +319,7 @@ impl<'a> DsparkWindow<'a> {
     /// contain only committed main-model positions, never unaccepted draft KV.
     pub unsafe fn write(&mut self, chunks: &[WindowChunk]) -> Result<()> {
         let (descriptors, seen, ends) = self.prepare_write(chunks, self.source_rows)?;
-        let bytes = unsafe { std::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), 384) };
+        let bytes = unsafe { std::slice::from_raw_parts(descriptors.as_ptr().cast::<u8>(), cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES) };
         self.staging.bytes_mut().copy_from_slice(bytes);
         let launched = (|| unsafe {
             self.stream
@@ -352,11 +355,11 @@ impl<'a> DsparkWindow<'a> {
     pub fn attention_read_with_width(&self, requests: &[(WindowLease, u64)], width: usize) -> Result<WindowRead> {
         ensure!(matches!(width, 5 | 7), "draft width must be five or seven");
         ensure!(
-            (1..=16).contains(&requests.len()),
+            (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&requests.len()),
             "invalid attention request count"
         );
-        let mut seen = [false; 16];
-        let mut descriptors = [V41AttentionWindow::default(); 16];
+        let mut seen = [false; cuteafd_core::V41_MAX_REQUESTS];
+        let mut descriptors = [V41AttentionWindow::default(); cuteafd_core::V41_MAX_REQUESTS];
         for (i, &(lease, expected_end)) in requests.iter().enumerate() {
             let slot = self.validate(lease)?;
             ensure!(!seen[slot], "duplicate attention cache slot");
@@ -421,7 +424,7 @@ mod reservation_tests {
     #[test]
     fn readers_block_only_their_slots_until_last_consumer_finishes() -> Result<()> {
         let slots = SlotAccess::default();
-        let mut used = [false; 16]; used[3] = true; used[9] = true;
+        let mut used = [false; cuteafd_core::V41_MAX_REQUESTS]; used[3] = true; used[9] = true;
         let first = slots.reserve(used)?;
         let second = slots.reserve(used)?;
         assert!(slots.writable(3).is_err());
@@ -456,7 +459,7 @@ mod reservation_tests {
         assert!(slots.readable(9).is_err());
         drop(peer);
         drop(reader);
-        assert_eq!(slots.0.get(), [0; 16]);
+        assert_eq!(slots.0.get(), [0; cuteafd_core::V41_MAX_REQUESTS]);
         Ok(())
     }
     #[test]
@@ -476,7 +479,7 @@ mod reservation_tests {
         assert!(window.capture_ring(first, ring.buffer).is_err());
         assert!(window.release(first).is_err());
         assert_eq!(window.committed_end(first)?, Some(2));
-        let descriptors = [DeviceAllocation::new(&lib, 384)?, DeviceAllocation::new(&lib, 384)?];
+        let descriptors = [DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?, DeviceAllocation::new(&lib, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES)?];
         lib.copy_h2d(descriptors[0].buffer, first_write.descriptor_bytes())?;
         lib.copy_h2d(descriptors[1].buffer, second_write.descriptor_bytes())?;
         // Declare streams last: error unwinding drains them before tickets/buffers.
@@ -536,4 +539,19 @@ mod reservation_tests {
         Ok(())
     }
 
+}
+
+#[cfg(test)]
+#[test]
+fn access_reservations_cover_high_request_identities() {
+    let access = SlotAccess::default();
+    let mut used = [false; cuteafd_core::V41_MAX_REQUESTS];
+    used[63] = true;
+    let read = access.reserve(used).unwrap();
+    assert!(access.reserve_write(used).is_err());
+    drop(read);
+    let write = access.reserve_write(used).unwrap();
+    assert!(access.reserve(used).is_err());
+    drop(write);
+    assert!(access.reserve(used).is_ok());
 }

@@ -65,6 +65,11 @@ pub enum V4LayerAttention {
 }
 
 impl DeepseekV4Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str {
+        crate::plan::Family::id(&crate::plan::families::deepseek::DEEPSEEK_V4)
+    }
+
     pub fn read(snapshot: &Path, mtp_stages: usize) -> Result<Self> {
         let inference = snapshot.join("inference/config.json");
         if inference.is_file() {

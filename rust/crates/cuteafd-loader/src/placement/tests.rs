@@ -7,7 +7,7 @@ const UNIT: u64 = 4 << 20;
 /// 1 GiB (+256 MiB staging), 4 MiB per pool unit of 256 tokens over all
 /// layers (2M tokens: 8192 units, 32 GiB).
 fn request(gpus: usize, free: u64, layers: usize, sparks: usize, onboard: Onboard) -> PlacementRequest {
-    PlacementRequest {
+    PlacementRequest { expert_tier: None,
         attention_placement: None,
         context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0,
@@ -43,9 +43,8 @@ const V4_HEADS: ExecutorModes = ExecutorModes { modes: &[LayerMode::HeadSplit, L
     attention: AttentionPlacement::Heads, ..families::DEEPSEEK_V4 };
 
 #[test]
-fn v4_defaults_to_pool_first_and_retains_explicit_max() {
+fn v4_defaults_to_pool_first() {
     assert_eq!(families::deepseek_v4::default_onboard(), Onboard::Auto);
-    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }));
 }
 
 #[test]
@@ -129,8 +128,6 @@ fn fixed_onboard_makes_the_pool_the_output() {
     assert_eq!(placement.expert_ranges.iter().map(|r| r.layers).collect::<Vec<_>>(), [5, 5]);
     assert_eq!(placement.pool_tokens, (44 * GIB - (5 * GIB + GIB / 2)) / UNIT * 256);
     assert!(placement.pool_tokens > 2 << 20);
-    // Fraction rounds to the nearest layer; 0 keeps every expert on the Sparks.
-    assert_eq!(solve(&request(2, 44 * GIB, 60, 4, Onboard::Fraction(0.25))).unwrap().onboard_layers, 15);
     let none = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(0))).unwrap();
     assert_eq!((none.onboard_layers, none.expert_ranges[0].peak_bytes), (0, 0));
     // More than fits beside the fixed demands is a refusal that names how many fit.
@@ -139,6 +136,32 @@ fn fixed_onboard_makes_the_pool_the_output() {
     // Fitting the layers but not the floor (the compiled context) is refused too.
     assert!(matches!(solve(&request(1, 33 * GIB, 60, 4, Onboard::Layers(32))),
         Err(PlacementError::BelowFloor { floor: 131_072, layers: 32, .. })));
+}
+
+#[test]
+fn max_pool_without_onboard_is_one_extra_solve_and_never_below_the_admitted_pool() {
+    for onboard in [Onboard::Layers(10), Onboard::Auto] {
+        let req = request(2, 44 * GIB, 60, 4, onboard);
+        let placement = solve(&req).unwrap();
+        assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens, "{onboard:?}");
+        // The same request with the onboarding set emptied, filled to its ceiling.
+        let mut free = req.clone();
+        free.onboard = Onboard::Layers(0);
+        free.pool.target = free.pool.ceiling;
+        let none = solve(&free).unwrap();
+        assert_eq!(placement.max_pool_tokens_no_onboard, none.pool_tokens, "{onboard:?}");
+        if placement.onboard_layers > 0 {
+            assert!(placement.max_pool_tokens_no_onboard > placement.pool_tokens, "{onboard:?}");
+        }
+        assert!(placement.summary().contains(&format!("max_pool_tokens_no_onboard={}",
+            placement.max_pool_tokens_no_onboard)));
+    }
+    // Nothing onboarded: the maximum is the admitted pool.
+    let none = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(0))).unwrap();
+    assert_eq!(none.max_pool_tokens_no_onboard, none.pool_tokens);
+    // Spark-free layouts cannot drop their routed layers.
+    let spark_free = solve(&request(2, 80 * GIB, 8, 0, Onboard::Auto)).unwrap();
+    assert_eq!(spark_free.max_pool_tokens_no_onboard, spark_free.pool_tokens);
 }
 
 #[test]
@@ -187,43 +210,6 @@ fn experts_stay_on_gpu0_when_the_peer_cannot_run_them() {
 }
 
 #[test]
-fn experts_first_fills_layers_above_the_pool_floor() {
-    let req = request(2, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
-    let placement = solve(&req).unwrap();
-    // 262K tokens = 1024 units x 4 MiB = 4 GiB; 40 GiB of arena -> 39 layers per GPU (0.25 + 39 + 0.25 <= 40).
-    assert_eq!(placement.onboard_layers, 60);
-    assert!(placement.pool_tokens >= 262_144 && placement.pool_tokens <= 2 << 20);
-    let mut one = request(1, 44 * GIB, 60, 4, Onboard::ExpertsFirst { pool_floor: 262_144 });
-    one.expert_gpus = 1;
-    let single = solve(&one).unwrap();
-    assert_eq!(single.onboard_layers, 39);
-    assert!(single.pool_tokens >= 262_144);
-    let auto = solve(&request(1, 44 * GIB, 60, 4, Onboard::Auto)).unwrap();
-    assert!(auto.onboard_layers < single.onboard_layers && auto.pool_tokens > single.pool_tokens);
-    // An explicit pool is exact: the most layers that still leave it.
-    one.pool.requested = Some(1 << 20);
-    let explicit = solve(&one).unwrap();
-    assert_eq!(explicit.pool_tokens, 1 << 20);
-    assert_eq!(explicit.onboard_layers, 27);
-}
-
-#[test]
-fn experts_first_keeps_a_mandatory_prefix() {
-    let mut req = request(2, 12 * GIB, 40, 4,
-        Onboard::ExpertsFirst { pool_floor: 262_144 });
-    req.minimum_expert_layers = 1;
-    let placed = solve(&req).unwrap();
-    assert!(placed.onboard_layers >= 1);
-    assert!(placed.pool_tokens >= 262_144);
-    req.minimum_expert_layers = 41;
-    assert!(matches!(solve(&req), Err(PlacementError::Inventory("invalid mandatory expert prefix"))));
-    req.minimum_expert_layers = 1;
-    req.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: GIB };
-    req.expert_gpus = 1;
-    assert!(solve(&req).is_err());
-}
-
-#[test]
 fn startup_phases_are_independent_and_not_retained_with_the_pool() {
     use cuteafd_core::memory_layout::{Basis, Category};
     let mut req = request(1, 12 * GIB, 40, 4, Onboard::Layers(0));
@@ -263,16 +249,21 @@ fn startup_peak_uses_the_same_baseline_for_planned_and_measured_inventory() {
 }
 
 #[test]
-fn onboard_parses_the_launcher_spellings() {
+fn onboard_parses_auto_and_exact_counts() {
     assert_eq!("auto".parse::<Onboard>(), Ok(Onboard::Auto));
     assert_eq!("12".parse::<Onboard>(), Ok(Onboard::Layers(12)));
-    assert_eq!("50%".parse::<Onboard>(), Ok(Onboard::Fraction(0.5)));
-    assert_eq!("all".parse::<Onboard>(), Ok(Onboard::Fraction(1.0)));
-    assert_eq!("max".parse::<Onboard>(), Ok(Onboard::ExpertsFirst { pool_floor: 262_144 }));
-    assert!("150%".parse::<Onboard>().is_err() && "x".parse::<Onboard>().is_err());
-    assert_eq!(Onboard::Fraction(0.5).layers(43), Some(22));
+    assert!("all".parse::<Onboard>().is_err() && "max".parse::<Onboard>().is_err());
+    assert!("50%".parse::<Onboard>().is_err() && "x".parse::<Onboard>().is_err());
     assert_eq!(Onboard::Layers(99).layers(43), Some(43));
     assert_eq!(Onboard::Layers(12).to_string(), "12");
+    // The unresolved setting keeps `all` and turns it into the exact count.
+    assert_eq!("auto".parse::<OnboardSetting>(), Ok(OnboardSetting::Auto));
+    assert_eq!("all".parse::<OnboardSetting>(), Ok(OnboardSetting::All));
+    assert_eq!("12".parse::<OnboardSetting>(), Ok(OnboardSetting::Layers(12)));
+    assert!("max".parse::<OnboardSetting>().is_err() && "50%".parse::<OnboardSetting>().is_err());
+    assert_eq!(OnboardSetting::All.resolve(43), Onboard::Layers(43));
+    assert_eq!(OnboardSetting::Auto.resolve(43), Onboard::Auto);
+    assert_eq!(OnboardSetting::Layers(12).resolve(43), Onboard::Layers(12));
 }
 
 const W0: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
@@ -425,10 +416,9 @@ fn tp2_request(free: [u64; 2], onboard: Onboard) -> PlacementRequest {
 }
 
 #[test]
-fn tp2_auto_fixed_max_use_the_tighter_rank() {
+fn tp2_auto_and_fixed_use_the_tighter_rank() {
     for free in [[44 * GIB; 2], [48 * GIB, 44 * GIB], [44 * GIB, 48 * GIB]] {
-        for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(1.0 / 6.0),
-            Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+        for onboard in [Onboard::Auto, Onboard::Layers(10)] {
             let req = tp2_request(free, onboard);
             let placement = solve(&req).unwrap();
             assert!(placement.expert_ranges.iter().all(|r| r.layers == 0 && r.peak_bytes == 0));
@@ -441,11 +431,11 @@ fn tp2_auto_fixed_max_use_the_tighter_rank() {
             if onboard == Onboard::Auto {
                 assert_eq!(placement.pool_tokens, 2 << 20);
                 assert_eq!(t.layers, if free[0] == 44 * GIB { 22 } else { 23 });
-            } else if onboard.layers(60).is_some() {
+            } else {
                 assert_eq!(t.layers, 10);
                 let fit = (0..2).map(|g| (free[g] - t.peak_bytes[g]) / UNIT * 256).min().unwrap();
                 assert_eq!(placement.pool_tokens, fit);
-            } else { assert_eq!(t.layers, 60); }
+            }
         }
     }
     let mut req = tp2_request([12 * GIB, 48 * GIB], Onboard::Auto);
@@ -456,6 +446,31 @@ fn tp2_auto_fixed_max_use_the_tighter_rank() {
     assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { .. })));
     req = tp2_request([31 * GIB; 2], Onboard::Layers(60));
     assert!(matches!(solve(&req), Err(PlacementError::BelowFloor { .. })));
+}
+
+#[test]
+fn v4_payload_is_charged_only_when_the_tp2_arena_opens() {
+    let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(4096, 2752, 64, 3).unwrap();
+    for layers in [0, 2] {
+        let req = tp2_request([44 * GIB; 2], Onboard::Layers(layers));
+        let baseline = solve(&req).unwrap();
+        let mut charged = req;
+        charged.tp2_workspace.iter_mut().for_each(|bytes| *bytes += payload);
+        let actual = solve(&charged).unwrap();
+        if layers == 0 {
+            assert!(actual.tp2.is_none());
+            assert_eq!(actual, baseline, "a closed TP2 arena must not reserve payload storage");
+        } else {
+            let before = baseline.tp2.unwrap();
+            let after = actual.tp2.unwrap();
+            assert_eq!(before.layers, after.layers);
+            for gpu in 0..2 {
+                assert_eq!(after.peak_bytes[gpu] - before.peak_bytes[gpu], payload);
+            }
+            assert!(actual.pool_tokens < baseline.pool_tokens,
+                "negative control: an open arena must consume the payload bytes");
+        }
+    }
 }
 
 #[test]
@@ -477,8 +492,7 @@ fn tp2_keeps_dspark_tp1_arena_separate() {
 
 #[test]
 fn one_gpu_placements_ignore_tp2_costs_byte_for_byte() {
-    for onboard in [Onboard::Auto, Onboard::Layers(10), Onboard::Fraction(0.25),
-        Onboard::ExpertsFirst { pool_floor: 262_144 }] {
+    for onboard in [Onboard::Auto, Onboard::Layers(10)] {
         let req = request(1, 44 * GIB, 60, 4, onboard);
         let expected = solve(&req).unwrap();
         let mut half = req;
@@ -500,30 +514,11 @@ fn tp2_staging_peak_is_reserved_beside_every_half() {
 }
 
 #[test]
-fn experts_first_falls_back_to_a_spark_pool_below_the_context() {
-    // A card that cannot hold the 1M context's pool even without RTX layers: v2 served it with no
-    // RTX layers and the largest pool above 262K (the context clamped to it).
-    let mut small = request(1, 8 * GIB, 60, 2, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
-    small.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, false);
-    let placement = solve(&small).unwrap();
-    assert_eq!(placement.onboard_layers, 0);
-    assert!((EXPERTS_FIRST_POOL_FLOOR..1 << 20).contains(&placement.pool_tokens), "{}", placement.pool_tokens);
-    // Below v2's floor it is still a refusal.
-    small.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 3 * GIB };
-    assert!(solve(&small).is_err());
-    // Spark-free layouts never fall back.
-    let mut spark_free = request(1, 8 * GIB, 60, 0, Onboard::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR });
-    spark_free.pool = PoolPolicy::resolve(&[32 * GIB], 1 << 20, None, 256, true);
-    assert!(solve(&spark_free).is_err());
-}
-
-
-#[test]
 fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
         // #57; V4: context, #58), heads on one.
-        let recorded = if ["qwen4", "deepseek_v41"].contains(&executor.family) { AttentionPlacement::Layers }
+        let recorded = if ["qwen4", "deepseek_v41", "kimi_k3"].contains(&executor.family) { AttentionPlacement::Layers }
             else if ["glm5", "glm5_flash", "deepseek_v4"].contains(&executor.family) { AttentionPlacement::Context }
             else { AttentionPlacement::Heads };
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
@@ -700,8 +695,8 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         let mut max_req = req.clone();
         max_req.onboard = Onboard::Layers(0);
         let max_pool = solve(&max_req).unwrap().pool_tokens;
-        assert!((max_pool as f64 / 1e6 - if nvfp4 { 2.22 } else { 2.54 }).abs() < 0.005);
         eprintln!("K0 GLM layers max_pool={max_pool}");
+        assert_eq!(max_pool, if nvfp4 { 2_471_424 } else { 2_808_000 });
         let records = layers.items.iter().map(|items| items.iter().find(|i| i.group == "records").unwrap().bytes / (2 << 20)).collect::<Vec<_>>();
         let k = layers.layers.iter().position(|l| l.mode == S0).unwrap();
         eprintln!("K0 GLM layers switch={k} hops={}", layers.hops.len());
@@ -709,8 +704,9 @@ fn section_6_glm_memory_uses_one_latent_and_charges_every_exchange_slot() {
         assert!(layers.layers[k..].iter().all(|l| l.mode == S0));
         eprintln!("K0 GLM layers records={records:?}");
         let used = layers.items.iter().map(|items| items.iter().map(|i| i.bytes).sum::<u64>() as f64 / GIB as f64).collect::<Vec<_>>();
-        let expected = if nvfp4 { [89.7, 76.4] } else { [81.6, 68.3] };
-        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.07, "NVFP4={nvfp4} layers GPU{gpu}: {}", used[gpu]); }
+        eprintln!("K0 GLM layers used={used:?}");
+        let expected = if nvfp4 { [84.32, 81.77] } else { [76.23, 73.68] };
+        for gpu in 0..2 { assert!((used[gpu] - expected[gpu]).abs() < 0.01); }
     }
 }
 
@@ -1190,7 +1186,7 @@ fn conditional_movable_selected_device_scratch_and_planned_measured_agree() {
 }
 
 fn owner_balance_request() -> PlacementRequest {
-    let mut req = request(2, 96 * GIB, 4, 4, Onboard::Auto);
+    let mut req = request(2, 16 * GIB, 4, 4, Onboard::Auto);
     req.executor = CONTEXT;
     req.attention_placement = Some(AttentionPlacement::Layers);
     req.pool_overhead = vec![0; 2];
@@ -1211,7 +1207,7 @@ fn owner_cut(req: &PlacementRequest) -> usize {
 #[test]
 fn nonempty_layer_ranges_keep_both_owners_under_extreme_entry_skew() {
     let mut req = owner_balance_request();
-    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 16 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 12 * GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 0);
     req.policy.ownership = LayerOwnership::NonemptyRanges;
     assert_eq!(owner_cut(&req), 1);
@@ -1230,15 +1226,15 @@ fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
     assert_eq!(owner_cut(&req), 2);
     assert!(first.items[0].iter().any(|i| i.category == Category::Tables && i.group == "side table" && i.bytes == GIB));
     assert!(!first.items[1].iter().any(|i| i.group == "side table"));
-    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 4 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "entry weights", 8 * GIB, Basis::Exact));
     let moved = solve(&req).unwrap();
     assert_eq!(owner_cut(&req), 1);
     assert!(moved.items[1].iter().any(|i| i.group == "side table" && i.bytes == GIB));
     assert!(!moved.items[0].iter().any(|i| i.group == "side table"));
     req.layers[1].extra[0].bytes = 8 * GIB;
     req.fixed.clear();
-    // A large side table participates in the primary owner balance, not just
-    // the final charge: k2 has 12/4 GiB, better than k1's 2/14 or k0's 0/16.
+    // The side table reduces physical KV capacity on its selected owner;
+    // spreading the remaining records over two layers per GPU wins.
     assert_eq!(owner_cut(&req), 2);
     req.layers[0].extra = std::mem::take(&mut req.layers[1].extra);
     assert_eq!(owner_cut(&req), 1);
@@ -1261,23 +1257,23 @@ fn layer_extra_rows_follow_the_cutover_and_reduce_available_pool() {
 }
 
 #[test]
-fn layer_switch_balances_owner_only_head_mtp_and_layer_weights() {
+fn layer_switch_balances_complete_fixed_costs_independent_of_group_names() {
     let mut req = owner_balance_request();
     assert_eq!(owner_cut(&req), 2);
-    req.fixed.push(Demand::new(0, Category::Weights, "Qwen head", 3 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(0, Category::Weights, "Qwen head", 7 * GIB, Basis::Exact));
     req.fixed.push(Demand::new(0, Category::Drafter, "Qwen MTP", GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 1);
-    // Same names on both ranks are paired, even when the byte totals differ.
+    // Diagnostic names and zero-byte paired rows cannot hide real costs.
     req.fixed.push(Demand::new(1, Category::Weights, "Qwen head", 0, Basis::Exact));
     req.fixed.push(Demand::new(1, Category::Drafter, "Qwen MTP", 0, Basis::Exact));
-    assert_eq!(owner_cut(&req), 2);
-    // Category is part of the key: an unrelated workspace cannot pair a head.
+    assert_eq!(owner_cut(&req), 1);
+    // An unrelated workspace cannot change the accounting either.
     req.fixed.retain(|d| d.gpu == 0 || d.category != Category::Weights);
     req.fixed.push(Demand::new(1, Category::Workspace, "Qwen head", 0, Basis::Exact));
     assert_eq!(owner_cut(&req), 1);
     req.fixed.clear();
     req.layers[0].weights.whole = 8 * GIB;
-    // k1 holds 10/6 GiB, better than k0's 0/16 GiB or k2's 12/4 GiB.
+    // Isolate the heavy first layer to maximize the tighter GPU's capacity.
     assert_eq!(owner_cut(&req), 1);
 }
 
@@ -1289,24 +1285,24 @@ fn layer_switch_balances_mandatory_unequal_tp2_not_optional_residency() {
             half: [Bytes2 { resident: 3 * GIB, staging: 0 }, Bytes2 { resident: 2 * GIB, staging: 0 }],
             tp2: true, spark_ok: true });
     }
-    // 384/256 resident ratio must not become mandatory under Auto with Sparks.
+    req.pool.target = 128 << 20;
+    // No optional expert fits after this large automatic pool.
     assert_eq!(owner_cut(&req), 2);
     req.onboard = Onboard::Layers(4);
-    assert_eq!(owner_cut(&req), 1);
-    req.onboard = Onboard::Fraction(1.0);
     assert_eq!(owner_cut(&req), 1);
     req.onboard = Onboard::Auto;
     req.inventory.spark_ranks = 0;
     assert_eq!(owner_cut(&req), 1);
     // An unequal mandatory workspace participates in the same primary score.
-    req.tp2_workspace = [0, 8 * GIB];
+    req.inventory.gpus.iter_mut().for_each(|g| g.baseline = Baseline::Measured { free_bytes: 32 * GIB });
+    req.tp2_workspace = [0, 16 * GIB];
     assert_eq!(owner_cut(&req), 3);
 }
 
 #[test]
 fn qwen_refuses_shared_solver_empty_owner_chain() {
     let mut req = owner_balance_request();
-    req.fixed.push(Demand::new(1, Category::Workspace, "owner1 fixed", 8 * GIB, Basis::Exact));
+    req.fixed.push(Demand::new(1, Category::Workspace, "owner1 fixed", 16 * GIB, Basis::Exact));
     assert_eq!(owner_cut(&req), 4);
     let p = solve(&req).unwrap();
     let owners = p.layers.iter().map(|layer| match layer.mode {
@@ -1552,10 +1548,60 @@ fn compulsory_prefix_reserves_exact_costs_before_an_automatic_pool() {
 }
 
 #[test]
+fn spark_budget_feeds_existing_tp2_pool_first_and_mark_selection() {
+    let mut req = request(2, 8 * GIB, 4, 6, Onboard::Auto);
+    req.pool = PoolPolicy::resolve(&[96 * GIB; 2], 1 << 20, Some(1 << 20), 64, false);
+    req.pool_overhead = vec![128 * 1024; 2]; // 2 GiB per GPU at the fixed 1M extent.
+    for layer in &mut req.layers {
+        let cost = layer.experts.as_mut().unwrap();
+        cost.tp2 = true;
+        cost.half = [Bytes2 { resident: GIB, staging: GIB / 4 }; 2];
+    }
+    req.tp2_workspace = [GIB / 4; 2];
+    let marks = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "exact marks", GIB, cuteafd_core::memory_layout::Basis::Exact)).collect::<Vec<_>>();
+    req.fixed = marks.iter().cloned().map(|mut demand| { demand.bytes *= 4; demand }).collect();
+    let budget = SparkBudgetInventory { layers: vec![0, 1, 2, 3],
+        resident: vec![vec![GIB; 4], vec![GIB, GIB, 2 * GIB, GIB]],
+        overhead: vec![GIB; 2], budget: 4 * GIB };
+    assert_eq!(budget.minimum_rtx_layers().unwrap(), 2); // The asymmetric rank is binding.
+    budget.constrain(&mut req).unwrap();
+    assert_eq!(req.minimum_expert_layers, 2);
+    let (placed, marks) = solve_with_marks(&req, 4, 1, &marks).unwrap();
+    assert_eq!(placed.onboard_layers, 2);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert_eq!(marks.slots, 3);
+    assert!(placed.layers[..2].iter().all(|layer| layer.experts == ExpertHome::RtxTp2));
+    req.onboard = Onboard::Layers(1);
+    let error = budget.constrain(&mut req).unwrap_err().to_string();
+    assert!(error.contains("--rtx-expert-layers 1") && error.contains("--spark-budget-gib"));
+    req.onboard = Onboard::Layers(2);
+    budget.constrain(&mut req).unwrap();
+    let all = SparkBudgetInventory { budget: 1, ..budget.clone() };
+    assert_eq!(all.minimum_rtx_layers().unwrap(), 4);
+    assert_eq!(all.rank_bytes(0, 4).unwrap(), 0);
+    let invalid = SparkBudgetInventory { budget: 0, ..budget };
+    assert!(invalid.minimum_rtx_layers().is_err());
+}
+
+#[test]
 fn compulsory_prefix_fails_when_even_the_weights_do_not_fit() {
     let mut req = request(1, GIB, 2, 4, Onboard::Auto);
     req.minimum_expert_layers = 1;
     assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 1, placed: 0 })));
+}
+
+#[test]
+fn onboard_all_pin_refuses_with_the_routed_layer_count_instead_of_shrinking() {
+    use crate::placement::OnboardSetting;
+    // `all` is an exact pin: when every routed-expert layer does not fit, the
+    // refusal names the count rather than placing fewer layers.
+    let mut req = request(2, 44 * GIB, 60, 4, Onboard::Auto);
+    req.expert_gpus = 1;
+    req.onboard = OnboardSetting::All.resolve(50);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 50, placed: 43 })));
+    req.onboard = Onboard::Layers(50);
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 50, placed: 43 })));
 }
 
 #[test]
@@ -1605,4 +1651,470 @@ fn alternating_owner_function_preserves_noncontiguous_colocate_groups() {
             [first, 0, 1 - first, first, first]);
     }
     assert!(attention::alternating_owners([], 2).is_err());
+}
+
+#[test]
+fn alternating_whole_experts_keep_exact_homes_and_arena_charges() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    // A dense hole does not consume an ownership ordinal.
+    req.layers[1].experts = None;
+    let p = solve(&req).unwrap();
+    assert_eq!(p.onboard_layers, 4);
+    for (layer, gpu) in [(0, 0), (2, 1), (3, 0), (4, 1)] {
+        assert_eq!(p.layers[layer].experts, ExpertHome::RtxWhole { gpu });
+    }
+    assert_eq!(p.layers[1].experts, ExpertHome::Dense);
+    assert_eq!(p.layers[5].experts, ExpertHome::Spark);
+    for gpu in 0..2 {
+        assert_eq!(p.expert_ranges[gpu].peak_bytes, 2 * GIB + GIB / 2);
+        assert_eq!(p.items[gpu].iter().filter(|i| i.category == cuteafd_core::memory_layout::Category::Experts)
+            .map(|i| i.bytes).sum::<u64>(), p.expert_ranges[gpu].peak_bytes);
+    }
+    assert!(p.summary().contains("rtx0 layers [0, 3]"));
+    assert!(p.summary().contains("rtx1 layers [2, 4]"));
+}
+
+#[test]
+fn alternating_whole_refuses_owner_overflow_instead_of_moving_layers() {
+    let mut req = request(2, 44 * GIB, 8, 6, Onboard::Layers(4));
+    req.policy.expert_ownership = ExpertOwnership::AlternatingWhole;
+    req.inventory.gpus[1].baseline = Baseline::Measured { free_bytes: GIB };
+    assert!(matches!(solve(&req), Err(PlacementError::ExpertLayers { requested: 4, .. })));
+    req.layers[0].experts.as_mut().unwrap().tp2 = true;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn fitting_glm_flash_and_mimo_pro_keep_their_budgeted_mark_counts() {
+    for (mark_bytes, expected) in [(147_619_840, 14), (39_321_600, 42)] {
+        let slots = cuteafd_core::prefix::mark_slots_for(16, 20, mark_bytes, 2 << 30);
+        assert_eq!(slots, expected);
+        let mut req = request(2, 44 * GIB, 2, 6, Onboard::Auto);
+        let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+            "exact marks", mark_bytes / 2, Basis::Exact)).collect::<Vec<_>>();
+        req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= slots; d }));
+        let (placement, selection) = solve_with_marks(&req, slots, 1, &parts).unwrap();
+        assert_eq!(selection.slots, expected);
+        assert!(selection.reduction_reason.is_none());
+        assert_eq!(placement, solve(&req).unwrap());
+        assert!(selection.summary().contains("legacy"));
+    }
+}
+
+#[test]
+fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
+    let mut req = request(2, 44 * GIB, 2, 6, Onboard::Layers(0));
+    req.pool.requested = Some(1 << 20);
+    req.pool.floor = 1 << 20;
+    req.pool.target = 1 << 20;
+    // This fixture's KV rate is 16 GiB/rank at 1M tokens. All other
+    // operands are fixed: 8 active states plus weights and workspaces.
+    let mark = 224_686_080;
+    let legacy = cuteafd_core::prefix::mark_slots_for(8, 8, 2 * mark, 16 << 30);
+    assert_eq!(legacy, 18);
+    let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
+        "Kimi exact KDA marks", mark, Basis::Exact)).collect::<Vec<_>>();
+    for gpu in 0..2 {
+        req.fixed.push(Demand::new(gpu, Category::Kv, "C8 active states", 8 * mark, Basis::Exact));
+        req.fixed.push(Demand::new(gpu, Category::Weights, "weights and workspaces",
+            44 * GIB - 16 * GIB - 12 * mark, Basis::Exact));
+    }
+    req.fixed.extend(parts.iter().cloned().map(|mut d| { d.bytes *= legacy; d }));
+    let original = req.clone();
+    let (placed, selection) = solve_with_marks(&req, legacy, 1, &parts).unwrap();
+    assert_eq!(selection.slots, 4);
+    assert_eq!(placed.pool_tokens, 1 << 20);
+    assert!(selection.reduction_reason.is_some());
+    assert!(selection.summary().contains("capacity-constrained"));
+    assert_eq!(req, original);
+    for gpu in 0..2 {
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "Kimi exact KDA marks").unwrap().bytes, 4 * mark);
+        assert_eq!(placed.items[gpu].iter().find(|d| d.group == "C8 active states").unwrap().bytes, 8 * mark);
+    }
+    // Even one byte short of one complete mark is a typed refusal.
+    for gpu in &mut req.inventory.gpus { gpu.baseline = Baseline::Measured { free_bytes: 44 * GIB - 3 * mark - 1 }; }
+    let mut final_attempt = req.clone();
+    for demand in &mut final_attempt.fixed {
+        if demand.group == "Kimi exact KDA marks" { demand.bytes = mark; }
+    }
+    let expected = solve(&final_attempt).unwrap_err().to_string();
+    let Err(PlacementError::PrefixMarks { minimum: 1, reason, .. }) = solve_with_marks(&req, legacy, 1, &parts)
+        else { panic!("one-mark shortfall must be a typed refusal") };
+    assert!(reason.contains("tried 18 complete-mark counts (18 down to 1)"));
+    assert!(reason.ends_with(&format!("final attempt with 1 marks: {expected}")));
+    let Err(PlacementError::PrefixMarks { reason, .. }) = solve_with_marks(&final_attempt, 1, 1, &parts)
+        else { panic!("single attempted count must retain its diagnostic") };
+    assert!(reason.contains("tried 1 complete-mark counts (1 down to 1)"));
+    assert!(reason.ends_with(&expected));
+    req.fixed[0].bytes -= 1;
+    assert!(matches!(solve_with_marks(&req, legacy, 1, &parts),
+        Err(PlacementError::Inventory(_)) | Err(PlacementError::PrefixMarks { .. })));
+    let mut invalid = original;
+    invalid.fixed.last_mut().unwrap().bytes -= 1;
+    assert!(matches!(solve_with_marks(&invalid, legacy, 1, &parts), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn owner_candidates_admit_pinned_and_conditional_draft_costs_before_pool() {
+    let mut req = owner_balance_request();
+    // Make KV capacity, not the target ceiling, decide the winning boundary.
+    req.pool.target = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    req.movables.push(Movable {
+        id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
+        parts: vec![Bytes2 { resident: 8 * GIB, staging: 0 }], conditional: vec![],
+    });
+    let pinned = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 3);
+    req.movables[0].parts.clear();
+    req.movables[0].conditional = vec![MovableDemands { placement_gpu: 1,
+        demands: vec![Demand::new(1, Category::Drafter, "predictor stages", 8 * GIB, Basis::Exact)] }];
+    let conditional = solve(&req).unwrap();
+    assert_eq!(conditional.layers, pinned.layers);
+    assert_eq!(conditional.pool_tokens, pinned.pool_tokens);
+    assert_eq!(conditional.pool_limits, pinned.pool_limits);
+    // Admission of loaded modes uses exactly the costs that selected them.
+    let frozen = solve_frozen(&req, &conditional).unwrap();
+    assert_eq!(frozen.items, conditional.items);
+    assert_eq!(frozen.pool_limits, conditional.pool_limits);
+    assert_eq!(frozen.movables, conditional.movables);
+    req.movables[0].allowed = vec![0];
+    req.movables[0].conditional[0].placement_gpu = 0;
+    req.movables[0].conditional[0].demands[0].gpu = 0;
+    assert_eq!(owner_cut(&req), 1);
+}
+
+#[test]
+fn owner_candidates_find_fit_that_balanced_boundary_refuses() {
+    let mut req = owner_balance_request();
+    req.inventory.gpus.iter_mut().for_each(|g| g.baseline = Baseline::Measured { free_bytes: 16 * GIB });
+    req.policy.ownership = LayerOwnership::NonemptyRanges;
+    req.pool.requested = Some(2 << 20);
+    req.pool.floor = 2 << 20;
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![0], expert_arena: false,
+        parts: vec![Bytes2 { resident: 13 * GIB, staging: 0 }], conditional: vec![] });
+    let solved = solve(&req).unwrap();
+    assert_eq!(owner_cut(&req), 1);
+    let mut balanced = solved.clone();
+    balanced.layers[1].mode = S0;
+    assert!(solve_frozen(&req, &balanced).is_err());
+}
+
+#[test]
+fn shared_owner_boundaries_keep_colocation_and_skip_duplicate_split_stretches() {
+    use attention::owner_boundaries;
+    let groups = [(false, None), (true, Some(7)), (true, Some(7)),
+        (false, None), (true, None), (false, None)];
+    assert_eq!(owner_boundaries(&groups, false), [0, 3, 5]);
+    assert_eq!(owner_boundaries(&groups, true), [3]);
+    assert_eq!(owner_boundaries(&[], false), [0]);
+    assert!(owner_boundaries(&[], true).is_empty());
+}
+
+#[test]
+fn owner_solver_charges_pooled_draft_inventory_without_slot_context_replication() {
+    let req = owner_balance_request();
+    let tokens = 1usize << 20;
+    let full = tokens * 1152;
+    let windows = 4 * 8 * 4160 * 1152;
+    let cache = crate::formats::dflash::DraftCacheLayout { target_tokens: tokens,
+        page_rows: 64, pages: tokens / 64, record_bytes: 1152, full_layers: 1,
+        window_bytes: windows as u64, full_bytes: full as u64,
+        page_table_bytes: 532736, layer_bytes: vec![windows / 4; 4].into_iter()
+            .chain(std::iter::once(full)).collect() };
+    let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
+        |owners| -> Result<_, PlacementError> {
+            let mut candidate = req.clone();
+            for (layer, &owner) in candidate.layers.iter_mut().zip(owners) {
+                layer.modes = vec![if owner == 0 { S0 } else { S1 }];
+            }
+            candidate.movables.push(draft::DrafterDemand::itemized(cache.demands(1).unwrap(), 1).movable(2)?);
+            Ok((solve(&candidate)?, candidate))
+        }).unwrap();
+    assert_eq!(solve_frozen(&inventory, &placed).unwrap(), placed);
+    assert_eq!(group_bytes(&placed, 1, "draft shared full-context KV pool"), full as u64);
+    assert_eq!(group_bytes(&placed, 1, "draft bounded window rings"), windows as u64);
+    assert_eq!(group_bytes(&placed, 1, "draft page tables"), cache.page_table_bytes);
+    assert_eq!(group_bytes(&placed, 0, "draft shared full-context KV pool"), 0);
+}
+
+#[test]
+fn owner_specific_inventory_callback_matches_frozen_admission() {
+    let req = owner_balance_request();
+    let groups = req.layers.iter().map(|_| (true, None)).collect::<Vec<_>>();
+    let (placed, inventory) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
+        |owners| -> Result<_, PlacementError> {
+            let mut candidate = req.clone();
+            // Header/native inventory may depend on the owners; its payload must
+            // come from the winning candidate, not a prior alternating layout.
+            for (layer, &owner) in candidate.layers.iter_mut().zip(owners) {
+                layer.modes = vec![if owner == 0 { S0 } else { S1 }];
+            }
+            candidate.fixed.push(Demand::new(1, Category::Drafter, "native predictor", 8 * GIB, Basis::Exact));
+            let placed = solve(&candidate)?;
+            Ok((placed, candidate))
+        }).unwrap();
+    assert_eq!(placed.layers.iter().filter(|l| l.mode == S0).count(), 3);
+    let checked = solve_frozen(&inventory, &placed).unwrap();
+    assert_eq!(checked, placed);
+    assert_eq!(group_bytes(&placed, 1, "native predictor"), 8 * GIB);
+
+    let mut attempted = 0;
+    let (valid, ()) = attention::solve_owners(&groups, LayerOwnership::Ranges, 0,
+        |_| -> Result<_, PlacementError> {
+            attempted += 1;
+            if attempted == 1 { Err(PlacementError::Overflow("refused boundary")) }
+            else { Ok((placed.clone(), ())) }
+        }).unwrap();
+    assert_eq!(attempted, 5);
+    assert_eq!(valid, placed);
+    let mut smaller = placed.clone();
+    smaller.onboard_layers = placed.onboard_layers + 1;
+    smaller.pool_tokens /= 2;
+    assert!(attention::owner_score(&placed) > attention::owner_score(&smaller));
+
+    let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 0, |_| Err(PlacementError::Overflow("candidate")));
+    assert_eq!(refused, Err(PlacementError::Overflow("candidate")));
+    let invalid: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 2, |_| unreachable!());
+    assert!(matches!(invalid, Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn fixed_expert_refusal_includes_experts_after_conditional_draft() {
+    let mut req = owner_balance_request();
+    req.onboard = Onboard::Layers(1);
+    req.pool.requested = Some(128 << 20);
+    req.pool.floor = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    for layer in &mut req.layers { layer.modes = vec![S0]; }
+    req.layers[0].experts = Some(ExpertCost { whole: Bytes2 { resident: GIB, staging: 0 },
+        half: [Bytes2 { resident: GIB / 2, staging: 0 }; 2], tp2: true, spark_ok: true });
+    req.expert_gpus = 2;
+    req.tp2_workspace = [GIB / 4; 2];
+    let plain = solve(&req).unwrap_err();
+    req.movables.push(Movable { id: MovableId::Drafter, allowed: vec![1], expert_arena: false,
+        parts: vec![], conditional: vec![MovableDemands { placement_gpu: 1,
+            demands: vec![Demand::new(1, Category::Drafter, "draft workspace", 256, Basis::Exact)] }] });
+    let draft = solve(&req).unwrap_err();
+    let PlacementError::PoolDoesNotFit { limits: plain, .. } = plain else { panic!("{plain}") };
+    let PlacementError::PoolDoesNotFit { limits: draft, .. } = draft else { panic!("{draft}") };
+    assert_eq!(draft.0[0].available_bytes, plain.0[0].available_bytes);
+    assert_eq!(draft.0[1].available_bytes + 256, plain.0[1].available_bytes);
+}
+
+#[test]
+fn owner_refusal_reports_largest_pool_and_selected_split_through_marks_and_context() {
+    let groups = [(false, None), (true, None), (false, None), (true, None)];
+    let mut attempted = 0;
+    let refused: anyhow::Result<(Placement, ())> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 0, |_| {
+            let fit = [100, 300, 200][attempted];
+            attempted += 1;
+            Err(anyhow::Error::new(PlacementError::PrefixMarks { minimum: 1,
+                reason: "one complete mark".into(),
+                source: Box::new(PlacementError::PoolDoesNotFit {
+                    requested: 400, fit, limits: PoolLimits(vec![]) }) }).context("native admission"))
+        });
+    assert_eq!(attempted, 3);
+    let error = refused.unwrap_err();
+    assert!(matches!(error.downcast_ref::<PlacementError>(), Some(PlacementError::OwnerCandidates {
+        fit: 300, rank0: 1, rank1: 1, .. })));
+    assert!(error.to_string().contains("rtx0=1, rtx1=1"));
+    // Equal failures retain the first legal candidate, as successful ties do.
+    let refused: Result<(Placement, ()), PlacementError> = attention::solve_owners(&groups,
+        LayerOwnership::Ranges, 1, |_| Err(PlacementError::BelowFloor {
+            pool: 100, floor: 400, layers: 0, short: 300, limits: PoolLimits(vec![]) }));
+    assert!(matches!(refused, Err(PlacementError::OwnerCandidates { fit: 100, rank0: 2, rank1: 0, .. })));
+}
+
+#[test]
+fn owner_search_matches_exhaustive_frozen_pool_with_bounded_draft_storage() {
+    let mut req = owner_balance_request();
+    req.pool.target = 128 << 20;
+    req.pool.ceiling = 128 << 20;
+    req.pool_bounded.push(BoundedDemand { gpu: 1, category: Category::Drafter,
+        group: "paged draft KV".into(), bytes_per_unit: UNIT / 3,
+        offset_units: 1, cap_units: 32_768, basis: Basis::Formula });
+    let accepted = solve(&req).unwrap();
+    let best = (0..=req.layers.len()).filter_map(|boundary| {
+        let mut frozen = accepted.clone();
+        for (index, layer) in frozen.layers.iter_mut().enumerate() {
+            layer.mode = if index < boundary { S0 } else { S1 };
+        }
+        solve_frozen(&req, &frozen).ok()
+    }).map(|p| attention::owner_score(&p)).max().unwrap();
+    assert_eq!(attention::owner_score(&accepted), best);
+    assert_eq!(solve_frozen(&req, &accepted).unwrap(), accepted);
+}
+
+const MIB: u64 = 1 << 20;
+
+/// A tier over every layer of `req`, 256 experts per layer (2 MiB TP2
+/// halves, 4 MiB whole experts in the fixtures above), uniform popularity
+/// unless `order` is given.
+fn tier(req: &PlacementRequest, size: ExpertTierSize, order: Option<TierOrder>) -> ExpertTierRequest {
+    let layers = (0..req.layers.len()).collect::<Vec<_>>();
+    let order = order.unwrap_or_else(|| expert_tier::optimized_order(&layers,
+        &ExpertActivation::uniform(layers.len(), 256, 24), &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 0));
+    ExpertTierRequest::new(size, 256, order, ExpertTierSource::Uniform)
+}
+
+fn tier_request(free: [u64; 2], size: ExpertTierSize) -> PlacementRequest {
+    let mut req = tp2_request(free, Onboard::Layers(0));
+    req.expert_tier = Some(tier(&req, size, None));
+    req
+}
+
+#[test]
+fn expert_tier_auto_fills_what_the_pool_target_leaves() {
+    let placement = solve(&tier_request([44 * GIB; 2], ExpertTierSize::Auto)).unwrap();
+    // Pool first: 2M tokens = 32 GiB per GPU; 12 GiB left. GPU0's arena binds:
+    // 0.5 GiB workspace + n * 2 MiB + 1/8 GiB staging <= 12 GiB.
+    assert_eq!(placement.pool_tokens, 2 << 20);
+    let t = placement.expert_tier.as_ref().unwrap();
+    let n = ((12 * GIB - GIB / 2 - GIB / 8) / (2 * MIB)) as usize;
+    assert_eq!(t.experts, n);
+    assert_eq!(t.shard, ExpertTierShard::Tp2);
+    assert_eq!(t.routed_experts, 60 * 256);
+    assert_eq!(t.resident_bytes, vec![n as u64 * 2 * MIB; 2]);
+    assert_eq!(t.peak_bytes, vec![GIB / 2 + n as u64 * 2 * MIB + GIB / 8, GIB / 4 + n as u64 * 2 * MIB + GIB / 8]);
+    assert_eq!(u64::from(t.byte_share_ppm), n as u64 * 1_000_000 / (60 * 256));
+    // Uniform: every layer within one expert, ascending ids per layer.
+    let counts = t.per_layer().collect::<Vec<_>>();
+    assert_eq!(counts.iter().sum::<usize>(), n);
+    assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+    assert!(t.resident.iter().all(|ids| ids.iter().enumerate().all(|(i, &id)| usize::from(id) == i)));
+    // No whole layer moved: the Sparks keep every layer.
+    assert_eq!(placement.onboard_layers, 0);
+    assert_eq!(t.whole_layers, 0);
+    assert!(placement.tp2.is_none());
+    assert!(placement.layers.iter().all(|l| l.experts == ExpertHome::Spark));
+    for gpu in 0..2 {
+        let item = placement.items[gpu].iter().find(|i| i.format == "tier").unwrap();
+        assert_eq!((item.category, item.bytes), (Category::Experts, t.peak_bytes[gpu]));
+    }
+    assert!(placement.max_pool_tokens_no_onboard > placement.pool_tokens);
+    assert!(placement.summary().contains(&format!("GPU expert tier (Uniform): {n} of 15360 routed experts")),
+        "{}", placement.summary());
+}
+
+#[test]
+fn expert_tier_fixed_count_makes_the_pool_the_output() {
+    for free in [[44 * GIB; 2], [48 * GIB, 44 * GIB]] {
+        let placement = solve(&tier_request(free, ExpertTierSize::Experts(3000))).unwrap();
+        let t = placement.expert_tier.as_ref().unwrap();
+        assert_eq!(t.experts, 3000);
+        assert_eq!(t.per_layer().collect::<Vec<_>>(), vec![50; 60]);
+        let fit = (0..2).map(|g| (free[g] - t.peak_bytes[g]) / UNIT * 256).min().unwrap();
+        assert_eq!(placement.pool_tokens, fit);
+    }
+    // 15,000 halves of 2 MiB need 29.3 GiB beside the arena on each GPU.
+    let too_many = tier_request([24 * GIB; 2], ExpertTierSize::Experts(15_000));
+    assert!(matches!(solve(&too_many), Err(PlacementError::ExpertTier { requested: 15_000, placed }) if placed < 15_000));
+    let beyond = tier_request([44 * GIB; 2], ExpertTierSize::Experts(60 * 256 + 1));
+    assert!(matches!(solve(&beyond), Err(PlacementError::ExpertTier { .. })));
+}
+
+#[test]
+fn expert_tier_follows_its_order_and_profile_counts() {
+    // A profile that routes everything to layer 7's experts 3 and 9.
+    let mut counts = vec![vec![0u64; 256]; 60];
+    counts[7][9] = 50;
+    counts[7][3] = 100;
+    counts[12][0] = 1;
+    let profile = ExpertRouteProfile { layers: counts };
+    let layers = (0..60).collect::<Vec<_>>();
+    let model = TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS;
+    let activation = ExpertActivation::from_profile(&profile, 60, 256, 6, 6, 24).unwrap();
+    let order = expert_tier::optimized_order(&layers, &activation, &model, 0);
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(0));
+    let mut request = tier(&req, ExpertTierSize::Experts(3), Some(order));
+    request.source = ExpertTierSource::Profile;
+    req.expert_tier = Some(request);
+    let t = solve(&req).unwrap().expert_tier.unwrap();
+    assert_eq!(t.resident[7], vec![3, 9]);
+    assert_eq!(t.resident[12], vec![0]);
+    assert_eq!(t.experts, 3);
+    assert_eq!(t.source, ExpertTierSource::Profile);
+    let resident = t.resident.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    assert!((profile.route_share(&resident) - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn expert_tier_stops_where_residency_stops_helping_and_honours_pinned_layers() {
+    // Plenty of memory: an automatic tier stops at the step model's balance
+    // point (~73% of each layer at 24 of 256 experts active), not at memory.
+    let roomy = solve(&tier_request([96 * GIB; 2], ExpertTierSize::Auto)).unwrap();
+    let t = roomy.expert_tier.unwrap();
+    let useful = tier_request([96 * GIB; 2], ExpertTierSize::Auto).expert_tier.unwrap().useful;
+    assert_eq!(t.experts, useful);
+    assert!(t.per_layer().all(|n| (180..=190).contains(&n)), "{:?}", t.per_layer().collect::<Vec<_>>());
+    // Pinned whole layers lead the order and must fit.
+    let mut req = tp2_request([44 * GIB; 2], Onboard::Layers(0));
+    let layers = (0..60).collect::<Vec<_>>();
+    let pinned = expert_tier::optimized_order(&layers, &ExpertActivation::uniform(60, 256, 24),
+        &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 3);
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Auto, Some(pinned.clone())));
+    let t = solve(&req).unwrap().expert_tier.unwrap();
+    assert_eq!(t.whole_layers, 3);
+    assert_eq!(&t.per_layer().take(4).collect::<Vec<_>>()[..3], &[256, 256, 256]);
+    assert!(t.per_layer().skip(3).all(|n| n < 256));
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Experts(3 * 256 - 1), Some(pinned.clone())));
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    let mut tight = tp2_request([34 * GIB; 2], Onboard::Layers(0));
+    let many = expert_tier::optimized_order(&layers, &ExpertActivation::uniform(60, 256, 24),
+        &TierStepModel::C1_VERIFY_48GB_PAIR_4_SPARKS, 20);
+    tight.expert_tier = Some(tier(&tight, ExpertTierSize::Auto, Some(many)));
+    assert!(matches!(solve(&tight), Err(PlacementError::ExpertTier { requested: 5120, .. })));
+}
+
+#[test]
+fn expert_tier_on_one_gpu_holds_whole_experts() {
+    let mut req = request(1, 44 * GIB, 60, 4, Onboard::Layers(0));
+    req.expert_tier = Some(tier(&req, ExpertTierSize::Auto, None));
+    let placement = solve(&req).unwrap();
+    let t = placement.expert_tier.unwrap();
+    assert_eq!(t.shard, ExpertTierShard::Whole { gpu: 0 });
+    // 12 GiB left: 1/4 GiB workspace + n * 4 MiB + 1/4 GiB staging.
+    assert_eq!(t.experts, ((12 * GIB - GIB / 2) / (4 * MIB)) as usize);
+    assert_eq!(t.peak_bytes, vec![12 * GIB]);
+}
+
+#[test]
+fn expert_tier_refuses_requests_it_cannot_run() {
+    // No Sparks to hold the other experts.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    req.inventory.spark_ranks = 0;
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    // Whole-layer onboarding and a tier together.
+    for (onboard, minimum) in [(Onboard::Auto, 0), (Onboard::Layers(2), 0), (Onboard::Layers(0), 1)] {
+        let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+        req.onboard = onboard;
+        req.minimum_expert_layers = minimum;
+        assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))), "{onboard:?} {minimum}");
+    }
+    // A layer residency that does not divide over its experts.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    req.expert_tier.as_mut().unwrap().experts_per_layer = 3;
+    req.expert_tier.as_mut().unwrap().order.retain(|slot| slot.expert < 3);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+    // A repeated slot.
+    let mut req = tier_request([44 * GIB; 2], ExpertTierSize::Auto);
+    let first = req.expert_tier.as_ref().unwrap().order[0];
+    req.expert_tier.as_mut().unwrap().order.push(first);
+    assert!(matches!(solve(&req), Err(PlacementError::Inventory(_))));
+}
+
+#[test]
+fn expert_tier_off_leaves_placements_unchanged() {
+    for onboard in [Onboard::Auto, Onboard::Layers(10)] {
+        let req = tp2_request([44 * GIB; 2], onboard);
+        let placement = solve(&req).unwrap();
+        assert!(placement.expert_tier.is_none());
+        assert!(!serde_json::to_string(&placement).unwrap().contains("expert_tier"));
+    }
 }

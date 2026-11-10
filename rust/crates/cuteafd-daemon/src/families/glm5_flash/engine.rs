@@ -47,7 +47,7 @@ use super::weights::{GlmfLayer, GlmfWeights};
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use super::head::GlmfHead;
 use crate::shared::target_head::TargetHead as TargetHeadRoute;
-use crate::families::glm5::dflash::TargetHead;
+use crate::shared::speculation::dflash::TargetHead;
 use crate::shared::experts::fp8::{Fp8Experts, Fp8Layer};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
@@ -57,10 +57,10 @@ use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_core_step_scratch, GlmfCoreScratch, glmf_step_workspaces, glmf_table_pages,
     glmf_temporary_bytes, GlmfKdaState, GlmfScratchOptions, GlmfStepShape};
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
 };
@@ -70,13 +70,38 @@ use crate::shared::experts::rtx::{ExpertInput, PartialDtype, Routes, RtxExpertLa
 use std::ffi::c_void;
 use std::rc::Rc;
 
-type Dev<'a> = DeviceAllocation<'a>;
+/// A retained device allocation or a disjoint view of the prefill slot arena.
+struct Dev<'a> {
+    buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    _owner: Rc<DeviceAllocation<'a>>,
+}
+impl<'a> Dev<'a> {
+    fn new(library: &'a NativeLibrary, bytes: usize) -> Result<Self> {
+        let owner = Rc::new(DeviceAllocation::new(library, bytes)?);
+        Ok(Self { buffer: owner.buffer, _owner: owner })
+    }
+    fn view(owner: Rc<DeviceAllocation<'a>>, offset: usize, bytes: usize) -> Result<Self> {
+        ensure!(offset.checked_add(bytes).is_some_and(|end| end <= owner.buffer.bytes),
+            "prefill slot view exceeds arena");
+        let buffer = cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: owner.buffer.ptr.wrapping_byte_add(offset), bytes, ..owner.buffer };
+        Ok(Self { buffer, _owner: owner })
+    }
+}
 
 #[path = "engine/context.rs"]
 mod context;
+mod core;
+mod native;
 #[path = "engine/layers.rs"]
 mod layers;
+#[path = "engine/units.rs"]
+mod units;
 pub(crate) use cuteafd_loader::placement::families::glm5_flash::GlmfAttention;
+
+const HC: usize = 4;
+
+fn decode_peer_bytes(rows: usize, hidden: usize) -> usize { rows * HC * hidden * 2 }
 
 pub(crate) const PAGE_ROWS: usize = 64;
 /// Rows of the decode-route programs (`_m64`).
@@ -315,77 +340,25 @@ impl RecordGuard {
 }
 
 const MAX_RANKS: usize = crate::shared::spark_intake::MAX_INTAKE_RANKS;
-/// Lanes a long Spark prefill chunk splits into by default, and at most (`--prefill-lanes`; each
-/// lane's GPU layers run while the other lanes' Spark waves are in flight, one transport per
-/// lane), and the fewest rows per lane worth another exchange per layer.
-pub(crate) const DEFAULT_PREFILL_LANES: usize = 2;
-pub(crate) const MAX_PREFILL_LANES: usize = 4;
-const MIN_LANE_ROWS: usize = 256;
-
-/// The longest chunk `lanes` lanes of `rows` rows take. Multi-lane splits must land on MLA page
-/// boundaries. A narrow workspace still accepts a single unpadded tail, but cannot advertise
-/// unusable padding.
-fn prefill_lane_capacity(lanes: usize, rows: usize) -> usize {
-    rows.max(lanes * (rows / PAGE_ROWS) * PAGE_ROWS)
-}
-
-/// How a chunk of `tokens` rows runs on up to `lanes` lanes of `rows` rows: (lanes, rows per
-/// lane). One lane per `MIN_LANE_ROWS` rows, at most `lanes`, and at least as many as the rows
-/// need once each lane's share is rounded up to whole MLA pages: every lane but the last holds
-/// the same number of pages, so each lane's pools and pages start where the previous lane's end.
-/// Two lanes keep the rule they always had: two from twice `MIN_LANE_ROWS` rows (or when one
-/// lane cannot hold the chunk), cut at the middle rounded up to a page.
-fn prefill_lane_plan(tokens: usize, lanes: usize, rows: usize) -> Result<(usize, usize)> {
-    ensure!(tokens > 0 && tokens <= prefill_lane_capacity(lanes, rows),
-        "prefill of {tokens} tokens exceeds {lanes} lanes of {rows} rows");
-    let mut wanted = (tokens / MIN_LANE_ROWS).clamp(1, lanes.max(1)).max(tokens.div_ceil(rows.max(1)));
-    let per_lane = loop {
-        let per_lane = if wanted == 1 { tokens } else { tokens.div_ceil(wanted).next_multiple_of(PAGE_ROWS) };
-        if per_lane <= rows || wanted >= lanes {
-            break per_lane;
-        }
-        wanted += 1;
-    };
-    ensure!(per_lane <= rows, "prefill lane of {per_lane} tokens exceeds {rows} rows");
-    Ok((tokens.div_ceil(per_lane), per_lane))
-}
-const HC: usize = 4;
-
-/// The longest chunk a lone prefill runs as one step: pipelined Spark lanes ([`prefill_lane_plan`])
-/// cut a chunk into two lanes from twice `MIN_LANE_ROWS` rows; a serial prefill takes `rows`.
-fn single_pass_rows(pipelined: bool, lanes: usize, rows: usize) -> usize {
-    if pipelined && lanes > 1 { (2 * MIN_LANE_ROWS - 1).min(rows) } else { rows }
-}
+/// Maximum in-flight prefill units on the single expert link.
+pub(crate) const MAX_PREFILL_WAVES: usize = 4;
 
 /// What a packed pass's `on_logits` returns for one sequence ([`GlmfEngine::prefill_packed`]):
 /// `Err` is a failure the pass shares (the engine's), which ends it for every sequence;
 /// `Ok(Err)` is that sequence's own (its grammar, its sampling), which fails it alone.
-pub(crate) type PackedOutcome = Result<Result<()>>;
+pub(crate) use crate::shared::prefill_packing::MemberOutcome as PackedOutcome;
 
 /// A packed pass once its step has run: the step wrote every sequence's KDA state and pages, so
 /// every placement advances first, then each sequence's `head(i)` logits go to `on_logits` in
 /// order. A sequence's own failure does not stop the others'; it is returned among the outcomes,
 /// and its caller releases or resets that placement.
-fn packed_tail<L>(sequences: &mut [(&mut GlmfPlacement, &[u32])], mut head: impl FnMut(usize) -> Result<L>,
+fn packed_tail<L>(sequences: &mut [(&mut GlmfPlacement, &[u32])], head: impl FnMut(usize) -> Result<L>,
     on_logits: &mut dyn FnMut(usize, L) -> PackedOutcome) -> Result<Vec<Result<()>>> {
     for (placement, tokens) in sequences.iter_mut() {
         placement.len += tokens.len();
         placement.kda_len = placement.len;
     }
-    (0..sequences.len()).map(|i| on_logits(i, head(i)?)).collect()
-}
-
-/// CUTEAFD_GLMF_PREFILL_LANES: (lanes on: unset or not `1`, lanes with a `--layers` subset: `subset`).
-fn lane_setting() -> (bool, bool) {
-    let setting = std::env::var("CUTEAFD_GLMF_PREFILL_LANES");
-    (setting.as_ref().map_or(true, |v| v != "1"), setting.as_ref().is_ok_and(|v| v == "subset"))
-}
-
-/// Lane scheduling is independent of the expert home. Only a Spark backend needs one
-/// transport per lane; local and TP2 work is serialized on the owning streams.
-fn prefill_pipeline_available(on: bool, complete: bool, subset: bool, lanes: usize,
-    transports: Option<usize>) -> bool {
-    on && (complete || subset) && lanes > 0 && transports.is_none_or(|count| count >= lanes)
+    crate::shared::prefill_packing::finish_members(sequences.len(), head, on_logits)
 }
 
 /// Routed experts on this GPU from the TP1 package. All layers stay resident
@@ -470,6 +443,17 @@ struct Tp2Experts<'a> {
     interval: usize,
     steps: Cell<usize>,
     schedule: RefCell<Option<crate::shared::peer_split::order::Schedule>>,
+    unit_checks: RefCell<Option<UnitRouteChecks<'a>>>,
+}
+
+struct RouteHosts<'a> {
+    hosts: [HostAllocation<'a>; 2],
+    collected: [bool; 2],
+}
+
+struct UnitRouteChecks<'a> {
+    slots: crate::shared::experts::rtx::routes::SlotRouteChecks<std::collections::BTreeMap<usize, RouteHosts<'a>>>,
+    units: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -486,12 +470,28 @@ impl PackedRoutes {
 pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
+    LocalNative(RefCell<Box<dyn RtxExpertLayer + 'a>>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
     /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transports: RefCell<Vec<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>> },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
+}
+
+fn native_local_layers(experts: &dyn RtxExpertLayer, device: i32) -> Result<Vec<usize>> {
+    ensure!(experts.shard() == crate::shared::experts::rtx::RtxShard::Whole
+        && experts.partial() == PartialDtype::Bf16 && experts.uses_fp8_input()
+        && experts.device() == device, "native whole expert binding differs from engine");
+    Ok(experts.layers().to_vec())
+}
+
+fn tp2_input(experts: &dyn RtxExpertLayer, wire: *mut c_void, hidden: *mut c_void) -> ExpertInput {
+    if experts.uses_fp8_input() { ExpertInput::Fp8K32(wire) } else { ExpertInput::Bf16(hidden) }
+}
+
+fn tp2_weight_read_bytes(ranks: [&dyn RtxExpertLayer; 2]) -> Result<usize> {
+    ranks.into_iter().try_fold(0, |largest, rank| Ok(largest.max(rank.weight_read_bytes()?)))
 }
 
 /// Per-program GPU times (CUTEAFD_GLMF_PROFILE_OPS=1): timing events around
@@ -650,6 +650,13 @@ impl GlmfPlacement {
         Self { units, pages, pool_pages, slot, len: 0, kda_len: 0 }
     }
 
+    /// Appends freshly reserved units (a decode top-up) with their MLA and pool pages.
+    pub fn extend(&mut self, units: &[u32]) {
+        self.pages.extend(units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i)));
+        self.pool_pages.extend(units.iter().map(|&u| u as i32));
+        self.units.extend_from_slice(units);
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -775,6 +782,8 @@ pub(crate) fn output_shard_reserve(lanes: usize, prefill_rows: usize, hidden: us
 /// exchange), so a GPU's lanes share one set of temporaries; decode keeps its own, since its
 /// graphs hold its pointers. Sizes: `cuteafd_loader::serving_capacity::glmf_lane_bytes`.
 struct Workspace<'a> {
+    core: Option<core::Slot<'a>>,
+    native: Option<native::Slot<'a>>,
     rows: usize,
     /// Zero rows: rank 1's partial of a dense MLP rank 0 runs whole (ModelOpt NVFP4); rank 1 of a
     /// head split only.
@@ -805,7 +814,6 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
-    router_host: RefCell<HostAllocation<'a>>,
     /// Shared by every prefill lane of this GPU (decode: its own).
     temps: Rc<Temporaries<'a>>,
 }
@@ -865,6 +873,7 @@ pub(crate) struct StepPlan<'p, 'a> {
     programs: &'a Programs<'a>,
     cfg: &'p GlmNextConfig,
     scratch: GlmfScratchOptions,
+    native: GlmfCoreScratch,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
     /// Rows of the decode workspace (`--decode-rows`): it runs the `_m64` programs, and with 128 the
@@ -873,7 +882,6 @@ pub(crate) struct StepPlan<'p, 'a> {
     /// Bytes of KDA replay records rank 0's prefill scratch holds (`--replay-records shared`): the
     /// scratch is at least this large. 0 with records of their own.
     shared_records: u64,
-    spark_bf16: bool,
 }
 
 /// Expert buffers required by the admitted routed-layer homes.
@@ -891,7 +899,6 @@ pub(crate) struct StepSettings {
     pub kda_output_shard: bool,
     pub kda_prefill_expanded: bool,
     pub full_prefill_logits: bool,
-    pub spark_bf16: bool,
     /// Sizes the page tables (`glmf_table_pages`).
     pub max_context: usize,
     /// The DSA index cache: the compact one runs the `index_producer_c` programs, whose scratch
@@ -909,7 +916,7 @@ pub(crate) struct StepSettings {
 impl<'p, 'a> StepPlan<'p, 'a> {
     /// The plan of an engine over `layers` with `experts` and `settings` (rank 0's shape).
     pub(crate) fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: &'p GlmNextConfig,
-        layers: &[GlmfLayer<'_>], experts: StepExperts, settings: StepSettings) -> Self {
+        layers: &[GlmfLayer<'_>], native_head: bool, experts: StepExperts, settings: StepSettings) -> Self {
         let split = layers.first().is_some_and(|l| l.split);
         let (table_pages, table_pool_pages) = glmf_table_pages(settings.max_context as u64);
         // As `GlmfEngine::new` resolves it: without an MLA layer there is no index cache.
@@ -925,6 +932,13 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             library,
             programs,
             cfg,
+            native: GlmfCoreScratch {
+                kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
+                    .all(|l| l.core.contains_key("self_attn.q_proj") || native::is_native(l)),
+                mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
+                    .all(|l| l.core.contains_key("self_attn.q_a_proj") || native::is_native(l)),
+                ffn: layers.iter().all(|l| core::native_ffn(l) || native::is_native(l)),
+            },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
                 kda_prefill_expanded: settings.kda_prefill_expanded, index_compact,
@@ -937,24 +951,24 @@ impl<'p, 'a> StepPlan<'p, 'a> {
                 spark: experts.spark,
                 partial_bytes: if settings.kda_fp32_partials { 4 } else { 2 },
                 output_shard: settings.kda_output_shard,
-                full_prefill_logits: settings.full_prefill_logits,
+                // K6 scoring downloads tiles through the ordinary bounded staging.
+                full_prefill_logits: settings.full_prefill_logits && !native_head,
                 table_pages,
                 table_pool_pages,
             },
             decode_rows: settings.decode_rows,
             shared_records,
-            spark_bf16: settings.spark_bf16,
         }
     }
 
     /// Device bytes of rank `rank`'s step workspaces: the decode workspace of the plan's decode rows,
     /// and `lanes` prefill lanes of `prefill_rows` rows over their one set of temporaries (what
-    /// `decode_workspace_of` and `prefill_lanes_of` allocate).
+    /// `decode_workspace_of` and `prefill_slots_of` allocate).
     pub(crate) fn workspace_bytes(&self, rank: usize, prefill_rows: usize, lanes: usize) -> Result<u64> {
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let decode_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, self.decode_rows as u64, true)?;
-        let mut prefill_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false)?;
+        let decode_scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, self.decode_rows as u64, true, self.native)?;
+        let mut prefill_scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false, self.native)?;
         if rank == 0 {
             // The prefill scratch also holds the replay records (`--replay-records shared`).
             prefill_scratch.programs = prefill_scratch.programs.max(self.shared_records);
@@ -963,15 +977,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64) {
-        (self.scratch, self.shape, self.decode_rows, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64) {
+        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape, usize, u64),
+    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -985,8 +999,7 @@ impl<'a> StepWorkspaces<'a> {
     /// The decode workspace and `lanes` prefill lanes of `rows` rows of `plan`, on the current device.
     pub(crate) fn allocate(plan: &StepPlan<'_, 'a>, rows: usize, lanes: usize) -> Result<Self> {
         let decode = plan.lane(0, plan.decode_rows, true, Rc::new(plan.temporaries(0, plan.decode_rows, true)?))?;
-        let temps = Rc::new(plan.temporaries(0, rows, false)?);
-        let lanes = (0..lanes).map(|_| plan.lane(0, rows, false, temps.clone())).collect::<Result<_>>()?;
+        let lanes = plan.slots(0, rows, lanes)?;
         Ok(Self { key: plan.key(), rows, decode, lanes })
     }
 
@@ -1002,7 +1015,7 @@ impl<'a> StepPlan<'_, 'a> {
     }
 
     fn alloc(&self, bytes: u64) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, usize::try_from(bytes)?.max(256))
+        Dev::new(self.library, usize::try_from(bytes)?.max(256))
     }
 
     fn zeroed(&self, bytes: u64) -> Result<Dev<'a>> {
@@ -1017,7 +1030,7 @@ impl<'a> StepPlan<'_, 'a> {
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let mut scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        let mut scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode, self.native)?;
         if rank == 0 && !decode {
             // The prefill scratch also holds the replay records (`--replay-records shared`).
             scratch.programs = scratch.programs.max(self.shared_records);
@@ -1050,38 +1063,61 @@ impl<'a> StepPlan<'_, 'a> {
 
     /// Rank `rank`'s lane buffers for steps of up to `rows` rows over `temps`, on the current device.
     fn lane(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>) -> Result<Workspace<'a>> {
+        self.slot(rank, rows, decode, temps, &mut |bytes| self.alloc(bytes))
+    }
+
+    /// All live prefill rows share one allocation; hook-local scratch stays separate.
+    fn slots(&self, rank: usize, rows: usize, count: usize) -> Result<Vec<Workspace<'a>>> {
+        let _scope = cuteafd_ffi::memory_ledger::scope("workspace");
+        let bytes = glmf_lane_bytes(self.cfg, rows as u64, false, &self.shape(rank)).arena_bytes();
+        let owner = Rc::new(DeviceAllocation::new(self.library,
+            usize::try_from(bytes)?.checked_mul(count).context("prefill arena overflow")?)?);
+        let temps = Rc::new(self.temporaries(rank, rows, false)?);
+        let mut offset = 0;
+        (0..count).map(|_| self.slot(rank, rows, false, temps.clone(), &mut |bytes| {
+            let bytes = usize::try_from(bytes)?.max(256);
+            let view = Dev::view(owner.clone(), offset, bytes)?;
+            offset += bytes.next_multiple_of(256);
+            Ok(view)
+        })).collect()
+    }
+
+    fn slot(&self, rank: usize, rows: usize, decode: bool, temps: Rc<Temporaries<'a>>,
+        alloc: &mut impl FnMut(u64) -> Result<Dev<'a>>) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         ensure!(rows <= temps.rows, "a lane of {rows} rows over temporaries of {}", temps.rows);
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, decode, &self.shape(rank));
         Ok(Workspace {
+            core: None,
+            native: None,
             rows,
-            zero: bytes.zero.map(|b| self.zeroed(b)).transpose()?,
-            sum: bytes.sum.map(|b| self.alloc(b)).transpose()?,
-            streams: [self.alloc(bytes.streams)?, self.alloc(bytes.streams)?],
-            post: self.alloc(bytes.post)?,
-            comb: self.alloc(bytes.comb)?,
-            x: self.alloc(bytes.x)?,
-            delta: self.alloc(bytes.delta)?,
-            shared: self.alloc(bytes.shared)?,
-            routed: bytes.routed.map(|b| self.alloc(b)).transpose()?,
-            positions: self.alloc(bytes.positions)?,
-            kv_slots: self.alloc(bytes.kv_slots)?,
-            kda_slots: self.alloc(bytes.kda_slots)?,
-            seq_first: self.alloc(bytes.seq_first)?,
-            pool_slots: self.alloc(bytes.pool_slots)?,
-            cache_lengths: self.alloc(bytes.cache_lengths)?,
-            page_table: self.alloc(bytes.page_table)?,
-            pool_table: self.alloc(bytes.pool_table)?,
-            ids: self.alloc(bytes.ids)?,
-            select: self.alloc(bytes.select)?,
-            router_logits: self.alloc(bytes.router_logits)?,
-            route_ids: self.alloc(bytes.route_ids)?,
-            route_weights: self.alloc(bytes.route_weights)?,
-            wire: self.alloc(bytes.wire)?,
-            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(bytes.router_host)?
-                + if self.spark_bf16 && rank == 0 && self.shape.spark {
-                    rows * (self.cfg.hidden - self.cfg.hidden / 32)
-                } else { 0 })?),
+            zero: bytes.zero.map(|b| -> Result<_> {
+                let view = alloc(b)?;
+                self.library.cuda_zero_bytes(view.buffer, view.buffer.bytes)?;
+                Ok(view)
+            }).transpose()?,
+            sum: bytes.sum.map(|b| alloc(b)).transpose()?,
+            streams: [alloc(bytes.streams)?, alloc(bytes.streams)?],
+            post: alloc(bytes.post)?,
+            comb: alloc(bytes.comb)?,
+            x: alloc(bytes.x)?,
+            delta: alloc(bytes.delta)?,
+            shared: alloc(bytes.shared)?,
+            routed: bytes.routed.map(|b| alloc(b)).transpose()?,
+            positions: alloc(bytes.positions)?,
+            kv_slots: alloc(bytes.kv_slots)?,
+            kda_slots: alloc(bytes.kda_slots)?,
+            seq_first: alloc(bytes.seq_first)?,
+            pool_slots: alloc(bytes.pool_slots)?,
+            cache_lengths: alloc(bytes.cache_lengths)?,
+            page_table: alloc(bytes.page_table)?,
+            pool_table: alloc(bytes.pool_table)?,
+            ids: alloc(bytes.ids)?,
+            select: alloc(bytes.select)?,
+            router_logits: alloc(bytes.router_logits)?,
+            route_ids: alloc(bytes.route_ids)?,
+            route_weights: alloc(bytes.route_weights)?,
+            wire: alloc(bytes.wire)?,
             temps,
         })
     }
@@ -1215,7 +1251,7 @@ impl<'a> Caches<'a> {
         slots: usize, kda_heads: usize, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, pool_marks: bool) -> Result<Self> {
         let zeroed = |bytes: usize| -> Result<Dev<'a>> {
-            let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+            let allocation = Dev::new(library, bytes.max(256))?;
             library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
             Ok(allocation)
         };
@@ -1225,7 +1261,7 @@ impl<'a> Caches<'a> {
         for layer in layers {
             match layer.attention {
                 GlmNextAttention::Mla => {
-                    ensure!(layer.has("w_uk") == layer.attention_share.present(),
+                    ensure!((layer.has("w_uk") || layer.has("w_uk_fp8")) == layer.attention_share.present(),
                         "MLA cache residency disagrees with uploaded attention weights");
                     if !layer.attention_share.present() {
                         kv.push(None);
@@ -1292,7 +1328,7 @@ pub(crate) struct GlmfPeer<'a> {
     caches: Caches<'a>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Its prefill lanes (a serial prefill runs in the first).
-    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
+    prefill_slots: RefCell<Vec<Workspace<'a>>>,
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     /// L2 prefetch of its next layer's weights while it waits for rank 0's expert exchange.
     l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
@@ -1318,6 +1354,11 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    core: Vec<Option<core::Rank<'a>>>,
+    native: Vec<native::Rank<'a>>,
+    core_admission: Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>,
+    core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
+    draft_core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
     /// The same admitted homes used to allocate early workspaces; validated against installed backends.
     step_experts: StepExperts,
     pub(crate) spark_bf16: bool,
@@ -1330,9 +1371,12 @@ pub(crate) struct GlmfEngine<'a> {
     pub max_context: usize,
     /// Rows of one prefill lane (and of a serial prefill chunk).
     pub prefill_rows: usize,
-    /// Prefill lanes (1..=[`MAX_PREFILL_LANES`]): a Spark prefill chunk runs in up to this many.
-    pub prefill_lane_count: usize,
+    /// Prefill lanes (1..=[`MAX_PREFILL_WAVES`]): a Spark prefill chunk runs in up to this many.
+    pub prefill_waves: usize,
+    /// Requested continuous-call span, bounded by context and floored at the live slots' rows.
+    prefill_span_rows: usize,
     pub pages: usize,
+    pub max_pool_tokens_no_onboard: Option<u64>,
     pub slots: usize,
     /// The most rows of one decode or verify step (`--decode-rows`): [`DECODE_ROWS`], or
     /// [`WIDE_DECODE_ROWS`], where a step of more than 64 rows runs the wide `_m128` programs (fewer
@@ -1370,9 +1414,13 @@ pub(crate) struct GlmfEngine<'a> {
     context: Option<context::GlmfContextSplit<'a>>,
     /// Per prefill lane and rank: this step's context gather and commit counts.
     context_units: RefCell<context::ContextUnits>,
+    context_unit: Cell<usize>,
+    context_reuse: Cell<bool>,
+    staging_owner: RefCell<[Option<(usize, usize)>; 2]>,
+    unit_prefill: Cell<bool>,
     // Hop consumers retire before the exchange whose terminal words they borrow.
     layer_execution: Option<layers::Execution<'a>>,
-    layer_waves: RefCell<Vec<Option<SparkExpertWave>>>,
+    layer_waves: RefCell<Vec<Option<crate::shared::spark_waves::WaveTicket>>>,
     /// The head split's second GPU and the exchange between the two.
     peer: Option<GlmfPeer<'a>>,
     exchange: Option<PeerExchange<'a>>,
@@ -1399,16 +1447,18 @@ pub(crate) struct GlmfEngine<'a> {
     decode_workspace: RefCell<Option<Workspace<'a>>>,
     /// Prefill lanes of `prefill_rows` rows over one set of temporaries (pipelined Spark prefill;
     /// a serial prefill runs in the first).
-    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
+    prefill_slots: RefCell<Vec<Workspace<'a>>>,
     experts: Option<Experts<'a>>,
+    packed_row_cap: Cell<Option<usize>>,
+    packed_programs: crate::shared::prefill_packing::ProgramInventory,
     dense_nvfp4: Option<DenseNvfp4<'a>>,
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     /// Host seconds per phase: GPU work until each expert exchange (waiting
     /// for the routes and wire rows), the Spark exchanges, and the head (final
     /// norm, vocabulary projection, logits download).
     pub profile: RefCell<[f64; 3]>,
-    /// Prefill steps keep every row's logits (golden scoring); otherwise the
-    /// prefill workspace holds logits for at most `DECODE_ROWS` rows.
+    /// Permit scoring every prefill row. Native K6 consumes bounded tiles on
+    /// the host; other heads retain full-row device logits.
     pub full_prefill_logits: bool,
     /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
     /// budget when one is set.
@@ -1421,15 +1471,8 @@ pub(crate) struct GlmfEngine<'a> {
     pub(crate) startup_graphs: bool,
     warming_graphs: std::cell::Cell<bool>,
     logged_graph_shapes: RefCell<std::collections::HashSet<(usize, usize, bool, GraphGeometry)>>,
-    /// Spark prefill runs in lanes (CUTEAFD_GLMF_PREFILL_LANES, default on).
-    lanes: bool,
-    /// CUTEAFD_GLMF_PREFILL_LANES=subset: lanes even with a `--layers`
-    /// subset (timing runs against loopback ranks that hold only those layers).
-    subset_lanes: bool,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
-    /// Recorded after a layer's routes and wire rows reach the host staging.
-    routes_ready: *mut c_void,
     /// The shared draft policy's per-step signals (layer events, routes), armed by
     /// `serve-glmf` under the shared policy and active only around its verify steps.
     draft_probe: RefCell<Option<super::draft_probe::RoundProbe<'a>>>,
@@ -1530,16 +1573,6 @@ pub(crate) fn workspace_reserve(plan: &StepPlan<'_, '_>, prefill_rows: usize, la
 /// `lanes` prefill lanes and (`drafter`) the drafter's.
 fn workspace_reserve_bytes(tracked: u64, lanes: usize, drafter: bool) -> u64 {
     tracked + cuteafd_loader::serving_capacity::glmf_graphs::workspace_runtime_overhead(lanes, drafter)
-}
-
-/// The prefill lanes a serving engine creates before readiness: `lanes` (`--prefill-lanes`) when
-/// prefill runs in lanes (`CUTEAFD_GLMF_PREFILL_LANES=1` turns them off, `subset` keeps them
-/// with a `--layers` subset), else one serial workspace.
-fn prefill_workspace_count(complete: bool, value: Option<&str>, lanes: usize) -> usize {
-    if prefill_pipeline_available(value != Some("1"), complete, value == Some("subset"), lanes, None) { lanes } else { 1 }
-}
-pub(crate) fn configured_prefill_lanes(complete: bool, lanes: usize) -> usize {
-    prefill_workspace_count(complete, std::env::var("CUTEAFD_GLMF_PREFILL_LANES").ok().as_deref(), lanes)
 }
 
 fn startup_graph_policy(graphs: Option<&str>, startup: Option<&str>) -> bool {
@@ -1657,8 +1690,15 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 /// both take this format.
 fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
     wire: Vec<u8>, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
+    spark_request_bytes(hidden, topk, layer, rows, routes, wire.into(), kind, bf16)
+}
+
+/// [`spark_request`] with a shared payload (a view of a wave slot's staging).
+#[allow(clippy::too_many_arguments)]
+fn spark_request_bytes(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
     let topk = topk as u32;
-    let mut request = ExpertProtocolV2Request::new(layer as u64 + 1, 17, layer as u32, hidden as u32,
+    let mut request = ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 17, layer as u32, hidden as u32,
         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
@@ -1710,7 +1750,7 @@ impl<'a> GlmfEngine<'a> {
     /// rows of one decode or verify step, [`DECODE_ROWS`] or [`WIDE_DECODE_ROWS`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
-        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_lane_count: usize, pages: usize,
+        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_waves: usize, prefill_span_rows: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
@@ -1722,8 +1762,9 @@ impl<'a> GlmfEngine<'a> {
         let verify_rows = verify_budget(decode_rows, sms);
         tracing::info!(decode_rows, verify_rows, sms, "GLM Flash decode and verify step rows");
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
-        ensure!((1..=MAX_PREFILL_LANES).contains(&prefill_lane_count) && prefill_rows > 0,
-            "{prefill_lane_count} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_LANES} lanes)");
+        ensure!((1..=MAX_PREFILL_WAVES).contains(&prefill_waves) && prefill_rows > 0,
+            "{prefill_waves} prefill lanes of {prefill_rows} rows (1 to {MAX_PREFILL_WAVES} lanes)");
+        ensure!(prefill_span_rows > 0, "prefill span must contain at least one row");
         ensure!(cfg.hc_mult == HC && cfg.kv_lora_rank == 512 && cfg.kda_head_dim == 128 && cfg.heads == 64,
             "the glmf programs are built for 4 mHC streams, a 512 latent, 64 MLA heads and 128-wide KDA heads");
         // Whole allocation units: four MLA pages and one pool page each.
@@ -1765,26 +1806,26 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_lane_count,
-            pages, slots, decode_rows, verify_rows,
+        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+            prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
             kda_ordinal, index_cache, replay_records, records: RecordGuard::new(replay_records), caches,
             device, context_mode, context: None, context_units: RefCell::new(Vec::new()),
+            context_unit: Cell::new(0), context_reuse: Cell::new(false),
+            staging_owner: RefCell::new([None; 2]), unit_prefill: Cell::new(false),
             layer_execution: None, layer_waves: RefCell::new(Vec::new()),
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             peer: None, exchange: None, drafter: None, pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages,
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
-            lane_workspaces: RefCell::new(Vec::new()),
-            experts: None, tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
+            prefill_slots: RefCell::new(Vec::new()),
+            experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::new(None)),
             use_graphs: std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: startup_graphs_enabled(),
             warming_graphs: std::cell::Cell::new(false), logged_graph_shapes: RefCell::new(std::collections::HashSet::new()),
-            lanes: lane_setting().0,
-            subset_lanes: lane_setting().1,
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
-            spark_bf16: false, full_prefill_logits: false, routes_ready: library.cuda_event_create_ordering()?,
+            spark_bf16: false, full_prefill_logits: false,
             draft_probe: RefCell::new(None), capturing: std::cell::Cell::new(false),
             ops: std::env::var("CUTEAFD_GLMF_PROFILE_OPS").is_ok_and(|v| v == "1").then(RefCell::default),
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
@@ -1803,10 +1844,10 @@ impl<'a> GlmfEngine<'a> {
     /// the prefill lanes a Spark prefill runs in (`--prefill-lanes`, over one set of temporaries;
     /// otherwise the serial workspace, lane 0), and the drafter's. No shared BLAS handles.
     pub fn prepare_serving_workspaces(&self) -> Result<()> {
-        let lanes = if self.pipelined() { self.prefill_lane_count } else { 1 };
+        let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..self.ranks() {
             drop(self.decode_workspace_of(rank)?);
-            drop(self.prefill_lanes_of(rank, lanes)?);
+            drop(self.prefill_slots_of(rank, lanes)?);
         }
         if let Some(drafter) = &self.drafter { drafter.prepare_workspace()?; }
         self.synchronize()
@@ -1843,7 +1884,7 @@ impl<'a> GlmfEngine<'a> {
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
             for &(rows, spec, geometry) in &shapes {
-                self.step(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None, None)?;
+                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
             }
             self.synchronize()
         })();
@@ -1977,15 +2018,15 @@ impl<'a> GlmfEngine<'a> {
     /// and workspaces must not yet exist: their pointers depend on these homes.
     pub(crate) fn install_tp2(&mut self, ranks: [Box<dyn RtxExpertLayer + 'a>; 2]) -> Result<()> {
         let peer = self.peer()?;
-        check_tp2_lanes(self.prefill_lane_count)?;
+
         let layers = ranks[0].layers().to_vec();
         ensure!(!layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
             && layers == ranks[1].layers()
             && layers.iter().all(|&id| self.weights.layers.get(id).is_some_and(|l| !l.dense)),
             "invalid GLM Flash TP2 routed inventory {layers:?}");
         ensure!(self.expert_routing.is_none() && self.tp2.is_none() && self.decode_workspace.borrow().is_none()
-            && self.lane_workspaces.borrow().is_empty() && peer.decode_workspace.borrow().is_none()
-            && peer.lane_workspaces.borrow().is_empty(), "install TP2 before step workspace allocation");
+            && self.prefill_slots.borrow().is_empty() && peer.decode_workspace.borrow().is_none()
+            && peer.prefill_slots.borrow().is_empty(), "install TP2 before step workspace allocation");
         for (rank, r) in ranks.iter().enumerate() {
             ensure!(r.shard() == RtxShard::Tp2 { rank: rank as u8 }
                 && r.device() == if rank == 0 { self.device } else { peer.device }
@@ -1993,7 +2034,8 @@ impl<'a> GlmfEngine<'a> {
         }
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream }, RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_lane_count, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes)?;
+            2 * self.prefill_waves, PackedRoutes::new(self.prefill_rows.max(self.decode_rows), self.cfg.topk).bytes,
+            PackedRoutes::new(self.decode_rows, self.cfg.topk).bytes)?;
         routes.trace_identity("glmf-tp2-routes");
         for (rank, producer) in [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device: peer.device, stream: peer.stream }].into_iter().enumerate() {
@@ -2005,7 +2047,7 @@ impl<'a> GlmfEngine<'a> {
             .transpose().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval")?.unwrap_or(0);
         self.tp2 = Some(Tp2Experts { layers, ranks: ranks.map(RefCell::new), combine, routes,
             source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(Default::default()),
-            interval, steps: Cell::new(0), schedule: RefCell::new(None) });
+            interval, steps: Cell::new(0), schedule: RefCell::new(None), unit_checks: RefCell::new(None) });
         Ok(())
     }
 
@@ -2021,10 +2063,9 @@ impl<'a> GlmfEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>) -> Result<()>) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(Experts::Spark { transports, .. }) = &self.experts {
-            for link in transports.try_borrow_mut()?.iter_mut() {
-                if let Err(error) = action(link) { failures.push(format!("{error:#}")); }
-            }
+        if let Some(Experts::Spark { transport, .. }) = &self.experts {
+            let mut link = transport.try_borrow_mut()?;
+            if let Err(error) = action(&mut link) { failures.push(format!("{error:#}")); }
         }
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
@@ -2087,14 +2128,14 @@ impl<'a> GlmfEngine<'a> {
     /// Resolve lazy expert/helper code before either stream can queue a peer wait.
     pub(crate) fn prime_tp2(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
-        let lanes = if self.pipelined() { self.prefill_lane_count } else { 1 };
+        let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..2 {
             drop(self.decode_workspace_of(rank)?);
-            drop(self.prefill_lanes_of(rank, lanes)?);
+            drop(self.prefill_slots_of(rank, lanes)?);
         }
         for rank in 0..2 {
             let decode = self.decode_workspace_of(rank)?;
-            let lanes = self.prefill_lanes_of(rank, lanes)?;
+            let lanes = self.prefill_slots_of(rank, lanes)?;
             let w = if self.prefill_rows >= self.decode_rows { &lanes[0] }
                 else { decode.as_ref().context("TP2 priming decode workspace")? };
             let rows = w.rows;
@@ -2107,17 +2148,28 @@ impl<'a> GlmfEngine<'a> {
                 self.router_on(rank, w, weights, rows, &[Span { first: 0, rows }])?;
                 let cap = if self.prefill_rows >= self.decode_rows { PREFILL_CAP } else { decode_cap(rows) };
                 self.ffn_on(rank, w, weights, self.cfg.moe_intermediate, cap,
-                    w.shared.buffer.ptr, Scalar::I32(rows as i32))?;
+                    w.shared.buffer.ptr, Scalar::I32(rows as i32))
+            })?;
+        }
+        // Native shared FFNs wait on their peer: enqueue both before draining either stream.
+        for rank in 0..2 {
+            let decode = self.decode_workspace_of(rank)?;
+            let lanes = self.prefill_slots_of(rank, lanes)?;
+            let w = if self.prefill_rows >= self.decode_rows { &lanes[0] }
+                else { decode.as_ref().context("TP2 priming decode workspace")? };
+            let rows = w.rows;
+            let layer = tp2.layers[0];
+            self.on(rank, || {
                 let mut experts = tp2.ranks[rank].borrow_mut();
-                let input = if experts.partial() == PartialDtype::F32 {
+                if experts.uses_fp8_input() {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: the scale section follows the FP8 values in the admitted wire buffer.
                     self.run_on(rank, false, "expert_input_quant", &[("source_ptr", w.x.buffer.ptr),
                         ("values_ptr", w.wire.buffer.ptr), ("scale_rows_ptr", unsafe {
                             w.wire.buffer.ptr.cast::<u8>().add(self.cfg.hidden).cast() }),
-                        ("scale_mma_ptr", w.delta.buffer.ptr)], &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
-                    ExpertInput::Fp8K32(w.wire.buffer.ptr)
-                } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+                        ("scale_mma_ptr", w.scratch.buffer.ptr)], &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
+                }
+                let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
                 let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
                 // SAFETY: valid maximum-capacity startup input/routes stay live through the synchronization.
                 unsafe {
@@ -2153,7 +2205,7 @@ impl<'a> GlmfEngine<'a> {
         let tokens: Vec<u32> = (0..rows).map(|i| (i % self.cfg.vocab_size) as u32).collect();
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
-        self.prefill_serial(&mut placement, &tokens, false)?;
+        self.prefill_units_with(&mut placement, &tokens, false, false, None, 1, None, None)?;
         *tp2.schedule.borrow_mut() = Some(Default::default());
         tp2.checking.set(true);
         self.decode_step(&mut [(&mut placement, 1)], &[1], None, false, None, None, true)?;
@@ -2171,6 +2223,10 @@ impl<'a> GlmfEngine<'a> {
                 ensure!(local.layers == layers, "EXL3 lazy inventory differs from admitted local inventory");
                 local.resident.borrow().as_ref().context("local EXL3 weights must be installed before binding homes")?
                     .1.layers().to_vec()
+            }
+            Experts::LocalNative(local) => {
+                let local = local.borrow();
+                native_local_layers(local.as_ref(), self.device)?
             }
             _ => anyhow::bail!("local expert backend required"),
         };
@@ -2219,13 +2275,13 @@ impl<'a> GlmfEngine<'a> {
     pub(crate) fn validate_attention_homes(&self, plan: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<()> {
         use crate::shared::placement::layers::AttentionShare;
         ensure!(plan.modes().len() == self.weights.layers.len(), "attention binding layer count differs from admission");
-        ensure!(plan.spec().lanes == self.prefill_lane_count as u64,
+        ensure!(plan.spec().lanes == self.prefill_waves as u64,
             "runtime prefill lane inventory differs from admission");
         let ranks: Vec<_> = std::iter::once((&self.weights.layers, &self.caches))
             .chain(self.peer.iter().map(|peer| (&peer.layers, &peer.caches))).collect();
         if ranks.len() == 2 && plan.modes().iter().any(|mode|
             matches!(mode, cuteafd_loader::placement::LayerMode::Whole { .. })) {
-            cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_lane_count)?;
+            cuteafd_loader::placement::validate_layer_pipeline_lanes(plan.spec().lanes, self.prefill_waves)?;
         }
         for (index, &mode) in plan.modes().iter().enumerate() {
             let shares = AttentionShare::bind(mode, ranks.len())?;
@@ -2235,7 +2291,22 @@ impl<'a> GlmfEngine<'a> {
             for (rank, (layers, caches)) in ranks.iter().enumerate() {
                 let layer = &layers[index];
                 ensure!(layer.attention_share == shares[rank], "attention share differs from admission at layer {index} rank {rank}");
+                let checkpoint_native = native::is_native(layer);
+                if checkpoint_native {
+                    let projections: &[&str] = match layer.attention {
+                        GlmNextAttention::Kda => &["q", "k", "v", "o", "beta", "f_a", "f_b", "g_a", "g_b"],
+                        GlmNextAttention::Mla => &["q_a", "kv_a", "q_b", "o", "index_q", "index_k"],
+                    };
+                    ensure!(projections.iter().all(|name| layer.native_projections.contains_key(name))
+                        && shares[rank].present(), "native attention projections differ from admission at layer {index} rank {rank}");
+                }
+                let native = layer.core.contains_key("self_attn.o_proj");
                 let operands: &[&str] = match layer.attention {
+                    GlmNextAttention::Mla if checkpoint_native => &["q_a_norm", "kv_a_norm", "w_uk_fp8", "w_uk_scale",
+                        "w_uv_fp8", "w_uv_scale", "k_norm_w", "k_norm_b", "ape", "index_gate"],
+                    GlmNextAttention::Kda if checkpoint_native => &["conv_w", "a_log", "dt_bias", "o_norm"],
+                    GlmNextAttention::Mla if native => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_iq", "w_ik",
+                        "k_norm_w", "k_norm_b", "ape"],
                     GlmNextAttention::Mla => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_qkv_a_fp8",
                         "w_qkv_a_scale", "w_q_b_fp8", "w_q_b_scale", "w_o_fp8", "w_o_scale", "w_iq", "w_ik",
                         "k_norm_w", "k_norm_b", "ape"],
@@ -2243,6 +2314,14 @@ impl<'a> GlmfEngine<'a> {
                 };
                 ensure!(operands.iter().all(|name| layer.has(name) == shares[rank].present()),
                     "attention operands differ from admission at layer {index} rank {rank}");
+                if native {
+                    let leaves: &[&str] = match layer.attention {
+                        GlmNextAttention::Kda => &["q_proj", "k_proj", "v_proj", "o_proj"],
+                        GlmNextAttention::Mla => &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"],
+                    };
+                    ensure!(shares[rank].present() && leaves.iter().all(|leaf|
+                        layer.core.contains_key(&format!("self_attn.{leaf}"))), "Flash K6 attention group incomplete");
+                }
                 if shares[rank].present() { weights.push(rank as u8); }
                 match layer.attention {
                     GlmNextAttention::Mla => {
@@ -2252,10 +2331,11 @@ impl<'a> GlmfEngine<'a> {
                             "compact index ordinal differs from admission at layer {index} rank {rank}");
                     }
                     GlmNextAttention::Kda => {
-                        let projections: &[&str] = if layer.has("w_in_fp8") {
+                        let projections: &[&str] = if native { &["w_aux"] }
+                        else if layer.has("w_in_fp8") {
                             &["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"]
                         } else { &["w_in", "w_o"] };
-                        ensure!(projections.iter().all(|name| layer.has(name)),
+                        ensure!(checkpoint_native || projections.iter().all(|name| layer.has(name)),
                             "KDA projections missing at layer {index} rank {rank}");
                         ensure!(shares[rank].present() && caches.kda_heads > 0, "KDA state missing on rank {rank}");
                         kv.push(rank as u8);
@@ -2282,7 +2362,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn local_layer(&self, layer: usize) -> bool {
-        matches!(self.routed_experts(layer), Some(Experts::Local(_) | Experts::LocalExl3(_)))
+        matches!(self.routed_experts(layer), Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)))
     }
 
     fn tp2_layer(&self, layer: usize) -> bool {
@@ -2296,36 +2376,42 @@ impl<'a> GlmfEngine<'a> {
         extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let remote = match &self.experts {
-            Some(Experts::Spark { transports, .. }) => transports.borrow().first()
-                .context("no installed GLM Flash Spark transport")?.transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
             if weights.dense { return Ok(LayerHome::Dense); }
             let tp = if self.tp2_layer(layer) { 2 } else {
                 match self.routed_experts(layer) {
-                    Some(Experts::Local(_) | Experts::LocalExl3(_)) => 1,
+                    Some(Experts::Local(_) | Experts::LocalExl3(_) | Experts::LocalNative(_)) => 1,
                     Some(Experts::Spark { .. }) => remote.len(),
                     _ => anyhow::bail!("GLM Flash layer {layer} has no installed expert home"),
                 }
             };
             ensure!(tp > 0, "GLM Flash layer {layer} has no installed expert ranks");
             let catalog = catalog.context("GLM Flash routed expert catalog missing")?;
-            let slice_bytes = match (catalog.fp8(), catalog.exl3()) {
+            let slice_bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
+                let left = tp2.ranks[0].borrow();
+                let right = tp2.ranks[1].borrow();
+                tp2_weight_read_bytes([left.as_ref(), right.as_ref()])? as f64
+            } else if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+                match self.routed_experts(layer) {
+                    Some(Experts::LocalNative(local)) => local.borrow().weight_read_bytes()? as f64,
+                    Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)? as f64,
+                    _ => anyhow::bail!("GLM Flash layer {layer} has no installed native byte descriptor"),
+                }
+            } else { match (catalog.fp8(), catalog.exl3()) {
                 (Some(_), _) => {
-                    let bytes = if let Some(tp2) = self.tp2.as_ref().filter(|tp2| tp2.layers.contains(&layer)) {
-                        tp2.ranks.iter().map(|rank| rank.borrow().weight_read_bytes())
-                            .collect::<Result<Vec<_>>>()?.into_iter().max().context("GLM Flash installed TP2 ranks missing")?
-                    } else { match self.routed_experts(layer) {
+                    let bytes = match self.routed_experts(layer) {
                         Some(Experts::Local(local)) => local.experts.borrow().weight_read_bytes(),
                         Some(Experts::Spark { .. }) => resource::worker_weight_read_bytes(&remote, layer)?,
                         _ => anyhow::bail!("GLM Flash layer {layer} has no installed FP8-family byte descriptor"),
-                    }};
+                    };
                     bytes as f64
                 }
                 (_, Some(manifest)) => resource::exl3_slice_bytes(manifest, layer, tp)?,
                 _ => anyhow::bail!("GLM Flash routed expert format cannot be priced"),
-            };
+            }};
             Ok(if matches!(self.routed_experts(layer), Some(Experts::Spark { .. })) && !self.tp2_layer(layer) {
                 LayerHome::Remote { slice_bytes }
             } else { LayerHome::Local { slice_bytes } })
@@ -2339,6 +2425,7 @@ impl<'a> GlmfEngine<'a> {
                     return Ok(group);
                 }
                 match self.routed_experts(layer) {
+                    Some(Experts::LocalNative(local)) => local.borrow().group_rows(rows),
                     Some(Experts::Local(local)) => Ok(local.experts.borrow().weight_read_group(rows, true)?.0),
                     Some(Experts::LocalExl3(local)) => crate::families::deepseek_v4::local::installed_window_group_rows(
                         &local.resident, || local.ensure(layer, self.stream), rows,
@@ -2410,13 +2497,98 @@ impl<'a> GlmfEngine<'a> {
         Ok(())
     }
 
+    fn prepare_unit_route_checks(&self, waves: usize) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        ensure!(tp2.unit_checks.borrow().is_none(), "undrained unit route diagnostics");
+        if (tp2.interval == 0 && !tp2.checking.get()) || self.warming_graphs.get() { return Ok(()) }
+        let mut storage = Vec::with_capacity(waves);
+        // Pinned allocation may synchronize: reserve every live slot before any peer waits.
+        for _ in 0..waves {
+            let mut layers = std::collections::BTreeMap::new();
+            for &layer in &tp2.layers {
+                let bytes = self.prefill_rows * self.cfg.topk * 8;
+                layers.insert(layer, RouteHosts { hosts: [
+                    self.on(0, || HostAllocation::new(self.library, bytes))?,
+                    self.on(1, || HostAllocation::new(self.library, bytes))?], collected: [false; 2] });
+            }
+            storage.push(layers);
+        }
+        *tp2.unit_checks.borrow_mut() = Some(UnitRouteChecks {
+            slots: crate::shared::experts::rtx::routes::SlotRouteChecks::new(storage, tp2.interval > 0)?,
+            units: vec![usize::MAX; waves] });
+        Ok(())
+    }
+
+    fn begin_unit_route_checks(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        let mut checks = tp2.unit_checks.borrow_mut();
+        let Some(checks) = checks.as_mut() else { return Ok(()) };
+        let step = tp2.steps.get() + 1;
+        tp2.steps.set(step);
+        checks.slots.begin(unit.slot, unit.index, unit.rows.len(),
+            tp2.checking.get() || tp2.interval > 0 && step % tp2.interval == 0)?;
+        checks.units[unit.slot] = unit.index;
+        if let Some(layers) = checks.slots.storage(unit.slot, unit.index)? {
+            for hosts in layers.values_mut() { hosts.collected = [false; 2]; }
+        }
+        Ok(())
+    }
+
+    fn finish_unit_route_checks(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        let mut checks = tp2.unit_checks.borrow_mut();
+        let Some(checks) = checks.as_mut() else { return Ok(()) };
+        let identity = checks.slots.finish(unit.slot, unit.index, |layers, rows| {
+            self.synchronize()?;
+            layers.iter().map(|(&layer, hosts)| {
+                ensure!(hosts.collected == [true; 2], "unit {} missing route collection at layer {layer}", unit.index);
+                let bytes = rows * self.cfg.topk * 8;
+                Ok(RouteCheck { layer, rows, topk: self.cfg.topk,
+                    ranks: std::array::from_fn(|rank| hosts.hosts[rank].bytes()[..bytes].to_vec()) })
+            }).collect()
+        })?;
+        if let Some(identity) = identity {
+            if identity.source() == RouteSource::Broadcast { tp2.source.set(RouteSource::Broadcast); }
+            cuteafd_bench::context::set_resolved("route-source", if tp2.source.get() == RouteSource::Broadcast {
+                "broadcast" } else { "replicated" });
+            tracing::info!(unit = unit.index, slot = unit.slot, layers_checked = identity.layers_checked,
+                rows_checked = identity.rows_checked, "GLM Flash unit route identity");
+        }
+        Ok(())
+    }
+
+    fn finish_unit_route_span(&self) -> Result<()> {
+        if let Some(tp2) = &self.tp2 {
+            let mut checks = tp2.unit_checks.borrow_mut();
+            if let Some(active) = checks.as_ref() { active.slots.finish_span()?; }
+            // Every enabled unit drained before finish; disabled units queued no staging writes.
+            *checks = None;
+        }
+        if self.tp2.as_ref().is_some_and(|tp2| tp2.checking.get()) { self.finish_route_checks()?; }
+        Ok(())
+    }
+
     fn collect_tp2_routes(&self, rank: usize, layer: usize, lane: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
+        if self.unit_prefill.get() {
+            let mut checks = tp2.unit_checks.borrow_mut();
+            let Some(checks) = checks.as_mut() else { return Ok(()) };
+            let unit = *checks.units.get(lane).context("route diagnostic slot")?;
+            let Some(layers) = checks.slots.storage(lane, unit)? else { return Ok(()) };
+            let hosts = layers.get_mut(&layer).context("unit route diagnostic layer")?;
+            ensure!(!hosts.collected[rank], "unit {unit} duplicate rank {rank} route collection at layer {layer}");
+            self.copy_route_check(rank, &hosts.hosts[rank], w, rows)?;
+            hosts.collected[rank] = true;
+            return Ok(());
+        }
         if !tp2.checking.get() || self.warming_graphs.get() { return Ok(()) }
         let checks = tp2.checks.borrow();
         let (expected, hosts) = checks.get(&(layer, lane)).context("route diagnostics not prepared")?;
         ensure!(*expected == rows, "route diagnostics width changed");
-        let host = &hosts[rank];
+        self.copy_route_check(rank, &hosts[rank], w, rows)
+    }
+
+    fn copy_route_check(&self, rank: usize, host: &HostAllocation<'_>, w: &Workspace<'_>, rows: usize) -> Result<()> {
         let bytes = rows * self.cfg.topk * 4;
         self.on(rank, || {
             // SAFETY: the pinned pair stays live until both streams finish this step.
@@ -2464,19 +2636,12 @@ impl<'a> GlmfEngine<'a> {
         self.router_on(1, w1, &peer.layers[layer], rows, &[Span { first: 0, rows }])?;
         self.tp2_rank(0, layer, lane, w, rows, w.delta.buffer.ptr)?;
         self.tp2_rank(1, layer, lane, w1, rows, w1.delta.buffer.ptr)?;
-        // The native combine forbids input/output overlap. Keep the existing
-        // shared-slot exchange contract after consuming the shared input.
-        self.on(1, || unsafe {
-            // SAFETY: disjoint rank-local buffers stay live and are ordered after combine.
-            self.library.copy_d2d_async(w1.shared.buffer, w1.delta.buffer,
-                rows * self.cfg.hidden * 2, self.stream_of(1))
-        })?;
         Ok(())
     }
 
     fn tp2_publish(&self, layer: usize, lane: usize, rows: usize, prepared_peer: Option<&Workspace<'_>>) -> Result<()> {
         let w1 = tp2_prepared_peer(prepared_peer)?;
-        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.shared.buffer.ptr, rows * self.cfg.hidden * 2)
+        self.exchange_push(self.exchange()?, "main", 1, slot(layer, true, lane), w1.delta.buffer.ptr, rows * self.cfg.hidden * 2)
     }
 
     fn router_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: usize, spans: &[Span]) -> Result<()> {
@@ -2503,14 +2668,13 @@ impl<'a> GlmfEngine<'a> {
                 let at = 2 * lane + layer % 2;
                 if rank == 0 {
                     ensure!(packed.bytes <= w.router_logits.buffer.bytes, "router scratch cannot pack routes");
-                    // SAFETY: aligned ids/weights and zero padding fit the consumed router logits.
+                    // SAFETY: the two canonical sections fit the consumed logits; padding is never read.
                     unsafe {
-                        self.library.cuda_zero_bytes_async(w.router_logits.buffer, packed.bytes, self.stream_of(rank))?;
-                        self.library.copy_d2d_async(w.router_logits.buffer, w.route_ids.buffer, packed.section, self.stream_of(rank))?;
-                        self.library.copy_d2d_async(cuteafd_ffi::CuteafdDeviceBuffer {
-                            ptr: w.router_logits.buffer.ptr.cast::<u8>().add(packed.weights).cast(),
-                            bytes: w.router_logits.buffer.bytes - packed.weights, ..w.router_logits.buffer
-                        }, w.route_weights.buffer, packed.section, self.stream_of(rank))?;
+                        self.library.sm_copy_regions(&[
+                            (w.router_logits.buffer.ptr, w.route_ids.buffer.ptr.cast_const(), packed.section as u64),
+                            (w.router_logits.buffer.ptr.cast::<u8>().add(packed.weights).cast(),
+                                w.route_weights.buffer.ptr.cast_const(), packed.section as u64),
+                        ], self.stream_of(rank))?;
                     }
                     self.exchange_push(&tp2.routes, "routes", 0, at, w.router_logits.buffer.ptr, packed.bytes)?;
                 } else {
@@ -2521,17 +2685,17 @@ impl<'a> GlmfEngine<'a> {
                 }
             }
             let mut experts = tp2.ranks[rank].borrow_mut();
-            let input = if experts.partial() == PartialDtype::F32 {
+            if experts.uses_fp8_input() {
                 if rank == 1 {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
                     // SAFETY: scale rows start after the FP8 values in each wire row.
                     self.run_on(rank, false, "expert_input_quant", &[("source_ptr", w.x.buffer.ptr),
                         ("values_ptr", w.wire.buffer.ptr), ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>()
-                            .add(self.cfg.hidden).cast() }), ("scale_mma_ptr", w.delta.buffer.ptr)],
+                            .add(self.cfg.hidden).cast() }), ("scale_mma_ptr", w.scratch.buffer.ptr)],
                         &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)])?;
                 }
-                ExpertInput::Fp8K32(w.wire.buffer.ptr)
-            } else { ExpertInput::Bf16(w.x.buffer.ptr) };
+            }
+            let input = tp2_input(experts.as_ref(), w.wire.buffer.ptr, w.x.buffer.ptr);
             // SAFETY: input/routes and expert scratch are rank-local and serialized on one stream.
             unsafe { experts.enqueue(layer, rows, input, routes, self.stream_of(rank),
                 &mut || self.abort_tp2_or_terminate())?; }
@@ -2585,8 +2749,11 @@ impl<'a> GlmfEngine<'a> {
         validate_attention_shares(execution, layers.iter().map(|layer| layer.attention_share), 1, 2)?;
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_lane_count,
-            rows * self.cfg.hidden * self.partial_bytes())?;
+            RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
+            rows * self.cfg.hidden * (self.partial_bytes()
+                + if self.weights.layers.iter().chain(&layers).flat_map(|l| l.core.values())
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 2 } else { 0 }),
+            decode_peer_bytes(self.decode_rows, self.cfg.hidden))?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
         ensure!(self.index_cache == IndexCache::Keys || self.context_mode.is_some()
@@ -2602,7 +2769,7 @@ impl<'a> GlmfEngine<'a> {
                 self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None,
                 self.caches.pool_marks)?;
             Ok(GlmfPeer { device, stream, layers, caches,
-                decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
+                decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())), l2: None })
         })?;
         self.peer = Some(peer);
@@ -2665,7 +2832,7 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
-    /// Runs `body` with rank `rank`'s device current (this engine's device again after).
+    /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
     pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
         let device = if rank == 1 { self.peer()?.device } else { self.device };
         crate::shared::memory::device::Device { library: self.library, id: device }.run(body)
@@ -2778,9 +2945,7 @@ impl<'a> GlmfEngine<'a> {
             for rank in 0..self.ranks() {
                 let map = self.caches_of(rank).pool_logical.buffer;
                 // SAFETY: each rank's map consumers run on its owned stream.
-                self.on(rank, || unsafe { self.library.copy_h2d_ordered(
-                    cuteafd_ffi::CuteafdDeviceBuffer { bytes: host.len() * 4, ..map },
-                    bytes_of(&host[..]), self.stream_of(rank)) })?;
+                self.on(rank, || unsafe { self.library.copy_h2d_ordered(map, bytes_of(&host[..]), self.stream_of(rank)) })?;
             }
         }
         Ok(())
@@ -2870,7 +3035,10 @@ impl<'a> GlmfEngine<'a> {
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
         for rank in 0..self.ranks() {
             for region in self.slot_regions_on(rank, slot) {
-                self.on(rank, || self.library.cuda_zero_bytes(region, region.bytes))?;
+                // SAFETY: the slot's state regions are live and read or written only on
+                // this rank's stream, so the clear queues behind the previous sequence's
+                // readers and before the new sequence's first step.
+                self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(region, region.bytes, self.stream_of(rank)) })?;
             }
         }
         Ok(())
@@ -2955,7 +3123,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        Dev::new(self.library, bytes.max(256))
     }
 
     fn run(&self, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
@@ -2967,6 +3135,7 @@ impl<'a> GlmfEngine<'a> {
     fn run_on(&self, rank: usize, split: bool, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar])
         -> Result<()> {
         let name = format!("{}_{name}", if split { "glmf2" } else { "glmf" });
+        self.packed_programs.check(&name)?;
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
         let program = self.programs.program(&name, &names)?;
         let raw: Vec<*mut c_void> = pointers.iter().map(|(_, p)| *p).collect();
@@ -3042,19 +3211,19 @@ impl<'a> GlmfEngine<'a> {
     /// Every prefill workspace teacher-forced scoring runs in, before readiness (`--full-prefill-logits`
     /// admits them): both ranks' prefill lanes, as a Spark prefill takes them. A serial prefill, a
     /// short chunk and the prefix captures run in lane 0, so there is no third workspace, and the
-    /// all-row logits live once, in the lanes' shared temporaries.
+    /// logits staging lives once in shared temporaries (bounded tiles for K6).
     pub fn prepare_scoring_prefill(&self) -> Result<()> {
-        let lanes = if self.pipelined() { self.prefill_lane_count } else { 1 };
+        let lanes = if self.pipelined() { self.prefill_waves } else { 1 };
         for rank in 0..self.ranks() {
-            drop(self.prefill_lanes_of(rank, lanes)?);
+            drop(self.prefill_slots_of(rank, lanes)?);
         }
         Ok(())
     }
 
     /// This engine's step plan: what its workspaces hold, given its configuration and experts.
     fn step_plan(&self) -> StepPlan<'_, 'a> {
-        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, self.step_experts,
-            StepSettings { spark_bf16: self.spark_bf16, kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
+        StepPlan::new(self.library, self.programs, &self.cfg, &self.weights.layers, matches!(self.weights.head, GlmfHead::K6(_) | GlmfHead::RowFp8(_)), self.step_experts,
+            StepSettings { kda_fp32_partials: self.kda_fp32_partials, kda_output_shard: self.kda_output_shard,
                 kda_prefill_expanded: self.kda_prefill_expanded, full_prefill_logits: self.full_prefill_logits,
                 max_context: self.max_context, index_cache: self.index_cache, kda_state: self.kda_state,
                 replay_records: self.replay_records, decode_rows: self.decode_rows })
@@ -3062,15 +3231,21 @@ impl<'a> GlmfEngine<'a> {
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
     /// what its step plan holds.
-    pub(crate) fn install_workspaces(&self, workspaces: StepWorkspaces<'a>) -> Result<()> {
+    pub(crate) fn install_workspaces(&self, mut workspaces: StepWorkspaces<'a>) -> Result<()> {
         let key = self.step_plan().key();
         ensure!(workspaces.key == key && workspaces.rows == self.prefill_rows,
             "step workspaces allocated for another plan: allocated {:?} ({} prefill rows), engine {key:?} ({} prefill rows)",
             workspaces.key, workspaces.rows, self.prefill_rows);
-        ensure!(self.decode_workspace.borrow().is_none() && self.lane_workspaces.borrow().is_empty(),
+        ensure!(self.decode_workspace.borrow().is_none() && self.prefill_slots.borrow().is_empty(),
             "step workspaces already allocated");
+        self.core_slot(0, &mut workspaces.decode, true, 0)?;
+        self.native_slot(0, &mut workspaces.decode, true)?;
+        for (lane, w) in workspaces.lanes.iter_mut().enumerate() {
+            self.core_slot(0, w, false, lane)?;
+            self.native_slot(0, w, false)?;
+        }
         *self.decode_workspace.borrow_mut() = Some(workspaces.decode);
-        *self.lane_workspaces.borrow_mut() = workspaces.lanes;
+        *self.prefill_slots.borrow_mut() = workspaces.lanes;
         Ok(())
     }
 
@@ -3095,6 +3270,9 @@ impl<'a> GlmfEngine<'a> {
                 let plan = self.step_plan();
                 plan.lane(rank, self.decode_rows, true, Rc::new(plan.temporaries(rank, self.decode_rows, true)?))
             })?;
+            let mut workspace = workspace;
+            self.core_slot(rank, &mut workspace, true, 0)?;
+            self.native_slot(rank, &mut workspace, true)?;
             *cell.borrow_mut() = Some(workspace);
         }
         Ok(cell.borrow())
@@ -3102,29 +3280,24 @@ impl<'a> GlmfEngine<'a> {
 
     /// Rank `rank`'s prefill lanes, at least `count` of `prefill_rows` rows over one set of
     /// temporaries, allocated on that rank's GPU on first use.
-    fn prefill_lanes_of(&self, rank: usize, count: usize) -> Result<std::cell::Ref<'_, Vec<Workspace<'a>>>> {
+    fn prefill_slots_of(&self, rank: usize, count: usize) -> Result<std::cell::Ref<'_, Vec<Workspace<'a>>>> {
         let cell = match (rank, &self.peer) {
-            (1, Some(peer)) => &peer.lane_workspaces,
+            (1, Some(peer)) => &peer.prefill_slots,
             _ => {
                 // Their scratch may hold the replay records: a commit after this sees it.
                 self.records.prefilled();
-                &self.lane_workspaces
+                &self.prefill_slots
             }
         };
-        if cell.borrow().len() < count {
-            let mut lanes = cell.borrow_mut();
-            self.on(rank, || -> Result<()> {
-                let plan = self.step_plan();
-                let temps = match lanes.first() {
-                    Some(lane) => lane.temps.clone(),
-                    None => Rc::new(plan.temporaries(rank, self.prefill_rows, false)?),
-                };
-                while lanes.len() < count {
-                    lanes.push(plan.lane(rank, self.prefill_rows, false, temps.clone())?);
-                }
-                Ok(())
-            })?;
+        if cell.borrow().is_empty() {
+            let mut slots = self.on(rank, || self.step_plan().slots(rank, self.prefill_rows, self.prefill_waves))?;
+            for (lane, w) in slots.iter_mut().enumerate() {
+                self.core_slot(rank, w, false, lane)?;
+                self.native_slot(rank, w, false)?;
+            }
+            *cell.borrow_mut() = slots;
         }
+        ensure!(count <= cell.borrow().len(), "prefill slots exceed admission");
         Ok(cell.borrow())
     }
 
@@ -3149,7 +3322,10 @@ impl<'a> GlmfEngine<'a> {
         let row = self.cfg.hidden * 2;
         let t = tokens.len();
         let host = std::time::Instant::now();
-        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: embed.len(), ..w.streams[1].buffer };
+        // A fixed [rows, H] view of the second stream buffer: the ordered staging is
+        // sized once by it (the whole [rows, 4, H] buffer would pin 4x as much).
+        let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: w.rows * row, ..w.streams[1].buffer };
+        ensure!(staged.bytes <= w.streams[1].buffer.bytes, "embedding staging view exceeds its stream buffer");
         // SAFETY: embedding scratch is read/written only on the engine stream.
         unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
         self.host_op("host: embedding upload", host);
@@ -3173,7 +3349,7 @@ impl<'a> GlmfEngine<'a> {
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
         // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-            w.streams[0].buffer.ptr, self.stream) }
+            w.streams[0].buffer.ptr, Some(w.streams[1].buffer), RankDevice { device: self.device, stream: self.stream }) }
     }
 
     fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables,
@@ -3217,16 +3393,19 @@ impl<'a> GlmfEngine<'a> {
         let rank = usize::from(self.peer.as_ref().is_some_and(|p| p.device == dev.buffer.device_id));
         // SAFETY: this engine owns the destination and its rank stream; uploads
         // precede new consumers and follow previous consumers outside capture.
-        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer },
-            bytes, self.stream_of(rank)) }
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
-        ensure!(bytes <= dev.buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", dev.buffer.bytes);
-        // SAFETY: the engine owns this stream.
+        self.download_buffer(dev.buffer, bytes)
+    }
+
+    fn download_buffer(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
+        ensure!(bytes <= buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", buffer.bytes);
+        // SAFETY: these rank-0 diagnostic buffers stay live until this engine stream drains.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
+        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 
@@ -3289,70 +3468,48 @@ impl<'a> GlmfEngine<'a> {
             tracing::info!(rows = t, start, token_hash = format_args!("{:016x}", audit_token_hash(tokens)),
                 "GLM Flash split audit prefill");
         }
-        if on_layer.is_none() && forced.is_none() && self.pipelined() {
-            return self.prefill_lanes(placement, tokens, all_logits, device, media);
-        }
-        Ok(self.prefill_one(placement, tokens, on_layer, forced, all_logits, media)?.map(StepLogits::Device))
+        let waves = if on_layer.is_some() || forced.is_some() || !self.pipelined() { 1 }
+            else { self.prefill_waves };
+        self.prefill_units_with(placement, tokens, all_logits, device, media, waves, on_layer, forced)
     }
 
-    /// One serial prefill pass of `tokens` (at most `prefill_rows`) in the first lane's workspace.
-    fn prefill_one(&self, placement: &mut GlmfPlacement, tokens: &[u32],
-        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, all_logits: bool,
-        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        let (t, start) = (tokens.len(), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
-        if start == 0 {
-            self.start(placement)?;
-        }
-        let mut tables = StepTables { page_table: self.columns(&placement.pages, self.table_pages),
-            pool_table: self.columns(&placement.pool_pages, self.table_pool_pages), ..Default::default() };
-        self.rows(placement, start..start + t, 0, &mut tables)?;
-        let logits = self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced, None, media)?;
-        placement.len += t;
-        placement.kda_len = placement.len;
-        Ok(logits)
-    }
-
-    /// A serial prefill pass whatever the lanes (the reference `--lane-check` holds lanes to):
-    /// every row's logits with `all_logits`, else the last row's.
-    pub(crate) fn prefill_serial(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool)
+    /// Compare executor widths without changing row cuts or numerical kernels.
+    pub(crate) fn prefill_unit_width(&self, placement: &mut GlmfPlacement, tokens: &[u32], waves: usize)
         -> Result<Option<Vec<f32>>> {
-        self.prefill_one(placement, tokens, None, None, all_logits, None)?
-            .map(|logits| logits.to_host(self.library)).transpose()
+        ensure!(waves > 0 && waves <= self.prefill_waves, "unit width exceeds admitted slots");
+        self.prefill_units_with(placement, tokens, true, false, None, waves, None, None)?
+            .map(|logits| logits.into_host(self.library)).transpose()
     }
 
     /// The rows of each lane a pipelined prefill of `tokens` rows runs in, in order.
     pub(crate) fn prefill_cuts(&self, tokens: usize) -> Result<Vec<usize>> {
-        let (_, per_lane) = prefill_lane_plan(tokens, self.prefill_lane_count, self.prefill_rows)?;
-        Ok((0..tokens).step_by(per_lane).map(|first| per_lane.min(tokens - first)).collect())
+        Ok(crate::shared::prefill_pipeline::prefill_units(tokens, self.prefill_rows,
+            self.prefill_waves, UNIT_ROWS)?.into_iter().map(|r| r.len()).collect())
     }
 
-    /// Whether prefill runs in admitted lanes (a transport per lane only for Spark homes).
-    /// CUTEAFD_GLMF_PREFILL_LANES=1 keeps the serial one-workspace prefill (A/B runs).
+    /// Full models admit continuous spans; partial-layer diagnostics use executor N=1.
     fn pipelined(&self) -> bool {
-        let transports = match &self.experts {
-            Some(Experts::Spark { transports, .. }) => Some(transports.borrow().len()),
-            _ => None,
-        };
-        prefill_pipeline_available(self.lanes, self.weights.layers.len() == self.cfg.layers,
-            self.subset_lanes, self.prefill_lane_count, transports)
+        self.weights.layers.len() == self.cfg.layers
     }
 
-    /// Longest chunk one prefill call takes: a lane of `prefill_rows` rows
-    /// each when Spark prefill is pipelined.
+    /// The continuous span may reuse all admitted slots within a call.
     pub fn prefill_capacity(&self) -> usize {
-        if self.pipelined() { prefill_lane_capacity(self.prefill_lane_count, self.prefill_rows) } else { self.prefill_rows }
+        if self.pipelined() {
+            self.prefill_span_rows.max(self.prefill_rows * self.prefill_waves).min(self.max_context)
+        } else { self.prefill_rows }
     }
 
-    /// A Spark prefill chunk as up to `prefill_lane_count` lanes of consecutive
-    /// rows (see [`Self::step_lanes`]).
-    fn prefill_lanes(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
+    /// A continuous span, split into page-aligned units with at most `prefill_waves` live.
+    fn prefill_units_with(&self, placement: &mut GlmfPlacement, tokens: &[u32], all_logits: bool,
+        device: bool, media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
         let (start, t) = (placement.len, tokens.len());
-        // Lanes split at a multiple of 64 rows (an MLA page), so each lane's
-        // pools and pages start where the previous lane's end.
-        let cuts = self.prefill_cuts(t)?;
+        // Cuts preserve MLA page alignment and recurrent state order.
+        let cuts = if on_layer.is_some() || forced.is_some() {
+            ensure!(t <= self.prefill_rows, "layer diagnostics take one admitted unit");
+            vec![t]
+        } else { self.prefill_cuts(t)? };
         ensure!(t > 0 && cuts.iter().all(|&n| n <= self.prefill_rows) && start + t <= self.max_context,
             "prefill of {t} rows at {start} exceeds {} rows per lane or the context", self.prefill_rows);
         if start == 0 {
@@ -3367,19 +3524,108 @@ impl<'a> GlmfEngine<'a> {
             steps.push((tables, &tokens[first..first + n]));
             first += n;
         }
-        let logits = self.step_lanes(&steps, if all_logits { t } else { 1 }, device, media)?;
+        let logits = self.step_units_with(&steps, if all_logits { t } else { 1 }, device, media,
+            waves, on_layer, forced)?;
         placement.len += t;
         placement.kda_len = placement.len;
         Ok(logits)
     }
 
-    /// What one packed prefill pass ([`Self::prefill_packed`]) may hold: the first prefill lane's
-    /// rows, one sequence's table columns, and the drafter's tap rows.
+    fn packed_program_inventory(&self) -> Vec<(String, crate::shared::prefill_packing::ProgramRows)> {
+        use crate::shared::prefill_packing::ProgramRows::*;
+        let mut inventory = Vec::new();
+        let mut add = |name: String, role| {
+            let item = (format!("glmf_{name}"), role);
+            if !inventory.contains(&item) { inventory.push(item); }
+        };
+        for name in ["mhc_pre", "mhc_post", "mhc_post_pre_m4096"] {
+            add(name.into(), SequenceLocal);
+        }
+        add("head".into(), PackedRows);
+        for layer in &self.weights.layers {
+            match layer.attention {
+                GlmNextAttention::Kda => {
+                    let name = if layer.has("w_in_fp8") {
+                        if self.kda_state == KdaState::F32 {
+                            format!("kda_w8{}_m4096", if self.kda_prefill_expanded { "_expanded" } else { "" })
+                        } else { self.kda_state.w8_program(PREFILL_CAP) }
+                    } else { self.kda_state.program(PREFILL_CAP) };
+                    add(name, SequenceLocal);
+                }
+                GlmNextAttention::Mla => {
+                    add("mla_producer_m4096".into(), PackedRows);
+                    add("o_m4096".into(), PackedRows);
+                    add(format!("index_producer{}_m4096", if self.index_cache == IndexCache::Compact { "_c" } else { "" }), SequenceLocal);
+                    for name in ["index_topk_prefill_m4096", "index_expand", "sparse_mla_prefill_m4096"] {
+                        add(name.into(), SequenceLocal);
+                    }
+                }
+            }
+            let inter = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
+            if !layer.has("nvfp4_w1") { add(format!("ffn_i{inter}_m4096"), PackedRows); }
+            if !layer.dense {
+                add("router_scores".into(), SequenceLocal);
+                add("add".into(), PackedRows);
+                if !self.spark_bf16 { add("expert_input_quant".into(), PackedRows); }
+            }
+        }
+        inventory
+    }
+
+    pub(crate) fn configure_packing(&self, mode: crate::shared::prefill_packing::PackingMode) -> Result<()> {
+        use crate::shared::prefill_packing::{log_mode, PackingMode};
+        if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
+        let inventory = self.packed_program_inventory();
+        let mut cap = if self.packs_prefill() {
+            crate::shared::prefill_packing::coordinator_row_cap(self.programs,
+                inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows)?
+        } else { 0 };
+        // NVFP4 dense modules have occupancy-dependent expert dispatch, outside Programs.
+        if self.dense_nvfp4.is_some() { cap = 0; }
+        // This family's packed executor is single-GPU only.
+        if !self.packs_prefill() { cap = 0; }
+        else {
+            let reports = match &self.experts {
+                Some(Experts::Spark { transport }) => transport.borrow().installed_grouping()?,
+                _ => Vec::new(),
+            };
+            let mut local_seen = Vec::new();
+            for (i, layer) in self.weights.layers.iter().enumerate() {
+                if layer.dense { continue; }
+                match self.routed_experts(i) {
+                    Some(Experts::Local(local)) => {
+                        let identity = std::ptr::from_ref(local);
+                        if !local_seen.contains(&identity) {
+                            cap = cap.min(local.experts.borrow().packed_row_cap(true, cap)?);
+                            local_seen.push(identity);
+                        }
+                    },
+                    Some(Experts::Spark { .. }) => {
+                        let mut found = false;
+                        for report in &reports {
+                            if report.layers().iter().any(|range| (range.first as usize..range.end as usize).contains(&i)) {
+                                cap = cap.min(report.packed_row_cap(self.spark_bf16));
+                                found = true;
+                            }
+                        }
+                        if !found { cap = 0; }
+                    }
+                    Some(Experts::LocalExl3(_) | Experts::LocalNative(_)) | None => cap = 0,
+                    Some(Experts::Skip) => {},
+                }
+            }
+        }
+        self.packed_row_cap.set(Some(cap));
+        log_mode(mode, cap);
+        Ok(())
+    }
+
+    /// The admitted unit, table and tap bounds plus an optional exact-route cap.
     pub(crate) fn packed_limits(&self) -> packing::Limits {
-        packing::Limits { rows: self.prefill_rows,
-            chunk_rows: single_pass_rows(self.pipelined(), self.prefill_lane_count, self.prefill_rows),
+        packing::Limits { rows: self.packed_row_cap.get().unwrap_or(self.prefill_rows),
+            chunk_rows: self.prefill_rows,
             table_pages: self.table_pages, table_pool_pages: self.table_pool_pages,
-            taps: self.drafter.as_ref().map(|_| crate::families::glm5::dflash::TAP_ROWS),
+            taps: self.drafter.as_ref().map(|_| crate::shared::speculation::dflash::TAP_ROWS),
             dense_context: self.cfg.dense_context(), max_context: self.max_context }
     }
 
@@ -3399,6 +3645,7 @@ impl<'a> GlmfEngine<'a> {
         on_logits: &mut dyn FnMut(usize, DeviceLogits) -> PackedOutcome)
         -> Result<(Vec<packing::Segment>, Vec<Result<()>>)> {
         ensure!(self.packs_prefill(), "a packed prefill runs on one GPU with every layer");
+        let _program_inventory = self.packed_programs.enter(|| self.packed_program_inventory())?;
         let chunks: Vec<(usize, usize)> = sequences.iter().map(|(p, tokens)| (p.len, tokens.len())).collect();
         let segments = packing::plan(&chunks, &self.packed_limits())?;
         let mut tables = StepTables::default();
@@ -3415,8 +3662,8 @@ impl<'a> GlmfEngine<'a> {
         }
         tables.segments = segments.clone();
         let tokens: Vec<u32> = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect();
-        self.step(&tables, &tokens, 1, None, None, None, None)?;
-        let lanes = self.prefill_lanes_of(0, 1)?;
+        self.step_units(&[(tables, &tokens)], 0, false, None)?;
+        let lanes = self.prefill_slots_of(0, 1)?;
         let w = lanes.first().context("prefill workspace")?;
         let outcomes = packed_tail(sequences, |i| {
             // The sequence's last normalized row through the head alone, as its own pass's.
@@ -3564,13 +3811,13 @@ impl<'a> GlmfEngine<'a> {
             pad_decode_tables(&mut tables, bucket);
             let mut padded = tokens.to_vec();
             padded.resize(bucket, 0);
-            self.step(&tables, &padded, bucket, None, None, None, None)?.map(|mut logits| {
+            self.decode_primitive(&tables, &padded, bucket, None, None, None)?.map(|mut logits| {
                 // Keep the bucket-sized greedy status offset while exposing only real rows.
                 logits.rows = rows;
                 logits
             })
         } else {
-            self.step(&tables, tokens, rows, on_layer, None, trace, media)?
+            self.decode_primitive(&tables, tokens, rows, on_layer, trace, media)?
         };
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
@@ -3618,7 +3865,7 @@ impl<'a> GlmfEngine<'a> {
             let mut ranked = if self.context.is_some() && w1.is_some() {
                 if !tables.decode {
                     let start = tables.positions.first().map_or(0, |&p| p as usize);
-                    let history = if lane == 0 { start } else { 0 };
+                    let history = start;
                     let rows = tables.positions.len();
                     let unit = |rank| self.context_prefill_tables(rank, lane, history, start, rows, units);
                     context_units.push([unit(0)?, unit(1)?]);
@@ -3648,7 +3895,7 @@ impl<'a> GlmfEngine<'a> {
         }
         Ok(Some(match lanes {
             None if decode => PeerWorkspaces::One(self.decode_workspace_of(1)?),
-            lanes => PeerWorkspaces::Lanes(self.prefill_lanes_of(1, lanes.unwrap_or(1))?),
+            lanes => PeerWorkspaces::Lanes(self.prefill_slots_of(1, lanes.unwrap_or(1))?),
         }))
     }
 
@@ -3680,7 +3927,7 @@ impl<'a> GlmfEngine<'a> {
         let h = self.cfg.hidden;
         let (first, owned) = output_rows(t, rank);
         let sent_first = if rank == 0 { owned } else { 0 };
-        let heads_slot = norm_slot(self.prefill_lane_count, output_slot);
+        let heads_slot = norm_slot(self.prefill_waves, output_slot);
         self.exchange_push(exchange, "main", rank, heads_slot, w.delta.buffer.ptr.wrapping_byte_add(sent_first * h * 2),
             (t - owned) * h * 2)?;
         self.exchange_wait(exchange, "main", rank, heads_slot)?;
@@ -3715,6 +3962,7 @@ impl<'a> GlmfEngine<'a> {
     /// Without a head split, returns `delta` itself.
     fn meet_attention(&self, w: &Workspace<'_>, slot: usize, t: usize, layer: &GlmfLayer<'_>, cap: &str) -> Result<*mut c_void> {
         let Some(exchange) = &self.exchange else { return Ok(w.delta.buffer.ptr) };
+        if let Some(out) = self.core_attention_meet(0, w, layer, slot, t)? { return Ok(out); }
         let (h, precise) = (self.cfg.hidden, self.precise_attention(layer));
         if self.output_shard_attention(layer) {
             return self.complete_output_shard(0, w, layer, slot, t, cap);
@@ -3751,8 +3999,9 @@ impl<'a> GlmfEngine<'a> {
 
     /// Rank 1's FFN output buffer of `layer`: its dense partial (`delta`; zero rows when rank
     /// 0 runs the MLP whole) or shared-expert half (`shared`).
-    fn peer_ffn_out(w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
-        match (layer.dense, layer.has("w_gate_up_fp8")) {
+    fn peer_ffn_out(&self, index: usize, w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
+        if self.tp2_layer(index) { return Ok(w1.delta.buffer.ptr); }
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, true) => Ok(w1.delta.buffer.ptr),
             (true, false) => w1.zero_ptr(),
             (false, _) => Ok(w1.shared.buffer.ptr),
@@ -3776,7 +4025,8 @@ impl<'a> GlmfEngine<'a> {
         self.attention(1, w1, index, layer, rows, cap, tables, None)?;
         let attended = slot(index, false, lane);
         let precise = self.precise_attention(layer);
-        let sum = if self.output_shard_attention(layer) {
+        let sum = if let Some(out) = self.core_attention_meet(1, w1, layer, attended, t)? { out }
+        else if self.output_shard_attention(layer) {
             self.complete_output_shard(1, w1, layer, attended, t, cap)?
         } else {
             self.exchange_push(exchange, "main", 1, attended, w1.delta.buffer.ptr, t * h * if precise { 4 } else { 2 })?;
@@ -3791,15 +4041,18 @@ impl<'a> GlmfEngine<'a> {
             w1.sum_ptr()?
         };
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
-        let out = Self::peer_ffn_out(w1, layer)?;
+        let out = self.peer_ffn_out(index, w1, layer)?;
+        // Startup bucket graphs exclude both ranks' real-row shared FFNs and their peer publication.
+        if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
-        match (layer.dense, layer.has("w_gate_up_fp8")) {
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer) || native::dense_ffn(layer)) {
             (true, false) => {}
             (true, true) => self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, out, rows)?,
-            (false, _) if !self.tp2_layer(index) => self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
+            (false, _) if !self.tp2_layer(index) =>
+                self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
             (false, _) => {},
         }
-        if self.tp2_layer(index) { return Ok(()) }
+        if self.tp2_layer(index) || self.unit_prefill.get() { return Ok(()) }
         self.exchange_push(exchange, "main", 1, slot(index, true, lane), out, t * h * 2)
     }
 
@@ -3811,7 +4064,7 @@ impl<'a> GlmfEngine<'a> {
         let Some(next) = peer.layers.get(index + 1) else { return Ok(()) };
         let ffn = slot(index, true, lane);
         self.exchange_wait(exchange, "main", 1, ffn)?;
-        exchange.add(1, exchange.recv(1, ffn)?, Self::peer_ffn_out(w1, &peer.layers[index])?, w1.sum_ptr()?,
+        exchange.add(1, exchange.recv(1, ffn)?, self.peer_ffn_out(index, w1, &peer.layers[index])?, w1.sum_ptr()?,
             t * self.cfg.hidden)?;
         self.post_pre_on(1, w1, w1.sum_ptr()?, 1, next, "attn", "input_norm", Scalar::I32(t as i32), cap)
     }
@@ -3826,53 +4079,70 @@ impl<'a> GlmfEngine<'a> {
                 self.peer_post(previous, 0, w1, t, decode_cap(t))?;
             }
             self.peer_attention(index, 0, w1, t, decode_cap(t), tables)
-        })
+        })?;
+        let layer = &self.peer()?.layers[index];
+        if self.startup_graphs && !layer.dense && !self.tp2_layer(index) {
+            let out = self.peer_ffn_out(index, w1, layer)?;
+            if self.warming_graphs.get() {
+                self.on(1, || unsafe {
+                    // SAFETY: the masked bucket owns its peer output until the boundary publication.
+                    self.library.cuda_zero_bytes_async(w1.shared.buffer, t * self.cfg.hidden * 2, self.stream_of(1))
+                })?;
+            } else {
+                let real = tables.real_rows;
+                ensure!(real > 0 && real <= t, "peer shared FFN real rows exceed bucket");
+                self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, decode_cap(t), out, Scalar::I32(real as i32))?;
+                if real < t {
+                    let offset = real * self.cfg.hidden * 2;
+                    let bytes = (t - real) * self.cfg.hidden * 2;
+                    self.on(1, || unsafe {
+                        // SAFETY: only the unused tail of this persistent bucket output is cleared.
+                        self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
+                            ptr: out.wrapping_byte_add(offset), bytes, ..w1.shared.buffer }, bytes, self.stream_of(1))
+                    })?;
+                }
+            }
+            // Queue this before the next segment can consume it in peer_post.
+            self.exchange_push(self.exchange()?, "main", 1, slot(index, true, 0), out, t * self.cfg.hidden * 2)?;
+        }
+        Ok(())
     }
 
-    fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+    fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            |scope| self.step_inner(scope, tables, tokens, logit_rows, on_layer, forced, trace, media))
+            |scope| self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media))
     }
 
-    fn step_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
+    fn decode_primitive_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
         tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        trace: Option<&std::path::Path>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.kv_slots.len());
-        // Decode runs in its own workspace, a serial prefill in the first prefill lane.
-        let (decode_workspace, prefill_lanes);
-        let w = if tables.decode {
-            decode_workspace = self.decode_workspace_of(0)?;
-            decode_workspace.as_ref().context("decode workspace")?
-        } else {
-            prefill_lanes = self.prefill_lanes_of(0, 1)?;
-            prefill_lanes.first().context("prefill workspace")?
-        };
+        ensure!(tables.decode, "decode primitive received prefill tables");
+        let decode_workspace = self.decode_workspace_of(0)?;
+        let w = decode_workspace.as_ref().context("decode workspace")?;
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
+        self.context_unit.set(0);
+        self.context_reuse.set(false);
         self.prepare_route_checks(&[t])?;
-        ensure!(tables.decode || self.full_prefill_logits || logit_rows <= DECODE_ROWS,
-            "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        // The head split's second GPU: its workspace of the same shape, and the same tables (under
-        // context each rank's own: its slots, unit tables and shard lengths).
-        let peer_workspaces = self.peer_workspaces(tables.decode, None)?;
+        let peer_workspaces = self.peer_workspaces(true, None)?;
         let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;
-        ensure!(w1.is_none() || forced.is_none(), "teacher-forced prefill runs without a head split");
         let ranked = self.step_tables(&[(w, w1, tables)], &[placement_units(tables)])?;
         let [tables, tables1] = &ranked[0];
         let row = h * 2;
         ensure!(tokens.len() == t, "{} tokens for a {t}-row step", tokens.len());
-        let graphed = !self.tp2.as_ref().is_some_and(|t| t.checking.get()) && self.use_graphs && tables.decode && !tables.eager && on_layer.is_none() && forced.is_none()
+        let graphed = !self.tp2.as_ref().is_some_and(|t| t.checking.get()) && self.use_graphs && tables.decode && !tables.eager && on_layer.is_none()
             && media.is_none_or(|m| m.spans().is_empty());
         self.load_streams(w, tokens, graphed)?;
         self.inject_media(w, tables, media)?;
         if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
         let rows = Scalar::I32(t as i32);
         if self.layer_execution.is_some() {
-            ensure!(forced.is_none() && trace.is_none() && tables.segments.is_empty(),
-                "per-layer execution needs unpacked rows without tracing or teacher forcing");
+            ensure!(trace.is_none() && tables.segments.is_empty(),
+                "per-layer decode needs unpacked rows without tracing");
             return self.layer_step(scope, w, w1.context("per-layer peer workspace")?,
                 tables, tables1, t, logit_rows, graphed, on_layer);
         }
@@ -3881,12 +4151,10 @@ impl<'a> GlmfEngine<'a> {
             self.finish_route_checks()?;
             return result;
         }
-        let cap = if tables.decode { decode_cap(t) } else { PREFILL_CAP };
+        let cap = decode_cap(t);
         let layers = &self.weights.layers;
-        // The mHC sites and the router scores run per sequence in a packed prefill (one span: the
-        // whole step).
         let spans = tables.spans();
-        ensure!(w1.is_none() || tables.segments.is_empty(), "a packed prefill runs on one GPU");
+        ensure!(tables.segments.is_empty(), "decode cannot contain packed prefill segments");
         if let Some(w1) = w1 {
             // The streams to the second GPU, which runs a unit ahead of the host's rank-0
             // work (all its inputs are pushes from rank 0).
@@ -3976,7 +4244,7 @@ impl<'a> GlmfEngine<'a> {
             }
             if let Some(drafter) = &self.drafter {
                 if tables.segments.is_empty() {
-                    let n = t.min(crate::families::glm5::dflash::TAP_ROWS);
+                    let n = t.min(crate::shared::speculation::dflash::TAP_ROWS);
                     drafter.tap_streams(index, w.streams[cur].buffer.ptr, HC, t - n, n)?;
                 } else {
                     // Each packed sequence's last rows, as its own pass taps them, at its tap rows.
@@ -3988,14 +4256,6 @@ impl<'a> GlmfEngine<'a> {
             }
             if let Some(on_layer) = on_layer.as_mut() {
                 on_layer(index, &self.download(&w.streams[cur], t * HC * row)?)?;
-            }
-            if let Some(rows_forced) = forced.and_then(|f| f(index)) {
-                ensure!(rows_forced.len() == t * HC * row, "teacher-forced streams of the wrong size");
-                self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows_forced.len(),
-                    ..w.streams[cur].buffer }, &rows_forced)?;
-                if let Some(next) = layers.get(index + 1) {
-                    self.pre(w, &w.streams[cur], next, rows)?;
-                }
             }
             crate::shared::console::layer_mark(index);
             self.probe_mark(index)?;
@@ -4009,12 +4269,6 @@ impl<'a> GlmfEngine<'a> {
         let timer = std::time::Instant::now();
         self.run("head", &[("streams", w.streams[cur].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
             ("out", w.x.buffer.ptr)], &[rows])?;
-        if !tables.segments.is_empty() {
-            // A packed prefill: the caller takes each sequence's last row's logits in turn
-            // ([`Self::prefill_packed`]) from the normalized rows.
-            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-            return Ok(None);
-        }
         self.logits(w, t, logit_rows, tables.decode)?;
         self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         Ok(Some(self.device_logits(w, logit_rows, false)))
@@ -4121,16 +4375,16 @@ impl<'a> GlmfEngine<'a> {
             }
             if layers.get(index).is_some_and(|layer| !layer.dense) {
                 if self.warming_graphs.get() {
-                    // Masked startup rows need no routed result; preserve peer event ordering.
-                    if self.tp2_layer(index) {
-                        let w1 = w1.context("TP2 peer workspace")?;
-                        // SAFETY: masked graph warm-up publishes zero payloads, never uninitialized router ids.
-                        unsafe {
-                            self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?;
-                            self.on(1, || self.library.cuda_zero_bytes_async(w1.shared.buffer,
-                                t * self.cfg.hidden * 2, self.stream_of(1)))?;
-                        }
-                    } else { self.exchange_window(index, true, true)?; }
+                    // Both ranks skip native/shared FFNs, so only the ordinary BF16 boundary publishes.
+                    // SAFETY: masked startup owns the live bucket outputs; no router ids are consumed.
+                    unsafe { self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?; }
+                    if let Some(w1) = w1 {
+                        let buffer = if self.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer };
+                        self.on(1, || unsafe {
+                            // SAFETY: this is the peer output subsequently published by this layer.
+                            self.library.cuda_zero_bytes_async(buffer, t * self.cfg.hidden * 2, self.stream_of(1))
+                        })?;
+                    }
                 } else if self.startup_graphs {
                     // A padded step's real rows run the router, the expert wire and the shared expert
                     // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
@@ -4161,7 +4415,7 @@ impl<'a> GlmfEngine<'a> {
                     })?;
                 } else {
                     // The router ran inside this layer's segment: its ids are still in place.
-                    self.probe_ring(index, w, t, matches!(self.experts, Some(Experts::Spark { .. })))?;
+                    self.probe_ring(index, w, t)?;
                     self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?;
                 }
             }
@@ -4195,10 +4449,22 @@ impl<'a> GlmfEngine<'a> {
     /// cores at every row count, or `--target-head exact`'s pedantic GEMM), or the FP8 head
     /// (--fp8-head) in 16-row spans for every row count.
     fn logits(&self, w: &Workspace<'_>, t: usize, logit_rows: usize, _decode: bool) -> Result<()> {
+        ensure!(logit_rows <= t && t <= w.rows, "head input exceeds admitted rows");
+        ensure!(logit_rows <= units::logits_capacity(w.logits.buffer.bytes, self.cfg.vocab_size)?,
+            "head logits exceed admitted storage");
         let h = self.cfg.hidden;
         // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
         match &self.weights.head {
+            GlmfHead::K6(weights) => {
+                let head = self.core_head.as_ref().context("Flash K6 head runtime not bound")?;
+                let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: x, bytes: logit_rows*h*2, ..w.x.buffer };
+                head.launch(weights, input, w.logits.buffer, logit_rows, self.stream)
+            },
+            GlmfHead::RowFp8(owner) => {
+                // SAFETY: normalized rows and output logits are live on the owner's stream.
+                unsafe { owner.head_logits(x, w.logits.buffer.ptr.cast(), logit_rows, self.stream) }
+            },
             GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
@@ -4216,7 +4482,15 @@ impl<'a> GlmfEngine<'a> {
     /// The target head as the DFlash drafter borrows it (the same resident copy).
     pub fn draft_head(&self) -> TargetHead<'_> {
         match &self.weights.head {
+            GlmfHead::K6(weights) => match &self.draft_core_head {
+                Some(head) => head.target(weights),
+                None => TargetHead::Launch(Box::new(|_, _, _, _| anyhow::bail!("K6 draft head runtime not bound"))),
+            },
             GlmfHead::Bf16(head) => TargetHead::Bf16(head),
+            GlmfHead::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                // SAFETY: the drafter supplies live normalized rows/output on the target device.
+                unsafe { owner.head_logits(x, logits, rows, stream) }
+            })),
             fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits
                 // workspace for `rows` rows, on the stream it launches the head on.
@@ -4401,7 +4675,7 @@ impl<'a> GlmfEngine<'a> {
             GlmNextAttention::Kda => tables.spans().iter().try_for_each(|span| {
                 ensure!(span.first == 0 || (rank == 0 && self.peer.is_none()), "per-sequence rows run on one GPU");
                 self.kda_on(rank, w, index, layer, if tables.segments.is_empty() { rows } else { span.rows() },
-                    span.first, cap, tables.spec)
+                    span.first, cap, tables.spec, native::sequence_count(&tables.kda_slots[span.first..span.first + span.rows]))
             }),
             GlmNextAttention::Mla => self.mla_on(rank, w, index, layer, rows, cap, tables, trace),
         }
@@ -4411,7 +4685,7 @@ impl<'a> GlmfEngine<'a> {
     /// `rows` rows from row `first` (one packed sequence's: its `seq_first` entries are 0).
     #[allow(clippy::too_many_arguments)]
     fn kda_on(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, first: usize,
-        cap: &str, spec: bool) -> Result<()> {
+        cap: &str, spec: bool, sequences: usize) -> Result<()> {
         let ordinal = self.kda_ordinal[index].context("KDA layer without a state pool")?;
         let at = |pool: cuteafd_ffi::CuteafdDeviceBuffer, per: usize| -> *mut c_void {
             // SAFETY: ordinal < KDA layers, so the layer's region lies inside the pool.
@@ -4419,6 +4693,14 @@ impl<'a> GlmfEngine<'a> {
         };
         let caches = self.caches_of(rank);
         let d = caches.kda_heads * self.cfg.kda_head_dim;
+        if native::is_native(layer) {
+            let view = |pool, per| crate::shared::experts::exlr8::view(pool, ordinal * per, per);
+            return self.native_kda(rank, w, layer, rows, first, cap, spec, sequences, [
+                view(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2)?,
+                view(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes())?,
+                view(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)))?,
+            ]);
+        }
         let conv_state = at(caches.kda_conv.buffer, self.slots * 3 * 3 * d * 2);
         let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         // Records of the step's programs' rows, layer by layer (an `_m64` step's 64-row records, a wide
@@ -4431,6 +4713,10 @@ impl<'a> GlmfEngine<'a> {
         let out_bytes = if self.precise_attention(layer) { 4 } else { 2 };
         let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
             w.delta.buffer.ptr.wrapping_byte_add(first * h * out_bytes)];
+        if layer.core.contains_key("self_attn.q_proj") {
+            ensure!(self.kda_state == KdaState::F32, "native Flash K6 requires the F32 KDA stage package");
+            return self.core_kda(rank, w, layer, rows, first, cap, spec, [conv_state, state, replay]);
+        }
         if layer.has("w_in_fp8") {
             return self.kda_w8(rank, w, layer, rows, rows_at, cap, spec, [conv_state, state, replay]);
         }
@@ -4512,6 +4798,8 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void,
         rows: Scalar) -> Result<()> {
+        if native::is_native(layer) { return self.native_ffn(rank, w, layer, cap, out, rows); }
+        if core::native_ffn(layer) { return self.core_ffn(rank, w, layer, cap, out, rows); }
         if layer.has("nvfp4_w1") {
             ensure!(rank == 0, "NVFP4 dense MLPs run on rank 0");
             let dense = self.dense_nvfp4.as_ref().context("an NVFP4 dense layer needs the fp8-glmfdense-nvfp4 package")?;
@@ -4559,7 +4847,7 @@ impl<'a> GlmfEngine<'a> {
             if tables.decode {
                 return self.context_decode_attention(rank, w, index, layer, rows, cap, tables);
             }
-            let unit = self.context_units.borrow().get(tables.lane).context("context prefill unit")?[rank];
+            let unit = self.context_units.borrow().get(self.context_unit.get()).context("context prefill unit")?[rank];
             return self.context_prefill_attention(rank, w, index, layer, rows, cap, tables, tables.lane, unit);
         }
         let caches = self.caches_of(rank);
@@ -4574,12 +4862,17 @@ impl<'a> GlmfEngine<'a> {
     fn mla_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         decode: bool) -> Result<()> {
         let cache = self.caches_of(rank).kv[index].as_ref().context("MLA layer without a record pool")?.buffer;
-        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache.ptr)
+        self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn mla_producer_into(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
-        decode: bool, cache: *mut c_void) -> Result<()> {
+        decode: bool, cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if native::is_native(layer) { return self.native_mla_producer(rank, w, layer, rows, cap, cache); }
+        let cache = cache.ptr;
+        if layer.core.contains_key("self_attn.q_a_proj") {
+            return self.core_mla_producer(rank, w, layer, rows, cap, cache);
+        }
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let fp8 = decode || self.fp8_prefill.mla;
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
@@ -4596,7 +4889,9 @@ impl<'a> GlmfEngine<'a> {
     /// its pool slot of `pools` (a negative slot skips it).
     #[allow(clippy::too_many_arguments)]
     fn index_producer_part(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
-        cap: &str, tables: &StepTables, first: usize, pools: *mut c_void) -> Result<()> {
+        cap: &str, tables: &StepTables, first: usize, pools: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if native::is_native(layer) { return self.native_index(rank, w, index, layer, rows, cap, tables, first, pools); }
+        let pools = pools.ptr;
         let caches = self.caches_of(rank);
         let index_cache = caches.index[index].as_ref().context("MLA layer without an index cache")?;
         let t = tables.positions.len();
@@ -4638,12 +4933,16 @@ impl<'a> GlmfEngine<'a> {
     fn index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmfLayer<'_>, rows: Scalar,
         cap: &str, tables: &StepTables) -> Result<()> {
         let pools = self.caches_of(rank).index[index].as_ref().context("MLA layer without an index cache")?.pools.buffer;
-        self.index_producer_part(rank, w, index, layer, rows, cap, tables, 0, pools.ptr)
+        self.index_producer_part(rank, w, index, layer, rows, cap, tables, 0, pools)
     }
 
     /// W_UV + o_proj of this rank's heads over `w.latent` into `delta` (a partial under a split).
     fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
         -> Result<()> {
+        if native::is_native(layer) { return self.native_mla_output(rank, w, layer, rows, cap); }
+        if layer.core.contains_key("self_attn.o_proj") {
+            return self.core_mla_output(rank, w, layer, rows, cap);
+        }
         let fp8 = decode || self.fp8_prefill.mla;
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
@@ -4666,22 +4965,35 @@ impl<'a> GlmfEngine<'a> {
         // already differ and cannot identify the original numerical cause.
         let trace = trace.filter(|_| tables.decode && index == 3);
         let mode = if tables.decode { "decode" } else { "prefill" };
-        let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
         let decode = tables.decode;
         let split = layer.attention_share.split();
         self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)?;
+        let (cache, pool_cache) = (cache.ptr, pool_buffer.ptr);
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
-            let q_width = self.cfg.heads * self.cfg.qk_nope_dim;
-            let bytes = (t * qkv_width * 2).next_multiple_of(1024)
-                + (t * q_width * 2).next_multiple_of(1024);
-            for (name, buffer, bytes) in [("mla_producer_scratch.bin", &w.scratch, bytes),
-                ("mla_query.bin", &w.query, t * self.cfg.heads * self.cfg.kv_lora_rank * 2),
+            let q_width = heads * self.cfg.qk_nope_dim;
+            let native = layer.core.contains_key("self_attn.q_a_proj");
+            if native {
+                let slot = w.core.as_ref().context("native MLA trace without stage buffers")?;
+                // q_a has been normalized into q_resid; its stage now contains q_b.
+                for (name, buffer, bytes) in [
+                    ("mla_q_b.bin", slot.stage("q")?, t * q_width * 2),
+                    ("mla_kv_a.bin", slot.stage("k")?, t * self.cfg.kv_lora_rank * 2)] {
+                    std::fs::write(dir.join(name), self.download_buffer(buffer, bytes)?)?;
+                }
+            } else {
+                let bytes = (t * qkv_width * 2).next_multiple_of(1024)
+                    + (t * q_width * 2).next_multiple_of(1024);
+                std::fs::write(dir.join("mla_producer_scratch.bin"), self.download(&w.scratch, bytes)?)?;
+            }
+            for (name, buffer, bytes) in [
+                ("mla_query.bin", &w.query, t * heads * self.cfg.kv_lora_rank * 2),
                 ("mla_q_resid.bin", &w.q_resid, t * self.cfg.q_lora_rank * 2)] {
                 std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
             }
             std::fs::write(dir.join("mla_meta.json"), serde_json::to_vec(&serde_json::json!({
-                "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024 }))?)?;
+                "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024,
+                "native_stages": native }))?)?;
         }
         // The DSA indexer, its pool top-k and the selection read one sequence's tables: a packed
         // prefill runs them once per sequence, over its rows and its tables (one part: the step).
@@ -4692,7 +5004,7 @@ impl<'a> GlmfEngine<'a> {
             let (q_fp8, head_weights) = (row_at(&w.q_fp8, first, INDEX_HEADS * 128), row_at(&w.head_weights, first,
                 INDEX_HEADS * 4));
             let positions = row_at(&w.positions, first, 8);
-            self.index_producer_part(rank, w, index, layer, rows, cap, tables, first, pool_cache)?;
+            self.index_producer_part(rank, w, index, layer, rows, cap, tables, first, pool_buffer)?;
             let pools_at = row_at(&w.pools, first, pools * 4);
             // A packed step is long when any of its sequences is: its short parts skip the top-k.
             if tables.long {
@@ -4751,14 +5063,17 @@ impl<'a> GlmfEngine<'a> {
         }
         if let Some(dir) = trace {
             std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,
-                t * self.cfg.heads * self.cfg.kv_lora_rank * 2)?)?;
+                t * heads * self.cfg.kv_lora_rank * 2)?)?;
             std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
                 self.scratch(&format!("sparse_mla_decode_{cap}"))?)?)?;
         }
         self.mla_output(rank, w, layer, cap, rows, decode)?;
         if let Some(dir) = trace {
-            std::fs::write(dir.join("mla_values.bin"), self.download(&w.scratch,
-                t * self.cfg.heads * self.cfg.v_head_dim * 2)?)?;
+            let values = if layer.core.contains_key("self_attn.o_proj") {
+                w.core.as_ref().context("native MLA trace without stage buffers")?.stage("values")?
+            } else { w.scratch.buffer };
+            std::fs::write(dir.join("mla_values.bin"), self.download_buffer(values,
+                t * heads * self.cfg.v_head_dim * 2)?)?;
         }
         Ok(())
     }
@@ -4795,13 +5110,13 @@ impl<'a> GlmfEngine<'a> {
                     self.cfg.routed_scale as f32, true, self.stream)
             }
         })?;
-        self.probe_ring(index, w, t, matches!(experts, Some(Experts::Spark { .. })))?;
+        self.probe_ring(index, w, t)?;
         if !matches!(experts, Some(Experts::Local(_))) && !self.spark_bf16 {
             let grid = self.quantize_grid.blocks(t, h);
             self.run("expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.scratch.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
         }
         Ok(())
     }
@@ -4843,12 +5158,18 @@ impl<'a> GlmfEngine<'a> {
                     .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up_fp8",
                         "w_gate_up_scale", "w_down_fp8", "w_down_scale"])
                     .copied().collect();
-                crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
+                let mut ranges = crate::shared::l2_prefetch::operands(&names, |n| next.range(n));
+                for weight in next.core.values() {
+                    ranges.extend([weight.payload.buffer, weight.suh.buffer, weight.svh.buffer]
+                        .map(|buffer| (buffer.ptr.cast_const(), buffer.bytes)));
+                }
+                if let Some(aux) = next.range("w_aux") { ranges.push(aux); }
+                ranges
             }
             None if rank == 1 => Vec::new(),
             None => {
-                std::iter::once(&self.weights.norm).chain(self.weights.head.allocations())
-                    .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect()
+                std::iter::once(self.weights.norm.buffer).chain(self.weights.head.allocations())
+                    .map(|a| (a.ptr.cast_const(), a.bytes)).collect()
             }
         }).collect()
     }
@@ -4907,26 +5228,36 @@ impl<'a> GlmfEngine<'a> {
                     unsafe { self.library.cuda_stream_synchronize(self.stream)? };
                 }
             }
+            Experts::LocalNative(local) => {
+                shared()?;
+                let mut experts = local.borrow_mut();
+                let routes = Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr };
+                // SAFETY: operands and owner outlive this serialized stream. Whole
+                // execution has no peer wait to abort; its completion owner drains on drop.
+                unsafe { experts.enqueue(index, t, ExpertInput::Fp8K32(w.wire.buffer.ptr), routes,
+                    self.stream, &mut || {})?; }
+                return self.run("add", &[("a", experts.output()), ("b", w.shared.buffer.ptr),
+                    ("out", w.delta.buffer.ptr)], &[rows]);
+            }
             Experts::LocalExl3(local) => {
                 shared()?;
                 local.ensure(index, self.stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
-                // stream order; the output is copied before the window can change.
+                // stream order; delta retains the reduction through its consumers.
                 unsafe {
-                    experts.run(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream)?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
+                    experts.run_into(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, w.delta.buffer.ptr, self.stream)?;
                 }
                 return Ok(());
             }
-            Experts::Spark { transports, runtime } => {
+            Experts::Spark { transport } => {
                 // The compact reducer adds the shared expert plane to the rank partials.
-                let mut transports = transports.borrow_mut();
-                let transport = transports.first_mut().context("no Spark transport")?;
-                let wave = self.spark_dispatch(w, index, t, decode, transport, shared)?;
-                return runtime.block_on(self.spark_land(w, t, transport, wave));
+                let mut transport = transport.borrow_mut();
+                let exchange = transport.exchange()?;
+                let wave = self.spark_send(w, index, t, decode, exchange, None, shared)?;
+                return self.spark_land(w, t, exchange, wave);
             }
         }
         self.run("add", &[("a", w.routed_ptr()?), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)], &[rows])
@@ -4942,11 +5273,12 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Queue layer `index`'s router ids into the draft probe's ring right
-    /// behind the router (`spark`: the layer's ids are also staged).
-    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize, spark: bool) -> Result<()> {
+    /// behind the router. Spark layers ring too: their routes reach the host
+    /// only on the exchange worker, after the post.
+    fn probe_ring(&self, index: usize, w: &Workspace<'_>, t: usize) -> Result<()> {
         if self.capturing.get() { return Ok(()); }
         let mut probe = self.draft_probe.borrow_mut();
-        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(spark)) else { return Ok(()) };
+        let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(false)) else { return Ok(()) };
         // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
         // is read after the step's sync.
         unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
@@ -4989,299 +5321,73 @@ impl<'a> GlmfEngine<'a> {
         self.draft_probe.borrow().as_ref().map(|probe| probe.ring_check)
     }
 
-    /// Routes and wire rows down and one request to every Spark rank; the
-    /// shared expert (`shared`) queues behind the copies and runs while the
-    /// ranks compute. Complete with [`Self::spark_land`].
-    fn spark_dispatch(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>,
-        shared: impl FnOnce() -> Result<()>) -> Result<SparkExpertWave> {
+    /// Layer `index`'s wave on the link's exchange: routes and wire rows copy
+    /// into the wave slot's pinned staging on the stream, then the shared
+    /// expert (`shared`) queues behind them and runs while the worker posts
+    /// and the ranks compute. This thread never waits for the GPU. Complete
+    /// with [`Self::spark_land`].
+    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>, shared: impl FnOnce() -> Result<()>)
+        -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
-            if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
-        let route_bytes = layout.route_bytes;
-        let staging = w.router_host.borrow_mut();
-        let timer = std::time::Instant::now();
-        // SAFETY: the pinned regions are large enough; the sync completes them.
-        unsafe {
-            layout.enqueue(self.library, staging.buffer,
-                [w.route_ids.buffer, w.route_weights.buffer,
-                    if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }], self.stream)?;
-            self.library.cuda_event_record(self.routes_ready, self.stream)?;
-        }
-        // The shared expert queues behind the copies and runs during the exchange;
-        // the host waits for the copies only (they also order after this
-        // workspace's previous plane uploads, which frees its pinned plane staging).
-        shared()?;
-        // SAFETY: the event was recorded on this engine's stream above.
-        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
-        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        let staged = staging.bytes();
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            probe.staged(index, &staged[..route_bytes]);
-        }
-        let routes = layout.routes(staged)?;
-        let wire = layout.wire(staged)?.to_vec();
-        drop(staging);
-        let request = spark_request(h, topk, index, t, routes, wire, kind, self.spark_bf16)?;
-        if self.split_audit && !decode && t >= 256 {
-            let counts = audit_route_counts(&request.routes);
-            tracing::info!(layer = index, rows = t, distinct = counts.len(),
-                max_routes = counts.values().max().copied().unwrap_or(0),
-                histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
-        }
-        transport.dispatch(&request)
-    }
-
-    /// Receives `wave`'s BF16 rank partials into its transport's intake planes
-    /// and sums them with the shared expert into `delta`.
-    async fn spark_land(&self, w: &Workspace<'_>, t: usize, transport: &mut SparkLink<'_>, wave: SparkExpertWave)
-        -> Result<()> {
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let timer = std::time::Instant::now();
-        transport.receive(wave, t, self.stream).await?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers; the planes are ordered after the wave by `receive`.
-        unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
-    }
-
-    fn spark_land_lane(&self, w: &Workspace<'_>, rows: usize, lane: usize, wave: SparkExpertWave) -> Result<()> {
-        let Some(Experts::Spark { transports, runtime }) = &self.experts else {
-            anyhow::bail!("Spark completion without its installed backend");
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
+        let audit = self.split_audit && !decode && t >= 256;
+        // SAFETY: ids, weights and wire rows hold this layer's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let combined_reply = origins.as_ref().map_or_else(|| crate::shared::spark_waves::single_reply_eligible(t, kind),
+            crate::shared::prefill_pipeline::ReplyOrigins::combined_reply_eligible);
+        let ticket = unsafe {
+            exchange.send(t, exchange.compact_payload(t), layout, [w.route_ids.buffer, w.route_weights.buffer,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, combined_reply, Box::new(move |routes, wire| {
+                    let mut request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
+                    if let Some(origins) = origins { origins.apply(&mut request)?; }
+                    if audit {
+                        let counts = audit_route_counts(&request.routes);
+                        tracing::info!(layer = index, rows = t, distinct = counts.len(),
+                            max_routes = counts.values().max().copied().unwrap_or(0),
+                            histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
+                    }
+                    Ok(request)
+                }))?
         };
-        let mut transports = transports.borrow_mut();
-        let transport = transports.get_mut(lane).context("Spark completion lane")?;
-        runtime.block_on(self.spark_land(w, rows, transport, wave))
+        shared()?;
+        Ok(ticket)
     }
 
-    /// Pipelined prefill of consecutive-row lanes of one sequence (each
-    /// with its own workspace and, for Spark homes only, transport). Units (layer, lane) run
-    /// layer-major: a lane's attention needs its own previous layer posted and
-    /// the previous lane's same layer done, which stream order gives (KDA
-    /// state and conv windows, MLA records and DSA token/pool keys all pass
-    /// through the engine's caches). Each lane's Spark wave stays in flight
-    /// while the other lane's GPU layers run and is received after the next
-    /// wave is dispatched, so the ranks hold the next request when they finish
-    /// one. Returns the logits of the last `logit_rows` rows across the lanes.
-    fn step_lanes(&self, lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
+    /// The land half of [`Self::spark_send`]: the stream waits for the wave's
+    /// planes and sums them with the shared expert into `delta`.
+    fn spark_land(&self, w: &Workspace<'_>, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
+        wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
+        let slot = wave.slot();
+        exchange.land(wave, self.stream)?;
+        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
+        // buffers; the slot's planes are ordered after the wave by `land`.
+        unsafe { exchange.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?.bytes)
+    }
+
+    /// Execute one continuous span with retained per-unit slots.
+    fn step_units(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<StepLogits>> {
+        self.step_units_with(units, logit_rows, device, media, self.prefill_waves, None, None)
+    }
+
+    fn step_units_with(&self, units: &[(StepTables, &[u32])], logit_rows: usize, device: bool,
+        media: Option<&cuteafd_engine::media::RequestMedia>, waves: usize,
+        on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>) -> Result<Option<StepLogits>> {
         crate::shared::experts::rtx::pair::submit_scoped(
             || self.require_live(), || self.shutdown_submission(),
-            |scope| self.step_lanes_inner(scope, lanes, logit_rows, device, media))
-    }
-
-    fn step_lanes_inner(&self, scope: &crate::shared::experts::rtx::pair::SubmissionScope<'_>,
-        lanes: &[(StepTables, &[u32])], logit_rows: usize, device: bool, media: Option<&cuteafd_engine::media::RequestMedia>)
-        -> Result<Option<StepLogits>> {
-        if self.layer_execution.is_some() {
-            return self.layer_steps(scope, lanes, logit_rows, device, media);
-        }
-        if let Some(Experts::Spark { transports, .. }) = &self.experts {
-            ensure!(transports.borrow().len() >= lanes.len(), "{} lanes need as many Spark transports", lanes.len());
-        }
-        let workspaces = self.prefill_lanes_of(0, lanes.len())?;
-        let total: usize = lanes.iter().map(|(t, _)| t.kv_slots.len()).sum();
-        ensure!(logit_rows <= total && (self.full_prefill_logits || logit_rows <= DECODE_ROWS),
-            "prefill logits past {DECODE_ROWS} rows need full_prefill_logits");
-        // Each lane's tables on both GPUs (under context each rank's own), uploaded once both
-        // streams drained.
-        let peer_workspaces = self.peer_workspaces(false, Some(lanes.len()))?;
-        let mut units = Vec::new();
-        for (lane, ((tables, _), w)) in lanes.iter().zip(workspaces.iter()).enumerate() {
-            let t = tables.kv_slots.len();
-            ensure!(t <= w.rows, "lane of {t} rows exceeds its workspace");
-            units.push((w, peer_workspaces.as_ref().map(|p| p.get(lane)).transpose()?, tables));
-        }
-        if peer_workspaces.is_some() {
-            // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
-            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-        }
-        let ranked = self.step_tables(&units, &lanes.iter().map(|(t, _)| placement_units(t)).collect::<Vec<_>>())?;
-        for ((tables, tokens), w) in lanes.iter().zip(workspaces.iter()) {
-            self.load_streams(w, tokens, false)?;
-            self.inject_media(w, tables, media)?;
-            if media.is_some_and(|m| !m.spans().is_empty()) { self.put(&w.ids, tokens)?; }
-        }
-        self.prepare_route_checks(&lanes.iter().map(|(t, _)| t.kv_slots.len()).collect::<Vec<_>>())?;
-        let layers = &self.weights.layers;
-        let local_layer = |layer| self.local_layer(layer) || matches!(self.routed_experts(layer), Some(Experts::Skip));
-        let cap = "m4096";
-        let rows_of = |lane: usize| Scalar::I32(lanes[lane].0.kv_slots.len() as i32);
-        let count_of = |lane: usize| lanes[lane].0.kv_slots.len();
-        // The head split's second GPU: each lane's streams, then every lane's layer-0 attention
-        // (rank 1 runs a unit ahead of the host's rank-0 work).
-        if let Some(peers) = &peer_workspaces {
-            for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
-                let w1 = peers.get(lane)?;
-                self.exchange_direct(w.streams[0].buffer.ptr, w1.streams[0].buffer.ptr,
-                    count_of(lane) * HC * self.cfg.hidden * 2)?;
-            }
-            for lane in 0..lanes.len() {
-                self.peer_attention(0, lane, peers.get(lane)?, count_of(lane), cap, &ranked[lane][1])?;
-            }
-        }
-        // After rank 0 queued unit (layer, lane)'s FFN: rank 1's FFN exchange of that unit and
-        // its lane's next attention.
-        let peer_next = |(layer, lane): (usize, usize)| -> Result<()> {
-            let Some(peers) = &peer_workspaces else { return Ok(()) };
-            let w1 = peers.get(lane)?;
-            self.peer_post(layer, lane, w1, count_of(lane), cap)?;
-            if layer + 1 < layers.len() {
-                self.peer_attention(layer + 1, lane, w1, count_of(lane), cap, &ranked[lane][1])?;
-            }
-            Ok(())
-        };
-        // The drafter taps the chunk's last TAP_ROWS rows: lane `lane`'s part of
-        // that window, at its offset in the tap rows.
-        let tap_rows = total.min(crate::families::glm5::dflash::TAP_ROWS);
-        let lane_first: Vec<usize> = lanes.iter().scan(0, |first, (t, _)| {
-            let here = *first;
-            *first += t.kv_slots.len();
-            Some(here)
-        }).collect();
-        // Streams sit in buffer 0 at a layer's start and in buffer 1 mid-layer.
-        let attention = |(layer, lane): (usize, usize)| -> Result<()> {
-            let (w, weights, rows) = (&workspaces[lane], &layers[layer], rows_of(lane));
-            let t = lanes[lane].0.kv_slots.len();
-            if layer == 0 {
-                self.pre(w, &w.streams[0], weights, rows)?;
-            }
-            self.attention(0, w, layer, weights, rows, cap, &ranked[lane][0], None)?;
-            let attended = self.meet_attention(w, slot(layer, false, lane), t, weights, "m4096")?;
-            self.post_pre_on(0, w, attended, 0, weights, "ffn", "post_norm", rows, cap)?;
-            if weights.dense {
-                self.ffn(w, weights, self.cfg.dense_intermediate, cap, w.delta.buffer.ptr, rows)
-            } else {
-                self.moe_front(w, layer, weights, t, rows, cap, &[Span { first: 0, rows: t }])
-            }
-        };
-        let post = |(layer, lane): (usize, usize)| -> Result<()> {
-            let (w, rows) = (&workspaces[lane], rows_of(lane));
-            let out = self.meet_ffn(w, layer, lane, layers.len(), count_of(lane))?;
-            match layers.get(layer + 1) {
-                Some(next) => self.post_pre_on(0, w, out, 1, next, "attn", "input_norm", rows, cap)?,
-                None => self.run("mhc_post", &[("x", out), ("residual", w.streams[1].buffer.ptr),
-                    ("prev_post", w.post.buffer.ptr), ("prev_comb", w.comb.buffer.ptr),
-                    ("out", w.streams[0].buffer.ptr)], &[rows])?,
-            }
-            if let Some(drafter) = &self.drafter {
-                let (first, t) = (lane_first[lane], lanes[lane].0.kv_slots.len());
-                let window = total - tap_rows;
-                let from = first.max(window);
-                if from < first + t {
-                    drafter.tap_streams_at(layer, w.streams[0].buffer.ptr, HC, from - first, first + t - from,
-                        from - window)?;
-                }
-            }
-            Ok(())
-        };
-        let units: Vec<(usize, usize)> = (0..layers.len()).flat_map(|l| (0..lanes.len()).map(move |k| (l, k))).collect();
-        let mut inflight: Option<((usize, usize), SparkExpertWave)> = None;
-        attention(units[0])?;
-        for (index, &unit) in units.iter().enumerate() {
-            let (layer, lane) = unit;
-            let w = &workspaces[lane];
-            let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;
-            if layers[layer].dense || self.tp2_layer(layer)
-                || local_layer(layer) {
-                // A local post may wait behind a previous lane's Spark FFN on the peer stream.
-                // Land that wave before queuing any blocking local meet.
-                if let Some((previous, wave)) = inflight.take() {
-                    let t = lanes[previous.1].0.kv_slots.len();
-                    self.spark_land_lane(&workspaces[previous.1], t, previous.1, wave)?;
-                    post(previous)?;
-                }
-            }
-            let next = units.get(index + 1).copied();
-            let local = layers[layer].dense || self.tp2_layer(layer)
-                || local_layer(layer);
-            let early_next = local && next.is_some_and(|(_, next_lane)| next_lane != lane);
-            let local_post = || -> Result<()> {
-                peer_next(unit)?;
-                if early_next { attention(next.context("independent next unit")?)?; }
-                post(unit)
-            };
-            if layers[layer].dense {
-                local_post()?;
-            } else if local_layer(layer) {
-                self.moe_experts(w, layer, &layers[layer], count_of(lane), rows_of(lane), cap, false, w1)?;
-                local_post()?;
-            } else if self.tp2_layer(layer) {
-                self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?;
-                self.tp2_publish(layer, lane, count_of(lane), w1)?;
-                local_post()?;
-            } else {
-                let t = lanes[lane].0.kv_slots.len();
-                let shared = || self.ffn(w, &layers[layer], self.cfg.moe_intermediate, cap, w.shared.buffer.ptr,
-                    rows_of(lane));
-                let Some(Experts::Spark { transports, .. }) = self.routed_experts(layer) else {
-                    anyhow::bail!("layer {layer} is not bound to a Spark backend");
-                };
-                let wave = self.spark_dispatch(w, layer, t, false, &mut transports.borrow_mut()[lane], shared)?;
-                peer_next(unit)?;
-                if let Some((previous, wave)) = inflight.take() {
-                    let t = lanes[previous.1].0.kv_slots.len();
-                    self.spark_land_lane(&workspaces[previous.1], t, previous.1, wave)?;
-                    post(previous)?;
-                }
-                inflight = Some((unit, wave));
-            }
-            let next = units.get(index + 1).copied();
-            // The next unit reads this unit's post when both are on one lane.
-            if next.is_none_or(|(_, next_lane)| next_lane == lane) {
-                if let Some((current, wave)) = inflight.take() {
-                    let t = lanes[current.1].0.kv_slots.len();
-                    self.spark_land_lane(&workspaces[current.1], t, current.1, wave)?;
-                    post(current)?;
-                }
-            }
-            if !early_next {
-                if let Some(next) = next { attention(next)?; }
-            }
-        }
-        // All lane producers are queued before a terminal wait can block the
-        // peer stream (in particular the next lane's fused TP2 publication).
-        if let Some(peers) = &peer_workspaces {
-            // Warm-up may have cached more workspaces than this request uses.
-            for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
-                self.replicate_terminal(w, peers.get(lane)?, 0, count_of(lane))?;
-            }
-        }
-        self.finish_route_checks()?;
-        if logit_rows == 0 {
-            self.synchronize()?;
-            return Ok(None);
-        }
-        let timer = std::time::Instant::now();
-        let last = lanes.len() - 1;
-        if device {
-            // The last rows sit in the last lane: their logits stay in its workspace.
-            let t = lanes[last].0.kv_slots.len();
-            ensure!(logit_rows <= t, "device logits of {logit_rows} rows across prefill lanes");
-            let w = &workspaces[last];
-            self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-                ("out", w.x.buffer.ptr)], &[Scalar::I32(t as i32)])?;
-            self.logits(w, t, logit_rows, false)?;
-            self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-            return Ok(Some(StepLogits::Device(self.device_logits(w, logit_rows, false))));
-        }
-        let mut logits = Vec::with_capacity(logit_rows * self.cfg.vocab_size);
-        for (((tables, _), w), &first) in lanes.iter().zip(workspaces.iter()).zip(&lane_first) {
-            let t = tables.kv_slots.len();
-            // Rows of this lane inside the last `logit_rows` of the chunk.
-            let wanted = (first + t).saturating_sub((total - logit_rows).max(first));
-            if wanted == 0 {
-                continue;
-            }
-            self.run("head", &[("streams", w.streams[0].buffer.ptr), ("weight", self.weights.norm.buffer.ptr),
-                ("out", w.x.buffer.ptr)], &[Scalar::I32(t as i32)])?;
-            self.logits(w, t, wanted, false)?;
-            let bytes = self.download(&w.logits, wanted * self.cfg.vocab_size * 4)?;
-            logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
-        }
-        self.profile.borrow_mut()[2] += timer.elapsed().as_secs_f64();
-        Ok(Some(StepLogits::Host(logits)))
+            |scope| self.step_units_inner(scope, units, logit_rows, device, media,
+                waves, on_layer, forced))
     }
 }
 
@@ -5322,8 +5428,6 @@ impl Drop for GlmfEngine<'_> {
         // Every rank can still read graph operands, weights and workspaces.
         // Abort before any owner releases storage when drainage is unproved.
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
-        // SAFETY: all rank streams drained while their event and operands remained live.
-        let _ = unsafe { self.library.cuda_event_destroy(self.routes_ready) };
         self.graphs = RefCell::new(GraphBank::new(None));
         if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphBank::new(None)); }
         if let Some(ops) = self.ops.take() {
@@ -5344,15 +5448,69 @@ fn decode_bucket(rows: usize, spec: bool) -> usize {
     else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
 }
 
-pub(crate) fn check_tp2_lanes(lanes: usize) -> Result<()> {
-    ensure!((1..=2).contains(&lanes),
-        "GLM Flash TP2 supports one or two prefill lanes; --prefill-lanes {lanes} has no admitted exchange schedule");
-    Ok(())
-}
+
+#[cfg(test)]
+#[path = "engine/warm_exchange_tests.rs"]
+mod warm_exchange_tests;
 
 #[cfg(test)]
 mod tp2_tests {
     use super::*;
+    #[test]
+    fn native_whole_binding_checks_independent_wire_and_partial_types() {
+        use crate::shared::experts::rtx::RtxShard;
+        struct Rank { shard: RtxShard, partial: PartialDtype, fp8: bool, device: i32 }
+        impl RtxExpertLayer for Rank {
+            fn shard(&self) -> RtxShard { self.shard }
+            fn partial(&self) -> PartialDtype { self.partial }
+            fn uses_fp8_input(&self) -> bool { self.fp8 }
+            fn layers(&self) -> &[usize] { &[3, 7] }
+            fn device(&self) -> i32 { self.device }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        let valid = || Rank { shard: RtxShard::Whole, partial: PartialDtype::Bf16, fp8: true, device: 4 };
+        assert_eq!(native_local_layers(&valid(), 4).unwrap(), [3, 7]);
+        let wire = 0x1000usize as *mut c_void;
+        let hidden = 0x2000usize as *mut c_void;
+        for (partial, fp8) in [(PartialDtype::Bf16, true), (PartialDtype::F32, true), (PartialDtype::Bf16, false)] {
+            let rank = Rank { shard: RtxShard::Tp2 { rank: 0 }, partial, fp8, device: 4 };
+            match tp2_input(&rank, wire, hidden) {
+                ExpertInput::Fp8K32(pointer) => { assert!(fp8); assert_eq!(pointer, wire); }
+                ExpertInput::Bf16(pointer) => { assert!(!fp8); assert_eq!(pointer, hidden); }
+            }
+        }
+        let mut wrong = valid(); wrong.shard = RtxShard::Tp2 { rank: 0 };
+        assert!(native_local_layers(&wrong, 4).is_err());
+        let mut wrong = valid(); wrong.partial = PartialDtype::F32;
+        assert!(native_local_layers(&wrong, 4).is_err());
+        let mut wrong = valid(); wrong.fp8 = false;
+        assert!(native_local_layers(&wrong, 4).is_err());
+        assert!(native_local_layers(&valid(), 0).is_err());
+    }
+    #[test]
+    fn draft_geometry_prices_installed_tp2_owners_and_propagates_errors() {
+        struct Rank(Option<usize>);
+        impl RtxExpertLayer for Rank {
+            fn shard(&self) -> crate::shared::experts::rtx::RtxShard { unreachable!() }
+            fn partial(&self) -> PartialDtype { PartialDtype::Bf16 }
+            fn uses_fp8_input(&self) -> bool { true }
+            fn layers(&self) -> &[usize] { &[3] }
+            fn device(&self) -> i32 { 0 }
+            fn workspace_bytes(&self) -> usize { 0 }
+            fn output(&self) -> *mut c_void { std::ptr::null_mut() }
+            fn weight_read_bytes(&self) -> Result<usize> { self.0.context("installed descriptor missing") }
+            unsafe fn enqueue(&mut self, _: usize, _: usize, _: ExpertInput, _: Routes,
+                _: *mut c_void, _: &mut dyn FnMut()) -> Result<()> { unreachable!() }
+        }
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(123)), &Rank(Some(456))]).unwrap(), 456);
+        assert_eq!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(Some(123))]).unwrap(), 456);
+        assert!(tp2_weight_read_bytes([&Rank(None), &Rank(Some(456))]).is_err());
+        assert!(tp2_weight_read_bytes([&Rank(Some(456)), &Rank(None)]).is_err());
+    }
+
     #[test]
     fn kda_only_owner_has_no_compact_index_storage() {
         for index in [IndexCache::Keys, IndexCache::Compact] {
@@ -5478,39 +5636,7 @@ mod tp2_tests {
         Ok(())
     }
 
-    #[test]
-    fn tp2_uses_the_steps_prepared_peer_for_decode_and_every_prefill_lane() {
-        let decode = "rank1-decode";
-        let prefill = ["rank1-prefill-lane0", "rank1-prefill-lane1"];
-        for prepared in std::iter::once(&decode).chain(prefill.iter()) {
-            let pair = tp2_prepared_peer(Some(prepared)).unwrap();
-            let publisher = tp2_prepared_peer(Some(prepared)).unwrap();
-            assert!(std::ptr::eq(pair, prepared));
-            assert!(std::ptr::eq(publisher, prepared));
-        }
-        assert!(tp2_prepared_peer::<usize>(None).is_err());
 
-        // Bind the CPU identity check to the actual callers: no expert helper
-        // may select a different workspace after the step prepared its peer.
-        let source = include_str!("engine.rs").split("\n#[cfg(test)]").next().unwrap();
-        let pair = source.split("    fn tp2_pair(").nth(1).unwrap().split("    fn tp2_publish(").next().unwrap();
-        let publisher = source.split("    fn tp2_publish(").nth(1).unwrap().split("    fn router_on(").next().unwrap();
-        for body in [pair, publisher] {
-            assert!(body.contains("tp2_prepared_peer(prepared_peer)?"));
-            assert!(!body.contains("self.peer_workspaces("));
-        }
-        assert!(source.contains("let peer_workspaces = self.peer_workspaces(tables.decode, None)?;"));
-        assert!(source.contains("let w1 = peer_workspaces.as_ref().map(|p| p.get(0)).transpose()?;"));
-        assert!(source.contains("let w1 = peer_workspaces.as_ref().map(|peers| peers.get(lane)).transpose()?;"));
-        assert!(source.contains("self.moe(w, index, layer, t, rows, cap, tables.decode, &spans, w1)?"));
-        assert!(source.contains("self.tp2_publish(index, 0, t, w1)?"));
-        assert!(source.contains("self.moe_experts(w, index, &layers[index], t, rows, cap, true, w1)?"));
-        assert!(source.contains("&[Span { first: 0, rows: real }], w1)"));
-        assert!(source.contains("self.moe_experts(w, index, layer, t, rows, cap, decode, prepared_peer)"));
-        assert!(source.contains("self.tp2_pair(index, 0, w, prepared_peer, t, rows, cap)"));
-        assert!(source.contains("self.tp2_pair(layer, lane, w, w1, count_of(lane), rows_of(lane), cap)?"));
-        assert!(source.contains("self.tp2_publish(layer, lane, count_of(lane), w1)?"));
-    }
 
     #[test]
     fn route_payload_is_aligned_with_separate_canonical_sections() {
@@ -5525,23 +5651,9 @@ mod tp2_tests {
         }
     }
 
-    #[test]
-    fn mixed_tp2_ffn_schedules_drain_for_every_admitted_lane_count() {
-        for lanes in 1..=2 {
-            assert!(check_tp2_lanes(lanes).is_ok());
-            for local in [0..0, 1..4, 0..5, 4..5] {
-                for broadcast in [false, true] {
-                    assert_eq!(order::check_submission_faults(&order::glmf_tp2_fixture(5, local.clone(), lanes, broadcast, true)), Ok(()));
-                }
-            }
-        }
-    }
 
-    #[test]
-    fn larger_tp2_lane_fronts_fail_closed() {
-        for lanes in [0, 3, 4] { assert!(check_tp2_lanes(lanes).is_err()); }
-        assert!(order::check(&order::glmf_tp2_fixture(5, 1..4, 3, false, true)).is_err());
-    }
+
+
 
     #[test]
     fn local_post_before_independent_lane_attention_deadlocks() {
@@ -5551,30 +5663,17 @@ mod tp2_tests {
 
 #[cfg(test)]
 mod prefill_lane_tests {
-    use super::{prefill_lane_capacity, prefill_lane_plan, KdaState, DEFAULT_PREFILL_LANES, MAX_PREFILL_LANES,
-        MIN_LANE_ROWS, PAGE_ROWS};
+    use super::{KdaState, MAX_PREFILL_WAVES};
 
     #[test]
-    fn terminal_replication_uses_active_lanes_not_cached_workspaces() {
-        let workspaces = ["warmed-lane0", "warmed-lane1"];
-        let peers = ["peer-lane0", "peer-lane1"];
-        for lanes in [vec![17], vec![17, 31]] {
-            let replicated: Vec<_> = workspaces.iter().take(lanes.len()).enumerate()
-                .map(|(lane, w)| (*w, peers[lane], lanes[lane])).collect();
-            assert_eq!(replicated.len(), lanes.len());
-            assert_eq!(replicated[0], ("warmed-lane0", "peer-lane0", 17));
-            if lanes.len() == 2 {
-                assert_eq!(replicated[1], ("warmed-lane1", "peer-lane1", 31));
-            }
-        }
-        // Bind the CPU fixture to the terminal loop that must not visit a
-        // warmed but inactive lane (GPU buffers cannot be built in this test).
-        let source = include_str!("engine.rs").split("\n#[cfg(test)]").next().unwrap();
-        let terminal = source.split("// All lane producers are queued before a terminal wait").nth(1).unwrap()
-            .split("self.finish_route_checks()?").next().unwrap();
-        assert!(terminal.contains("workspaces.iter().take(lanes.len()).enumerate()"));
-        assert!(terminal.contains("self.replicate_terminal(w, peers.get(lane)?, 0, count_of(lane))?"));
+    fn a_decode_top_up_matches_a_placement_built_over_all_its_units() {
+        let mut grown = super::GlmfPlacement::new(vec![5, 1], 2);
+        grown.extend(&[8, 3]);
+        let whole = super::GlmfPlacement::new(vec![5, 1, 8, 3], 2);
+        assert_eq!((&grown.units, &grown.pages, &grown.pool_pages), (&whole.units, &whole.pages, &whole.pool_pages));
     }
+
+
 
     #[test]
     fn kda_state_selects_its_programs_and_element_size() {
@@ -5621,19 +5720,65 @@ mod prefill_lane_tests {
         for (path, expected) in [
             // Shared KDA geometry keeps GLM's low-rank gates, BF16 norm and rounded beta;
             // projection routes and capacity-based thresholds are unchanged.
-            ("integration/cuteafd/glmf.py", 0xb51f_2224_6aff_2bd4_u64),
+            // Fork #136 adds full-head MLA absorb/UV cache hints and preserves W8 prefill mode;
+            // projection dispatch, shapes and arithmetic thresholds remain unchanged.
+            // Fork #146 (FP8 dense decode duel, #703) moves the GEMV tuning table into
+            // `_fp8_weights` (re-exported) and gives each measured shape one column group and the
+            // wide tile its own (column block, tiles per CTA): the per-shape `warps` (the K split
+            // and cross-warp fold, hence the numerics), the head-split KDA tile (8, 2), the
+            // projection routes and the capacity thresholds are unchanged; only the launch grid
+            // partitions, so a shape outside the table keeps master's (warps, 4) bitwise.
+            // Fork #150 reads each GLM Flash projection's shipped warps from
+            // `fp8_gemv_shipped_warps`; a tuning entry moves only the grid, never the warps.
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            // Fork c81a39a2/0b9292f1 add a separate prefill-router exporter; decode projection
+            // dispatch, shapes, arithmetic and capacity thresholds are unchanged.
+            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
-            ("integration/cuteafd/_glm_kernels.py", 0x7f20_e05f_fd23_f141),
-            ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
+            // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
+            // Fork #200 (Mistral Large 4) adds GlmRankNormPackKV q_rank 0 (q statements behind
+            // const_expr, original order kept for q_rank > 0) and GlmIndexPost rope=False (default
+            // True); projection routes and thresholds untouched. SM188/170 vs the master-pinned
+            // baseline: glm, glm2, glmf, glm-stage programs byte-identical including SASS.
+            // Re-audit shared with Mistral commit a14370e52.
+            ("integration/cuteafd/_glm_kernels.py", 0x481c_c910_48bc_d648),
+            // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
+            // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
+            // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
+            // (16-byte read-only loads, L1 evict, ping-pong widen) runs the same MMAs in the same
+            // order with the same FP32 accumulation: bitwise-equal outputs at every row count.
+            // Fork #150 keys the tables by the warps each cell was measured at and applies an
+            // entry only when it matches the caller's warps, restoring callers #146 moved.
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            ("integration/cuteafd/_fp8_weights.py", 0x43a74e768ef10f78_u64),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
             // 34317cc1 adds Int8 without changing BF16/FP8 mappings or projection routes.
-            ("integration/cuteafd/_common.py", 0x7e63_b6fc_ae75_9f0a),
+            // Fork 417f09fc appends an optional runtime SM scalar in the Python launch helper
+            // only for flagged indexer programs; decode projections set no such metadata.
+            // Projection shapes, arithmetic routes and capacity thresholds are unchanged.
+            ("integration/cuteafd/_common.py", 0x47fa_7c5a_585a_eb49),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),
+            // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
+            // (3072,4096): none is a GLM Flash [N,K], and each retile keeps the same K order.
+            // Fork #145 adds COMPENSATED_TILES_BY_ROWS ((6144,4096), (4096,12288), (4096,6144),
+            // (384,4096), (3072,4096), (24752,7168): none is a GLM Flash [N,K]) and an explicit
+            // tile_m entry form. Only pointwise.compile_bf16_projection_aot(compensated=True)
+            // reads that table; the uncompensated decode route never does. RowTiledBf16Projection
+            // gains pass-through prefill overrides, and every existing caller (RoutedBf16Projection's
+            // large tile, including _glm_kernels.glm_projection) passes none, so its default kernel
+            // and entries are built exactly as before: shapes, arithmetic routes and thresholds
+            // are unchanged.
+            // Fork #151 splits only `COMPENSATED_TILES_BY_ROWS[(6144, 4096)]`'s 16-row band at
+            // 8 rows (bitwise-equal retiling; no GLM program reads the compensated table).
+            // The V4.1-only activation subclass leaves the default epilogue as identity;
+            // glmf/glmf2 SM188/170 exports remain byte-identical (88/88 objects and SASS).
+            // Router-only row tiles do not change RoutedBf16Projection or its default kernels.
+            // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
+            ("gemm/bf16_gemv/_skinny.py", 0xf2bb7e72f51a9d1b_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
@@ -5683,10 +5828,10 @@ mod prefill_lane_tests {
         // Whole workspaces kept a serial one beside the lanes (1 + lanes past one lane); shared lanes
         // run a serial prefill in lane 0, so scoring's union is the configured lanes' (with all-row
         // logits in their temporaries: `step_workspaces_reproduce_...`), one allowance per workspace.
-        for lanes in 1..=MAX_PREFILL_LANES {
+        for lanes in 1..=MAX_PREFILL_WAVES {
             for drafter in [false, true] {
                 assert_eq!(super::workspace_reserve_bytes(10_000, lanes, drafter),
-                    10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(drafter)) as u64);
+                    10_000 + super::WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64);
             }
         }
     }
@@ -5795,25 +5940,7 @@ mod prefill_lane_tests {
         }
     }
 
-    #[test]
-    fn startup_defaults_honor_both_explicit_disables() {
-        assert!(super::startup_graph_policy(None, None));
-        assert!(super::startup_graph_policy(Some("1"), Some("1")));
-        assert!(!super::startup_graph_policy(Some("0"), None));
-        assert!(!super::startup_graph_policy(None, Some("0")));
-        assert_eq!(super::prefill_workspace_count(true, None, 2), 2);
-        assert_eq!(super::prefill_workspace_count(true, None, 4), 4);
-        assert_eq!(super::prefill_workspace_count(true, Some("1"), 4), 1);
-        assert_eq!(super::prefill_workspace_count(false, None, 2), 1);
-        assert_eq!(super::prefill_workspace_count(false, Some("subset"), 2), 2);
-        for transports in [None, Some(2), Some(4)] {
-            assert!(super::prefill_pipeline_available(true, true, false, 2, transports));
-        }
-        assert!(!super::prefill_pipeline_available(true, true, false, 2, Some(1)));
-        assert!(!super::prefill_pipeline_available(false, true, false, 2, None));
-        assert!(!super::prefill_pipeline_available(true, false, false, 2, None));
-        assert!(super::prefill_pipeline_available(true, false, true, 2, None));
-    }
+
 
     #[test]
     fn step_workspaces_reproduce_the_frozen_accounting_and_share_the_lanes_temporaries() {
@@ -5849,8 +5976,8 @@ mod prefill_lane_tests {
         let spark = GlmfStepShape { local_experts: false, spark: true, ..shape };
         assert_eq!(glmf_step_workspaces(&cfg, 2, 4096, 64, &spark, decode, prefill).device_bytes(), 2_882_837_760);
         let reserve = super::workspace_reserve_bytes(shared, 2, true);
-        assert_eq!(reserve, shared + 4 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
-        assert!(reserve >= shared + 3 * 71_942_144 + 68_269_888);
+        assert_eq!(reserve, shared + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+        assert!(reserve >= shared + 2 * 71_942_144 + 68_269_888);
         // The programs' scratch keeps its capacity whatever a lane's rows.
         for rows in [1, 64, 512, 4096] {
             let temps = glmf_temporary_bytes(&cfg, rows, false, &shape, prefill);
@@ -5870,10 +5997,10 @@ mod prefill_lane_tests {
             < glmf_lane_bytes(&cfg, 4096, false, &shape).device_bytes());
         // Scoring's exact union (`--full-prefill-logits`): the same lanes, a serial prefill in lane 0,
         // the all-row logits once in their shared temporaries. Whole workspaces held them three
-        // times (a serial workspace and two lanes) at four runtime allowances.
+        // times (a serial workspace and two lanes). Runtime now owns decode and one arena.
         let scoring = glmf_step_workspaces(&cfg, 2, 4096, 64, &full, decode, prefill).device_bytes();
         assert_eq!(scoring - shared, (4096 - 64) * 154_880 * 4);
-        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 3 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+        assert_eq!(super::workspace_reserve_bytes(scoring, 2, false), scoring + 2 * super::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
     }
 
     #[test]
@@ -6024,7 +6151,7 @@ mod prefill_lane_tests {
 
     #[test]
     fn output_shard_norm_slots_isolate_every_lane_and_layer_parity() {
-        for lanes in 1..=MAX_PREFILL_LANES {
+        for lanes in 1..=MAX_PREFILL_WAVES {
             let mut heads = std::collections::BTreeSet::new();
             let mut existing = std::collections::BTreeSet::new();
             for lane in 0..lanes {
@@ -6042,52 +6169,11 @@ mod prefill_lane_tests {
         }
     }
 
-    #[test]
-    fn every_advertised_prefill_tail_fits_its_lane_workspaces() {
-        for lanes in 1..=MAX_PREFILL_LANES {
-            for rows in [1, 63, 64, 65, 96, 127, 128, 255, 256, 511, 512, 1024, 1536, 2047, 2048, 4096] {
-                let capacity = prefill_lane_capacity(lanes, rows);
-                for tokens in 1..=capacity {
-                    let (used, per_lane) = prefill_lane_plan(tokens, lanes, rows).unwrap();
-                    assert!(used <= lanes && per_lane <= rows, "lanes={lanes}, rows={rows}, tokens={tokens}");
-                    let starts: Vec<_> = (0..tokens).step_by(per_lane).collect();
-                    assert_eq!(starts.len(), used);
-                    assert_eq!(starts.iter().map(|&s| per_lane.min(tokens - s)).sum::<usize>(), tokens);
-                    assert!(starts.iter().all(|&s| per_lane.min(tokens - s) <= rows));
-                    assert!(starts.iter().skip(1).all(|s| s % PAGE_ROWS == 0));
-                }
-                assert!(prefill_lane_plan(capacity + 1, lanes, rows).is_err());
-            }
-        }
-    }
 
-    #[test]
-    fn two_lanes_keep_their_cuts_for_every_chunk() {
-        // The rule before the lane count was a setting: identical cuts give identical bits.
-        let before = |tokens: usize, rows: usize| {
-            let lanes = if tokens <= rows && tokens < 2 * MIN_LANE_ROWS { 1 } else { 2 };
-            if lanes == 1 { tokens } else { tokens.div_ceil(lanes).next_multiple_of(PAGE_ROWS) }
-        };
-        for rows in [64, 128, 256, 2048, 4096] {
-            for tokens in 1..=prefill_lane_capacity(2, rows) {
-                assert_eq!(prefill_lane_plan(tokens, 2, rows).unwrap().1, before(tokens, rows), "{tokens} of {rows}");
-            }
-        }
-    }
 
-    #[test]
-    fn four_lanes_of_2048_hold_a_chunk_of_8192() {
-        assert_eq!(prefill_lane_capacity(4, 2048), 8192);
-        assert_eq!(prefill_lane_plan(8192, 4, 2048).unwrap(), (4, 2048));
-        assert_eq!(prefill_lane_plan(4096, 4, 2048).unwrap(), (4, 1024));
-        // One lane per 256 rows, cut on 64-row pages.
-        assert_eq!(prefill_lane_plan(1000, 4, 2048).unwrap(), (3, 384));
-        assert_eq!(prefill_lane_plan(511, 4, 2048).unwrap(), (1, 511));
-        // One lane: the chunk is the lane.
-        assert_eq!(prefill_lane_capacity(1, 4096), 4096);
-        assert_eq!(prefill_lane_plan(4096, 1, 4096).unwrap(), (1, 4096));
-        assert!(prefill_lane_plan(4097, 1, 4096).is_err());
-    }
+
+
+
 
     #[test]
     fn the_workspace_arithmetic_uses_the_engine_geometry() {
@@ -6099,29 +6185,9 @@ mod prefill_lane_tests {
         assert_eq!(GLMF_HEAD_WORKSPACE, cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64);
     }
 
-    #[test]
-    fn single_pass_rows_are_the_chunks_the_lane_plan_leaves_in_one_lane() {
-        for (lanes, rows) in [(2, 4096), (4, 2048), (3, 1024), (2, 256), (1, 4096)] {
-            let single = super::single_pass_rows(true, lanes, rows);
-            for tokens in 1..=prefill_lane_capacity(lanes, rows) {
-                let (cut, _) = prefill_lane_plan(tokens, lanes, rows).unwrap();
-                assert_eq!(cut == 1, tokens <= single, "{lanes} lanes of {rows}: {tokens} tokens in {cut} lanes");
-            }
-        }
-        assert_eq!(super::single_pass_rows(false, 2, 4096), 4096);
-    }
 
-    #[test]
-    fn narrow_workspace_splits_the_short_tool_prompt() {
-        assert_eq!(prefill_lane_plan(214, 2, 128).unwrap(), (2, 128));
-        assert_eq!(prefill_lane_plan(1, 2, 1).unwrap(), (1, 1));
-        assert!(prefill_lane_plan(0, 2, 128).is_err());
-        assert!(prefill_lane_plan(1, 2, 0).is_err());
-        // Keep the qualified default's lane threshold and advertised width.
-        assert_eq!(prefill_lane_capacity(DEFAULT_PREFILL_LANES, 4096), 8192);
-        assert_eq!(prefill_lane_plan(511, 2, 4096).unwrap(), (1, 511));
-        assert_eq!(prefill_lane_plan(512, 2, 4096).unwrap(), (2, 256));
-    }
+
+
 }
 
 #[cfg(test)]
@@ -6522,8 +6588,8 @@ mod replay_record_tests {
 
 #[cfg(test)]
 mod spark_warmup_tests {
-    use super::{prefill_lane_capacity, prefill_lane_plan, prefill_workspace_count, spark_request, spark_warmup_request,
-        DECODE_ROWS, MAX_PREFILL_LANES};
+    use super::{spark_request, spark_warmup_request,
+        DECODE_ROWS, MAX_PREFILL_WAVES};
     use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
     use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,
@@ -6615,29 +6681,7 @@ mod spark_warmup_tests {
         }
     }
 
-    /// Start-up warms each transport a prefill runs on (`configured_prefill_lanes`, which agrees with
-    /// `GlmfEngine::pipelined`): every lane's while lanes run (1 to 4), else transport 0, which also
-    /// carries decode, verify and serial chunks. No chunk the engine takes uses another transport or
-    /// puts more rows on one than the warm-up sent.
-    #[test]
-    fn the_warmup_covers_every_transport_a_prefill_uses() {
-        let rows = 4096;
-        for lanes in 1..=MAX_PREFILL_LANES {
-            for (setting, complete) in [(None, true), (Some("1"), true), (None, false), (Some("subset"), false),
-                (Some("subset"), true)] {
-                let warmed = prefill_workspace_count(complete, setting, lanes);
-                // `lane_setting`: lanes run unless set to 1, over every layer or a subset with `subset`.
-                let pipelined = setting != Some("1") && (complete || setting == Some("subset"));
-                assert_eq!(warmed, if pipelined { lanes } else { 1 }, "{lanes} lanes, {setting:?}, {complete}");
-                let capacity = if pipelined { prefill_lane_capacity(lanes, rows) } else { rows };
-                for tokens in (1..=capacity).step_by(61).chain([capacity]) {
-                    let (used, per_lane) = if pipelined { prefill_lane_plan(tokens, lanes, rows).unwrap() }
-                        else { (1, tokens) };
-                    assert!(used <= warmed && per_lane <= rows, "{tokens} tokens, {lanes} lanes, {setting:?}");
-                }
-            }
-        }
-    }
+
 }
 
 #[cfg(test)]
@@ -6753,5 +6797,25 @@ mod packed_step_tests {
         let tables = StepTables { kv_slots: vec![0; 141], segments, ..Default::default() };
         assert_eq!(tables.spans(), [Span { first: 0, rows: 40 }, Span { first: 40, rows: 100 },
             Span { first: 140, rows: 1 }]);
+    }
+}
+
+#[cfg(test)]
+mod decode_extent_tests {
+    use super::*;
+
+    #[test]
+    fn declared_decode_extent_matches_mhc_and_route_transfers() {
+        for rows in [64, 128] {
+            for hidden in [4096, 6144] {
+                let residual = rows * HC * hidden * 2;
+                let partial_f32 = rows * hidden * 4;
+                let projection = rows * hidden * 2;
+                assert_eq!(decode_peer_bytes(rows, hidden),
+                    [residual, partial_f32, projection].into_iter().max().unwrap());
+                let routes = PackedRoutes::new(rows, 8);
+                assert_eq!(routes.bytes, (routes.weights + routes.section).next_multiple_of(16));
+            }
+        }
     }
 }

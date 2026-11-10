@@ -42,8 +42,12 @@ struct Current {
     /// "everything chained so far" ([`fence_mark`]), and which device marked each.
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    /// Advances whenever the head changes; a [`HeadMark`] names one value.
+    generation: Rc<Cell<u64>>,
     /// This pass may run device-ordered ([`deferred`]).
     device: bool,
+    /// This device-ordered pass is paced ([`paced`]).
+    paced: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -66,13 +70,20 @@ pub(crate) struct StageChain<'a> {
     fork: Rc<Cell<Option<usize>>>,
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    generation: Rc<Cell<u64>>,
     device: Cell<bool>,
+    paced: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
-    /// Whether the next scoped pass may run device-ordered (with
-    /// [`device_enabled`]); default on.
+    pub fn library(&self) -> &'a NativeLibrary { self.library }
+    /// Whether the next scoped pass runs device-ordered; default on.
     pub fn set_device_order(&self, on: bool) {
         self.device.set(on);
+    }
+    /// Whether the next scoped device-ordered pass is paced ([`paced`]);
+    /// default off.
+    pub fn set_pacing(&self, on: bool) {
+        self.paced.set(on);
     }
     /// A chain for the current device only.
     pub fn new(library: &'a NativeLibrary) -> Result<Self> {
@@ -90,10 +101,8 @@ impl<'a> StageChain<'a> {
                 library.cuda_set_device(device)?;
                 events.push((device, library.cuda_event_create_ordering()?));
                 forks.push((device, library.cuda_event_create_ordering()?));
-                if device_enabled() {
-                    fences.push(Fence { device, stream: library.cuda_stream_create()?,
-                        events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
-                }
+                fences.push(Fence { device, stream: library.cuda_stream_create()?,
+                    events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
             }
             Ok(())
         })();
@@ -106,14 +115,16 @@ impl<'a> StageChain<'a> {
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
             forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
-            marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
+            marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true),
+            paced: Cell::new(false) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle<'a> {
         ChainHandle { library: self.library, current: Current {
             events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone(), device: self.device.get() } }
+            marked: self.marked.clone(), generation: self.generation.clone(), device: self.device.get(),
+            paced: self.paced.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -121,6 +132,7 @@ impl<'a> StageChain<'a> {
         self.fork.set(None);
         self.marked.set([None; 2]);
         if let Some(head) = self.head.replace(None) {
+            self.generation.set(self.generation.get().wrapping_add(1));
             unsafe { self.library.cuda_event_synchronize(self.events[head].1)?; }
         }
         Ok(())
@@ -148,6 +160,33 @@ impl<'a> StageChain<'a> {
         })();
         self.library.cuda_set_device(previous)?;
         result?;
+        self.drain()
+    }
+    /// [`Self::drain_bounded`] for a paced pass: between polls it yields to
+    /// the executor (after the shared host-wait pacing) instead of sleeping
+    /// on the thread, so the other busy lane keeps issuing meanwhile.
+    pub async fn drain_cooperative(&self, limit: std::time::Duration) -> Result<()> {
+        let Some(head) = self.head.get() else { return self.drain() };
+        let (device, event) = self.events[head];
+        let Some(fence) = self.fences.iter().find(|f| f.device == device).copied() else { return self.drain() };
+        let on_device = |work: &dyn Fn() -> Result<bool>| -> Result<bool> {
+            let previous = self.library.cuda_get_device()?;
+            self.library.cuda_set_device(device)?;
+            let result = work();
+            self.library.cuda_set_device(previous)?;
+            result
+        };
+        // SAFETY: the fence stream and head event belong to this chain's device.
+        on_device(&|| unsafe { self.library.cuda_stream_wait_event(fence.stream, event).map(|()| true) })?;
+        let started = std::time::Instant::now();
+        let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+        // SAFETY: as above.
+        while !on_device(&|| unsafe { self.library.cuda_stream_query(fence.stream) })? {
+            anyhow::ensure!(started.elapsed() < limit,
+                "device-ordered pass did not complete within {limit:?} (a device wait never released)");
+            backoff.pause();
+            tokio::task::yield_now().await;
+        }
         self.drain()
     }
 }
@@ -235,6 +274,8 @@ pub(crate) struct ChainHandle<'a> {
     current: Current,
 }
 impl<'a> ChainHandle<'a> {
+    /// Whether the scope this handle installs is device-ordered and paced.
+    pub fn paced(&self) -> bool { self.current.device && self.current.paced }
     /// Poll `future` with this chain installed as the current scope. Cancellation
     /// drains its recorded work before the future releases borrowed storage.
     pub fn scope<F: Future>(self, future: F) -> ChainScope<'a, F> {
@@ -249,60 +290,11 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CUTEAFD_STAGE_CHAIN").map_or(true, |v| v != "0"))
 }
 
-/// Whether chained V4.1 passes also drop the host waits that only kept
-/// copy-engine transfers from queuing behind unresolved events
-/// (`CUTEAFD_V41_DEVICE=1`, PLAN.md device-driven exchange, stage D3): peer
-/// transfers become SM copies ordered by device events and the host enqueues
-/// the next stage at once. Off by default; the default path is unchanged.
-pub(crate) fn device_enabled() -> bool {
-    device_setting() > 0
-}
-
-/// Whether V4.1 remote verification waves also use the device-driven Spark
-/// exchange (`CUTEAFD_V41_DEVICE=1`; `chain` keeps them on the host path).
-pub(crate) fn device_exchange_enabled() -> bool {
-    device_setting() > 1
-}
-
-/// `CUTEAFD_V41_DEVICE_LANES=1`: device-ordered passes also while both lanes
-/// are busy (off: a lane runs device-ordered only while the other is idle).
-pub(crate) fn device_with_lanes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
-}
-
-/// `CUTEAFD_V41_STAGING_FENCE=0`: device-ordered passes do not wait for the
-/// previous layer's staged uploads before preparing the next layer (stages
-/// whose pinned staging differs by layer keep one region per layer,
-/// `LayerStaging`), so the host can queue the pass ahead of the GPU.
-pub(crate) fn staging_fence() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("CUTEAFD_V41_STAGING_FENCE").as_deref(), Ok("0" | "off")))
-}
-
-fn device_setting() -> u8 {
-    static SETTING: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *SETTING.get_or_init(|| {
-        let setting = match std::env::var("CUTEAFD_V41_DEVICE").as_deref() {
-            Ok("1" | "on" | "true") => 2,
-            Ok("chain") => 1,
-            _ => 0,
-        };
-        if setting > 0 {
-            tracing::info!(exchange = setting > 1, "V4.1 device-ordered passes: chained stages enqueue without host waits");
-        }
-        setting
-    })
-}
-
 /// Device-ordered passes run under this watchdog: a pass still pending after
 /// `CUTEAFD_V41_DEVICE_WATCHDOG_S` (default 60) seconds is a device wait that
-/// never released (draining it would block forever), so the process logs every
-/// device lane's sequences and exits instead of holding the GPUs.
+/// never released (draining it would block forever), so the process logs it
+/// and exits instead of holding the GPUs.
 pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
-    if !device_enabled() {
-        return future.await;
-    }
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| std::env::var("CUTEAFD_V41_DEVICE_WATCHDOG_S").ok()
         .and_then(|v| v.parse().ok()).unwrap_or(60));
@@ -310,17 +302,28 @@ pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
     tokio::select! {
         output = &mut future => output,
         () = tokio::time::sleep(std::time::Duration::from_secs(limit)) => {
-            tracing::error!(limit_s = limit, lanes = %cuteafd_transport::expert::device_stuck_report(),
-                "device-ordered pass stuck: exiting (a device wait never released)");
+            tracing::error!(limit_s = limit, "device-ordered pass stuck: exiting (a device wait never released)");
             std::process::exit(70);
         }
     }
 }
 
-/// Inside a chain scope with [`device_enabled`]: stages that used to wait on
-/// the host for a producer stream join the chain instead.
+/// Inside a device-ordered chain scope: stages that used to wait on the host
+/// for a producer stream join the chain instead. Scopes are device-ordered
+/// unless the pass owner turned it off ([`StageChain::set_device_order`]:
+/// both V4.1 lanes busy).
 pub(crate) fn deferred() -> bool {
-    device_enabled() && CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
+}
+
+/// Inside a device-ordered scope the pass owner paced
+/// ([`StageChain::set_pacing`]: `CUTEAFD_V41_BUSY_LANES=paced` with both
+/// V4.1 lanes busy): a stage that would queue a wait on a Spark reply first
+/// waits, yielding, until the reply landed, as a host-ordered pass does, so
+/// no stream holds a wait through the round trip and the lanes interleave
+/// layer by layer.
+pub(crate) fn paced() -> bool {
+    CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device && c.paced))
 }
 
 pub(crate) struct ChainScope<'a, F> {
@@ -357,6 +360,7 @@ impl<F> Drop for ChainScope<'_, F> {
         if !self.drain_on_drop { return; }
         self.current.fork.set(None);
         if let Some(head) = self.current.head.replace(None) {
+            self.current.generation.set(self.current.generation.get().wrapping_add(1));
             // SAFETY: the pass retains the chain's events and library. All
             // recorded producers are already submitted (the Spark proxy runs
             // independently), so draining needs no progress from this future.
@@ -390,6 +394,53 @@ pub(crate) unsafe fn join(library: &NativeLibrary, stream: *mut c_void) -> Resul
     let Some(head) = current.head.get() else { return Ok(()) };
     // Cross-device event waits are permitted; the event lives on its own device.
     unsafe { library.cuda_stream_wait_event(stream, current.events[head].1) }
+}
+
+/// The chain head a pushing stage joined ([`join_for_push`]): its receiver on
+/// the other GPU follows exactly this head through the push's device flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeadMark {
+    generation: u64,
+}
+
+/// [`join`] for a stage that pushes to the other GPU: `stream` (on the
+/// pushing GPU) follows the head before its push, and the returned mark names
+/// that head for the receiver's [`finish_after_flag`]. `None` outside a scope.
+/// # Safety
+/// As [`join`].
+pub(crate) unsafe fn join_for_push(library: &NativeLibrary, stream: *mut c_void) -> Result<Option<HeadMark>> {
+    let Some(current) = current() else { return Ok(None) };
+    unsafe { join(library, stream)? };
+    Ok(Some(HeadMark { generation: current.generation.get() }))
+}
+
+/// Whether a receiver may adopt the head without merging it: the head is
+/// still the one its sender joined (no stage finished in between).
+fn adoptable(generation: u64, mark: Option<HeadMark>) -> Result<()> {
+    let mark = mark.ok_or_else(|| anyhow::anyhow!("flag-ordered receiver has no chain mark"))?;
+    anyhow::ensure!(mark.generation == generation,
+        "chain head moved between a push's join and its receiver ({} -> {generation})", mark.generation);
+    Ok(())
+}
+
+/// [`finish`] for the receiver of a push: `stream` (on this GPU) waited on the
+/// flag of a push whose stream joined the head named by `mark`, so it already
+/// follows that head. Records the head on `stream` without merging the
+/// previous head, which would be a cross-device event wait the flag makes
+/// redundant; the chain stays a total order. Refuses if any stage finished
+/// since the mark. Outside a scope, drains `stream` like [`finish`].
+/// # Safety
+/// `stream` holds this stage's queued work, behind its wait on that flag.
+pub(crate) unsafe fn finish_after_flag(library: &NativeLibrary, stream: *mut c_void, mark: Option<HeadMark>) -> Result<()> {
+    let Some(current) = current() else { return unsafe { library.cuda_stream_synchronize(stream) } };
+    adoptable(current.generation.get(), mark)?;
+    let device = library.cuda_get_device()?;
+    let index = current.events.iter().position(|&(d, _)| d == device)
+        .ok_or_else(|| anyhow::anyhow!("chain has no event on device {device}"))?;
+    unsafe { library.cuda_event_record(current.events[index].1, stream)?; }
+    current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
+    Ok(())
 }
 
 /// Mark a fork on `stream`: work queued so far on it (for example the query
@@ -437,6 +488,7 @@ pub(crate) unsafe fn finish(library: &NativeLibrary, stream: *mut c_void) -> Res
     }
     unsafe { library.cuda_event_record(current.events[index].1, stream)?; }
     current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
     Ok(())
 }
 
@@ -450,6 +502,80 @@ pub(crate) async unsafe fn finish_cooperative(stream: &LoadStream<'_>) -> Result
     } else {
         stream.wait().await
     }
+}
+
+/// The device whose event is the chain head (None outside a scope or before
+/// any stage finished).
+pub(crate) fn head_device() -> Option<i32> {
+    let current = current()?;
+    current.head.get().map(|head| current.events[head].0)
+}
+
+/// Records the current chain head into `event` (no host wait): another
+/// chain's stages ordered after it with [`depend`] follow everything chained
+/// here so far. No-op outside a scope or before any stage finished.
+/// # Safety
+/// `event` is a live event on the chain's head device.
+pub(crate) unsafe fn record_into(library: &NativeLibrary, event: *mut c_void) -> Result<bool> {
+    let Some(current) = current() else { return Ok(false) };
+    let Some(head) = current.head.get() else { return Ok(false) };
+    let device = current.events[head].0;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    let previous = library.cuda_get_device()?;
+    library.cuda_set_device(device)?;
+    // SAFETY: the fence stream and head event belong to this chain's device;
+    // `event` lives on the same device (caller contract).
+    let recorded = unsafe { library.cuda_stream_wait_event(fence.stream, current.events[head].1)
+        .and_then(|()| library.cuda_event_record(event, fence.stream)) };
+    library.cuda_set_device(previous)?;
+    recorded.map(|()| true)
+}
+
+/// Orders the current chain after `event` (recorded by another chain with
+/// [`record_into`]): every later stage of this scope joins a head that
+/// includes it. No host wait.
+/// # Safety
+/// `event` is a live event recorded on the chain's current device.
+#[cfg(test)]
+thread_local! {
+    /// Test-only negative control: `depend` leaves an open fork untouched (the
+    /// pre-fix behaviour, hunt C #1).
+    static SKIP_FORK_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+pub(crate) unsafe fn depend(library: &NativeLibrary, event: *mut c_void) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let device = library.cuda_get_device()?;
+    let index = current.events.iter().position(|&(d, _)| d == device)
+        .ok_or_else(|| anyhow::anyhow!("chain has no event on device {device}"))?;
+    let fence = current.fences.iter().find(|f| f.device == device).copied()
+        .ok_or_else(|| anyhow::anyhow!("chain has no fence stream on device {device}"))?;
+    // SAFETY: the fence stream and events belong to this chain's device.
+    unsafe {
+        if let Some(head) = current.head.get() {
+            library.cuda_stream_wait_event(fence.stream, current.events[head].1)?;
+        }
+        library.cuda_stream_wait_event(fence.stream, event)?;
+        library.cuda_event_record(current.events[index].1, fence.stream)?;
+        // An open fork window must include the dependency too: fork joiners
+        // (`join_fork`) wait on the fork event, not the head, so without this
+        // they would overtake `event` (hunt C #1). The fork event becomes
+        // "old fork point + event", recorded on this device's fork slot.
+        #[cfg(test)]
+        let skip = SKIP_FORK_FOLD.with(|skip| skip.get());
+        #[cfg(not(test))]
+        let skip = false;
+        if let Some(fork) = current.fork.get().filter(|_| !skip) {
+            let slot = current.forks.iter().position(|&(d, _)| d == device)
+                .ok_or_else(|| anyhow::anyhow!("chain has no fork event on device {device}"))?;
+            library.cuda_stream_wait_event(fence.stream, current.forks[fork].1)?;
+            library.cuda_event_record(current.forks[slot].1, fence.stream)?;
+            current.fork.set(Some(slot));
+        }
+    }
+    current.head.set(Some(index));
+    current.generation.set(current.generation.get().wrapping_add(1));
+    Ok(())
 }
 
 /// Host wait for all chained work before a host-synchronous operation (legacy
@@ -470,6 +596,17 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::task::Waker;
     use std::time::Duration;
+
+    /// A receiver adopts the head only when it is still the one its push's
+    /// stream joined; any finish since (or no mark at all) refuses.
+    #[test]
+    fn adopting_the_head_requires_an_unmoved_mark() {
+        let mark = HeadMark { generation: 7 };
+        assert!(adoptable(7, Some(mark)).is_ok());
+        let moved = adoptable(8, Some(mark)).unwrap_err().to_string();
+        assert!(moved.contains("moved") && moved.contains("7 -> 8"), "{moved}");
+        assert!(adoptable(7, None).unwrap_err().to_string().contains("no chain mark"));
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
@@ -494,7 +631,8 @@ mod tests {
                     vec![Fence { device: 0, stream: std::ptr::null_mut(),
                         events: [std::ptr::null_mut(); 2] }; 2]
                 } else { vec![] }.into(),
-                marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true),
+                marked: Rc::new(Cell::new([None; 2])), generation: Rc::new(Cell::new(0)), device: Cell::new(true),
+                paced: Cell::new(false),
             };
             if path == "cancel" {
                 let mut scope = Box::pin(chain.handle().scope(async move {
@@ -704,4 +842,69 @@ mod tests {
             Ok(())
         })
     }
+
+    /// Hunt C #1: two slots' chains, unit B's chain depends on unit A's
+    /// recorded publication while B's fork window is open. A `join_fork`
+    /// stage of B must wait for A (gated here). The negative control skips the
+    /// fold, and that stage then completes while A is still held.
+    fn fork_join_follows_a_cross_slot_dependency(fold: bool) -> Result<()> {
+        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        library.cuda_set_device(0)?;
+        let device = Device { library: &library, id: 0 };
+        let [a, b_main, b_fork] = [Stream::new(device)?, Stream::new(device)?, Stream::new(device)?];
+        let published = library.cuda_event_create_ordering()?;
+        // Recorded right after the fork joiner's wait: the stage's own
+        // ordering, before its `finish` merges the head (which includes A).
+        let joined = library.cuda_event_create_ordering()?;
+        let chains = [StageChain::new(&library)?, StageChain::new(&library)?];
+        for chain in &chains { chain.set_device_order(true); }
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        // Warm every call ungated (lazy module loading) before gating A.
+        runtime.block_on(chains[0].handle().scope(async { unsafe {
+            super::finish(&library, a.raw)?; super::record_into(&library, published).map(|_| ())
+        } }))?;
+        unsafe { library.cuda_stream_synchronize(a.raw)?; }
+        library.cuda_device_synchronize()?;
+        let gate = unsafe { CudaStreamGate::new(&library, a.raw)? };
+        // Unit A (slot 0): a stage held by the gate, then its publication.
+        runtime.block_on(chains[0].handle().scope(async { unsafe {
+            super::join(&library, a.raw)?;
+            super::finish(&library, a.raw)?;
+            super::record_into(&library, published).map(|_| ())
+        } }))?;
+        // Unit B (slot 1): marks a fork, depends on A's publication, then a
+        // fork joiner stage.
+        SKIP_FORK_FOLD.with(|skip| skip.set(!fold));
+        let queued = runtime.block_on(chains[1].handle().scope(async { unsafe {
+            super::join(&library, b_main.raw)?;
+            super::mark_fork(&library, b_main.raw)?;
+            super::finish(&library, b_main.raw)?;
+            super::depend(&library, published)?;
+            super::join_fork(&library, b_fork.raw)?;
+            library.cuda_event_record(joined, b_fork.raw)?;
+            super::finish(&library, b_fork.raw)
+        } }));
+        SKIP_FORK_FOLD.with(|skip| skip.set(false));
+        queued?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(if fold { 2 } else { 10 });
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            if unsafe { library.cuda_event_query(joined)? } { done = true; break; }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(gate);
+        for chain in &chains { chain.drain()?; }
+        unsafe { library.cuda_event_destroy(published)?; library.cuda_event_destroy(joined)?; }
+        assert_eq!(done, !fold, "the fork joiner {} while unit A's publication was held",
+            if done { "completed" } else { "stayed pending" });
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and a GPU"]
+    fn fork_joiners_wait_for_a_cross_slot_dependency() -> Result<()> { fork_join_follows_a_cross_slot_dependency(true) }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and a GPU"]
+    fn unfolded_fork_joiners_overtake_a_cross_slot_dependency() -> Result<()> { fork_join_follows_a_cross_slot_dependency(false) }
 }

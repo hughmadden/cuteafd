@@ -10,6 +10,12 @@ cuteafd_build_cache_defaults
 native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
 [[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
+remote_min_free_gib="${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB-60}"
+[[ "$remote_min_free_gib" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB must be a positive integer"
+# Keep the GiB-to-KiB comparison inside Bash's signed integer range.
+((${#remote_min_free_gib} <= 9)) ||
+  release_die "CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB is too large"
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
 
@@ -77,7 +83,7 @@ BUILD_ROOT/container-home when a build root is set and /tmp/cuteafd-home inside
 the container otherwise.
 
 Release exports derive from CUTEAFD_RELEASE_MATRIX (default:
-scripts/bench/release-smoke-v3.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
+scripts/bench/release-smoke-v4.json). --scope / CUTEAFD_RELEASE_SCOPE selects all
 (default), comma-separated family or entry names, or explicit (raw knobs only).
 Raw CUTEAFD_RELEASE_* export knobs add to selected cards; OFF/empty cannot remove
 required exports. Narrow or explicit builds are for development, not release tags.
@@ -140,7 +146,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 release_scope="${CUTEAFD_RELEASE_SCOPE:-all}"
-release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v3.json}"
+release_matrix="${CUTEAFD_RELEASE_MATRIX:-$repo_root/scripts/bench/release-smoke-v4.json}"
 release_matrix_sha256="$(sha256sum "$release_matrix" | awk '{print $1}')"
 release_scope_exports="$(python3 "$repo_root/scripts/build/release-scope.py" derive \
   --matrix "$release_matrix" --scope "$release_scope" --shell)"
@@ -736,12 +742,16 @@ fi
 
 local_free_kib="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
 ((local_free_kib >= 60 * 1024 * 1024)) || release_die "local build needs at least 60 GiB free"
+# Measure the filesystem that really holds the Spark staging directory (it may
+# resolve off a small $HOME, e.g. a symlink onto the Spark /scratch).
 remote_free_kib="$(
-  release_ssh "$seed_host" bash -s <<'REMOTE'
-df -Pk "$HOME" | awk 'NR == 2 { print $4 }'
+  release_ssh "$seed_host" bash -s -- "$remote_dir" <<'REMOTE'
+p="$(readlink -m "$1")"
+while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+df -Pk "$(readlink -f "$p")" | awk 'NR == 2 { print $4 }'
 REMOTE
 )"
-((remote_free_kib >= 60 * 1024 * 1024)) || release_die "$seed_host build needs at least 60 GiB free"
+((remote_free_kib >= $remote_min_free_gib * 1024 * 1024)) || release_die "$seed_host build needs at least $remote_min_free_gib GiB free"
 
 # A relocated build root is its own filesystem decision: the two checks above
 # cover the source tree and the Spark home, not the scratch the container writes.
@@ -760,8 +770,8 @@ if [[ -n "$release_build_root" ]]; then
     release_ssh "$seed_host" \
       "mkdir -p $release_build_root_quoted && df -Pk $release_build_root_quoted | awk 'NR == 2 { print \$4 }'"
   )"
-  ((remote_root_free_kib >= 60 * 1024 * 1024)) ||
-    release_die "$seed_host release build root $release_build_root needs at least 60 GiB free"
+  ((remote_root_free_kib >= $remote_min_free_gib * 1024 * 1024)) ||
+    release_die "$seed_host release build root $release_build_root needs at least $remote_min_free_gib GiB free"
 fi
 
 # Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
@@ -832,6 +842,7 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
   "${release_build_user_args[@]}" \
   "${compiler_cache_args[@]}" \
+  -e "CUTEAFD_RELEASE_COORDINATOR_FEATURES=${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
@@ -847,7 +858,11 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "CUTEAFD_RELEASE_QWEN4_AOT=${CUTEAFD_RELEASE_QWEN4_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_QWEN_DENSE_AOT=${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_STEP5_AOT=${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_KIMIK3_AOT=${CUTEAFD_RELEASE_KIMIK3_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_MUSE_AOT=${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_ML4_AOT=${CUTEAFD_RELEASE_ML4_AOT:-OFF}" \
   -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_EXLR8_FAMILIES=${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$release_source_dir:/source:ro" \
   -v "$artifact_dir:/output" \
@@ -1120,6 +1135,7 @@ docker run --rm --name "$export_container" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
   -e "CUTEAFD_RELEASE_AUDIO_AOT=$audio_aot" \
   -e "CUTEAFD_RELEASE_EXLR8_AOT=${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
+  -e "CUTEAFD_RELEASE_EXLR8_FAMILIES=${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   ${native_build_env_args[@]+"${native_build_env_args[@]}"} \
   ${release_build_root_args[@]+"${release_build_root_args[@]}"} \
   -v "$remote_dir:/source:ro" \
@@ -1334,7 +1350,10 @@ for role in coordinator spark-expert; do
     --notices "$repo_root/dist/$role/THIRD_PARTY_NOTICES.md" \
     --verify "$repo_root/dist/$role/SPARKINFER_PROVENANCE.json"
   (
-    python3 "$repo_root/python/tools/aot/package_exl3_aot.py" verify --package "$repo_root/dist/$role/exl3" --sparkinfer-revision "$sparkinfer_commit"
+    # A scope with no EXL3 family ships an empty exl3/ (see build-release-artifacts.sh).
+    if compgen -G "$repo_root/dist/$role/exl3/*" >/dev/null; then
+      python3 "$repo_root/python/tools/aot/package_exl3_aot.py" verify --package "$repo_root/dist/$role/exl3" --sparkinfer-revision "$sparkinfer_commit"
+    fi
     cd "$repo_root/dist/$role"
     sha256sum -c SPARKINFER_SHA256SUMS
     sha256sum -c XGRAMMAR_SHA256SUMS
@@ -1389,13 +1408,18 @@ for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
   release_ssh "$host" "docker image rm --force '$SPARK_EXPERT_DOCKER_INFERENCE' >/dev/null 2>&1 || true"
 done
 rdmapipe_ready=1
+# A single build host has nobody to copy to; do not require rdmapipe then.
+((${#RELEASE_BUILD_HOSTS[@]} > 1)) || rdmapipe_ready=2
 for host in "${RELEASE_BUILD_HOSTS[@]}"; do
+  ((rdmapipe_ready != 2)) || break
   if ! release_ssh "$host" "command -v rdmapipe >/dev/null 2>&1"; then
     rdmapipe_ready=0
     break
   fi
 done
-if ((rdmapipe_ready)); then
+if ((rdmapipe_ready == 2)); then
+  echo "== single Spark build host: nothing to distribute =="
+elif ((rdmapipe_ready)); then
   echo "== concurrently distributing Spark image over RDMA =="
   image_copy_pids=()
   image_copy_hosts=()
@@ -1422,7 +1446,19 @@ if ((rdmapipe_ready)); then
   done
   ((image_copy_failed == 0)) || release_die "concurrent RDMA Spark image distribution failed"
 else
-  release_die "rdmapipe is required on every Spark build host to distribute the Spark image"
+  # Without rdmapipe on every build host, stream the same `docker image save |
+  # load` over ssh through this host. Slower, same bytes, same identity gates below.
+  echo "== rdmapipe missing on a build host: distributing Spark image over ssh (docker save | load) =="
+  printf -v spark_image_quoted '%q' "$SPARK_EXPERT_DOCKER_INFERENCE"
+  for host in "${RELEASE_BUILD_HOSTS[@]:1}"; do
+    echo "== ssh image copy $seed_host -> $host =="
+    (
+      set -o pipefail
+      release_ssh "$seed_host" "set -o pipefail; docker image save $spark_image_quoted" |
+        release_ssh "$host" "set -o pipefail; docker image load"
+    ) || release_die "ssh Spark image distribution to $host failed"
+    echo "== ssh image copy $seed_host -> $host complete =="
+  done
 fi
 
 coordinator_revision="$(

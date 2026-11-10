@@ -2,11 +2,14 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+mod muse;
+pub mod mistral;
 mod qwen;
 pub mod local;
 pub mod remote;
 pub mod worker;
 pub mod audio;
+pub mod pcm_audio;
 
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
@@ -18,7 +21,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     thread::{self, JoinHandle},
@@ -31,7 +34,7 @@ pub enum VisionError {
     #[error("vision I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("vision config: {0}")]
-    Json(#[from] serde_json::Error),
+    JsonFile(#[from] cuteafd_loader::JsonFileError),
     #[error("vision native: {0}")]
     Native(#[from] cuteafd_ffi::vision::VisionError),
     #[error("audio tower: {0}")]
@@ -141,7 +144,7 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
     let mut files = BTreeSet::new();
     let index_path = snapshot.join("model.safetensors.index.json");
     if index_path.exists() {
-        let index: serde_json::Value = serde_json::from_reader(File::open(index_path)?)?;
+        let index: serde_json::Value = cuteafd_loader::read_json_file(&index_path)?;
         let map = index["weight_map"]
         .as_object()
         .ok_or_else(|| VisionError::Unsupported("safetensors weight_map absent".into()))?;
@@ -192,24 +195,31 @@ fn tower_catalog(snapshot: &Path, prefix: &str) -> Result<BTreeMap<String, (Path
 
 impl TowerSpec {
     pub fn from_snapshot(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         match cfg["model_type"].as_str() {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            Some("muse_spark") => Self::muse(snapshot, max_tokens),
+            // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
+            Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
+    /// Marker rows this tower writes after each merged row (Mistral's span: 1).
+    pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            5 => ImageFamily::Muse,
+            mistral::RESERVED => ImageFamily::Mistral,
             _ => ImageFamily::Mimo,
         }
     }
     pub fn mimo(snapshot: &Path, max_tokens: usize) -> Result<Self> {
-        let cfg: MimoConfig = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let cfg: MimoConfig = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
         cfg.validate(max_tokens)?;
         let tensors = tower_catalog(snapshot, "visual.")?;
         for bias in [
@@ -255,7 +265,7 @@ impl TowerSpec {
             max_tokens: max_tokens as u32,
             output_width: cfg.hidden_size,
             ..Default::default()
-        };
+        }.with_depth(cfg.vision_config.depth);
         native.patch = put(
             "patch_embed.proj.weight",
             &[1280, 3, 2, 16, 16],
@@ -313,7 +323,7 @@ impl TowerSpec {
     }
     /// Canonical header extents, sorted by tensor name; no tower payload is read.
     pub fn encoder_id(&self, revision: &str, sm: u32) -> cuteafd_loader::media::EncoderId {
-        let headers = self.reads.iter().map(|read| {
+        let mut headers: BTreeMap<String, serde_json::Value> = self.reads.iter().map(|read| {
             let m = &read.metadata;
             (m.name.clone(), serde_json::json!({"dtype": format!("{:?}", m.dtype),
                 "shape": m.shape, "byte_offset": m.byte_offset, "byte_length": m.byte_length}))
@@ -322,8 +332,14 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
+            cuteafd_loader::media::ImageFamily::Mistral => "mistral_large4",
         };
-        cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
+        let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
+            headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));
+            2
+        } else { 1 };
+        cuteafd_loader::media::EncoderId::derive(family, revision, &headers, numerics, sm)
     }
 
     fn load_weights(&self) -> Result<Vec<u8>> {
@@ -345,14 +361,26 @@ impl TowerSpec {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
         }
+        if self.native.reserved == mistral::RESERVED {
+            // Pixtral's interleaved axial order (height half, then width half).
+            for (i, value) in mistral::axial_inv_freq().into_iter().enumerate() {
+                let start = self.native.inv_freq as usize + i * 4;
+                weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            return Ok(weights);
+        }
         let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
         for i in 0..frequencies {
-            let value = 1.0f32 / 10000f32.powf(i as f32 / frequencies as f32);
+            let value = axial_frequency(i, frequencies);
             let start = self.native.inv_freq as usize + i * 4;
             weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
         }
         Ok(weights)
     }
+}
+
+fn axial_frequency(index: usize, frequencies: usize) -> f32 {
+    1.0f32 / 10000f32.powf(index as f32 / frequencies as f32)
 }
 
 /// Matches the CPU reference's f64 rescale followed by f32 normalize, without FMA.
@@ -405,9 +433,12 @@ pub struct EncodeJob {
 }
 pub struct EncoderTicket {
     result: mpsc::Receiver<Result<Vec<u16>>>,
+    encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
 impl EncoderTicket {
+    /// Published by the owner before its completed features, excluding queue/poll delays.
+    pub fn encode_ms(&self) -> f64 { self.encode_ns.load(Ordering::Acquire) as f64 / 1_000_000.0 }
     pub fn poll(&self) -> Result<Option<Vec<u16>>> {
         match self.result.try_recv() {
             Ok(result) => result.map(Some),
@@ -431,6 +462,7 @@ enum EncoderJob {
 struct Work {
     job: EncoderJob,
     reply: mpsc::SyncSender<Result<Vec<u16>>>,
+    encode_ns: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
 }
 struct OwnerHealth(Arc<AtomicBool>);
@@ -458,6 +490,7 @@ pub struct EncoderService {
     owner: Option<JoinHandle<()>>,
     pub ledger: VisionLedger,
     pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
+    audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
     healthy: Arc<AtomicBool>,
 }
 impl EncoderService {
@@ -502,11 +535,12 @@ impl EncoderService {
             }
         }
         if let Some(config) = &audio {
-            let required = cuteafd_ffi::audio::NativeAudio::required(&library, config.spec.native())?.total_bytes()?;
-            if required > config.admitted_bytes {
-                return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes)));
+            let required = config.required_bytes(&library)?;
+            if required > config.admitted_bytes() {
+                return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes())));
             }
         }
+        let audio_geometry = audio.as_ref().map(audio::AudioOwnerConfig::geometry);
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
@@ -517,7 +551,7 @@ impl EncoderService {
                 let _health = OwnerHealth(owner_health.clone());
                 // Query in the allocating owner/context, before loading either tower.
                 let vision_bytes = vision.as_ref().map_or(0, |(_, bytes)| *bytes);
-                let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes);
+                let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
                 let preflight = vision_bytes.checked_add(audio_bytes)
                     .ok_or_else(|| VisionError::Unsupported("media reservation overflow".into()))
                     .and_then(|required| worker::check_cuda_room(&library, device, required)
@@ -553,6 +587,7 @@ impl EncoderService {
                     return;
                 }
                 while let Ok(work) = jobs.recv() {
+                    let started = std::time::Instant::now();
                     let result = if work.cancelled.load(Ordering::Acquire) {
                         Err(VisionError::Cancelled)
                     } else {
@@ -574,6 +609,7 @@ impl EncoderService {
                             } else { Ok(output) }
                         })
                     };
+                    work.encode_ns.store(started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64, Ordering::Release);
                     if let Err(ref error) = result {
                         tracing::debug!(%error, "media job failed");
                     }
@@ -587,6 +623,7 @@ impl EncoderService {
                 owner: Some(owner),
                 ledger,
                 audio_ledger,
+                audio_geometry,
                 healthy,
             }),
             Ok(Err(error)) => {
@@ -608,6 +645,7 @@ impl EncoderService {
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
     }
+    pub fn audio_geometry(&self) -> Option<cuteafd_core::media::AudioTokenGeometry> { self.audio_geometry }
     pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
         if self.audio_ledger.is_none() {
             return Err(VisionError::Unsupported("audio encoder is not loaded".into()));
@@ -621,9 +659,11 @@ impl EncoderService {
         if !self.healthy() { return Err(VisionError::Unavailable); }
         let (reply, result) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
+        let encode_ns = Arc::new(AtomicU64::new(0));
         let work = Work {
             job,
             reply,
+            encode_ns: encode_ns.clone(),
             cancelled: cancelled.clone(),
         };
         self.queue
@@ -634,7 +674,7 @@ impl EncoderService {
                 mpsc::TrySendError::Full(_) => VisionError::QueueFull,
                 mpsc::TrySendError::Disconnected(_) => VisionError::Unavailable,
             })?;
-        Ok(EncoderTicket { result, cancelled })
+        Ok(EncoderTicket { result, encode_ns, cancelled })
     }
 }
 impl Drop for EncoderService {
@@ -648,7 +688,56 @@ impl Drop for EncoderService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn muse_axial_frequencies_match_official_torch_cpu_bytes() {
+        let fixture = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../../scripts/tests/fixtures/muse-vision-inv-freq.txt"));
+        let expected = fixture.lines().map(|line| u32::from_str_radix(line, 16).unwrap()).collect::<Vec<_>>();
+        assert_eq!(expected.len(), 24);
+        assert_eq!((0..24).map(|i| super::axial_frequency(i, 24).to_bits()).collect::<Vec<_>>(), expected);
+    }
     use super::*;
+
+    pub(super) fn assert_ctypes_spec(snapshot: &Path, family: &str, tower: &TowerSpec) {
+        let spec = &tower.native;
+        let mut values = vec![spec.abi_version as u64, spec.max_tokens as u64,
+            spec.output_width as u64, spec.reserved as u64, spec.weight_bytes,
+            spec.patch, spec.merger_norm, spec.merger_fc1, spec.merger_fc2, spec.inv_freq,
+            spec.hidden as u64, spec.depth as u64, spec.heads as u64, spec.kv_heads as u64,
+            spec.head_dim as u64, spec.intermediate as u64, spec.patch_size as u64,
+            spec.merger_width as u64, spec.norm_eps.to_bits() as u64,
+            spec.geometry_reserved as u64, spec.patch_bias, spec.pos_embed,
+            spec.merger_norm_bias, spec.merger_fc1_bias, spec.merger_fc2_bias];
+        values.extend(spec.merger_extra);
+        for block in &spec.blocks {
+            values.extend([block.qkv, block.qkv_bias, block.proj, block.proj_bias,
+                block.gate_up, block.gate_up_bias, block.down, block.down_bias,
+                block.norm1, block.norm2, block.key0_bias,
+                block.window as u64, block.column_order as u64]);
+        }
+        for layer in [&spec.norm1_bias, &spec.norm2_bias, &spec.q_norm, &spec.k_norm] {
+            assert_eq!(layer.len(), spec.depth as usize);
+            values.extend(layer);
+        }
+        // Cargo's CPU-only gate needs no Python. The script gate additionally
+        // executes each real ctypes packer over these same header-only fixtures.
+        if let Some(python) = std::env::var_os("CUTEAFD_MEDIA_PARITY_PYTHON") {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+            let prefix = if family == "mimo_v2" { "visual." } else { "model.visual." };
+            let placements: BTreeMap<_, _> = tower.reads.iter().map(|read| (
+                read.metadata.name.strip_prefix(prefix).unwrap(),
+                (read.destination, read.metadata.byte_length * if read.vector { 2 } else { 1 })
+            )).collect();
+            let output = std::process::Command::new(python)
+                .args(["-c", "import importlib.util,json,sys; p=sys.argv[1]; s=importlib.util.spec_from_file_location('parity',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.packed_spec_fields(sys.argv[2],sys.argv[3],json.loads(sys.argv[4]))))"])
+                .arg(root.join("scripts/tests/test_qwen_vision_gate.py"))
+                .arg(snapshot).arg(family).arg(serde_json::to_string(&placements).unwrap()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let ctypes: Vec<u64> = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(values, ctypes, "Rust/ctypes tower spec differs for {family}");
+        }
+    }
+
     #[test]
     fn owner_exit_and_panic_publish_health_without_scheduler_polling() {
         for panic in [false, true] {
@@ -690,7 +779,7 @@ mod tests {
         });
         assert!(matches!(result.recv().unwrap(), Err(VisionError::Native(_))));
         assert!(!healthy.load(Ordering::Acquire));
-        let queued = EncoderTicket { result: queued_result, cancelled: Arc::new(AtomicBool::new(false)) };
+        let queued = EncoderTicket { result: queued_result, encode_ns: Arc::new(AtomicU64::new(0)), cancelled: Arc::new(AtomicBool::new(false)) };
         owner.join().unwrap();
         assert!(matches!(queued.poll(), Err(VisionError::Unavailable)));
 
@@ -706,12 +795,13 @@ mod tests {
     fn shared_queue_orders_modalities_and_rejects_disabled_audio() {
         let (queue, jobs) = mpsc::sync_channel(2);
         let mut service = EncoderService { queue: Some(queue), owner: None,
-            ledger: Default::default(), audio_ledger: None,
+            ledger: Default::default(), audio_ledger: None, audio_geometry: None,
             healthy: Arc::new(AtomicBool::new(true)) };
         let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
             output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));
         service.audio_ledger = Some(Default::default());
+        service.audio_geometry = Some(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = observed.clone();
         let (gate, wait) = mpsc::sync_channel(0);
@@ -849,6 +939,7 @@ mod tests {
         for width in [4096, 6144] {
             let snapshot = sparse_snapshot(width);
             let tower = TowerSpec::mimo(snapshot.path(), 4096).unwrap();
+            assert_ctypes_spec(snapshot.path(), "mimo_v2", &tower);
             assert_eq!(tower.native.output_width, width as u32);
             assert_eq!(
                 tower.native.weight_bytes,
@@ -875,7 +966,7 @@ mod tests {
             }
             let config = snapshot.path().join("config.json");
             let mut cfg: serde_json::Value =
-                serde_json::from_reader(File::open(&config).unwrap()).unwrap();
+                cuteafd_loader::read_json_file(&config).unwrap();
             cfg["vision_config"]["patch_size"] = serde_json::json!(14);
             std::fs::write(config, serde_json::to_vec(&cfg).unwrap()).unwrap();
             assert!(TowerSpec::mimo(snapshot.path(), 4096)
@@ -963,6 +1054,7 @@ mod tests {
         let flag = Arc::new(AtomicBool::new(false));
         let ticket = EncoderTicket {
             result: recv,
+            encode_ns: Arc::new(AtomicU64::new(0)),
             cancelled: flag.clone(),
         };
         assert!(ticket.poll().unwrap().is_none());

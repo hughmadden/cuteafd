@@ -78,6 +78,13 @@ impl<T> DeviceOwner<'_, T> {
     /// Metadata access is ordinary; GPU work must use this owner's device scope.
     pub fn get(&self) -> &T { &self.value }
     pub fn get_mut(&mut self) -> &mut T { &mut self.value }
+    /// The owned value, to be dropped by the caller in this owner's device
+    /// scope (moved into another device-scoped owner).
+    pub fn into_inner(self) -> T {
+        let mut this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `this` is never dropped; the value is moved out exactly once.
+        unsafe { ManuallyDrop::take(&mut this.value) }
+    }
 }
 impl<T> std::ops::Deref for DeviceOwner<'_, T> {
     type Target = T;
@@ -307,6 +314,8 @@ impl<'a> Stream<'a> {
     pub(crate) async fn wait(&self) -> Result<()> {
         let mut guard = self.cancellation_guard("interrupted device stream");
         while !self.ready()? { tokio::task::yield_now().await; }
+        // A completed wait is progress (`wait_policy::Backoff` restarts its spin).
+        cuteafd_transport::wait_policy::note_active();
         guard.complete = true;
         Ok(())
     }
@@ -349,12 +358,96 @@ impl Drop for Event<'_> {
     }
 }
 
+/// The widest decode-width peer transfer: a decode lane's 80 rows
+/// (`DECODE_LANE_ROWS`, the compiled cover of the 64-row verify width) of a
+/// 10240-byte BF16 hidden row. Every decode/verify transfer is at most this;
+/// every prefill unit (>= 256 rows, `V41_LIVE_MIN_ROWS`) is wider.
+pub(crate) const DECODE_PEER_COPY_BYTES: usize = 80 * 10240;
+
+/// Whether a device-ordered peer copy of `bytes` runs as an SM copy on the
+/// issuing stream (ordered by its event waits) instead of on a copy engine.
+/// Decode-width transfers do: a copy-engine copy queued behind an unmet event
+/// wait parks that engine and head-of-line blocks every other copy on it
+/// (Engram uploads, peer landings). Prefill-width transfers keep the copy
+/// engines (prof12: SM copies cost ~1.2 s of GPU0 per 64K prefill on two RTX).
+pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize, decode_lane_bytes: usize) -> bool {
+    deferred && bytes <= decode_lane_bytes
+}
+
+/// Same-device handoff behind an upstream device wait. Decode-sized payloads
+/// use SM reads on the consumer stream rather than park a shared copy engine.
+///
+/// # Safety
+/// Both admitted buffers and stream survive completion, and stream order covers
+/// every source writer and destination reader/rewrite.
+pub(crate) unsafe fn copy_device_ordered(library: &NativeLibrary, destination: CuteafdDeviceBuffer,
+    source: CuteafdDeviceBuffer, bytes: usize, stream: *mut c_void) -> Result<()> {
+    ensure!(destination.device_id == source.device_id && bytes <= destination.bytes && bytes <= source.bytes,
+        "device-ordered copy exceeds admitted same-device buffers");
+    if bytes == 0 || destination.ptr == source.ptr { return Ok(()); }
+    if sm_peer_copy_for(true, bytes, DECODE_PEER_COPY_BYTES) {
+        // SAFETY: caller retains both regions; the issuing stream orders all readers.
+        unsafe { library.sm_copy_regions(&[(destination.ptr, source.ptr.cast_const(), bytes as u64)], stream) }
+    } else {
+        // SAFETY: caller retains both regions, as for the existing wide copy path.
+        unsafe { library.copy_d2d_async(destination, source, bytes, stream) }
+    }
+}
+
+#[cfg(test)]
+mod peer_copy_choice_tests {
+    /// Decode-width device-ordered transfers run as SM copies (never parked on
+    /// a copy engine behind an unmet wait); prefill-width ones keep the copy
+    /// engines; host-ordered passes always use the copy engines.
+    #[test]
+    fn decode_width_device_ordered_copies_use_sm() {
+        use super::{sm_peer_copy_for, DECODE_PEER_COPY_BYTES};
+        for deferred in [false, true] {
+            for bytes in [0, 10240, 80 * 10240, 80 * 10240 + 1, 256 * 10240, 2752 * 10240] {
+                assert_eq!(sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES),
+                    deferred && bytes <= 80 * 10240, "V4.1 routing changed at {bytes}");
+            }
+        }
+        // mHC residuals have four BF16 hidden streams per row.
+        let glmf_decode = 64 * 4 * 4096 * 2;
+        assert!(sm_peer_copy_for(true, glmf_decode, glmf_decode));
+        assert!(!sm_peer_copy_for(true, glmf_decode + 1, glmf_decode));
+        assert!(!sm_peer_copy_for(true, 2752 * 4096 * 2, glmf_decode));
+        assert!(!sm_peer_copy_for(true, 4096 * 4 * 4096 * 2, glmf_decode));
+        for row_bytes in [8192, 10240, 12288] {
+            assert!(sm_peer_copy_for(true, 80 * row_bytes, 80 * row_bytes));
+            assert!(!sm_peer_copy_for(true, 81 * row_bytes, 80 * row_bytes));
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only negative control: `copy_then_ordered` neither joins nor acquires.
+    static SKIP_COPY_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only negative control: a pushing transfer's destination does not
+    /// wait on the push's flag before `then`.
+    pub(crate) static SKIP_PUSH_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How a pushing [`PeerTransfer`] moves its bytes (implemented by
+/// `shared::peer_split::FlagRoute`, one device flag of a peer exchange).
+pub(crate) trait PushRoute {
+    /// Queues on `stream` (the source GPU's producer stream): copy `bytes` of
+    /// `source` into `destination` on the other GPU, then publish the flag.
+    fn push(&self, stream: *mut c_void, source: *const c_void, destination: *mut c_void, bytes: usize) -> Result<()>;
+    /// Queues on `stream` (the destination GPU): wait for the next publication.
+    fn wait(&self, stream: *mut c_void) -> Result<()>;
+}
+
 /// One transfer direction for one lane; stream and event are allocated at startup.
 pub(crate) struct PeerTransfer<'a> {
     destination: Stream<'a>,
     ready: Event<'a>,
     /// SM copies for device-ordered passes ([`super::chain::deferred`]).
     sm: Option<cuteafd_ffi::V41PeerCopy<'a>>,
+    /// Device-ordered passes push instead ([`Self::enable_push`]).
+    push: Option<Box<dyn PushRoute + 'a>>,
 }
 impl<'a> PeerTransfer<'a> {
     pub fn new(source: Device<'a>, destination: Device<'a>) -> Result<Self> {
@@ -364,10 +457,29 @@ impl<'a> PeerTransfer<'a> {
         let stream = Stream::new(destination)?;
         let ready = Event { device: source,
             raw: source.run(|| source.library.cuda_event_create())? };
-        let sm = super::chain::device_enabled()
-            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
-        Ok(Self { destination: stream, ready, sm })
+        let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
+        Ok(Self { destination: stream, ready, sm, push: None })
     }
+
+    /// From now on a device-ordered pass pushes: the producer's stream copies
+    /// the bytes into the destination (SMs up to `decode_lane_bytes`, else its
+    /// copy engine) and publishes a flag, and the destination stream waits on
+    /// that flag before `then`. No cross-device event and no SM pull.
+    ///
+    /// Only for an owner private to one decode lane: its `then` writes and
+    /// its destination are reused once per layer, and the next layer's push
+    /// follows this layer's readers through that lane's flags, which is why
+    /// the guard of [`Self::copy_then_ordered`] is not needed. Layers must not
+    /// pipeline; V4.1's `v41_peer_push::schedule_tests` check this invariant.
+    pub fn enable_push(&mut self, route: Box<dyn PushRoute + 'a>) {
+        self.push = Some(route);
+    }
+
+    /// The source and destination GPUs (a [`PushRoute`]'s two ranks).
+    pub fn devices(&self) -> [Device<'a>; 2] { [self.ready.device, self.destination.device] }
+
+    /// Whether the next device-ordered transfer pushes (see [`Self::enable_push`]).
+    pub fn pushes(&self) -> bool { self.push.is_some() && super::chain::deferred() }
 
     /// # Safety
     /// All source writes must be ordered on `producer`; no aliases may access
@@ -384,6 +496,33 @@ impl<'a> PeerTransfer<'a> {
     /// callback itself is retained until the completion/cancellation drain.
     pub async unsafe fn copy_then(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
         producer: &Stream<'a>, bytes: usize,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_ordered(source, destination, producer, bytes, None, then).await }
+    }
+    /// As [`Self::copy_then`]; under device ordering, `guard` (when given)
+    /// replaces the join to the whole chain head. The destination stream then
+    /// waits only on the producer's event and on the guard: the release of
+    /// the last cross-stream reader of what `then` writes (the caller's
+    /// write-after-read edge, `row_window::ScratchGuard`). Readers on this
+    /// stream (the destination staging) are ordered by the stream.
+    /// # Safety
+    /// As `copy_then`; with a guard, every reader of `then`'s outputs on other
+    /// streams releases the guard after its read.
+    pub async unsafe fn copy_then_ordered(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_adopting(source, destination, producer, bytes, guard, None, then).await }
+    }
+    /// As [`Self::copy_then_ordered`]; a pushing transfer given `adopt` (the
+    /// mark of a push whose stream the producer follows) adopts the chain
+    /// head on its destination stream instead of merging it (a merge is a
+    /// cross-device event wait when the head is on the source GPU).
+    /// # Safety
+    /// As `copy_then_ordered`; `producer` follows the stream that joined the
+    /// head `adopt` names, and no stage finished since.
+    pub async unsafe fn copy_then_adopting(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        adopt: Option<super::chain::HeadMark>,
         mut then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
         let library = self.destination.device.library;
         ensure!(source.device.id == self.ready.device.id
@@ -395,23 +534,53 @@ impl<'a> PeerTransfer<'a> {
             && bytes <= source.buffer.bytes && bytes <= destination.buffer.bytes,
             "peer transfer owner or extent mismatch");
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
-        self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        let sm = self.sm.as_ref().filter(|_| deferred);
+        if let Some(push) = self.push.as_ref().filter(|_| deferred) {
+            // The bytes are final on `producer` in stream order, so the push
+            // queues there behind nothing from the other GPU; the destination
+            // waits on its flag. Push before wait, in one synchronous block.
+            push.push(producer.raw, source.buffer.ptr, destination.buffer.ptr, bytes)?;
+            #[cfg(test)]
+            let unordered = SKIP_PUSH_WAIT.with(|skip| skip.get());
+            #[cfg(not(test))]
+            let unordered = false;
+            self.destination.device.run(|| unsafe {
+                if !unordered { push.wait(self.destination.raw)?; }
+                then(destination.buffer, self.destination.raw)?;
+                match adopt {
+                    Some(mark) => super::chain::finish_after_flag(library, self.destination.raw, Some(mark)),
+                    None => super::chain::finish(library, self.destination.raw),
+                }
+            })?;
+            drain.complete = true;
+            return Ok(());
+        }
+        self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
+        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
+            // The destination's previous readers precede this write: the
+            // caller's guard, or the whole chain head.
+            #[cfg(test)]
+            let unordered = SKIP_COPY_ORDER.with(|skip| skip.get());
+            #[cfg(not(test))]
+            let unordered = false;
+            match guard {
+                _ if unordered => {}
+                Some(guard) if deferred => guard.acquire(self.destination.raw)?,
+                _ if deferred => super::chain::join(library, self.destination.raw)?,
+                _ => {}
+            }
             match sm {
-                // An SM copy waiting on its event holds no copy-engine queue.
-                Some(sm) => {
-                    // The destination's previous readers precede this write.
-                    super::chain::join(library, self.destination.raw)?;
-                    sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?
-                }
+                Some(sm) => sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?,
+                // Device-ordered passes copy on the copy engines too (#815,
+                // prof13): this stream waits on events only, never a memory
+                // wait, so it holds no other lane's DMA behind it.
                 None => library.copy_peer_async(destination.buffer, source.buffer, bytes, self.destination.raw)?,
             }
             then(destination.buffer, self.destination.raw)
         })?;
-        if sm.is_some() {
+        if deferred {
             self.destination.device.run(|| unsafe { super::chain::finish(library, self.destination.raw) })?;
             drain.complete = true;
             return Ok(());
@@ -584,4 +753,71 @@ mod tests {
         assert_eq!(lib.cuda_get_device()?, 0);
         Ok(())
     }
+
+    /// Hunt A 1E: a guarded peer transfer's `then` write waits for the last
+    /// cross-stream reader of its output (released on that reader's chain),
+    /// without joining the writer's whole chain head. Negative control: with
+    /// no ordering, the write overtakes the held reader.
+    fn guarded_copy_waits_for_the_output_reader(ordered: bool) -> Result<()> {
+        use crate::shared::memory::chain::StageChain;
+        use crate::shared::memory::row_window::ScratchGuard;
+        let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        lib.cuda_set_device(0)?;
+        let (d0, d1) = (Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 });
+        let source = Allocation::new(d0, 4096)?;
+        let mut staging = Allocation::new(d1, 4096)?;
+        let out = Allocation::new(d1, 4096)?;
+        let check = Allocation::new(d1, 4096)?;
+        let (producer, reader) = (Stream::new(d0)?, Stream::new(d1)?);
+        let mut transfer = PeerTransfer::new(d0, d1)?;
+        let guard = ScratchGuard::new(&lib, &[0, 1])?;
+        lib.copy_h2d(source.buffer, &[2u8; 4096])?;
+        d1.run(|| lib.copy_h2d(out.buffer, &[1u8; 4096]))?;
+        let written = d1.run(|| lib.cuda_event_create_ordering())?;
+        let chains = [StageChain::on_devices(&lib, &[0, 1])?, StageChain::on_devices(&lib, &[0, 1])?];
+        for chain in &chains { chain.set_device_order(true); }
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        lib.cuda_device_synchronize()?;
+        let gate = d1.run(|| unsafe { cuteafd_ffi::test_support::CudaStreamGate::new(&lib, reader.raw) })?;
+        // Unit A: the reader of `out` (held), joined into A's chain, then released.
+        runtime.block_on(chains[0].handle().scope(async { d1.run(|| unsafe {
+            super::chain::join(&lib, reader.raw)?;
+            lib.copy_d2d_async(check.buffer, out.buffer, 4096, reader.raw)?;
+            super::chain::finish(&lib, reader.raw)?;
+            guard.release()
+        }) }))?;
+        // Unit B: the guarded transfer overwrites `out` in `then`.
+        SKIP_COPY_ORDER.with(|skip| skip.set(!ordered));
+        let queued = runtime.block_on(chains[1].handle().scope(async { unsafe {
+            transfer.copy_then_ordered(&source, &mut staging, &producer, 4096, Some(&guard), |copied, stream| {
+                lib.copy_d2d_async(out.buffer, copied, 4096, stream)?;
+                lib.cuda_event_record(written, stream)
+            }).await
+        } }));
+        SKIP_COPY_ORDER.with(|skip| skip.set(false));
+        queued?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(if ordered { 2 } else { 10 });
+        let mut done = false;
+        while std::time::Instant::now() < deadline {
+            if d1.run(|| unsafe { lib.cuda_event_query(written) })? { done = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(gate);
+        for chain in &chains { chain.drain()?; }
+        lib.cuda_device_synchronize()?;
+        let mut seen = vec![0u8; 4096];
+        d1.run(|| lib.copy_d2h(&mut seen, check.buffer))?;
+        d1.run(|| unsafe { lib.cuda_event_destroy(written) })?;
+        assert_eq!(done, !ordered, "the guarded write {} while the reader was held", if done { "completed" } else { "stayed pending" });
+        assert_eq!(seen[0], if ordered { 1 } else { 2 }, "the reader saw {} data", if seen[0] == 2 { "the overwrite's" } else { "its own" });
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
+    fn guarded_peer_transfer_waits_for_its_output_reader() -> Result<()> { guarded_copy_waits_for_the_output_reader(true) }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_NATIVE_LIB and two CUDA GPUs"]
+    fn unordered_peer_transfer_overwrites_a_held_reader() -> Result<()> { guarded_copy_waits_for_the_output_reader(false) }
 }

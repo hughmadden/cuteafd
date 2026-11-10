@@ -27,7 +27,7 @@ impl RemoteVision {
             "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
         let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
             .context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
@@ -53,7 +53,7 @@ impl RemoteAudio {
             "--audio-peers requires Spark/auto audio placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("audio peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "audio needs 1..6 replicas");
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "audio needs 1..8 replicas");
         let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.audio_encoder_plan_hash.as_deref()
             .context("--audio-peers requires --audio-encoder-plan-hash")?)?;
         let revision = args.audio_encoder_revision.clone().context("--audio-peers requires --audio-encoder-revision")?;
@@ -102,7 +102,7 @@ impl ReadyVision {
             anyhow::ensure!(preparer.as_ref().unwrap().config().max_image_tokens <= 4096, "MiMo tower capacity is 4096 tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "MiMo tower/LM output width mismatch");
             image_encoder = Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
@@ -115,6 +115,7 @@ impl ReadyVision {
             let spec = audio_spec.take().context("remote audio requires enabled checkpoint audio tower")?;
             let id = spec.plan().encoder_id(&remote.revision, 121, &remote.backend);
             let expected = crate::shared::vision::remote::AudioHandshake {
+                geometry: cuteafd_core::media::AudioTokenGeometry::MimoRvq,
                 encoder_id: id, plan_hash: remote.plan_hash, max_samples: spec.native().max_samples,
                 output_width: spec.native().output_width,
             };
@@ -156,9 +157,9 @@ impl ReadyVision {
                 audio_preparer = Some(Arc::new(cuteafd_api::openai::media::audio::AudioPreparer::new(
                     spec.plan().encoder_id(revision, sm, &backend), slots.clone())));
                 let bytes = cuteafd_ffi::audio::NativeAudio::required(&args.native_lib, spec.native())?.total_bytes()?;
-                Ok(crate::shared::vision::audio::AudioOwnerConfig { spec, admitted_bytes: bytes })
+                Ok(crate::shared::vision::audio::AudioOwnerConfig::Mimo { spec, admitted_bytes: bytes })
             }).transpose()?;
-            let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes);
+            let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
             library.cuda_set_device(gpu)?;
             let loaded = (|| -> Result<_> {
                 let (free, total) = library.cuda_memory_info()?;
@@ -190,78 +191,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
-    Local(crate::shared::vision::local::LocalEncoder),
-    Remote(crate::shared::vision::remote::RemoteEncoder),
-    Split { image: Box<Encoder>, audio: Box<Encoder> },
-    #[cfg(test)]
-    Fixture(cuteafd_engine::media::FakeEncoder, Arc<std::sync::atomic::AtomicBool>),
-    Off,
-}
-impl Encoder {
-    fn split(image: Self, audio: Self) -> Self {
-        Self::Split { image: Box::new(image), audio: Box::new(audio) }
-    }
-    pub fn health_handle(&self, audio_job: bool) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        match self {
-            Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()),
-            Self::Split { image, audio } => if audio_job { audio } else { image }.health_handle(audio_job),
-            #[cfg(test)]
-            Self::Fixture(_, health) => Some(health.clone()),
-            Self::Off => None,
-        }
-    }
-    pub fn available_for(&self, audio_job: bool) -> bool {
-        match self {
-            Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(),
-            Self::Split { image, audio } => if audio_job { audio } else { image }.available_for(audio_job),
-            #[cfg(test)]
-            Self::Fixture(_, health) => health.load(std::sync::atomic::Ordering::Acquire),
-            Self::Off => false,
-        }
-    }
-}
-impl cuteafd_engine::media::EncoderClient for Encoder {
-    fn submit(&mut self, job: EncodeJob) -> std::result::Result<cuteafd_engine::media::EncoderTicket, cuteafd_engine::media::MediaError> {
-        use cuteafd_engine::media::MediaError;
-        match self {
-            Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
-            Self::Split { image, audio } => {
-                let is_audio = job.key.is_audio();
-                let owner = if is_audio { audio } else { image };
-                let ticket = owner.submit(job)?;
-                // Each owner starts at ticket zero. Reserve the low bit for modality.
-                match ticket.0.checked_mul(2).and_then(|id| id.checked_add(u64::from(is_audio))) {
-                    Some(id) => Ok(cuteafd_engine::media::EncoderTicket(id)),
-                    None => { owner.cancel(ticket); Err(MediaError::QueueFull) },
-                }
-            },
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.submit(job),
-            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())),
-        }
-    }
-    fn poll(&mut self, ticket: cuteafd_engine::media::EncoderTicket) -> Option<std::result::Result<cuteafd_engine::media::EncodeOutput, cuteafd_engine::media::MediaError>> {
-        match self {
-            Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket),
-            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
-                .poll(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.poll(ticket),
-            Self::Off => None,
-        }
-    }
-    fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
-        match self {
-            Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket),
-            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
-                .cancel(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.cancel(ticket),
-            Self::Off => (),
-        }
-    }
-}
+pub(super) use crate::shared::qwen::Encoder;
 pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
         cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull =>
@@ -316,8 +246,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
             let mut spans = Vec::with_capacity(images.len());
             for (span, image) in probe.spec.media.iter().zip(&images) {
                 let end = span.start.checked_add(span.len).context("probe media extent")?;
-                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key), "probe prepared image identity differs");
+                span.verify_image(image)?;
                 anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
                     && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
                     "probe image rows/marker boundaries differ");
@@ -341,6 +270,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let echo = image_spans.into_iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
             cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
                 key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
+                identity: Some(cuteafd_api::openai::probe::ProbeImageIdentity::prepared(image)),
+                input_key: probe.spec.media.get(i).filter(|s| s.identity.is_some()).map(|s| s.key.clone()),
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
         }).collect();
         probe.media(echo);
@@ -573,8 +504,8 @@ mod tests {
         assert!(encoder.poll(i).unwrap().is_ok());
         audio_health.store(false, Ordering::Release);
         assert!(encoder.available_for(false)); assert!(!encoder.available_for(true));
-        assert!(Arc::ptr_eq(&encoder.health_handle(false).unwrap(), &image_health));
-        assert!(Arc::ptr_eq(&encoder.health_handle(true).unwrap(), &audio_health));
+        assert!(Arc::ptr_eq(&encoder.health_handle_for(false).unwrap(), &image_health));
+        assert!(Arc::ptr_eq(&encoder.health_handle_for(true).unwrap(), &audio_health));
     }
     #[test]
     fn remote_audio_requires_complete_sm121_identity_and_enabled_placement() {
@@ -628,7 +559,7 @@ mod tests {
             cuteafd_api::openai::NativeFailure::Unavailable(message) if message == "vision encoder unavailable"));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
+        NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
     }
@@ -637,7 +568,7 @@ mod tests {
             "vision_start_token_id": 4, "vision_end_token_id": 6})
     }
     fn image() -> Arc<PreparedImage> {
-        Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
     }
     #[test]
@@ -770,7 +701,7 @@ mod tests {
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
             media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
         let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
         let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
@@ -955,7 +886,7 @@ mod tests {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
             image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
         let run = |span: ProbeMedia, tokens: Vec<u32>| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });

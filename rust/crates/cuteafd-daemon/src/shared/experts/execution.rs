@@ -37,11 +37,18 @@ fn validate_live_rows(rows: usize, live: u32) -> std::result::Result<(), NativeE
 
 /// Native roles that publish token-major FP32 routed partials and therefore
 /// need the compact output buffer plus the compact reducer: legacy grouped
-/// Spark TP4 (role 1) and the Spark shard families TP2/TP3/pure-TP6 (roles
-/// 5/6/7). The full-width RTX backbone (role 2) owns its separate local reducer
+/// Spark TP4 (role 1) and the Spark shard families TP2/TP3/TP6/TP8 (roles
+/// 5/6/7/8). The full-width RTX backbone (role 2) owns its separate local reducer
 /// and never enters this execution.
-fn compact_output_role(role: u32) -> bool {
-    matches!(role, 1 | 5 | 6 | 7)
+pub(super) fn compact_output_role(role: u32) -> bool {
+    matches!(role, 1 | 5 | 6 | 7 | 8) || cuteafd_core::tp_units::native_role_width(role).is_some()
+}
+
+pub(super) fn grouped_decode_rows(layer: ExpertLayer, library: &NativeLibrary, capacity: u32,
+    nvfp4: bool) -> Result<u32> {
+    let exports = if nvfp4 { library.nvfp4_expert_exports(layer.role())? }
+        else { library.native_expert_exports(layer.role())? };
+    exports.grouped_decode(capacity).map_err(anyhow::Error::msg)
 }
 
 /// Admit the exact states owned by this wave before allocating their scratch.
@@ -49,9 +56,10 @@ fn compact_output_role(role: u32) -> bool {
 fn native_reduction_plan(layer: ExpertLayer, library: &NativeLibrary, capacity: u32,
     nvfp4: bool) -> Result<Option<super::ExpertReductionPlan>> {
     if nvfp4 || !compact_output_role(layer.role()) { return Ok(None); }
+    let grouped = grouped_decode_rows(layer, library, capacity, nvfp4)?;
     let mut capacities = vec![capacity]; // execution_state index 0: main
     if capacity > 1 { capacities.push(1); } // index 1: serial
-    if capacity > 80 { capacities.push(80); } // index 2: grouped decode
+    if capacity > grouped { capacities.push(grouped); } // index 2: grouped decode
     let infos = capacities.into_iter().map(|rows| layer.select_info(library, rows, false))
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(super::ExpertReductionPlan::native(library, infos)?))
@@ -106,6 +114,15 @@ struct DecodeExecution<'library> {
     slots: [*mut c_void; 44],
 }
 
+struct NativeWidthState<'library> {
+    kernel: V41ExpertKernel<'library>,
+    scratch: DeviceAllocation<'library>,
+    decode: Option<DecodeExecution<'library>>,
+    small: Option<DecodeExecution<'library>>,
+    reduction_plan: Option<super::ExpertReductionPlan>,
+    slots: [*mut c_void; 44],
+}
+
 /// One exclusive wave's buffers and graph borrow immutable resident weights.
 /// Upstream producers and transport must obey this owner's stream/lifetime contract.
 pub(crate) struct ExpertExecution<'weights, 'library> {
@@ -125,19 +142,23 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     ids: DeviceAllocation<'library>,
     routing: DeviceAllocation<'library>,
     /// Pinned route ids then weights, uploaded asynchronously per request. The
-    /// stream drains before each response is emitted, so the next request may
-    /// rewrite this staging.
-    route_staging: crate::shared::memory::HostAllocation<'library>,
+    /// unit fence protects each staging slot until its own response is emitted.
+    route_staging: Vec<crate::shared::memory::HostAllocation<'library>>,
     compact_reducer: Option<V41CompactReducer<'library>>,
     compact_output: Option<DeviceAllocation<'library>>,
+    reply_codec: Option<super::reply::ReplyCodec<'library>>,
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
-    graph: Option<(*mut c_void, u32, bool)>,
+    graph: Option<(*mut c_void, u32, bool, u32, u32)>,
+    alternate_widths: Vec<NativeWidthState<'library>>,
     /// Replicated-group index this worker owns; set once at startup for an
     /// explicit `TP×EP` topology, `None` for every legacy path. The group is
     /// independent of the resident layer, so rebinding a layer never changes it.
     native_group: Option<u8>,
+    /// Mapped requests return queued; the owner emits each reply after its unit fence.
+    deferred: bool,
+    pending: timing::PendingUnits<'library>,
     live_capacity: u32,
     budget: ExpertExecutionBudget,
 }
@@ -159,10 +180,56 @@ impl<'library> ExpertWeights<'library> {
         let decode = if compact_output_role(info.role) && compiled > 1 {
             usize::try_from(layer.select_info(library, 1, nvfp4)?.scratch_bytes)?
         } else { 0 };
-        let small = if compact_output_role(info.role) && compiled > 80 {
-            usize::try_from(layer.select_info(library, 80, nvfp4)?.scratch_bytes)?
+        let grouped = if compact_output_role(info.role) { grouped_decode_rows(layer, library, compiled, nvfp4)? } else { compiled };
+        let small = if compact_output_role(info.role) && compiled > grouped {
+            usize::try_from(layer.select_info(library, grouped, nvfp4)?.scratch_bytes)?
         } else { 0 };
         ExpertExecutionBudget::from_info(info, live, decode, small)
+    }
+    pub(crate) fn plan_execution_layers(layers: impl IntoIterator<Item = ExpertLayer>,
+        library: &NativeLibrary, compiled: u32, live: u32, nvfp4: bool) -> Result<ExpertExecutionBudget> {
+        let mut roles = Vec::new();
+        let mut budgets = Vec::new();
+        for layer in layers {
+            if roles.contains(&layer.role()) { continue; }
+            roles.push(layer.role());
+            budgets.push(Self::plan_execution(layer, library, compiled, live, nvfp4)?);
+        }
+        ensure!(!budgets.is_empty() && budgets.len() <= 2,
+            "native owner needs one or two adjacent width states");
+        let mut budget = budgets[0];
+        for other in &budgets[1..] {
+            budget.scratch_bytes = budget.scratch_bytes.checked_add(other.scratch_bytes)
+                .context("native width scratch overflow")?;
+            budget.decode_scratch_bytes = budget.decode_scratch_bytes.checked_add(other.decode_scratch_bytes)
+                .context("native width decode scratch overflow")?;
+            budget.small_scratch_bytes = budget.small_scratch_bytes.checked_add(other.small_scratch_bytes)
+                .context("native width grouped scratch overflow")?;
+            ensure!(budget.hidden_bytes == other.hidden_bytes && budget.routing_bytes == other.routing_bytes
+                && budget.output_and_shared_bytes == other.output_and_shared_bytes,
+                "native width states cannot share their I/O geometry");
+        }
+        Ok(budget)
+    }
+
+    pub(crate) fn execution_layers(layers: &[Self], compiled: u32, live: u32,
+        available: usize) -> Result<ExpertExecution<'_, 'library>> {
+        let first = layers.first().context("native execution has no resident layers")?;
+        let library = first.buffers[0].library;
+        let budget = Self::plan_execution_layers(layers.iter().map(|weight| weight.layer),
+            library, compiled, live, first.is_nvfp4())?;
+        ensure!(budget.total()? <= available, "native width execution exceeds device budget");
+        let mut execution = first.execution(compiled, live, available)?;
+        for weight in layers {
+            if weight.layer.role() == execution.kernel.info().role
+                || execution.alternate_widths.iter().any(|state| state.kernel.info().role == weight.layer.role()) {
+                continue;
+            }
+            ensure!(execution.alternate_widths.is_empty(), "more than two native width states");
+            execution.add_width(weight, compiled)?;
+        }
+        execution.budget = budget;
+        Ok(execution)
     }
     pub fn execution(
         &self,
@@ -275,8 +342,11 @@ impl<'library> ExpertWeights<'library> {
             }))
         };
         let decode = prepare_small(1, budget.decode_scratch_bytes)?;
-        let small = prepare_small(80, budget.small_scratch_bytes)?;
-        let route_staging = crate::shared::memory::HostAllocation::named(library, budget.routing_bytes, "experts/workspace/route_staging")?;
+        let grouped = if budget.small_scratch_bytes > 0 { grouped_decode_rows(self.layer, library, compiled, self.is_nvfp4())? } else { compiled };
+        let small = prepare_small(grouped, budget.small_scratch_bytes)?;
+        let route_staging = (0..1).map(|_| crate::shared::memory::HostAllocation::named(library,
+            budget.routing_bytes, "experts/workspace/route_staging" )).collect::<Result<Vec<_>>>()?;
+        let reply_codec = if compact_output_role(kernel.info().role) { Some(super::reply::ReplyCodec::load(library)?) } else { None };
         Ok(ExpertExecution {
             stream,
             _weights: self,
@@ -291,6 +361,7 @@ impl<'library> ExpertWeights<'library> {
             worker_timing: None,
             compact_reducer,
             compact_output,
+            reply_codec,
             scratch,
             hidden,
             ids,
@@ -298,7 +369,10 @@ impl<'library> ExpertWeights<'library> {
             output,
             shared,
             slots,
+            deferred: false,
+            pending: timing::PendingUnits::new(library, 1)?,
             graph: None,
+            alternate_widths: Vec::new(),
             native_group: None,
             live_capacity: live,
             budget,
@@ -330,7 +404,39 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.native_group = group;
         Ok(())
     }
-    /// Reuse a wave's workspace across resident layers after its prior work drains.
+    fn add_width(&mut self, weights: &'weights ExpertWeights<'library>, compiled: u32) -> Result<()> {
+        let prepare = |rows, name| -> Result<DecodeExecution<'library>> {
+            let kernel = weights.layer.select_kernel(self.library, rows, weights.is_nvfp4())?;
+            ensure!(kernel.info().input_dtype == self.kernel.info().input_dtype,
+                "native width states have different input formats");
+            let scratch = DeviceAllocation::named(self.library,
+                usize::try_from(kernel.info().scratch_bytes)?, name)?;
+            let mut slots = self.slots;
+            // SAFETY: the new state owns its scratch; all retained states share
+            // the same admitted I/O and execute serially on this owner's stream.
+            unsafe {
+                kernel.bind_scratch(scratch.buffer.ptr, scratch.buffer.bytes as u64, &mut slots)?;
+            }
+            weights.bind(&kernel, &mut slots)?;
+            // SAFETY: initialization is drained before publishing this state.
+            let initialized = unsafe { kernel.initialize_scratch(scratch.buffer.ptr,
+                scratch.buffer.bytes as u64, self.stream.raw) };
+            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream.raw) };
+            if drained.is_err() { self.library.quarantine_module_after_failed_drain(); }
+            initialized.and(drained)?;
+            Ok(DecodeExecution { kernel, scratch, slots })
+        };
+        let reduction_plan = native_reduction_plan(weights.layer, self.library, compiled, weights.is_nvfp4())?;
+        let main = prepare(compiled, "experts/workspace/alternate_main_scratch")?;
+        let decode = if compiled > 1 { Some(prepare(1, "experts/workspace/alternate_serial_scratch")?) } else { None };
+        let grouped = grouped_decode_rows(weights.layer, self.library, compiled, weights.is_nvfp4())?;
+        let small = if compiled > grouped { Some(prepare(grouped, "experts/workspace/alternate_grouped_scratch")?) } else { None };
+        self.alternate_widths.push(NativeWidthState { kernel: main.kernel, scratch: main.scratch,
+            slots: main.slots, decode, small, reduction_plan });
+        Ok(())
+    }
+
+    /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
         ensure!(
@@ -343,7 +449,19 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         );
         ensure!(self._weights.is_nvfp4() == weights.is_nvfp4(),
             "cannot rebind expert workspace across quantization families");
-        self.synchronize()?;
+        if self.kernel.info().role != weights.layer.role() {
+            let state = self.alternate_widths.iter_mut()
+                .find(|state| state.kernel.info().role == weights.layer.role())
+                .context("native width state was not initialized before readiness")?;
+            std::mem::swap(&mut self.kernel, &mut state.kernel);
+            std::mem::swap(&mut self.scratch, &mut state.scratch);
+            std::mem::swap(&mut self.decode, &mut state.decode);
+            std::mem::swap(&mut self.small, &mut state.small);
+            std::mem::swap(&mut self.reduction_plan, &mut state.reduction_plan);
+            std::mem::swap(&mut self.slots, &mut state.slots);
+        }
+        // Launch copies its pointer arguments; rebinding uncaptured arguments
+        // cannot mutate earlier work, and stream order protects shared scratch.
         let mut slots = self.slots;
         weights.bind(&self.kernel, &mut slots)?;
         for decode in [&mut self.decode, &mut self.small].into_iter().flatten() {
@@ -437,15 +555,70 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping, InstalledExpertVariant};
         let mut kernels = vec![&self.kernel];
         kernels.extend([&self.decode, &self.small].into_iter().flatten().map(|state| &state.kernel));
+        for state in &self.alternate_widths {
+            ensure!(state.kernel.group_rows() == self.kernel.group_rows(),
+                "native width states disagree on main grouping");
+            let alternate = [&state.kernel, state.decode.as_ref().map_or(&state.kernel, |s| &s.kernel),
+                state.small.as_ref().map_or(&state.kernel, |s| &s.kernel)];
+            for (left, right) in kernels.iter().zip(alternate) {
+                ensure!(left.info().capacity_rows == right.info().capacity_rows,
+                    "native width states disagree on compiled capacities");
+                for rows in 1..=left.info().capacity_rows as usize {
+                    ensure!(left.group_rows_for(rows)? == right.group_rows_for(rows)?,
+                        "native width states disagree on grouping at rows {rows}");
+                }
+            }
+        }
         let variants = kernels.into_iter().map(|kernel| InstalledExpertVariant::from_queries(
             kernel.info().capacity_rows as usize, |rows| kernel.group_rows_for(rows))).collect::<Result<Vec<_>>>()?;
+        let role = self._weights.layer.role();
+        let exports = if self._weights.is_nvfp4() {
+            self.library.nvfp4_expert_exports(role)?
+        } else {
+            self.library.native_expert_exports(role)?
+        };
         let report = InstalledExpertGrouping::new(loaded, rank, self.live_capacity as usize,
-            ExpertGroupingSelector::Native, variants)?;
+            ExpertGroupingSelector::Native { exports }, variants)?;
         for rows in 0..=self.live_capacity as usize {
             ensure!(report.group_rows(rows)? == self.group_rows(rows)?,
                 "native installed grouping differs from actual selector at rows {rows}");
         }
         Ok(report)
+    }
+
+    /// Leave mapped requests queued at return (see `deferred`).
+    pub(crate) fn defer(&mut self, units: usize, staging_rows: usize, owner: cuteafd_core::ExecutionOwner) -> Result<()> {
+        ensure!(self.pending.is_empty(), "cannot resize an active expert queue");
+        ensure!(staging_rows > 0 && staging_rows <= self.live_capacity as usize, "native staging exceeds owner rows");
+        self.pending = timing::PendingUnits::for_owner(self.library, units, owner)?;
+        let bytes = staging_rows.checked_mul(cuteafd_core::expert_geometry().topk as usize * 8)
+            .context("native route staging overflow")?;
+        self.route_staging.clear();
+        for _ in 0..units {
+            self.route_staging.push(crate::shared::memory::HostAllocation::named(self.library,
+                bytes, "experts/workspace/route_staging")?);
+        }
+        self.deferred = true;
+        Ok(())
+    }
+
+    /// Publish deferred diagnostics after the owner's existing completion check.
+    /// Returns the completed unit's measured pace.
+    pub(crate) fn complete(&mut self) -> Result<Option<timing::UnitPace>> {
+        let Some(((request_id, layer, rows, executor_id), pace)) = self.pending.pop()? else { return Ok(None) };
+        if let Some(timing) = &mut self.worker_timing {
+            // SAFETY: the caller observed this stream drained after both records.
+            unsafe { timing.publish(request_id, layer, rows, executor_id, "native")?; }
+        }
+        Ok(Some(pace))
+    }
+
+    pub(crate) fn unit_ready(&self) -> Result<bool> { self.pending.ready() }
+
+    /// Whether every request queued on this execution's stream has completed.
+    pub(crate) fn stream_idle(&self) -> Result<bool> {
+        // SAFETY: the owned stream is live for the worker's lifetime.
+        unsafe { self.library.cuda_stream_query(self.stream.raw) }
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -467,12 +640,34 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         include_shared: bool,
         stream: *mut c_void,
     ) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, include_shared, stream, None) }
+    }
+    /// Launch with the rows already in the transport's mapped request frame
+    /// instead of this execution's resident input buffer.
+    /// # Safety
+    /// Same contract as `launch`: `hidden` addresses `rows * row_bytes`
+    /// initialized wire rows on this execution's device, and the transport
+    /// retains that storage until the stream work that reads it completes.
+    pub(crate) unsafe fn launch_hidden(&mut self, rows: u32, hidden: *mut c_void) -> Result<()> {
+        unsafe { self.launch_hidden_on(rows, false, self.stream.raw, Some(hidden)) }
+    }
+    unsafe fn launch_hidden_on(
+        &mut self,
+        rows: u32,
+        include_shared: bool,
+        stream: *mut c_void,
+        hidden: Option<*mut c_void>,
+    ) -> Result<()> {
         ensure!(
             !include_shared || self.shared.is_some(),
             "shared output belongs on coordinator RTX"
         );
         let (kernel, slots, _) = self.execution_state(rows)?;
-        let args = V41ExpertLaunchArgs::new(kernel.info(), *slots, rows, stream)?;
+        let mut pointers = *slots;
+        if let Some(hidden) = hidden {
+            pointers[0] = hidden;
+        }
+        let args = V41ExpertLaunchArgs::new(kernel.info(), pointers, rows, stream)?;
         unsafe {
             kernel.launch(&args)?;
         }
@@ -520,7 +715,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         let captured = unsafe { self.library.cuda_graph_end_capture(self.stream.raw) };
         match (launch, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows, include_shared));
+                self.graph = Some((graph, rows, include_shared, self.kernel.info().role,
+                    self.kernel.info().logical_intermediate));
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -537,7 +733,9 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// The captured rows' inputs (and optional shared output) must satisfy launch's
     /// contract, with writes ordered before replay and reads ordered after it.
     pub unsafe fn replay(&mut self) -> Result<()> {
-        let (graph, _, _) = self.graph.context("expert graph has not been captured")?;
+        let (graph, _, _, role, width) = self.graph.context("expert graph has not been captured")?;
+        ensure!(role == self.kernel.info().role && width == self.kernel.info().logical_intermediate,
+            "captured expert graph belongs to a different width state");
         unsafe { self.library.cuda_graph_launch(graph, self.stream.raw) }
     }
 }
@@ -546,7 +744,7 @@ impl Drop for ExpertExecution<'_, '_> {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error,"draining V4.1 expert execution");
         }
-        if let Some((graph, _, _)) = self.graph.take() {
+        if let Some((graph, _, _, _, _)) = self.graph.take() {
             if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
                 tracing::error!(%error,"destroying V4.1 expert execution graph");
             }
@@ -642,6 +840,23 @@ impl ExpertExecution<'_, '_> {
         Ok(Some(response))
     }
 
+    /// # Safety
+    /// Transport retains mapped request/reply frames until this unit's fence and send complete.
+    pub(crate) unsafe fn execute_mapped_payload(&mut self,
+        request: &cuteafd_transport::expert::BackboneRequest<'_>, executor_id: u64,
+        exchange: &mut HostExpertExchange, mapped: cuteafd_transport::ProtocolV2RequestDevicePayload)
+        -> Result<Option<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>>> {
+        let Some(slot) = mapped.response_slot else { return Ok(None) };
+        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        if !request.permits_device_response() || slot.bytes < prefix + bytes { return Ok(None); }
+        // SAFETY: validated output range is inside the exclusively retained frame.
+        let output = CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix).cast() }, bytes, ..slot };
+        let response = request.response_device(executor_id, output)?;
+        self.execute_request_output(request, executor_id, exchange, Some(output), Some(mapped.hidden_payload))?;
+        Ok(Some(response))
+    }
+
     /// Host fallback from a validated wire request to a compact BF16 rank response.
     /// The borrowed response prevents reuse of exchange storage until encoding/send ends.
     pub fn execute_host_request<'a>(
@@ -671,6 +886,7 @@ impl ExpertExecution<'_, '_> {
         ensure!(executor_id != 0, "native response needs executor identity");
         validate_live_rows(request.rows() as usize, self.live_capacity)?;
         request.require_input_dtype(self.kernel.info().input_dtype)?;
+        let stage = self.pending.next_slot()?;
         let routes = request.rows() as usize * cuteafd_core::expert_geometry().topk as usize;
         let bytes = request.plane_bytes()?;
         ensure!(
@@ -698,16 +914,16 @@ impl ExpertExecution<'_, '_> {
             cfg!(target_endian = "little"),
             "native host exchange requires little-endian storage"
         );
-        // Every earlier request drained this stream before emitting its response
-        // (and bind_layer drains on rebind), so all three inputs are enqueued
-        // back to back with no host wait: the hidden rows as a device copy from
-        // the mapped request frame when the transport exposes one, and the route
-        // ids/weights from pinned staging.
+        // Every copy follows the preceding unit's consumers on this stream.
+        // Mapped sources stay transport-owned; converted routes stay in this
+        // unit's pinned staging until its own completion fence.
         let hidden_bytes = request.hidden().len();
-        ensure!(routes * 8 <= self.route_staging.buffer.bytes && hidden_bytes <= self.hidden.buffer.bytes,
+        ensure!(routes * 8 <= self.route_staging[stage].buffer.bytes && hidden_bytes <= self.hidden.buffer.bytes,
             "native request staging is too small");
         {
-            let staging = self.route_staging.bytes_mut();
+            let staging = self.route_staging[stage].bytes_mut();
+            // SAFETY: both typed route arrays contain `routes` initialized values;
+            // their byte views do not overlap the exclusively borrowed staging.
             unsafe {
                 staging[..routes * 4].copy_from_slice(
                     std::slice::from_raw_parts(exchange.ids.as_ptr().cast::<u8>(), routes * 4));
@@ -715,17 +931,29 @@ impl ExpertExecution<'_, '_> {
                     std::slice::from_raw_parts(exchange.routing.as_ptr().cast::<u8>(), routes * 4));
             }
         }
+        let device = self.hidden.buffer.device_id;
+        let mut in_frame = None;
         let uploaded = (|| -> Result<()> { unsafe {
+            // The unit's pace starts before its input copies (#762).
+            self.pending.arrive(self.stream.raw)?;
             match hidden_view.filter(|view| view.bytes >= hidden_bytes) {
+                // The kernel reads the rows from its input pointer exactly as
+                // it would read the resident copy, and the transport retains
+                // the frame until this unit's fence, so an aligned same-device
+                // view is input storage: read it where it landed and skip the
+                // LPDDR-to-LPDDR copy pass.
+                Some(view) if view.ptr as usize % 16 == 0 && view.device_id == device =>
+                    in_frame = Some(view.ptr),
                 Some(view) => self.library.copy_d2d_async(self.hidden.buffer,
                     CuteafdDeviceBuffer { bytes: hidden_bytes, ..view }, hidden_bytes, self.stream.raw)?,
                 None => self.library.copy_h2d_async(self.hidden.buffer, request.hidden(), self.stream.raw)?,
             }
-            let mut ids = self.route_staging.buffer; ids.bytes = routes * 4;
-            self.library.copy_host_buffer_h2d_async(self.ids.buffer, ids, routes * 4, self.stream.raw)?;
-            let mut weights = self.route_staging.buffer;
+            let mut ids = self.route_staging[stage].buffer; ids.bytes = routes * 4;
+            let mut weights = self.route_staging[stage].buffer;
             weights.ptr = weights.ptr.cast::<u8>().add(routes * 4).cast(); weights.bytes = routes * 4;
-            self.library.copy_host_buffer_h2d_async(self.routing.buffer, weights, routes * 4, self.stream.raw)?;
+            self.library.copy_host_buffers_h2d_batch_async(
+                &[self.ids.buffer, self.routing.buffer], &[ids, weights],
+                &[routes * 4, routes * 4], self.stream.raw)?;
             Ok(())
         } })();
         if let Err(error) = uploaded { self.synchronize()?; return Err(error); }
@@ -738,14 +966,19 @@ impl ExpertExecution<'_, '_> {
         // SAFETY: this worker retains events, inputs and stream through the barrier below.
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(0, self.stream.raw)?; }
-            self.launch(request.rows(), false)?;
+            match in_frame {
+                Some(hidden) => self.launch_hidden(request.rows(), hidden)?,
+                None => self.launch(request.rows(), false)?,
+            }
         }
         if let Some(timing) = &self.timing {
             unsafe {
                 timing.record(1, self.stream.raw)?;
             }
         }
-        let output = destination.unwrap_or(self
+        let compressed = request.output_dtype() != cuteafd_transport::ExpertV2Dtype::Bf16;
+        ensure!(!compressed || destination.is_some(), "compressed replies require a mapped response slot");
+        let output = destination.filter(|_| !compressed).unwrap_or(self
             .compact_output
             .as_ref()
             .context("missing compact output")?
@@ -763,6 +996,11 @@ impl ExpertExecution<'_, '_> {
                         output.ptr.cast(), request.rows(), self.stream.raw)?,
             }
         }
+        if compressed {
+            // SAFETY: BF16 scratch and mapped destination live through the unit fence below.
+            unsafe { self.reply_codec.as_ref().context("missing reply codec")?.quantize(request,
+                output, destination.context("missing compressed destination")?, request.rows() as usize, self.stream.raw)?; }
+        }
         if let Some(timing) = &self.timing {
             unsafe {
                 timing.record(2, self.stream.raw)?;
@@ -771,6 +1009,13 @@ impl ExpertExecution<'_, '_> {
         // SAFETY: the reducer and kernel precede this end event on the owned stream.
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
+        }
+        // This unit's fence releases its mapped I/O independently of later
+        // requests already queued on the same stream.
+        if self.deferred && destination.is_some() {
+            // SAFETY: all copies, math and output writes precede this unit fence.
+            unsafe { self.pending.record((request.request_id(), request.layer(), request.rows(), executor_id), self.stream.raw)?; }
+            return Ok(());
         }
         self.synchronize()?;
         if let Some(timing) = &mut self.worker_timing {
@@ -862,15 +1107,15 @@ mod capacity_tests {
 #[cfg(test)]
 mod timing_role_tests {
     /// The timing gate is the same predicate that selects the compact output
-    /// and reducer, so the Spark shard families (roles 5/6/7) and the legacy
+    /// and reducer, so the Spark shard families (roles 5/6/7/8) and the legacy
     /// grouped Spark TP4 (role 1) all publish the routed breakdown; the dSpark,
     /// full-width RTX and RTX TP2 roles do not.
     #[test]
     fn routed_timing_is_enabled_for_the_compact_output_roles() {
-        for role in [1u32, 5, 6, 7] {
+        for role in [1u32, 5, 6, 7, 8] {
             assert!(super::compact_output_role(role), "role {role} must be timed");
         }
-        for role in [0u32, 2, 3, 4, 8, u32::MAX] {
+        for role in [0u32, 2, 3, 4, 9, u32::MAX] {
             assert!(!super::compact_output_role(role), "role {role} must not be timed");
         }
     }

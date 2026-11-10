@@ -61,6 +61,11 @@ pub struct KimiK3Config {
 }
 
 impl KimiK3Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str {
+        crate::plan::Family::id(&crate::plan::families::kimi::KIMI_K3)
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self> {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
     }

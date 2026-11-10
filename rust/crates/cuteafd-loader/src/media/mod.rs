@@ -1,16 +1,36 @@
 //! CPU media preparation. V4.1 deliberately keeps its original processor and identity.
 pub mod audio;
 pub mod audio_tower;
+pub mod pcm_audio;
 mod decode;
 mod exif;
+mod muse;
+pub mod muse_vision;
 mod resize;
 mod spans;
+
+/// Bundled audio execution selected by the checkpoint's declaration, not its LM family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTowerKind { MimoRvq, MusePcm }
+impl AudioTowerKind {
+    pub fn from_config(config: &serde_json::Value) -> std::result::Result<Option<Self>, String> {
+        let Some(audio) = config.get("audio_config").filter(|value| !value.is_null()) else { return Ok(None) };
+        if !audio.is_object() { return Err("audio_config must be an object".into()); }
+        match audio.get("model_type") {
+            Some(kind) if kind == "muse_spark_audio" => Ok(Some(Self::MusePcm)),
+            Some(kind) => Err(format!("unsupported bundled audio_config.model_type {kind}; add a tower exporter/kernel")),
+            None if config["model_type"] == "mimo_v2" => Ok(Some(Self::MimoRvq)),
+            None => Err(format!("unsupported bundled audio_config without model_type for root {}; add a tower exporter/kernel",
+                config["model_type"])),
+        }
+    }
+}
 
 pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use spans::{ExpandedMediaPrompt, SpanExpander};
+pub use spans::{ExpandedMediaPrompt, MistralSpanExpander, SpanExpander};
 use std::{path::Path, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +62,8 @@ pub struct ImageGrid {
 #[derive(Debug, Clone)]
 pub struct PreparedImage {
     pub key: ImageKey,
+    pub encoder: EncoderId,
+    pub processor: PreprocessId,
     /// ViT patch grid, not the merged LM grid; t=1 for still images.
     pub grid: ImageGrid,
     pub rgb8: Arc<[u8]>,
@@ -84,10 +106,16 @@ pub enum ImageFamily {
     Mimo,
     Qwen,
     GlmFlash,
+    Muse,
+    /// Mistral Large 4's Pixtral processor: longest edge 1540, 28-pixel merged
+    /// cells, no temporal axis and no pad canvas.
+    Mistral,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
+    #[serde(default, skip_serializing_if = "Resample::is_bicubic")]
+    pub resample: Resample,
     pub family: ImageFamily,
     pub patch: u32,
     pub merge: u32,
@@ -102,16 +130,32 @@ pub struct ProcessorConfig {
 }
 /// Largest Qwen merged image admitted by the calibrated BF16 tower.
 pub const QWEN_MAX_IMAGE_TOKENS: usize = 1024;
+/// Mistral Large 4's processor `size.longest_edge` (= params.json `max_image_size`).
+pub const MISTRAL_LONGEST_EDGE: u64 = 1540;
+/// Mistral's LM span at the longest edge: 55 merged rows of 55 `[IMG]` plus a
+/// `[IMG_BREAK]`/`[IMG_END]` each.
+pub const MISTRAL_MAX_IMAGE_TOKENS: usize = 55 * 56;
 const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub use resize::Resample;
+
 impl ProcessorConfig {
+    pub fn token_geometry(&self) -> cuteafd_core::media::ImageTokenGeometry {
+        cuteafd_core::media::ImageTokenGeometry { merge: self.merge,
+            row_markers: u32::from(self.family == ImageFamily::Mistral) }
+    }
+
     pub fn for_family(family: ImageFamily) -> Self {
         let (patch, min_pixels, max_pixels, mean, std) = match family {
             ImageFamily::Mimo => (16, 3136, 12_845_056, CLIP_MEAN, CLIP_STD),
             ImageFamily::Qwen => (16, 65_536, 16_777_216, [0.5; 3], [0.5; 3]),
             ImageFamily::GlmFlash => (14, 16, 8000, CLIP_MEAN, CLIP_STD),
+            ImageFamily::Muse => (14, 1, 4096, [0.5; 3], [0.5; 3]),
+            // Longest edge in pixels (min/max are edge bounds for Mistral).
+            ImageFamily::Mistral => (14, 1, MISTRAL_LONGEST_EDGE, CLIP_MEAN, CLIP_STD),
         };
         Self {
+            resample: if family == ImageFamily::Muse { Resample::Lanczos } else { Resample::Bicubic },
             family,
             patch,
             merge: 2,
@@ -120,7 +164,11 @@ impl ProcessorConfig {
             std,
             min_pixels,
             max_pixels,
-            max_image_tokens: if family == ImageFamily::Qwen { QWEN_MAX_IMAGE_TOKENS } else { 4096 },
+            max_image_tokens: match family {
+                ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
+                ImageFamily::Mistral => MISTRAL_MAX_IMAGE_TOKENS,
+                _ => 4096,
+            },
             decode: DecodePolicy::default(),
         }
     }
@@ -129,7 +177,7 @@ impl ProcessorConfig {
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
         // GLM's standard HF snapshot embeds image/video processors in this file.
         // MiMo/Qwen keep their existing AutoProcessor precedence unchanged.
-        let file = if family == ImageFamily::GlmFlash {
+        let file = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse | ImageFamily::Mistral) {
             "processor_config.json"
         } else {
             "preprocessor_config.json"
@@ -138,7 +186,7 @@ impl ProcessorConfig {
             .map_err(|e| MediaError::Config(e.to_string()))?;
         let document: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| MediaError::Config(e.to_string()))?;
-        let value = if family == ImageFamily::GlmFlash {
+        let value = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse | ImageFamily::Mistral) {
             document.get("image_processor").filter(|v| v.is_object()).ok_or_else(|| {
                 MediaError::Config("processor_config.json requires image_processor object".into())
             })?
@@ -146,6 +194,9 @@ impl ProcessorConfig {
             &document
         };
         let mut config = Self::for_family(family);
+        if family == ImageFamily::Mistral {
+            return Self::mistral_from(&document, value, config);
+        }
         for (name, dest) in [
             ("patch_size", &mut config.patch),
             ("merge_size", &mut config.merge),
@@ -169,7 +220,7 @@ impl ProcessorConfig {
                     .map_err(|e| MediaError::Config(format!("{name}: {e}")))?;
             }
         }
-        let (min_name, max_name) = if family == ImageFamily::GlmFlash {
+        let (min_name, max_name) = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
             ("min_image_tokens", "max_image_tokens")
         } else {
             ("min_pixels", "max_pixels")
@@ -179,7 +230,7 @@ impl ProcessorConfig {
             (max_name, "longest_edge", &mut config.max_pixels),
         ] {
             let v = value.get(name).or_else(|| {
-                if family == ImageFamily::GlmFlash {
+                if matches!(family, ImageFamily::GlmFlash | ImageFamily::Muse) {
                     None
                 } else {
                     value.get("size").and_then(|s| s.get(size_name))
@@ -191,17 +242,65 @@ impl ProcessorConfig {
                 })?;
             }
         }
-        if value.get("resample").is_some_and(|v| v.as_u64() != Some(3)) {
-            return Err(MediaError::Config(
-                "only the gated Pillow bicubic resampler is supported".into(),
-            ));
+        if let Some(value) = value.get("resample") {
+            config.resample = match value.as_u64() {
+                Some(3) => Resample::Bicubic,
+                Some(1) => Resample::Lanczos,
+                _ => return Err(MediaError::Config("unsupported Pillow resampler".into())),
+            };
         }
+        if family == ImageFamily::Muse {
+            config.max_image_tokens = usize::try_from(config.max_pixels)
+                .map_err(|_| MediaError::Config("Muse image token budget overflow".into()))?;
+            for name in ["do_convert_rgb", "do_normalize", "do_rescale", "do_resize"] {
+                if value.get(name).is_some_and(|v| v.as_bool() != Some(true)) {
+                    return Err(MediaError::Config(format!("Muse requires {name}=true")));
+                }
+            }
+            if value.get("rescale_factor").is_some_and(|v| v.as_f64() != Some(1.0 / 255.0)) {
+                return Err(MediaError::Config("Muse requires rescale_factor=1/255".into()));
+            }
+            if config.patch != 14 || config.merge != 2 || config.temporal != 2
+                || config.max_image_tokens > 4096 {
+                return Err(MediaError::Config("unsupported Muse processor geometry or token cap".into()));
+            }
+        }
+        config.validate()?;
+        Ok(config)
+    }
+    /// PixtralImageProcessor (HF): `patch_size`, `size.longest_edge`, mean/std,
+    /// bicubic; the processor's `spatial_merge_size` sets the 28-pixel cell.
+    fn mistral_from(document: &serde_json::Value, value: &serde_json::Value, mut config: Self) -> Result<Self> {
+        let int = |v: &serde_json::Value, name: &str| v.as_u64().and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| MediaError::Config(format!("{name} must be a positive integer")));
+        config.patch = int(&value["patch_size"], "patch_size")?;
+        config.merge = int(&document["spatial_merge_size"], "spatial_merge_size")?;
+        config.max_pixels = value["size"]["longest_edge"].as_u64()
+            .ok_or_else(|| MediaError::Config("size.longest_edge must be a positive integer".into()))?;
+        for (name, dest) in [("image_mean", &mut config.mean), ("image_std", &mut config.std)] {
+            *dest = serde_json::from_value(value[name].clone()).map_err(|e| MediaError::Config(format!("{name}: {e}")))?;
+        }
+        if value["resample"].as_u64() != Some(3) || value["do_resize"] != true || value["do_normalize"] != true
+            || value["do_rescale"] != true || value["rescale_factor"].as_f64() != Some(1.0 / 255.0)
+            || value["do_convert_rgb"] != true {
+            return Err(MediaError::Config("Pixtral processor must rescale 1/255, normalize and resize bicubic".into()));
+        }
+        // The token cap follows the checkpoint's own longest edge.
+        let cells = config.max_pixels.div_ceil(u64::from(config.patch * config.merge)) as usize;
+        config.max_image_tokens = cells * (cells + 1);
         config.validate()?;
         Ok(config)
     }
     pub fn with_detail(&self, low: bool) -> Self {
         let mut config = self.clone();
-        if low {
+        if low && config.family == ImageFamily::Mistral {
+            // Pixtral bounds the edge, not the count: the largest edge whose
+            // span (cells * (cells + 1)) stays within 256 rows.
+            let cell = u64::from(config.patch * config.merge);
+            let cells = (1..).take_while(|c: &u64| c * (c + 1) <= 256).last().unwrap_or(1);
+            config.max_pixels = config.max_pixels.min(cells * cell);
+            config.max_image_tokens = (cells * (cells + 1)) as usize;
+        } else if low {
             config.max_image_tokens = config.max_image_tokens.min(256);
         }
         config
@@ -223,6 +322,9 @@ impl ProcessorConfig {
                 "invalid processor geometry, budget or normalization".into(),
             ));
         }
+        if self.family == ImageFamily::Mistral {
+            return Ok(());
+        }
         let budget = self.effective_max();
         if self.min_pixels > budget {
             return Err(MediaError::Config(
@@ -234,7 +336,7 @@ impl ProcessorConfig {
     fn effective_max(&self) -> u64 {
         let cap = self.max_image_tokens as u64;
         self.max_pixels
-            .min(if self.family == ImageFamily::GlmFlash {
+            .min(if matches!(self.family, ImageFamily::GlmFlash | ImageFamily::Muse) {
                 cap
             } else {
                 cap * u64::from(self.patch * self.merge).pow(2)
@@ -242,7 +344,10 @@ impl ProcessorConfig {
     }
     pub fn id(&self) -> PreprocessId {
         let mut hash = Sha256::new();
-        hash.update(b"cuteafd-preprocess-v1:pillow-bicubic");
+        hash.update(match self.resample {
+            Resample::Bicubic => b"cuteafd-preprocess-v1:pillow-bicubic".as_slice(),
+            Resample::Lanczos => b"cuteafd-preprocess-v1:pillow-lanczos".as_slice(),
+        });
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
         PreprocessId(hash.finalize().into())
     }
@@ -254,7 +359,12 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::GlmFlash {
+        if self.family == ImageFamily::Muse {
+            muse::resize_shape(height, width, factor, self.effective_max() as u32)
+                .ok_or_else(|| invalid("Muse resize dimensions overflow"))
+        } else if self.family == ImageFamily::Mistral {
+            Ok(mistral_resize(height, width, factor, self.max_pixels))
+        } else if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
         } else {
             qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
@@ -279,6 +389,26 @@ fn qwen_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Resu
     }
     Ok((rh as u32, rw as u32))
 }
+/// HF `get_resize_output_image_size` (Pixtral): scale so the longest side is
+/// at most `longest` (floor, unlike mistral_common's round), then each side to
+/// whole `factor` cells: `(side - 1) // factor + 1`.
+fn mistral_resize(height: u32, width: u32, factor: u32, longest: u64) -> (u32, u32) {
+    let (mut h, mut w) = (f64::from(height), f64::from(width));
+    let ratio = (h / longest as f64).max(w / longest as f64);
+    if ratio > 1.0 {
+        h = (h / ratio).floor();
+        w = (w / ratio).floor();
+    }
+    let cells = |side: f64| ((side as u64).saturating_sub(1) / u64::from(factor) + 1) as u32;
+    (cells(h) * factor, cells(w) * factor)
+}
+
+/// Mistral's merged grid `(rows, columns)` and LM span length `rows * (columns + 1)`.
+pub fn mistral_span(grid: ImageGrid, merge: u32) -> (usize, usize, usize) {
+    cuteafd_core::media::ImageTokenGeometry { merge, row_markers: 1 }
+        .extent([grid.t, grid.h, grid.w]).unwrap_or((0, 0, 0))
+}
+
 fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
     let align = |v: u64| v.div_ceil(u64::from(factor)) * u64::from(factor);
     let f2 = u64::from(factor).pow(2);
@@ -324,8 +454,8 @@ impl ImageProcessor for ProcessorConfig {
         if image.data.len() != image.width as usize * image.height as usize * 3 {
             return Err(invalid("RGB byte extent differs from dimensions"));
         }
-        let tokens = (height / (self.patch * self.merge)) as usize
-            * (width / (self.patch * self.merge)) as usize;
+        let (_, _, tokens) = self.token_geometry().extent([1, height / self.patch, width / self.patch])
+            .ok_or_else(|| invalid("image grid differs from processor merge geometry"))?;
         if tokens == 0 || tokens > self.max_image_tokens {
             return Err(invalid("official resize exceeds the image token cap"));
         }
@@ -347,7 +477,7 @@ impl ImageProcessor for ProcessorConfig {
                 .floor()
                 .max(1.0)
                 .min(f64::from(width)) as u32;
-            let content = resize::resize_bicubic(&image, cw, ch);
+            let content = resize::resize(&image, cw, ch, self.resample);
             let mut data = vec![0; width as usize * height as usize * 3];
             for y in 0..ch as usize {
                 data[y * width as usize * 3..y * width as usize * 3 + cw as usize * 3]
@@ -359,23 +489,18 @@ impl ImageProcessor for ProcessorConfig {
                 data,
             }
         } else {
-            resize::resize_bicubic(&image, width, height)
+            resize::resize(&image, width, height, self.resample)
         };
         let grid = ImageGrid {
             t: 1,
             h: height / self.patch,
             w: width / self.patch,
         };
-        let mut hash = Sha256::new();
-        hash.update(b"cuteafd-image-v1");
-        hash.update(encoder.0);
-        hash.update(self.id().0);
-        for dim in [grid.t, grid.h, grid.w] {
-            hash.update(dim.to_le_bytes());
-        }
-        hash.update(&rgb.data);
+        let processor = self.id();
         Ok(PreparedImage {
-            key: ImageKey(hash.finalize().into()),
+            key: PreparedImage::key_for(encoder, processor, grid, &rgb.data),
+            encoder,
+            processor,
             grid,
             rgb8: rgb.data.into(),
             tokens,
@@ -384,6 +509,17 @@ impl ImageProcessor for ProcessorConfig {
 }
 
 impl PreparedImage {
+    /// Rebind input identity without changing the admitted encoder's cache key.
+    pub fn key_for(encoder: EncoderId, processor: PreprocessId, grid: ImageGrid, rgb: &[u8]) -> ImageKey {
+        let mut hash = Sha256::new();
+        hash.update(b"cuteafd-image-v1");
+        hash.update(encoder.0);
+        hash.update(processor.0);
+        for dim in [grid.t, grid.h, grid.w] { hash.update(dim.to_le_bytes()); }
+        hash.update(rgb);
+        ImageKey(hash.finalize().into())
+    }
+
     /// Reference-compatible f32 patches. The encoder's RGB8/LUT path avoids
     /// constructing this large array; qualification uses it to check layout.
     pub fn patches(&self, config: &ProcessorConfig) -> Result<Vec<f32>> {
@@ -411,6 +547,26 @@ impl PreparedImage {
             })
         });
         let mut out = Vec::with_capacity(gh * gw * 3 * t * p * p);
+        if config.family == ImageFamily::Muse {
+            // Muse patch rows are raster ordered, with temporal then channel
+            // inside each patch; spatial merging happens after the encoder.
+            for row in 0..gh {
+                for column in 0..gw {
+                    for _ in 0..t {
+                        for (channel, table) in lut.iter().enumerate() {
+                            for py in 0..p {
+                                for px in 0..p {
+                                    let y = row * p + py;
+                                    let x = column * p + px;
+                                    out.push(table[self.rgb8[(y * gw * p + x) * 3 + channel] as usize]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
         for bh in 0..gh / m {
             for bw in 0..gw / m {
                 for mh in 0..m {

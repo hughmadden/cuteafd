@@ -4,7 +4,7 @@ use crate::shared::memory::device::{Device, DeviceOwner};
 mod placement;
 mod distributed;
 pub(crate) use distributed::{DistributedExecution, PendingDistributedProduction};
-pub(crate) use placement::PlacedProducerWaves;
+pub(crate) use placement::{PlacedProducerStorage, PlacedProducerWaves};
 use crate::families::deepseek_v41::v41_backbone_lane::{BackboneLane, LaneFfn, PendingLaneFfn};
 use crate::families::deepseek_v41::v41_backbone_router::ExpertRow;
 use crate::families::deepseek_v41::v41_compressor::{CompressorWave, CompressorWeights};
@@ -33,6 +33,24 @@ pub(crate) struct PreparedLayer<'l, 'w, 'a> {
     produced_us: u64,
     indexed_us: u64,
     attended_us: u64,
+}
+/// Completed attention with no borrowed lane storage. Re-entry validates the
+/// original query binding before exposing any slot-owned FFN input.
+pub(crate) struct UnitPreparedLayer {
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+    cooperative: bool,
+    rows: Vec<ExpertRow>,
+    batch: u64,
+    layer: usize,
+    started: std::time::Instant,
+    produced_us: u64,
+    indexed_us: u64,
+    attended_us: u64,
+}
+pub(crate) struct UnitPendingLayer {
+    prepared: UnitPreparedLayer,
+    pending: crate::families::deepseek_v41::v41_backbone_lane::LaneUnitFfn,
+    shared_tp: usize,
 }
 pub(crate) struct CompletedLayer<'t> {
     result: NativeFfnOutput<'t>,
@@ -73,7 +91,65 @@ impl CompletedLayer<'_> {
             finish_us=total_us-self.experts_us, total_us, "verification layer cost");
     }
 }
+impl UnitPendingLayer {
+    /// # Safety
+    /// Preserve the original unit's buffers until this FIFO ticket completes.
+    pub async unsafe fn land<'t, 'l>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'l>, link: &'t mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'l>) -> Result<CompletedLayer<'t>> {
+        let result = unsafe { lane.land_unit(transport, link, self.pending).await? };
+        let prepared = self.prepared;
+        Ok(CompletedLayer { result, batch: prepared.batch, layer: prepared.layer,
+            rows: prepared.rows.len(), routed_backend: "spark_tp4", shared_tp: self.shared_tp,
+            started: prepared.started, produced_us: prepared.produced_us,
+            indexed_us: prepared.indexed_us, attended_us: prepared.attended_us,
+            experts_us: prepared.started.elapsed().as_micros() as u64 })
+    }
+}
+impl UnitPreparedLayer {
+    /// # Safety
+    /// The original lane's input and shared result remain in this unit's slot
+    /// until `UnitPendingLayer::land` finishes or the pass is discarded.
+    pub async unsafe fn send<'a>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &mut NativeTp4Wave<'a>, link: &mut crate::families::deepseek_v41::v41_experts::coordinator::V41Link<'a>, placement: u64, image_mask: &[u8])
+        -> Result<UnitPendingLayer> {
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let pending = unsafe { ffn.send_unit(transport, link, placement, image_mask, &self.rows).await? };
+        Ok(UnitPendingLayer { prepared: self, pending, shared_tp })
+    }
+    /// # Safety
+    /// The original lane retains this unit's storage unchanged between hooks.
+    pub async unsafe fn execute<'t>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'_>, placement: u64, image_mask: &[u8])
+        -> Result<CompletedLayer<'t>> {
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let routed_backend = if transport.has_tp2_layer(self.layer) { "rtx_tp2" }
+            else if transport.has_local_layer(self.layer) { "rtx_local" } else { "spark_tp4" };
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let result = unsafe { ffn.execute_tp4(transport, placement, image_mask, &self.rows).await? };
+        Ok(CompletedLayer { result, batch: self.batch, layer: self.layer, rows: self.rows.len(),
+            routed_backend, shared_tp, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us: self.attended_us,
+            experts_us: self.started.elapsed().as_micros() as u64 })
+    }
+}
 impl PreparedLayer<'_, '_, '_> {
+    /// Finish the attention chain before releasing its borrow to the executor.
+    pub async fn into_unit(self) -> Result<UnitPreparedLayer> {
+        let (binding, attended_us) = match self.ffn {
+            PreparedFfn::Ready(ffn) => (ffn.input.binding(), self.attended_us),
+            PreparedFfn::Pending(pending) => {
+                let ffn = pending.complete().await?;
+                (ffn.input.binding(), self.started.elapsed().as_micros() as u64)
+            }
+        };
+        // A unit's router and shared-expert waits yield to the executor (the
+        // same kernels; only the wait differs): another unit issues meanwhile
+        // instead of the engine thread blocking on this unit's stream (#815).
+        Ok(UnitPreparedLayer { binding, cooperative: true, rows: self.rows, batch: self.batch,
+            layer: self.layer, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us })
+    }
     #[cfg(test)]
     pub async unsafe fn trace_ffn_input(mut self, library: &cuteafd_ffi::NativeLibrary,
         destination: cuteafd_ffi::CuteafdDeviceBuffer, stream: *mut std::ffi::c_void)
@@ -242,6 +318,38 @@ struct Produced {
     producer_us: u64,
     indexed: bool,
 }
+/// One RTX's cache-producer storage shared by every prefill slot
+/// (`shared::memory::row_window`): the window storage (one shared stream,
+/// each layer's proposal plane at the reserve) and one compressor storage per
+/// source layer's wave (one storage holding all four source layers' planes at
+/// the reserve, carry and plain scratch at the unit, one stream). A private
+/// pass builds its own with rows == unit (one compressor storage per layer).
+pub(crate) struct ProducerStorage<'a> {
+    windows: std::rc::Rc<crate::families::deepseek_v41::v41_window::WindowStorage<'a>>,
+    sources: Vec<std::rc::Rc<crate::families::deepseek_v41::v41_compressor::CompressorStorage<'a>>>,
+    /// Rows of each slot's window batch table (full-phase commits only).
+    batch_rows: usize,
+}
+impl<'a> ProducerStorage<'a> {
+    /// Planes over `rows` reserve rows, scratch for units of up to `unit` rows,
+    /// every wave on the storage's shared stream.
+    pub(crate) fn new(library: &'a NativeLibrary, rows: usize, unit: usize) -> Result<Self> {
+        Ok(Self {
+            windows: crate::families::deepseek_v41::v41_window::WindowStorage::new(library, rows, unit,
+                &(0..40).collect::<Vec<_>>(), true)?,
+            // One compressor storage for the four source layers: one stream
+            // orders every slot's productions, scratch is shared (WP2 contract).
+            sources: vec![crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+                library, rows, unit, &SOURCES)?; SOURCES.len()],
+            batch_rows: unit,
+        })
+    }
+}
+impl Clone for ProducerStorage<'_> {
+    fn clone(&self) -> Self {
+        Self { windows: self.windows.clone(), sources: self.sources.clone(), batch_rows: self.batch_rows }
+    }
+}
 pub(crate) struct BackboneExecution<'w, 'a> {
     weights: &'w CacheProducerWeights<'a>,
     windows: Vec<WindowWave<'w, 'a>>,
@@ -258,13 +366,15 @@ struct WindowBatch<'a> {
     library: &'a NativeLibrary,
     stream: crate::shared::memory::LoadStream<'a>,
     staging: crate::shared::memory::HostAllocation<'a>,
+    /// `CUTEAFD_V41_CHECK_STAGING`: the previous batch's upload ran.
+    staging_check: crate::shared::memory::staging_check::StagingCheck<'a>,
     table: crate::shared::memory::DeviceAllocation<'a>,
     kernel: cuteafd_ffi::V41KvStoreLayers<'a>,
     capacity: usize,
 }
 impl<'a> WindowBatch<'a> {
     const LAYERS: usize = 40;
-    const CHUNKS: usize = 16;
+    const CHUNKS: usize = cuteafd_core::V41_MAX_REQUESTS;
     fn bytes(capacity: usize) -> usize {
         Self::LAYERS * (std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>() + capacity * 8 + Self::CHUNKS * 16)
     }
@@ -274,6 +384,7 @@ impl<'a> WindowBatch<'a> {
             library,
             stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
             staging: crate::shared::memory::HostAllocation::new(library, bytes)?,
+            staging_check: crate::shared::memory::staging_check::StagingCheck::new(library, "V4.1 window batch", 1),
             table: crate::shared::memory::DeviceAllocation::new(library, bytes)?,
             kernel: library.v41_kv_store_layers()?,
             capacity,
@@ -285,15 +396,29 @@ impl<'a> WindowBatch<'a> {
     unsafe fn enqueue(&mut self, layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<()> {
         let rows = layers.first().context("empty window batch")?.destinations.len();
         let chunks = layers[0].ends.len();
-        ensure!(layers.len() <= Self::LAYERS && rows <= self.capacity && (1..=Self::CHUNKS).contains(&chunks)
+        self.staging_check.before_write(0)?;
+        let offset = Self::stage(self.staging.bytes_mut(), self.table.buffer.ptr as u64,
+            self.table.buffer.device_id, self.capacity, layers)?;
+        let mut host = self.staging.buffer; host.bytes = offset;
+        unsafe {
+            self.library.copy_host_buffer_h2d_async(self.table.buffer, host, offset, self.stream.raw)?;
+            self.staging_check.uploaded(0, self.stream.raw)?;
+            self.kernel.launch(self.table.buffer, layers.len(), rows, chunks, self.stream.raw)
+        }
+    }
+    fn stage(staging: &mut [u8], base: u64, device: i32, capacity: usize,
+        layers: &[crate::families::deepseek_v41::v41_window::BatchedWindowCommit]) -> Result<usize> {
+        let rows = layers.first().context("empty window batch")?.destinations.len();
+        let chunks = layers[0].ends.len();
+        ensure!(layers.len() <= Self::LAYERS && rows <= capacity && chunks <= rows
+            && (1..=Self::CHUNKS).contains(&chunks)
             && layers.iter().all(|l| l.destinations.len() == rows && l.ends.len() == chunks
-                && l.device == self.table.buffer.device_id),
-            "window batch shape differs");
+                && l.device == device), "window batch shape differs");
         let entry = std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>();
-        let base = self.table.buffer.ptr as u64;
+        let bytes = layers.len() * (entry + rows * 8 + chunks * 16);
+        ensure!(staging.len() >= bytes, "window batch staging too small");
         let mut offset = layers.len() * entry;
         let mut entries = Vec::with_capacity(layers.len());
-        let staging = self.staging.bytes_mut();
         for layer in layers {
             let mut value = layer.layer;
             value.destinations = base + offset as u64;
@@ -313,11 +438,7 @@ impl<'a> WindowBatch<'a> {
             let bytes = unsafe { std::slice::from_raw_parts((value as *const cuteafd_ffi::V41KvStoreLayer).cast::<u8>(), entry) };
             staging[i * entry..(i + 1) * entry].copy_from_slice(bytes);
         }
-        let mut host = self.staging.buffer; host.bytes = offset;
-        unsafe {
-            self.library.copy_host_buffer_h2d_async(self.table.buffer, host, offset, self.stream.raw)?;
-            self.kernel.launch(self.table.buffer, layers.len(), rows, chunks, self.stream.raw)
-        }
+        Ok(offset)
     }
     fn synchronize(&self) -> Result<()> {
         unsafe { self.library.cuda_stream_synchronize(self.stream.raw) }
@@ -396,9 +517,9 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         std::env::var("CUTEAFD_WINDOW_BATCH").map_or(true, |v| v != "0")
     }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let mut total = WindowWave::device_bytes(library, capacity)?
-            .checked_mul(40)
-            .context("window workspace budget overflow")?;
+        // One window storage: shared producer scratch, each layer's proposal plane.
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+            library, capacity as usize, capacity, 40)?;
         for layer in SOURCES {
             total = total
                 .checked_add(CompressorWave::device_bytes(layer, capacity as usize)?)
@@ -420,33 +541,45 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             Self::workspace_bytes(weights.library, capacity)? <= budget,
             "cache producer workspace exceeds budget"
         );
+        // A private pass: its layers share scratch, each wave keeps its own stream.
+        let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
+            capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>(), false)?;
+        let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
+            weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;
+        Self::on_storage(weights, ProducerStorage { windows, sources, batch_rows: capacity as usize })
+    }
+    /// Bytes of one prefill slot set's producer storage on one RTX
+    /// ([`ProducerStorage::new`]): window planes and compressed-source planes
+    /// at the `rows` reserve, scratch at the `unit` cap, and the window batch
+    /// table at the unit (only full-phase commits use it).
+    pub fn storage_bytes(library: &NativeLibrary, rows: u32, unit: u32) -> Result<usize> {
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+            library, rows as usize, unit, 40)?
+            + crate::families::deepseek_v41::v41_compressor::CompressorStorage::device_bytes(&SOURCES, rows as usize, unit as usize)?;
+        if Self::window_batch_enabled() { total += WindowBatch::bytes(unit as usize); }
+        Ok(total)
+    }
+    /// Every prefill slot's producers on one shared storage set
+    /// ([`ProducerStorage`]); `select_window` places each slot's unit.
+    pub fn on_storage(weights: &'w CacheProducerWeights<'a>, storage: ProducerStorage<'a>) -> Result<Self> {
+        ensure!(weights.placement.is_none(), "distributed producer weights require placed execution workspaces");
         ensure!(
-            weights.windows.len() == 40 && weights.sources.len() == 4,
+            weights.windows.len() == 40 && weights.sources.len() == SOURCES.len() && storage.sources.len() == SOURCES.len(),
             "cache producer weight owners incomplete"
         );
         let windows = weights
             .windows
             .iter()
-            .map(|w| {
-                w.wave(
-                    capacity,
-                    WindowWave::device_bytes(weights.library, capacity)?,
-                )
-            })
+            .map(|w| w.on_storage(storage.windows.clone()))
             .collect::<Result<Vec<_>>>()?;
         let sources = weights
             .sources
             .iter()
-            .zip(SOURCES)
-            .map(|(w, layer)| {
-                w.wave(
-                    capacity as usize,
-                    CompressorWave::device_bytes(layer, capacity as usize)?,
-                )
-            })
+            .zip(&storage.sources)
+            .map(|(w, storage)| w.on_storage(storage.clone()))
             .collect::<Result<Vec<_>>>()?;
         let window_batch = Self::window_batch_enabled()
-            .then(|| WindowBatch::new(weights.library, capacity as usize)).transpose()?;
+            .then(|| WindowBatch::new(weights.library, storage.batch_rows)).transpose()?;
         Ok(Self {
             weights,
             windows,
@@ -491,10 +624,27 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
         self.queued_production = None;
         self.progress = PassProgress::default();
     }
+    /// A failed or cancelled unit's producers back at rest: every pending
+    /// query and unconsumed proposal dropped (after its stream drains), so the
+    /// slot's next unit or non-unit work can select a window.
+    pub fn abort_queries(&mut self) -> Result<()> {
+        self.queued_production = None;
+        let mut result = Ok(());
+        for wave in &mut self.windows { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        for wave in &mut self.sources { if let Err(error) = wave.abort_query() { result = Err(error); } }
+        result
+    }
 
     pub fn restart_for(&mut self, stage: CacheStage) {
         self.queued_production = None;
         self.progress = PassProgress::for_stage(stage);
+    }
+    /// Selects this slot's unit rows in every producer's shared planes, at
+    /// rest (`shared::memory::row_window`).
+    pub(crate) fn select_window(&mut self, window: crate::shared::memory::row_window::RowWindow) -> Result<()> {
+        for wave in &mut self.windows { wave.select_window(window.clone())?; }
+        for wave in &mut self.sources { wave.select_window(window.clone())?; }
+        Ok(())
     }
     /// Publish source 20 after a complete reserved encoder chunk.
     /// # Safety
@@ -782,6 +932,43 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn window_batch_staging_covers_c64_and_short_rows() -> Result<()> {
+        use crate::families::deepseek_v41::v41_window::BatchedWindowCommit;
+        for count in [1, 16, 33, 64] {
+            for rows in [count, 2752] {
+                let layers: Vec<_> = (0..40).map(|layer| BatchedWindowCommit {
+                    destinations: (0..rows as u64).map(|row| row + layer * 10000).collect(),
+                    ends: (0..count as u64).map(|slot| (slot, 1000 + slot)).collect(),
+                    layer: cuteafd_ffi::V41KvStoreLayer { values: layer, scales: 2, cache: 3,
+                        cache_scales: 4, ends: 5, capacity: 8192, destinations: 0, end_pairs: 0 },
+                    device: 0,
+                }).collect();
+                let capacity = WindowBatch::bytes(rows);
+                let mut bytes = vec![0xa5; capacity + 16];
+                let used = WindowBatch::stage(&mut bytes[..capacity], 4096, 0, rows, &layers)?;
+                let entry = std::mem::size_of::<cuteafd_ffi::V41KvStoreLayer>();
+                let mut offset = layers.len() * entry;
+                for (i, layer) in layers.iter().enumerate() {
+                    let actual: Vec<_> = bytes[i * entry..(i + 1) * entry].chunks_exact(8)
+                        .map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
+                    assert_eq!(actual, [i as u64, 2, 3, 4, 5, 8192,
+                        4096 + offset as u64, 4096 + (offset + rows * 8) as u64]);
+                    let payload: Vec<_> = layer.destinations.iter().copied()
+                        .chain(layer.ends.iter().flat_map(|&(slot, end)| [slot, end]))
+                        .flat_map(u64::to_ne_bytes).collect();
+                    assert_eq!(&bytes[offset..offset + payload.len()], &payload);
+                    offset += payload.len();
+                }
+                assert_eq!(used, offset);
+                assert!(bytes[used..].iter().all(|&b| b == 0xa5));
+                let mut short = vec![0xa5; used - 1];
+                assert!(WindowBatch::stage(&mut short, 4096, 0, rows, &layers).is_err());
+                assert!(short.iter().all(|&b| b == 0xa5));
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn window_batch_inventory_matches_device_descriptor_storage() -> Result<()> {
         for rows in [1, 80, 256, 1024, 4096] {
             assert_eq!(WindowBatch::bytes(rows) as u64,
@@ -851,3 +1038,12 @@ mod tests {
 #[cfg(test)]
 #[path = "v41_backbone_execution/distributed_tests.rs"]
 mod distributed_tests;
+
+#[cfg(test)]
+impl CacheProducerWeights<'_> {
+    pub(crate) fn visit(&self, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
+        for (layer, w) in self.windows.iter().enumerate() { w.visit(&format!("gpu{}.window{layer}.", w.device.id), f); }
+        for (i, w) in self.sources.iter().enumerate() { w.visit(&format!("gpu{}.compressor{i}.", w.device.id), f); }
+        for s in &self._sinks { s.visit(&format!("gpu{}.sinks.", s.device.id), f); }
+    }
+}

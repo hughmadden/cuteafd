@@ -9,7 +9,7 @@ use super::{
 };
 use crate::shared::{
     memory::device::{Allocation, Device},
-    spark_intake::SparkDeviceLink,
+    spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{programs::Programs, CuteafdDeviceBuffer};
@@ -86,6 +86,7 @@ impl<'a> TargetChain<'a> {
         let mut bytes = weights
             .checked_add(contract.rope_tables.allocation_bytes)
             .context("chain rope overflow")?;
+        let catalog = (count > 3).then(|| cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)).transpose()?;
         let mut routed = Vec::new();
         for layer in &contract.layers[..count] {
             let workspace = if layer.sliding.is_some() {
@@ -99,7 +100,11 @@ impl<'a> TargetChain<'a> {
                     .workspace_bytes()
             } else {
                 let plan =
-                    RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?;
+                    RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?
+                        .with_bf16_input({
+                            let catalog = catalog.as_ref().context("Step-5 routed expert headers missing")?;
+                            super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer.layer)?
+                        });
                 let workspace = plan.workspace_bytes();
                 routed.push(Some(plan));
                 workspace
@@ -127,6 +132,7 @@ impl<'a> TargetChain<'a> {
         rows: usize,
         available: u64,
         reservations: &[u64],
+        kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     ) -> Result<Self> {
         let (bytes, routed) = Self::plan(programs, checkpoint, count, rows)?;
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
@@ -157,8 +163,7 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[],
-                )?)
+                    &[], kv_format)?)
             } else {
                 Attention::Sparse(CsaLayer::load(
                     device,
@@ -168,8 +173,7 @@ impl<'a> TargetChain<'a> {
                     rows,
                     Some(rope.clone()),
                     available,
-                    &[],
-                )?)
+                    &[], kv_format)?)
             };
             let routed = plan
                 .map(|p| RoutedFfn::load(device, programs, checkpoint, id, p))
@@ -213,8 +217,7 @@ impl<'a> TargetChain<'a> {
         step: &mut Step<'e, 'a, E>,
         rank: usize,
         input: &'e Allocation<'a>,
-        link: Option<&'e SparkDeviceLink<'a>>,
-        kind: u32,
+        link: Option<(&'e std::cell::RefCell<SparkLink<'a>>, super::routed::GateRequest)>,
     ) -> Result<()> {
         ensure!(
             rank == 0,
@@ -222,9 +225,9 @@ impl<'a> TargetChain<'a> {
         );
         ensure!(
             !self.layers.iter().any(|l| l.routed.is_some()) || link.is_some(),
-            "Step-5 routed chain needs device expert link"
+            "Step-5 routed chain needs an expert link"
         );
-        if let Some(link) = link {
+        if let Some((link, _)) = link {
             step.compose(rank, link, |_, _| Ok(()))?;
         }
         step.compose(rank, input, |owner, meta| {
@@ -283,12 +286,8 @@ impl<'a> TargetChain<'a> {
                             )
                         }
                     })?;
-                    ffn.enqueue_on(
-                        meta.rows,
-                        kind,
-                        link.context("Step-5 expert link")?,
-                        meta.stream,
-                    )
+                    let (link, request) = link.context("Step-5 expert link")?;
+                    ffn.enqueue_on(meta.rows, link, request, meta.stream)
                 })?;
             }
             source = output;
@@ -309,7 +308,7 @@ mod tests {
     use cuteafd_engine::prefix::{PrefixCache, PrefixConfig, PrefixFamily};
     use cuteafd_hostcache::copy::StubCopyEngine;
     use cuteafd_transport::{
-        expert::{DeviceBuild, SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+        expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
         worker_selection::ModelAdmission,
         ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
         ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
@@ -317,6 +316,7 @@ mod tests {
     use serde_json::Value;
     use sha2::{Digest, Sha256};
     use std::{cell::RefCell, path::Path};
+    use super::super::routed::GateRequest;
 
     const H: usize = 4096;
     const REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
@@ -515,6 +515,7 @@ mod tests {
     fn request(
         layer: usize,
         rows: usize,
+        dtype: ExpertV2Dtype,
         routes: Vec<ExpertProtocolV2RouteEntry>,
         wire: bytes::Bytes,
     ) -> Result<ExpertProtocolV2Request> {
@@ -523,7 +524,7 @@ mod tests {
             17,
             layer as u32,
             H as u32,
-            ExpertV2Dtype::Bf16,
+            dtype,
             (0..rows as u32)
                 .map(|row| ExpertProtocolV2RowDescriptor {
                     row_id: row as u64,
@@ -541,16 +542,16 @@ mod tests {
         Ok(request)
     }
 
-    fn link<'a>(device: Device<'a>, snapshot: &Path, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
-        use crate::shared::placement::{spark_rings, SparkAdmission};
+    fn link<'a>(device: Device<'a>, snapshot: &Path, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
+        use crate::shared::placement::SparkAdmission;
         let peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?
             .split(',')
             .map(str::parse)
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let world = SparkWorld::canonical(peers.len())?;
         ensure!(
-            [4, 6].contains(&peers.len()) && world.supports_device_exchange(),
-            "chain gate requires canonical TP4 or TP6"
+            cuteafd_core::tp_units::spark_package_worlds("step5", "fp8").contains(&peers.len()),
+            "chain gate requires a shared width-class Spark recipe"
         );
         let hosted = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?
             .split(',').map(str::parse).collect::<std::result::Result<Vec<usize>, _>>()?;
@@ -573,20 +574,7 @@ mod tests {
                 && tp4["tp"] == peers.len(),
             "sealed Step-5 expert geometry"
         );
-        let capacities = tp4["capacities"]
-            .as_array()
-            .context("sealed FP8 TP capacities")?;
-        let compiled = capacities
-            .iter()
-            .map(|c| c["capacity"].as_u64().context("FP8 capacity integer"))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
-            .context("empty FP8 capacities")?;
-        ensure!(
-            (64..=4096).contains(&compiled),
-            "FP8 package must cover chain rows"
-        );
+        let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
         SparkAdmission::plan(
             snapshot,
             ExpertGeometry::STEP5,
@@ -599,20 +587,15 @@ mod tests {
             },
             peers.len(),
             None,
-            ModelAdmission {
-                capacity: 64,
-                compiled_capacity: u32::try_from(compiled)?,
-                endpoints: vec![SparkEndpoint {
-                    capacity: 64,
-                    ingress: SparkIngress::Bf16,
-                }],
-                rings: spark_rings(config.max_frame_bytes)?,
-            },
+            crate::families::step5::serve::spark_model(&exports,
+                SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Native, partial_reply_bytes: None },
+                1, 1, config.max_frame_bytes)?,
         )?
         .select(&peers)?;
         let warm = request(
             layers[0],
             64,
+            ExpertV2Dtype::Bf16,
             (0..64 * 8)
                 .map(|i| ExpertProtocolV2RouteEntry {
                     row_index: (i / 8) as u32,
@@ -622,22 +605,10 @@ mod tests {
                 .collect(),
             vec![0; 64 * H * 2].into(),
         )?;
-        let build: DeviceBuild = Box::new(|wave, routes, wire| {
-            request(wave.layer as usize, wave.rows as usize, routes, wire)
-        });
-        SparkDeviceLink::new(
-            device.library,
-            device.id,
-            world,
-            &peers,
-            64,
-            8,
-            H * 2,
-            H * 2,
-            config,
-            Some(warm),
-            build,
-        )
+        // The widest wave sizes every rank's rings and the exchange staging.
+        let mut link = SparkLink::new(device.library, world, &peers, 64, config, H * 2)?;
+        link.bootstrap(&warm)?;
+        Ok(RefCell::new(link))
     }
 
     fn native(count: usize) -> Result<()> {
@@ -765,8 +736,7 @@ mod tests {
             &[
                 cache.borrow().bytes() as u64,
                 staging.allocation_bytes() as u64,
-            ],
-        )?;
+            ], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let input = Allocation::new(device, 64 * H * 4)?;
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
@@ -794,10 +764,6 @@ mod tests {
             device.run(|| library.copy_h2d(input.buffer, &data))?;
             let mut first = Vec::new();
             for replay in 0..2 {
-                if let Some(link) = &link {
-                    link.arm()?;
-                    link.expect(1);
-                }
                 let mut step = Step::begin(
                     vec![&cache],
                     vec![&staging],
@@ -805,11 +771,9 @@ mod tests {
                     &mut placement,
                     rows,
                 )?;
-                chain.enqueue_step(&mut step, 0, &input, link.as_ref(), 0)?;
+                chain.enqueue_step(&mut step, 0, &input, link.as_ref().map(|link| (link, request as GateRequest)))?;
                 cache.borrow().drain()?;
-                if let Some(link) = &link {
-                    link.check()?;
-                }
+                crate::shared::spark_waves::healthy()?;
                 // Dropping an incomplete target aborts its private proposal after drainage.
                 drop(step);
                 for layer in 0..count {
@@ -842,7 +806,7 @@ mod tests {
             }
             if let Some(link) = &link {
                 ensure!(
-                    manifest["same_quant"]["tp"] == link.world_size()
+                    manifest["same_quant"]["tp"] == link.borrow().world_size()
                         && manifest["same_quant"]["error_ratio_bound"] == 1.01
                         && manifest["same_quant"]["revision"].as_str()
                             == snapshot.file_name().and_then(|s| s.to_str()),
@@ -868,8 +832,6 @@ mod tests {
                     )
                 };
                 device.run(|| library.copy_h2d(ffn.input(), &load("residual")?))?;
-                link.arm()?;
-                link.expect(1);
                 let mut step = Step::begin(
                     vec![&cache],
                     vec![&staging],
@@ -879,10 +841,10 @@ mod tests {
                 )?;
                 step.compose(0, link, |_, _| Ok(()))?;
                 step.compose(0, ffn, |ffn, meta| {
-                    ffn.enqueue_on(rows, 0, link, meta.stream)
+                    ffn.enqueue_on(rows, link, request, meta.stream)
                 })?;
                 cache.borrow().drain()?;
-                link.check()?;
+                crate::shared::spark_waves::healthy()?;
                 drop(step);
                 let actual = read(ffn.output(), rows * H * 4)?;
                 let official = load("wiring_output")?;
@@ -930,7 +892,7 @@ mod tests {
         let programs = library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
         let checkpoint = Checkpoint::coordinator(&snapshot, false, false)?;
         let link = device.run(|| link(device, &snapshot, &[88, 89, 90]))?;
-        ensure!(link.world_size() == 6, "BF16 tail qualification requires TP6");
+        ensure!(link.borrow().world_size() == 6, "BF16 tail qualification requires TP6");
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
             device.run(|| library.copy_d2h(&mut result, buffer))?;
@@ -982,11 +944,9 @@ mod tests {
                 device.run(|| library.copy_h2d(ffn.input(), &load("residual")?))?;
                 let mut first = Vec::new();
                 for replay in 0..3 {
-                    link.arm()?;
-                    link.expect(1);
-                    ffn.enqueue_on(rows, 0, &link, &stream)?;
+                    ffn.enqueue_on(rows, &link, request, &stream)?;
                     stream.drain()?;
-                    link.check()?;
+                    crate::shared::spark_waves::healthy()?;
                     let actual = read(ffn.output(), rows * H * 4)?;
                     if replay == 0 {
                         accuracy(&actual, &load("wiring_output")?, &load("fp64_output")?, H)?;

@@ -37,6 +37,26 @@ pub struct LoadedTokenizer {
 /// Byte ranges in a rendered prompt originating from literal token spellings.
 pub type LiteralSpans = Vec<std::ops::Range<usize>>;
 
+/// The loaded tokenizer could not encode request text (not a load or span error).
+#[derive(Debug, thiserror::Error)]
+#[error("prompt tokenization: {0}")]
+pub struct PromptEncodingError(String);
+
+/// Whether an added token is a media marker a user or tool must not materialize
+/// from text. Each family's spellings (checked against its checkpoint's tokenizer):
+/// `<|image|>`/`<|vision_pad|>`/`<|audio_pad|>`/`<|video_pad|>` words (GLM, Qwen, MiMo,
+/// Muse, V4.1 `<｜deepseek_image｜>`), Mistral `[IMG]`/`[IMG_BREAK]`/`[IMG_END]`, Muse
+/// `<|vid_start|>`/`<|vid_frame_separator|>`/`<|patch|>`, Kimi `<|media_begin|>`..`<|media_pad|>`,
+/// Step `<im_start>`/`<im_patch>`/`<im_end>`/`<patch_start>`/`<patch_newline>`/`<patch_end>`,
+/// DeepSeek V4 `<|place_holder_mm_span_NNNN|>`. Chat tokens (`<|im_start|>`) are not media.
+pub fn is_media_marker(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ["image", "audio", "video", "vision", "<|vid_", "<|media_", "mm_span", "<|patch|>", "<patch_", "<im_patch>"]
+        .iter().any(|word| lower.contains(word))
+        || token.starts_with("[IMG")
+        || matches!(token, "<im_start>" | "<im_end>")
+}
+
 /// Checkpoint spellings that must not become control tokens in message text.
 pub struct LiteralTokens {
     all: Option<daachorse::DoubleArrayAhoCorasick<u32>>,
@@ -68,8 +88,7 @@ impl LiteralTokens {
                 .match_kind(daachorse::MatchKind::LeftmostLongest).build(tokens)
                 .expect("nonempty distinct literal token spellings"))
         };
-        let media = tokens.iter().filter(|token| ["image", "audio", "video", "vision"]
-            .iter().any(|word| token.contains(word))).cloned().collect();
+        let media = tokens.iter().filter(|token| is_media_marker(token)).cloned().collect();
         Self { all: matcher(tokens), media: matcher(media) }
     }
 
@@ -131,9 +150,7 @@ impl LoadedTokenizer {
             tokenizer_path = snapshot_path.join("tiktoken.model");
             tiktoken::load(snapshot_path)?
         } else {
-            tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|err| {
-                anyhow::anyhow!("loading tokenizer {}: {err}", tokenizer_path.display())
-            })?
+            return Self::from_file(&tokenizer_path);
         };
         let pieces = pieces::Pieces::new(&tokenizer);
         Ok(Self {
@@ -142,6 +159,28 @@ impl LoadedTokenizer {
             pieces,
             literal: OnceLock::new(),
         })
+    }
+
+    /// Load an explicitly named tokenizer document through the same tokenizer representation.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let tokenizer = tokenizers::Tokenizer::from_file(path)
+            .map_err(|error| anyhow::anyhow!("loading tokenizer {}: {error}", path.display()))?;
+        let pieces = pieces::Pieces::new(&tokenizer);
+        Ok(Self { tokenizer_path: path.display().to_string(), tokenizer, pieces, literal: OnceLock::new() })
+    }
+
+    /// The loaded vocabulary and byte-decoder metadata consumed by native grammar compilation.
+    pub fn grammar_tokenizer_json(&self) -> Result<String> {
+        self.tokenizer.to_string(false)
+            .map_err(|error| anyhow::anyhow!("serializing grammar tokenizer: {error}"))
+    }
+
+    /// Resolve only explicitly added token spellings, preserving the caller's order.
+    /// Ordinary vocabulary entries must not become message-boundary markers.
+    pub fn added_token_ids(&self, spellings: &[&str]) -> Vec<u32> {
+        let added = self.tokenizer.get_added_tokens_decoder();
+        spellings.iter().filter_map(|spelling| added.iter()
+            .find_map(|(&id, token)| (token.content == *spelling).then_some(id))).collect()
     }
 
     /// `text`'s token ids without special tokens, byte-identical to the tokenizer's own
@@ -153,7 +192,7 @@ impl LoadedTokenizer {
             Ok(self
                 .tokenizer
                 .encode_fast(text, false)
-                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .map_err(|err| PromptEncodingError(err.to_string()))?
                 .get_ids()
                 .to_vec())
         };
@@ -180,7 +219,7 @@ impl LoadedTokenizer {
                 "invalid literal prompt span");
             ids.extend(self.encode_ids(&text[end..span.start])?);
             ids.extend_from_slice(literal.encode_fast(&text[span.clone()], false)
-                .map_err(|error| anyhow::anyhow!("encoding literal prompt text: {error}"))?.get_ids());
+                .map_err(|error| PromptEncodingError(error.to_string()))?.get_ids());
             end = span.end;
         }
         ids.extend(self.encode_ids(&text[end..])?);
@@ -195,7 +234,7 @@ impl LoadedTokenizer {
         let token_ids = if add_special_tokens {
             self.tokenizer
                 .encode(text.to_owned(), true)
-                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .map_err(|err| PromptEncodingError(err.to_string()))?
                 .get_ids()
                 .to_vec()
         } else {
@@ -230,7 +269,7 @@ impl LoadedTokenizer {
     }
 }
 
-fn cached_tokenizer(snapshot_path: &Path) -> Result<Arc<LoadedTokenizer>> {
+pub fn cached_tokenizer(snapshot_path: &Path) -> Result<Arc<LoadedTokenizer>> {
     let cache = TOKENIZER_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
     let key = snapshot_path.to_path_buf();
     if let Some(tokenizer) = cache

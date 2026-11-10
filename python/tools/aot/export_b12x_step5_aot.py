@@ -22,13 +22,18 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
         if group == "region-scores":
             return {"region_scores": lambda: a.compile_region_scores_aot(
                 groups=groups, capacity=summary_capacity)}
-        return {
+        result = {
             "region_compress": a.compile_region_compress_aot,
             "region_scores": lambda: a.compile_region_scores_aot(groups=groups, capacity=summary_capacity),
-            "swa_attention": lambda: a.compile_selected_gqa_aot(
-                query_heads=heads, kv_heads=groups, selection_width=512, selection_groups=1),
-            "csa_attention": lambda: a.compile_selected_gqa_aot(query_heads=heads, kv_heads=groups),
         }
+        for kv_format in ("bf16", "fp8"):
+            suffix = "_fp8" if kv_format == "fp8" else ""
+            result[f"swa_attention{suffix}"] = lambda kv_format=kv_format: a.compile_selected_gqa_aot(
+                query_heads=heads, kv_heads=groups, selection_width=512, selection_groups=1,
+                kv_format=kv_format)
+            result[f"csa_attention{suffix}"] = lambda kv_format=kv_format: a.compile_selected_gqa_aot(
+                query_heads=heads, kv_heads=groups, kv_format=kv_format)
+        return result
     if group == "metadata":
         from b12x.integration.cuteafd import cache_transactions as c, region_selection as s
         return {
@@ -38,6 +43,13 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
             "region_commit": lambda: c.compile_region_commit_aot(
                 max_staged_regions=max_staged_regions, capacity=summary_capacity),
         }
+    if group == "native":
+        # Native K6/K4 gate and up are separate projections; this group is last,
+        # so every earlier program keeps its table index and object.
+        from b12x.integration.cuteafd import pointwise as p
+        return {f"post_silu_split_w{width}_c{int(limit)}": (
+                    lambda width=width, limit=limit: p.compile_post_silu_split_aot(width=width, limit=limit))
+                for width in (1536, 13824) for limit in (7.0, 10.0)}
     if group not in ("pointwise", "projections"):
         raise ValueError(f"unknown Step-5 export group: {group}")
     import torch
@@ -56,11 +68,16 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
             "dense_down": (13824, 4096, torch.bfloat16),
             "shared_gate_up": (4096, 2 * 1536, torch.bfloat16),
             "shared_down": (1536, 4096, torch.bfloat16),
+            "mtp_eh": (8192, 4096, torch.bfloat16),
         }
         return {name: (lambda width=width, outputs=outputs, dtype=dtype:
                 p.compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype))
                 for name, (width, outputs, dtype) in shapes.items()}
+    from types import SimpleNamespace
+    from b12x.integration.cuteafd.dsv4_ffn import compile_dsv4_expert_input_quant_aot
     result = {
+        "expert_input_quant": lambda: compile_dsv4_expert_input_quant_aot(SimpleNamespace(hidden=4096)),
+        "pack_fp8_kv_plane": lambda: p.compile_pack_fp8_kv_plane_aot(kv_heads=groups, head_dim=192),
         "residual_bf16": lambda: p.compile_residual_add_aot(width=4096),
         "residual_f32": lambda: p.compile_residual_add_aot(width=4096, delta_dtype=torch.float32),
         "hidden_norm": lambda: p.compile_affine_norm_aot(width=4096, zero_centered=True, eps=None),
@@ -98,7 +115,7 @@ def programs(heads, max_rows, max_context):
     capacity = (max_context + 7) // 8
     maximum = (max_rows + 14) // 8
     return [(name, name, {"max_rows": max_rows}, build)
-            for group in ("pointwise", "projections", "attention", "metadata")
+            for group in ("pointwise", "projections", "attention", "metadata", "native")
             for name, build in builders(heads, group, capacity, maximum).items()]
 
 
@@ -106,7 +123,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
-    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "metadata", "region-scores"), default="pointwise")
+    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "metadata", "region-scores", "native"), default="pointwise")
     parser.add_argument("--summary-capacity", type=int, default=131072)
     parser.add_argument("--max-staged-regions", type=int, default=513)
     args = parser.parse_args()

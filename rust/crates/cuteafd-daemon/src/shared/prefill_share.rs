@@ -170,8 +170,23 @@ impl<P> PrefillQueue<P> {
     /// [`ROUND_S`], and prompts that ran go behind those that did not.
     /// Returns the prompts that finished (`Ok`) or failed (`Err`); call
     /// [`Self::settle`] once the finished ones joined the running requests.
-    pub fn round(&mut self, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+    pub fn round(&mut self, chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+        self.round_since(Instant::now(), chunk)
+    }
+
+    /// [`Self::round`] after `prepare` (e.g. a family's packed pass over the
+    /// waiting prompts) inside the same timed window: its time counts toward
+    /// the round, so the running requests are owed their share of it too.
+    /// `context` is lent to both steps in turn. A `prepare` error ends the
+    /// round before any chunk runs.
+    pub fn round_with<C>(&mut self, context: &mut C, prepare: impl FnOnce(&mut C, &mut Self) -> Result<()>,
+        mut chunk: impl FnMut(&mut C, &mut P) -> Result<Chunk>) -> Result<Vec<(P, Result<()>)>> {
         let started = Instant::now();
+        prepare(context, self)?;
+        Ok(self.round_since(started, |prompt| chunk(context, prompt)))
+    }
+
+    fn round_since(&mut self, started: Instant, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
@@ -231,6 +246,19 @@ impl<P> PrefillQueue<P> {
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
         out
+    }
+
+    /// Greedily pack only already-queued adjacent chunks into the admitted unit.
+    /// `rows` returns None for a member that must use the singleton path. Family
+    /// resource checks can further bound taps/tables without adding a wait policy.
+    pub fn round_packed(&mut self, cap: usize, most: usize, rows: impl Fn(&P) -> Option<usize>,
+        fits: impl Fn(&[P], &P) -> bool,
+        chunk: impl FnMut(&mut [P]) -> Vec<Result<Chunk>>) -> Vec<(P, Result<()>)> {
+        self.round_groups(most, |group, next| {
+            group.iter().chain([next]).try_fold(0usize, |total, p|
+                rows(p).filter(|&n| n > 0).and_then(|n| total.checked_add(n)))
+                .is_some_and(|total| total <= cap) && fits(group, next)
+        }, chunk)
     }
 
     /// Opt-in groups of adjacent prompts, [`Self::round_pairs`] for up to `most`: the oldest
@@ -455,6 +483,25 @@ mod tests {
     }
 
     #[test]
+    fn a_prepared_round_charges_its_preparation_to_the_owed_time() {
+        let mut queue = PrefillQueue::new(0.5);
+        queue.push(Prompt { id: 0, left: 2 });
+        let mut log = Vec::new();
+        let finished = queue.round_with(&mut log, |log, queue| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            log.push(queue.len());
+            Ok(())
+        }, |log, p| { log.push(10 + p.id); p.left -= 1; Ok(if p.left == 0 { Chunk::Done } else { Chunk::More }) }).unwrap();
+        assert!(finished.is_empty());
+        assert_eq!(log, [1, 10]);
+        queue.settle(true);
+        // Share 0.5 owes the round's time, preparation included.
+        assert!(queue.decode_seconds() >= 0.02, "{}", queue.decode_seconds());
+        let failed = queue.round_with(&mut log, |_, _| anyhow::bail!("prepare failed"), |_, _| panic!("no chunk"));
+        assert!(failed.is_err() && queue.len() == 1);
+    }
+
+    #[test]
     fn short_prompts_share_a_round_and_rotate_behind_unserved_ones() {
         let mut queue = PrefillQueue::new(0.2);
         queue.push(Prompt { id: 0, left: 2 });
@@ -606,6 +653,49 @@ mod tests {
         });
         assert_eq!(finished.iter().map(|(p, r)| (p.id, r.is_ok())).collect::<Vec<_>>(), [(1, false), (2, false)]);
         assert_eq!(queue.waiting.iter().map(|p| (p.id, p.left)).collect::<Vec<_>>(), [(0, 1)]);
+    }
+
+    #[test]
+    fn zero_packing_cap_runs_every_request_alone_without_changing_its_chunk() {
+        let mut queue = PrefillQueue::new(0.0);
+        for (id, left) in [29, 40, 100].into_iter().enumerate() { queue.push(Prompt { id, left }); }
+        let mut observed = Vec::new();
+        let finished = queue.round_packed(0, 8, |p| Some(p.left), |_, _| true, |group| {
+            assert_eq!(group.len(), 1);
+            observed.push((group[0].id, group[0].left));
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(observed, [(0, 29), (1, 40), (2, 100)]);
+        assert_eq!(finished.len(), 3);
+        assert!(finished.into_iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
+    fn packed_round_is_queued_only_bounded_and_never_skips_an_ineligible_member() {
+        let mut queue = PrefillQueue::new(0.2).one_wave_rounds();
+        let mut groups = Vec::new();
+        assert!(queue.round_packed(8, 8, |p: &Prompt| Some(p.left), |_, _| true,
+            |_| panic!("empty queues must not execute or wait")).is_empty());
+        queue.push(Prompt { id: 0, left: 3 });
+        let finished = queue.round_packed(8, 8, |p| Some(p.left), |_, _| true, |group| {
+            groups.push(group.iter().map(|p| p.id).collect::<Vec<_>>());
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(groups, [vec![0]]); // immediate singleton, no partner wait
+        assert_eq!(finished.len(), 1);
+        for (id, left) in [(1, 3), (2, 5), (3, 1), (4, 1)] { queue.push(Prompt { id, left }); }
+        let finished = queue.round_packed(8, 8, |p| Some(p.left), |_, _| true, |group| {
+            assert_eq!(group.iter().map(|p| p.id).collect::<Vec<_>>(), [1, 2]);
+            vec![Err(anyhow::anyhow!("cancelled after submission")), Ok(Chunk::Done)]
+        });
+        assert!(finished[0].1.is_err() && finished[1].1.is_ok());
+        queue.push(Prompt { id: 5, left: 1 });
+        let finished = queue.round_packed(8, 8, |p| (p.id != 4).then_some(p.left), |_, _| true, |group| {
+            assert_eq!(group.iter().map(|p| p.id).collect::<Vec<_>>(), [3]);
+            vec![Ok(Chunk::Done)]
+        });
+        assert_eq!(finished.len(), 1);
+        assert_eq!(queue.iter().map(|p| p.id).collect::<Vec<_>>(), [4, 5]);
     }
 
     #[test]

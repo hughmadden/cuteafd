@@ -1,6 +1,6 @@
 //! Family-independent view of a Hugging Face checkpoint: configuration JSON,
 //! the safetensors index and every shard header. Nothing here reads tensor data.
-use crate::{read_safetensors_metadata, SafetensorsTensorMetadata};
+use crate::{catalog::MAX_JSON_BYTES, read_safetensors_metadata, SafetensorsTensorMetadata};
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -8,20 +8,43 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Bounds a metadata read, not tensor data. Kimi K3 EXL3 K2's index names
-/// 991,812 tensors (~100 MiB) and its GPTQModel storage map is ~141 MiB.
-const MAX_JSON_BYTES: u64 = 512 * 1024 * 1024;
-
 pub mod identity;
 
 /// Storage discovery is shared by inventories, catalogs and bootstrap identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointFormat { HfIndexed, HfSingle, Exlr8 }
 
+/// The default Hugging Face safetensors index.
+pub const HF_INDEX: &str = "model.safetensors.index.json";
+
+/// The safetensors index a checkpoint declares: `config.json`'s
+/// `transformers_weights` (Mistral's `consolidated.safetensors.index.json`,
+/// honored by transformers' loader), else the standard name. The declared
+/// name must be a plain `*.index.json` file name inside the snapshot.
+pub fn index_name(snapshot: &Path) -> Result<String> {
+    let path = snapshot.join("config.json");
+    if !path.is_file() { return Ok(HF_INDEX.into()); }
+    let config = read_json(&path)?;
+    match config.get("transformers_weights") {
+        None | Some(Value::Null) => Ok(HF_INDEX.into()),
+        Some(Value::String(name)) => {
+            ensure!(name.ends_with(".index.json") && !name.contains(['/', '\\']) && !name.starts_with('.'),
+                "config.json transformers_weights {name:?} is not a safetensors index file name");
+            Ok(name.clone())
+        }
+        Some(other) => anyhow::bail!("config.json transformers_weights must be a file name, found {other}"),
+    }
+}
+
+/// The path of the checkpoint's declared safetensors index.
+pub fn index_path(snapshot: &Path) -> Result<PathBuf> {
+    Ok(snapshot.join(index_name(snapshot)?))
+}
+
 impl CheckpointFormat {
     pub fn detect(snapshot: &Path) -> Result<Self> {
         if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
-        if snapshot.join("model.safetensors.index.json").is_file() { return Ok(Self::HfIndexed); }
+        if index_path(snapshot)?.is_file() { return Ok(Self::HfIndexed); }
         ensure!(snapshot.join("model.safetensors").is_file(),
             "checkpoint has no recognized tensor inventory");
         Ok(Self::HfSingle)
@@ -60,7 +83,7 @@ pub struct Checkpoint {
     pub snapshot: PathBuf,
     /// `config.json`, verbatim.
     pub config: Value,
-    /// Standard external quantization metadata (including ModelOpt's HF export), when present.
+    /// Standard external quantization metadata, without the separately validated tensor_storage map.
     pub quantize_config: Option<Value>,
     /// Authoritative inventory, including tensors whose shards are not local.
     pub weight_map: BTreeMap<String, String>,
@@ -71,18 +94,18 @@ pub struct Checkpoint {
     pub shard_bytes: u64,
 }
 
+pub(crate) fn validate_index_headers(shard: &str, names: &BTreeSet<&str>,
+    headers: &[SafetensorsTensorMetadata]) -> Result<()> {
+    ensure!(headers.len() == names.len(), "index/header tensor count mismatch in {shard}");
+    for tensor in headers {
+        ensure!(names.contains(tensor.name.as_str()),
+            "tensor {} appears in unexpected shard {shard}", tensor.name);
+    }
+    Ok(())
+}
+
 pub fn read_json(path: &Path) -> Result<Value> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .with_context(|| format!("opening {}", path.display()))?
-        .take(MAX_JSON_BYTES + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_JSON_BYTES,
-        "{} exceeds {MAX_JSON_BYTES} bytes",
-        path.display()
-    );
-    serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))
+    Ok(crate::read_json_file(path)?)
 }
 
 impl Checkpoint {
@@ -131,7 +154,18 @@ impl Checkpoint {
         Self::open_filtered(snapshot, Some(role), needed)
     }
 
+    pub(crate) fn open_with_header_validation(snapshot: &Path) -> Result<(Self, Result<(), String>)> {
+        let mut validation = Ok(());
+        let checkpoint = Self::open_filtered_validated(snapshot, None, |_| true, Some(&mut validation))?;
+        Ok((checkpoint, validation))
+    }
+
     fn open_filtered(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool) -> Result<Self> {
+        Self::open_filtered_validated(snapshot, role, needed, None)
+    }
+
+    fn open_filtered_validated(snapshot: &Path, role: Option<&str>, needed: impl Fn(&str) -> bool,
+        mut validation: Option<&mut Result<(), String>>) -> Result<Self> {
         let config = read_json(&snapshot.join("config.json"))?;
         if CheckpointFormat::detect(snapshot)? == CheckpointFormat::Exlr8 {
             return super::exlr8::inventory(snapshot, config, needed);
@@ -140,39 +174,44 @@ impl Checkpoint {
             .iter()
             .map(|name| snapshot.join(name))
             .find(|path| path.is_file())
-            .map(|path| read_json(&path))
+            .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
             .transpose()?;
-        let index_path = snapshot.join("model.safetensors.index.json");
+        let index_path = index_path(snapshot)?;
         let weight_map: BTreeMap<String, String> = if index_path.is_file() {
-            let index = read_json(&index_path)?;
-            serde_json::from_value(
-                index
-                    .get("weight_map")
-                    .cloned()
-                    .context("index has no weight_map")?,
-            )
-            .context("decoding weight_map")?
+            #[derive(serde::Deserialize)]
+            struct Index { weight_map: BTreeMap<String, String> }
+            let file = File::open(&index_path)?;
+            let size = file.metadata()?.len();
+            ensure!(size <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            // Slice parsing avoids serde_json's per-byte Read adapter on large indexes.
+            let mut bytes = Vec::with_capacity(usize::try_from(size)?);
+            file.take(MAX_JSON_BYTES + 1).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() as u64 <= MAX_JSON_BYTES, "index exceeds metadata size limit");
+            let index: Index = serde_json::from_slice(&bytes).context("decoding weight_map")?;
+            index.weight_map
         } else {
             let single = snapshot.join("model.safetensors");
             ensure!(
                 single.is_file(),
-                "{} has neither model.safetensors.index.json nor model.safetensors",
-                snapshot.display()
+                "{} has neither {} nor model.safetensors",
+                snapshot.display(), index_path.file_name().unwrap_or_default().to_string_lossy()
             );
             read_safetensors_metadata(&single)?
                 .into_iter()
                 .map(|meta| (meta.name, "model.safetensors".to_owned()))
                 .collect()
         };
-        let shards: BTreeSet<&String> = weight_map.iter()
-            .filter(|(name, _)| needed(name)).map(|(_, shard)| shard).collect();
+        // Group once instead of scanning the complete index for every shard.
+        let mut shards = BTreeMap::<&String, BTreeSet<&str>>::new();
+        for (name, shard) in &weight_map {
+            if needed(name) { shards.entry(shard).or_default().insert(name); }
+        }
         let mut tensors = Vec::with_capacity(weight_map.len());
         let mut missing_shards = Vec::new();
         let mut shard_bytes = 0u64;
-        for shard in shards {
+        for (shard, names) in shards {
             let path = snapshot.join(shard);
-            let tensor = weight_map.iter().find(|(name, file)| *file == shard && needed(name))
-                .map(|(name, _)| name.as_str()).context("selected shard has no tensor")?;
+            let tensor = names.first().context("selected shard has no tensor")?;
             let requirement = || format!("role {} needs tensor {tensor} in shard {shard} at snapshot {}",
                 role.unwrap_or("planner"), snapshot.display());
             let metadata = match path.metadata() {
@@ -191,19 +230,20 @@ impl Checkpoint {
                     continue;
                 }
             };
+            if let Some(result) = validation.as_deref_mut().filter(|result| result.is_ok()) {
+                *result = validate_index_headers(shard, &names, &headers).map_err(|error| error.to_string());
+            }
             if let Some(role) = role {
                 let header_names: BTreeSet<_> = headers.iter().map(|meta| meta.name.as_str()).collect();
-                for (name, file) in &weight_map {
-                    if file == shard && needed(name) {
-                        ensure!(header_names.contains(name.as_str()),
-                            "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
-                            snapshot.display());
-                    }
+                for name in &names {
+                    ensure!(header_names.contains(name),
+                        "role {role} needs tensor {name} in shard {shard} at snapshot {}: header is missing",
+                        snapshot.display());
                 }
             }
             shard_bytes += metadata.len();
             for meta in headers {
-                if weight_map.get(&meta.name) == Some(shard) && needed(&meta.name) {
+                if names.contains(meta.name.as_str()) {
                     tensors.push(CheckpointTensor {
                         shard: shard.clone(),
                         meta,
@@ -425,11 +465,25 @@ impl Checkpoint {
             "{name}: host embedding is ineligible: tie_word_embeddings=true");
         let embedding = self.tensors.iter().find(|t| t.meta.name == name)
             .with_context(|| format!("host embedding tensor {name} is missing"))?;
-        let heads: Vec<_> = self.tensors.iter().filter(|t|
-            t.meta.name == "head.weight" || t.meta.name == "lm_head.weight"
-                || t.meta.name.ends_with(".lm_head.weight")).collect();
-        ensure!(!heads.is_empty(), "{name}: host embedding is ineligible: no separate LM head tensor");
-        for head in heads {
+        let family = super::family::detect(self)
+            .context("host embedding requires a recognized model family")?;
+        let model = family.open(self)?;
+        // Use the loader's component inventory and operand validation: a trellis
+        // head has no .weight, and every companion must remain disjoint too.
+        let heads = super::format::group_tensor_refs(self.tensors.iter().filter(|tensor| {
+            let stem = super::format::split_stem(&tensor.meta.name).0;
+            family.classify(model.spec(), &format!("{stem}.weight"))
+                .is_some_and(|role| role.component == super::spec::Component::LmHead)
+        }));
+        let mut separate_head = false;
+        for members in heads.values() {
+            let operand = super::format::detect(members)
+                .with_context(|| format!("{name}: host embedding is ineligible: malformed LM head"))?;
+            separate_head |= operand.matrix().is_some() && (members.contains_key("weight")
+                || matches!(operand.encoding, super::format::Encoding::Exl3 { .. }));
+        }
+        ensure!(separate_head, "{name}: host embedding is ineligible: no separate LM head tensor");
+        for head in heads.values().flat_map(|members| members.values()) {
             let same_file = head.shard == embedding.shard
                 || std::fs::canonicalize(self.snapshot.join(&head.shard)).ok().zip(
                     std::fs::canonicalize(self.snapshot.join(&embedding.shard)).ok())
@@ -666,6 +720,24 @@ mod sliced_tests {
     }
 
     #[test]
+    fn grouped_shards_ignore_unindexed_and_wrong_shard_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"a.weight":"a.safetensors","z.weight":"z.safetensors"}}"#).unwrap();
+        write_safetensors(&dir.path().join("a.safetensors"), &[
+            t("a.weight", "BF16", &[2]), t("z.weight", "BF16", &[2]), t("extra.weight", "BF16", &[2])]);
+        write_safetensors(&dir.path().join("z.safetensors"), &[t("z.weight", "BF16", &[2])]);
+        let (_, validation) = Checkpoint::open_with_header_validation(dir.path()).unwrap();
+        assert!(validation.unwrap_err().contains("index/header tensor count mismatch"));
+        let checkpoint = Checkpoint::open_for_role(dir.path(), "coordinator", |_| true).unwrap();
+        assert_eq!(checkpoint.tensors.iter().map(|tensor| (tensor.meta.name.as_str(), tensor.shard.as_str()))
+            .collect::<Vec<_>>(), [("a.weight", "a.safetensors"), ("z.weight", "z.safetensors")]);
+        assert_eq!(Checkpoint::open_for_role(dir.path(), "coordinator", |name| name == "z.weight")
+            .unwrap().tensors.len(), 1);
+    }
+
+    #[test]
     fn selected_tensor_missing_from_header_is_named() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.json"), "{}").unwrap();
@@ -690,9 +762,95 @@ mod embedding_tests {
         let t = |name: &str, offset| CheckpointTensor { shard: "model.safetensors".into(),
             meta: SafetensorsTensorMetadata { name: name.into(), dtype: DType::Bf16,
                 shape: vec![64, 128], byte_offset: offset, byte_length: 16384 } };
-        Checkpoint { snapshot: Default::default(), config: serde_json::json!({"tie_word_embeddings":false}),
+        Checkpoint { snapshot: Default::default(), config: super::super::testing::glm5_config(),
             quantize_config: None, weight_map: Default::default(), missing_shards: vec![], shard_bytes: 0,
             tensors: vec![t("model.embed_tokens.weight", 0), t("lm_head.weight", 16384)] }
+    }
+
+    const GLMF_EMBEDDING: &str = "model.language_model.embed_tokens.weight";
+
+    fn published_quantized_head() -> Checkpoint {
+        let source: Value = serde_json::from_str(include_str!(
+            "checkpoint/glm53f-k4-core-k6-head.json")).unwrap();
+        let mut checkpoint = fixture();
+        checkpoint.config = source["config"].clone();
+        checkpoint.tensors = source["header"].as_object().unwrap().iter().map(|(name, header)| {
+            let offsets = header["data_offsets"].as_array().unwrap();
+            CheckpointTensor { shard: source["shard"].as_str().unwrap().into(),
+                meta: SafetensorsTensorMetadata { name: name.clone(),
+                    dtype: DType::from_safetensors(header["dtype"].as_str().unwrap()),
+                    shape: header["shape"].as_array().unwrap().iter()
+                        .map(|dim| dim.as_u64().unwrap() as usize).collect(),
+                    byte_offset: offsets[0].as_u64().unwrap(),
+                    byte_length: offsets[1].as_u64().unwrap() - offsets[0].as_u64().unwrap(),
+                } }
+        }).collect();
+        checkpoint
+    }
+
+    #[test]
+    fn host_embedding_accepts_published_glmf_k6_head_headers() {
+        let checkpoint = published_quantized_head();
+        assert_eq!(checkpoint.text_config()["tie_word_embeddings"], false);
+        assert!(!checkpoint.tensors.iter().any(|t| t.meta.name == "lm_head.weight"));
+        checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap();
+    }
+
+    #[test]
+    fn host_embedding_refuses_tied_quantized_head() {
+        for root in [true, false] {
+            let mut checkpoint = published_quantized_head();
+            if root { checkpoint.config["tie_word_embeddings"] = Value::Bool(true); }
+            else { checkpoint.config["text_config"]["tie_word_embeddings"] = Value::Bool(true); }
+            assert!(checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap_err()
+                .to_string().contains("tie_word_embeddings=true"));
+        }
+    }
+
+    #[test]
+    fn host_embedding_refuses_missing_or_incomplete_quantized_head() {
+        let checkpoint = published_quantized_head();
+        for member in checkpoint.tensors.iter().filter(|t| t.meta.name.starts_with("lm_head.")) {
+            let mut incomplete = published_quantized_head();
+            incomplete.tensors.retain(|t| t.meta.name != member.meta.name);
+            assert!(incomplete.require_untied_embedding(GLMF_EMBEDDING).is_err(), "{}", member.meta.name);
+        }
+        let mut missing = published_quantized_head();
+        missing.tensors.retain(|t| t.meta.name == GLMF_EMBEDDING);
+        assert!(missing.require_untied_embedding(GLMF_EMBEDDING).unwrap_err()
+            .to_string().contains("no separate LM head"));
+    }
+
+    #[test]
+    fn host_embedding_refuses_every_overlapping_quantized_head_member() {
+        for member in published_quantized_head().tensors.iter().filter(|t| t.meta.name.starts_with("lm_head.")) {
+            let mut checkpoint = published_quantized_head();
+            let offset = checkpoint.tensors.iter().find(|t| t.meta.name == GLMF_EMBEDDING).unwrap().meta.byte_offset;
+            checkpoint.tensors.iter_mut().find(|t| t.meta.name == member.meta.name).unwrap().meta.byte_offset = offset;
+            let error = checkpoint.require_untied_embedding(GLMF_EMBEDDING).unwrap_err().to_string();
+            assert!(error.contains("aliases") && error.contains(&member.meta.name), "{error}");
+        }
+    }
+
+    #[test]
+    fn host_embedding_rejects_a_lone_head_companion() {
+        let mut checkpoint = published_quantized_head();
+        checkpoint.tensors.retain(|t| t.meta.name == GLMF_EMBEDDING || t.meta.name == "lm_head.mcg");
+        assert!(checkpoint.require_untied_embedding(GLMF_EMBEDDING).is_err());
+    }
+
+    #[test]
+    fn host_embedding_checks_fp8_head_scales_too() {
+        let mut checkpoint = fixture();
+        checkpoint.tensors[1].meta.dtype = DType::F8E4M3;
+        let mut scale = checkpoint.tensors[1].clone();
+        scale.meta = SafetensorsTensorMetadata { name: "lm_head.weight_scale_inv".into(),
+            dtype: DType::F32, shape: vec![1, 1], byte_offset: 32768, byte_length: 4 };
+        checkpoint.tensors.push(scale);
+        checkpoint.require_untied_embedding("model.embed_tokens.weight").unwrap();
+        checkpoint.tensors[2].meta.byte_offset = 0;
+        assert!(checkpoint.require_untied_embedding("model.embed_tokens.weight").unwrap_err()
+            .to_string().contains("lm_head.weight_scale_inv aliases"));
     }
 
     #[test]
@@ -703,7 +861,7 @@ mod embedding_tests {
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("tie_word_embeddings"));
         c.config = serde_json::json!({"text_config":{"tie_word_embeddings":true}});
         assert!(c.require_untied_embedding("model.embed_tokens.weight").is_err());
-        c.config = serde_json::json!({});
+        c.config = fixture().config;
         c.tensors[1].meta.byte_offset = 8192;
         assert!(c.require_untied_embedding("model.embed_tokens.weight").unwrap_err().to_string().contains("aliases"));
         c.tensors.pop();

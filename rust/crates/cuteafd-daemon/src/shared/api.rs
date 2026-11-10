@@ -3,6 +3,19 @@ use cuteafd_api::openai::{auth::{ApiKey, Auth}, health::HealthWitness, ModelProf
 use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 
+/// Admission errors terminate only this request, never the scheduler's receive loop.
+pub(crate) fn admission_result<T>(events: &tokio::sync::mpsc::UnboundedSender<
+    Result<cuteafd_api::openai::InferenceChunk, cuteafd_api::openai::NativeFailure>>,
+    result: anyhow::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            let _ = events.send(Err(cuteafd_api::openai::NativeFailure::from_admission_error(error)));
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ApiArgs {
     /// Require a bearer key from this file on /v1/* (health stays open).
@@ -104,6 +117,7 @@ impl ApiPolicy {
     /// Install the gateway mount on a family's profile (`--gateway on`).
     /// `snapshot` holds the tokenizer `count_tokens` uses.
     pub(crate) fn serve(&self, profile: ModelProfile, snapshot: &std::path::Path) -> anyhow::Result<ModelProfile> {
+        cuteafd_bench::context::set_thinking_off(profile.encoding.supports_thinking_off());
         let profile = if snapshot.join("tokenizer.json").is_file() { profile.with_tokenizer(snapshot)? } else { profile };
         let mut profile = profile_with_health(profile);
         if let Some(policy) = &self.gateway {
@@ -195,6 +209,14 @@ pub(crate) fn catch_scheduler_panic(work: impl FnOnce() -> anyhow::Result<()>) -
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("scheduler panicked")))
 }
+/// Borrow scheduler request owners from outside `work`, so fatal diagnostics precede channel closure.
+pub(crate) fn run_scheduler(work: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let result = catch_scheduler_panic(work);
+    if let Err(error) = &result {
+        tracing::error!(reason = %format_args!("scheduler stopped: {error:#}"));
+    }
+    result
+}
 pub(crate) async fn watch_scheduler(worker: tokio::task::JoinHandle<anyhow::Result<()>>) {
     let reason = match worker.await {
         Ok(Ok(())) => "scheduler stopped".into(),
@@ -213,6 +235,48 @@ fn profile_with_health(mut profile: ModelProfile) -> ModelProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scheduler_error_is_logged_before_request_owners_close() {
+        use tracing_subscriber::{layer::SubscriberExt, Layer};
+        use std::sync::Mutex;
+        struct Observe {
+            client: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>>,
+            messages: Arc<Mutex<Vec<String>>>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Observe {
+            fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                assert_eq!(*event.metadata().level(), tracing::Level::ERROR);
+                assert!(!self.client.lock().unwrap().is_closed());
+                struct Message(String);
+                impl tracing::field::Visit for Message {
+                    fn record_debug(&mut self, _: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.messages.lock().unwrap().push(message.0);
+            }
+        }
+        let (owner, client) = tokio::sync::mpsc::unbounded_channel();
+        let client = Arc::new(Mutex::new(client));
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Observe {
+            client: client.clone(), messages: messages.clone(),
+        });
+        let result = tracing::subscriber::with_default(subscriber, || run_scheduler(|| {
+            assert!(!owner.is_closed());
+            Err(anyhow::anyhow!("underlying CUDA failure")).context("decode scheduler")
+        }));
+        assert_eq!(format!("{:#}", result.unwrap_err()), "decode scheduler: underlying CUDA failure");
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("decode scheduler: underlying CUDA failure"));
+        assert!(!client.lock().unwrap().is_closed());
+        drop(owner);
+        assert!(client.lock().unwrap().is_closed());
+    }
+
     #[tokio::test]
     async fn default_has_no_benchmark_routes_and_keyed_auth_is_outermost() {
         use axum::{body::Body, http::StatusCode};

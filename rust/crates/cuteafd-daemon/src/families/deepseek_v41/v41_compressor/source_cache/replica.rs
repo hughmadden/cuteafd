@@ -35,7 +35,7 @@ pub(crate) struct SourceReplica<'a> {
     pages: Allocation<'a>,
     lengths: Allocation<'a>,
     /// The authoritative cache's identity (its writing flags).
-    owner: Rc<std::cell::Cell<u16>>,
+    owner: Rc<std::cell::Cell<u64>>,
     capacity: usize,
     stride: usize,
 }

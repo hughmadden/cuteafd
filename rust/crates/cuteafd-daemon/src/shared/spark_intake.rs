@@ -8,13 +8,12 @@
 //! - `gpu`: the NIC writes payloads straight into the planes (GPUDirect RDMA
 //!   over dma-buf; see `cuteafd_transport::DeviceLanding`). No host copy, no
 //!   upload.
-//! - `pinned`: payloads stay in the transport's pinned receive slots and are
-//!   uploaded from there on a copy stream as they arrive; the compute stream
-//!   only waits for those copies before the reduce. Decode-sized waves (up to
-//!   1 MiB) take the host path instead: their copies are cheaper than slot
-//!   retention and a cross-stream wait.
-//! - `host`: the original path: payloads are copied into a pinned staging
-//!   buffer and uploaded on the compute stream after the wave.
+//! - `pinned`: payloads stay in the transport's pinned receive slots; the
+//!   link's exchange lands them in the planes from there
+//!   ([`crate::shared::spark_waves`]: an SM pull of the frames in place, or
+//!   copy-engine copies once the host saw the wave land).
+//! - `host`: zero partials staged in pinned memory and uploaded on the
+//!   compute stream (benchmarks without Spark ranks, [`SparkIntake::upload_zeros`]).
 //!
 //! `auto` (the default) probes dma-buf landing once at startup (a loopback
 //! QP pair timing sends into device vs pinned host memory, and pinned host to
@@ -27,23 +26,21 @@
 //! copy engine or receive-slot retention, and prefill lanes overlap each
 //! wave's wire time with the other lanes' GPU work, so a wave's standalone
 //! landing time (18 ms for V4 Pro TP6's 352 MB) is not on the critical path.
-//! Any `gpu` failure (no dma-buf, no registration, GPUDirect writes not
-//! ordered for kernels) falls back to `pinned` and says why.
+//! An unusable capability probe selects `pinned` and says why. Once `gpu`
+//! is selected, range alignment or registration failure refuses startup;
+//! the selected path never silently changes to pinned receives.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
-use cuteafd_transport::expert::{LaneBuild, SparkExperts, SparkExpertLane, SparkExpertWave, WaveReceipt};
+use cuteafd_transport::expert::SparkExperts;
 use cuteafd_transport::{DeviceLanding, GpuLandingProbe, VerbsHostProtocolV2ResponsePayload};
-use std::cell::{Cell, RefCell};
+use crate::shared::wave_geometry::SlotGeometry;
+use std::cell::RefCell;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 /// Most ranks a compact reduction sums.
 pub(crate) const MAX_INTAKE_RANKS: usize = 8;
-
-/// Waves up to this many partial bytes (all ranks) are small: pinned mode
-/// stages them, and uploads that remain go on the compute stream.
-const SMALL_WAVE_BYTES: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,52 +119,22 @@ impl IntakeChoice {
     }
 }
 
-/// Probes dma-buf GPU landing (64 MiB loopback sends) on the current device.
-pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingProbe> {
+/// The RDMA device, port and source GID a landing probe binds: chosen by the
+/// address that reaches the Spark peers, never by device or GID table order.
+pub(crate) type LandingRoute<'r> = &'r dyn Fn() -> Result<cuteafd_transport::fabric::RdmaSelection>;
+
+/// Probes dma-buf GPU landing (64 MiB loopback sends) on the current device,
+/// over `route`'s device, port and source GID.
+pub(crate) fn probe_gpu_landing(library: &NativeLibrary, route: LandingRoute<'_>) -> Result<GpuLandingProbe> {
     ensure!(!std::env::var("CUTEAFD_GPU_LANDING_PROBE").is_ok_and(|v| v == "unavailable"),
         "GPU landing probe forced unavailable");
-    let probe = cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)?;
+    let rdma = route()?;
+    let probe = cuteafd_transport::gpu_landing_probe(library, &rdma, 64 << 20, 8)?;
     let link = landing_pcie_link(library);
-    tracing::info!(cuda_device = probe.cuda_device, gpu_gbps = probe.gpu_gbps,
-        host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
+    tracing::info!(cuda_device = probe.cuda_device, rdma_device = %rdma.device, port = rdma.port,
+        gid_index = rdma.gid_index, gpu_gbps = probe.gpu_gbps, host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
         pcie_width = ?link.as_ref().and_then(|link| link.width), usable = probe.usable(), "GPU landing probe");
     Ok(probe)
-}
-
-fn device_choice_available(choice: &IntakeChoice) -> bool {
-    choice.mode == IntakeMode::Gpu
-}
-
-/// Intake choice for executors whose receive uploads do not overlap compute.
-/// Explicit settings still win; only the automatic default is constrained.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum IntakePreference { Probed, Pinned }
-
-fn preferred_choice(mut choice: IntakeChoice, preference: IntakePreference) -> IntakeChoice {
-    if choice.setting == "auto" && matches!(preference, IntakePreference::Pinned) {
-        choice.mode = IntakeMode::Pinned;
-        choice.reason = format!("executor retains pinned uploads; {}", choice.reason);
-    }
-    choice
-}
-
-pub(crate) fn choose_preferred_mode(library: &NativeLibrary, preference: IntakePreference) -> Result<IntakeChoice> {
-    choose_mode(library).map(|choice| preferred_choice(choice, preference))
-}
-
-pub(crate) fn preferred_device_exchange_available(library: &NativeLibrary, preference: IntakePreference) -> Result<bool> {
-    Ok(device_choice_available(&choose_preferred_mode(library, preference)?))
-}
-
-/// Optional device-driven exchange must not turn a failed landing probe into
-/// a startup error. The existing pinned transport remains the fallback.
-pub(crate) fn device_exchange_available(library: &NativeLibrary) -> Result<bool> {
-    let choice = choose_mode(library)?;
-    let available = device_choice_available(&choice);
-    if !available {
-        tracing::warn!(reason = %choice.reason, "GPU exchange unavailable; retaining pinned-host Spark intake");
-    }
-    Ok(available)
 }
 
 /// Pinned host to device copy rate on the current device, GB/s: eight
@@ -221,9 +188,9 @@ fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Op
     }
 }
 
-/// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing for `auto` and
-/// `gpu`) once per process.
-pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
+/// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing over `route`
+/// for `auto` and `gpu`) once per process.
+pub(crate) fn choose_mode(library: &NativeLibrary, route: LandingRoute<'_>) -> Result<IntakeChoice> {
     static CHOICE: OnceLock<IntakeChoice> = OnceLock::new();
     if let Some(choice) = CHOICE.get() {
         return Ok(choice.clone());
@@ -233,7 +200,7 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
         "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None, None),
         "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None, None),
         "gpu" | "auto" => {
-            let probe = probe_gpu_landing(library);
+            let probe = probe_gpu_landing(library, route);
             let h2d = match (&probe, setting.as_str()) {
                 (Ok(p), "auto") if p.usable() => probe_h2d(library)
                     .map_err(|error| tracing::warn!("H2D copy probe failed: {error:#}")).ok(),
@@ -247,15 +214,6 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
     let choice = IntakeChoice { setting, mode, reason, probe, h2d_gbps };
     tracing::info!(setting = %choice.setting, mode = choice.mode.name(), reason = %choice.reason, "Spark partial intake");
     Ok(CHOICE.get_or_init(|| choice).clone())
-}
-
-/// The intake mode for a transport of `ranks` x `capacity` rows of
-/// `row_bytes`, logged.
-pub(crate) fn transport_mode(library: &NativeLibrary, ranks: usize, capacity: usize, row_bytes: usize)
-    -> Result<IntakeMode> {
-    let (mode, reason) = choose_mode(library)?.mode_for(ranks * capacity * row_bytes);
-    tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
-    Ok(mode)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -306,10 +264,33 @@ impl FabricLanding {
     }
 }
 
+/// The device, port and source GID `cuteafd fabric` probes landing on: the
+/// address that reaches `peer`, or, without one, the only RoCE v2 address on
+/// the host. Several candidates and no peer is refused rather than guessed.
+fn fabric_landing_route(peer: Option<std::net::SocketAddr>) -> Result<cuteafd_transport::fabric::RdmaSelection> {
+    let ports = cuteafd_transport::fabric::discover()?.ports;
+    if let Some(peer) = peer {
+        return cuteafd_transport::fabric::select_rdma_route(&ports, peer);
+    }
+    sole_rdma_address(&ports)
+}
+
+fn sole_rdma_address(ports: &[cuteafd_transport::fabric::RdmaPort]) -> Result<cuteafd_transport::fabric::RdmaSelection> {
+    let candidates: Vec<_> = ports.iter().filter(|port| port.active && port.link_layer == "Ethernet")
+        .flat_map(|port| port.roce_v2.iter().map(move |&(gid_index, address)| (port, gid_index, address))).collect();
+    match candidates.as_slice() {
+        [(port, gid_index, _)] => Ok(cuteafd_transport::fabric::RdmaSelection {
+            device: port.device.clone(), port: port.port, gid_index: *gid_index }),
+        [] => anyhow::bail!("no active RoCE v2 IPv4 address"),
+        many => anyhow::bail!("{} RoCE v2 IPv4 addresses ({}); pass --landing-peer to pick the one that reaches the Sparks",
+            many.len(), many.iter().map(|(port, _, address)| format!("{}:{address}", port.device)).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 /// Runs the GPU landing probe for `cuteafd fabric` when a native library is
 /// given (or `CUTEAFD_NATIVE_LIB` names one).
-pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32)
-    -> Vec<FabricLanding> {
+pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32,
+    peer: Option<std::net::SocketAddr>) -> Vec<FabricLanding> {
     let library = (|| -> Result<NativeLibrary> {
         let path = native_lib.map(std::path::PathBuf::from)
             .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from))
@@ -324,7 +305,7 @@ pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, wa
         let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
             let library = library.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
             if warmup { warm_landing_link(library)?; }
-            let probe = probe_gpu_landing(library)?;
+            let probe = probe_gpu_landing(library, &|| fabric_landing_route(peer))?;
             let pcie_link = landing_pcie_link(library);
             let h2d = probe_h2d(library).ok();
             Ok((probe, h2d, pcie_link))
@@ -336,60 +317,133 @@ pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, wa
     }).collect()
 }
 
-/// One transport's rank planes and the machinery that fills them.
+/// One transport's rank planes.
+///
+/// Each rank owns one range of `waves` return slots of `rows` rows
+/// ([`SlotGeometry`], fixed for the intake's lifetime). The link's exchange
+/// ([`crate::shared::spark_waves`]) takes the slots in dispatch order, lands
+/// each wave in its slot and reuses a slot only once its previous wave was
+/// consumed.
 pub(crate) struct SparkIntake<'a> {
     library: &'a NativeLibrary,
     mode: IntakeMode,
     ranks: usize,
-    rows: usize,
     row_bytes: usize,
-    planes: Vec<DeviceAllocation<'a>>,
-    /// Host mode: every rank's plane back to back.
+    /// One allocation per rank holding its whole reserve range.
+    planes: Vec<IntakePlane<'a>>,
+    /// The exchange's storage, retained past its close ([`Self::exchange_storage`]).
+    exchange_storage: RefCell<Option<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>>>,
+    /// Admitted return slots.
+    waves: usize,
+    geometry: RefCell<SlotGeometry>,
+    /// Host mode: every rank's plane back to back ([`Self::upload_zeros`]).
     staging: Option<RefCell<HostAllocation<'a>>>,
-    /// Pinned/GPU modes: uploads from receive slots, off the compute stream.
+    /// The stream terminal teardown drains ([`Self::terminal_drain_copies`]).
     copy_stream: *mut c_void,
-    copied: *mut c_void,
-    /// Recorded after the reduce that read the planes; a new wave may be
-    /// dispatched (and so may overwrite the planes) only after it.
-    consumed: *mut c_void,
-    consumed_pending: Cell<bool>,
-    copies_pending: Cell<bool>,
-    /// Receive slots whose uploads are queued; released before the next wave.
-    held: Arc<Mutex<Vec<(usize, u32, VerbsHostProtocolV2ResponsePayload)>>>,
+    /// Reply frames a closed exchange still held (its pulls may have read
+    /// them): released at the link's reset or terminal release, after its
+    /// consuming streams drained.
+    held: RefCell<Vec<VerbsHostProtocolV2ResponsePayload>>,
+}
+
+/// Owns the raw cudaMalloc while every consumer uses the aligned interior view.
+struct IntakePlane<'a> {
+    _allocation: DeviceAllocation<'a>,
+    buffer: CuteafdDeviceBuffer,
 }
 
 impl<'a> SparkIntake<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize, row_bytes: usize)
         -> Result<Self> {
+        Self::with_waves(library, mode, ranks, rows, row_bytes, 1)
+    }
+
+    /// `waves` return slots of `rows` rows, registered as one contiguous
+    /// range of `waves * rows` rows per rank.
+    pub(crate) fn with_waves(library: &'a NativeLibrary, mode: IntakeMode, ranks: usize, rows: usize,
+        row_bytes: usize, waves: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-        ensure!((1..=6).contains(&ranks), "{ranks} Spark ranks are outside the qualified one-through-six worlds");
-        let plane_bytes = rows * row_bytes;
-        let planes = (0..ranks).map(|_| DeviceAllocation::new(library, plane_bytes.max(256)))
-            .collect::<Result<Vec<_>>>()?;
-        // Host mode stages every wave; pinned mode only small ones (see `stages`).
+        ensure!((1..=8).contains(&ranks), "{ranks} Spark ranks are outside the one-through-eight transport worlds");
+        ensure!((1..=4).contains(&waves), "Spark intake admits 1..=4 return slots");
+        let geometry = SlotGeometry::new(waves, rows)?;
+        let reserve_rows = geometry.reserve_rows();
+        let plane_bytes = rows.checked_mul(row_bytes).context("Spark intake plane size overflow")?;
+        let logical_bytes = reserve_rows.checked_mul(row_bytes).context("Spark intake reserve size overflow")?;
+        let reserve_bytes = usize::try_from(cuteafd_core::serving_capacity::spark_intake_allocation_bytes(
+            u64::try_from(logical_bytes.max(256))?)?)?;
+        let planes = (0..ranks).map(|rank| {
+            let allocation = DeviceAllocation::new(library, reserve_bytes)?;
+            let (offset, bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(
+                allocation.buffer.ptr as u64, u64::try_from(logical_bytes.max(256))?)?;
+            let (offset, bytes) = (usize::try_from(offset)?, usize::try_from(bytes)?);
+            ensure!(offset.checked_add(bytes).is_some_and(|end| end <= allocation.buffer.bytes),
+                "Spark intake aligned range exceeds raw allocation");
+            let buffer = CuteafdDeviceBuffer {
+                // SAFETY: the checked aligned interior range belongs to the retained raw allocation.
+                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                bytes, ..allocation.buffer
+            };
+            tracing::info!(rank, waves, rows, row_bytes, logical_bytes, allocation_bytes = reserve_bytes,
+                allocation_ptr = ?allocation.buffer.ptr, aligned_offset = offset,
+                ptr = ?buffer.ptr, registered_bytes = bytes, "allocated Spark intake reserve");
+            Ok(IntakePlane { _allocation: allocation, buffer })
+        }).collect::<Result<Vec<_>>>()?;
+        // Host mode stages its zero partials; the exchange lands every other wave.
         let staging = match mode {
             IntakeMode::Host => Some(RefCell::new(HostAllocation::new(library, ranks * plane_bytes)?)),
-            IntakeMode::Pinned => Some(RefCell::new(HostAllocation::new(library,
-                (ranks * plane_bytes).min(SMALL_WAVE_BYTES).max(256))?)),
-            IntakeMode::Gpu => None,
+            IntakeMode::Pinned | IntakeMode::Gpu => None,
         };
-        let copy_stream = match mode {
-            IntakeMode::Host => std::ptr::null_mut(),
-            _ => library.cuda_stream_create()?,
-        };
+        let copy_stream = library.cuda_stream_create()?;
         Ok(Self {
-            library, mode, ranks, rows, row_bytes, planes, staging, copy_stream,
-            copied: library.cuda_event_create_ordering()?,
-            consumed: library.cuda_event_create_ordering()?,
-            consumed_pending: Cell::new(false),
-            copies_pending: Cell::new(false),
-            held: Arc::new(Mutex::new(Vec::new())),
+            library, mode, ranks, row_bytes, planes, waves, geometry: RefCell::new(geometry), staging, copy_stream,
+            exchange_storage: RefCell::new(None), held: RefCell::new(Vec::new()),
         })
     }
 
-    /// The device ranges a GPU-mode transport lands in.
+    /// The device ranges a GPU-mode transport lands in: a single-slot link's
+    /// one range, or a multi-slot link's placed reserve range, whose waves
+    /// name their slices ([`Self::placed`]).
     pub(crate) fn landing(&self) -> Option<Vec<DeviceLanding>> {
-        (self.mode == IntakeMode::Gpu).then(|| self.planes.iter().map(|p| DeviceLanding::new(p.buffer)).collect())
+        (self.mode == IntakeMode::Gpu).then(|| self.planes.iter().map(|p| match self.placed() {
+            true => DeviceLanding::placed(p.buffer).expect("validated intake reserve"),
+            false => DeviceLanding::new(p.buffer),
+        }).collect())
+    }
+
+    /// Multi-slot links place each wave's GPU landing slice per request; a
+    /// single-slot link keeps one rotating range.
+    pub(crate) fn placed(&self) -> bool { self.waves > 1 }
+
+    /// Each rank's whole reserve range.
+    pub(crate) fn ranges(&self) -> Vec<CuteafdDeviceBuffer> { self.planes.iter().map(|plane| plane.buffer).collect() }
+    /// The return slots and their rows.
+    pub(crate) fn geometry(&self) -> SlotGeometry { self.geometry.borrow().clone() }
+
+    /// Return slots of the current cut.
+    pub(crate) fn waves(&self) -> usize { self.geometry.borrow().cut().waves }
+    /// Admitted return slots.
+    pub(crate) fn slots(&self) -> usize { self.waves }
+    /// Rows of one return slot under the current cut.
+    pub(crate) fn rows(&self) -> usize { self.geometry.borrow().cut().rows }
+    pub(crate) fn row_bytes(&self) -> usize { self.row_bytes }
+    pub(crate) fn ranks(&self) -> usize { self.ranks }
+    /// The CUDA device the planes live on.
+    pub(crate) fn device(&self) -> i32 { self.planes[0].buffer.device_id }
+
+    /// Reply frames a closed exchange still held (its pulls may have read
+    /// them): kept until the link's reset or terminal release, which follow
+    /// the drain of its consuming streams.
+    pub(crate) fn keep_frames(&self, frames: Vec<VerbsHostProtocolV2ResponsePayload>) {
+        self.held.borrow_mut().extend(frames);
+    }
+    fn slot_planes(&self, slot: usize) -> impl Iterator<Item = CuteafdDeviceBuffer> + '_ {
+        let (offset, bytes) = self.geometry.borrow().slice(slot, self.row_bytes);
+        self.planes.iter().map(move |plane| CuteafdDeviceBuffer {
+            // SAFETY: every slot of the cut lies within this rank's reserve allocation.
+            ptr: unsafe { plane.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes,
+            ..plane.buffer
+        })
     }
 
     /// Points `transport`'s receives at this intake's planes (GPU mode).
@@ -405,148 +459,11 @@ impl<'a> SparkIntake<'a> {
         unsafe { transport.set_gpu_landing(self.landing()) }
     }
 
-    /// Spawns a lane transport that lands in this intake's planes (GPU mode).
-    ///
-    /// # Safety
-    /// As [`Self::attach`], for the lane's thread and waves.
-    pub(crate) unsafe fn spawn_lane(&self, world: cuteafd_transport::expert::SparkWorld,
-        peers: Vec<std::net::SocketAddr>, capacity: u32,
-        config: cuteafd_transport::TcpTransportConfig) -> Result<SparkExpertLane> {
-        ensure!(peers.len() == self.ranks, "intake ranks differ from the lane's");
-        // SAFETY: forwarded from this function's contract.
-        unsafe { SparkExpertLane::spawn_world(world, peers, capacity, config, self.landing()) }
-    }
-
-    /// Before dispatching a wave on this intake's transport: the previous
-    /// wave's reduce and uploads are done, and its receive slots are released.
-    pub(crate) fn before_dispatch(&self) -> Result<()> {
-        if self.consumed_pending.get() {
-            // SAFETY: the event was recorded on the engine's stream by `consumed`.
-            unsafe { self.library.cuda_event_synchronize(self.consumed)? };
-            self.consumed_pending.set(false);
-        }
-        if self.copies_pending.get() {
-            // SAFETY: recorded after the held slots' uploads; they must finish
-            // before the slots go back to the transport.
-            unsafe { self.library.cuda_event_synchronize(self.copied)? };
-            self.copies_pending.set(false);
-        }
-        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
-        Ok(())
-    }
-
-    /// Whether a wave of `plane_bytes` per rank goes through the pinned
-    /// staging: always in host mode, and for small (decode-sized) waves in
-    /// pinned mode, whose few-KB copies cost less than retaining receive
-    /// slots and ordering a separate upload.
-    fn stages(&self, plane_bytes: usize) -> bool {
-        match self.mode {
-            IntakeMode::Host => true,
-            IntakeMode::Pinned => self.ranks * plane_bytes <= SMALL_WAVE_BYTES,
-            IntakeMode::Gpu => false,
-        }
-    }
-
     fn check(&self, t: usize, ranks: usize) -> Result<usize> {
-        ensure!(ranks == self.ranks && t <= self.rows,
-            "a wave of {t} rows from {ranks} ranks exceeds the intake ({} ranks x {} rows)", self.ranks, self.rows);
+        let rows = self.rows();
+        ensure!(ranks == self.ranks && t <= rows,
+            "a wave of {t} rows from {ranks} ranks exceeds the intake ({} ranks x {rows} rows)", self.ranks);
         Ok(t * self.row_bytes)
-    }
-
-    /// Receives `wave` into the planes and orders the compute `stream` after
-    /// it; the reduce may follow on `stream` (then call [`Self::consumed`]).
-    pub(crate) async fn receive(&self, transport: &mut SparkExperts, wave: SparkExpertWave, t: usize,
-        stream: *mut c_void) -> Result<WaveReceipt> {
-        let plane_bytes = self.check(t, transport.world_size())?;
-        // A receive can fail or be cancelled after an upload queues but before
-        // its completion event is recorded. Drain while every source is held.
-        let drain = ReceiveDrain(Some(|| {
-            // SAFETY: the caller's stream and the intake's copy stream
-            // outlive this receive, as do all retained source owners.
-            crate::shared::decode_graph::fatal_drain(unsafe {
-                self.terminal_drain_copies().and_then(|()|
-                    self.library.cuda_stream_synchronize(stream))
-            }, "cancelled Spark intake receive");
-        }));
-        let receipt = match self.stages(plane_bytes) {
-            true => {
-                let mut staging = self.staging.as_ref().context("host intake staging")?.borrow_mut();
-                let bytes = staging.bytes_mut();
-                let row_bytes = self.row_bytes;
-                let receipt = transport.receive_wave(wave, |rank, first, payload| {
-                    let offset = first as usize * row_bytes;
-                    ensure!(offset + payload.len() <= plane_bytes, "rank {rank} partial rows run past its plane");
-                    let at = rank * plane_bytes + offset;
-                    copy_parallel(&mut bytes[at..at + payload.len()], payload);
-                    Ok(())
-                }).await?;
-                drop(staging);
-                self.upload_staging(receipt.landed, plane_bytes, stream)?;
-                receipt
-            }
-            false => {
-                let target = self.upload_stream(plane_bytes, stream);
-                let receipt = transport.receive_wave_owned(wave, |rank, first, payload| {
-                    retain_before_enqueue(&self.held, (rank, first, payload), |(rank, first, payload)| {
-                        self.queue_upload(*rank, *first, payload, plane_bytes, target)
-                    })
-                }).await?;
-                self.join_uploads(target, stream, receipt.landed)?;
-                receipt
-            }
-        };
-        drain.complete();
-        Ok(receipt)
-    }
-
-    /// Queues one lane wave: `build` makes its request on the lane thread
-    /// and the rank rows are gathered there; finish with [`Self::after_lane`].
-    pub(crate) fn submit_lane(&self, lane: &mut SparkExpertLane, t: usize, build: LaneBuild) -> Result<()> {
-        let plane_bytes = self.check(t, lane.world_size())?;
-        match self.stages(plane_bytes) {
-            true => {
-                let staging = self.staging.as_ref().context("host intake staging")?.borrow().buffer;
-                // Crosses to the lane thread as an integer; see the SAFETY note below.
-                let base = staging.ptr as usize;
-                let row_bytes = self.row_bytes;
-                lane.submit(build, Box::new(move |rank, first, payload: &[u8]| {
-                    let offset = first as usize * row_bytes;
-                    ensure!(offset + payload.len() <= plane_bytes, "rank {rank} partial rows run past its plane");
-                    // SAFETY: rank planes are disjoint regions of the pinned
-                    // staging; the inference thread reads it (for the uploads)
-                    // only after waiting for this wave, and rewrites nothing.
-                    let target = unsafe {
-                        std::slice::from_raw_parts_mut((base + rank * plane_bytes + offset) as *mut u8, payload.len())
-                    };
-                    copy_parallel(target, payload);
-                    Ok(())
-                }))
-            }
-            false => {
-                let held = Arc::clone(&self.held);
-                lane.submit_owned(build, Box::new(move |rank, first, payload| {
-                    held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.push((rank, first, payload));
-                    Ok(())
-                }))
-            }
-        }
-    }
-
-    /// After a lane wave's wait: uploads what did not land and orders `stream`.
-    pub(crate) fn after_lane(&self, t: usize, landed: u8, stream: *mut c_void) -> Result<()> {
-        let plane_bytes = self.check(t, self.ranks)?;
-        match self.stages(plane_bytes) {
-            true => self.upload_staging(landed, plane_bytes, stream),
-            false => {
-                let target = self.upload_stream(plane_bytes, stream);
-                let held = self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?;
-                for (rank, first, payload) in held.iter() {
-                    self.queue_upload(*rank, *first, payload, plane_bytes, target)?;
-                }
-                drop(held);
-                self.join_uploads(target, stream, landed)
-            }
-        }
     }
 
     /// Benchmarks without Spark ranks: zero partials of `t` rows uploaded
@@ -559,25 +476,29 @@ impl<'a> SparkIntake<'a> {
         self.upload_staging(0, plane_bytes, stream)
     }
 
-    /// Plane pointers for the compact reducer.
+    /// Plane pointers of return slot 0 (a host-mode intake's, which
+    /// [`Self::upload_zeros`] fills), for the compact reducer.
     pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
+        self.slot_pointers(0)
+    }
+
+    /// Plane pointers of return slot `slot`.
+    pub(crate) fn slot_pointers(&self, slot: usize) -> [*const u16; MAX_INTAKE_RANKS] {
         let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-        for (slot, plane) in pointers.iter_mut().zip(&self.planes) {
-            *slot = plane.buffer.ptr.cast();
+        for (pointer, plane) in pointers.iter_mut().zip(self.slot_planes(slot)) {
+            *pointer = plane.ptr.cast();
         }
         pointers
     }
 
-    /// The planes' device buffers, in rank order.
-    pub(crate) fn planes(&self) -> impl Iterator<Item = CuteafdDeviceBuffer> + '_ {
-        self.planes.iter().map(|p| p.buffer)
-    }
-
-    /// Marks the planes read once `stream` reaches this point (after the reduce).
-    pub(crate) fn consumed(&self, stream: *mut c_void) -> Result<()> {
-        // SAFETY: both handles are live; the event only orders later dispatches.
-        unsafe { self.library.cuda_event_record(self.consumed, stream)? };
-        self.consumed_pending.set(true);
+    /// Resets the drained transport: the copy stream drains, the wire
+    /// resets, and only then go the frames a closed exchange still held (the
+    /// NIC or a pull may still have read them until the reset).
+    fn reset(&self, transport: &mut SparkExperts) -> Result<()> {
+        transport.require_drained_reset()?;
+        self.terminal_drain_copies()?;
+        transport.reset_drained()?;
+        self.held.borrow_mut().clear();
         Ok(())
     }
 
@@ -593,62 +514,33 @@ impl<'a> SparkIntake<'a> {
         unsafe { self.library.cuda_stream_synchronize(self.copy_stream) }
     }
 
-    pub(crate) fn terminal_release_payloads(&self) -> Result<()> {
-        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
-        self.copies_pending.set(false);
-        self.consumed_pending.set(false);
-        Ok(())
+    pub(crate) fn terminal_release_payloads(&self) {
+        self.held.borrow_mut().clear();
+        self.exchange_storage.borrow_mut().take();
     }
 
-    /// Small waves upload on the compute stream itself (a cross-stream wait
-    /// costs more than their copies); large ones on the copy stream, so they
-    /// overlap the compute stream until the reduce needs them.
-    fn upload_stream(&self, plane_bytes: usize, stream: *mut c_void) -> *mut c_void {
-        if self.ranks * plane_bytes <= SMALL_WAVE_BYTES { stream } else { self.copy_stream }
-    }
-
-    /// Queues `payload`'s upload into `rank`'s plane on `target`; the payload
-    /// must be held until that stream passes the copy.
-    fn queue_upload(&self, rank: usize, first: u32, payload: &VerbsHostProtocolV2ResponsePayload, plane_bytes: usize,
-        target: *mut c_void) -> Result<()> {
-        let bytes = payload.as_ref().len();
-        let offset = upload_offset(self.ranks, rank, first, self.row_bytes, bytes, plane_bytes)?;
-        let destination = CuteafdDeviceBuffer {
-            // SAFETY: the range was checked against the plane above.
-            ptr: unsafe { self.planes[rank].buffer.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes,
-            ..self.planes[rank].buffer
-        };
-        match payload.pinned_host_buffer() {
-            // SAFETY: the pinned receive slot stays alive (held) until the
-            // copied event completes; the target range is inside the plane.
-            Some(source) => unsafe {
-                self.library.copy_host_buffer_h2d_async(destination, source, bytes, target)?
-            },
-            // SAFETY: a pageable source is staged by the driver before return.
-            None => unsafe { self.library.copy_h2d_async(destination, payload.as_ref(), target)? },
+    /// The exchange's control words, pull descriptors and reply codec, held
+    /// here past a consuming [`crate::shared::spark_waves::Waves::close`]
+    /// until terminal consumer drainage: called initially or after the link's
+    /// reset proved consumer drainage.
+    pub(crate) fn exchange_storage(&self, geometry: &crate::shared::spark_waves::Intake)
+        -> Result<std::rc::Rc<crate::shared::spark_waves::ExchangeStorage<'a>>> {
+        let mut retained = self.exchange_storage.borrow_mut();
+        if let Some(storage) = retained.as_ref() {
+            ensure!(storage.matches(geometry), "exchange storage geometry changed across reset");
+            ensure!(std::rc::Rc::strong_count(storage) == 1, "previous exchange still owns its storage");
+            storage.reset_drained();
+        } else {
+            *retained = Some(std::rc::Rc::new(crate::shared::spark_waves::ExchangeStorage::new(self.library, geometry)?));
         }
-        Ok(())
-    }
-
-    /// Orders `stream` after uploads queued on the copy stream (none when
-    /// every rank landed in device memory or the wave used `stream` itself).
-    fn join_uploads(&self, target: *mut c_void, stream: *mut c_void, landed: u8) -> Result<()> {
-        if landed.count_ones() as usize == self.ranks {
-            return Ok(());
-        }
-        // SAFETY: both streams and the event are live handles on this device.
-        unsafe {
-            self.library.cuda_event_record(self.copied, target)?;
-            if target != stream {
-                self.library.cuda_stream_wait_event(stream, self.copied)?;
-            }
-        }
-        self.copies_pending.set(true);
-        Ok(())
+        Ok(retained.as_ref().unwrap().clone())
     }
 
     fn upload_staging(&self, landed: u8, plane_bytes: usize, stream: *mut c_void) -> Result<()> {
+        self.upload_staging_slot(0, landed, plane_bytes, stream)
+    }
+
+    fn upload_staging_slot(&self, slot: usize, landed: u8, plane_bytes: usize, stream: *mut c_void) -> Result<()> {
         let staging = self.staging.as_ref().context("host intake staging")?.borrow();
         for rank in (0..self.ranks).filter(|rank| landed & (1 << rank) == 0) {
             let source = CuteafdHostBuffer {
@@ -658,14 +550,14 @@ impl<'a> SparkIntake<'a> {
                 ..staging.buffer
             };
             // SAFETY: pinned source and device plane both hold `plane_bytes`;
-            // the next wave rewrites the staging only after `before_dispatch`.
-            unsafe { self.library.copy_host_buffer_h2d_async(self.planes[rank].buffer, source, plane_bytes, stream)? };
+            // the caller orders the next rewrite of the staging after this copy.
+            unsafe { self.library.copy_host_buffer_h2d_async(self.slot_planes(slot).nth(rank).expect("validated intake rank"), source, plane_bytes, stream)? };
         }
         Ok(())
     }
 }
 
-fn upload_offset(ranks: usize, rank: usize, first: u32, row_bytes: usize,
+pub(crate) fn upload_offset(ranks: usize, rank: usize, first: u32, row_bytes: usize,
     bytes: usize, plane_bytes: usize) -> Result<usize> {
     ensure!(rank < ranks, "rank {rank} exceeds intake plane count");
     let offset = (first as usize).checked_mul(row_bytes).context("intake row offset overflow")?;
@@ -674,28 +566,6 @@ fn upload_offset(ranks: usize, rank: usize, first: u32, row_bytes: usize,
     Ok(offset)
 }
 
-/// Error/cancellation must drain queued uploads even before event publication.
-struct ReceiveDrain<F: FnOnce()>(Option<F>);
-impl<F: FnOnce()> ReceiveDrain<F> {
-    fn complete(mut self) { self.0.take(); }
-}
-impl<F: FnOnce()> Drop for ReceiveDrain<F> {
-    fn drop(&mut self) {
-        if let Some(drain) = self.0.take() { drain(); }
-    }
-}
-
-/// Acquiring the ownership store precedes every enqueue. If an enqueue
-/// returns an error after accepting some asynchronous work, its source still
-/// belongs to the intake and can only be released after terminal drainage.
-fn retain_before_enqueue<T>(held: &std::sync::Mutex<Vec<T>>, item: T,
-    enqueue: impl FnOnce(&T) -> Result<()>) -> Result<()> {
-    let mut held = held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?;
-    held.push(item);
-    enqueue(held.last().expect("item was retained before enqueue"))
-}
-
-/// The stream calls a [`WarmStream`] makes (the native library's; a fake in tests).
 pub(crate) trait StreamLibrary {
     fn create_stream(&self) -> Result<*mut c_void>;
     /// # Safety
@@ -864,6 +734,21 @@ mod warm_stream_tests {
         }
     }
 
+    fn spark_transport_constructor(source: &str) -> Option<usize> {
+        ["new", "new_waves"].iter()
+            .filter_map(|constructor| source.find(&format!("SparkLink::{constructor}(")))
+            .min()
+    }
+
+    #[test]
+    fn transport_audit_recognizes_single_and_multi_wave_constructors() {
+        for constructor in ["new", "new_waves"] {
+            let source = format!("let transport = SparkLink::{constructor}(");
+            assert_eq!(spark_transport_constructor(&source), Some(16));
+        }
+        assert_eq!(spark_transport_constructor("SparkLink::new_unchecked("), None);
+    }
+
     /// Every family that builds a Spark transport bootstraps it with a request
     /// at install, so each rank's persistent session is open and its immutable
     /// installed expert grouping is published before anything plans against the
@@ -877,7 +762,6 @@ mod warm_stream_tests {
     #[test]
     fn every_spark_family_bootstraps_its_transport_with_a_wave_request() {
         // The needles are joined here, so this file's own text does not match them.
-        let link = ["SparkLink::", "new("].concat();
         let open = [".boot", "strap(&"].concat();
         for (family, source) in [
             ("deepseek_v4", include_str!("../families/deepseek_v4/mod.rs")),
@@ -885,8 +769,11 @@ mod warm_stream_tests {
             ("glm5_flash", include_str!("../families/glm5_flash/mod.rs")),
             ("mimo_v2", include_str!("../families/mimo_v2/mod.rs")),
             ("qwen4", include_str!("../families/qwen4/mod.rs")),
+            ("step5", include_str!("../families/step5/serve.rs")),
+            ("step5 golden", include_str!("../families/step5/golden.rs")),
         ] {
-            let transport = source.find(&link).unwrap_or_else(|| panic!("{family}: no Spark transport"));
+            let transport = spark_transport_constructor(source)
+                .unwrap_or_else(|| panic!("{family}: no Spark transport"));
             let bootstrap = source.find(&open)
                 .unwrap_or_else(|| panic!("{family}: the Spark transport is never bootstrapped"));
             assert!(bootstrap > transport, "{family}: the bootstrap precedes the transport it opens");
@@ -909,99 +796,14 @@ mod warm_stream_tests {
     }
 }
 
-#[cfg(test)]
-mod terminal_ownership_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}};
-
-    struct Owner(Arc<AtomicUsize>);
-    impl Drop for Owner { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
-
-    #[test]
-    fn receive_error_and_cancellation_drain_before_source_release() {
-        use std::{future::Future, task::Poll};
-        for cancel in [false, true] {
-            let drops = Arc::new(AtomicUsize::new(0));
-            let drains = AtomicUsize::new(0);
-            let held = Mutex::new(Vec::new());
-            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-            runtime.block_on(async {
-                let work = async {
-                    let _drain = ReceiveDrain(Some(|| {
-                        assert_eq!(drops.load(Ordering::SeqCst), 0);
-                        assert_eq!(held.lock().unwrap().len(), 1);
-                        drains.fetch_add(1, Ordering::SeqCst);
-                    }));
-                    retain_before_enqueue(&held, Owner(drops.clone()), |_| Ok(())).unwrap();
-                    if cancel { std::future::pending::<()>().await; }
-                    anyhow::bail!("injected receive failure before event publication");
-                    #[allow(unreachable_code)]
-                    Ok::<_, anyhow::Error>(())
-                };
-                if cancel {
-                    let mut work = std::pin::pin!(work);
-                    std::future::poll_fn(|cx| {
-                        assert!(work.as_mut().poll(cx).is_pending());
-                        Poll::Ready(())
-                    }).await;
-                } else {
-                    assert!(work.await.is_err());
-                }
-            });
-            assert_eq!(drains.load(Ordering::SeqCst), 1);
-            assert_eq!(drops.load(Ordering::SeqCst), 0);
-            held.lock().unwrap().clear();
-            assert_eq!(drops.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[test]
-    fn successful_receive_defers_drain_to_normal_completion() {
-        let drains = Cell::new(0);
-        ReceiveDrain(Some(|| drains.set(drains.get() + 1))).complete();
-        assert_eq!(drains.get(), 0);
-    }
-
-    #[test]
-    fn failed_enqueue_keeps_its_source_owner() {
-        let drops = Arc::new(AtomicUsize::new(0));
-        let held = Mutex::new(Vec::new());
-        assert!(retain_before_enqueue(&held, Owner(drops.clone()), |_| anyhow::bail!("injected enqueue failure")).is_err());
-        assert_eq!(held.lock().unwrap().len(), 1);
-        assert_eq!(drops.load(Ordering::SeqCst), 0);
-        held.lock().unwrap().clear();
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn failed_ownership_insertion_never_enqueues() {
-        let held = Arc::new(Mutex::new(Vec::<Owner>::new()));
-        let poison = held.clone();
-        let _ = std::thread::spawn(move || {
-            let _guard = poison.lock().unwrap();
-            panic!("injected ownership lock failure");
-        }).join();
-        let calls = AtomicUsize::new(0);
-        let drops = Arc::new(AtomicUsize::new(0));
-        assert!(retain_before_enqueue(&held, Owner(drops.clone()), |_| {
-            calls.fetch_add(1, Ordering::SeqCst); Ok(())
-        }).is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(drops.load(Ordering::SeqCst), 1);
-    }
-}
-
 impl Drop for SparkIntake<'_> {
     fn drop(&mut self) {
-        // SAFETY: the handles were created by this intake; queued copies drain first.
+        // SAFETY: the stream was created by this intake; queued work drains first.
         unsafe {
             if !self.copy_stream.is_null() {
                 let _ = self.library.cuda_stream_synchronize(self.copy_stream);
                 let _ = self.library.cuda_stream_destroy(self.copy_stream);
             }
-            let _ = self.library.cuda_event_destroy(self.copied);
-            let _ = self.library.cuda_event_synchronize(self.consumed);
-            let _ = self.library.cuda_event_destroy(self.consumed);
         }
     }
 }
@@ -1009,17 +811,12 @@ impl Drop for SparkIntake<'_> {
 /// `dst.copy_from_slice(src)`, split over threads for large payloads (one
 /// core copies pinned memory at about 20 GB/s).
 pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
-    const THREADS: usize = 8;
     if src.len() < 2 << 20 {
         dst.copy_from_slice(src);
         return;
     }
-    let chunk = src.len().div_ceil(THREADS).next_multiple_of(4096);
-    std::thread::scope(|scope| {
-        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
-            scope.spawn(move || d.copy_from_slice(s));
-        }
-    });
+    // Persistent pool threads: no spawn per copy.
+    cuteafd_transport::copy_pool_parallel(dst, src, 8);
 }
 
 /// Waves whose expert input is at least this large go out through the
@@ -1027,41 +824,20 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 /// (decode) requests keep their own copy.
 const EGRESS_MIN_BYTES: usize = 1 << 20;
 
-/// How prefill requests leave (`CUTEAFD_SPARK_EGRESS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Egress {
-    /// Each rank's session copies the payload into its own send ring.
-    Copied,
-    /// Zero-copy from one registered buffer, every rank's send posted at once.
-    Parallel,
-    /// Zero-copy, each rank's send posted once the previous one left (default).
-    Staggered,
-}
-
-fn egress_setting() -> Egress {
-    static SETTING: OnceLock<Egress> = OnceLock::new();
-    *SETTING.get_or_init(|| {
-        let egress = match std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() {
-            Ok("off" | "0" | "copied") => Egress::Copied,
-            Ok("parallel") => Egress::Parallel,
-            Ok("on" | "staggered") | Err(_) => Egress::Staggered,
-            Ok(other) => {
-                tracing::warn!(setting = other, "CUTEAFD_SPARK_EGRESS is staggered, parallel or off; staggered");
-                Egress::Staggered
-            }
-        };
-        tracing::info!(?egress, min_bytes = EGRESS_MIN_BYTES, "Spark request egress");
-        egress
-    })
-}
-
-fn egress_bytes(capacity: usize, row_bytes: usize, enable: bool, setting: Egress) -> usize {
-    if enable && setting != Egress::Copied { capacity * row_bytes } else { 0 }
+fn registered_egress_bytes(request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<usize> {
+    let mut geometry = cuteafd_core::expert_geometry();
+    geometry.hidden = request.header.hidden_dim;
+    ensure!(request.header.row_count > 0 && request.header.route_count % request.header.row_count == 0,
+        "egress bootstrap needs a uniform route geometry");
+    geometry.topk = request.header.route_count / request.header.row_count;
+    geometry.compact_wire_bytes(request.header.row_count,
+        request.header.hidden_dtype == cuteafd_transport::ExpertV2Dtype::Bf16)
+        .map(|wire| wire.0).context("registered egress geometry overflow")
 }
 
 /// Logs once how this coordinator moves expert traffic, from the fabric it
-/// detected: requests leave zero-copy from one registered buffer
-/// (`CUTEAFD_SPARK_EGRESS`), partials arrive by the probed intake
+/// detected: large requests leave zero-copy from one registered buffer as
+/// chunked WRITEs, partials arrive by the probed intake
 /// (`CUTEAFD_SPARK_INTAKE`), and every rank's traffic uses the coordinator's
 /// first rail. Measured on raptor (one 400 Gb port, both GPUs a host bridge
 /// away from the NIC) with six Sparks: the coordinator's intake (~19 GB/s
@@ -1074,7 +850,7 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
         Ok(report) => {
             let ports = report.rails.rails.iter().map(|rail| format!("{}@{} {:.0}G", rail.device, rail.address,
                 rail.effective_gbps)).collect::<Vec<_>>().join(", ");
-            tracing::info!(ranks, intake = mode.name(), egress = ?egress_setting(),
+            tracing::info!(ranks, rdma_tc = report.rdma_traffic_class, dscp = report.rdma_traffic_class >> 2, intake = mode.name(),
                 coordinator_rails = %ports, "Spark transfer plan: every rank on the first coordinator rail");
         }
         Err(error) => tracing::warn!("Spark transfer plan: fabric discovery failed: {error:#}"),
@@ -1083,12 +859,28 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
 
 /// A Spark transport and the intake its waves land in (dropped in that order).
 pub(crate) struct SparkLink<'a> {
-    pub(crate) transport: SparkExperts,
-    pub(crate) intake: std::rc::Rc<SparkIntake<'a>>,
+    prefill: bool,
+    intake: std::rc::Rc<SparkIntake<'a>>,
     /// Bytes of the transport's egress buffer (0: none).
     egress_bytes: usize,
+    egress_enabled: bool,
     terminal_library: Option<Arc<NativeLibrary>>,
     terminal_released: bool,
+    /// The link's persistent exchange worker ([`Self::waves`]), started by
+    /// [`Self::bootstrap`]; it owns the transport while it runs.
+    exchange: Option<crate::shared::spark_waves::Waves<'a>>,
+    /// The transport while no exchange runs (before bootstrap, and while it
+    /// is handed back for a reset or terminal teardown).
+    transport: Option<SparkExperts>,
+    /// Widest wave staging each slot needs (bytes), sized at bootstrap.
+    staging_bytes: usize,
+    /// The bootstrap request without its (all-zero) hidden payload, and that
+    /// payload's length: a reset re-opens the sessions with it before the
+    /// exchange restarts, as bootstrap does.
+    bootstrap: Option<(cuteafd_transport::ExpertProtocolV2Request, usize)>,
+    timing: bool,
+    world_size: usize,
+    capacity: u32,
 }
 
 impl<'a> SparkLink<'a> {
@@ -1096,70 +888,198 @@ impl<'a> SparkLink<'a> {
     /// waves land in an intake of the process-wide [`choose_mode`].
     pub(crate) fn new(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr], capacity: u32,
         config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        let transport = SparkExperts::new_world(world, peers, capacity, config)?;
-        Self::with_egress(library, transport, row_bytes, IntakePreference::Probed, true)
+        let timing = config.timing;
+        let transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        Self::with_egress_waves(library, transport, row_bytes, true, false, 1, capacity, timing)
     }
+
+    /// A link admitting `waves` outstanding waves of up to `capacity` rows,
+    /// each with its own return slot ([`SparkIntake::with_waves`]). Waves are
+    /// received in dispatch order, with one GPU landing range per slot.
+    /// `capacity` bounds every request on the transport; each return slot
+    /// holds `wave_rows` (at most `capacity`), the widest wave in flight.
+    pub(crate) fn new_waves(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
+        row_bytes: usize, waves: usize, wave_rows: u32) -> Result<Self> {
+        ensure!((1..=capacity).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
+        let timing = config.timing;
+        let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        transport.set_max_waves(waves)?;
+        Self::with_egress_waves(library, transport, row_bytes, true, true, waves, wave_rows, timing)
+    }
+
+    /// Return slots.
+    pub(crate) fn waves(&self) -> usize { self.intake.waves() }
+    pub(crate) fn slots(&self) -> usize { self.intake.slots() }
+    pub(crate) fn world_size(&self) -> usize { self.world_size }
+    /// The most rows any request on this link may carry.
+    pub(crate) fn capacity(&self) -> u32 { self.capacity }
+    /// The intake planes' device (the reduce's GPU).
+    pub(crate) fn device(&self) -> i32 { self.intake.device() }
 
     /// Adopts an existing topology-bound or canonical transport without changing
     /// its route contract, rank identities or connection configuration.
     pub(crate) fn from_transport(library: &'a NativeLibrary, transport: SparkExperts,
-        row_bytes: usize, preference: IntakePreference) -> Result<Self> {
-        Self::with_egress(library, transport, row_bytes, preference, false)
+        row_bytes: usize, timing: bool) -> Result<Self> {
+        let capacity = transport.capacity();
+        Self::with_egress_waves(library, transport, row_bytes, false, false, 1, capacity, timing)
     }
 
-    fn with_egress(library: &'a NativeLibrary, mut transport: SparkExperts,
-        row_bytes: usize, preference: IntakePreference, enable_egress: bool) -> Result<Self> {
+    /// [`Self::from_transport`] with `waves` outstanding waves of `wave_rows`
+    /// rows (one prefill transport with N waves, PLAN "Prefill contract").
+    pub(crate) fn from_transport_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
+        row_bytes: usize, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
+        ensure!((1..=transport.capacity()).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
+        transport.set_max_waves(waves)?;
+        Self::with_egress_waves(library, transport, row_bytes, false, true, waves, wave_rows, timing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_egress_waves(library: &'a NativeLibrary, mut transport: SparkExperts,
+        row_bytes: usize, enable_egress: bool, prefill: bool, waves: usize, wave_rows: u32, timing: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
         let ranks = transport.world_size();
         let capacity = transport.capacity();
         library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
-        let (mode, reason) = choose_preferred_mode(library, preference)?.mode_for(ranks * capacity as usize * row_bytes);
+        let route = || transport.rdma_route();
+        let (mode, reason) = choose_mode(library, &route)?.mode_for(ranks * capacity as usize * row_bytes);
         tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
-        let intake = SparkIntake::new(library, mode, ranks, capacity as usize, row_bytes)?;
-        // SAFETY: the link drops its transport before its intake, and every
-        // dispatch goes through `dispatch`, which calls `before_dispatch`.
+        let intake = SparkIntake::with_waves(library, mode, ranks, wave_rows as usize, row_bytes, waves)?;
+        // SAFETY: the link drops its transport (and its exchange's) before its
+        // intake, and every wave's planes are read only between its landing
+        // and its consume, both ordered by the exchange.
         unsafe { intake.attach(&mut transport)? };
-        // Expert input rows are at most BF16, as wide as a partial row.
         log_transfer_plan(mode, ranks);
-        let egress_bytes = egress_bytes(capacity as usize, row_bytes, enable_egress, egress_setting());
-        if egress_bytes > 0 {
-            transport.enable_egress(egress_bytes, egress_setting() == Egress::Staggered)?;
-        }
-        Ok(Self { transport, intake: std::rc::Rc::new(intake), egress_bytes, terminal_library: None, terminal_released: false })
+        Ok(Self { prefill, intake: std::rc::Rc::new(intake), egress_bytes: 0, egress_enabled: enable_egress,
+            terminal_library: None, terminal_released: false, exchange: None, transport: Some(transport),
+            staging_bytes: 0, bootstrap: None, timing, world_size: ranks, capacity })
     }
 
-    /// Where to write a wave's `bytes` of expert input so it goes out
-    /// zero-copy (then build the request with [`Self::egress_payload`]), or
-    /// `None` for a small wave or without egress. Waits for the previous
-    /// wave's request sends; the previous request must have been dropped.
-    pub(crate) fn egress(&mut self, bytes: usize) -> Result<Option<CuteafdHostBuffer>> {
-        if bytes < EGRESS_MIN_BYTES || bytes > self.egress_bytes {
-            return Ok(None);
-        }
-        self.transport.egress_target().map(Some)
+    /// The transport while no exchange runs (setup and teardown only).
+    fn idle_transport(&mut self) -> Result<&mut SparkExperts> {
+        ensure!(self.exchange.is_none(), "the Spark transport belongs to its running exchange");
+        self.transport.as_mut().context("Spark link has no transport")
     }
 
-    /// The first `bytes` of the egress buffer as a request payload.
-    pub(crate) fn egress_payload(&self, bytes: usize) -> Result<bytes::Bytes> {
-        self.transport.egress_payload(bytes)
-    }
-
-    pub(crate) fn world_size(&self) -> usize {
-        self.transport.world_size()
+    /// Bind the admitted endpoint before bootstrap starts its exchange worker.
+    pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        self.idle_transport()?.bind_model_endpoint(endpoint)
     }
 
     /// Completes every rank's persistent bootstrap without dispatching a wave,
     /// so the workers' immutable installed grouping is readable before the
     /// first request and the rings its widest wave needs are already
-    /// registered. Every Spark family calls this once, right after
-    /// [`Self::enable_terminal_ownership`] and before anything plans against
-    /// the transport; dispatch then reuses the open sessions.
+    /// registered, then starts the link's exchange worker. Every Spark family
+    /// calls this once, right after [`Self::enable_terminal_ownership`] and
+    /// before anything plans against the transport.
     ///
     /// `request` must be the widest wave the family dispatches (the one its
-    /// start-up warm-up sends): it sizes every rank's registered rings, and a
-    /// later wider request would have to retire and reconnect them.
+    /// start-up warm-up sends): it sizes every rank's registered rings and
+    /// each slot's wave staging.
     pub(crate) fn bootstrap(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<()> {
-        self.transport.bootstrap(request)
+        let staging = crate::shared::experts::staging::RouteStaging::new(request.header.row_count as usize,
+            usize::try_from(request.header.route_count / request.header.row_count.max(1))?.max(1),
+            request.hidden_payload.len() / (request.header.row_count as usize).max(1))?.bytes;
+        let (egress_enabled, egress_bytes, waves) = (self.egress_enabled, self.egress_bytes, self.slots());
+        let transport = self.idle_transport()?;
+        let mut registered = egress_bytes;
+        if egress_enabled && egress_bytes == 0 {
+            let bytes = registered_egress_bytes(request)?;
+            let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
+            transport.enable_egress(bytes)?;
+            registered = bytes;
+            tracing::info!(slot_bytes = bytes, slots = waves, min_bytes = EGRESS_MIN_BYTES,
+                registered_bytes = bytes * waves, "Spark registered request egress");
+        }
+        transport.bootstrap(request)?;
+        self.egress_bytes = registered;
+        self.staging_bytes = staging;
+        let shape = cuteafd_transport::ExpertProtocolV2Request { hidden_payload: bytes::Bytes::new(), ..request.clone() };
+        self.bootstrap = Some((shape, request.hidden_payload.len()));
+        self.start()
+    }
+
+    /// Starts the exchange worker on the idle transport.
+    fn start(&mut self) -> Result<()> {
+        let intake = &self.intake;
+        let transport = self.transport.take().context("Spark link has no transport")?;
+        // A link whose registered request ring has a slot per wave, each large
+        // enough, stages in those slots: every rank then sends each request
+        // straight from its slot (RDMA WRITE chunks or a gathered SEND), with
+        // no per-rank copy. Otherwise each slot gets its own pinned arena.
+        let egress = match transport.egress_arenas() {
+            Ok(egress) => egress,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
+        let bytes = self.staging_bytes.max(256);
+        let slots = intake.slots();
+        let registered = egress.len() == slots && egress.iter().all(|arena| arena.bytes() >= bytes);
+        let arenas = if registered { Ok(egress) } else {
+            let _scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
+            (0..slots).map(|_| cuteafd_transport::StagingArena::new(bytes)).collect::<Result<Vec<_>>>()
+        };
+        let arenas = match arenas {
+            Ok(arenas) => arenas,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
+        tracing::info!(slots, bytes, registered, "Spark exchange staging");
+        let landing = transport.gpu_landing_ranks().iter().enumerate()
+            .fold(0u8, |bits, (rank, &landed)| if landed { bits | 1 << rank } else { bits });
+        let geometry = crate::shared::spark_waves::Intake { prefill: self.prefill, ranks: intake.ranks(), row_bytes: intake.row_bytes(),
+            ranges: intake.ranges(), geometry: intake.geometry(),
+            landing: if intake.mode == IntakeMode::Gpu { landing } else { 0 }, placed: intake.placed() };
+        // Read-only worker metadata, kept so callers need not reach the transport.
+        let grouping = transport.installed_grouping().unwrap_or_default();
+        let storage = match intake.exchange_storage(&geometry) {
+            Ok(storage) => storage,
+            Err(error) => { self.transport = Some(transport); return Err(error); }
+        };
+        self.exchange = Some(crate::shared::spark_waves::Waves::start(intake.library, geometry, transport, grouping,
+            arenas, self.timing, storage)?);
+        Ok(())
+    }
+
+    /// The link's exchange: every Spark wave goes through it.
+    pub(crate) fn exchange(&mut self) -> Result<&mut crate::shared::spark_waves::Waves<'a>> {
+        self.exchange.as_mut().context("Spark link exchange not started (bootstrap first)")
+    }
+
+    /// Reuse after cancellation: stops the exchange (its consumers drained),
+    /// resets the connections and starts it again.
+    pub(crate) fn reset_connections(&mut self) -> Result<()> {
+        if let Some(exchange) = self.exchange.take() {
+            // A failed exchange already abandoned its waves; a cancelled one
+            // gives up the engine's unlanded waves without a failure (the
+            // process stays healthy) and releases their waits. Either way the
+            // worker hands its transport back (#784).
+            let (transport, frames, result) = exchange.cancel::<SparkExperts>()?;
+            self.intake.keep_frames(frames);
+            self.transport = Some(transport);
+            if let Err(error) = result {
+                tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; resetting its transport");
+            }
+        }
+        let intake = std::rc::Rc::clone(&self.intake);
+        let transport = self.transport.as_mut().context("Spark link has no transport")?;
+        intake.reset(transport)?;
+        // Re-open every rank's session as bootstrap did: the exchange reads
+        // which ranks land in device memory from the live sessions.
+        if let Some((shape, payload)) = &self.bootstrap {
+            let request = cuteafd_transport::ExpertProtocolV2Request {
+                hidden_payload: bytes::Bytes::from(vec![0; *payload]), ..shape.clone() };
+            transport.bootstrap(&request)?;
+        }
+        self.start()
+    }
+
+    /// Immutable worker metadata from the bootstrap (installed grouping).
+    pub(crate) fn installed_grouping(&self) -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
+        // The grouping is fixed at bootstrap; the exchange keeps a copy.
+        match (&self.exchange, &self.transport) {
+            (Some(exchange), _) => Ok(exchange.installed_grouping().to_vec()),
+            (None, Some(transport)) => transport.installed_grouping(),
+            (None, None) => anyhow::bail!("Spark link has no transport"),
+        }
     }
 
     /// Must precede connection/bootstrap so a temporary failed endpoint can
@@ -1167,66 +1087,43 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn enable_terminal_ownership(&mut self, library: Arc<NativeLibrary>) -> Result<()> {
         ensure!(std::ptr::eq(library.as_ref(),self.intake.library),"terminal intake must retain its actual native library owner");
         self.intake.library.rdma_rc_endpoint_quiesce_available()?;
-        self.transport.enable_terminal_ownership()?;
+        self.idle_transport()?.enable_terminal_ownership()?;
         self.terminal_library = Some(library);
         Ok(())
     }
 
-    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> { self.transport.terminal_quiesce() }
+    /// Terminal teardown, step 1: closes the exchange (releasing every queued
+    /// wait), takes its transport back and quiesces the QPs (#784: the
+    /// exchange owns the transport once started).
+    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> {
+        if let Some(exchange) = self.exchange.take() {
+            // Teardown may abandon waves; the worker then fails, releases its
+            // waits and still hands the transport back.
+            let (transport, frames, result) = exchange.close::<SparkExperts>()?;
+            self.intake.keep_frames(frames);
+            self.transport = Some(transport);
+            if let Err(error) = result {
+                tracing::warn!(error = %format!("{error:#}"), "Spark exchange closed with a failure; quiescing its transport");
+            }
+        }
+        self.transport.as_mut().context("Spark link has no transport")?.terminal_quiesce()
+    }
     pub(crate) fn terminal_drain_copies(&self) -> Result<()> { self.intake.terminal_drain_copies() }
     pub(crate) fn terminal_release(&mut self) -> Result<()> {
         // Validate successful QP quiescence before releasing any held source.
-        // Those payloads retain their endpoint registrations until this final
-        // clear, even after the transport drops its drained pending owners.
-        self.transport.terminal_release()?;
-        self.intake.terminal_release_payloads()?;
+        self.transport.as_mut().context("Spark link has no transport")?.terminal_release()?;
+        self.intake.terminal_release_payloads();
         self.terminal_released = true;
-        Ok(())
-    }
-
-    /// Posts `request` to every rank once the previous wave's planes are free.
-    pub(crate) fn dispatch(&mut self, request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<SparkExpertWave> {
-        self.intake.before_dispatch()?;
-        self.transport.dispatch_wave(request)
-    }
-
-    /// Receives `wave` (`t` rows) into the planes, ordering `stream` after it.
-    pub(crate) async fn receive(&mut self, wave: SparkExpertWave, t: usize, stream: *mut c_void)
-        -> Result<WaveReceipt> {
-        self.intake.receive(&mut self.transport, wave, t, stream).await
-    }
-
-    /// Queues `output = shared + sum of the rank planes` for `t` rows on
-    /// `stream` (after [`Self::receive`]) and releases the planes after it.
-    ///
-    /// # Safety
-    /// `shared` and `output` are live `[t, hidden]` BF16 device buffers,
-    /// ordered on `stream` before this call.
-    pub(crate) unsafe fn reduce(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
-        -> Result<()> {
-        let library = self.intake.library;
-        let drain = ReceiveDrain(Some(|| {
-            // SAFETY: the borrowed inputs outlive this call, including a partial
-            // kernel launch or a failed consumption-event publication.
-            crate::shared::decode_graph::fatal_drain(unsafe {
-                self.intake.terminal_drain_copies().and_then(|()| library.cuda_stream_synchronize(stream))
-            }, "failed Spark intake reduction");
-        }));
-        // SAFETY: the planes hold this wave's `t` rows once `stream` reaches
-        // this point (see `receive`); the caller vouches for the rest.
-        unsafe {
-            library.v41_compact_reducer()?.reduce_planes(self.intake.pointers(), self.world_size() as u32, shared,
-                output, t as u32, stream)?;
-        }
-        self.intake.consumed(stream)?;
-        drain.complete();
         Ok(())
     }
 }
 
 impl Drop for SparkLink<'_> {
     fn drop(&mut self) {
-        if self.transport.terminal_owned() && !self.terminal_released {
+        // The exchange joins first; with waves outstanding it fails and
+        // releases every queued wait.
+        drop(self.exchange.take());
+        if self.transport.as_ref().is_some_and(SparkExperts::terminal_owned) && !self.terminal_released {
             // Drop may run inside fallible connection or submission scopes,
             // before the engine regains control. QP quiescence alone cannot
             // prove the compute stream passed these planes/pinned sources.
@@ -1239,335 +1136,75 @@ impl Drop for SparkLink<'_> {
     }
 }
 
-/// Retains external landing, pinned sources and their loaded library unless
-/// the complete QP/compute/copy retirement handshake has succeeded.
-struct LaneOwners<T>(Option<T>);
-impl<T> LaneOwners<T> {
-    fn release(&mut self) { self.0.take(); }
-}
-impl<T> Drop for LaneOwners<T> {
-    fn drop(&mut self) {
-        if let Some(owners) = self.0.take() {
-            std::mem::forget(owners);
-            tracing::error!("retaining terminal lane intake without complete quiescence and consumer drainage");
-        }
-    }
-}
-
-#[cfg(test)]
-mod lane_owner_tests {
-    use super::*;
-    struct Owner(std::rc::Rc<Cell<usize>>);
-    impl Drop for Owner { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
-
-    #[test]
-    fn unproved_lane_release_retains_intake_and_loaded_library() {
-        let drops = std::rc::Rc::new(Cell::new(0));
-        drop(LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone())))));
-        assert_eq!(drops.get(), 0);
-        let mut released = LaneOwners(Some((Owner(drops.clone()), Owner(drops.clone()))));
-        released.release();
-        drop(released);
-        assert_eq!(drops.get(), 2);
-    }
-}
-
-/// A prefill lane and its external intake. Keep this owner whole: joining a
-/// thread alone is not proof that RDMA writes or queued copies have stopped.
-pub(crate) struct SparkLane<'a> {
-    pub(crate) lane: SparkExpertLane,
-    pub(crate) intake: std::rc::Rc<SparkIntake<'a>>,
-    terminal: LaneOwners<(std::rc::Rc<SparkIntake<'a>>, Arc<NativeLibrary>)>,
-}
-
-impl<'a> SparkLane<'a> {
-    pub(crate) fn new(library: &'a Arc<NativeLibrary>, world: cuteafd_transport::expert::SparkWorld, peers: Vec<std::net::SocketAddr>, capacity: u32,
-        config: cuteafd_transport::TcpTransportConfig, row_bytes: usize) -> Result<Self> {
-        library.rdma_rc_endpoint_quiesce_available()?;
-        let mode = transport_mode(library, peers.len(), capacity as usize, row_bytes)?;
-        let intake = std::rc::Rc::new(SparkIntake::new(library, mode, peers.len(), capacity as usize, row_bytes)?);
-        let terminal = LaneOwners(Some((intake.clone(), library.clone())));
-        // SAFETY: the terminal guard retains the intake and its actual loaded
-        // library until checked QP quiescence and all consumers are drained.
-        let lane = unsafe { intake.spawn_lane(world, peers, capacity, config)? };
-        Ok(Self { lane, intake, terminal })
-    }
-
-    pub(crate) fn terminal_quiesce(&mut self) -> Result<()> { self.lane.terminal_quiesce() }
-
-    /// Called only after the submission's compute streams and intake copies
-    /// drain successfully, never merely because the transport thread joined.
-    pub(crate) fn terminal_release(&mut self) -> Result<()> {
-        self.lane.terminal_release()?;
-        self.intake.terminal_release_payloads()?;
-        self.terminal.release();
-        Ok(())
-    }
-
-    pub(crate) fn world_size(&self) -> usize {
-        self.lane.world_size()
-    }
-
-    /// Queues a `t`-row wave whose request `build` makes on the lane thread.
-    pub(crate) fn submit(&mut self, t: usize, build: LaneBuild) -> Result<()> {
-        self.intake.before_dispatch()?;
-        self.intake.submit_lane(&mut self.lane, t, build)
-    }
-
-    /// Waits for the submitted wave and orders `stream` after its planes.
-    pub(crate) fn wait(&mut self, t: usize, timeout: std::time::Duration, stream: *mut c_void)
-        -> Result<cuteafd_transport::expert::LaneTimes> {
-        let times = self.lane.wait(timeout)?;
-        self.intake.after_lane(t, times.landed, stream)?;
-        Ok(times)
-    }
-}
-
-/// Whether engines that support it exchange decode/verify waves through the
-/// device-driven [`SparkDeviceLink`] (`CUTEAFD_SPARK_DEVICE=1`; off by default).
-pub(crate) fn device_exchange_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_DEVICE").as_deref(), Ok("1" | "on" | "true")))
-}
-
-impl Drop for SparkDeviceLink<'_> {
-    fn drop(&mut self) {
-        let stats = self.lane.stats();
-        tracing::info!(waves = stats.waves, build_post_us = stats.build_post_us, receive_us = stats.receive_us,
-            wakes = stats.wakes, wake_us = stats.wake_us, "device-driven Spark exchange closed");
-    }
-}
-
-/// The device-driven Spark exchange (PLAN.md): the engine's stream copies a
-/// wave's routes and wire rows into a pinned mailbox and publishes it
-/// ([`Self::dispatch`]); a proxy thread ([`SparkDeviceLane`]) posts it and
-/// lands every rank's partials in this link's planes; the stream waits for
-/// the proxy's completion ([`Self::collect`]) and reduces ([`Self::reduce`]).
-/// No host wait, parse or launch sits between a layer's router and its
-/// reduce, so a step's layers can be queued (and captured) back to back.
-pub(crate) struct SparkDeviceLink<'a> {
-    /// Dropped first: joins the proxy before its mailbox and planes go.
-    lane: cuteafd_transport::expert::SparkDeviceLane,
-    intake: SparkIntake<'a>,
-    mailbox: HostAllocation<'a>,
-    /// Write mode (`CUTEAFD_SPARK_WRITE=1`): the ranks RDMA-write their rows
-    /// and completion flags here (planes, then one 64-byte flag line per rank);
-    /// no receive and no host thread is involved in a wave's return.
-    written: Option<DeviceAllocation<'a>>,
-    library: &'a NativeLibrary,
-    capacity: usize,
-    topk: usize,
-    wire_row_bytes: usize,
-    row_bytes: usize,
-    ranks: usize,
-}
-
-/// Write mode: one plane per rank, then one 64-byte line per rank flag.
-fn written_layout(ranks: usize, capacity: usize, row_bytes: usize) -> (usize, usize) {
-    let plane = (capacity * row_bytes).next_multiple_of(256);
-    (plane, ranks * plane)
-}
-
-/// Whether device exchanges have the ranks write their responses
-/// (`CUTEAFD_SPARK_WRITE=1`; needs workers that accept write targets).
-pub(crate) fn written_responses() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_SPARK_WRITE").as_deref(), Ok("1" | "on")))
-}
-
-impl<'a> SparkDeviceLink<'a> {
-    pub(crate) fn terminal_drain_copies(&self) -> Result<()> {
-        self.intake.terminal_drain_copies()
-    }
-
-    /// Connects the proxy's transport (`capacity` rows of `topk` routes and
-    /// `wire_row_bytes` per wave; partial rows of `row_bytes`) on `device`.
-    /// Needs GPU landing (the probed intake mode must be `gpu`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(library: &'a NativeLibrary, device: i32, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
-        capacity: usize, topk: usize, wire_row_bytes: usize, row_bytes: usize,
-        config: cuteafd_transport::TcpTransportConfig, warm: Option<cuteafd_transport::ExpertProtocolV2Request>,
-        build: cuteafd_transport::expert::DeviceBuild) -> Result<Self> {
-        use cuteafd_transport::expert::device_mailbox;
-        let choice = choose_mode(library)?;
-        ensure!(device_choice_available(&choice),
-            "the device Spark exchange needs GPU landing, but the intake is {} ({})", choice.mode.name(), choice.reason);
-        library.v41_compact_reducer()?.require_plane_reduction(peers.len() as u32)?;
-        let intake = SparkIntake::new(library, IntakeMode::Gpu, peers.len(), if written_responses() { 1 } else { capacity },
-            row_bytes)?;
-        let mailbox = HostAllocation::new(library, device_mailbox::bytes(capacity, topk, wire_row_bytes))?;
-        library.peer_exchange_initialize()?;
-        let landing = intake.landing().context("GPU intake planes")?;
-        let ranks = peers.len();
-        let (written, targets) = if written_responses() {
-            let (plane, flags) = written_layout(ranks, capacity, row_bytes);
-            // dma-buf export covers the whole allocation, which must be page-sized.
-            let allocation = DeviceAllocation::new(library, (flags + ranks * 64).next_multiple_of(2 << 20))?;
-            library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { allocation.buffer.ptr.cast::<u8>()
-                .add(flags) }.cast(), bytes: ranks * 64, ..allocation.buffer }, &vec![0u8; ranks * 64])?;
-            let targets = (0..ranks).map(|rank| cuteafd_transport::DeviceWriteTarget {
-                base: allocation.buffer.ptr as usize, bytes: allocation.buffer.bytes, plane_offset: rank * plane,
-                plane_bytes: capacity * row_bytes, flag_offset: flags + rank * 64 }).collect();
-            (Some(allocation), Some(targets))
-        } else { (None, None) };
-        // SAFETY: the mailbox and the intake planes are fields of this link,
-        // dropped after the lane (which joins its thread first); the engine
-        // publishes a wave only after it waited for the previous one and
-        // reduced its planes (`dispatch` follows `collect` + `reduce` in
-        // stream order).
-        let lane = unsafe {
-            cuteafd_transport::expert::SparkDeviceLane::spawn(world, peers.to_vec(), capacity as u32,
-                config, landing, device, mailbox.buffer.ptr as usize, mailbox.buffer.bytes, topk, wire_row_bytes,
-                warm, targets, build)?
-        };
-        tracing::info!(ranks, capacity, written = written.is_some(),
-            "device-driven Spark exchange ready (proxy thread posts; responses land in GPU memory)");
-        Ok(Self { lane, intake, mailbox, written, library, capacity, topk, wire_row_bytes, row_bytes, ranks })
-    }
-
-    pub(crate) fn world_size(&self) -> usize {
-        self.lane.world_size()
-    }
-
-    /// Plane pointers for the compact reducer.
-    pub(crate) fn pointers(&self) -> [*const u16; MAX_INTAKE_RANKS] {
-        match &self.written {
-            Some(allocation) => {
-                let (plane, _) = written_layout(self.ranks, self.capacity, self.row_bytes);
-                let mut pointers = [std::ptr::null::<u16>(); MAX_INTAKE_RANKS];
-                for (rank, slot) in pointers.iter_mut().enumerate().take(self.ranks) {
-                    // SAFETY: rank planes lie inside the written allocation.
-                    *slot = unsafe { allocation.buffer.ptr.cast::<u8>().add(rank * plane) }.cast();
-                }
-                pointers
-            }
-            None => self.intake.pointers(),
-        }
-    }
-
-    /// Before queuing a step's waves; returns an earlier wave's error.
-    pub(crate) fn arm(&self) -> Result<()> {
-        self.lane.arm()
-    }
-
-    /// Announces `waves` waves the stream will publish (before it can): the
-    /// proxy spins only while announced waves are outstanding.
-    pub(crate) fn expect(&self, waves: u64) {
-        self.lane.expect(waves)
-    }
-
-    /// After the step's stream drained: an error of any of its waves.
-    pub(crate) fn check(&self) -> Result<()> {
-        use cuteafd_transport::expert::device_mailbox as m;
-        self.lane.check()?;
-        if self.written.is_some() {
-            // SAFETY: a u32 word of the live pinned mailbox, written by the GPU's waits.
-            let word = unsafe { &*(self.mailbox_at(m::WRITE_ERROR).ptr as *const std::sync::atomic::AtomicU32) };
-            let failed = word.swap(0, std::sync::atomic::Ordering::AcqRel);
-            ensure!(failed == 0, "device Spark exchange: ranks {failed:#b} could not write their responses");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn stats(&self) -> cuteafd_transport::expert::DeviceLaneStats {
-        self.lane.stats()
-    }
-
-    /// The lane's and the mailbox's sequences, for a stuck-step report.
-    pub(crate) fn state(&self) -> String {
-        use cuteafd_transport::expert::device_mailbox as m;
-        // SAFETY: u32 words of the live pinned mailbox.
-        let word = |offset| unsafe { std::ptr::read_volatile(self.mailbox_at(offset).ptr as *const u32) };
-        format!("{}; mailbox ready {} done {} send_state {} recv_state {}", self.lane.state(), word(m::READY),
-            word(m::DONE), word(m::SEND_STATE), word(m::RECV_STATE))
-    }
-
-    fn mailbox_at(&self, offset: usize) -> CuteafdHostBuffer {
-        CuteafdHostBuffer {
-            // SAFETY: offsets come from `device_mailbox` and lie inside it.
-            ptr: unsafe { self.mailbox.buffer.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: self.mailbox.buffer.bytes - offset,
-            ..self.mailbox.buffer
-        }
-    }
-
-    /// Loads the signal/wait kernels on another GPU whose streams will
-    /// dispatch or collect on this link (the sequences live in the mailbox).
-    pub(crate) fn initialize_on(&self, device: i32) -> Result<()> {
-        let previous = self.library.cuda_get_device()?;
-        self.library.cuda_set_device(device)?;
-        let loaded = self.library.peer_exchange_initialize();
-        self.library.cuda_set_device(previous)?;
-        loaded
-    }
-
-    /// Queues on `stream` the copy of a wave's `rows` x `topk` route ids
-    /// (u32) and gate weights (f32) and its wire rows into the mailbox, then
-    /// publishes it (layer, rows and `kind` for the proxy's request builder).
-    ///
-    /// # Safety
-    /// `ids`, `weights` and `wire` are live device buffers holding the wave,
-    /// complete in `stream` order; every earlier wave on this link was
-    /// collected and reduced earlier on `stream`.
-    pub(crate) unsafe fn dispatch(&self, layer: usize, rows: usize, kind: u32, ids: CuteafdDeviceBuffer,
-        weights: CuteafdDeviceBuffer, wire: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
-        use cuteafd_transport::expert::device_mailbox as m;
-        ensure!(rows > 0 && rows <= self.capacity, "a device wave of {rows} rows exceeds the link's {}", self.capacity);
-        let (route_bytes, wire_bytes) = (rows * self.topk * 4, rows * self.wire_row_bytes);
-        // SAFETY: the mailbox ranges hold a full-capacity wave; the caller
-        // vouches for the sources and their ordering.
-        unsafe {
-            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::ROUTES), ids, route_bytes, stream)?;
-            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::weights(self.capacity, self.topk)), weights,
-                route_bytes, stream)?;
-            self.library.copy_d2h_host_buffer_async(self.mailbox_at(m::wire(self.capacity, self.topk)), wire,
-                wire_bytes, stream)?;
-            self.library.host_signal(self.mailbox_at(m::READY).ptr.cast(), self.mailbox_at(m::SEND_STATE).ptr.cast(),
-                self.mailbox_at(m::DESCRIPTOR).ptr.cast(), [layer as u32, rows as u32, kind, self.topk as u32], stream)
-        }
-    }
-
-    /// Queues on `stream` the wait for the proxy's completion of the oldest
-    /// published, not yet collected wave (its partials are then in the planes).
-    ///
-    /// # Safety
-    /// A [`Self::dispatch`] for this wait was queued earlier on `stream`.
-    pub(crate) unsafe fn collect(&self, stream: *mut c_void) -> Result<()> {
-        use cuteafd_transport::expert::device_mailbox as m;
-        if let Some(allocation) = &self.written {
-            let (_, flags) = written_layout(self.ranks, self.capacity, self.row_bytes);
-            // SAFETY: the flags lie in the written allocation the ranks write;
-            // the state and error words are pinned, device-mapped mailbox memory.
-            return unsafe {
-                self.library.spark_wait_written(allocation.buffer.ptr.cast::<u8>().add(flags).cast(), self.ranks as u32,
-                    8, self.mailbox_at(m::RECV_STATE).ptr.cast(), self.mailbox_at(m::WRITE_ERROR).ptr.cast(), stream)
-            };
-        }
-        // SAFETY: the DONE word is pinned, device-mapped mailbox memory; the
-        // state word is pinned mailbox memory too.
-        unsafe { self.library.peer_wait(self.mailbox_at(m::DONE).ptr.cast(), self.mailbox_at(m::RECV_STATE).ptr.cast(),
-            stream) }
-    }
-
-    /// Queues `output = shared + sum of the rank planes` for `t` rows on
-    /// `stream` (after [`Self::collect`]).
-    ///
-    /// # Safety
-    /// As [`SparkLink::reduce`].
-    pub(crate) unsafe fn reduce(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
-        -> Result<()> {
-        // SAFETY: the planes hold the collected wave's `t` rows in `stream`
-        // order; the caller vouches for the rest.
-        unsafe {
-            self.library.v41_compact_reducer()?.reduce_planes(self.pointers(), self.world_size() as u32, shared,
-                output, t as u32, stream)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn mimo_endpoint_reservation_matches_allocated_backing() -> Result<()> {
+        use cuteafd_loader::families::mimo_v2::{admission, MimoExpertInput, MimoV2Config};
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        for hidden in [17, 6144] {
+            let cfg = MimoV2Config::from_hf(&serde_json::json!({
+                "model_type": "mimo_v2", "num_hidden_layers": 1, "hidden_size": hidden,
+                "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 128,
+                "v_head_dim": 128, "rope_theta": 10000.0, "swa_rope_theta": 10000.0,
+                "sliding_window": 128, "vocab_size": 256, "intermediate_size": 256,
+                "n_routed_experts": 8, "num_experts_per_tok": 2, "moe_intermediate_size": 128,
+            }))?;
+            for ranks in [1, 2, 6] { for rows in [1, 64, 256] { for waves in [1, 3, 4] {
+                // Reload resets the fake DSO's bounded, lifetime-wide event registry.
+                let library = fixture.load()?;
+                let endpoints = admission::spark_endpoints(rows, MimoExpertInput::Fp8)?;
+                let reservation = admission::transport_reservations(&cfg, 1, 0, rows, waves, ranks, cuteafd_core::SparkReplyFormat::Bf16)?;
+                let planned = reservation.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap().bytes;
+                let owner = "test/mimo-endpoint-reservation";
+                let _owner = cuteafd_ffi::memory_ledger::owner(owner);
+                let decode = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[0].capacity as usize, hidden * 2, 1)?;
+                let prefill = SparkIntake::with_waves(&library, IntakeMode::Gpu, ranks,
+                    endpoints[1].capacity as usize, hidden * 2, waves)?;
+                for (intake, slots) in [(&decode, 1), (&prefill, waves)] {
+                    let backing: u64 = intake.planes.iter().map(|plane| plane._allocation.buffer.bytes as u64).sum();
+                    assert_eq!(backing, cuteafd_loader::serving_capacity::prefill_return_bytes(
+                        slots as u64, intake.rows() as u64, ranks as u64, hidden as u64));
+                }
+                let actual = cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0);
+                assert_eq!(planned, actual as u64, "hidden={hidden} ranks={ranks} rows={rows} waves={waves}");
+                drop((decode, prefill));
+                assert_eq!(cuteafd_ffi::memory_ledger::snapshot()
+                    .by_owner(cuteafd_ffi::memory_ledger::Space::Device, library.cuda_get_device()?)
+                    .get(owner).copied().unwrap_or(0), 0);
+            } } }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn padded_partial_reserve_keeps_logical_wave_offsets_and_plan_charge() -> Result<()> {
+        let (waves, rows, row_bytes, ranks) = (3, 2752, 34_864, 6);
+        let geometry = SlotGeometry::new(waves, rows)?;
+        let logical = geometry.reserve_rows() * row_bytes;
+        let backing = cuteafd_core::serving_capacity::spark_intake_allocation_bytes(logical as u64)?;
+        assert!(backing > logical as u64);
+        for base in [4096, 4608] {
+            let (aligned_offset, registered_bytes) = cuteafd_core::serving_capacity::spark_intake_export_range(base, logical as u64)?;
+            assert_eq!((base + aligned_offset) % 4096, 0);
+            assert!(aligned_offset + registered_bytes <= backing);
+            cuteafd_core::serving_capacity::validate_spark_intake_export(base + aligned_offset, registered_bytes)?;
+        }
+        for slot in 0..waves {
+            let (offset, bytes) = geometry.slice(slot, row_bytes);
+            assert_eq!((offset, bytes), (slot * rows * row_bytes, rows * row_bytes));
+            assert!((offset + bytes) as u64 <= backing);
+        }
+        assert_eq!(cuteafd_loader::serving_capacity::prefill_return_bytes(
+            waves as u64, rows as u64, ranks, row_bytes as u64 / 2), ranks * backing);
+        Ok(())
+    }
 
     fn probe(gpu_gbps: f64) -> GpuLandingProbe {
         GpuLandingProbe {
@@ -1577,8 +1214,24 @@ mod tests {
     }
 
     #[test]
+    fn fabric_landing_without_a_peer_needs_a_sole_rdma_address() {
+        use cuteafd_transport::fabric::{RdmaPort, RdmaSelection};
+        let port = |roce_v2: Vec<(u32, std::net::Ipv4Addr)>| RdmaPort { device: "mlx5_0".into(), port: 1, active: true,
+            link_layer: "Ethernet".into(), link_gbps: 400.0, netdev: Some("eno1".into()), mtu: Some(9000), roce_v2,
+            subnets: vec![], pci: None };
+        let rail = std::net::Ipv4Addr::new(10, 55, 0, 22);
+        assert_eq!(sole_rdma_address(&[port(vec![(7, rail)])]).unwrap(),
+            RdmaSelection { device: "mlx5_0".into(), port: 1, gid_index: 7 });
+        // A management address beside the rail (lower index): no guess.
+        let error = sole_rdma_address(&[port(vec![(3, std::net::Ipv4Addr::new(192, 168, 1, 50)), (7, rail)])])
+            .unwrap_err().to_string();
+        assert!(error.contains("--landing-peer") && error.contains("192.168.1.50"), "{error}");
+        assert!(sole_rdma_address(&[port(vec![])]).is_err());
+    }
+
+    #[test]
     fn fabric_probe_reports_missing_library_for_each_bounded_repeat() {
-        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3);
+        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3, None);
         assert_eq!(reports.len(), 3);
         for report in reports {
             assert!(report.probe.is_none());
@@ -1588,12 +1241,50 @@ mod tests {
     }
 
     #[test]
-    fn adopted_transport_preserves_egress_while_new_links_enable_it() {
-        for setting in [Egress::Copied, Egress::Parallel, Egress::Staggered] {
-            assert_eq!(egress_bytes(4096, 10240, false, setting), 0);
-            assert_eq!(egress_bytes(4096, 10240, true, setting),
-                if setting == Egress::Copied { 0 } else { 4096 * 10240 });
+    fn registered_egress_matches_widest_bootstrap_request_geometry() -> Result<()> {
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor,
+            ExpertProtocolV2RouteEntry, ExpertV2SourceKind, ExpertV2Dtype};
+        for rows in [64u32, 1024, 2048, 4096] {
+            for dtype in [ExpertV2Dtype::Bf16, ExpertV2Dtype::Fp8E4m3Ue8m0K32] {
+                let geometry = cuteafd_core::ExpertGeometry::MIMO_V26_PRO;
+                let hidden_bytes = if dtype == ExpertV2Dtype::Bf16 { geometry.hidden * 2 }
+                    else { geometry.hidden + geometry.hidden / 32 };
+                let request = ExpertProtocolV2Request::new(1, 17, 0, geometry.hidden, dtype,
+                    (0..rows).map(|row| ExpertProtocolV2RowDescriptor {
+                        row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill,
+                        source_request_id: 1, token_position: u64::from(row),
+                        route_offset: row * geometry.topk, route_count: geometry.topk,
+                    }).collect(),
+                    (0..rows).flat_map(|row| (0..geometry.topk).map(move |expert| ExpertProtocolV2RouteEntry {
+                        row_index: row, expert_id: expert, gate_weight: 0.0,
+                    })).collect(), vec![0; (rows * hidden_bytes) as usize])?;
+                let expected = geometry.compact_wire_bytes(rows, dtype == ExpertV2Dtype::Bf16).unwrap().0;
+                assert_eq!(registered_egress_bytes(&request)?, expected);
+                assert_eq!(request.encode()?.len(), expected);
+            }
         }
+        Ok(())
+    }
+
+    /// A prefill wave stages its route ids, gate weights and input rows in a
+    /// slot of the registered egress ring (spark_waves), so every family's
+    /// widest wave must fit the slot its widest bootstrap request sized.
+    #[test]
+    fn registered_egress_slots_hold_a_whole_prefill_wave_staging() -> Result<()> {
+        use cuteafd_core::ExpertGeometry as G;
+        for geometry in [G::DEEPSEEK_V41, G::DEEPSEEK_V4_FLASH, G::DEEPSEEK_V4_PRO, G::GLM5, G::GLM5_FLASH,
+            G::MIMO_V2_FLASH, G::MIMO_V26_PRO, G::QWEN4, G::KIMI_K3, G::STEP5] {
+            for rows in [1u32, 64, 1024, 4096] {
+                for bf16 in [false, true] {
+                    let (hidden, topk) = (geometry.hidden as usize, geometry.topk as usize);
+                    let wire = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
+                    let staging = crate::shared::experts::staging::RouteStaging::new(rows as usize, topk, wire)?.bytes;
+                    let slot = geometry.compact_wire_bytes(rows, bf16).unwrap().0;
+                    assert!(staging <= slot, "{geometry:?} {rows} rows bf16={bf16}: {staging} > {slot}");
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -1606,166 +1297,6 @@ mod tests {
         assert!(upload_offset(2, 0, 1, usize::MAX, 1, usize::MAX).is_err());
         assert!(upload_offset(2, 0, 2, usize::MAX, 0, usize::MAX).is_err());
         assert_eq!(upload_offset(2, 1, 3, 10240, 20480, 51200).unwrap(), 30720);
-    }
-
-    #[test]
-    fn pageable_uploads_match_rank_ordered_reduction_and_reuse_after_drain() -> Result<()> {
-        let Some(path) = std::env::var_os("CUTEAFD_PLANE_UPLOAD_LIBRARY") else {
-            eprintln!("skip GPU intake upload test: CUTEAFD_PLANE_UPLOAD_LIBRARY unset");
-            return Ok(());
-        };
-        // SAFETY: the opt-in path names the built native library for this GPU.
-        let library = unsafe { NativeLibrary::load(path)? };
-        for ranks in [2, 3, 4, 6] {
-            let intake = SparkIntake::new(&library, IntakeMode::Pinned, ranks, 4096, 10240)?;
-            let stream = WarmStream::new(&library)?;
-            let shared = DeviceAllocation::new(&library, 4096 * 10240)?;
-            let output = DeviceAllocation::new(&library, 4096 * 10240)?;
-            let reducer = library.v41_compact_reducer()?;
-            for rows in [1, 6, 80, 81, 256, 1024, 4096, 6] {
-                intake.before_dispatch()?;
-                let bytes = rows * 10240;
-                library.copy_h2d(shared.buffer, &0x3f00u16.to_ne_bytes().repeat(bytes / 2))?;
-                let payloads: Vec<Vec<u8>> = (0..ranks).map(|rank| (0..bytes / 2).flat_map(|i| {
-                    let value = rank as f32 + 1.0 + (i % 31) as f32 / 32.0;
-                    ((value.to_bits() >> 16) as u16).to_ne_bytes()
-                }).collect()).collect();
-                for (plane, payload) in intake.planes.iter().zip(&payloads) {
-                    library.copy_h2d(plane.buffer, payload)?;
-                }
-                // SAFETY: all initialized planes and output hold the live rows.
-                unsafe {
-                    match ranks {
-                        2 => reducer.reduce_tp2(std::array::from_fn(|r| intake.planes[r].buffer.ptr.cast::<u16>().cast_const()),
-                            shared.buffer.ptr.cast(), output.buffer.ptr.cast(), rows as u32, stream.raw())?,
-                        4 => reducer.reduce(std::array::from_fn(|r| intake.planes[r].buffer.ptr.cast::<u16>().cast_const()),
-                            shared.buffer.ptr.cast(), output.buffer.ptr.cast(), rows as u32, stream.raw())?,
-                        _ => reducer.reduce_planes(intake.pointers(), ranks as u32,
-                            shared.buffer.ptr.cast(), output.buffer.ptr.cast(), rows as u32, stream.raw())?,
-                    }
-                    library.cuda_stream_synchronize(stream.raw())?;
-                }
-                let mut expected = vec![0; bytes];
-                library.copy_d2h(&mut expected, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
-                for plane in &intake.planes { library.copy_h2d(plane.buffer, &vec![0; bytes])?; }
-                let drain = ReceiveDrain(Some(|| {
-                    crate::shared::decode_graph::fatal_drain(intake.terminal_drain_copies()
-                        .and_then(|()| unsafe { library.cuda_stream_synchronize(stream.raw()) }),
-                        "intake upload test drain");
-                }));
-                let target = intake.upload_stream(bytes, stream.raw());
-                for first in (0..rows).step_by(3) {
-                    let end = (first + 3).min(rows);
-                    for rank in (0..ranks).rev() {
-                        let payload = VerbsHostProtocolV2ResponsePayload::from_owned(
-                            payloads[rank][first * 10240..end * 10240].to_vec());
-                        retain_before_enqueue(&intake.held, (rank, first as u32, payload), |(rank, first, payload)| {
-                            intake.queue_upload(*rank, *first, payload, bytes, target)
-                        })?;
-                    }
-                }
-                intake.join_uploads(target, stream.raw(), 0)?;
-                // SAFETY: upload completion precedes the reduction on this stream.
-                unsafe {
-                    reducer.reduce_planes(intake.pointers(), ranks as u32, shared.buffer.ptr.cast(),
-                        output.buffer.ptr.cast(), rows as u32, stream.raw())?;
-                }
-                intake.consumed(stream.raw())?;
-                drop(drain);
-                let mut actual = vec![0; bytes];
-                library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
-                assert_eq!(actual, expected, "ranks={ranks} rows={rows}");
-                intake.before_dispatch()?;
-                assert!(intake.held.lock().unwrap().is_empty());
-            }
-            stream.finish()?;
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires four idle live Spark workers and CUDA native library"]
-    fn retained_roce_uploads_drain_before_recycling_live() -> Result<()> {
-        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor,
-            ExpertProtocolV2RouteEntry, ExpertV2SourceKind, ExpertV2Dtype, TcpTransportConfig};
-        // SAFETY: the opt-in path names the matching trusted native library.
-        let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_PLANE_UPLOAD_LIBRARY")?)? };
-        let peers = std::env::var("CUTEAFD_LIVE_ROCE_PEERS")?.split(',')
-            .map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
-        ensure!(peers.len() == 4, "four peers required");
-        let mut transport = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 4096, TcpTransportConfig { timing: false, timeout: std::time::Duration::from_secs(30),
-                max_frame_bytes: 64 << 20 })?;
-        let intake = SparkIntake::new(&library, IntakeMode::Pinned, 4, 4096, 10240)?;
-        // SAFETY: transport drops first and dispatch follows before_dispatch.
-        unsafe { intake.attach(&mut transport)? };
-        let stream = WarmStream::new(&library)?;
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        runtime.block_on(async {
-            let mut request_id = 900_000;
-            for rows in [1u32, 6, 80, 81, 256, 1024, 4096, 6] {
-                let mut hidden = Vec::with_capacity(rows as usize * 5280);
-                for row in 0..rows {
-                    hidden.extend((0..5120).map(|i| 0x30 + ((i + row) % 8) as u8));
-                    hidden.extend([120; 160]);
-                }
-                let mut request = ExpertProtocolV2Request::new(request_id, 17, 39, 5120,
-                    ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-                    (0..rows).map(|r| ExpertProtocolV2RowDescriptor {
-                        row_id: r as u64, source_kind: ExpertV2SourceKind::Prefill,
-                        source_request_id: request_id, token_position: r as u64,
-                        route_offset: r * 6, route_count: 6,
-                    }).collect(),
-                    (0..rows).flat_map(|r| (0..6).map(move |j| ExpertProtocolV2RouteEntry {
-                        row_index: r, expert_id: (r * 7 + j) % 384, gate_weight: 1.0 / 6.0,
-                    })).collect(), hidden)?;
-                request.header.flags = cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-                for fail in [false, true, false] {
-                    request_id += 1;
-                    request.header.request_id = request_id;
-                    intake.before_dispatch()?;
-                    let plane_bytes = rows as usize * 10240;
-                    let target = intake.upload_stream(plane_bytes, stream.raw());
-                    let mut expected = Vec::new();
-                    {
-                        let _drain = ReceiveDrain(Some(|| {
-                            crate::shared::decode_graph::fatal_drain(intake.terminal_drain_copies()
-                                .and_then(|()| unsafe { library.cuda_stream_synchronize(stream.raw()) }),
-                                "live retained intake test drain");
-                        }));
-                        let wave = transport.dispatch_wave(&request)?;
-                        let result = transport.receive_wave_owned(wave, |rank, first, payload| {
-                            ensure!(payload.pinned_host_buffer().is_some() && payload.retains_receive_slot(),
-                                "live response is not a retained pinned receive slot");
-                            expected.push((rank, first, payload.as_ref().to_vec()));
-                            retain_before_enqueue(&intake.held, (rank, first, payload), |(rank, first, payload)| {
-                                intake.queue_upload(*rank, *first, payload, plane_bytes, target)
-                            })?;
-                            if fail { anyhow::bail!("injected failure after pinned upload enqueue"); }
-                            Ok(())
-                        }).await;
-                        assert_eq!(result.is_err(), fail);
-                        if fail { transport.reset_connections(); }
-                    }
-                    assert!(!expected.is_empty());
-                    if !fail { assert_eq!(expected.iter().map(|(_, _, b)| b.len()).sum::<usize>(),
-                        plane_bytes * 4); }
-                    for (rank, first, bytes) in expected {
-                        let offset = upload_offset(4, rank, first, 10240, bytes.len(), plane_bytes)?;
-                        let plane = intake.planes[rank].buffer;
-                        // SAFETY: the checked range belongs to this live plane, whose upload drained.
-                        let source = CuteafdDeviceBuffer { ptr: unsafe { plane.ptr.cast::<u8>().add(offset).cast() },
-                            bytes: bytes.len(), ..plane };
-                        let mut actual = vec![0; bytes.len()];
-                        library.copy_d2h(&mut actual, source)?;
-                        assert_eq!(actual, bytes, "rows={rows} fail={fail} rank={rank}");
-                    }
-                    intake.before_dispatch()?;
-                    assert!(intake.held.lock().unwrap().is_empty());
-                }
-            }
-            Ok::<_, anyhow::Error>(())
-        })?;
-        stream.finish()
     }
 
     #[test]
@@ -1784,33 +1315,13 @@ mod tests {
     }
 
     #[test]
-    fn pinned_preference_does_not_change_probed_auto() {
-        let mut measured = probe(19.2);
-        measured.host_gbps = 55.0;
-        let h2d = Some(55.0);
-        assert_eq!(pinned_path_gbps(measured.host_gbps, h2d.unwrap()), 27.5);
-        let (mode, reason) = resolve_landing_probe("auto", &Ok(measured.clone()), h2d);
-        assert_eq!(mode, IntakeMode::Gpu);
-        let generic = IntakeChoice { setting: "auto".into(), mode, reason,
-            probe: Some(measured), h2d_gbps: h2d };
-        assert!(device_choice_available(&generic));
-        let v41 = preferred_choice(generic, IntakePreference::Pinned);
-        assert_eq!(v41.mode, IntakeMode::Pinned);
-        assert!(!device_choice_available(&v41));
-        assert_eq!(v41.mode_for(4096 * 10240).0, IntakeMode::Pinned);
-    }
-
-    #[test]
-    fn pinned_preference_preserves_explicit_gpu_and_capability_fallback() {
+    fn explicit_gpu_intake_lands_on_the_gpu_only_when_the_probe_can() {
         let measured = probe(19.2);
         for supported in [true, false] {
             let result = if supported { Ok(measured.clone()) }
                 else { Err(anyhow::anyhow!("forced unavailable")) };
-            let (mode, reason) = resolve_landing_probe("gpu", &result, None);
-            let choice = preferred_choice(IntakeChoice { setting: "gpu".into(), mode, reason,
-                probe: result.ok(), h2d_gbps: None }, IntakePreference::Pinned);
-            assert_eq!(device_choice_available(&choice), supported);
-            assert_eq!(choice.mode, if supported { IntakeMode::Gpu } else { IntakeMode::Pinned });
+            let (mode, _) = resolve_landing_probe("gpu", &result, None);
+            assert_eq!(mode, if supported { IntakeMode::Gpu } else { IntakeMode::Pinned });
         }
     }
 
@@ -1822,17 +1333,16 @@ mod tests {
         let choice = IntakeChoice { setting: "auto".into(), mode, reason,
             probe: Some(measured), h2d_gbps: Some(57.6) };
         assert!(choice.probe.as_ref().unwrap().usable());
-        assert!(!device_choice_available(&choice));
+        assert_eq!(choice.mode_for(4096 * 10240).0, IntakeMode::Pinned);
     }
 
     #[test]
-    fn unavailable_landing_keeps_pinned_intake_and_disables_device_exchange() {
+    fn unavailable_landing_keeps_pinned_intake() {
         for setting in ["auto", "gpu"] {
             let (mode, reason) = resolve_landing_probe(setting, &Err(anyhow::anyhow!("forced unavailable")), None);
             assert!(reason.contains("forced unavailable"));
             let choice = IntakeChoice { setting: setting.into(), mode,
                 reason, probe: None, h2d_gbps: None };
-            assert!(!device_choice_available(&choice));
             assert_eq!(choice.mode_for(4096 * 10240).0, IntakeMode::Pinned);
         }
     }

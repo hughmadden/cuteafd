@@ -1,14 +1,22 @@
 //! Shared native FP8 SwiGLU execution for backbone and dSpark weights.
 use crate::shared::memory::{DeviceAllocation, LoadStream};
 use crate::families::deepseek_v41::v41_tensors::NativeRtxTensors;
-use anyhow::{ensure, Context, Result};
+use anyhow::{ensure, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Fp8Plan, V41SharedSwiGlu};
 use std::ffi::c_void;
+use std::rc::Rc;
 
 pub(crate) struct SharedFfn<'weights, 'library> {
     _weights: &'weights NativeRtxTensors<'library>,
     scales: &'weights [DeviceAllocation<'library>],
     tensors: [CuteafdDeviceBuffer; 3],
+    storage: Rc<SharedFfnStorage<'library>>,
+
+}
+/// Plain unit-cap scratch, used entirely on the containing shared wave's
+/// single shared stream. No intermediate survives the FFN hook. Standalone
+/// dSpark owners retain private storage and their existing external stream.
+pub(crate) struct SharedFfnStorage<'library> {
     up_kernel: V41Fp8Plan<'library>,
     down_kernel: V41Fp8Plan<'library>,
     activation: V41SharedSwiGlu<'library>,
@@ -19,6 +27,44 @@ pub(crate) struct SharedFfn<'weights, 'library> {
     up: DeviceAllocation<'library>,
     intermediate: DeviceAllocation<'library>,
     capacity: u32,
+}
+impl<'library> SharedFfnStorage<'library> {
+    fn allocation_sizes(up: usize, down: usize, unit: u32) -> [usize; 6] {
+        [up, down, 4, unit as usize * 4608, unit as usize * 4608, unit as usize * 4608]
+    }
+    pub(crate) fn storage_bytes(library: &NativeLibrary, unit: u32) -> Result<usize> {
+        ensure!((1..=4096).contains(&unit), "invalid shared FFN unit");
+        Ok(Self::allocation_sizes(
+            library.v41_fp8_matrix_plan_info(unit, 5120, 2304)?.scratch_bytes as usize,
+            library.v41_fp8_matrix_plan_info(unit, 2304, 5120)?.scratch_bytes as usize, unit)
+            .into_iter().sum())
+    }
+    pub(crate) fn new(library: &'library NativeLibrary, unit: u32) -> Result<Rc<Self>> {
+        Self::storage_bytes(library, unit)?;
+        let up_kernel = library.v41_fp8_matrix_plan(unit, 5120, 2304)?;
+        let down_kernel = library.v41_fp8_matrix_plan(unit, 2304, 5120)?;
+        let [up, down, alpha, gate, intermediate_up, intermediate] = Self::allocation_sizes(
+            up_kernel.info().scratch_bytes as usize, down_kernel.info().scratch_bytes as usize, unit);
+        let value = Self {
+            up_scratch: DeviceAllocation::new(library, up)?,
+            down_scratch: DeviceAllocation::new(library, down)?,
+            up_kernel, down_kernel,
+            activation: library.v41_shared_swiglu()?,
+            alpha: DeviceAllocation::new(library, alpha)?,
+            gate: DeviceAllocation::new(library, gate)?,
+            up: DeviceAllocation::new(library, intermediate_up)?,
+            intermediate: DeviceAllocation::new(library, intermediate)?,
+            capacity: unit,
+        };
+        let stream = LoadStream { library, raw: library.cuda_stream_create()? };
+        // SAFETY: initialization only touches owned buffers; drain on failure too.
+        let initialized = unsafe {
+            value.up_kernel.initialize_scratch(value.up_scratch.buffer, value.alpha.buffer, stream.raw)
+                .and_then(|()| value.down_kernel.initialize_scratch(value.down_scratch.buffer, value.alpha.buffer, stream.raw))
+        };
+        initialized.and(unsafe { library.cuda_stream_synchronize(stream.raw) })?;
+        Ok(Rc::new(value))
+    }
 }
 impl<'weights, 'library> SharedFfn<'weights, 'library> {
     /// # Safety
@@ -39,9 +85,9 @@ impl<'weights, 'library> SharedFfn<'weights, 'library> {
         for i in 0..3 {
             ensure!(
                 tensors[i].bytes == self.tensors[i].bytes
-                    && tensors[i].device_id == self.gate.buffer.device_id
+                    && tensors[i].device_id == self.storage.gate.buffer.device_id
                     && scales[i].buffer.bytes == self.scales[i].buffer.bytes
-                    && scales[i].buffer.device_id == self.gate.buffer.device_id,
+                    && scales[i].buffer.device_id == self.storage.gate.buffer.device_id,
                 "shared FFN rebound weight extent or device differs"
             );
         }
@@ -63,59 +109,28 @@ impl<'weights, 'library> SharedFfn<'weights, 'library> {
             Self::device_bytes(library, capacity)? <= budget,
             "shared FFN exceeds budget"
         );
-        let up_kernel = library.v41_fp8_matrix_plan(capacity, 5120, 2304)?;
-        let down_kernel = library.v41_fp8_matrix_plan(capacity, 2304, 5120)?;
-        let value = SharedFfn {
-            _weights: weights,
-            scales,
-            tensors: [
-                weights.get(&format!("{prefix}.w1.weight"))?,
+        Self::on_storage(library, weights, prefix, scales, SharedFfnStorage::new(library, capacity)?)
+    }
+    pub(crate) fn on_storage(
+        _library: &'library NativeLibrary,
+        weights: &'weights NativeRtxTensors<'library>,
+        prefix: &str,
+        scales: &'weights [DeviceAllocation<'library>],
+        storage: Rc<SharedFfnStorage<'library>>,
+    ) -> Result<Self> {
+        ensure!(scales.len() == 3, "shared FFN requires three packed scales");
+        Ok(Self { _weights: weights, scales,
+            tensors: [weights.get(&format!("{prefix}.w1.weight"))?,
                 weights.get(&format!("{prefix}.w3.weight"))?,
-                weights.get(&format!("{prefix}.w2.weight"))?,
-            ],
-            up_scratch: DeviceAllocation::new(library, up_kernel.info().scratch_bytes as usize)?,
-            down_scratch: DeviceAllocation::new(
-                library,
-                down_kernel.info().scratch_bytes as usize,
-            )?,
-            up_kernel,
-            down_kernel,
-            activation: library.v41_shared_swiglu()?,
-            alpha: DeviceAllocation::new(library, 4)?,
-            gate: DeviceAllocation::new(library, capacity as usize * 2304 * 2)?,
-            up: DeviceAllocation::new(library, capacity as usize * 2304 * 2)?,
-            intermediate: DeviceAllocation::new(library, capacity as usize * 2304 * 2)?,
-            capacity,
-        };
-        let stream = LoadStream {
-            library,
-            raw: library.cuda_stream_create()?,
-        };
-        unsafe {
-            value.up_kernel.initialize_scratch(
-                value.up_scratch.buffer,
-                value.alpha.buffer,
-                stream.raw,
-            )?;
-            value.down_kernel.initialize_scratch(
-                value.down_scratch.buffer,
-                value.alpha.buffer,
-                stream.raw,
-            )?;
-            library.cuda_stream_synchronize(stream.raw)?;
-        }
-        Ok(value)
+                weights.get(&format!("{prefix}.w2.weight"))?], storage })
     }
 }
 impl SharedFfn<'_, '_> {
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        let up = library.v41_fp8_matrix_plan_info(capacity, 5120, 2304)?;
-        let down = library.v41_fp8_matrix_plan_info(capacity, 2304, 5120)?;
-        usize::try_from(up.scratch_bytes + down.scratch_bytes + u64::from(capacity) * 2304 * 6 + 4)
-            .context("shared FFN scratch budget overflow")
+        SharedFfnStorage::storage_bytes(library, capacity)
     }
     pub fn intermediates(&self) -> [CuteafdDeviceBuffer; 3] {
-        [self.gate.buffer, self.up.buffer, self.intermediate.buffer]
+        [self.storage.gate.buffer, self.storage.up.buffer, self.storage.intermediate.buffer]
     }
     /// Enqueue on the owning expert wave stream; the caller must drain even on
     /// failure before releasing this exclusive borrow of scratch.
@@ -127,48 +142,70 @@ impl SharedFfn<'_, '_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            rows > 0 && rows <= self.capacity,
+            rows > 0 && rows <= self.storage.capacity,
             "shared FFN rows exceed capacity"
         );
+        unsafe { self.enqueue_up(input, rows, stream)?; self.enqueue_down(output, rows, stream) }
+    }
+    pub(crate) unsafe fn enqueue_up(&self, input: CuteafdDeviceBuffer, rows: u32, stream: *mut c_void) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.storage.capacity, "shared FFN rows exceed capacity");
         let scales = self.scales;
         unsafe {
-            self.up_kernel.launch(
+            self.storage.up_kernel.launch(
                 input,
                 self.tensors[0],
                 scales[0].buffer,
-                self.up_scratch.buffer,
-                self.alpha.buffer,
-                self.gate.buffer,
+                self.storage.up_scratch.buffer,
+                self.storage.alpha.buffer,
+                self.storage.gate.buffer,
                 rows,
                 stream,
             )?;
-            self.up_kernel.launch(
+            self.storage.up_kernel.launch(
                 input,
                 self.tensors[1],
                 scales[1].buffer,
-                self.up_scratch.buffer,
-                self.alpha.buffer,
-                self.up.buffer,
+                self.storage.up_scratch.buffer,
+                self.storage.alpha.buffer,
+                self.storage.up.buffer,
                 rows,
                 stream,
             )?;
-            self.activation.launch(
-                self.gate.buffer,
-                self.up.buffer,
-                self.intermediate.buffer,
+            self.storage.activation.launch(
+                self.storage.gate.buffer,
+                self.storage.up.buffer,
+                self.storage.intermediate.buffer,
                 rows,
                 stream,
-            )?;
-            self.down_kernel.launch(
-                self.intermediate.buffer,
+            )
+        }
+    }
+    pub(crate) unsafe fn enqueue_down(&self, output: CuteafdDeviceBuffer, rows: u32, stream: *mut c_void) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.storage.capacity, "shared FFN rows exceed capacity");
+        let scales = self.scales;
+        unsafe {
+            self.storage.down_kernel.launch(
+                self.storage.intermediate.buffer,
                 self.tensors[2],
                 scales[2].buffer,
-                self.down_scratch.buffer,
-                self.alpha.buffer,
+                self.storage.down_scratch.buffer,
+                self.storage.alpha.buffer,
                 output,
                 rows,
                 stream,
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod storage_bytes_tests {
+    use super::*;
+    #[test]
+    fn shared_ffn_storage_bytes_equal_planned_allocations() {
+        for unit in [4096, 2752, 2048] {
+            let sizes = SharedFfnStorage::allocation_sizes(123, 456, unit);
+            assert_eq!(sizes.into_iter().sum::<usize>(), 123 + 456 + 4 + unit as usize * 13824);
         }
     }
 }

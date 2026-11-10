@@ -28,16 +28,25 @@ fn resident_embedding(checkpoint: &Checkpoint, ranks: usize, dspark: bool) -> Op
 use crate::plan::Checkpoint;
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
-    let mut shape = Shape::resolve(report, model, options,
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
+        crate::serving_capacity::prefill_waves::PrefillLimits {
+            max_waves: if report.spark_ranks == 0 { 1 } else { crate::serving_capacity::prefill_waves::MAX_WAVES }, ..crate::plan::Family::prefill_limits(&crate::plan::families::deepseek::DEEPSEEK_V4)
+        }) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
+    let mut shape = Shape::resolve(input, report, model, options,
         ShapePolicy { all_native_stages: true, ..ShapePolicy::manifest_bounded() });
+    shape.prefill_rows = prefill.unit_rows;
+    report.prefill_span_rows = Some(prefill.span_rows);
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let split = gpus == 2 && options.head_split;
     let ranks = if split { 2 } else { 1 };
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes, items: Vec::new(), kv_tokens: 0 }).collect();
+            capacity_bytes: bytes, worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 }).collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
         format!("attention placement {}", report.attention_placement)];
@@ -61,12 +70,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let id = if model.spec().hidden == 4096 { "dsv4f" } else { "dsv4p" };
     let workspace = (|| {
-        let manifest = shape.manifest.as_ref()?;
+        let manifest = shape.manifest.as_deref()?;
         let cfg = DeepseekV4Config::read(&checkpoint.snapshot, shape.native_layers).ok()?;
         let scratch = crate::serving_capacity::deepseek_v4_workspace_scratch(manifest, id, split,
             shape.prefill_rows, shape.decode_rows).ok()?;
         crate::serving_capacity::deepseek_v4_workspace_geometry(&cfg, shape.prefill_rows, shape.decode_rows,
-            crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?, ranks, scratch).ok()
+            crate::serving_capacity::compiled_c128_width(manifest, id).ok()?.checked_mul(128)?, ranks, options.prefill_waves, scratch).ok()
     })();
     if workspace.is_none() {
         notes.push("V4 workspace allowance is estimated without a matching PROGRAMS.json; use --workspace-manifest for Flash/Pro allocation geometry".into());
@@ -74,18 +83,19 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     // V4's coordinator always holds dSpark (and any RTX layers) in the catalog's package.
     let package = if report.experts.as_ref().is_some_and(|e| e.package.contains("exl3")) { "exl3" } else { "*" };
     for (index, device) in devices.iter_mut().take(ranks).enumerate() {
-        device.items.push(runtime_item(shape.manifest.as_ref(), &program_families(id, split), package, split,
-            index, options.rtx_bytes[index]));
+        device.items.push(runtime_item(shape.manifest.as_deref(), &program_families(id, split), package, split,
+            index, options.coordinator_arch, options.rtx_bytes[index]));
     }
-    let spark_working = crate::placement::SparkWorkingSet {
+    let mut spark_working = crate::placement::SparkWorkingSet {
         rtx_layers: Vec::new(),
         spark_layers: if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
-            (0..model.spec().layers.len()).collect() } else { Vec::new() },
+            let first = input.expert_catalog().map(|catalog| catalog.routed_experts().first_layer).unwrap_or(0);
+            (first..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
-        prefill_lanes: v4::PREFILL_LANES,
+        prefill_lanes: 1,
     };
-    let endpoints = spark_endpoints("deepseek_v4", v4::PREFILL_LANES);
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints,
+    let endpoints = spark_endpoints("deepseek_v4", 1);
+    let mut sparks = spark_devices(report, model, input, options, SPARK, &spark_working, endpoints,
         &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
@@ -121,6 +131,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 *note = format!("attention placement {}", placement.attention_placement);
             }
             local_layers = placement.onboard_layers;
+            spark_working.spark_layers = placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer)).collect();
+            spark_working.rtx_layers = placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                matches!(home.experts, crate::placement::ExpertHome::RtxTp2
+                    | crate::placement::ExpertHome::RtxWhole { .. }).then_some(layer)).collect();
             if let Some(t) = placement.tp2 {
                 notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers));
             }
@@ -143,8 +158,26 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         resolve_encoder(report, &towers, &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
+    if let Ok(catalog) = input.expert_catalog() {
+        if catalog.exl3().is_none() && catalog.nvfp4().is_none() {
+            let e = catalog.routed_experts();
+            if let Some(capacity) = [1, 16, 80, 256, 1024, 4096].into_iter()
+                .find(|&c| u64::from(c) >= shape.prefill_rows) {
+                if !spark_working.rtx_layers.is_empty() {
+                    notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                        [e.intermediate / ranks], 120, capacity, e.experts, e.topk));
+                }
+                let spark_ranks = spark_working.spark_ranks;
+                if spark_ranks > 0 && !spark_working.spark_layers.is_empty() {
+                    let widths = cuteafd_core::tp_units::package_width_keys(e.intermediate, 32, spark_ranks, false, true, false);
+                    notes.push(cuteafd_core::mxfp4_layouts::native_prefill_note(e.hidden,
+                        widths.into_iter().map(|(_, width)| width), 121, capacity, e.experts, e.topk));
+                }
+            }
+        }
+    }
     // Reapply after admission: rank-local I/O never belongs to the coordinator KV budget.
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, input, options, SPARK, &spark_working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -168,21 +201,16 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
     let gpus = devices.iter().zip(&options.rtx_bytes).map(|(device, &total)|
         (total, Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect();
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let context = shape.manifest.as_ref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
+    let context = shape.manifest.as_deref().and_then(|m| v4::manifest_context(m, id, cfg.n_heads, shape.decode_rows));
     let attention = report.requested_attention.unwrap_or(if devices.len() == 2 && context.is_some() {
         crate::placement::AttentionPlacement::Context
     } else { crate::placement::AttentionPlacement::Heads });
+    let host_marks = v4::host_marks_enabled(devices.len(), attention != crate::placement::AttentionPlacement::Heads,
+        options.host_cache_bytes != Some(0));
     let mark_slots = if let Some(slots) = options.prefix_slots { slots }
-        else if options.host_cache_bytes != Some(0) && (devices.len() == 1
-            || attention != crate::placement::AttentionPlacement::Heads) {
-            if options.mimo_prefix_entries == 0 { 0 } else { cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS }
-        } else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
-            shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes)? };
-    let onboard = match (options.onboard, options.local_expert_layers) {
-        (Some(onboard), _) => onboard,
-        (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),
-        (None, None) => v4::default_onboard(),
-    };
+        else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
+            shape.native_layers, shape.concurrency, options.prefix_entries("deepseek_v4"), options.mimo_prefix_mark_bytes, host_marks)? };
+    let onboard = options.resolve_onboard(routed.routed_layers()).unwrap_or_else(v4::default_onboard);
     let tp2_workspace = if devices.len() == 2 && onboard.layers(routed.layers - routed.first_layer) != Some(0) {
         crate::serving_capacity::deepseek_v4_tp2_workspace(catalog, options.workspace_manifest.as_deref(),
             shape.prefill_rows.max(shape.decode_rows)).ok()
@@ -191,18 +219,18 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         anyhow::bail!("V4 TP2 expert kernels are missing: export the matching rtx-tp2 package for explicit local layers");
     }
     let id = if cfg.dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let inputs = v4::V4Inputs { automatic_context: options.context_tokens == 0, cfg: &cfg,
+    let inputs = v4::V4Inputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0, cfg: &cfg,
         weights: crate::families::deepseek_v4::resident::WeightInventory::from_headers(&cfg, devices.len(),
             shape.native_layers > 0, checkpoint.tensors.iter().map(|t| &t.meta))?,
         cache_stages: shape.native_layers, gpus, headroom_floor: options.headroom_bytes,
-        spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, decode_rows: shape.decode_rows,
+        spark_ranks, sequences: shape.concurrency, prefill_rows: shape.prefill_rows, prefill_waves: options.prefill_waves, decode_rows: shape.decode_rows,
         max_context: shape.context_tokens, reserve_bytes: v4::RESERVE_BYTES, mark_slots, workspace,
         experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half: if tp2_workspace.is_some() { v4::expert_half_costs(catalog)? } else { Vec::new() },
         tp2_workspace: tp2_workspace.map_or([0; 2], |bytes| [bytes; 2]),
         exchange_f32: options.exchange_f32,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len()),
+        full_prefill_logits: 0, code_bytes: v4::code_bytes(cfg.dim, v4::code_experts(catalog), devices.len(), options.coordinator_arch),
         context,
         attention: report.requested_attention };
     let request = v4::request(&inputs)?;

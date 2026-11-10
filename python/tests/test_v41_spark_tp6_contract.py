@@ -49,7 +49,18 @@ def _literal_assignments(path: Path, names: set[str]) -> dict[str, object]:
             continue
         target = node.targets[0]
         if isinstance(target, ast.Name) and target.id in names:
-            found[target.id] = ast.literal_eval(node.value)
+            if target.id == "ROLE_GEOMETRY":
+                sys.path.insert(0, str(TOOLS / "lib"))
+                from spark_packages import native_spark_artifacts
+                from mxfp4_layouts import stored_width
+                found[target.id] = {a.name: (384, a.logical, a.stored, 6)
+                                    for artifacts in native_spark_artifacts().values() for a in artifacts
+                                    if not a.name.startswith("spark_w")}
+                found[target.id].update(coordinator=(128, 2304, 2304, 3),
+                    dspark_tp2=(128, 1152, 1152, 3), rtx_tp2=(384, 1152, 1152, 6),
+                    rtx_backbone=(384, 2304, stored_width(5120, 2304), 6))
+            else:
+                found[target.id] = ast.literal_eval(node.value)
     return found
 
 
@@ -74,7 +85,8 @@ def test_role7_is_unique_across_the_whole_registry() -> None:
     )
     native_ids = tables["ROLE_NATIVE_ID"]
     assert sorted(native_ids.values()) == list(range(len(native_ids))), native_ids
-    assert native_ids["spark_tp6"] == max(native_ids.values()) == 7
+    assert native_ids["spark_tp6"] == 7
+    assert native_ids["spark_tp8"] == max(native_ids.values()) == 8
     # Every role with a native id also has a plan-time geometry and, for the
     # Spark family, a TP degree.
     assert set(native_ids) == set(tables["ROLE_GEOMETRY"])
@@ -150,7 +162,7 @@ def test_exporter_plane_and_scratch_sizes_are_congruent_for_384() -> None:
 
 def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
     tables = _literal_assignments(EXPERTS_EXPORTER, {"SPARK_ROLES", "SPARK_TP_DEGREES"})
-    assert tables["SPARK_ROLES"] == ("spark", "spark_tp2", "spark_tp3", "spark_tp6")
+    assert tables["SPARK_ROLES"] == ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8")
     assert tables["SPARK_TP_DEGREES"]["spark_tp6"] == 6
     source = EXPERTS_EXPORTER.read_text(encoding="utf-8")
     assert "Spark TP2/TP3/TP6 use the native FP8 K32 slice export only" in source
@@ -160,15 +172,18 @@ def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
 
 
 def test_native_helper_selects_the_tp6_symbol_family() -> None:
-    source = NATIVE_HELPER.read_text(encoding="utf-8")
-    assert '6: "cuteafd_v41_spark_tp6_expert_"' in source
-    assert "assert spark_tp in (None, 2, 3, 6)" in source
-    assert "(7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6" in source
+    sys.path.insert(0, str(TOOLS / "lib"))
+    from _v41_expert_native import expert_symbol_prefix
+    from spark_packages import native_spark_artifacts
+    for artifacts in native_spark_artifacts().values():
+        for artifact in artifacts:
+            assert expert_symbol_prefix(artifact=artifact) == artifact.prefix()
+    assert native_spark_artifacts()[6][0].role == 7
 
 
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
-    assert "tp2, tp3 and tp6" in tp
+    assert "tp2, tp3, tp5, tp6, tp7 and tp8" in tp
     assert 'set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH' in tp
     assert f'"{DEFAULT_WIDTH_MAP}"' in tp
     assert "v41_spark_tp6_experts.cc" in tp
@@ -176,7 +191,7 @@ def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     assert "families/deepseek_v41/src/v41_spark_tp6_experts.cc" in tp
     # The new role must not change the existing TP2/TP3 selector contract.
     assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
-    assert "--atomic-min-capacity 256" in tp
+    assert "--atomic-min-capacity" not in tp
     assert 'if(NOT CUTEAFD_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
         encoding="utf-8"
     )
@@ -220,19 +235,19 @@ def test_build_selectors_accept_a_tp6_role() -> None:
     common = (ROOT / "scripts" / "lib" / "release-common.sh").read_text(encoding="utf-8")
     # The universal set and the role validation live in the shared release helpers.
     assert 'release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"' in build
-    assert "printf '%s\\n' 'tp2;tp3;tp6'" in common
+    assert "printf '%s\\n' 'tp2;tp3;tp5;tp6;tp7;tp8'" in common
     assert "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}" in build
-    assert "tp2|tp3|tp6)" in common
-    assert "accepts only tp2, tp3 and tp6" in common
+    assert "tp2|tp3|tp5|tp6|tp7|tp8)" in common
+    assert "accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in common
     assert "NON-UNIVERSAL expert role subset" in build
 
     release = RELEASE_ARTIFACTS.read_text(encoding="utf-8")
-    assert "tp2|tp3|tp6)" in release
-    assert "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in release
+    assert "tp2|tp3|tp5|tp6|tp7|tp8)" in release
+    assert "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in release
 
     wip = WIP_ARTIFACTS.read_text(encoding="utf-8")
-    assert "tp2|tp3|tp6)" in wip
-    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in wip
+    assert "tp2|tp3|tp5|tp6|tp7|tp8)" in wip
+    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in wip
 
 
 def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
@@ -245,7 +260,7 @@ def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
     assert tables["ROLE_INFO_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_info"
     assert tables["ROLE_LAUNCH_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_launch"
     source = MANIFEST.read_text(encoding="utf-8")
-    assert "expected tp2, tp3 or tp6" in source
+    assert "expected tp2, tp3, tp6 or tp8" in source
 
 
 # --------------------------------------------------------------------------- #
@@ -579,19 +594,17 @@ def test_qualifier_role_tables_cover_tp6() -> None:
     torch = pytest.importorskip("torch")
     assert torch is not None
     module = _load_qualifier(torch)
-    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
-    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7}
-    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
-    # Role ids stay 3 + degree so 2->5, 3->6, 6->9 is NOT the rule; assert the
-    # table is the authority rather than the arithmetic.
-    assert module.SPARK_TP_ROLE[6] == 7
+    artifacts = module.native_spark_artifacts()
+    assert artifacts[6][0].role == 7
+    assert artifacts[6][0].logical == artifacts[6][0].stored == 384
+    assert len(artifacts[5]) == len(artifacts[7]) == 2
 
 
 def test_qualifier_accepts_tp6_on_the_cli() -> None:
     torch = pytest.importorskip("torch")
     source = QUALIFIER.read_text(encoding="utf-8")
-    assert 'choices=(2, 3, 6)' in source
-    assert "role 7 = Spark TP6" in source
+    assert 'choices=tuple(native_spark_artifacts())' in source
+    assert "from spark_packages import native_spark_artifacts, native_shard" in source
 
 
 def test_role_gate_accepts_the_matching_library_and_rejects_others() -> None:
@@ -600,31 +613,31 @@ def test_role_gate_accepts_the_matching_library_and_rejects_others() -> None:
     module = _load_qualifier(torch)
 
     accepted = _FakeLibrary(role=7, logical=384, kernel=384)
-    meta = module.assert_native_role_geometry(accepted, 16, tp_degree=6)
+    meta = module.assert_native_role_geometry(accepted, 16, artifact=module.native_spark_artifacts()[6][0])
     assert (meta.role, meta.logical_intermediate, meta.kernel_intermediate) == (7, 384, 384)
 
     # A library built only for TP2 (role 5, 1152) must be refused for tp6.
     wrong_family = _FakeLibrary(role=5, logical=1152, kernel=1152)
     with pytest.raises(AssertionError):
-        module.assert_native_role_geometry(wrong_family, 16, tp_degree=6)
+        module.assert_native_role_geometry(wrong_family, 16, artifact=module.native_spark_artifacts()[6][0])
 
     # Right family, wrong storage extent (the padded-TP4 mistake) must be refused.
     wrong_extent = _FakeLibrary(role=7, logical=384, kernel=640)
     with pytest.raises(AssertionError):
-        module.assert_native_role_geometry(wrong_extent, 16, tp_degree=6)
+        module.assert_native_role_geometry(wrong_extent, 16, artifact=module.native_spark_artifacts()[6][0])
 
     # Wrong expert/hidden/topk geometry must be refused too.
     wrong_shape = _FakeLibrary(role=7, logical=384, kernel=384, topk=3)
     with pytest.raises(AssertionError):
-        module.assert_native_role_geometry(wrong_shape, 16, tp_degree=6)
+        module.assert_native_role_geometry(wrong_shape, 16, artifact=module.native_spark_artifacts()[6][0])
 
     # TP2/TP3 stay correct, and the legacy TP4 baseline keeps its 576/640 split.
     assert module.assert_native_role_geometry(
-        _FakeLibrary(role=5, logical=1152, kernel=1152), 16, tp_degree=2).role == 5
+        _FakeLibrary(role=5, logical=1152, kernel=1152), 16, artifact=module.native_spark_artifacts()[2][0]).role == 5
     assert module.assert_native_role_geometry(
-        _FakeLibrary(role=6, logical=768, kernel=768), 16, tp_degree=3).role == 6
+        _FakeLibrary(role=6, logical=768, kernel=768), 16, artifact=module.native_spark_artifacts()[3][0]).role == 6
     legacy = module.assert_native_role_geometry(
-        _FakeLibrary(role=1, logical=576, kernel=640), 16, tp4_legacy=True)
+        _FakeLibrary(role=1, logical=576, kernel=640), 16, artifact=module.native_spark_artifacts()[4][0])
     assert (legacy.role, legacy.logical_intermediate, legacy.kernel_intermediate) == (
         1, 576, 640)
 

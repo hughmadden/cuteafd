@@ -1,10 +1,11 @@
-//! EXL3 TP2 rank execution: raw FP32 partials, without finish or re-quantization.
+//! Shared EXL3 whole/TP2 execution: FP32 token sums, without finish or re-quantization.
 use super::native::{output_bytes, validate_layers, RankCompletion};
 use super::{ExpertInput, PartialDtype, Routes, RtxExpertLayer, RtxSelectionPolicy, RtxShard};
 use crate::shared::experts::{
     exl3::{
         execution::{
-            Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace,
+            Exl3Epilogue, Exl3Modules, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy,
+            Exl3Workspace,
         },
         Exl3Weights,
     },
@@ -25,6 +26,7 @@ pub(crate) struct Exl3Tp2<'a> {
     completion: RankCompletion<Event<'a>>,
     device: Device<'a>,
     rank: u8,
+    shard: RtxShard,
     layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
@@ -42,6 +44,7 @@ pub(crate) struct Exl3Tp2<'a> {
 pub(crate) struct Exl3Tp2Weights<'a> {
     device: Device<'a>,
     rank: u8,
+    shard: RtxShard,
     layers: Vec<usize>,
     geometry: ExpertGeometry,
     row_policy: Exl3RowPolicy,
@@ -65,6 +68,13 @@ impl<'a> Exl3Tp2Weights<'a> {
     pub(crate) fn execution(&self) -> Result<Exl3Tp2<'a>> {
         self.execution_with_modules(None)
     }
+    /// The same resident weights admitted at another row capacity: lanes built
+    /// from it select packages, workspace and output at `max_rows`.
+    pub(crate) fn with_max_rows(&self, max_rows: usize) -> Result<Self> {
+        let workspace_bytes = Exl3Tp2::workspace_bytes_for_selection(&self.package, self.geometry.hidden as usize,
+            max_rows, self.row_policy, self.selection)?;
+        Ok(Self { max_rows, workspace_bytes, ..self.clone() })
+    }
     pub(crate) fn execution_with_modules(&self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<Exl3Tp2<'a>> {
         let reduction_plan = match self.selection {
             RtxSelectionPolicy::FirstCapacity => None,
@@ -78,6 +88,7 @@ impl<'a> Exl3Tp2Weights<'a> {
             completion: RankCompletion::new(Event::new(self.device)?),
             device: self.device,
             rank: self.rank,
+            shard: self.shard,
             layers: self.layers.clone(),
             geometry: self.geometry,
             row_policy: self.row_policy,
@@ -125,7 +136,13 @@ fn selected_capacities(
     selection: RtxSelectionPolicy,
 ) -> Result<Vec<u32>> {
     if selection == RtxSelectionPolicy::FirstCapacity {
-        let mut capacities = super::native::kernel_capacities(row_policy.required_capacity(max_rows))?;
+        // Every capacity up to the first at or above the required rows, on the
+        // EXL3 ladder (which also carries the 2048/2752 prefill units).
+        let required = row_policy.required_capacity(max_rows);
+        anyhow::ensure!((1..=4096).contains(&required), "invalid EXL3 rank capacity");
+        let ladder = cuteafd_core::EXL3_CAPACITIES;
+        let compiled = ladder.into_iter().find(|&c| c as usize >= required).unwrap_or(4096);
+        let mut capacities: Vec<u32> = ladder.into_iter().filter(|&c| c <= compiled).collect();
         if row_policy == Exl3RowPolicy::GlmFlashK64 {
             capacities.retain(|&capacity| capacity != 16);
         }
@@ -145,6 +162,37 @@ fn selected_directories(
         .into_iter()
         .map(|capacity| package.join(format!("m{capacity}")))
         .collect())
+}
+
+fn validate_whole_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy, geometry: ExpertGeometry) -> Result<()> {
+    validate_shard_package(package, rows, policy, selection, geometry, geometry.intermediate as u64)
+}
+
+fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
+    selection: RtxSelectionPolicy, geometry: ExpertGeometry, intermediate: u64) -> Result<()> {
+    for path in selected_directories(package, rows, policy, selection)? {
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
+        ensure!(meta["hidden"].as_u64() == Some(geometry.hidden as u64)
+            && meta["intermediate"].as_u64() == Some(intermediate)
+            && meta["experts"].as_u64() == Some(geometry.experts as u64)
+            && meta["top_k"].as_u64() == Some(geometry.topk as u64)
+            && meta["output_dtype"].as_str() == Some("fp32"),
+            "EXL3 shard package geometry/output differs from selected experts");
+        let activation = match geometry.activation() {
+            cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
+            cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
+            cuteafd_core::FfnActivation::Situ { .. } => "situ",
+        };
+        // The exporter omits the activation key only for its ordinary SiLU default.
+        let exported_activation = match meta.get("activation") {
+            None => Some("silu"),
+            Some(value) => value.as_str(),
+        };
+        ensure!(exported_activation == Some(activation),
+            "EXL3 shard package activation differs from checkpoint geometry; rebuild exports for {activation}");
+    }
+    Ok(())
 }
 
 impl<'a> Exl3Tp2<'a> {
@@ -183,10 +231,18 @@ impl<'a> Exl3Tp2<'a> {
         row_policy: Exl3RowPolicy,
         selection: RtxSelectionPolicy,
     ) -> Result<usize> {
+        let sizes = Self::allocation_sizes_for_selection(package, hidden, max_rows, row_policy, selection)?;
+        sizes[0].checked_add(sizes[1]).context("EXL3 TP2 workspace overflow")
+    }
+
+    pub(crate) fn allocation_sizes_for_selection(package: &Path, hidden: usize, max_rows: usize,
+        row_policy: Exl3RowPolicy, selection: RtxSelectionPolicy) -> Result<[usize; 2]> {
         let paths = selected_directories(package, max_rows, row_policy, selection)?;
         for path in &paths {
-            let manifest: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
+            let metadata = path.join("v41_exl3.json");
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&metadata)
+                .with_context(|| format!("read EXL3 TP2 workspace metadata {}", metadata.display()))?)
+                .with_context(|| format!("parse EXL3 TP2 workspace metadata {}", metadata.display()))?;
             ensure!(
                 manifest["hidden"].as_u64() == Some(hidden as u64)
                     && manifest["capacity"].as_u64()
@@ -201,14 +257,9 @@ impl<'a> Exl3Tp2<'a> {
         if selection == RtxSelectionPolicy::CanonicalDecode {
             Exl3ReductionPlan::new(&paths)?;
         }
-        Exl3Workspace::plan(&paths, Self::INPUT_FORMAT)?
-            .checked_add(
-                max_rows
-                    .checked_mul(hidden)
-                    .and_then(|n| n.checked_mul(4))
-                    .context("EXL3 TP2 output overflow")?,
-            )
-            .context("EXL3 TP2 workspace overflow")
+        Ok([Exl3Workspace::plan(&paths, Self::INPUT_FORMAT, Exl3Epilogue::Sum)?,
+            max_rows.checked_mul(hidden).and_then(|n| n.checked_mul(4))
+                .context("EXL3 TP2 output overflow")?])
     }
 
     /// Loads each layer's two slices concurrently before advancing to the next
@@ -280,6 +331,38 @@ impl<'a> Exl3Tp2<'a> {
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
     ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
+        Self::pair_weights(devices, catalog, geometry, packages, layers, max_rows, budgets, selection, None)
+    }
+
+    /// As `load_pair_weights`, but publishing halves a committed push group
+    /// already landed (one rank arena per GPU), under the same admission checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        pushed: [Vec<Exl3Weights<'a>>; 2],
+    ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
+        Self::pair_weights(devices, catalog, geometry, packages, layers, max_rows, budgets, selection, Some(pushed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        pushed: Option<[Vec<Exl3Weights<'a>>; 2]>,
+    ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
         let started = std::time::Instant::now();
         let label = format!(
             "experts/TP2 expert layer halves {layers:?}"
@@ -338,6 +421,7 @@ impl<'a> Exl3Tp2<'a> {
         let make = |rank: usize, weights| Exl3Tp2Weights {
             device: devices[rank],
             rank: rank as u8,
+            shard: RtxShard::Tp2 { rank: rank as u8 },
             layers: layers.clone(),
             geometry,
             row_policy,
@@ -348,7 +432,23 @@ impl<'a> Exl3Tp2<'a> {
             weights: Rc::new(weights),
         };
         let ranks = [make(0, left), make(1, right)];
-        let ranks = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+        let ranks = if let Some(pushed) = pushed {
+            let mut ranks = ranks;
+            for (rank, mut loaded) in pushed.into_iter().enumerate() {
+                ensure!(loaded.len() == layers.len() && loaded.iter().zip(&layers).all(|(weight, &layer)|
+                    matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(l) if l == layer)
+                    && weight.layout.rank == rank && weight.layout.world == 2),
+                    "pushed EXL3 TP2 rank {rank} differs from the admitted layers");
+                let resident = loaded.iter().map(|weight| weight.budget.resident_bytes).sum::<usize>();
+                ensure!(resident <= remaining[rank], "pushed EXL3 TP2 rank {rank} exceeds its admitted arena");
+                devices[rank].run(|| {
+                    Rc::get_mut(Rc::get_mut(&mut ranks[rank].weights).expect("unpublished device owner").get_mut())
+                        .expect("unpublished EXL3 rank").append(&mut loaded);
+                    Ok(())
+                })?;
+            }
+            ranks
+        } else if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
             let remaining = std::cell::RefCell::new(remaining);
             load_layer_pairs(
                 ranks,
@@ -420,6 +520,111 @@ impl<'a> Exl3Tp2<'a> {
         Ok(ranks)
     }
 
+    pub(crate) fn preload_tp2_modules(device: Device<'a>, package: &Path,
+        rows: usize, geometry: ExpertGeometry, selection: RtxSelectionPolicy)
+        -> Result<Vec<Exl3Modules<'a>>> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        ensure!(geometry.intermediate % 2 == 0, "EXL3 TP2 intermediate is odd");
+        validate_shard_package(package, rows, policy, selection, geometry, u64::from(geometry.intermediate / 2))?;
+        Self::preload_selected_modules(device, package, rows, policy, selection)
+    }
+
+    fn preload_selected_modules(device: Device<'a>, package: &Path, rows: usize,
+        policy: Exl3RowPolicy, selection: RtxSelectionPolicy) -> Result<Vec<Exl3Modules<'a>>> {
+        device.run(|| selected_directories(package, rows, policy, selection)?.iter().map(|path| {
+            // SAFETY: sealed modules remain retained until their execution owners retire.
+            unsafe { Exl3Modules::load(device.library, path, Self::INPUT_FORMAT) }
+        }).collect())
+    }
+
+    pub(crate) fn preload_whole_modules(device: Device<'a>, package: &Path,
+        rows: usize, geometry: ExpertGeometry, selection: RtxSelectionPolicy)
+        -> Result<Vec<Exl3Modules<'a>>> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        validate_whole_package(package, rows, policy, selection, geometry)?;
+        Self::preload_selected_modules(device, package, rows, policy, selection)
+    }
+
+    pub(crate) fn whole_workspace_bytes(package: &Path, max_rows: usize,
+        geometry: ExpertGeometry, selection: RtxSelectionPolicy) -> Result<usize> {
+        let policy = Exl3RowPolicy::for_geometry(geometry);
+        validate_whole_package(package, max_rows, policy, selection, geometry)?;
+        Self::workspace_bytes_for_selection(package, geometry.hidden as usize,
+            max_rows, policy, selection)
+    }
+
+    /// Complete experts on one admitted device. The same capacity bindings,
+    /// scratch arena and completion protocol serve both whole and TP2 shards.
+    pub(crate) fn load_whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, None)
+    }
+
+    /// Binds committed whole-layer payloads with the mount path's package and admission checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Vec<Exl3Weights<'a>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        Self::whole_weights(device, catalog, package, layers, max_rows, budget, selection, Some(pushed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn whole_weights(
+        device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &Path, layers: Vec<usize>, max_rows: usize, budget: usize,
+        selection: RtxSelectionPolicy, pushed: Option<Vec<Exl3Weights<'a>>>,
+    ) -> Result<Exl3Tp2Weights<'a>> {
+        validate_layers(&layers, 0)?;
+        let geometry = expert_geometry();
+        let row_policy = Exl3RowPolicy::for_geometry(geometry);
+        let workspace_bytes = Self::workspace_bytes_for_selection(package,
+            geometry.hidden as usize, max_rows, row_policy, selection)?;
+        validate_whole_package(package, max_rows, row_policy, selection, geometry)?;
+        let plans = layers.iter().map(|&layer| Exl3Weights::plan(catalog,
+            ExpertLayer::BackboneFull { layer })).collect::<Result<Vec<_>>>()?;
+        let mut used = workspace_bytes;
+        for plan in &plans {
+            used = used.checked_add(plan.resident_bytes).context("EXL3 whole resident overflow")?;
+            ensure!(used.checked_add(plan.device_staging_bytes).context("EXL3 whole peak overflow")?
+                <= budget, "EXL3 whole weights + workspace + staging exceed admitted budget");
+        }
+        let label = format!("experts/whole expert layers {layers:?}");
+        let weights = device.own(|| {
+            let _scope = cuteafd_ffi::memory_ledger::scope_owned(&label);
+            let weights = match pushed {
+                Some(weights) => {
+                    ensure!(weights.len() == plans.len() && weights.iter().zip(&layers).zip(&plans)
+                        .all(|((weight, &layer), plan)|
+                            matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(id) if id == layer)
+                            && weight.layout.world == 1 && weight.layout.rank == 0
+                            && weight.budget.resident_bytes == plan.resident_bytes),
+                        "pushed whole EXL3 weights differ from the admitted inventory and footprint");
+                    weights
+                }
+                None => {
+                    let mut weights = Vec::with_capacity(layers.len());
+                    let mut remaining = budget.checked_sub(workspace_bytes).context("EXL3 whole workspace exceeds budget")?;
+                    for &layer in &layers {
+                        let weight = Exl3Weights::load(device.library, catalog,
+                            ExpertLayer::BackboneFull { layer }, remaining)?;
+                        remaining -= weight.budget.resident_bytes;
+                        weights.push(weight);
+                    }
+                    weights
+                }
+            };
+            Ok(Rc::new(weights))
+        })?;
+        Ok(Exl3Tp2Weights { device, rank: 0, shard: RtxShard::Whole, layers, geometry,
+            row_policy, selection, package: package.to_path_buf(), max_rows, workspace_bytes,
+            weights: Rc::new(weights) })
+    }
+
     fn initialize_lane(&mut self, modules: Option<Vec<Exl3Modules<'a>>>) -> Result<()> {
         let paths = selected_directories(
             &self.package,
@@ -428,7 +633,7 @@ impl<'a> Exl3Tp2<'a> {
             self.selection,
         )?;
         self.executions = Some(self.device.own(|| {
-            let arena = Exl3Workspace::new(self.device.library, &paths)?;
+            let arena = Exl3Workspace::new(self.device.library, &paths, Exl3Epilogue::Sum)?;
             let modules = match modules {
                 Some(modules) => modules,
                 None => paths.iter().map(|path| {
@@ -450,6 +655,7 @@ impl<'a> Exl3Tp2<'a> {
                             self.device.library,
                             self.weights.get().clone(),
                             modules,
+                            Exl3Epilogue::Sum,
                             Some(arena.clone()),
                         )?
                     };
@@ -478,6 +684,7 @@ impl<'a> Exl3Tp2<'a> {
         Exl3Tp2Weights {
             device: self.device,
             rank: self.rank,
+            shard: self.shard,
             layers: self.layers.clone(),
             geometry: self.geometry,
             row_policy: self.row_policy,
@@ -539,13 +746,52 @@ impl<'a> Exl3Tp2<'a> {
     }
 }
 
+impl Exl3Tp2<'_> {
+    /// Per-expert partial replies of `layer` for `rows` rows (families with a
+    /// per-expert output norm, combined by the coordinator): the EXL3 core on
+    /// this rank's half, then the shared partial-reply epilogue writing every
+    /// routed (row, slot)'s unweighted BF16 partial into `out` (`plan`'s BF16
+    /// region; RTX holders reply BF16 at every width). The same core and
+    /// epilogue the Spark worker runs, so the bytes are the Sparks'.
+    ///
+    /// # Safety
+    /// `wire` and `routes` are this rank's FP8 K32 rows and route ids/weights,
+    /// written on `stream` before this call; `out` is an exclusive device
+    /// allocation of at least the plan's payload, live through the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue_partials(&mut self, layer: usize, rows: usize, wire: *mut c_void, routes: Routes,
+        epilogue: &mut crate::shared::experts::exl3::partial::PartialEpilogue<'_>,
+        plan: &cuteafd_transport::PartialReplyPlan, out: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows) && plan.regions.len() == rows,
+            "EXL3 TP2 partial layer/rows not resident");
+        ensure!(!wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(), "null EXL3 TP2 partial input");
+        let buffer = |ptr, width| CuteafdDeviceBuffer { ptr, bytes: rows * width, device_id: self.device.id, flags: 0 };
+        let inputs = [buffer(wire, self.geometry.hidden as usize * 33 / 32),
+            buffer(routes.ids, self.geometry.topk as usize * 4), buffer(routes.weights, self.geometry.topk as usize * 4)];
+        let ids = inputs[1];
+        let selected = self.execution_index(rows)?;
+        let resident = super::resident_index(&self.layers, layer)?;
+        let (topk, width) = (self.geometry.topk as usize, self.geometry.hidden as usize);
+        self.device.run(|| {
+            let executions = self.executions.as_mut().expect("initialized EXL3 rank");
+            // SAFETY: the caller's inputs and output contract; the core's sources are
+            // this execution's own, read by the epilogue on the same stream.
+            unsafe {
+                let sources = executions[selected].launch_layer_core(resident, inputs, rows, stream)?;
+                epilogue.launch(plan, rows, topk, width, sources, ids, out, stream)
+            }
+        })
+    }
+}
+
 impl RtxExpertLayer for Exl3Tp2<'_> {
     fn shard(&self) -> RtxShard {
-        RtxShard::Tp2 { rank: self.rank }
+        self.shard
     }
     fn partial(&self) -> PartialDtype {
         PartialDtype::F32
     }
+    fn uses_fp8_input(&self) -> bool { true }
     fn layers(&self) -> &[usize] {
         &self.layers
     }
@@ -638,6 +884,94 @@ impl RtxExpertLayer for Exl3Tp2<'_> {
 mod tests {
     use super::*;
     #[test]
+    fn package_activation_matches_exporter_defaults_and_all_native_variants() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        for (geometry, activation) in [(ExpertGeometry::GLM5, "silu"),
+            (ExpertGeometry::KIMI_K3, "situ"), (ExpertGeometry::STEP5, "silu_post_clamp")] {
+            for intermediate in [geometry.intermediate, geometry.intermediate / 2] {
+                let mut meta = serde_json::json!({"hidden":geometry.hidden,
+                    "intermediate":intermediate,"experts":geometry.experts,
+                    "top_k":geometry.topk,"output_dtype":"fp32"});
+                let validate = |meta: &serde_json::Value| -> Result<()> {
+                    std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?;
+                    validate_shard_package(temp.path(), 1, Exl3RowPolicy::for_geometry(geometry),
+                        RtxSelectionPolicy::FirstCapacity, geometry, u64::from(intermediate))
+                };
+                assert_eq!(validate(&meta).is_ok(), activation == "silu");
+                meta["activation"] = activation.into();
+                validate(&meta)?;
+                for wrong in [serde_json::Value::Null, serde_json::json!(false),
+                    serde_json::json!(17), serde_json::json!("unknown"),
+                    serde_json::json!(if activation == "silu" { "situ" } else { "silu" })] {
+                    meta["activation"] = wrong;
+                    let error = validate(&meta).unwrap_err();
+                    assert!(error.to_string().contains("rebuild exports"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn whole_package_rejects_half_width_and_wrong_output_before_allocation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        let geometry = ExpertGeometry::KIMI_K3;
+        let mut meta = serde_json::json!({"hidden":geometry.hidden,
+            "intermediate":geometry.intermediate,"experts":geometry.experts,
+            "top_k":geometry.topk,"output_dtype":"fp32","activation":"situ"});
+        let write = |meta: &serde_json::Value| -> Result<()> {
+            Ok(std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?)
+        };
+        write(&meta)?;
+        let validate = || validate_whole_package(temp.path(), 1,
+            Exl3RowPolicy::for_geometry(geometry), RtxSelectionPolicy::FirstCapacity, geometry);
+        validate()?;
+        meta["intermediate"] = (geometry.intermediate / 2).into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta["intermediate"] = geometry.intermediate.into();
+        meta["output_dtype"] = "bf16".into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta["output_dtype"] = "fp32".into();
+        meta["activation"] = "silu".into();
+        write(&meta)?;
+        assert!(validate().is_err());
+        meta.as_object_mut().unwrap().remove("activation");
+        write(&meta)?;
+        assert!(validate().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn tp2_package_requires_half_width_fp32_and_native_activation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("m1");
+        std::fs::create_dir(&directory)?;
+        let geometry = ExpertGeometry::KIMI_K3;
+        let good = serde_json::json!({"hidden":3584, "intermediate":1536, "experts":896,
+            "top_k":16, "output_dtype":"fp32", "activation":"situ"});
+        let validate = |meta: &serde_json::Value| -> Result<()> {
+            std::fs::write(directory.join("v41_exl3.json"), serde_json::to_vec(meta)?)?;
+            validate_shard_package(temp.path(), 1, Exl3RowPolicy::for_geometry(geometry),
+                RtxSelectionPolicy::FirstCapacity, geometry, u64::from(geometry.intermediate / 2))
+        };
+        validate(&good)?;
+        for (key, value) in [("hidden", serde_json::json!(7168)), ("intermediate", serde_json::json!(3072)),
+            ("experts", serde_json::json!(448)), ("top_k", serde_json::json!(8)),
+            ("output_dtype", serde_json::json!("bf16")), ("activation", serde_json::json!("silu"))] {
+            let mut bad = good.clone();
+            bad[key] = value;
+            assert!(validate(&bad).is_err(), "accepted invalid {key}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn rank1_mid_load_failure_releases_both_rank_owners() {
         use std::{
             cell::{Cell, RefCell},
@@ -696,7 +1030,7 @@ mod tests {
             std::fs::write(
                 directory.join("v41_exl3.json"),
                 serde_json::to_vec(&serde_json::json!({
-                    "capacity": capacity, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
+                    "capacity": capacity, "decode_capacity": true, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                         "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": scratch, "zero_on_create": false},
                         "alias": {"allocation": "scratch", "dtype": "f32", "bytes": 99999, "zero_on_create": false},
                         "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
@@ -723,7 +1057,7 @@ mod tests {
         std::fs::write(
             directory.join("v41_exl3.json"),
             serde_json::to_vec(&serde_json::json!({
-                "capacity": 80, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
+                "capacity": 80, "decode_capacity": true, "hidden": 8, "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32}, "buffers": {
                     "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": 2048, "zero_on_create": false},
                     "state": {"allocation": "state", "dtype": "i32", "bytes": 0, "zero_on_create": true}
                 }
@@ -778,12 +1112,15 @@ mod tests {
 
     #[test]
     fn first_capacity_preload_preserves_selection_without_dead_k64_m16() -> Result<()> {
+        let ladder = |rows: usize| -> Vec<u32> {
+            let top = cuteafd_core::EXL3_CAPACITIES.into_iter().find(|&c| c as usize >= rows).unwrap();
+            cuteafd_core::EXL3_CAPACITIES.into_iter().filter(|&c| c <= top).collect()
+        };
         for maximum in 1..=4096 {
-            let nearest = super::super::native::kernel_capacities(maximum)?;
             assert_eq!(selected_capacities(maximum, Exl3RowPolicy::Nearest,
-                RtxSelectionPolicy::FirstCapacity)?, nearest);
+                RtxSelectionPolicy::FirstCapacity)?, ladder(maximum));
             let policy = Exl3RowPolicy::GlmFlashK64;
-            let before = super::super::native::kernel_capacities(policy.required_capacity(maximum))?;
+            let before = ladder(policy.required_capacity(maximum));
             let after = selected_capacities(maximum, policy, RtxSelectionPolicy::FirstCapacity)?;
             assert_eq!(after, policy.capacities(maximum)?);
             assert!(!after.contains(&16));

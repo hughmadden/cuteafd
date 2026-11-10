@@ -268,6 +268,97 @@ mod tests {
         }).collect()))
     }
 
+    struct PackedReference {
+        rowwise: Reference<'static>,
+        members: Vec<Reference<'static>>,
+        segments: Vec<crate::shared::prefill_packing::Segment>,
+    }
+
+    macro_rules! rowwise {
+        ($name:ident($($arg:ident: $ty:ty),*) -> $out:ty) => {
+            fn $name(&mut self, $($arg: $ty),*) -> Result<$out> { self.rowwise.$name($($arg),*) }
+        };
+    }
+
+    impl Ops for PackedReference {
+        type Rows = Rows;
+        rowwise!(residual_mix(site: MixSite, stored: &[&Rows], current: &Rows) -> Rows);
+        rowwise!(norm(layer: Option<usize>, attention: bool, x: &Rows) -> Rows);
+        rowwise!(dense_ffn(layer: usize, x: &Rows) -> Rows);
+        rowwise!(route(layer: usize, x: &Rows) -> Vec<Routes>);
+        rowwise!(latent_down(layer: usize, x: &Rows) -> Rows);
+        rowwise!(experts(layer: usize, latent: &Rows, routes: &[Routes]) -> Rows);
+        rowwise!(latent_up(layer: usize, combined: &Rows) -> Rows);
+        rowwise!(shared_ffn(layer: usize, x: &Rows) -> Rows);
+        rowwise!(add(a: &Rows, b: &Rows) -> Rows);
+        fn kda(&mut self, layer: usize, x: &Rows) -> Result<Rows> {
+            let mut output = Vec::new();
+            for (member, segment) in self.members.iter_mut().zip(&self.segments) {
+                output.extend(member.kda(layer, &x[segment.first..segment.end_row()].to_vec())?);
+            }
+            Ok(output)
+        }
+        fn mla(&mut self, layer: usize, x: &Rows) -> Result<Rows> {
+            let mut output = Vec::new();
+            for (member, segment) in self.members.iter_mut().zip(&self.segments) {
+                output.extend(member.mla(layer, &x[segment.first..segment.end_row()].to_vec())?);
+            }
+            Ok(output)
+        }
+    }
+
+    fn packed_arm(changed: bool) -> Result<(Rows, Vec<Reference<'static>>)> {
+        let (cfg, layers, norm, mix, rows) = model(71);
+        let make = || Reference::new(cfg.clone(), layers.clone(), norm.clone(), mix.clone(), running_sum());
+        let mut members = vec![make(), make(), make()];
+        // A fresh member and two independent resumes, including a different length.
+        for (i, start) in [0, 2, 1].into_iter().enumerate() {
+            if start > 0 { forward(&cfg, &mut members[i], rows[..start].to_vec(), cfg.layers)?; }
+        }
+        let segments = crate::shared::prefill_packing::plan(&[(0, 2), (2, 3), (1, 1)],
+            &crate::shared::prefill_packing::Limits { rows: 16, chunk_rows: 16, max_context: 32, taps: Some(16) })?;
+        let mut input = rows[..2].iter().chain(&rows[2..]).chain(&rows[1..2]).cloned().collect::<Rows>();
+        if changed { for value in input[2..5].iter_mut().flatten() { *value = contract::bf16(*value + 0.5); } }
+        let mut packed = PackedReference { rowwise: make(), members, segments };
+        let result = forward(&cfg, &mut packed, input, cfg.layers)?;
+        Ok((result, packed.members))
+    }
+
+    #[test]
+    fn packed_check_matches_singletons_with_member_local_kda_and_mla() -> Result<()> {
+        let (cfg, layers, norm, mix, rows) = model(71);
+        let (packed, mut members) = packed_arm(false)?;
+        let mut expected = Vec::new();
+        for (i, (start, count)) in [(0, 2), (2, 3), (1, 1)].into_iter().enumerate() {
+            let mut alone = Reference::new(cfg.clone(), layers.clone(), norm.clone(), mix.clone(), running_sum());
+            if start > 0 { forward(&cfg, &mut alone, rows[..start].to_vec(), cfg.layers)?; }
+            expected.extend(forward(&cfg, &mut alone, rows[start..start + count].to_vec(), cfg.layers)?);
+            // Continue after the packed call to catch recurrent-state and KV corruption.
+            assert_eq!(forward(&cfg, &mut members[i], rows[..1].to_vec(), cfg.layers)?,
+                forward(&cfg, &mut alone, rows[..1].to_vec(), cfg.layers)?);
+            assert_eq!(members[i].cache, alone.cache);
+        }
+        assert_eq!(packed, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn packed_check_partner_changes_and_cancellation_stay_member_local() -> Result<()> {
+        let (base, _) = packed_arm(false)?;
+        let (changed, _) = packed_arm(true)?;
+        assert_eq!(&base[..2], &changed[..2]);
+        assert_eq!(&base[5..], &changed[5..]);
+        assert_ne!(&base[2..5], &changed[2..5]);
+        let mut visited = Vec::new();
+        let outcomes = crate::shared::prefill_packing::finish_members(3, Ok, &mut |i, value| {
+            visited.push(value);
+            Ok(if i == 1 { Err(anyhow::anyhow!("client cancelled")) } else { Ok(()) })
+        })?;
+        assert_eq!(visited, [0, 1, 2]);
+        assert!(outcomes[0].is_ok() && outcomes[1].is_err() && outcomes[2].is_ok());
+        Ok(())
+    }
+
     #[test]
     fn mla_rank_norms_do_not_inherit_decoder_epsilon() {
         let (mut cfg, layers, norm, mix, mut rows) = model(19);

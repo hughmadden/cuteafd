@@ -154,6 +154,18 @@ fn planned_backend(plan: cuteafd_core::coordinator_programs::AttentionReductionP
         "V4.1 admitted BF16 AOT attention shape rows={rows} heads={heads} requires an aligned view and loaded AOT kernel; refusing backend switch");
     Ok(aot)
 }
+/// Every batch kernel a plan names must be loaded: the native FP32 two-part
+/// window kernel always, and the BF16 AOT ten-part kernel only when the plan's
+/// compressed recipe is BF16 AOT (SM120). An SM89 plan's compressed recipe is
+/// the native FP32 ten-part kernel, which the batch symbol carries.
+fn plan_kernels(plan: cuteafd_core::coordinator_programs::AttentionReductionPlan, heads: usize,
+    batch: bool, aot_loaded: bool) -> Result<()> {
+    let bf16_aot = plan.sparse_recipe(true).backend == cuteafd_core::coordinator_programs::SparseAttentionBackend::Bf16Aot;
+    ensure!(plan.capacity_rows() <= cuteafd_core::V41_VERIFY_ROWS && batch && (aot_loaded || !bf16_aot),
+        "V4.1 attention plan rows={} capacity={} heads={heads} requires {} ten-part and native FP32 two-part batch kernels",
+        plan.rows(), plan.capacity_rows(), if bf16_aot { "BF16 AOT" } else { "native FP32" });
+    Ok(())
+}
 
 impl V41SparseAttention<'_> {
     pub fn heads(&self) -> usize { self.heads }
@@ -174,7 +186,7 @@ impl V41SparseAttention<'_> {
             (1..=4096).contains(&rows) && (1..=10).contains(&parts),
             "invalid sparse attention split shape"
         );
-        Ok(rows * parts * heads * 514 * 4)
+        Ok(cuteafd_core::coordinator_programs::sparse_split_scratch_bytes(rows, parts, heads))
     }
 
     fn checked_view(
@@ -281,10 +293,7 @@ impl V41SparseAttention<'_> {
     /// Resolve required symbols at load, before any graph capture or readiness.
     pub fn validate_plan(&self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
         buffers: &[CuteafdDeviceBuffer]) -> Result<()> {
-        ensure!(plan.capacity_rows() <= cuteafd_core::V41_VERIFY_ROWS && self.supports_batch()
-            && self.batch_aot_launch.is_some(),
-            "V4.1 attention plan rows={} capacity={} heads={} requires BF16 AOT ten-part and native FP32 two-part batch kernels",
-            plan.rows(), plan.capacity_rows(), self.heads);
+        plan_kernels(plan, self.heads, self.supports_batch(), self.batch_aot_launch.is_some())?;
         for buffer in buffers {
             ensure!(!buffer.ptr.is_null() && buffer.ptr as usize % 16 == 0,
                 "V4.1 attention plan rows={} capacity={} heads={}: {}-byte workspace on GPU {} is not 16-byte aligned",
@@ -324,7 +333,7 @@ impl V41SparseAttention<'_> {
         bounds: CuteafdDeviceBuffer, scratch: CuteafdDeviceBuffer,
         plan: Option<cuteafd_core::coordinator_programs::AttentionReductionPlan>,
     ) -> Result<V41SparseBatch> {
-        ensure!(!requests.is_empty() && requests.len() <= 16, "invalid sparse batch requests");
+        ensure!(!requests.is_empty() && requests.len() <= cuteafd_core::V41_MAX_REQUESTS, "invalid sparse batch requests");
         let limit = if plan.is_some() { cuteafd_core::V41_VERIFY_ROWS } else { 16 };
         ensure!(requests.iter().all(|(_, _, n)| (1..=limit).contains(n)), "sparse batch requires split rows");
         let rows: usize = requests.iter().map(|(_, _, n)| n).sum();
@@ -491,6 +500,40 @@ mod tests {
             }
             assert!(planned_backend(plan, 0, 64, true, true, true).is_err());
             assert!(planned_backend(plan, 65, 64, true, true, true).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_requires_the_aot_kernel_only_for_a_bf16_aot_compressed_recipe() -> Result<()> {
+        use cuteafd_core::{coordinator_programs::AttentionReductionPlan, GpuArch};
+        let plan = AttentionReductionPlan::new(64, Some(5), None)?;
+        for heads in [32, 64] {
+            // SM120: the BF16 AOT kernel is required; its absence is a refusal.
+            let sm120 = plan.with_compressed(GpuArch::Sm120.v41_compressed_attention());
+            plan_kernels(sm120, heads, true, true)?;
+            let refused = plan_kernels(sm120, heads, true, false).unwrap_err().to_string();
+            assert_eq!(refused, format!("V4.1 attention plan rows=6 capacity=64 heads={heads} requires \
+                BF16 AOT ten-part and native FP32 two-part batch kernels"));
+            // SM89: the native FP32 batch kernel carries both recipes.
+            let sm89 = plan.with_compressed(GpuArch::Sm89.v41_compressed_attention());
+            plan_kernels(sm89, heads, true, false)?;
+            plan_kernels(sm89, heads, true, true)?;
+            for arch in [GpuArch::Sm89, GpuArch::Sm120] {
+                assert!(plan_kernels(plan.with_compressed(arch.v41_compressed_attention()), heads, false, true).is_err());
+            }
+            let refused = plan_kernels(sm89, heads, false, false).unwrap_err().to_string();
+            assert!(refused.contains("requires native FP32 ten-part"), "{refused}");
+            // The plan never selects AOT where it is not named, nor refuses SM89's.
+            for rows in [1, 6, 64] {
+                assert!(!planned_backend(sm89, rows, heads, true, false, false)?);
+                assert!(!planned_backend(sm89, rows, heads, false, false, false)?);
+                assert!(planned_backend(sm120, rows, heads, true, false, true).is_err());
+            }
+        }
+        let wide = AttentionReductionPlan::new(65, None, None)?;
+        for arch in [GpuArch::Sm89, GpuArch::Sm120] {
+            assert!(plan_kernels(wide.with_compressed(arch.v41_compressed_attention()), 64, true, true).is_err());
         }
         Ok(())
     }

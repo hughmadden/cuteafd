@@ -4,9 +4,9 @@
 //! layers the unit's four 64-row record pages of BF16 K/V (2,048 B per row) and raw index keys
 //! (256 B per row), and the pool page of the same index (64 pooled block keys of 4 tokens,
 //! 256 B each) = 7.27 MB per unit (28,416 B per token); with `--mtp` the MTP layer's pages ride
-//! along (2,368 B per token more). Units are refcounted: full units are shared, nobody writes
-//! them again (every sequence appends past its own length), and a partial tail unit is copied
-//! (its rows and its complete blocks).
+//! along (2,368 B per token more). Refcounted units strictly below the earliest writable row
+//! are shared. The remaining retained units are copied, including the last full unit when
+//! MTP still needs to consume hidden(P-1) at a page-aligned target frontier.
 //!
 //! Mark: the GDN layers' recurrent state is per sequence and overwritten by every step, so a
 //! snapshot copies the sequence's whole state slot: every GDN layer's FP32 state `[48, 128,
@@ -19,9 +19,9 @@
 //! so `capture_reach` is 0.
 //!
 //! Restores are exact frontiers only (`ReuseRule::EXACT`): recurrent state exists at the points
-//! it was captured and nowhere else. The MTP drafter's stash is not captured: a restored
-//! sequence drafts once its own rows reach the stash (its MTP K/V before the restore point are
-//! the snapshot writer's, the same pairs for the same tokens, except the last).
+//! it was captured and nowhere else. Drafting marks retain canonical MTP KV through P-2
+//! and hidden(P-1) in the mark. Shared lookup rejects predictor-incomplete marks only for
+//! drafting requests. The next prompt token or sampled token closes the restored pending pair.
 //!
 //! Each logical mark preserves global-layer ordering across owner-local arenas. Copies enqueue
 //! on the owning execution stream; drain retires work on every owner.
@@ -31,7 +31,7 @@ use crate::shared::memory::device::{Allocation, Device};
 use std::rc::Rc;
 use crate::shared::prefix::view;
 use anyhow::{ensure, Context, Result};
-use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy};
+use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, ReuseRule, TailCopy, Mark, RestoreContext, RestorePlan};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_hostcache::copy::DeviceRange;
 
@@ -51,15 +51,35 @@ pub(crate) struct Qwen4Prefix<'e, 'a> {
     mark_layout: MarkLayout,
     arenas: Vec<Rc<Allocation<'a>>>,
     slots: usize,
+    /// Per execution owner: the prefix copy stream, fenced against that owner's stream; and
+    /// the owner index of each device.
+    copies: crate::shared::prefix::PrefixCopies<'a>,
+    owners: Vec<i32>,
 }
 
+/// Device copies `(owner, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
+
 impl<'e, 'a> Qwen4Prefix<'e, 'a> {
+    /// Resolve the real owner geometry without allocating the mark arenas.
+    pub(super) fn geometry(engine: &Qwen4Engine<'_>) -> Result<FamilyLayout> {
+        let paged = engine.paged_buffers();
+        ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
+        let regions = engine.snapshot_regions(0);
+        let mark = MarkLayout::new(&regions.iter().map(|r| (r.device_id, r.bytes)).collect::<Vec<_>>())?;
+        ensure!(mark.bytes > 0, "Qwen 3.8 Flash Next without GDN state");
+        Ok(FamilyLayout { page_rows: UNIT_ROWS, pages: engine.pool_pages,
+            page_bytes: paged.len() * (UNIT_ROWS * (engine.kv_record_bytes + KEY_BYTES) + POOL_PAGE_BYTES),
+            mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
+            mark_store: MarkStore::Arena, page_owners: Default::default() })
+    }
+
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e Qwen4Engine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = engine.paged_buffers();
         ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
-        let state_regions = engine.slot_regions(0);
+        let state_regions = engine.snapshot_regions(0);
         for buffer in paged.iter().flatten().chain(&state_regions) {
             engine.state_stream(buffer.device_id)?;
         }
@@ -78,7 +98,11 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
                 Allocation::new(Device { library: engine.library, id }, bytes).map(Rc::new)
             }).collect::<Result<Vec<_>>>()?
         };
-        Ok(Self { engine, paged, mark_bytes, mark_layout, arenas, slots })
+        let streams = engine.owner_streams();
+        let copies = crate::shared::prefix::PrefixCopies::new(engine.library, streams.iter()
+            .map(|&(device, stream)| vec![crate::shared::prefix::Reader { device, stream }]).collect())?;
+        let owners = streams.into_iter().map(|(device, _)| device).collect();
+        Ok(Self { engine, paged, mark_bytes, mark_layout, arenas, slots, copies, owners })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -93,13 +117,20 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
         self.slots
     }
 
-    fn copy(&self, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
+    /// Adds a copy to `copies` on its device's owner.
+    fn copy(&self, copies: &mut Copies, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(dst.bytes == src.bytes && dst.device_id == src.device_id, "Qwen snapshot region mismatch");
-        let stream = self.engine.state_stream(dst.device_id)?;
-        // SAFETY: views belong to retained allocations and serialize with owner-local forward passes.
-        Device { library: self.engine.library, id: dst.device_id }.run(|| unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, stream)
-        })
+        let owner = self.owners.iter().position(|&device| device == dst.device_id)
+            .context("Qwen snapshot device without an execution owner")?;
+        copies.push((owner, dst, src));
+        Ok(())
+    }
+
+    /// Queues `copies` on their owners' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: views belong to retained allocations of their owner's device (checked by
+        // `view`); the cache drains the copy streams before it hands that storage to anyone.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// The device ranges of one unit, per paged layer: records, raw index keys, pooled keys.
@@ -132,19 +163,40 @@ impl<'e, 'a> Qwen4Prefix<'e, 'a> {
     /// Copy global state-region order without inter-device copies or approximation.
     fn move_mark(&self, slot: MarkSlot, state: i32, capture: bool) -> Result<()> {
         ensure!(state >= 0 && (state as usize) < self.engine.slots, "state slot {state} of {}", self.engine.slots);
-        let regions = self.engine.slot_regions(state as usize);
+        let regions = self.engine.snapshot_regions(state as usize);
         let marks = self.mark_buffers(slot)?;
         ensure!(regions.len() == marks.len(), "Qwen snapshot region count changed");
+        let mut copies = Copies::new();
         for (region, mark) in regions.into_iter().zip(marks) {
-            if capture { self.copy(mark, region)?; } else { self.copy(region, mark)?; }
+            if capture { self.copy(&mut copies, mark, region)?; } else { self.copy(&mut copies, region, mark)?; }
         }
-        Ok(())
+        self.submit(&copies)
     }
 
 }
 
-impl PrefixFamily for Qwen4Prefix<'_, '_> {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Frontier {
+    pub target: usize,
+    pub predictors: Vec<usize>,
+    pub pending: bool,
+}
+
+impl Frontier {
+    pub fn supports_predictors(&self, frontier: usize) -> bool {
+        // Row P-1 consumes token(P), which is outside the retained prefix.
+        // Only the unconsumed hidden row is valid for arbitrary continuations.
+        self.target == frontier && frontier > 0 && self.pending
+            && self.predictors.as_slice() == [frontier - 1]
+    }
+}
+
+impl PrefixFamily<Frontier> for Qwen4Prefix<'_, '_> {
     type Placement = Qwen4Placement;
+
+    fn write_frontier(&self, len: usize) -> usize {
+        if self.engine.weights.mtp.is_some() { len.saturating_sub(1) } else { len }
+    }
 
     fn record_format(&self) -> &'static str {
         match self.engine.kv_format {
@@ -170,8 +222,36 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
         &placement.units
     }
 
+    /// Step tables are rebuilt from the expanded pages; the unit count picks a captured graph.
+    fn extend_pages(&self, placement: &mut Qwen4Placement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &Qwen4Placement) -> usize {
         placement.state_len.min(placement.len)
+    }
+
+    fn capture_meta(&self, placement: &Qwen4Placement, len: usize) -> Result<Frontier, BoxError> {
+        if len != placement.len || len != placement.state_len {
+            return Err("Qwen snapshot target frontier mismatch".into());
+        }
+        Ok(Frontier { target: len, predictors: self.engine.weights.mtp.as_ref()
+            .map(|_| vec![placement.mtp_frontier.get()]).unwrap_or_default(),
+            pending: placement.mtp_snapshot_pending.get() && placement.mtp_frontier.get() == len.saturating_sub(1) })
+    }
+
+    fn restore_with(&self, mark: Option<&Mark>, saved: Option<&Frontier>, placement: &mut Qwen4Placement,
+        plan: &RestorePlan, _context: &RestoreContext<'_>) -> Result<(), BoxError> {
+        let saved = saved.ok_or("Qwen snapshot predictor metadata absent")?;
+        if saved.target != plan.resume() || saved.predictors.iter().any(|&p| p > saved.target) {
+            return Err("Qwen snapshot frontier metadata mismatch".into());
+        }
+        let Some(Mark::Slot(slot)) = mark else { return Err("Qwen snapshot mark absent".into()); };
+        self.restore(Some(*slot), placement, plan.resume())?;
+        placement.mtp_frontier.set(saved.predictors.first().copied().unwrap_or(0));
+        placement.mtp_snapshot_pending.set(saved.pending);
+        Ok(())
     }
 
     fn capture(&self, slot: MarkSlot, placement: &Qwen4Placement, len: usize) -> Result<(), BoxError> {
@@ -189,7 +269,6 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
         if len == 0 || len.div_ceil(UNIT_ROWS) > placement.units.len() {
             return Err(format!("restore of {len} rows into {} units", placement.units.len()).into());
         }
-        self.engine.map_pools(placement)?;
         self.move_mark(slot, placement.slot, false)?;
         placement.len = len;
         placement.state_len = len;
@@ -198,22 +277,24 @@ impl PrefixFamily for Qwen4Prefix<'_, '_> {
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let blocks = copy.rows / BLOCK;
+        let mut copies = Copies::new();
         for &[records, keys, pools] in &self.paged {
             for (buffer, row) in [(records, self.engine.kv_record_bytes), (keys, KEY_BYTES)] {
-                self.copy(view(buffer, copy.to as usize * UNIT_ROWS * row, copy.rows * row)?,
+                self.copy(&mut copies, view(buffer, copy.to as usize * UNIT_ROWS * row, copy.rows * row)?,
                     view(buffer, copy.from as usize * UNIT_ROWS * row, copy.rows * row)?)?;
             }
             // The complete blocks' pooled keys.
             if blocks > 0 {
                 let (from, to) = (copy.from as usize * POOL_PAGE_BYTES, copy.to as usize * POOL_PAGE_BYTES);
-                self.copy(view(pools, to, blocks * BLOCK_KEY_BYTES)?, view(pools, from, blocks * BLOCK_KEY_BYTES)?)?;
+                self.copy(&mut copies, view(pools, to, blocks * BLOCK_KEY_BYTES)?,
+                    view(pools, from, blocks * BLOCK_KEY_BYTES)?)?;
             }
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        Ok(self.engine.drain_state()?)
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
@@ -305,6 +386,32 @@ fn paged_rows(family: &Qwen4Prefix<'_, '_>, placement: &Qwen4Placement, len: usi
     Ok(out)
 }
 
+pub(crate) fn packed_state(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement) -> Result<Vec<u8>> {
+    let family = Qwen4Prefix::new(engine, |_| 0)?;
+    let mut bytes = slot_state(engine, placement.slot)?;
+    bytes.extend(paged_rows(&family, placement, placement.len)?);
+    if engine.weights.mtp.is_some() {
+        let frontier = placement.mtp_frontier.get();
+        bytes.extend(frontier.to_le_bytes());
+        bytes.push(u8::from(placement.mtp_snapshot_pending.get()));
+        if placement.mtp_snapshot_pending.get() {
+            let pending = engine.snapshot_regions(usize::try_from(placement.slot)?)
+                .last().copied().context("Qwen MTP pending snapshot region")?;
+            bytes.extend(download(engine, pending)?);
+        }
+        for (u, &unit) in placement.units.iter().enumerate().take(frontier.div_ceil(UNIT_ROWS)) {
+            let rows = (frontier - u * UNIT_ROWS).min(UNIT_ROWS);
+            let blocks = (frontier / BLOCK).saturating_sub(u * PAGE_ROWS).min(PAGE_ROWS);
+            let ranges = family.unit_ranges(unit)?;
+            let mtp = &ranges[ranges.len() - 3..];
+            bytes.extend_from_slice(&download(engine, mtp[0])?[..rows * engine.kv_record_bytes]);
+            bytes.extend_from_slice(&download(engine, mtp[1])?[..rows * KEY_BYTES]);
+            bytes.extend_from_slice(&download(engine, mtp[2])?[..blocks * BLOCK_KEY_BYTES]);
+        }
+    }
+    Ok(bytes)
+}
+
 /// One `--resume-at` case.
 pub(crate) struct ResumeCase {
     pub at: usize,
@@ -328,6 +435,9 @@ pub(crate) fn resume_check(engine: &Qwen4Engine<'_>, tokens: &[u32], cases: &[Re
     let mut allocator = Allocator::new(engine.pages, engine.slots, &engine.cfg);
     let mut passed = true;
     for case in cases {
+        if engine.weights.mtp.is_some() && case.at >= 3 {
+            drafting_resume_check(engine, &family, &mut allocator, tokens, case.at)?;
+        }
         match resume_case(engine, &family, &mut allocator, tokens, case, decode, cold, repeat) {
             Ok(ok) => passed &= ok,
             Err(error) => {
@@ -337,6 +447,147 @@ pub(crate) fn resume_check(engine: &Qwen4Engine<'_>, tokens: &[u32], cases: &[Re
         }
     }
     Ok(passed)
+}
+
+/// Native byte oracle: a two-row accepted turn must execute its first pending
+/// pair and retain only its final hidden row, just like a cold canonical prefix.
+fn drafting_resume_check(engine: &Qwen4Engine<'_>, family: &Qwen4Prefix<'_, '_>, allocator: &mut Allocator,
+    tokens: &[u32], at: usize) -> Result<()> {
+    use super::speculate::{self, MtpSeq};
+    ensure!(at >= 3 && at < tokens.len(), "MTP resume needs at least three target rows");
+    let err = |error: BoxError| anyhow::anyhow!("{error}");
+    let mut writer = allocator.admit(at + 1)?;
+    let mut cold = allocator.admit(at + 1)?;
+    let mut writer_seq = MtpSeq::default();
+    let mut cold_seq = MtpSeq::default();
+    let writer_slot = writer.slot;
+    for (placement, seq) in [(&mut writer, &mut writer_seq), (&mut cold, &mut cold_seq)] {
+        for start in (0..at - 2).step_by(64) {
+            let end = (start + 64).min(at - 2);
+            engine.prefill(placement, &tokens[start..end])?;
+            speculate::prefill_chunk(engine, placement, start, &tokens[start..end], Some(tokens[end]), seq)?;
+        }
+        engine.verify(&mut [(placement, &tokens[at - 2..at])], None)?;
+        if placement.slot == writer_slot {
+            // Production accept stashes two rows, then executes all but the
+            // last before the turn snapshot is published.
+            speculate::accept(engine, &mut [speculate::Verified { placement, seq,
+                start: at - 2, history: history_of(&engine.cfg, &tokens[..at - 2]),
+                rows: &tokens[at - 2..at], first_row: 0, kept: Some((2, tokens[at])),
+                finished: true, neural: true }], false)?;
+        } else {
+            // Cold oracle writes canonical row P-2 directly from the target,
+            // and preserves hidden(P-1), without normalization or accept.
+            engine.mtp_stash(true, &[(placement.slot, 1, 1, 0)])?;
+            let rows = vec![super::engine::MtpRow { position: at - 2, token: tokens[at - 1], source: 0 }];
+            engine.mtp_step(true, &[super::engine::MtpGroup { placement, rows }], super::engine::MtpSource::Target,
+                &[], super::engine::MtpTokens::Host(&tokens[at - 1..at]),
+                super::engine::MtpOut::Download { logits: false })?;
+            placement.mtp_frontier.set(at - 1);
+            placement.mtp_snapshot_pending.set(true);
+        }
+    }
+    let saved = family.capture_meta(&writer, at).map_err(err)?;
+    ensure!(saved.supports_predictors(at), "drafting writer did not publish complete MTP state");
+    family.capture(MarkSlot(0), &writer, at).map_err(err)?;
+    // Compare only canonical live rows, not padding/proposal bytes beyond P-1.
+    let canonical = |placement: &Qwen4Placement| -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for region in engine.snapshot_regions(placement.slot as usize) { out.extend(download(engine, region)?); }
+        for (index, &unit) in placement.units.iter().enumerate().take(at.div_ceil(UNIT_ROWS)) {
+            let rows = (at - 1).saturating_sub(index * UNIT_ROWS).min(UNIT_ROWS);
+            let blocks = ((at - 1) / BLOCK).saturating_sub(index * PAGE_ROWS).min(PAGE_ROWS);
+            let ranges = family.unit_ranges(unit)?;
+            let mtp = &ranges[ranges.len() - 3..];
+            for (range, len) in [(mtp[0], rows * engine.kv_record_bytes), (mtp[1], rows * KEY_BYTES),
+                (mtp[2], blocks * BLOCK_KEY_BYTES)] {
+                out.extend_from_slice(&download(engine, range)?[..len]);
+            }
+        }
+        Ok(out)
+    };
+    let expected = canonical(&cold)?;
+    ensure!(canonical(&writer)? == expected, "two-row turn normalization differs from cold MTP state");
+    allocator.release(cold);
+    let (mut reader, copy) = allocator.fork(&writer, &tokens[..at], at + 1)?;
+    if let Some(copy) = copy { family.copy_rows(copy).map_err(err)?; }
+    let plan = RestorePlan { snapshot_end: at, target_end: at, lag: cuteafd_engine::prefix::LaggedState {
+        source_end: at, replay_start: at }, fidelity: cuteafd_engine::prefix::RestoreFidelity::Exact };
+    family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&saved), &mut reader, &plan,
+        &RestoreContext { native_tokens: tokens, media: &[] }).map_err(err)?;
+    ensure!(canonical(&reader)? == expected, "drafting reader differs byte-exactly from cold MTP state");
+    let mut resumed = MtpSeq::default();
+    speculate::restore_pending(engine, &reader, at, None, &mut resumed)?;
+    ensure!(resumed.pending == vec![(at - 1, 0)] && resumed.open, "restored MTP stash bookkeeping differs");
+    allocator.release(reader);
+    allocator.release(writer);
+    // Exercise the production shared lookup, not just the metadata helper:
+    // a no-spec writer has target bytes but no canonical predictor history.
+    let mut cache = cuteafd_engine::prefix::PrefixCache::<crate::shared::prefix::CudaCopyEngine<'_>, Frontier>::new(
+        family.layout(), cuteafd_engine::prefix::PrefixConfig { entries: 2, mark_slots: 2,
+            keep_logits: false, min_tokens: 1 }, None)?;
+    let place = |units| Qwen4Placement::new(units, 0, history_of(&engine.cfg, &[]));
+    let mut target_only = cache.admit_cold(family, at, at + 1, place)?.placement;
+    for part in tokens[..at].chunks(64) { engine.prefill(&mut target_only, part)?; }
+    ensure!(cache.capture(family, cuteafd_engine::prefix::SnapshotKind::Turn, &tokens[..at],
+        &target_only, cuteafd_engine::prefix::After::default())?, "Qwen target-only mark not retained");
+    cache.release(family, &target_only.units)?;
+    let compatible = |saved: &Frontier, frontier| saved.supports_predictors(frontier);
+    let mut drafting = cache.admit_native_compatible(family, &tokens[..at + 1], &tokens[..at + 1], &[],
+        at + 1, false, Some(&compatible), place)?;
+    ensure!(drafting.resume == 0, "Qwen drafting reader restored target-only MTP pages");
+    let mut draft_state = MtpSeq::default();
+    for start in (0..at - 2).step_by(64) {
+        let end = (start + 64).min(at - 2);
+        engine.prefill(&mut drafting.placement, &tokens[start..end])?;
+        speculate::prefill_chunk(engine, &drafting.placement, start, &tokens[start..end], Some(tokens[end]), &mut draft_state)?;
+    }
+    engine.verify(&mut [(&mut drafting.placement, &tokens[at - 2..at])], None)?;
+    speculate::accept(engine, &mut [speculate::Verified { placement: &mut drafting.placement, seq: &mut draft_state,
+        start: at - 2, history: history_of(&engine.cfg, &tokens[..at - 2]), rows: &tokens[at - 2..at],
+        first_row: 0, kept: Some((2, tokens[at])), finished: true, neural: true }], false)?;
+    ensure!(canonical(&drafting.placement)? == expected, "Qwen no-spec writer/drafting miss differs from cold MTP state");
+    ensure!(cache.capture(family, cuteafd_engine::prefix::SnapshotKind::Turn, &tokens[..at],
+        &drafting.placement, cuteafd_engine::prefix::After::default())?, "Qwen drafting turn not retained");
+    cache.release(family, &drafting.placement.units)?;
+    let restored = cache.admit_native_compatible(family, &tokens[..at + 1], &tokens[..at + 1], &[],
+        at + 1, false, Some(&compatible), place)?;
+    ensure!(restored.resume == at, "Qwen drafting reader missed its predictor-complete turn");
+    ensure!(canonical(&restored.placement)? == expected, "Qwen shared drafting cache hit differs from cold MTP state");
+    let pending_row = |placement: &Qwen4Placement| -> Result<Vec<u8>> {
+        let ranges = family.unit_ranges(placement.units[(at - 1) / UNIT_ROWS])?;
+        let records = ranges[ranges.len() - 3];
+        let offset = (at - 1) % UNIT_ROWS * engine.kv_record_bytes;
+        download(engine, view(records, offset, engine.kv_record_bytes)?)
+    };
+    let retained_pending = pending_row(&restored.placement)?;
+    let mut hit_seq = MtpSeq::default();
+    speculate::restore_pending(engine, &restored.placement, at, Some(tokens[at]), &mut hit_seq)?;
+    ensure!(restored.placement.mtp_frontier.get() == at && hit_seq.pending.is_empty(),
+        "Qwen continuation did not consume its restored final hidden row");
+    let peer_place = |units| Qwen4Placement::new(units, 1, history_of(&engine.cfg, &[]));
+    let mut different = tokens[..at + 1].to_vec();
+    different[at] = (different[at] + 1) % engine.cfg.vocab_size as u32;
+    let peer = cache.admit_native_compatible(family, &different, &different, &[],
+        at + 1, false, Some(&compatible), peer_place)?;
+    ensure!(peer.resume == at && pending_row(&peer.placement)? == retained_pending,
+        "Qwen first continuation mutated retained predictor row");
+    let first_pending = pending_row(&restored.placement)?;
+    let mut peer_seq = MtpSeq::default();
+    speculate::restore_pending(engine, &peer.placement, at, Some(different[at]), &mut peer_seq)?;
+    let check_place = |units| Qwen4Placement::new(units, 2, history_of(&engine.cfg, &[]));
+    let check = cache.admit_native_compatible(family, &tokens[..at + 1], &tokens[..at + 1], &[],
+        at + 1, false, Some(&compatible), check_place)?;
+    ensure!(check.resume == at && pending_row(&check.placement)? == retained_pending,
+        "Qwen interleaved continuation mutated retained predictor row");
+    ensure!(canonical(&check.placement)? == expected && pending_row(&restored.placement)? == first_pending,
+        "Qwen continuations do not own independent canonical predictor state");
+    for placement in [&restored.placement, &peer.placement, &check.placement] {
+        cache.release(family, &placement.units)?;
+    }
+    cache.clear(family)?;
+    println!("Qwen MTP drafting turn restore at={at} stashed_rows=2 canonical_kv=true hidden_stash=true byte_exact=true");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -464,5 +715,26 @@ mod tests {
         assert_eq!(p.pool_slot(299).unwrap(), 10);
         assert_eq!(p.pool_slot(300).unwrap(), -1);
         assert_eq!(p.pool_slot(255).unwrap(), 2 * 64 + 63);
+    }
+}
+
+#[cfg(test)]
+mod frontier_tests {
+    use super::Frontier;
+
+    #[test]
+    fn target_only_marks_do_not_restore_predictors_but_canonical_stashes_do() {
+        for target in [1usize, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1492] {
+            let mut mark = Frontier { target, predictors: vec![0], pending: false };
+            assert!(!mark.supports_predictors(target));
+            mark.predictors[0] = target - 1;
+            assert!(!mark.supports_predictors(target));
+            mark.pending = true;
+            assert!(mark.supports_predictors(target));
+            assert!(!mark.supports_predictors(target + 1));
+            mark.predictors[0] = target;
+            mark.pending = false;
+            assert!(!mark.supports_predictors(target), "known-next-token state is not prefix-independent");
+        }
     }
 }

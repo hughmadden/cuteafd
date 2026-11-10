@@ -23,8 +23,6 @@ pub const GLMF_WIDE_DECODE_ROWS: u64 = 128;
 pub const GLMF_SPARSE_TOPK: u64 = 2112;
 /// The vocabulary head's cuBLAS workspace (`cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE`).
 pub const GLMF_HEAD_WORKSPACE: u64 = 4 << 20;
-/// Prefill lanes by default (the engine's `--prefill-lanes`).
-pub const GLMF_DEFAULT_PREFILL_LANES: u64 = 2;
 /// mHC streams per row.
 const HC: u64 = 4;
 /// Tokens per DSA index pool.
@@ -71,6 +69,32 @@ pub struct GlmfScratchOptions {
     pub index_compact: bool,
     /// The KDA recurrent state (`--kda-state`): which KDA programs the steps launch.
     pub kda_state: GlmfKdaState,
+}
+
+/// Fused projection groups fully replaced by separately admitted native core stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlmfCoreScratch {
+    pub kda: bool,
+    pub mla: bool,
+    pub ffn: bool,
+}
+
+/// Native groups own their projection/stage scratch in `CoreCharges`, not the fused arena.
+/// Keep indexer, sparse attention, mHC and top-k scratch for native dense cores.
+pub fn glmf_core_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig,
+    options: GlmfScratchOptions, rows: u64, decode: bool, native: GlmfCoreScratch)
+    -> Result<GlmfScratch, GlmfMissingProgram> {
+    glmf_step_scratch(|name| {
+        let stem = name.strip_prefix("glmf2_").or_else(|| name.strip_prefix("glmf_")).unwrap_or(name);
+        if (native.kda && stem.starts_with("kda_"))
+            || (native.mla && (stem.starts_with("mla_producer_") || stem.starts_with("o_")))
+            || (native.ffn && stem.starts_with("ffn_i")) { Some(0) } else { lookup(name) }
+    }, cfg, GlmfScratchOptions {
+        kda_fp32_partials: options.kda_fp32_partials && !native.kda,
+        kda_output_shard: options.kda_output_shard && !native.kda,
+        kda_prefill_expanded: options.kda_prefill_expanded && !native.kda,
+        ..options
+    }, rows, decode)
 }
 
 /// The storage of GLM 5.3 Flash's KDA recurrent state (`--kda-state`). Every KDA program computes
@@ -225,18 +249,24 @@ pub struct GlmfLaneBytes {
     pub route_ids: u64,
     pub route_weights: u64,
     pub wire: u64,
-    /// Pinned host staging of the routes and wire rows (Spark experts); not device memory.
-    pub router_host: u64,
 }
 
 impl GlmfLaneBytes {
-    /// Device bytes, every allocation floored as the engine allocates it.
-    pub fn device_bytes(&self) -> u64 {
+    fn device_fields(&self) -> impl Iterator<Item = u64> {
         [self.streams, self.streams, self.post, self.comb, self.x, self.delta, self.shared, self.positions,
             self.kv_slots, self.kda_slots, self.seq_first, self.pool_slots, self.cache_lengths, self.page_table,
             self.pool_table, self.ids, self.select, self.router_logits, self.route_ids, self.route_weights, self.wire]
             .into_iter().chain([self.zero, self.sum, self.routed].into_iter().flatten())
-            .map(|bytes| bytes.max(FLOOR)).sum()
+    }
+
+    /// Separate decode allocations preserve their exact byte ledger.
+    pub fn device_bytes(&self) -> u64 {
+        self.device_fields().map(|bytes| bytes.max(FLOOR)).sum()
+    }
+
+    /// Packed prefill views keep every operand 256-byte aligned.
+    pub fn arena_bytes(&self) -> u64 {
+        self.device_fields().map(|bytes| bytes.max(FLOOR).next_multiple_of(FLOOR)).sum()
     }
 }
 
@@ -296,7 +326,6 @@ pub fn glmf_lane_bytes(cfg: &GlmNextConfig, rows: u64, decode: bool, shape: &Glm
         route_ids: route(t * topk * 4),
         route_weights: route(t * topk * 4),
         wire: route(t * (h + h / 32)),
-        router_host: if shape.lead && shape.spark { t * (topk * 8 + h + h / 32) } else { FLOOR },
     }
 }
 
@@ -367,12 +396,6 @@ pub fn glmf_expert_rows(prefill_rows: u64, decode_rows: u64) -> u64 {
     prefill_rows.max(decode_rows)
 }
 
-/// Device bytes of GLM 5.3 Flash's Spark intake planes: one transport per prefill lane (decode
-/// reuses lane zero's), each with a plane of `rows` BF16 partial rows of `hidden` per Spark rank.
-pub fn glmf_spark_intake_bytes(lanes: u64, ranks: u64, rows: u64, hidden: u64) -> u64 {
-    lanes * ranks * rows * hidden * 2
-}
-
 /// The step workspaces of `lanes` prefill lanes of `lane_rows` rows and the decode workspace of
 /// `decode_rows` rows (the engine's `--decode-rows`), over the scratch of each step shape.
 pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, decode_rows: u64,
@@ -381,7 +404,7 @@ pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, d
     GlmfStepWorkspaces {
         decode: glmf_lane_bytes(cfg, rows, true, shape).device_bytes()
             + glmf_temporary_bytes(cfg, rows, true, shape, decode_scratch).device_bytes(),
-        lane: glmf_lane_bytes(cfg, lane_rows, false, shape).device_bytes(),
+        lane: glmf_lane_bytes(cfg, lane_rows, false, shape).arena_bytes(),
         lanes: lanes as u64,
         prefill_temporaries: glmf_temporary_bytes(cfg, lane_rows, false, shape, prefill_scratch).device_bytes(),
     }
@@ -390,6 +413,30 @@ pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_groups_drop_only_their_fused_scratch_and_package_requirement() {
+        let cfg = glm53_flash();
+        let native = GlmfCoreScratch { kda: true, mla: true, ffn: true };
+        for split in [false, true] {
+            for (rows, decode) in [(64, true), (128, true), (64, false), (4096, false)] {
+                let options = GlmfScratchOptions { split, kda_fp32_partials: split, ..Default::default() };
+                let lookup = |name: &str| {
+                    let stem = name.strip_prefix("glmf2_").or_else(|| name.strip_prefix("glmf_")).unwrap();
+                    if stem.starts_with("kda_") || stem.starts_with("mla_producer_")
+                        || stem.starts_with("o_") || stem.starts_with("ffn_i") { None }
+                    else { Some(if stem.starts_with("index_topk_") { 17 } else { 23 }) }
+                };
+                assert_eq!(glmf_core_step_scratch(lookup, &cfg, options, rows, decode, native).unwrap(),
+                    GlmfScratch { programs: 23, topk: 17 });
+                assert!(glmf_step_scratch(lookup, &cfg, options, rows, decode).is_err());
+                for mask in [GlmfCoreScratch { kda: false, ..native }, GlmfCoreScratch { mla: false, ..native },
+                    GlmfCoreScratch { ffn: false, ..native }] {
+                    assert!(glmf_core_step_scratch(lookup, &cfg, options, rows, decode, mask).is_err());
+                }
+            }
+        }
+    }
 
     /// The GLM programs' scratch at capacity of our first own build (slot `base`,
     /// `work/p0` c3e5de13 exported on an RTX 5090): `glmf_*` single-GPU programs.
@@ -502,13 +549,13 @@ mod tests {
         let workspaces = |lanes: usize, rows: u64| glmf_step_workspaces(&cfg, lanes, rows, GLMF_DECODE_ROWS, &shape,
             scratch(&cfg, 64, true), scratch(&cfg, rows, false));
         let two = workspaces(2, 4096);
-        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_540, 1_993_850_880));
-        assert_eq!(two.device_bytes(), 2_872_635_480);
+        assert_eq!((two.decode, two.lane, two.prefill_temporaries), (94_955_520, 391_914_752, 1_993_850_880));
+        assert_eq!(two.device_bytes(), 2_872_635_904);
         // Four lanes of 2,048 rows hold the same rows in flight; the per-row temporaries halve,
         // the programs' scratch (laid out for 4,096 rows) does not.
         let four = workspaces(4, 2048);
-        assert_eq!((four.lane, four.prefill_temporaries), (195_961_900, 1_688_969_216));
-        assert_eq!(four.device_bytes(), 2_567_772_336);
+        assert_eq!((four.lane, four.prefill_temporaries), (195_962_112, 1_688_969_216));
+        assert_eq!(four.device_bytes(), 2_567_773_184);
         assert_eq!(workspaces(1, 4096).device_bytes(), two.device_bytes() - two.lane);
     }
 
@@ -598,10 +645,9 @@ mod tests {
         let cfg = glm53_flash();
         let lane = glmf_lane_bytes(&cfg, 4096, false, &spark_shape());
         assert_eq!((lane.zero, lane.sum, lane.routed), (None, None, None));
-        assert_eq!(lane.router_host, 4096 * (8 * 8 + 4096 + 128));
         let local = glmf_lane_bytes(&cfg, 4096, false,
             &GlmfStepShape { local_experts: true, spark: false, ..spark_shape() });
-        assert_eq!((local.routed, local.router_host), (Some(4096 * 4096 * 2), FLOOR));
+        assert_eq!(local.routed, Some(4096 * 4096 * 2));
         // A head split: both ranks keep the sum, rank 1 the zero rows and none of the lead's buffers.
         let lead = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { split: true, ..spark_shape() });
         assert_eq!((lead.zero, lead.sum), (None, Some(64 * 4096 * 2)));
@@ -625,7 +671,6 @@ mod tests {
         assert_eq!((peer.route_ids, peer.route_weights, peer.wire), (lead.route_ids, lead.route_weights, lead.wire));
         let old = glmf_lane_bytes(&cfg, 64, true, &GlmfStepShape { tp2_experts: false, ..shape });
         assert_eq!((peer.delta, peer.shared), (old.delta, old.shared));
-        assert_eq!(peer.router_host, FLOOR);
     }
 
     /// The wide decode programs' scratch at capacity in the offline SM 12.0 export of SparkInfer

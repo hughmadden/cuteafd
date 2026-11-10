@@ -6,6 +6,21 @@ use std::ptr::NonNull;
 
 pub const V41_EXPERT_POINTER_COUNT: usize = 44;
 
+/// Load-time source rectangle and coded plane; matches cuteafd_scale_code_job_t.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct V41ScaleCodeJob {
+    pub source: *const u8,
+    pub destination: *mut u8,
+    pub source_bytes: u64,
+    pub destination_bytes: u64,
+    pub pitch: u64,
+    pub rows: u32,
+    pub columns: u32,
+    pub stored_rows: u32,
+    pub start_row: u32,
+}
+
 /// Native slot 41 representation; dtype and route axis are independent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum V41ExpertOutputKind {
@@ -118,13 +133,24 @@ pub struct V41ExpertReduction {
 }
 impl V41ExpertReduction {
     pub fn validate(&self, info: &V41ExpertInfo) -> Result<()> {
-        ensure!(self.version == 1 && matches!(self.slice_width, 64 | 128 | 192)
+        if self.version == 2 {
+            ensure!(self.slice_width == 128 && self.mma_k == 32 && self.block_threads == 256
+                && self.fc1_k_stage == 128 && self.fc2_k_steps == info.logical_intermediate.div_ceil(32)
+                && self.plane_count == 1 && self.plane_fold == 4 && self.implementation == 3
+                && info.abi_version == 2 && info.kernel_intermediate == info.logical_intermediate
+                && matches!(info.capacity_rows, 256 | 1024 | 4096),
+                "unsupported native STREAM original-route attestation");
+            return Ok(());
+        }
+        ensure!(self.version == 1 && matches!(self.slice_width, 32 | 64 | 128 | 192)
             && self.mma_k == 32 && self.block_threads == 128 && self.fc1_k_stage == 128,
             "unsupported native expert reduction attestation");
         ensure!(self.fc2_k_steps == self.slice_width / self.mma_k
             && self.plane_count == info.logical_intermediate.div_ceil(self.slice_width)
+            && info.kernel_intermediate >= info.logical_intermediate
             && self.plane_count.checked_mul(self.slice_width)
-                .is_some_and(|extent| extent <= info.kernel_intermediate),
+                .and_then(|extent| extent.checked_sub(info.logical_intermediate))
+                .is_some_and(|tail| tail < self.slice_width),
             "native expert slice/fold geometry differs from compiled expert info");
         ensure!(matches!(self.plane_fold, 1 | 2 | 3) && matches!(self.implementation, 1 | 2),
             "unknown native expert plane fold or implementation");
@@ -226,17 +252,17 @@ pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
     intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
 
-/// Physical-rank counts the compact reduction contract defines: one through six. Library-independent; use
+/// Physical-rank counts the compact reduction contract defines: one through eight. Library-independent; use
 /// [`V41CompactReducer::supports_rank_count`] for what the loaded library can
 /// actually execute.
 pub fn v41_rank_count_supported(ranks: u32) -> bool {
-    (1..=6).contains(&ranks)
+    (1..=8).contains(&ranks)
 }
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
-/// under the process geometry. Each role is one tensor-parallel slice of the
-/// routed experts; kernels store it padded to 128, and the NVFP4 Spark TP4
-/// family also accepts the exact extent. Roles 0 and 4 are the dSpark draft
+/// under the process geometry. Native Spark roles and stored extents come from
+/// the shared world-to-artifacts contract; NVFP4 retains its frozen padded or
+/// exact extent. Roles 0 and 4 are the dSpark draft
 /// experts (128 experts, top-3), whose shape does not follow the target model.
 fn expected_expert_geometry(
     geometry: cuteafd_core::ExpertGeometry,
@@ -244,6 +270,15 @@ fn expected_expert_geometry(
     role: u32,
     kernel_intermediate: u32,
 ) -> Option<(u32, u32, u32, u32)> {
+    if !nvfp4 && (cuteafd_core::tp_units::native_role_width(role).is_some()
+        || matches!(role, 1 | 5 | 6 | 7 | 8)) {
+        return (2..=cuteafd_core::MAX_SPARK_WORLD).find_map(|world|
+            cuteafd_core::tp_units::native_spark_artifacts(geometry.hidden as usize,
+                geometry.intermediate as usize, world).ok()?.into_iter()
+                .find(|artifact| artifact.role == role)
+                .map(|artifact| (geometry.experts, artifact.logical as u32,
+                    artifact.stored as u32, geometry.topk)));
+    }
     let draft = |intermediate: u32| Some((128, intermediate, intermediate, 3));
     let tp = match (nvfp4, role) {
         (false, 0) => return draft(2304),
@@ -253,11 +288,16 @@ fn expected_expert_geometry(
         (_, 3) | (false, 5) => 2,
         (_, 6) => 3,
         (_, 7) => 6,
+        (false, 8) => 8,
         _ => return None,
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
     let padded = logical.div_ceil(128) * 128;
-    let kernel = if nvfp4 && kernel_intermediate == logical { logical } else { padded };
+    let kernel = if nvfp4 {
+        if kernel_intermediate == logical { logical } else { padded }
+    } else {
+        cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, logical as usize)? as u32
+    };
     Some((geometry.experts, logical, kernel, geometry.topk))
 }
 
@@ -351,7 +391,7 @@ impl V41CompactReducer<'_> {
         match ranks {
             2 => self.reduce_planes.is_some() || self.reduce_tp2.is_some(),
             4 => true,
-            1 | 3 | 5 | 6 => self.reduce_planes.is_some(),
+            1 | 3 | 5 | 6 | 7 | 8 => self.reduce_planes.is_some(),
             _ => false,
         }
     }
@@ -361,7 +401,7 @@ impl V41CompactReducer<'_> {
     pub fn require_rank_count(&self, ranks: u32) -> Result<()> {
         ensure!(
             v41_rank_count_supported(ranks),
-            "unsupported physical rank count {ranks}; expected 1 through 6"
+            "unsupported physical rank count {ranks}; expected 1 through 8"
         );
         ensure!(
             self.supports_rank_count(ranks),
@@ -373,7 +413,7 @@ impl V41CompactReducer<'_> {
     /// Shared Spark intake always uses the N-plane ABI, even at two/four ranks.
     /// Reject a legacy-only library before allocating its landing planes.
     pub fn require_plane_reduction(&self, ranks: u32) -> Result<()> {
-        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 6");
+        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 8");
         ensure!(self.reduce_planes.is_some(), "native N-plane compact BF16 reduction unavailable; rebuild the native library");
         Ok(())
     }
@@ -381,7 +421,7 @@ impl V41CompactReducer<'_> {
     /// The physical-rank counts this loaded library can reduce, in ascending
     /// order. Useful for startup logging and fallback rejection.
     pub fn available_rank_counts(&self) -> Vec<u32> {
-        (1u32..=6)
+        (1u32..=8)
             .into_iter()
             .filter(|ranks| self.supports_rank_count(*ranks))
             .collect()
@@ -491,7 +531,7 @@ impl V41CompactReducer<'_> {
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
     /// current device; `planes[ranks..N]` must be null. Output must not overlap any
     /// plane and may alias `shared` only exactly. 1 <= rows <= 4096 and ranks is
-    /// in 1..=6. Storage and this library must outlive stream completion and
+    /// in 1..=8. Storage and this library must outlive stream completion and
     /// every captured graph replay, with producer writes ordered first. The eight
     /// pointers travel to the kernel by value; no device pointer array is used.
     pub unsafe fn reduce_planes<const N: usize>(
@@ -504,8 +544,8 @@ impl V41CompactReducer<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=6).contains(&ranks),
-            "N-plane reduction requires ranks 1 through 6"
+            (1..=8).contains(&ranks),
+            "N-plane reduction requires ranks 1 through 8"
         );
         let function = self
             .reduce_planes
@@ -593,6 +633,79 @@ impl NativeLibrary {
         })
     }
 
+    /// Generate equal-pitch omitted row tails without touching source bytes.
+    /// # Safety
+    /// The destination is on the current device and stays live through completion.
+    pub unsafe fn zero_pitched_async(&self, destination: CuteafdDeviceBuffer,
+        pitch: usize, width: usize, rows: usize, stream: *mut c_void) -> Result<()> {
+        ensure!(width > 0 && rows > 0 && pitch >= width
+            && (rows - 1).checked_mul(pitch).and_then(|n| n.checked_add(width))
+                .is_some_and(|n| n <= destination.bytes), "zero pitch exceeds destination");
+        type F = unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, *mut c_void) -> i32;
+        let zero = unsafe { self.lib.get::<F>(b"cuteafd_zero_pitched_async")? };
+        let status = unsafe { zero(destination.ptr, destination.bytes as u64,
+            pitch as u64, width as u64, rows as u64, stream) };
+        ensure!(status == 0, "pitched zero failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Pack one fused raw plane out of place, using the mount packer's kernel.
+    /// # Safety
+    /// Both buffers must be live on the current device through stream completion.
+    /// FC1 halves must already contain their independently padded [up;gate] rows.
+    pub unsafe fn v41_pack_plane_async(&self, source: crate::CuteafdDeviceBuffer,
+        destination: crate::CuteafdDeviceBuffer, intermediate: u32, plane: u32,
+        stream: *mut c_void) -> Result<()> {
+        type PlaneFn = unsafe extern "C" fn(*const u8, u64, *mut u8, u64, u32, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<PlaneFn>(b"cuteafd_pack_expert_plane_async")? };
+        let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
+            destination.ptr.cast(), destination.bytes as u64, intermediate, plane, stream) };
+        ensure!(status == 0, "V4.1 plane packing failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Pack tile-aligned rows of one projection into its native plane.
+    /// # Safety
+    /// Buffers are disjoint on the current device and live through completion.
+    pub unsafe fn v41_pack_window_async(&self, source: CuteafdDeviceBuffer,
+        destination: CuteafdDeviceBuffer, intermediate: u32, projection: u32,
+        first: u32, rows: u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const u8, u64, *mut u8, u64, u32, u32, u32, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_pack_expert_window_async")? };
+        let status = unsafe { pack(source.ptr.cast(), source.bytes as u64,
+            destination.ptr.cast(), destination.bytes as u64, intermediate, projection, first, rows, stream) };
+        ensure!(status == 0, "expert window packing failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Pack W1/W3/W2 payloads without allocating raw scale destinations.
+    /// # Safety
+    /// Sources and destinations are disjoint, correctly sized device buffers
+    /// on the current device and remain live through stream completion.
+    pub unsafe fn v41_pack_weights_async(&self, sources: [*const u8; 3],
+        destinations: [*mut u8; 2], intermediate: u32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const u8, *const *mut u8, u32, *mut c_void) -> i32;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_pack_expert_weights_async")? };
+        let status = unsafe { pack(sources.as_ptr(), destinations.as_ptr(), intermediate, stream) };
+        ensure!(status == 0, "expert payload packing failed with CUDA status {status}");
+        Ok(())
+    }
+
+    /// Recode scale rectangles without changing a checkpoint exponent.
+    /// # Safety
+    /// Jobs must be in mapped pinned memory, all source/output/error storage
+    /// device-visible on the current device and live through stream completion.
+    /// Output omitted rows are zeroed by the caller; error starts at u64::MAX.
+    pub unsafe fn v41_pack_scale_codes_async(&self, jobs: *const V41ScaleCodeJob,
+        count: usize, error: *mut u64, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*const V41ScaleCodeJob, u32, *mut u64, *mut c_void) -> i32;
+        let count = u32::try_from(count)?;
+        let pack = unsafe { self.lib.get::<F>(b"cuteafd_v41_pack_scale_codes_async")? };
+        let status = unsafe { pack(jobs, count, error, stream) };
+        ensure!(status == 0, "V4.1 scale-code packing failed with CUDA status {status}");
+        Ok(())
+    }
+
     pub fn v41_expert_packer(&self, intermediate: u32) -> Result<V41ExpertPacker<'_>> {
         ensure!(
             v41_pack_intermediate_supported(intermediate),
@@ -661,6 +774,10 @@ impl NativeLibrary {
         self.expert_info_for(capacity, 11)
     }
 
+    pub fn v41_spark_tp8_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
+        self.expert_info_for(capacity, 14)
+    }
+
     /// Whether this NVFP4 role uses a shared FC1 activation scale. An old
     /// artifact without policy metadata must be rebuilt before expert-scale mode.
     pub fn v41_nvfp4_shared_input(&self, role: u32) -> Result<bool> {
@@ -685,16 +802,51 @@ impl NativeLibrary {
         }
     }
 
+    /// Installed capacity metadata is resolved once during startup, before any
+    /// expert execution arena is allocated; the launch path never reads files.
+    pub fn native_expert_exports(&self, role: u32) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        self.expert_exports(role, false)
+    }
+
+    pub fn nvfp4_expert_exports(&self, role: u32) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        self.expert_exports(role, true)
+    }
+
+    fn expert_exports(&self, role: u32, nvfp4: bool) -> Result<cuteafd_core::spark_executions::ExpertExportCapacities> {
+        let family = cuteafd_core::expert_geometry().family().context("unknown native expert family")?;
+        let role = match role {
+            0 => "coordinator".to_owned(), 1 => "spark".to_owned(),
+            2 => "rtx_backbone".to_owned(), 3 => "rtx_tp2".to_owned(),
+            4 => "dspark_tp2".to_owned(), 5 => "spark_tp2".to_owned(),
+            6 => "spark_tp3".to_owned(), 7 => "spark_tp6".to_owned(),
+            8 => "spark_tp8".to_owned(),
+            other => format!("spark_w{}", cuteafd_core::tp_units::native_role_width(other)
+                .context("unknown native expert role")?),
+        };
+        let path = [self.artifact_root.join("V41_EXPERT_TP_AOT.json"),
+            self.artifact_root.join("../share/V41_EXPERT_TP_AOT.json")].into_iter()
+            .find(|path| path.is_file()).context("missing installed native expert capacity manifest")?;
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let key = format!("{family}:{role}");
+        let package = &manifest[if nvfp4 { "nvfp4_packages" } else { "native_packages" }][&key];
+        cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(package)
+            .map_err(anyhow::Error::msg).with_context(|| format!("native expert package {key} in {}", path.display()))
+    }
+
     /// Query immutable native MXFP4 numerical metadata before allocation/readiness.
     pub fn native_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
         type Query = unsafe extern "C" fn(i32, *mut V41ExpertReduction) -> i32;
+        let width_name = cuteafd_core::tp_units::native_role_width(info.role)
+            .map(|width| format!("cuteafd_v41_spark_w{width}_expert_info_reduction"));
         let name: &[u8] = match info.role {
+            _ if width_name.is_some() => width_name.as_ref().unwrap().as_bytes(),
             1 => b"cuteafd_v41_expert_info_reduction",
             2 => b"cuteafd_v41_local_expert_info_reduction",
             3 => b"cuteafd_v41_tp2_expert_info_reduction",
             5 => b"cuteafd_v41_spark_tp2_expert_info_reduction",
             6 => b"cuteafd_v41_spark_tp3_expert_info_reduction",
             7 => b"cuteafd_v41_spark_tp6_expert_info_reduction",
+            8 => b"cuteafd_v41_spark_tp8_expert_info_reduction",
             _ => anyhow::bail!("native slice reduction metadata requires a routed-expert role"),
         };
         let name = family_symbol(name)?;
@@ -707,6 +859,37 @@ impl NativeLibrary {
         ensure!(status == 0, "native expert reduction query failed with CUDA status {status}");
         result.validate(info)?;
         Ok(result)
+    }
+
+    /// An adjacent K32 shard selected from absolute layer/rank ownership.
+    pub fn native_width_expert_info(&self, capacity: u32, width: usize) -> Result<V41ExpertInfo> {
+        let role = cuteafd_core::tp_units::native_width_role(width)
+            .context("invalid native K32 artifact width")?;
+        let name = family_symbol(format!("cuteafd_v41_spark_w{width}_expert_info").as_bytes())?;
+        // SAFETY: the width export uses the same immutable repr(C) metadata ABI.
+        let function = unsafe { self.lib.get::<InfoFn>(&name) }
+            .with_context(|| format!("missing adjacent native artifact {}", String::from_utf8_lossy(&name)))?;
+        let mut info = V41ExpertInfo::default();
+        // SAFETY: info is writable; the capacity conversion is checked.
+        let status = unsafe { function(i32::try_from(capacity)?, &mut info) };
+        let geometry = cuteafd_core::expert_geometry();
+        let expected = expected_expert_geometry(geometry, false, role, info.kernel_intermediate)
+            .context("native width is not an adjacent shard of the checkpoint")?;
+        let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
+            geometry.experts as usize, geometry.topk as usize, width, role, capacity,
+            geometry.family() == Some("v41")).context("invalid native width scratch recipe")?;
+        ensure!(status == 0 && info.role == role && info.abi_version == 2
+            && info.input_dtype == 7 && info.hidden_size == geometry.hidden
+            && info.capacity_rows == capacity && info.scratch_bytes == scratch
+            && (info.experts, info.logical_intermediate, info.kernel_intermediate, info.topk) == expected,
+            "adjacent native expert metadata differs from the checkpoint: {info:?}, expected {expected:?}");
+        Ok(info)
+    }
+
+    pub fn native_width_expert_kernel(&self, capacity: u32, width: usize) -> Result<V41ExpertKernel<'_>> {
+        let info = self.native_width_expert_info(capacity, width)?;
+        let prefix = family_symbol(format!("cuteafd_v41_spark_w{width}").as_bytes())?;
+        self.expert_kernel_named(capacity, info, String::from_utf8(prefix)?, false)
     }
 
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
@@ -726,6 +909,7 @@ impl NativeLibrary {
             11 => b"cuteafd_v41_spark_tp6_expert_info",
             12 => b"cuteafd_v41_nvfp4_spark_tp3_expert_info",
             13 => b"cuteafd_v41_nvfp4_spark_tp6_expert_info",
+            14 => b"cuteafd_v41_spark_tp8_expert_info",
             _ => b"cuteafd_v41_expert_info",
         };
         let name = family_symbol(name)?;
@@ -759,11 +943,11 @@ impl NativeLibrary {
                 // inside the kernel.
                 info.input_dtype == 1
             } else {
-                info.input_dtype == 1 || (matches!(info.role, 1 | 2 | 3 | 4 | 5 | 6 | 7) && info.input_dtype == 7)
+                info.input_dtype == 1 || (matches!(info.role, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8) && info.input_dtype == 7)
             },
             "unsupported native expert input representation"
         );
-        if matches!(interface, 8 | 9 | 11) {
+        if matches!(interface, 8 | 9 | 11 | 14) {
             // Replicated-group and pure TP6 Spark shards are always exported
             // from the native FP8 K32 wire format; reject a BF16-hidden
             // artifact explicitly.
@@ -798,6 +982,7 @@ impl NativeLibrary {
             11 => Some(7),
             12 => Some(6),
             13 => Some(7),
+            14 => Some(8),
             other => Some(u32::from(other)),
         };
         match expected_role {
@@ -838,6 +1023,10 @@ impl NativeLibrary {
     /// intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 11)
+    }
+
+    pub fn v41_spark_tp8_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
+        self.expert_kernel_for(capacity, 14)
     }
 
     /// W4A4 ModelOpt NVFP4 expert kernels. The family publishes BF16
@@ -902,9 +1091,15 @@ impl NativeLibrary {
             11 => "cuteafd_v41_spark_tp6",
             12 => "cuteafd_v41_nvfp4_spark_tp3",
             13 => "cuteafd_v41_nvfp4_spark_tp6",
+            14 => "cuteafd_v41_spark_tp8",
             _ => "cuteafd_v41",
         };
         let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
+        self.expert_kernel_named(capacity, info, prefix, matches!(interface, 5 | 6 | 7 | 12 | 13))
+    }
+
+    fn expert_kernel_named(&self, capacity: u32, info: V41ExpertInfo, prefix: String,
+        nvfp4: bool) -> Result<V41ExpertKernel<'_>> {
         let symbol = |operation: &str| format!("{prefix}_expert_{operation}").into_bytes();
         // SAFETY: this additive entry point writes one u32 and loads no CUDA state.
         let query_group_rows = unsafe { *self.lib.get::<GroupRowsFn>(&symbol("group_rows"))? };
@@ -924,7 +1119,6 @@ impl NativeLibrary {
             status == 0,
             "V4.1 expert initialization failed with CUDA status {status}"
         );
-        let nvfp4 = matches!(interface, 5 | 6 | 7 | 12 | 13);
         let output_kind = if info.abi_version == 3 || nvfp4 {
             type OutputKindFn = unsafe extern "C" fn(i32, *mut u32) -> i32;
             let query = unsafe { self.lib.get::<OutputKindFn>(&symbol("output_kind"))? };
@@ -940,7 +1134,7 @@ impl NativeLibrary {
                     self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_reduce_tp2_bf16_routes_async")?;
                 }
             } else {
-                ensure!(kind == V41ExpertOutputKind::Fp32Tokens && matches!(info.role, 1 | 2 | 3 | 5 | 6 | 7),
+                ensure!(kind == V41ExpertOutputKind::Fp32Tokens && matches!(info.role, 1 | 2 | 3 | 5 | 6 | 7 | 8),
                     "unsupported V4.1 ABI 3 output layout");
                 unsafe { self.lib.get::<CompactFn>(b"cuteafd_compact_tokens_bf16_async")?; }
             }
@@ -1098,8 +1292,10 @@ mod tests {
         assert_eq!(expected_expert_geometry(V41, true, 6, 768), Some((384, 768, 768, 6)));
         assert_eq!(expected_expert_geometry(V41, true, 7, 384), Some((384, 384, 384, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
-        // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
-        assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));
+        // TP4 follows the measured storage table; RTX TP2 role semantics are unchanged.
+        let logical = V41.intermediate / 4;
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(V41.hidden as usize, logical as usize).unwrap() as u32;
+        assert_eq!(expected_expert_geometry(V41, false, 1, stored), Some((384, logical, stored, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 3, 1152), Some((384, 1152, 1152, 6)));
         // Unknown or cross-family pairs still fail closed.
         // A role-7 artifact with a 768 kernel cannot match the 384 expectation.
@@ -1121,11 +1317,61 @@ mod tests {
     }
 
     #[test]
-    fn rank_count_contract_is_one_through_six() {
-        for ranks in 1u32..=6 {
+    fn native_tp8_geometry_uses_the_measured_storage_policy() {
+        for (geometry, experts, logical, stored) in [
+            (V41, 384, 288, 288),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH, 256, 256, 256),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO, 384, 384, 384),
+        ] {
+            assert_eq!(expected_expert_geometry(geometry, false, 8, stored),
+                Some((experts, logical, stored, 6)));
+            assert_eq!(expected_expert_geometry(geometry, true, 8, stored), None);
+        }
+    }
+
+    #[test]
+    fn native_width_metadata_uses_checkpoint_adjacent_geometry() {
+        for geometry in [V41, cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO] {
+            let intermediate = geometry.intermediate as usize;
+            for width in (32..=8192).step_by(32) {
+                let role = cuteafd_core::tp_units::native_width_role(width).unwrap();
+                let adjacent = (2..=8).any(|world| {
+                    let unit = cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world);
+                    let units = intermediate / unit;
+                    units % world != 0
+                        && [units / world * unit, units.div_ceil(world) * unit].contains(&width)
+                });
+                let result = expected_expert_geometry(geometry, false, role, 0);
+                assert_eq!(result.is_some(), adjacent);
+                if let Some((experts, logical, stored, topk)) = result {
+                    assert_eq!((experts, logical, topk), (geometry.experts, width as u32, geometry.topk));
+                    assert_eq!(stored as usize, cuteafd_core::mxfp4_layouts::stored_width(
+                        geometry.hidden as usize, width).unwrap());
+                }
+                assert!(expected_expert_geometry(geometry, true, role, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn compute_tail_is_not_resident_weight_padding() {
+        let info = V41ExpertInfo { abi_version: 2, logical_intermediate: 288,
+            kernel_intermediate: 288, ..Default::default() };
+        let recipe = V41ExpertReduction { version: 1, slice_width: 128, fc2_k_steps: 4,
+            plane_count: 3, plane_fold: 1, implementation: 1, mma_k: 32,
+            block_threads: 128, fc1_k_stage: 128 };
+        recipe.validate(&info).unwrap();
+        assert!(recipe.plane_count * recipe.slice_width > info.kernel_intermediate);
+        assert!(recipe.validate(&V41ExpertInfo { kernel_intermediate: 256, ..info }).is_err());
+    }
+
+    #[test]
+    fn rank_count_contract_is_one_through_eight() {
+        for ranks in 1u32..=8 {
             assert!(v41_rank_count_supported(ranks));
         }
-        for ranks in [0u32, 7, 8, 9, 12] {
+        for ranks in [0u32, 9, 12] {
             assert!(!v41_rank_count_supported(ranks));
         }
     }
@@ -1153,7 +1399,7 @@ mod tests {
         assert!(reducer.require_plane_reduction(9).is_err());
         // The current build must expose every count through the eight-slot path.
         assert!(
-            (1..=6).all(|ranks| reducer.supports_rank_count(ranks)),
+            (1..=8).all(|ranks| reducer.supports_rank_count(ranks)),
             "current library is missing the N-plane compact reducer"
         );
         let legacy = V41CompactReducer { reduce_planes: None, ..reducer };
@@ -1397,6 +1643,24 @@ mod tests {
         assert!(info.input_row_bytes().is_err());
         info.input_dtype = 3;
         assert!(info.input_row_bytes().is_err());
+    }
+
+    #[test]
+    fn compiled_stream_attestation_requires_original_routes_and_prefill() {
+        let info = V41ExpertInfo { abi_version: 2, capacity_rows: 256,
+            logical_intermediate: 352, kernel_intermediate: 352, ..Default::default() };
+        let recipe = V41ExpertReduction { version: 2, slice_width: 128, fc2_k_steps: 11,
+            plane_count: 1, plane_fold: 4, implementation: 3, mma_k: 32,
+            block_threads: 256, fc1_k_stage: 128 };
+        recipe.validate(&info).unwrap();
+        for bad in [V41ExpertReduction { plane_fold: 2, ..recipe },
+            V41ExpertReduction { block_threads: 128, ..recipe },
+            V41ExpertReduction { fc2_k_steps: 4, ..recipe },
+            V41ExpertReduction { plane_count: 3, ..recipe }] {
+            assert!(bad.validate(&info).is_err());
+        }
+        assert!(recipe.validate(&V41ExpertInfo { capacity_rows: 80, ..info }).is_err());
+        assert!(recipe.validate(&V41ExpertInfo { abi_version: 3, ..info }).is_err());
     }
 
     #[test]

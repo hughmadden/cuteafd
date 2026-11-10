@@ -2,11 +2,53 @@
 //! Spark expert service. One process serves one model, so the geometry is a
 //! process-wide value fixed at startup; it defaults to DeepSeek V4.1 so every
 //! V4.1 path (and its tests) behaves exactly as before.
+/// Request metadata is followed by zero padding so mapped payloads support
+/// native 16-byte vector loads, independent of row and route counts.
+pub fn expert_request_payload_offset(header: usize, row_bytes: usize, route_bytes: usize) -> Option<usize> {
+    header.checked_add(row_bytes)?.checked_add(route_bytes)?.checked_add(15).map(|n| n & !15)
+}
+
 use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 /// Native EXLR8 workers reuse one device arena across serial request chunks.
 pub const EXLR8_EXECUTION_ROWS: usize = 64;
+
+/// Capacity-specific execution payload from the selected installed packages.
+/// Mapped request/reply rings retain each network unit separately; device I/O
+/// and scratch are reused in stream order by one execution owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparkOwnerWorkspace {
+    pub scratch_bytes: u64,
+    pub io_bytes: u64,
+    pub pinned_staging_bytes: u64,
+    pub buffered_units: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SparkWorkspaceBytes {
+    pub device_bytes: u64,
+    pub pinned_bytes: u64,
+}
+impl SparkWorkspaceBytes {
+    pub fn total(self) -> Option<u64> { self.device_bytes.checked_add(self.pinned_bytes) }
+}
+
+/// Shared planner/worker owner census. Unit buffering multiplies only pinned
+/// route staging, never compute scratch or stream-ordered device input planes.
+pub fn spark_owner_workspace_bytes(owners: impl IntoIterator<Item = SparkOwnerWorkspace>)
+    -> Option<SparkWorkspaceBytes> {
+    owners.into_iter().try_fold(SparkWorkspaceBytes::default(), |mut total, owner| {
+        if !(1..=4).contains(&owner.buffered_units) { return None; }
+        total.device_bytes = total.device_bytes.checked_add(owner.scratch_bytes)?.checked_add(owner.io_bytes)?;
+        total.pinned_bytes = total.pinned_bytes.checked_add(owner.pinned_staging_bytes
+            .checked_mul(u64::from(owner.buffered_units))?)?;
+        Some(total)
+    })
+}
+
+/// Debug response header bytes a partial reply frame may carry (no row indices).
+pub const PARTIAL_RESPONSE_HEADER_BYTES: usize = 128;
 
 /// One persistent coordinator-to-Spark connection, resolved before allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +56,15 @@ pub const EXLR8_EXECUTION_ROWS: usize = 64;
 pub struct SparkEndpoint {
     pub capacity: u32,
     pub ingress: SparkIngress,
+    /// Overrides only this connection's depth; other endpoints keep the model default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring_depth: Option<usize>,
+    /// Partial-reply endpoints (`EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES`): the
+    /// largest per-rank partial payload any admitted wave replies (the family's
+    /// worst region mix at its unit, cutoff and sequences). Sizes the response
+    /// frame instead of the compact BF16 plane; absent for every other endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_reply_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +72,8 @@ pub struct SparkEndpoint {
 pub enum SparkIngress {
     Fp8K32,
     Bf16,
+    /// Each layer uses its package's native input; the worker checks the dtype.
+    Native,
     /// Decode rows are unquantized; prefill uses FP8 K32 on the same QP.
     Bf16Decode { rows: u32 },
 }
@@ -166,6 +219,12 @@ pub struct SparkRings {
 }
 
 impl SparkEndpoint {
+    /// The planner and both transport peers use the same admitted ring depth.
+    pub fn resolved_rings(self, rings: SparkRings) -> Option<SparkRings> {
+        let depth = self.ring_depth.unwrap_or(rings.depth);
+        (1..=8).contains(&depth).then_some(SparkRings { depth, ..rings })
+    }
+
     /// Retained response metadata per QP: largest header plus indexed rows.
     pub fn response_prefix_bytes(self) -> Option<usize> {
         if !(1..=4096).contains(&self.capacity) { return None; }
@@ -175,7 +234,7 @@ impl SparkEndpoint {
     pub fn wire_bytes(self, geometry: ExpertGeometry) -> Option<(usize, usize)> {
         if !(1..=4096).contains(&self.capacity) { return None; }
         let (request, response) = geometry.compact_wire_bytes(self.capacity,
-            self.ingress == SparkIngress::Bf16)?;
+            matches!(self.ingress, SparkIngress::Bf16 | SparkIngress::Native))?;
         let request = match self.ingress {
             SparkIngress::Bf16Decode { rows } => {
                 if rows == 0 || rows > self.capacity { return None; }
@@ -183,12 +242,31 @@ impl SparkEndpoint {
             }
             _ => request,
         };
+        // A partial reply is never row-indexed: header plus the region payload.
+        let response = match self.partial_reply_bytes {
+            Some(bytes) => usize::try_from(bytes).ok()?.checked_add(PARTIAL_RESPONSE_HEADER_BYTES)?,
+            None => response,
+        };
         Some((request, response))
+    }
+
+    /// The frame this endpoint needs: the model's budget, or this endpoint's
+    /// larger partial reply (one SEND per frame, never chunked).
+    pub fn frame_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
+        let (request, response) = self.wire_bytes(geometry)?;
+        Some(if self.partial_reply_bytes.is_some() { rings.max_frame_bytes.max(request).max(response) }
+            else { rings.max_frame_bytes })
     }
 
     pub fn ring_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
         let (request, response) = self.wire_bytes(geometry)?;
-        geometry.ring_bytes_for_wire(request, response, rings, 1)
+        geometry.ring_bytes_for_wire(request, response, self.endpoint_rings(geometry, rings)?, 1)
+    }
+
+    /// Rings resolved for this endpoint: its depth, and its own frame budget.
+    pub fn endpoint_rings(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<SparkRings> {
+        let resolved = self.resolved_rings(rings)?;
+        Some(SparkRings { max_frame_bytes: self.frame_bytes(geometry, resolved)?, ..resolved })
     }
 }
 
@@ -224,8 +302,16 @@ impl ExpertGeometry {
     /// output (not the 7168 residual); routed layers 1..93, sigmoid top-16, Situ.
     pub const KIMI_K3: Self = Self { hidden: 3584, experts: 896, topk: 16, intermediate: 3072, layers: 93 };
 
+    /// Mistral Large 4 (mistral_large4): routed layers 1..72, softmax top-4,
+    /// SiLU unclamped, one shared expert on the coordinator.
+    pub const MISTRAL_LARGE4: Self = Self { hidden: 6144, experts: 128, topk: 4, intermediate: 6144, layers: 72 };
+
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
+    /// Muse Spark: experts see the 4096-wide `pre_expert_proj` stream (not the
+    /// 8192 residual); 62 routed layers, sigmoid top-8, each expert's output
+    /// RMS-normalized before its routing weight.
+    pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -236,7 +322,9 @@ impl ExpertGeometry {
     pub fn compact_wire_bytes(&self, capacity: u32, bf16: bool) -> Option<(usize, usize)> {
         let rows = capacity as usize;
         let hidden = self.hidden as usize;
-        let request = rows.checked_mul(40 + self.topk as usize * 12 + if bf16 { hidden * 2 } else { hidden + hidden / 32 })?.checked_add(96)?;
+        let prefix = expert_request_payload_offset(96, rows.checked_mul(40)?,
+            rows.checked_mul(self.topk as usize)?.checked_mul(12)?)?;
+        let request = prefix.checked_add(rows.checked_mul(if bf16 { hidden * 2 } else { hidden + hidden / 32 })?)?;
         let response = rows.checked_mul(4 + hidden * 2)?.checked_add(96)?;
         Some((request, response))
     }
@@ -280,19 +368,34 @@ impl ExpertGeometry {
             (Self::QWEN4, "qwen4"),
             (Self::STEP5, "step5"),
             (Self::KIMI_K3, "kimik3"),
+            (Self::MUSE_SPARK, "muse"),
+            (Self::MISTRAL_LARGE4, "ml4"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
+    /// Whether this geometry's Spark replies are per-expert partials
+    /// (`EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES`: a per-expert output norm the
+    /// coordinator applies), not the weighted top-k sum.
+    pub fn partial_replies(&self) -> bool { self.same_shape(&Self::MUSE_SPARK) }
+
+    /// Upper bound of one rank's partial reply payload at `capacity` rows: every
+    /// routed (row, expert) as a BF16 record (the widest reply format). The
+    /// admitted endpoint carries the exact worst mix; this bounds the frame.
+    pub fn partial_reply_bound(&self, capacity: u32) -> Option<usize> {
+        self.partial_replies().then(|| (capacity as usize).checked_mul(self.topk as usize)?
+            .checked_mul(self.hidden as usize * 2)).flatten()
+    }
+
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo
-    /// and Qwen 3.8 Flash Next are unclamped (`None`).
+    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
+    /// Qwen 3.8 Flash Next Kimi K3, Muse Spark and Mistral Large 4 are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3)).then_some(10.0)
+            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK) && !self.same_shape(&Self::MISTRAL_LARGE4)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
@@ -317,6 +420,11 @@ impl ExpertGeometry {
     }
 }
 
+/// Every EXL3 package's capacity ladder (native/cmake/shared/exl3.cmake):
+/// decode and verify (1/16/80), tails (256/1024), and the prefill wave units
+/// (2048/2752/4096: an 8192-row reserve split into 4/3/2 waves, #762).
+pub const EXL3_CAPACITIES: [u32; 8] = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
+
 /// Capacity selects the compiled reduction geometry, never the live row count.
 /// GLM Flash and Kimi use K64 at m1/m80; m16 uses K128 and causes drift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -340,14 +448,14 @@ impl Exl3RowPolicy {
 
     /// Shared by loader admission, artifact preload and runtime dispatch.
     pub fn capacities(self, max_live_rows: usize) -> Result<Vec<u32>, crate::serving_capacity::CapacityError> {
-        const CAPACITIES: [u32; 6] = [1, 16, 80, 256, 1024, 4096];
+        let capacities = EXL3_CAPACITIES;
         if !(1..=4096).contains(&max_live_rows) {
             return Err(crate::serving_capacity::CapacityError::Invalid("EXL3 live capacity must be 1..4096"));
         }
         // Keep a canonical-reduction decode export available even at narrow admission.
         let required = max_live_rows.max(if max_live_rows > 1 { 80 } else { 1 });
-        let maximum = CAPACITIES.into_iter().find(|&c| c as usize >= required).unwrap();
-        Ok(CAPACITIES.into_iter().filter(|&c| c <= maximum
+        let maximum = capacities.into_iter().find(|&c| c as usize >= required).unwrap();
+        Ok(capacities.into_iter().filter(|&c| c <= maximum
             && (self != Self::GlmFlashK64 || c != 16)).collect())
     }
 }
@@ -371,12 +479,129 @@ pub fn expert_geometry() -> ExpertGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execution_workspace_charges_scratch_once_and_retains_every_route_stage() {
+        use super::*;
+        let decode = SparkOwnerWorkspace { scratch_bytes: 7, io_bytes: 11,
+            pinned_staging_bytes: 13, buffered_units: 1 };
+        let prefill = SparkOwnerWorkspace { scratch_bytes: 101, io_bytes: 103,
+            pinned_staging_bytes: 107, buffered_units: 3 };
+        let bytes = spark_owner_workspace_bytes([decode, decode, prefill]).unwrap();
+        assert_eq!(bytes.device_bytes, 2 * (7 + 11) + 101 + 103);
+        assert_eq!(bytes.pinned_bytes, 2 * 13 + 3 * 107);
+        assert_eq!(bytes.total(), Some(bytes.device_bytes + bytes.pinned_bytes));
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 0, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { buffered_units: 5, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { scratch_bytes: u64::MAX, ..decode }]).is_none());
+        assert!(spark_owner_workspace_bytes([SparkOwnerWorkspace { pinned_staging_bytes: u64::MAX,
+            buffered_units: 3, ..decode }]).is_none());
+    }
+
     use super::*;
+
+    #[test]
+    fn odd_request_capacity_charges_padding_before_ring_alignment() {
+        for geometry in [ExpertGeometry::MIMO_V2_FLASH, ExpertGeometry::DEEPSEEK_V41,
+            ExpertGeometry::GLM5, ExpertGeometry::KIMI_K3] {
+            for rows in [1u32, 3, 2487, 2752] {
+                for bf16 in [false, true] {
+                    let n = rows as usize;
+                    let raw_prefix = 96 + n * (40 + geometry.topk as usize * 12);
+                    let padding = (16 - raw_prefix % 16) % 16;
+                    let (request, response) = geometry.compact_wire_bytes(rows, bf16).unwrap();
+                    let stride = if bf16 { geometry.hidden as usize * 2 }
+                        else { geometry.hidden as usize * 33 / 32 };
+                    assert_eq!(request, raw_prefix + padding + n * stride);
+                    // Alignment=1 exposes the exact padding charge, not just page rounding.
+                    assert_eq!(geometry.compact_ring_bytes(rows, 64 << 20, 3, 1, 1, 2, bf16),
+                        Some((request + response) * 3 * 2));
+                    let page = |bytes: usize| (bytes + 4095) / 4096 * 4096;
+                    assert_eq!(geometry.compact_ring_bytes(rows, 64 << 20, 3, 1, 4096, 2, bf16),
+                        Some((page(request) + page(response)) * 3 * 2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
+        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None, partial_reply_bytes: None };
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        assert_eq!(endpoint.resolved_rings(rings), Some(rings));
+        let default_bytes = endpoint.ring_bytes(geometry, rings).unwrap();
+        for depth in 1..=8 {
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert_eq!(endpoint.resolved_rings(rings), Some(SparkRings { depth, ..rings }));
+            assert_eq!(endpoint.ring_bytes(geometry, rings), Some(default_bytes / 8 * depth));
+        }
+        for depth in [0, 9, usize::MAX] {
+            assert!(endpoint.resolved_rings(SparkRings { depth, ..rings }).is_none());
+            let endpoint = SparkEndpoint { ring_depth: Some(depth), ..endpoint };
+            assert!(endpoint.resolved_rings(rings).is_none());
+            assert!(endpoint.ring_bytes(geometry, rings).is_none());
+        }
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert!(serialized.get("ring_depth").is_none());
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+        let endpoint = SparkEndpoint { ring_depth: Some(2), ..endpoint };
+        let serialized = serde_json::to_value(endpoint).unwrap();
+        assert_eq!(serialized["ring_depth"], 2);
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
+    }
+
+    /// A partial-reply endpoint's response frame is its admitted worst reply
+    /// plus a header, and its own frame budget covers it; every other endpoint
+    /// keeps the compact response and the model budget (serde-identical seal).
+    #[test]
+    fn partial_reply_endpoint_sizes_its_own_frame() {
+        let geometry = ExpertGeometry::MUSE_SPARK;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let plain = SparkEndpoint { capacity: 2752, ingress: SparkIngress::Fp8K32, ring_depth: Some(4),
+            partial_reply_bytes: None };
+        assert_eq!(plain.frame_bytes(geometry, rings), Some(64 << 20));
+        assert!(serde_json::to_value(plain).unwrap().get("partial_reply_bytes").is_none());
+        let reply = 96 << 20;
+        let partial = SparkEndpoint { partial_reply_bytes: Some(reply), ..plain };
+        let (request, response) = partial.wire_bytes(geometry).unwrap();
+        assert_eq!(response, reply as usize + PARTIAL_RESPONSE_HEADER_BYTES);
+        assert_eq!(request, plain.wire_bytes(geometry).unwrap().0);
+        let frame = partial.frame_bytes(geometry, rings).unwrap();
+        assert_eq!(frame, response);
+        let resolved = partial.endpoint_rings(geometry, rings).unwrap();
+        assert_eq!((resolved.max_frame_bytes, resolved.depth), (frame, 4));
+        // Four slots of the worst frame per direction, page aligned.
+        let page = |bytes: usize| bytes.div_ceil(4096) * 4096;
+        assert_eq!(partial.ring_bytes(geometry, rings), Some((page(request.max(8 << 20)) + page(response)) * 4));
+        let encoded = serde_json::to_value(partial).unwrap();
+        assert_eq!(encoded["partial_reply_bytes"], reply);
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(encoded).unwrap(), partial);
+        // A small partial reply never shrinks the model budget.
+        let small = SparkEndpoint { partial_reply_bytes: Some(1 << 20), ..plain };
+        assert_eq!(small.frame_bytes(geometry, rings), Some(64 << 20));
+        assert!(geometry.partial_replies() && !ExpertGeometry::GLM5.partial_replies());
+        assert_eq!(geometry.partial_reply_bound(2752), Some(2752 * 8 * 8192));
+        assert_eq!(ExpertGeometry::KIMI_K3.partial_reply_bound(2752), None);
+    }
+
+    #[test]
+    fn native_endpoint_reserves_bf16_maximum() {
+        for capacity in [1, 80, 2048, 2752, 4096] {
+            let native = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Native, partial_reply_bytes: None };
+            let bf16 = SparkEndpoint { ingress: SparkIngress::Bf16, ..native };
+            let fp8 = SparkEndpoint { ingress: SparkIngress::Fp8K32, ..native };
+            assert_eq!(native.wire_bytes(ExpertGeometry::STEP5), bf16.wire_bytes(ExpertGeometry::STEP5));
+            assert!(native.wire_bytes(ExpertGeometry::STEP5).unwrap().0 > fp8.wire_bytes(ExpertGeometry::STEP5).unwrap().0);
+            let encoded = serde_json::to_value(native).unwrap();
+            assert_eq!(serde_json::from_value::<SparkEndpoint>(encoded).unwrap(), native);
+        }
+    }
 
     #[test]
     fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
         for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
-            let endpoint = SparkEndpoint { capacity, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
             assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
                 Some(128 + capacity as usize * 4)
             } else { None });
@@ -395,9 +620,12 @@ mod tests {
             assert_eq!(policy.capacities(rows).unwrap(), [1, 80]);
             assert_eq!(Exl3RowPolicy::Nearest.capacities(rows).unwrap(), [1, 16, 80]);
         }
-        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 4096]);
+        assert_eq!(policy.capacities(4096).unwrap(), [1, 80, 256, 1024, 2048, 2752, 4096]);
+        assert_eq!(Exl3RowPolicy::Nearest.capacities(4096).unwrap(), EXL3_CAPACITIES);
+        assert_eq!(policy.capacities(2048).unwrap(), [1, 80, 256, 1024, 2048]);
+        assert_eq!(policy.capacities(2049).unwrap(), [1, 80, 256, 1024, 2048, 2752]);
         assert_eq!(Exl3RowPolicy::for_geometry(ExpertGeometry::KIMI_K3), policy);
-        let old = [1, 16, 80, 256, 1024, 4096];
+        let old = [1, 16, 80, 256, 1024, 2048, 2752, 4096];
         let new = policy.capacities(4096).unwrap();
         for rows in 1..=4096 {
             let required = policy.required_capacity(rows);
@@ -436,7 +664,13 @@ mod tests {
         assert_eq!(kimi.slice(6), Some(512));
         // Latent rows: BF16 ingress is sized from 3584, not the 7168 residual.
         assert_eq!(kimi.row_bytes(), 7168);
-        assert_eq!(kimi.compact_wire_bytes(1, true), Some((40 + 16 * 12 + 3584 * 2 + 96, 4 + 3584 * 2 + 96)));
+        assert_eq!(kimi.compact_wire_bytes(1, true), Some((336 + 3584 * 2, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
+        let muse = ExpertGeometry::MUSE_SPARK;
+        assert_eq!(muse.family(), Some("muse"));
+        assert_eq!(muse.swiglu_limit(), None);
+        assert_eq!(muse.activation(), crate::FfnActivation::SiluBf16Product { limit: None });
+        // Rows on the wire are the 4096-wide pre-expert stream, not the 8192 residual.
+        assert_eq!(muse.row_bytes(), 8192);
     }
 }

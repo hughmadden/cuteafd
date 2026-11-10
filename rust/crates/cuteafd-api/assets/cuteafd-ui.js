@@ -326,7 +326,7 @@ function heat(el, cells, opts = {}) {
 }
 
 // ---------------------------------------------------------------- fabric chip
-// One chip: "Fabric OK", or the problem by host name. Idle and unproven ports,
+// One chip: "Fabric OK", or the problem by host name. Idle ports,
 // and a Spark's unused second rail being down, are normal and say nothing; only
 // retransmits above the warning rate (yellow), an engine port that is down (red), or an engine
 // link below the host's fastest active port produce words. Details (host names,
@@ -334,7 +334,7 @@ function heat(el, cells, opts = {}) {
 // visible and `opts.live()` holds.
 // Retransmits: go-back-N resends as a share of packets moved (the server's
 // fabric health: one count per gap, packets = bytes ÷ the RoCE MTU). No data
-// is lost. A rate above the server's warning is yellow, and only on a window
+// is lost and results remain valid. A rate above the server's warning is yellow, and only on a window
 // that moved enough to judge; red is only an engine port that is down.
 const JUDGE_MIN_GB = 2;
 // Two significant digits; "<0.0001%" below that.
@@ -370,9 +370,8 @@ function fabricModel(snapshot, now = performance.now() / 1000) {
   const hosts = [], problems = [];
   for (const [key, host] of Object.entries(snapshot.hosts || {})) {
     const name = fabricHost(key, host);
-    const used = new Set((host.engine || []).map((e) => `${e.device}/${e.port}`));
+    const used = new Set((host.engine || []).filter((e) => e.sent_bytes > 0 || e.received_bytes > 0).map((e) => `${e.device}/${e.port}`));
     const ports = host.ports || [];
-    const fastest = Math.max(0, ...ports.filter((p) => /ACTIVE/.test(p.state || '')).map((p) => p.link_gbps || 0));
     const rows = ports.map((p) => {
       const h = p.health_since_start || {};
       const active = /ACTIVE/.test(p.state || ''), engine = used.has(`${p.device}/${p.port}`);
@@ -383,12 +382,12 @@ function fabricModel(snapshot, now = performance.now() / 1000) {
       // The last minute judges once the page has one (and it moved enough); since launch until then.
       const high = window ? window.gb >= JUDGE_MIN_GB && recent > limit : !!h.retransmit_judged && since > limit;
       let issue = null;
-      if (engine && !active) issue = 'down';
+      if (engine && /DOWN/.test(p.state || '')) issue = 'down';
       else if (high) issue = 'retransmits';
-      else if (active && engine && fastest && p.link_gbps && p.link_gbps < fastest) issue = 'slow link';
       if (issue) problems.push({ host: name, issue });
       return { port: `${p.device}/${p.port}`, state: active ? 'up' : (p.state || '').replace(/^\d+:\s*/, '').toLowerCase() || 'unknown',
-        rate: p.link_gbps, recent, since, limit, engine, issue, verdict: h.verdict || 'unknown' };
+        rate: p.link_gbps, recent, since, limit, engine, issue,
+        verdict: issue ? 'warn' : (window ? window.gb >= JUDGE_MIN_GB && recent != null : h.retransmit_judged && since != null) ? 'ok' : h.moved_gb != null && h.moved_gb < JUDGE_MIN_GB ? 'idle' : 'unknown' };
     });
     hosts.push({ name, rows, coordinator: key === 'coordinator' });
   }
@@ -420,18 +419,20 @@ function fabricChip(opts = {}) {
         <td>${r.recent == null ? '<small>…</small>' : pct2(r.recent)}</td><td class="muted">${pct2(r.since)}</td>
         <td>${r.issue ? `<b>${fmt.esc(r.issue)}</b>` : r.engine && r.verdict === 'ok' ? 'ok' : ''}</td></tr>`).join('')).join('') +
       `</tbody></table><p class="note">Retransmits are go-back-N resends as a share of packets moved; no data is lost. A warning above ${pct2(limit)},
-      judged on at least 2 GB; the last 60 s judges once the page has watched that long. Idle, unproven and unused ports are normal.</p>`;
+      judged on at least 2 GB; the last 60 s judges once the page has watched that long. Idle and unused ports are normal. Results remain valid; only throughput may be lower.</p><p class="note">A lossless RoCE class with switch PFC can help; check cabling and link errors too. <a href="https://github.com/tpurtell/cuteafd/blob/work/p0/docs/host-tuning.md#lossless-roce-and-results" target="_blank" rel="noopener">Lossless RoCE guide</a> (<a href="https://github.com/tpurtell/cuteafd/pull/759" target="_blank" rel="noopener">#759</a>).</p>`;
   }
   function show() {
     if (!model || !model.hosts.length) { chip.hidden = true; return; }
     chip.hidden = false;
     const p = model.problems;
-    let cls = 'ok', label = 'Fabric OK';
+    const rows = model.hosts.flatMap((h) => h.rows);
+    let cls = rows.some((r) => r.verdict === 'ok') ? 'ok' : 'unknown';
+    let label = cls === 'ok' ? 'Fabric OK' : rows.every((r) => r.verdict === 'idle') ? 'Fabric Idle' : 'Fabric: telemetry unavailable';
     if (p.length) {
       const hosts = [...new Set(p.map((x) => x.host))], kinds = [...new Set(p.map((x) => x.issue))];
-      // Red only for an engine port that is down; retransmits and slow links are warnings.
+      // Red only for an engine port that is down; only excessive retransmits are warnings.
       cls = p.some((x) => x.issue === 'down') ? 'bad' : 'warn';
-      const words = { down: 'port down', retransmits: 'retransmits', 'slow link': 'slow link' };
+      const words = { down: 'port down', retransmits: 'retransmits' };
       label = hosts.length === 1 && kinds.length === 1 ? `Fabric: ${words[kinds[0]] || kinds[0]} on ${hosts[0]}` : `Fabric: ${p.length} port${p.length === 1 ? '' : 's'} degraded`;
     }
     chip.className = 'fabric-chip ' + cls; text.textContent = label;

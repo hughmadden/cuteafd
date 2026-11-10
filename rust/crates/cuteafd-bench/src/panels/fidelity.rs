@@ -14,9 +14,8 @@ pub static FULL: FidelityPanel = FidelityPanel { full: true };
 pub struct FidelityPanel { full: bool }
 
 pub fn prefill_unavailable(info: &ServerInfo) -> Option<String> {
-    // V4.1's native sparse scorer admits selected prefill rows without an all-row workspace switch.
-    let admitted = info.family.as_deref() == Some("deepseek_v41")
-        || crate::fidelity_dataset::prefill_admitted(&info.configuration.settings);
+    let admitted = crate::fidelity_dataset::full_prefill_logits(info.family.as_deref(),
+        crate::fidelity_dataset::prefill_admitted(&info.configuration.settings));
     (!admitted).then(|| "Prefill scoring not admitted at launch; restart with FULL_PREFILL_LOGITS=on (--full-prefill-logits).".into())
 }
 
@@ -32,11 +31,12 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
         media_root: std::env::var_os("CUTEAFD_FIDELITY_MEDIA_ROOT").map(PathBuf::from),
         dataset: None, dataset_revision: None, dataset_config: None, dataset_cache: None,
         rows: None, dump_dir: Some(scratch.path().to_path_buf()), score_path: path.into(),
-        verify_rows: None, api_key: None };
+        verify_rows: Vec::new(), api_key: None, api_key_file: None };
     let mut model_record = client.model_record()?;
     model_record["max_context"] = json!(max_context);
     model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
     model_record["snapshot"] = json!(info.configuration.snapshot);
+    model_record["settings"] = json!(info.configuration.settings);
     let checkpoint = info.checkpoint();
     // The checkpoint, not an aliased served name, binds the reference and history.
     run_with(&args, &checkpoint, &model_record, |request| {

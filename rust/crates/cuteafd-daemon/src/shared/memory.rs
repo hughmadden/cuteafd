@@ -13,15 +13,41 @@ pub(crate) use download::RowDownload;
 pub(crate) mod device;
 #[path = "memory/staging.rs"]
 pub(crate) mod staging;
+#[path = "memory/staging_check.rs"]
+pub(crate) mod staging_check;
 #[path = "memory/peer_publication.rs"]
 pub(crate) mod peer_publication;
 #[path = "memory/proposal_replica.rs"]
 pub(crate) mod proposal_replica;
 #[path = "memory/chain.rs"]
 pub(crate) mod chain;
+#[path = "memory/row_window.rs"]
+pub(crate) mod row_window;
 
 #[path = "memory/budget.rs"]
 pub(crate) mod budget;
+#[path = "memory/load_timing.rs"]
+pub(crate) mod load_timing;
+#[path = "memory/push_coordinator.rs"]
+pub(crate) mod push_coordinator;
+#[path = "memory/weight_arena.rs"]
+pub(crate) mod weight_arena;
+#[path = "memory/weight_validation.rs"]
+pub(crate) mod weight_validation;
+#[path = "memory/weight_views.rs"]
+pub(crate) mod weight_views;
+#[path = "memory/push_consumer.rs"]
+pub(crate) mod push_consumer;
+#[path = "memory/push_initialize.rs"]
+pub(crate) mod push_initialize;
+#[path = "memory/push_exl3.rs"]
+pub(crate) mod push_exl3;
+#[path = "memory/push_exlr8.rs"]
+pub(crate) mod push_exlr8;
+#[path = "memory/push_fp8.rs"]
+pub(crate) mod push_fp8;
+#[path = "memory/push_native.rs"]
+pub(crate) mod push_native;
 
 pub(crate) struct DeviceAllocation<'a> {
     pub(crate) library: &'a NativeLibrary,
@@ -139,10 +165,9 @@ impl<'a> ResidentWeight<'a> {
     }
 }
 
-/// Pinned staging with one region per layer while V4.1 passes may run
-/// device-ordered (`chain::device_enabled`), else one region: each layer's
-/// queued uploads then read their own bytes, so the host can queue later
-/// layers before earlier uploads ran (no staging fence).
+/// Pinned staging with one region per layer: V4.1 passes run device-ordered,
+/// so each layer's queued uploads read their own bytes and the host can queue
+/// later layers before earlier uploads ran (no staging fence).
 pub(crate) struct LayerStaging<'a> {
     allocation: HostAllocation<'a>,
     region: usize,
@@ -150,7 +175,7 @@ pub(crate) struct LayerStaging<'a> {
 }
 impl<'a> LayerStaging<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, region: usize, layers: usize) -> Result<Self> {
-        let regions = if chain::device_enabled() { layers.max(1) } else { 1 };
+        let regions = layers.max(1);
         Ok(Self { allocation: HostAllocation::new(library, region.max(1) * regions)?, region: region.max(1), regions })
     }
     /// Layer `layer`'s region: its host buffer and bytes.
@@ -165,6 +190,68 @@ impl<'a> LayerStaging<'a> {
     }
     pub(crate) fn region_bytes(&self) -> usize { self.region }
 }
+/// A per-step host wait for a stream's queued work (the sampling sync, a
+/// draft round): under `--host-wait block` it polls one blocking-sync event
+/// per device, recorded on the stream, for `BLOCK_SPIN`, then sleeps on it;
+/// under `spin` it is a
+/// stream synchronize, which the context's default scheduling spins.
+pub(crate) struct BlockingWait<'a> {
+    library: &'a NativeLibrary,
+    events: Vec<(i32, *mut std::ffi::c_void)>,
+}
+
+impl<'a> BlockingWait<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary) -> Self { Self { library, events: Vec::new() } }
+
+    /// Waits until everything queued on `stream` so far has completed.
+    ///
+    /// # Safety
+    /// `stream` is live until this wait completes (its device need not be current).
+    pub(crate) unsafe fn wait(&mut self, stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: forwarded from this function's contract.
+        let device = unsafe { self.library.cuda_stream_device(stream)? };
+        let _device = device::Device { library: self.library, id: device }.enter()?;
+        if cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Spin {
+            // SAFETY: forwarded from this function's contract.
+            return unsafe { self.library.cuda_stream_synchronize(stream) };
+        }
+        let event = match self.events.iter().find(|(owner, _)| *owner == device) {
+            Some(&(_, event)) => event,
+            None => {
+                let event = self.library.cuda_event_create_blocking()?;
+                self.events.push((device, event));
+                event
+            }
+        };
+        // SAFETY: the event belongs to the current device, as does `stream`
+        // (the caller's contract); it lives until this wait drops. Polls it
+        // for the first `BLOCK_SPIN` (10 ms: every per-layer decode wait
+        // completes within that, and the wake-up of a blocking sync would be
+        // on the critical path), then sleeps in the driver.
+        unsafe {
+            self.library.cuda_event_record(event, stream)?;
+            if cuteafd_transport::wait_policy::spin_window(|| self.library.cuda_event_query(event))? { return Ok(()); }
+            self.library.cuda_event_synchronize(event)
+        }
+    }
+}
+
+impl Drop for BlockingWait<'_> {
+    fn drop(&mut self) {
+        for &(device, event) in &self.events {
+            let previous = self.library.cuda_get_device();
+            let _ = self.library.cuda_set_device(device);
+            // SAFETY: created by this wait on `device`; synchronizing retires
+            // its last record before the event is destroyed.
+            unsafe {
+                let _ = self.library.cuda_event_synchronize(event);
+                let _ = self.library.cuda_event_destroy(event);
+            }
+            if let Ok(previous) = previous { let _ = self.library.cuda_set_device(previous); }
+        }
+    }
+}
+
 pub(crate) struct LoadStream<'a> {
     pub(crate) library: &'a NativeLibrary,
     pub(crate) raw: *mut c_void,
@@ -202,6 +289,9 @@ impl LoadStream<'_> {
         while !unsafe { self.library.cuda_stream_query(self.raw)? } {
             tokio::task::yield_now().await;
         }
+        // A completed wait is progress: the host-wait pacing around the
+        // caller's loop restarts its spin (`wait_policy::Backoff`).
+        cuteafd_transport::wait_policy::note_active();
         guard.complete = true;
         Ok(())
     }
@@ -277,5 +367,31 @@ mod load_stream_lifetime_tests {
                 "failed drain must abort before its stream destroy, pinned/device free or module unload");
         }
         Ok(())
+    }
+}
+
+/// Test support for fake SparkNest push sources.
+#[cfg(test)]
+pub(crate) mod push_testing {
+    /// A fake SparkNest's `accept`, bounded: a rank that never connects fails the
+    /// test after `timeout` with a clear error instead of hanging (Listener has no
+    /// accept timeout; a waker connects at the deadline).
+    pub(crate) fn accept_within(listener: &cuteafd_loader::push_load::Listener, socket: &str, timeout: std::time::Duration)
+        -> anyhow::Result<cuteafd_loader::push_load::Conn> {
+        let (accepted, watch) = std::sync::mpsc::channel::<()>();
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (path, flag) = (socket.to_string(), fired.clone());
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(timeout).is_err() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                let _ = cuteafd_loader::push_load::Conn::connect(&path);
+            }
+        });
+        let conn = listener.accept();
+        let _ = accepted.send(());
+        let _ = watchdog.join();
+        anyhow::ensure!(!fired.load(std::sync::atomic::Ordering::SeqCst),
+            "fake SparkNest: no rank connected to {socket} within {} s", timeout.as_secs());
+        Ok(conn?)
     }
 }

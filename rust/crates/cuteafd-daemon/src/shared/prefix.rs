@@ -8,6 +8,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 pub(crate) mod budget;
 pub(crate) use budget::HostBudget;
 pub(crate) mod cuda_copy;
+pub(crate) mod copy_stream;
+pub(crate) use copy_stream::{PrefixCopies, Reader};
 pub(crate) use cuda_copy::CudaCopyEngine;
 
 /// The prefix cache's knobs.
@@ -19,7 +21,7 @@ pub(crate) struct PrefixArgs {
     #[arg(skip)]
     pub scoring_host_bytes: u64,
     /// Device snapshots per bank; the host tier is limited only by --host-cache-bytes.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = cuteafd_core::concurrency::AUTO_ENTRIES)]
     pub prefix_cache_entries: usize,
     /// Device mark budget in MiB. With host retention, two staging marks are reserved;
     /// host-off retains the legacy entry/budget count with two per decoding sequence plus two.
@@ -58,6 +60,9 @@ pub(crate) struct PrefixArgs {
     /// state). Off: exact snapshot frontiers only. GLM 5.3 Flash has none (recurrent state).
     #[arg(long, env = "CUTEAFD_PREFIX_PARTIAL", value_enum, default_value_t = Toggle::Off)]
     pub prefix_partial: Toggle,
+    /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
+    #[command(flatten)]
+    pub reserve: crate::shared::kv_reserve::ReserveArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -79,7 +84,7 @@ pub struct MarkRule {
 impl MarkRule {
     /// Slots of the arena for marks of `mark_bytes` (every rank's part): what the runtime
     /// allocates (`MarkArena::slots_for`) and what its planner reserves
-    /// ([`cuteafd_core::prefix::mark_slots_for`]). The budget holds whole marks, so the count
+    /// ([`cuteafd_core::prefix::mark_slots_with_host`]). The budget holds whole marks, so the count
     /// depends on the exact mark bytes: size both sides from the same mark.
     pub fn slots(self, mark_bytes: usize) -> usize {
         cuteafd_core::prefix::mark_slots_with_host(self.lanes as u64, self.entries as u64, mark_bytes as u64,
@@ -88,6 +93,12 @@ impl MarkRule {
 }
 
 impl PrefixArgs {
+    pub fn resolve_entries(&mut self, concurrency: usize) {
+        if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES {
+            self.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(concurrency as u64) as usize;
+        }
+    }
+
     pub fn with_scoring(&self, rows: usize, lane_rows: usize, vocab: usize) -> Result<Self> {
         let mut args = self.clone();
         args.scoring_host_bytes = cuteafd_core::memory_layout::host_logits_bytes(rows as u64, lane_rows as u64, vocab as u64)
@@ -97,7 +108,7 @@ impl PrefixArgs {
 
     /// The device mark arena's knobs for `lanes` decoding sequences.
     pub fn mark_rule(&self, lanes: usize) -> MarkRule {
-        MarkRule { lanes, entries: self.prefix_cache_entries,
+        MarkRule { lanes, entries: if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES { cuteafd_core::concurrency::prefix_entries(lanes as u64) as usize } else { self.prefix_cache_entries },
             budget_bytes: (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20), host: self.host_cache_bytes.enabled() }
     }
 
@@ -123,10 +134,22 @@ impl PrefixArgs {
         Ok((prefix, usize::try_from(bytes)?))
     }
 
-    /// Resolve the host quota once, before pinned allocation. Call only when
-    /// this family's copy engine can restore every rank's snapshot exactly.
-    /// Host prefix bytes are not active device KV capacity.
+    /// Resolve and admit a host quota when no other future host consumers need
+    /// joint admission. Call only when this family's copy engine restores every
+    /// rank exactly; these bytes are not active device KV capacity.
     pub fn host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
+        -> Result<Option<cuteafd_hostcache::config::Config>> {
+        let config = self.resolve_host_config(layout, max_context, concurrency)?;
+        if let Some(config) = &config {
+            budget::admit(config.bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
+        }
+        Ok(config)
+    }
+
+    /// Resolve and validate the host quota without admission or allocation.
+    /// Pass the returned quota alongside every future table to one complete
+    /// `memory::budget::admit_host_memory` call, then retain this exact config.
+    pub fn resolve_host_config(&self, layout: FamilyLayout, max_context: usize, concurrency: usize)
         -> Result<Option<cuteafd_hostcache::config::Config>> {
         if self.prefix_cache_entries == 0 || !self.host_cache_bytes.enabled() {
             return Ok(None);
@@ -147,7 +170,6 @@ impl PrefixArgs {
         };
         anyhow::ensure!(bytes > 0,
             "host prefix quota resolves to zero; provide a positive quota or disable it explicitly for device retention");
-        budget::admit(bytes, self.scoring_host_bytes, self.host_cache_headroom_bytes)?;
         let config = cuteafd_hostcache::config::Config {
             bytes,
             eviction_headroom: budget::eviction_headroom(layout, self.host_cache_evict_tokens)?,
@@ -180,14 +202,9 @@ impl PrefixArgs {
     }
 }
 
-/// Ids of the `markers` (message-start tokens such as `<|user|>`) that `tokenizer.json`'s added
-/// tokens define, for intermediate snapshot points at message boundaries.
+/// Explicit added-token message boundaries from the checkpoint's native tokenizer.
 pub(crate) fn marker_ids(snapshot: &std::path::Path, markers: &[&str]) -> Result<Vec<u32>> {
-    let text = std::fs::read_to_string(snapshot.join("tokenizer.json"))?;
-    let tokenizer: serde_json::Value = serde_json::from_str(&text)?;
-    let added = tokenizer["added_tokens"].as_array().map_or(&[][..], Vec::as_slice);
-    Ok(markers.iter().filter_map(|marker| added.iter().find(|t| t["content"] == *marker)
-        .and_then(|t| t["id"].as_u64()).map(|id| id as u32)).collect())
+    Ok(cuteafd_loader::cached_tokenizer(snapshot)?.added_token_ids(markers))
 }
 
 /// Positions of any of `markers` in `tokens` (message boundaries, in order).
@@ -236,6 +253,27 @@ mod tests {
     }
 
     #[test]
+    fn runtime_mark_rule_matches_shared_planner_and_arena_with_or_without_host() {
+        for host in ["0", "auto", "32GiB"] {
+            for entries in [0, 1, 20] {
+                let cli = Cli::parse_from(["serve", "--host-cache-bytes", host,
+                    "--prefix-cache-entries", &entries.to_string()]);
+                for lanes in [1, 16, 64] {
+                    // Paged MLA (no positional mark), dense/recurrent state, and SWA marks.
+                    for bytes in [0, 37_500_000, 147_619_840, 256 << 20] {
+                        let rule = cli.prefix.mark_rule(lanes);
+                        let planned = cuteafd_core::prefix::mark_slots_with_host(lanes as u64, entries,
+                            bytes as u64, rule.budget_bytes, host != "0") as usize;
+                        let arena = cuteafd_engine::prefix::MarkArena::slots_for(lanes, entries as usize, bytes,
+                            rule.budget_bytes as usize, host != "0");
+                        assert_eq!((rule.slots(bytes), arena), (planned, planned));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mimo_prefix_marks_help_links_experimental_qualification() {
         use clap::CommandFactory;
         let help = Cli::command().render_long_help().to_string();
@@ -261,8 +299,104 @@ mod tests {
     }
 
     #[test]
+    fn every_media_cache_capability_matches_admitted_plan_and_runtime() -> Result<()> {
+        use cuteafd_loader::plan::{self, encoder::EncoderKind, family, layout::LayoutOptions,
+            testing, ExpertPlacement, Family, MediaMode, PlanOptions};
+        use anyhow::Context;
+        use serde_json::json;
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "0"]).prefix;
+        let memory = budget::HostMemory { total: 256 << 30, available: 256 << 30 };
+        let mut covered = std::collections::BTreeSet::new();
+        for adapter in family::registry().iter().filter(|family| family.media_cache_headroom()) {
+            let dir = tempfile::tempdir()?;
+            let mut options = LayoutOptions { host_memory: Some((memory.total, memory.available)),
+                host_cache_bytes: Some(0), pool_tokens: Some(32768), target_pool_tokens: 32768,
+                ..Default::default() };
+            let mut placement = ExpertPlacement::Local;
+            match adapter.id() {
+                "mimo_v2" => {
+                    let mut config = testing::mimo_flash_config();
+                    config["vision_config"] = json!({"depth":28,"hidden_size":1280,"intermediate_size":4608,
+                        "num_heads":32,"num_key_value_heads":8,"out_hidden_size":4096,"patch_size":16,
+                        "temporal_patch_size":2,"spatial_merge_size":2,"hidden_act":"silu"});
+                    let mut tensors = testing::mimo_flash_tensors();
+                    tensors.push(testing::t("visual.patch_embed.proj.weight", "BF16", &[1280,3,2,16,16]));
+                    testing::write_snapshot(dir.path(), &config, &tensors, None);
+                    let package = dir.path().join("mimo-experts.json");
+                    std::fs::write(&package, serde_json::to_vec(&json!({"layouts":{"tp1":{
+                        "input":"bf16", "tp":1, "hidden":4096, "experts":256,
+                        "top_k":8, "intermediate":2048, "slice":2048, "weights":"fp8",
+                        "capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
+                    }}}))?)?;
+                    options.mimo_expert_manifest = Some(package);
+                }
+                "qwen4" => {
+                    let mut config = testing::qwen4_config(1);
+                    config["vision_config"] = json!({"depth":27,"hidden_size":1152,"intermediate_size":4304,
+                        "num_heads":16,"num_position_embeddings":2304,"out_hidden_size":2560,
+                        "patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2,
+                        "hidden_act":"gelu_pytorch_tanh","deepstack_visual_indexes":[]});
+                    let tensors = [testing::t("model.visual.patch_embed.proj.weight", "BF16", &[1152,3,2,16,16]),
+                        testing::t("model.visual.patch_embed.proj.bias", "BF16", &[1152]),
+                        testing::t("model.visual.blocks.0.norm1.weight", "BF16", &[1152]),
+                        testing::t("model.visual.blocks.0.norm1.bias", "BF16", &[1152])];
+                    testing::write_snapshot(dir.path(), &config, &tensors, None);
+                }
+                "glm5_flash" => {
+                    let mut config = testing::glm5_flash_config(2);
+                    config["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+                        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+                        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+                        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+                    let tensors = testing::glm5_flash_vision_tensors();
+                    testing::write_snapshot(dir.path(), &config, &tensors, Some(4));
+                }
+                "muse_spark" => {
+                    testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+                    let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
+                    let programs = crate::families::muse_spark::programs::required(2)?.into_iter()
+                        .map(|(name, _)| name)
+                        .chain([crate::families::muse_spark::programs::ROPE_TABLES.to_string()])
+                        .map(|name| json!({"name":name,"capacity_rows":4096})).collect::<Vec<_>>();
+                    std::fs::write(&path, serde_json::to_vec(&json!({"schema":1,"programs":programs}))?)?;
+                    options.workspace_manifest = Some(path);
+                    options.rtx_bytes = vec![cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES; 2];
+                    options.head_split = true;
+                    placement = ExpertPlacement::from_spark_ranks(6);
+                }
+                id => panic!("add an admitted media fixture for capability-enabled family {id}"),
+            }
+            let input = testing::BudgetedPlanInput::open(dir.path())?;
+            assert_eq!(family::detect(input.checkpoint()).unwrap().id(), adapter.id());
+            for quota in [None, Some(0), Some(123_456_789)] {
+                options.media_cache_bytes = quota;
+                for vision in [MediaMode::Rtx(Some(0)), MediaMode::Off] {
+                    let report = input.plan(&PlanOptions { placement, vision, audio: MediaMode::Off,
+                        layout: Some(options.clone()), ..Default::default() })?;
+                    let admitted = report.encoder.as_ref().context("admitted encoder record")?;
+                    assert_eq!(admitted.kind != EncoderKind::Off, vision != MediaMode::Off,
+                        "{}: {:?}", adapter.id(), report.hints);
+                    let runtime = if admitted.kind == EncoderKind::Off { 0 } else {
+                        let (_, bytes) = prefix.media_headroom(quota, memory)?;
+                        assert_eq!(cuteafd_engine::media::EmbeddingCache::new(bytes).capacity(), bytes);
+                        bytes as u64
+                    };
+                    let planned = report.host_ledger.as_ref().context("host media ledger")?.items.iter()
+                        .filter(|item| item.group == "media/embedding-cache").map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(planned, runtime, "{}: vision={vision:?}, quota={quota:?}", adapter.id());
+                }
+            }
+            covered.insert(adapter.id());
+        }
+        assert_eq!(covered, std::collections::BTreeSet::from(["glm5_flash", "mimo_v2", "muse_spark", "qwen4"]));
+        assert!(!plan::families::deepseek::DEEPSEEK_V41.media_cache_headroom());
+        Ok(())
+    }
+
+    #[test]
     fn prefix_knobs_default_on_with_the_host_tier_off() {
-        let cli = Cli::parse_from(["serve"]);
+        let mut cli = Cli::parse_from(["serve"]);
+        cli.prefix.resolve_entries(16);
         assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, HostBudget::Bytes(0)));
         assert_eq!(cli.prefix.host_cache_evict_tokens, 16 * 1024);
         assert_eq!(Cli::parse_from(["serve", "--host-cache-evict-tokens", "0"]).prefix.host_cache_evict_tokens, 0);
@@ -279,6 +413,24 @@ mod tests {
         assert_eq!(parse_bytes("123"), Ok(123));
         assert!(parse_bytes("12 parsecs").is_err() && parse_bytes("-1").is_err());
         assert!(parse_bytes("NaN").is_err() && parse_bytes("inf").is_err());
+    }
+
+    #[test]
+    fn resolve_host_config_defers_admission_but_still_validates_geometry() {
+        let prefix = Cli::parse_from(["serve", "--host-cache-bytes", "1MiB"]).prefix;
+        let layout = FamilyLayout { page_rows: 64, pages: 1024, page_bytes: 65536, mark_bytes: 4096,
+            draft_bytes: 0, rule: cuteafd_core::prefix::ReuseRule::EXACT,
+            mark_store: Default::default(), page_owners: Default::default() };
+        let mut impossible = prefix.clone();
+        impossible.scoring_host_bytes = u64::MAX;
+        let config = impossible.resolve_host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!((config.bytes, config.max_tokens), (1 << 20, 32768));
+        assert!(impossible.host_config(layout, 32768, 1).is_err());
+        let admitted = prefix.host_config(layout, 32768, 1).unwrap().unwrap();
+        assert_eq!(config, admitted);
+        assert!(impossible.resolve_host_config(layout, 0, 1).is_err());
+        impossible.prefix_cache_entries = 0;
+        assert!(impossible.resolve_host_config(layout, 0, 1).unwrap().is_none());
     }
 
     #[test]

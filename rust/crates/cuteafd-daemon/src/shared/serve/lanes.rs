@@ -32,14 +32,77 @@ impl LaneSet {
         LaneLease { index, stop: &self.stop }
     }
 
+    /// Construct each lane's owners with the same identities used by `run`.
+    pub fn try_map<T>(&self, mut setup: impl FnMut(LaneLease<'_>) -> Result<T>) -> Result<[T; 2]> {
+        Ok([setup(self.lease(0))?, setup(self.lease(1))?])
+    }
+
+    /// Run both lane loops with shared failure propagation, without cancelling
+    /// an outstanding device or transport operation.
+    pub async fn run<'s, F, G>(&'s self,
+        first: impl FnOnce(LaneLease<'s>) -> F,
+        second: impl FnOnce(LaneLease<'s>) -> G,
+    ) -> Result<()>
+    where F: Future<Output = Result<()>>, G: Future<Output = Result<()>> {
+        self.join(self.lease(0).run(first(self.lease(0))),
+            self.lease(1).run(second(self.lease(1)))).await
+    }
+
+    /// Run a family's only decode lane (`LaneSupport::One`): lane 0 under the
+    /// same lease, failure stop and host-wait pacing as a pair.
+    pub async fn run_one<'s, T, F>(&'s self, lane: impl FnOnce(LaneLease<'s>) -> F) -> Result<T>
+    where F: Future<Output = Result<T>> {
+        let lease = self.lease(0);
+        paced(std::pin::pin!(lease.run(lane(lease)))).await
+    }
+
     /// Poll two lanes to completion. Neither is cancelled when the other fails;
     /// a failing lane stops its peers at their next boundary ([`LaneLease::run`]).
     /// The first lane's error wins when both fail.
     pub async fn join(&self, first: impl Future<Output = Result<()>>, second: impl Future<Output = Result<()>>)
         -> Result<()> {
-        let (first, second) = tokio::join!(first, second);
+        let joined = std::pin::pin!(async { tokio::join!(first, second) });
+        let (first, second) = paced(joined).await;
         first.and(second)
     }
+}
+
+/// Lanes wait by yielding (stream queries, reply and commit polls), so the
+/// executor re-polls at once: `--host-wait spin` keeps that; under `block` a
+/// pending stretch spins for its first [`BLOCK_SPIN`] (10 ms: every
+/// per-layer wait ends within it, and they are the critical path), then sleeps
+/// [`BLOCK_SLEEP`] per poll. A poll that completes restarts the spin.
+///
+/// [`BLOCK_SPIN`]: cuteafd_transport::wait_policy::BLOCK_SPIN
+/// [`BLOCK_SLEEP`]: cuteafd_transport::wait_policy::BLOCK_SLEEP
+async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
+    let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
+    std::future::poll_fn(move |context| {
+        // Inner waits yield their pending polls to this pacer, which sleeps
+        // once per pending poll (they only spin while it polls).
+        let poll = { let _paced = cuteafd_transport::wait_policy::Paced::enter(); future.as_mut().poll(context) };
+        if poll.is_pending() { backoff.pause() } else { backoff.reset() }
+        poll
+    }).await
+}
+
+/// Balance a drained request cohort before admission. Preserve the first
+/// survivor migration and lane-zero tie break. Call only after both lanes
+/// release their outstanding device and transport work.
+pub(crate) fn rebalance<T>(entries: &mut [T], lane: impl Fn(&T) -> Option<usize>,
+    set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
+    let mut loads = [0usize; 2];
+    for entry in entries.iter() {
+        if let Some(index) = lane(entry) { loads[index] += 1; }
+    }
+    while loads[0].abs_diff(loads[1]) > 1 {
+        let heavy = usize::from(loads[1] > loads[0]);
+        let Some(entry) = entries.iter_mut().find(|entry| lane(entry) == Some(heavy)) else { break };
+        set_lane(entry, 1 - heavy);
+        loads[heavy] -= 1;
+        loads[1 - heavy] += 1;
+    }
+    loads
 }
 
 impl LaneLease<'_> {
@@ -49,7 +112,7 @@ impl LaneLease<'_> {
     /// Ask every lane of the set to return at its next completed boundary.
     pub fn stop(&self) { self.stop.set(true); }
     /// Run this lane's loop; an error stops the peers.
-    pub async fn run(self, lane: impl Future<Output = Result<()>>) -> Result<()> {
+    pub async fn run<T>(self, lane: impl Future<Output = Result<T>>) -> Result<T> {
         let result = lane.await;
         if result.is_err() { self.stop(); }
         result
@@ -111,14 +174,75 @@ mod tests {
     }
 
     #[test]
+    fn owner_setup_and_execution_share_lane_identities() -> Result<()> {
+        let set = LaneSet::default();
+        let identities = set.try_map(|lease| Ok(lease.index()))?;
+        let ran = RefCell::new(Vec::new());
+        block_on(set.run(
+            |lease| record(&ran, lease.index(), false),
+            |lease| record(&ran, lease.index(), false),
+        ))?;
+        assert_eq!(identities, [0, 1]);
+        assert_eq!(*ran.borrow(), identities);
+        let mut attempted = Vec::new();
+        assert!(set.try_map::<()>(|lease| {
+            attempted.push(lease.index());
+            anyhow::bail!("setup failed")
+        }).is_err());
+        assert_eq!(attempted, [0]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_single_lane_runs_as_lane_zero_and_a_failure_stops_the_set() {
+        let set = LaneSet::default();
+        let value = block_on(set.run_one(|lease| async move {
+            for _ in 0..3 { tokio::task::yield_now().await; }
+            Ok((lease.index(), lease.stopping()))
+        })).unwrap();
+        assert_eq!(value, (0, false));
+        assert!(!set.lease(0).stopping());
+        let error = block_on(set.run_one(failing_one)).unwrap_err();
+        assert_eq!(error.to_string(), "single lane failed");
+        assert!(set.lease(0).stopping());
+    }
+    async fn failing_one(lease: LaneLease<'_>) -> Result<()> {
+        anyhow::ensure!(lease.index() != 0, "single lane failed");
+        Ok(())
+    }
+
+    #[test]
     fn a_failing_lane_stops_its_peer_at_a_boundary_without_cancelling_it() {
         let set = LaneSet::default();
         let (rounds, finished) = (Cell::new(0), Cell::new(false));
-        let error = block_on(set.join(set.lease(0).run(peer(set.lease(0), &rounds, &finished)),
-            set.lease(1).run(failing(set.lease(1))))).unwrap_err();
+        let error = block_on(set.run(|lease| peer(lease, &rounds, &finished), failing)).unwrap_err();
         assert_eq!(error.to_string(), "lane failed");
         // The peer ran to its own boundary and returned; it was not dropped.
         assert!(finished.get() && rounds.get() >= 3);
+    }
+
+    #[test]
+    fn drained_cohorts_migrate_first_survivors_and_keep_balanced_assignments() {
+        for original in [vec![], vec![None], vec![Some(0); 8], vec![Some(1); 7],
+            vec![Some(0), None, Some(1), Some(0)]] {
+            let mut expected = original.clone();
+            let mut loads = [0usize; 2];
+            for index in expected.iter().flatten() { loads[*index] += 1; }
+            while loads[0].abs_diff(loads[1]) > 1 {
+                let heavy = usize::from(loads[1] > loads[0]);
+                *expected.iter_mut().flatten().find(|index| **index == heavy).unwrap() = 1 - heavy;
+                loads[heavy] -= 1;
+                loads[1 - heavy] += 1;
+            }
+            let mut actual = original;
+            assert_eq!(rebalance(&mut actual, |entry| *entry,
+                |entry, index| *entry = Some(index)), loads);
+            assert_eq!(actual, expected);
+            let unchanged = actual.clone();
+            assert_eq!(rebalance(&mut actual, |entry| *entry,
+                |entry, index| *entry = Some(index)), loads);
+            assert_eq!(actual, unchanged);
+        }
     }
 
     async fn record(ran: &RefCell<Vec<usize>>, index: usize, fail: bool) -> Result<()> {

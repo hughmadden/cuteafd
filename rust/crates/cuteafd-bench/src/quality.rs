@@ -106,6 +106,12 @@ fn declared_w4a4(snapshot: &Path) -> bool {
 /// before the run was stored: there is nothing to recompute from.
 fn bar_met(check: &Check) -> Option<bool> {
     let run: crate::fidelity::Run = serde_json::from_value(check.metrics.get("run")?.clone()).ok()?;
+    // Archived flat-era runs did not record a precision tier. Do not invent one
+    // from today's cache or rewrite their published status while re-rendering.
+    run.precision.as_ref()?;
+    // A published report was graded once when it was placed (`publish::slim_placed`)
+    // and its rows dropped: with nothing to re-score, the verdict set then stands.
+    if run.score.records.is_empty() { return None; }
     Some(crate::fidelity::verdict(&run).pass)
 }
 
@@ -177,6 +183,30 @@ mod tests {
     }
 
     #[test]
+    fn failed_nvfp4_tier_verdict_keeps_calibrated_w4a4_info_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = nvfp4_card(tmp.path(), experts("NVFP4"));
+        let panel = crate::sample::full_report();
+        let mut run: crate::fidelity::Run = serde_json::from_value(
+            panel.panel("fidelity").unwrap().latest().unwrap()["decode"].clone()).unwrap();
+        run.precision = Some(crate::fidelity_precision::Precision::new(4.0, "nvfp4", false, "test").unwrap());
+        for p in &mut run.score.records { p.kl = 0.0655; }
+        let verdict = crate::fidelity::verdict(&run);
+        assert!(!verdict.pass);
+        assert!(verdict.reasons.iter().any(|s| s.contains("KL above 3 to <6 bpw tier bar 0.05")));
+        let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut().find(|c| c.id == "fidelity").unwrap();
+        check.set("run", json!(run)); check.set("verdict", json!(verdict));
+        check.set("precision", json!(run.precision));
+        check.status = CheckStatus::Fail;
+        reconcile(&mut report);
+        let check = report.baseline.as_ref().unwrap().quality.check("fidelity").unwrap();
+        assert_eq!(check.status, CheckStatus::Info);
+        assert_eq!(check.note.as_deref(), Some(CALIBRATED_W4A4));
+        assert_eq!(check.metrics["verdict"]["pass"], false);
+        assert!(crate::render::card::card_svg(&report).contains("4.0 bpw"));
+    }
+
+    #[test]
     fn the_bar_still_gates_a_checkpoint_without_w4a4_experts() {
         let tmp = tempfile::tempdir().unwrap();
         let mut report = nvfp4_card(tmp.path(), experts("W4A16_NVFP4"));
@@ -204,6 +234,25 @@ mod tests {
         let html = crate::publish::results(&placed, &crate::publish::one_row_of(&placed[0])).unwrap();
         assert!(!html.contains("FAILED"), "{html}");
         assert!(!crate::publish::index(&placed).contains("quality gate failed"));
+    }
+
+    #[test]
+    fn a_published_report_keeps_the_verdict_set_when_it_was_slimmed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = nvfp4_card(tmp.path(), experts("W4A16_NVFP4"));
+        let panel = crate::sample::full_report();
+        let mut run: crate::fidelity::Run = serde_json::from_value(
+            panel.panel("fidelity").unwrap().latest().unwrap()["decode"].clone()).unwrap();
+        run.precision = Some(crate::fidelity_precision::Precision::new(4.0, "exl3", false, "test").unwrap());
+        assert!(crate::fidelity::verdict(&run).pass);
+        let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut().find(|c| c.id == "fidelity").unwrap();
+        check.set("run", json!(run)); check.status = CheckStatus::Pass;
+        let mut value = serde_json::to_value(&report).unwrap();
+        crate::publish::slim(&mut value);
+        let mut slimmed: Report = serde_json::from_value(value).unwrap();
+        reconcile(&mut slimmed);
+        assert_eq!(slimmed.baseline.as_ref().unwrap().quality.check("fidelity").unwrap().status, CheckStatus::Pass);
+        assert!(!slimmed.quality_failed());
     }
 
     #[test]

@@ -41,7 +41,7 @@
    "set": {
     "ADDR": "0.0.0.0:8732",
     "EXPERT_PORT": "19832",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "0"
    }
   },
@@ -58,7 +58,7 @@
     "ADDR": "0.0.0.0:8737",
     "EXPERT_PORT": "19837",
     "RTX_GPUS": "2",
-    "COORDINATOR_GPU": "0",
+    "COORDINATOR_GPUS": "0,1",
     "SPARK_COUNT": "0",
     "EXPERT_BACKEND": "local"
    }
@@ -111,12 +111,71 @@
     "ostrich",
     "dodo",
     "emu",
-    "kiwi"
+    "kiwi",
+    "rhea",
+    "moa"
    ],
    "set": {
     "ADDR": "0.0.0.0:8701",
     "EXPERT_PORT": "19801",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
+   "name": "v41-flash-ref-tp4",
+   "family": "deepseek_v41",
+   "config": "examples/configs/deepseek-v41-mxfp4-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8745",
+    "EXPERT_PORT": "19845",
     "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
+   "name": "v41-flash-sim5090",
+   "family": "deepseek_v41",
+   "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8748",
+    "EXPERT_PORT": "19848",
+    "RTX_GPUS": "1",
+    "COORDINATOR_GPUS": "0",
+    "COORDINATOR_GPU_BUDGET_GIB": "31.8",
+    "SPARK_INTAKE": "pinned",
+    "MAX_CONTEXT_TOKENS": "1048576",
+    "SPECULATOR": "dspark",
+    "SPARK_COUNT": "4",
+    "SPARK_TP": "4",
+    "SPARK_EP": "1",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
     "SPARK_2_HOST": "emu",
@@ -201,7 +260,7 @@
   {
    "name": "glm53-exl3-max",
    "family": "glm5",
-   "config": "examples/configs/glm53-exl3-max.config",
+   "config": "examples/configs/glm53-exl3-k6core-max.config",
    "gpus": [
     0,
     1
@@ -217,6 +276,58 @@
    "set": {
     "ADDR": "0.0.0.0:8703",
     "EXPERT_PORT": "19803",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
+   "name": "glm53-exl3-min",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exl3-min.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8747",
+    "COORDINATOR_GPUS": "1",
+    "EXPERT_PORT": "19847",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
+   "name": "glm53-exlr8-max",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exlr8-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8746",
+    "EXPERT_PORT": "19846",
     "SPARK_COUNT": "6",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",
@@ -268,16 +379,46 @@
    "set": {
     "ADDR": "0.0.0.0:8736",
     "EXPERT_PORT": "19836",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "2",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
    }
   },
   {
+   "name": "kimi-k3-min",
+   "family": "kimi_k3",
+   "config": "examples/configs/kimi-k3-exl3-k6-min.config",
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8749",
+    "EXPERT_PORT": "19849",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa",
+    "RTX_GPUS": "1",
+    "COORDINATOR_GPUS": "0",
+    "SPARK_DEVICE_BUDGET_BYTES": "118111600640"
+   }
+  },
+  {
    "name": "kimi-k3-max",
    "family": "kimi_k3",
-   "config": "examples/configs/kimi-k3-exl3-max.config",
+   "config": "examples/configs/kimi-k3-exl3-k6-max.config",
    "gpus": [
     0,
     1
@@ -346,7 +487,7 @@
    "set": {
     "ADDR": "0.0.0.0:8744",
     "EXPERT_PORT": "19844",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "4",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",

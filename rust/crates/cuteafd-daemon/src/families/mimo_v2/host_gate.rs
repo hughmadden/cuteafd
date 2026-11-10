@@ -170,3 +170,54 @@ fn dual_rank_host_restore_matches_cold_continuation() -> Result<()> {
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| run(&args, engine, &tokens))
 }
+
+#[test]
+#[ignore = "requires MiMo Pro and RTX kernels; CUTEAFD_MIMO_RESUME_GATE_ARGS is a JSON golden argv list"]
+fn native_mtp_resume_all_page_and_ring_frontiers() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    #[derive(Parser)]
+    struct ResumeArgs {
+        #[command(flatten)]
+        golden: GoldenArgs,
+    }
+    fn sha256(path: &std::path::Path) -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; 65536];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 { break; }
+            hash.update(&buffer[..n]);
+        }
+        Ok(format!("{:x}", hash.finalize()))
+    }
+
+    let argv: Vec<String> = serde_json::from_str(&std::env::var("CUTEAFD_MIMO_RESUME_GATE_ARGS")?)?;
+    let args = ResumeArgs::try_parse_from(std::iter::once("mimo-resume-gate".to_string()).chain(argv))?.golden;
+    ensure!(args.engine.skip_experts && args.engine.mtp == 3 && args.engine.draft.is_none(),
+        "state-only gate requires skipped routed experts and all three native MTP stages");
+    let provenance: serde_json::Value = serde_json::from_slice(&std::fs::read(args.golden.join("provenance.json"))?)?;
+    ensure!(provenance["set_sha256"] == "4a16d05350aa7df48011ac49501f772812fa88bb0166b7e2103ac6ecaa36d4fa"
+        && provenance["window_id"] == "legacy", "unexpected resume token source");
+    let token_path = args.golden.join("tokens.bin");
+    let tokens_sha = sha256(&token_path)?;
+    ensure!(tokens_sha == "e377648dedddff2e9990f100c147c2e8ebecdb2c2683929305f681ae438a8ae2"
+        && provenance["tokens_sha256"] == tokens_sha, "resume token bytes changed");
+    let bytes = std::fs::read(&token_path)?;
+    ensure!(bytes.len() == 513 * 4, "resume fixture must contain 513 complete token rows");
+    let tokens = bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect::<Vec<_>>();
+    println!("{}", serde_json::json!({"gate":"mimo-native-mtp-resume", "state_only_skip_experts":true,
+        "set_sha256":provenance["set_sha256"], "window_id":provenance["window_id"],
+        "tokens_sha256":tokens_sha, "binary_sha256":sha256(&std::env::current_exe()?)?,
+        "native_lib_sha256":sha256(&args.engine.native_lib)?, "swa_format":format!("{:?}", args.engine.swa_kv_cache)}));
+    let opened = open(&args.engine)?;
+    ensure!(tokens.iter().all(|&token| (token as usize) < opened.cfg.vocab_size), "out-of-vocabulary resume token");
+    opened.with_engine(&args.engine, |engine| {
+        for at in [63, 64, 65, 255, 256, 257] {
+            resume_check(&args, engine, &tokens, at)?;
+        }
+        Ok(())
+    })
+}

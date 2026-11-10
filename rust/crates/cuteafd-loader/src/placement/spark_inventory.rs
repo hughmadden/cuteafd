@@ -1,5 +1,6 @@
 //! Spark owners: manifests describe execution, checkpoint selection describes weights.
 use crate::placement::SparkAssignment;
+use crate::serving_capacity::Exl3Epilogue;
 use cuteafd_core::memory_layout::{Basis, Category, Item};
 use serde::Serialize;
 use serde_json::Value;
@@ -163,7 +164,7 @@ impl SparkExecutionInventory {
         }
         let tp = match manifest["role"].as_str() {
             Some("spark") => 4, Some("spark_tp2") => 2,
-            Some("spark_tp3") => 3, Some("spark_tp6") => 6,
+            Some("spark_tp3") => 3, Some("spark_tp6") => 6, Some("spark_tp8") => 8,
             _ => return Err(invalid("not a supported native Spark role")),
         };
         if number(manifest, "spark_tp_degree")? != tp {
@@ -179,8 +180,13 @@ impl SparkExecutionInventory {
         }
         let mut expected = vec![compiled];
         if compiled > 1 { expected.push(1); }
-        if compiled > 80 { expected.push(80); }
-        if retained != expected { return Err(invalid("native retained state must be main, m1, m80 in owner order")); }
+        let exports = cuteafd_core::spark_executions::ExpertExportCapacities::from_manifest(manifest)
+            .map_err(invalid)?;
+        let grouped = exports.grouped_decode(compiled).map_err(invalid)?;
+        if compiled > grouped && grouped > 1 { expected.push(grouped); }
+        if retained != expected {
+            return Err(invalid("native retained state must match manifest main, m1 and grouped-decode owners"));
+        }
         let input = match manifest["input_format"].as_str() {
             Some("bf16") => 5120 * 2, Some("fp8_k32") => 5120 + 5120 / 32,
             _ => return Err(invalid("unsupported native Spark ingress")),
@@ -237,7 +243,7 @@ impl SparkExecutionInventory {
             width = Some(intermediate);
             sources.push(provenance(manifest, vec![rows], physical_sms)?);
         }
-        let arena = crate::serving_capacity::exl3_workspace_bytes(manifests, true)
+        let arena = crate::serving_capacity::exl3_workspace_bytes(manifests, true, Exl3Epilogue::Sum)
             .map_err(|e| invalid(e.to_string()))?;
         Ok(Self { compiled_capacity: compiled, live_capacity: live, retained_capacities: retained.into(),
             physical_sms, logical_intermediate: width.unwrap() as u32, stored_intermediate: width.unwrap() as u32,
@@ -534,7 +540,7 @@ mod tests {
     }
     fn native() -> Value {
         json!({"schema":1,"role":"spark_tp3","spark_tp_degree":3,"capability":[12,1],
-            "physical_sms":48,"sparkinfer_revision":"test","input_format":"fp8_k32",
+            "physical_sms":48,"sparkinfer_revision":"test","input_format":"fp8_k32","decode_capacities":[1,80],
             "geometry":{"experts":384,"hidden":5120,"intermediate":768,"kernel_intermediate":768,"topk":6},
             "variants":[{"capacity_rows":1,"core_scratch_nbytes":11},
                 {"capacity_rows":80,"core_scratch_nbytes":80},
@@ -735,6 +741,47 @@ mod tests {
         assert_eq!(result.device.iter().chain(&result.pinned).chain(&result.host).map(|i| i.bytes).sum::<u64>(), result.serve_peak);
     }
     #[test]
+    fn native_tp3_tp6_census_uses_manifest_decode_capacity() {
+        let verify = cuteafd_core::V41_VERIFY_ROWS as u32;
+        for tp in [3, 6] {
+            let mut manifest = native();
+            manifest["role"] = json!(format!("spark_tp{tp}"));
+            manifest["spark_tp_degree"] = json!(tp);
+            manifest["geometry"]["intermediate"] = json!(2304 / tp);
+            manifest["geometry"]["kernel_intermediate"] = json!(2304 / tp);
+            manifest["decode_capacities"] = json!([1,16,verify]);
+            manifest["variants"] = json!([
+                {"capacity_rows":1,"core_scratch_nbytes":11},
+                {"capacity_rows":16,"core_scratch_nbytes":16},
+                {"capacity_rows":verify,"core_scratch_nbytes":verify},
+                {"capacity_rows":4096,"core_scratch_nbytes":4096}]);
+            let inventory = SparkExecutionInventory::native(&manifest,48,4096,2752,
+                &[4096,1,verify],load()).unwrap();
+            assert_eq!(inventory.retained_capacities(), &[4096,1,verify]);
+            assert!(SparkExecutionInventory::native(&manifest,48,4096,2752,
+                &[4096,1,80],load()).is_err());
+        }
+    }
+
+    #[test]
+    fn native_tp8_checks_role_degree_and_padded_geometry() {
+        let mut manifest = native();
+        manifest["role"] = json!("spark_tp8");
+        manifest["spark_tp_degree"] = json!(8);
+        manifest["geometry"]["intermediate"] = json!(288);
+        manifest["geometry"]["kernel_intermediate"] = json!(384);
+        let inventory = SparkExecutionInventory::native(&manifest,48,4096,1024,&[4096,1,80],load()).unwrap();
+        assert_eq!((inventory.logical_intermediate(), inventory.stored_intermediate()), (288,384));
+        for (field, value) in [("spark_tp_degree", json!(6)), ("role", json!("spark_tp7"))] {
+            let mut wrong = manifest.clone(); wrong[field] = value;
+            assert!(SparkExecutionInventory::native(&wrong,48,4096,1024,&[4096,1,80],load()).is_err());
+        }
+        for (field, value) in [("intermediate", 384), ("kernel_intermediate", 256)] {
+            let mut wrong = manifest.clone(); wrong["geometry"][field] = json!(value);
+            assert!(SparkExecutionInventory::native(&wrong,48,4096,1024,&[4096,1,80],load()).is_err());
+        }
+    }
+    #[test]
     fn native_rejects_unsupported_states_and_package_mismatches() {
         for (sms, compiled, live, states) in [(47,4096,1024,vec![4096,1,80]),
             (48,4096,4097,vec![4096,1,80]), (48,4096,1024,vec![4096]),
@@ -816,10 +863,10 @@ mod checkpoint_load_tests {
     #[test]
     fn exl3_load_inventory_matches_simultaneous_banks_not_all_layers() {
         let dir=tempfile::tempdir().unwrap();
-        crate::plan::testing::write_v41_exl3_snapshot(dir.path(),3);
+        crate::plan::testing::write_v4_pro_exl3_snapshot(dir.path());
         let catalog=crate::read_expert_catalog(dir.path()).unwrap();
         let manifest=catalog.exl3().unwrap();
-        let plans=[3,4].into_iter().map(|layer|manifest.residency(crate::V41Exl3Layer::Backbone(layer),3,1).unwrap()).collect::<Vec<_>>();
+        let plans=[1,3].into_iter().map(|layer|manifest.residency(crate::V41Exl3Layer::Backbone(layer),3,1).unwrap()).collect::<Vec<_>>();
         let result=SparkLoadInventory::exl3(&catalog,&plans).unwrap();
         let staging=plans.iter().map(|p|p.loads.chunks(9).map(|jobs|jobs.iter().map(|j|j.bytes as u64).sum::<u64>()).max().unwrap()).max().unwrap();
         let init=plans.iter().flat_map(|p|&p.buffers).map(|b|b.initial_words.len() as u64*4).max().unwrap();

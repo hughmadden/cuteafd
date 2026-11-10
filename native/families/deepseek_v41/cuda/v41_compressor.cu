@@ -1,3 +1,4 @@
+#include "v41_capacity.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -260,7 +261,7 @@ extern "C" int32_t cuteafd_v41_index_store(const uint8_t* packed,const uint8_t* 
 extern "C" int32_t cuteafd_v41_compressor_pool(const float* kv,const float* scores,
     const float* pending_kv,const float* pending_scores,const uint64_t* predecessors,
     const uint16_t* norm_weight,uint16_t* output,int32_t rows,int32_t slots,void* stream) {
-  if(rows<1 || rows>4096 || slots<1 || slots>16)return cudaErrorInvalidValue;
+  if(rows<1 || rows>4096 || slots<1 || slots>CUTEAFD_V41_MAX_REQUESTS)return cudaErrorInvalidValue;
   const void* inputs[]={kv,scores,pending_kv,pending_scores,predecessors,norm_weight};
   const uint64_t sizes[]={uint64_t(rows)*2048,uint64_t(rows)*2048,uint64_t(slots)*2048,
       uint64_t(slots)*2048,uint64_t(rows)*8,1024};

@@ -74,9 +74,9 @@ impl BackboneCache<'_> {
         }
         Ok(())
     }
-    fn publication_counts(&self, batch: &CacheBatch) -> Result<([u32; 16], usize)> {
-        ensure!(batch.requests.len() <= 16, "too many publication requests");
-        let mut counts = [0; 16];
+    fn publication_counts(&self, batch: &CacheBatch) -> Result<([u32; cuteafd_core::V41_MAX_REQUESTS], usize)> {
+        ensure!(batch.requests.len() <= cuteafd_core::V41_MAX_REQUESTS, "too many publication requests");
+        let mut counts = [0; cuteafd_core::V41_MAX_REQUESTS];
         for (count, request) in counts.iter_mut().zip(&batch.requests) {
             *count = request.work.tokens;
         }

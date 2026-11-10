@@ -112,8 +112,10 @@ impl NativeWorkspace {
         })
     }
 
-    /// One lane, matching LocalExpertWave or OwnerPair respectively. The
-    /// owner path retains route planes even when a kernel can sum tokens.
+    /// One lane, matching LocalExpertWave or OwnerPair (`OwnerPair::
+    /// device_bytes_for` with `OwnerPolicy::native`): the TP2 owner keeps
+    /// BF16 route planes on NVFP4 and FP32 token sums on MXFP4 (the shipped
+    /// TP2 reducer sums routes; startup cross-checks the exact arena).
     pub fn lane_bytes(
         self,
         rows: u64,
@@ -123,8 +125,8 @@ impl NativeWorkspace {
         nvfp4: bool,
     ) -> anyhow::Result<u64> {
         use anyhow::Context;
-        let columns = if dual { topk.checked_mul(if nvfp4 { 2 } else { 4 })
-            .context("V4.1 expert route extent overflow")? } else { 2 };
+        let columns = if dual { if nvfp4 { topk.checked_mul(2).context("V4.1 expert route extent overflow")? } else { 4 } }
+            else { 2 };
         let output = rows
             .checked_mul(hidden)
             .and_then(|n| n.checked_mul(columns))
@@ -146,7 +148,7 @@ impl NativeWorkspace {
 pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     use anyhow::{ensure, Context};
     ensure!((1..=4096).contains(&rows), "invalid V4.1 expert capacity");
-    let capacities = [1, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::V41_TARGET_CAPACITIES;
     let compiled = capacities
         .into_iter()
         .find(|&n| n >= rows)
@@ -156,7 +158,7 @@ pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
             rows == compiled,
             "local expert rows must be a compiled capacity"
         );
-        Ok([1, 16, 80]
+        Ok(cuteafd_core::V41_DECODE_CAPACITIES.map(|n| n as u64)
             .into_iter()
             .filter(|&n| n < rows)
             .chain([rows])
@@ -164,12 +166,6 @@ pub fn expert_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
     } else {
         Ok(capacities.into_iter().filter(|&n| n <= compiled).collect())
     }
-}
-
-/// EXL3 needs a canonical wide decode export even for narrow lane admission.
-/// Keep the existing explicit prefill state set for local owners.
-pub fn exl3_capacities(rows: u64, local: bool) -> anyhow::Result<Vec<u64>> {
-    expert_capacities(if rows > 1 && rows < 80 { 80 } else { rows }, local)
 }
 
 /// The native packer's four resident planes, independent of staging format.
@@ -220,20 +216,11 @@ pub fn expert_cost(
     rank: usize,
     stored: u64,
 ) -> anyhow::Result<Bytes2> {
-    use anyhow::ensure;
+    use anyhow::{ensure, Context};
     ensure!(
         matches!(world, 1 | 2) && rank < world && layer < 40,
         "invalid V4.1 RTX expert selection"
     );
-    if let Some(exl3) = catalog.exl3() {
-        return Ok(Bytes2 {
-            resident: exl3
-                .residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?
-                .device_arena_layout()?
-                .1 as u64,
-            staging: 0,
-        });
-    }
     let selection = if world == 1 {
         crate::V41ExpertSelection::BackboneFull { layer, expert: 0 }
     } else {
@@ -250,23 +237,60 @@ pub fn expert_cost(
         catalog.expert_staging(selection)?.staging_bytes()
     };
     let shape = catalog.routed_experts();
-    Ok(Bytes2 {
-        resident: resident_bytes(shape.hidden as u64, stored, shape.experts as u64, nvfp4)?,
-        staging: staging as u64,
-    })
+    let resident = if !nvfp4 && catalog.mxfp4_scale_codes() {
+        crate::formats::scale_codes::expert_bytes(shape.experts as u64, shape.hidden as u64,
+            shape.intermediate as u64 / world as u64).context("coded expert residency overflow")?
+    } else {
+        resident_bytes(shape.hidden as u64, stored, shape.experts as u64, nvfp4)?
+    };
+    Ok(Bytes2 { resident, staging: staging as u64 })
 }
 
 /// Exact conditional expert owners: immutable checkpoint residency and two
 /// independent serving lanes. Fixed target lanes stay in the baseline.
+/// Expert costs per layer and the RTX expert workspace for `lanes` target
+/// passes (two decode lanes plus any further prefill slot), each with its own
+/// local or TP2 expert wave.
+/// Per-layer expert costs, and the coordinator's expert workspaces: the
+/// prefill slots' (one per slot on one RTX at the `rows` unit; one shared TP2
+/// arena on two, planes at the `reserve`) and the two decode lanes' at
+/// `decode_rows`.
 pub fn expert_inventory(
     catalog: &crate::OfficialV41Catalog,
     programs: &std::path::Path,
     rows: u64,
     gpus: usize,
     sms: u32,
+    slots: usize,
+    reserve: u64,
+    decode_rows: u64,
 ) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
     use anyhow::{ensure, Context};
     ensure!(matches!(gpus, 1 | 2), "V4.1 supports one or two RTX owners");
+    ensure!((1..=4).contains(&slots) && rows <= reserve, "V4.1 runs one to four prefill slots in the reserve");
+    // Slot arenas run live rows on the covering AOT capacity; decode lanes
+    // at their compiled width.
+    let slot_capacity = if gpus == 1 {
+        u64::from(cuteafd_core::coordinator_programs::v41_aot_rows(u32::try_from(rows)?)
+            .context("invalid V4.1 prefill rows")?)
+    } else { rows };
+    let (experts, slot) = expert_workspace(catalog, programs, slot_capacity, reserve, gpus, sms)?;
+    let (_, decode) = expert_workspace(catalog, programs, decode_rows, decode_rows, gpus, sms)?;
+    let slots = if gpus == 1 { slots as u64 } else { 1 };
+    Ok((experts, slot.checked_mul(slots).and_then(|n| n.checked_add(2 * decode))
+        .context("V4.1 expert workspaces overflow")?))
+}
+
+/// Per-layer costs, and one expert workspace at `rows` (TP2: planes at `reserve`).
+fn expert_workspace(
+    catalog: &crate::OfficialV41Catalog,
+    programs: &std::path::Path,
+    rows: u64,
+    reserve: u64,
+    gpus: usize,
+    sms: u32,
+) -> anyhow::Result<(Vec<ExpertCost>, u64)> {
+    use anyhow::{ensure, Context};
     let shape = catalog.routed_experts();
     ensure!(
         shape.layers == 40 && shape.hidden == 5120,
@@ -277,67 +301,14 @@ pub fn expert_inventory(
         .context("program manifest has no parent")?;
     let local = gpus == 1;
     let role = if local { "rtx_backbone" } else { "rtx_tp2" };
-    let capacity = if local {
-        cuteafd_core::coordinator_programs::v41_aot_rows(u32::try_from(rows)?)
-            .context("invalid V4.1 prefill rows")? as u64
-    } else {
-        rows
-    };
-    let (stored, routed) = if let Some(exl3) = catalog.exl3() {
-        let tiers: String = exl3.decoder_tiers().iter().map(usize::to_string).collect();
-        let layout = if local { "rtx-tp1" } else { "rtx-tp2" };
-        let stem = format!("exl3-k{tiers}");
-        let package = [
-            parent.join("exl3").join(&stem).join(layout),
-            parent.join("../lib/exl3").join(&stem).join(layout),
-            parent.join("exl3").join(layout),
-        ]
-        .into_iter()
-        .find(|p| p.is_dir())
-        .context("missing V4.1 EXL3 expert workspace package")?;
-        let manifests = exl3_capacities(capacity, local)?
-            .into_iter()
-            .map(|c| {
-                let path = package.join(format!("m{c}/v41_exl3.json"));
-                let value: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-                )?;
-                ensure!(
-                    value["capacity"].as_u64() == Some(c)
-                        && value["hidden"].as_u64() == Some(shape.hidden as u64)
-                        && value["experts"].as_u64() == Some(shape.experts as u64)
-                        && value["intermediate"].as_u64() == Some((shape.intermediate / gpus) as u64)
-                        && value["top_k"].as_u64() == Some(shape.topk as u64),
-                    "V4.1 EXL3 workspace geometry mismatch"
-                );
-                Ok(value)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let scratch = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
-        let output = capacity * shape.hidden as u64 * if local { 2 } else { 4 };
-        (
-            0,
-            scratch
-                + output
-                + if local {
-                    0
-                } else {
-                    owner_workspace(capacity, shape.hidden as u64, shape.topk as u64)?
-                },
-        )
-    } else {
-        let format = if catalog.nvfp4().is_some() {
-            "nvfp4"
-        } else {
-            "mxfp4"
-        };
-        let path = parent
-            .join("V41_EXPERT_WORKSPACES")
-            .join(format!("{format}_{role}.json"));
-        let value =
-            serde_json::from_slice(&std::fs::read(&path).with_context(|| {
-                format!("missing exact workspace manifest {}", path.display())
-            })?)?;
+    // A compiled capacity on one RTX (the caller covers live rows); TP2 rows.
+    let capacity = rows;
+    let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+    let path = parent.join("V41_EXPERT_WORKSPACES").join(format!("{format}_{role}.json"));
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).with_context(|| {
+        format!("missing exact workspace manifest {}", path.display())
+    })?)?;
+    let (stored, routed) = {
         let workspace = NativeWorkspace::from_manifest(
             &value,
             role,
@@ -363,9 +334,11 @@ pub fn expert_inventory(
     } else {
         let fp8: serde_json::Value =
             serde_json::from_slice(&std::fs::read(parent.join("V41_FP8_AOT.json"))?)?;
+        // Shared TP2 (its sums a plane at the reserve) and the peer inputs
+        // and final output planes at the reserve (WP7 `tp2_ffn::Storage`).
         routed
-            .checked_add(shared_workspace(&fp8, rows, sms)?)
-            .and_then(|n| n.checked_add(rows * (10240 + 5280 + 24 + 24 + 10240)))
+            .checked_add(shared_workspace(&fp8, rows, sms)? - rows * 10240 + reserve * 10240)
+            .and_then(|n| n.checked_add(reserve * (10240 + 5280 + 24 + 24 + 10240)))
             .context("V4.1 FFN workspace overflow")?
     };
     let experts = (0..40)
@@ -386,10 +359,37 @@ pub fn expert_inventory(
             Ok(cost)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    Ok((
-        experts,
-        lane.checked_mul(2).context("V4.1 serving lanes overflow")?,
-    ))
+    if let Some(storage) = value.get("expert_storage") {
+        for cost in &experts {
+            check_expert_storage(storage, cost, shape.experts as u64)
+                .with_context(|| path.display().to_string())?;
+        }
+    }
+    Ok((experts, lane))
+}
+
+/// A package that declares its resident expert layout (`expert_storage`, as
+/// SM89 exports do) must store exactly the bytes the planner charges for this
+/// role: one TP2 half per expert on two RTX, one whole expert on one.
+fn check_expert_storage(storage: &serde_json::Value, cost: &ExpertCost, experts: u64) -> anyhow::Result<()> {
+    use anyhow::{ensure, Context};
+    let declared = storage["bytes_per_expert"].as_u64().context("expert_storage has no bytes_per_expert")?;
+    if let Some(planes) = storage.get("plane_bytes") {
+        let planes = planes.as_array().context("expert_storage plane_bytes is not a list")?.iter()
+            .map(|plane| plane.as_u64().context("expert_storage plane is not a byte count"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        ensure!(planes.iter().sum::<u64>() == declared,
+            "expert_storage planes {planes:?} do not sum to its {declared} B per expert");
+    }
+    let parts = if cost.tp2 { cost.half.to_vec() } else { vec![cost.whole] };
+    for part in parts {
+        ensure!(experts > 0 && part.resident == declared.checked_mul(experts).context("expert_storage overflow")?,
+            "the package stores {declared} B per expert ({}, {}) but the planner charges {} B: \
+             it does not load this expert layout",
+            storage["weight_layout"].as_str().unwrap_or("unnamed weights"),
+            storage["scale_layout"].as_str().unwrap_or("unnamed scales"), part.resident / experts.max(1));
+    }
+    Ok(())
 }
 
 pub fn owner_workspace(rows: u64, hidden: u64, topk: u64) -> anyhow::Result<u64> {
@@ -420,7 +420,7 @@ pub fn cache_demands(request: &mut PlacementRequest, config: &serde_json::Value,
     use cuteafd_core::memory_layout::{Basis, Category};
     let ranks = request.inventory.gpus.len();
     let geometry = crate::serving_capacity::deepseek_v41_cache_geometry(config, ranks)?;
-    ensure!((1..=16).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
+    ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&slots) && retained_turns <= 128 && (!replicated || ranks == 2),
         "invalid V4.1 cache admission shape");
     let tails = slots + 2 * retained_turns;
     let mut units = geometry.ranks.iter().map(|r| r.persistent_unit_bytes).collect::<Vec<_>>();
@@ -505,7 +505,7 @@ pub fn request(
 ) -> PlacementRequest {
     let gpus = inventory.gpus.len();
     assert!(experts.len() <= 40, "V4.1 has exactly 40 backbone layers");
-    PlacementRequest {
+    PlacementRequest { expert_tier: None,
         inventory,
         attention_placement: Some(if gpus == 2 { AttentionPlacement::Layers } else { AttentionPlacement::Heads }),
         context_buffers: ContextBuffers::default(),
@@ -543,7 +543,175 @@ pub fn request(
     }
 }
 
-/// What the V4.1 dSpark drafter retains, measured from its own plan before
+/// `--gpu-expert-tier` and `--gpu-expert-tier-profile` as `cuteafd plan
+/// --layout` and serving both read them: the one source of the tier V4.1
+/// asks the solver for, so a plan admits the resident set serving loads.
+#[derive(Debug, Clone, Default)]
+pub struct TierChoice {
+    pub setting: ExpertTierSetting,
+    pub profile: Option<std::path::PathBuf>,
+    /// What the slots are ranked by (serving: the default model).
+    pub model: TierStepModel,
+}
+
+/// The activations a tier's order comes from, and the profile they were
+/// read from (the plan's notes).
+#[derive(Debug, Clone)]
+pub struct TierInputs {
+    pub activation: ExpertActivation,
+    pub source: ExpertTierSource,
+    pub profile: Option<ExpertRouteProfile>,
+}
+
+impl TierChoice {
+    /// The tier's expected activations over `routed` routed layers of
+    /// `experts` experts (`topk` per row): the profile at the step model's
+    /// verify width, else uniform popularity; `None` when the tier is off.
+    /// A profile without a tier is refused.
+    pub fn inputs(&self, routed: usize, experts: usize, topk: u32) -> anyhow::Result<Option<TierInputs>> {
+        match (&self.profile, self.setting.enabled()) {
+            (Some(_), false) => anyhow::bail!("--gpu-expert-tier-profile needs --gpu-expert-tier auto or N"),
+            (_, false) => Ok(None),
+            (None, true) => Ok(Some(TierInputs {
+                activation: ExpertActivation::uniform(routed, experts, self.model.active_experts),
+                source: ExpertTierSource::Uniform, profile: None })),
+            (Some(path), true) => {
+                let profile = ExpertRouteProfile::read(path)?;
+                let activation = ExpertActivation::from_profile(&profile, routed, experts, self.model.step_rows, topk,
+                    self.model.active_experts)?;
+                Ok(Some(TierInputs { activation, source: ExpertTierSource::Profile, profile: Some(profile) }))
+            }
+        }
+    }
+
+    /// Asks `request` (V4.1's, built by [`request`]) for the tier: every
+    /// routed slot ranked by how much its residency cuts the predicted step
+    /// time, behind the whole layers `pinned` (`--rtx-expert-layers`) pins,
+    /// in place of whole-layer onboarding (no TP2 or TP1 layer prefix, none
+    /// mandatory). The Sparks keep every expert, so it needs Spark ranks.
+    pub fn apply(&self, request: &mut PlacementRequest, inputs: &TierInputs, pinned: Option<Onboard>,
+        experts: usize) -> anyhow::Result<()> {
+        use anyhow::ensure;
+        let routed = request.layers.iter().enumerate().filter(|(_, layer)| layer.experts.is_some())
+            .map(|(index, _)| index).collect::<Vec<_>>();
+        let size = self.setting.size(routed.len()).ok_or_else(|| anyhow::anyhow!("the GPU expert tier is off"))?;
+        ensure!(request.inventory.spark_ranks > 0,
+            "the GPU expert tier runs non-resident experts on the Sparks: plan it with Spark ranks");
+        let pinned = match pinned {
+            None | Some(Onboard::Auto) => 0,
+            Some(Onboard::Layers(layers)) => layers,
+        };
+        ensure!(pinned <= routed.len(), "--rtx-expert-layers {pinned} exceeds the {} routed layers", routed.len());
+        let order = super::super::expert_tier::optimized_order(&routed, &inputs.activation, &self.model, pinned);
+        request.expert_tier = Some(ExpertTierRequest::new(size, experts, order, inputs.source));
+        request.onboard = Onboard::Layers(0);
+        request.minimum_expert_layers = 0;
+        Ok(())
+    }
+}
+
+/// Device bytes one lane's GPU expert tier adds on each GPU beyond the routed
+/// owner pair it runs on (the TP2 FFN's, sized like a whole layer's): the
+/// `slot_of` tables of `layers` backbone layers of `experts` experts, and the
+/// compact slots of `rows` rows of six routes.
+pub fn tier_lane_bytes(layers: u64, experts: u64, rows: u64) -> u64 {
+    layers * experts * 4 + rows * 6 * 4
+}
+
+/// Each GPU's weights outside the routed experts, as `--coordinator-weight-
+/// budget-gib` counts them: the weight, embedding and table owners in
+/// `fixed` (and an external drafter's weights), plus the dSpark drafter's
+/// resident bytes beside the head on the last GPU and, with its TP2 experts,
+/// the other half on GPU0.
+pub fn fixed_weight_bytes(fixed: &[Demand], draft: Option<&DraftInventory>, gpus: usize) -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    (0..gpus).map(|gpu| {
+        let mut bytes = fixed.iter().filter(|d| usize::from(d.gpu) == gpu
+            && (matches!(d.category, Category::Weights | Category::Embedding | Category::Tables)
+                || d.group == "external drafter weights"))
+            .try_fold(0u64, |sum, d| sum.checked_add(d.bytes).context("V4.1 weight budget overflow"))?;
+        if gpu == gpus - 1 {
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.resident)).context("V4.1 draft weight budget overflow")?;
+        }
+        if gpu == 0 && gpus == 2 {
+            // --tp2-dspark-experts: GPU0 holds the other half of dSpark's experts.
+            bytes = bytes.checked_add(draft.map_or(0, |d| d.peer_half)).context("V4.1 draft weight budget overflow")?;
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Each GPU's retained weights in `placed`: its `fixed` weights
+/// ([`fixed_weight_bytes`]) plus the GPU expert tier's and the onboarded
+/// routed layers' resident experts.
+pub fn retained_weight_bytes(request: &PlacementRequest, placed: &Placement, fixed: &[u64])
+    -> anyhow::Result<Vec<u64>> {
+    use anyhow::Context;
+    fixed.iter().enumerate().map(|(gpu, &fixed)| {
+        let mut bytes = fixed;
+        if let Some(tier) = &placed.expert_tier {
+            bytes = bytes.checked_add(tier.resident_bytes.get(gpu).copied().unwrap_or(0))
+                .context("V4.1 GPU expert tier weight budget overflow")?;
+        }
+        for (layer, assigned) in request.layers.iter().zip(&placed.layers) {
+            if let Some(cost) = layer.experts {
+                let resident = match assigned.experts {
+                    ExpertHome::RtxTp2 => cost.half[gpu].resident,
+                    ExpertHome::RtxWhole { gpu: owner } if usize::from(owner) == gpu => cost.whole.resident,
+                    _ => 0,
+                };
+                bytes = bytes.checked_add(resident).context("V4.1 expert weight budget overflow")?;
+            }
+        }
+        Ok(bytes)
+    }).collect()
+}
+
+/// Solves `request` within `limit` retained weight bytes per GPU
+/// (`--coordinator-weight-budget-gib`), as `cuteafd plan` and serving both
+/// admit: an over-budget solution sheds GPU expert tier experts (whole
+/// experts, by the excess), else optional whole layers, and solves again
+/// (an automatic pool kept as first admitted). `fixed` is each GPU's weights
+/// outside the routed experts ([`fixed_weight_bytes`]).
+pub fn solve_with_weight_limit(request: &PlacementRequest, fixed: &[u64], limit: u64) -> anyhow::Result<Placement> {
+    use anyhow::{ensure, Context};
+    let mut placement = solve(request)?;
+    loop {
+        let retained = retained_weight_bytes(request, &placement, fixed)?;
+        if retained.iter().all(|&bytes| bytes <= limit) { return Ok(placement); }
+        if let Some(tier) = placement.expert_tier.as_ref().filter(|tier| tier.experts > 0) {
+            // Shrink the tier by the excess, in whole experts (the largest
+            // per-expert part bounds how many must go).
+            let excess = retained.iter().map(|&bytes| bytes.saturating_sub(limit)).max().unwrap_or(0);
+            let largest = request.layers.iter().filter_map(|layer| layer.experts)
+                .flat_map(|cost| [cost.half[0].resident, cost.half[1].resident, cost.whole.resident])
+                .max().unwrap_or(0) / request.expert_tier.as_ref().map_or(1, |t| t.experts_per_layer.max(1)) as u64;
+            let drop = usize::try_from(excess.div_ceil(largest.max(1)))?.max(1);
+            let mut trial = request.clone();
+            let mut shrunk = trial.expert_tier.take().context("GPU expert tier request")?;
+            let keep = tier.experts.saturating_sub(drop);
+            ensure!(keep >= shrunk.pinned,
+                "V4.1 coordinator weight budget exceeded; pinned whole layers need more than {limit} bytes");
+            if shrunk.size == ExpertTierSize::Auto { trial.pool.pin_selected(placement.pool_tokens); }
+            shrunk.size = ExpertTierSize::Experts(keep);
+            trial.expert_tier = Some(shrunk);
+            placement = solve(&trial)?;
+            continue;
+        }
+        ensure!(request.inventory.spark_ranks > 0 && request.onboard.layers(40).is_none()
+            && placement.onboard_layers > request.minimum_expert_layers,
+            "V4.1 coordinator weight budget exceeded; mandatory owners require more than {limit} bytes");
+        let mut trial = request.clone();
+        trial.onboard = Onboard::Layers(placement.onboard_layers - 1);
+        // Keep pool-first's admitted pool while reducing only the optional prefix.
+        if matches!(request.onboard, Onboard::Auto) {
+            trial.pool.pin_selected(placement.pool_tokens);
+        }
+        placement = solve(&trial)?;
+    }
+}
+
+/// What the V4.1 dSpark drafter retains, measured from its own plan before/// What the V4.1 dSpark drafter retains, measured from its own plan before
 /// any payload is read. Runtime owners come from `owners::NativePrograms::dspark`
 /// (request lanes, main context, windows) on the default native BF16 path;
 /// EXL3 arenas and TP2 expert halves are sized from their packages.
@@ -779,7 +947,7 @@ mod tests {
     fn exact_cache_demands_match_allocator_across_table_caps_and_replicas() {
         use cuteafd_core::memory_layout::Category;
         for (ranks, replicated) in [(1, false), (2, false), (2, true)] {
-            for (slots, turns) in [(1, 0), (16, 20), (3, 128)] {
+            for (slots, turns) in [(1, 0), (16, 20), (17, 20), (32, 20), (64, 80), (3, 128), (64, 128)] {
                 let tails = slots + 2 * turns;
                 for physical in [tails + slots, 2047, 2048, 2049, 4095, 4096, 4097, 131072] {
                     let logical = physical - tails;
@@ -802,34 +970,35 @@ mod tests {
     }
 
     #[test]
+    fn exact_cache_rejects_slots_outside_compiled_request_bank() {
+        for slots in [0, cuteafd_core::V41_MAX_REQUESTS as u64 + 1] {
+            assert!(crate::serving_capacity::deepseek_v41_cache_bytes(&config(), 1, slots, 2048, false).is_err());
+        }
+    }
+
+    #[test]
     fn native_manifest_demands_use_exact_retained_variants_and_resident_width() {
         let mut manifest = serde_json::json!({"role":"rtx_tp2", "geometry": {
             "hidden":5120,"intermediate":1152,"kernel_intermediate":1280,"experts":256,"topk":6},
-            "variants": ([1,16,80,256,1024,4096].map(|c| serde_json::json!({
+            "variants": ([1,16,64,256,1024,4096].map(|c| serde_json::json!({
                 "capacity_rows":c,"core_scratch_nbytes":if c == 16 { 99999 } else { c * 7 }})))});
         let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2", 81,5120,1152,256,6).unwrap();
         assert_eq!(demand, NativeWorkspace { scratch_bytes:99999, kernel_intermediate:1280 });
-        assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(24+26));
+        assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(4+26));
         assert_eq!(demand.lane_bytes(81,5120,6,true,true).unwrap(),99999+81*5120*(12+26));
         assert_eq!(demand.lane_bytes(81,5120,6,false,false).unwrap(),99999+81*5120*2);
-        manifest["variants"][2]["requested_rows"] = 80.into();
+        manifest["variants"][2]["requested_rows"] = 64.into();
         manifest["variants"][2]["capacity_rows"] = 96.into();
         assert_eq!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).unwrap(), demand);
         manifest["variants"][2]["requested_rows"] = 79.into();
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
-        manifest["variants"][2]["requested_rows"] = 80.into();
+        manifest["variants"][2]["requested_rows"] = 64.into();
         let duplicate = manifest["variants"][2].clone();
         manifest["variants"].as_array_mut().unwrap().push(duplicate);
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
         assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6).is_err());
-        assert_eq!(exl3_capacities(4096,true).unwrap(), [1,16,80,4096]);
-        assert_eq!(exl3_capacities(16,true).unwrap(), [1,16,80]);
-        assert_eq!(exl3_capacities(16,false).unwrap(), [1,16,80]);
-        assert_eq!(exl3_capacities(1,true).unwrap(), [1]);
-        assert!(exl3_capacities(0,true).is_err());
-        assert!(exl3_capacities(4097,false).is_err());
-        assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,80,4096]);
-        assert_eq!(expert_capacities(81,false).unwrap(), [1,16,80,256]);
+        assert_eq!(expert_capacities(4096,true).unwrap(), [1,16,64,4096]);
+        assert_eq!(expert_capacities(81,false).unwrap(), [1,16,64,256]);
         assert!(expert_capacities(81,true).is_err());
         assert!(expert_capacities(4097,false).is_err());
         assert!(owner_workspace(1,1,u64::MAX).is_err());
@@ -841,7 +1010,7 @@ mod tests {
     #[test]
     fn shared_fp8_capacity_scratch_is_a_sum_not_a_maximum() {
         let variants = [(5120,1152),(1152,5120)].into_iter().flat_map(|(k,n)|
-            [1,16,80,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
+            [1,16,64,256,1024,4096].map(|c| serde_json::json!({"capacity":c,"input_dim":k,
                 "output_dim":n,"label":format!("shared_{k}_{n}_m{c}"),"scratch_bytes":c+1}))).collect::<Vec<_>>();
         let manifest = serde_json::json!({"variants":variants});
         assert_eq!(shared_workspace(&manifest,257,188).unwrap(),

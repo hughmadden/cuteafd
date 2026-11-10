@@ -4,7 +4,8 @@
 //! under `benchmarks/<family>/<date>-<profile>-<hardware>/`.
 use crate::report::{CheckStatus, Report};
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -30,9 +31,13 @@ pub fn family_title(family: &str) -> &str {
         "deepseek_v41" => "DeepSeek V4.1",
         "deepseek_v4" => "DeepSeek V4",
         "glm5" => "GLM 5.3",
+        "mistral_large4" => "Mistral Large 4",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
         "qwen4" => "Qwen 3.8",
+        "qwen3_5" => "Qwen 3.5 / 3.8 dense",
+        "kimi_k3" => "Kimi K3",
+        "step5" => "Step-5",
         other => other,
     }
 }
@@ -159,6 +164,41 @@ impl MatrixRow {
 #[derive(Debug, Clone)]
 pub struct Matrix {
     pub rows: Vec<MatrixRow>,
+    pub retired: Vec<Retired>,
+}
+
+/// A historical card, pinned independently of the current three-column set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Retired {
+    pub name: String,
+    pub config: PathBuf,
+    pub report: PathBuf,
+    pub release: String,
+    pub release_note: String,
+}
+
+pub fn validate_retired(entries: &[Retired]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        if entry.name.trim().is_empty() || !names.insert(&entry.name) {
+            bail!("retired cards need nonempty, unique names");
+        }
+        let normal = |path: &Path| path.components().all(|p| matches!(p, std::path::Component::Normal(_)));
+        if !normal(&entry.report) || entry.report.components().count() != 3
+            || !entry.report.starts_with("benchmarks") {
+            bail!("retired report must be benchmarks/<family>/<directory>");
+        }
+        if !normal(&entry.config) || entry.config.components().count() != 3
+            || !entry.config.starts_with("examples/configs") || entry.config.extension().is_none_or(|e| e != "config") {
+            bail!("retired config must be examples/configs/<name>.config");
+        }
+        if entry.release.trim().is_empty() || entry.release.chars().any(char::is_control)
+            || entry.release_note.trim().is_empty() {
+            bail!("retired cards need a build version label and an explicit provenance note");
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -166,6 +206,8 @@ pub struct Matrix {
 struct RawMatrix {
     schema: String,
     cells: Vec<RawRow>,
+    #[serde(default)]
+    retired: Vec<Retired>,
 }
 
 #[derive(Deserialize)]
@@ -238,7 +280,8 @@ impl Matrix {
             rows.push(MatrixRow::new(&row.family, &row.checkpoint,
                 cells.try_into().map_err(|_| anyhow::anyhow!("three cells per row"))?));
         }
-        Ok(Matrix { rows })
+        validate_retired(&raw.retired)?;
+        Ok(Matrix { rows, retired: raw.retired })
     }
 }
 
@@ -274,7 +317,7 @@ fn cell(column: Column, raw: RawCell, family: &str, checkpoint: &str) -> Result<
 /// A one-row matrix: the table and page renderers' test scaffolding.
 #[cfg(test)]
 pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
-    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)] }
+    Matrix { rows: vec![MatrixRow::new(family, checkpoint, cells)], retired: Vec::new() }
 }
 
 /// Re-renders the images a published run already carries from its own
@@ -290,6 +333,53 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 ///
 /// A re-render that fails is the publisher's error, not a run without that
 /// export: publishing stops rather than leave the stale image in place.
+/// The committed copy of a placed `report.json`: per-row fidelity and probe rows and
+/// the baseline's duplicate fabric counters are measurement scratch (several MB
+/// per report). The verdict is set once, when the report is published from its
+/// full rows (`slim_placed`); a slimmed report keeps it (`quality::bar_met`).
+/// Run directories keep the full report for paired fidelity comparisons.
+pub fn slim(report: &mut Value) {
+    if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
+        baseline.remove("fabric");
+        if let Some(checks) = baseline.get_mut("quality").and_then(|q| q.get_mut("checks")).and_then(Value::as_array_mut) {
+            for check in checks {
+                for rows in ["/metrics/run/score/records", "/metrics/probe/rows"] {
+                    if let Some(rows) = check.pointer_mut(rows) {
+                        *rows = Value::Array(Vec::new());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn slim_placed(dir: &Path) -> Result<()> {
+    let path = dir.join("report.json");
+    let text = std::fs::read_to_string(&path).with_context(|| format!("{}", path.display()))?;
+    let mut value: Value = serde_json::from_str(&text).with_context(|| format!("{}", path.display()))?;
+    let before = value.clone();
+    // Set the verdict from the full rows under the rule in force now, then keep it.
+    let mut report: Report = serde_json::from_value(value.clone()).with_context(|| format!("{}", path.display()))?;
+    crate::quality::reconcile(&mut report);
+    if let (Some(graded), Some(baseline)) = (report.baseline.as_ref(), value.get_mut("baseline")) {
+        baseline["quality"]["status"] = serde_json::to_value(graded.quality.status)?;
+        if let Some(checks) = baseline["quality"]["checks"].as_array_mut() {
+            for (check, graded) in checks.iter_mut().zip(&graded.quality.checks) {
+                check["status"] = serde_json::to_value(graded.status)?;
+                match &graded.note {
+                    Some(note) => check["note"] = Value::String(note.clone()),
+                    None => { check.as_object_mut().map(|c| c.remove("note")); }
+                }
+            }
+        }
+    }
+    slim(&mut value);
+    if value != before {
+        crate::cli::write_if_changed(&path, &serde_json::to_string(&value)?)?;
+    }
+    Ok(())
+}
+
 fn rerender(dir: &Path, report: &Report) -> Result<()> {
     let mut names: Vec<String> = ["card.svg", "card.png", "report.svg", "report.png"]
         .map(str::to_string).to_vec();
@@ -318,15 +408,14 @@ fn coordinator_budget(report: &Report) -> Option<f64> {
 
 fn short_hardware(report: &Report) -> String {
     let hw = &report.server.hardware;
-    if report.server.simulated_5090() {
-        return report.server.hardware_line();
-    }
-    let mut out = if report.server.column_5090() {
+    let mut out = if report.server.simulated_5090() {
+        "simulated 5090".into()
+    } else if report.server.column_5090() {
         "RTX 5090".into()
     } else {
         format!("{}× RTX", hw.used_gpus())
     };
-    if let Some(gib) = coordinator_budget(report) {
+    if let Some(gib) = coordinator_budget(report).filter(|_| !report.server.simulated_5090()) {
         out.push_str(&format!(" ({gib} GiB budget)"));
     }
     if !hw.sparks.is_empty() {
@@ -349,7 +438,7 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 6] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4"];
+const FAMILIES: [&str; 7] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4", "mimo_v2", "qwen4"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -545,8 +634,9 @@ fn grid_cell(cell: &Resolved) -> String {
 /// benchmarks index for everything older.
 pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
     let rows = select(placed, matrix)?;
+    let retired = retired_results(placed, &matrix.retired)?;
     if rows.is_empty() {
-        return Ok("_Pending the first published run._\n".into());
+        return Ok(format!("_Pending the first published run._\n{retired}"));
     }
     let mut out = String::from("<table>\n<tr><th>Model · quant</th><th>5090</th><th>1× RTX</th><th>2× RTX</th></tr>\n");
     for row in &rows {
@@ -565,9 +655,39 @@ pub fn results(placed: &[Placed], matrix: &Matrix) -> Result<String> {
         out.push_str("</tr>\n");
     }
     out.push_str("</table>\n\n");
-    out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent code with thinking \
-        off, cold 8K prefill, logit fidelity against the family golden reference, prefix-cache restore exactness \
-        and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).\n");
+    out.push_str("Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking \
+        off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and \
+        drafts and reads higher), cold 8K prefill, logit fidelity against the family golden reference, prefix-cache \
+        restore exactness and lossless speculation. Older releases, other profiles and every report: \
+        [benchmarks](benchmarks/README.md).\n");
+    out.push_str(&retired);
+    Ok(out)
+}
+
+fn retired_results(placed: &[Placed], entries: &[Retired]) -> Result<String> {
+    validate_retired(entries)?;
+    if entries.is_empty() { return Ok(String::new()); }
+    let escape = crate::render::svg::escape;
+    let mut out = String::from("\n### Retired\n\nLast Release-smoke cards for retired configurations; no new measurements. \
+        Version labels identify the actual tagged or development build recorded by each report; hover for provenance.\n\n\
+        <table>\n<tr><th>Model</th><th>Config</th><th>Version</th><th>Last card</th></tr>\n");
+    for entry in entries {
+        let p = placed.iter().find(|p| p.dir == entry.report)
+            .with_context(|| format!("{}: missing retired report {}", entry.name, entry.report.display()))?;
+        if p.report.profile != "smoke" || p.report.baseline.is_none() {
+            bail!("{}: retired card must pin a measured Release-smoke report", entry.name);
+        }
+        let build = &p.report.server.build;
+        let provenance = format!("build {}; commit {}; {}", build.label(),
+            build.commit.as_deref().unwrap_or("unknown"), entry.release_note);
+        let card = escape(&link(&p.dir, "card.svg"));
+        out.push_str(&format!("<tr><td>{}</td><td><a href=\"{}\">{}</a><br><sub>{}</sub></td>\
+            <td title=\"{}\">{}</td><td><a href=\"{card}\"><img width=\"360\" src=\"{card}\" alt=\"{}\"></a>{}{}</td></tr>\n",
+            escape(&p.report.server.checkpoint()), escape(&entry.config.to_string_lossy()),
+            escape(&entry.name), escape(&short_hardware(&p.report)),
+            escape(&provenance), escape(&entry.release), escape(&entry.name), quality_note(p), caveat(p)));
+    }
+    out.push_str("</table>\n");
     Ok(out)
 }
 
@@ -728,6 +848,11 @@ pub fn publish(root: &Path, dirs: &[PathBuf], matrix_path: &Path) -> Result<(Pat
     // Resolve first: a missing pinned report must fail before any file is touched.
     // Superseded exports remain archived unchanged, including their images.
     let rows = select(&placed, &matrix)?;
+    // Validate historical pins before touching any generated document or image.
+    retired_results(&placed, &matrix.retired)?;
+    for p in &placed {
+        slim_placed(&root.join(&p.dir))?;
+    }
     for row in &rows {
         for cell in &row.cells {
             if let Resolved::Card(p) = cell {
@@ -767,11 +892,17 @@ pub fn one_row_of(placed: &Placed) -> Matrix {
     };
     let cells = [cell(Column::Rtx5090), cell(Column::OneRtx), cell(Column::TwoRtx)];
     Matrix { rows: vec![MatrixRow::new(report.server.family.as_deref().unwrap_or("unknown"),
-        &report.server.checkpoint(), cells)] }
+        &report.server.checkpoint(), cells)], retired: Vec::new() }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mistral_large4_is_named_and_published() {
+        assert_eq!(super::family_title("mistral_large4"), "Mistral Large 4");
+        assert!(super::FAMILIES.contains(&"mistral_large4"));
+    }
+
     use super::*;
 
     /// A publication marker: cell selection reads report data, never a directory name.
@@ -862,7 +993,7 @@ mod tests {
         assert!(!html.contains("older/card.svg"));
         assert!(index(&reports).contains("older/report.svg"));
         // An empty matrix publishes nothing, and says so.
-        assert_eq!(results(&reports, &Matrix { rows: Vec::new() }).unwrap(), "_Pending the first published run._\n");
+        assert_eq!(results(&reports, &Matrix { rows: Vec::new(), retired: Vec::new() }).unwrap(), "_Pending the first published run._\n");
     }
 
     #[test]
@@ -1030,7 +1161,7 @@ mod tests {
             } },
         ];
         let matrix = Matrix { rows: vec![MatrixRow::new("mimo_v2", "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
-            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])] };
+            [Cell::pending("no 5090 card yet"), Cell::current(), Cell::pending("no two-RTX card")])], retired: Vec::new() };
         let rows = select(&placed, &matrix).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows.iter().any(|row| row.label.contains("MiMo-V2-Flash")));
@@ -1120,6 +1251,71 @@ mod tests {
         assert!(Matrix::load(root.path()).is_err());
     }
 
+    #[test]
+    fn retired_schema_and_rendering_are_pinned_and_escaped() {
+        let mut p = marked("old", 1, None);
+        p.report.profile = "smoke".into();
+        p.report.server.build.commit = Some("abc123".into());
+        let entry = Retired { name: "old<&".into(), config: "examples/configs/old.config".into(),
+            report: p.dir.clone(), release: "v3 dev 2026-10-14 <local>".into(), release_note: "actual <build>".into() };
+        let doc = serde_json::json!({"schema": MATRIX_SCHEMA, "cells": [], "retired": [entry]});
+        let matrix = Matrix::parse(&doc.to_string()).unwrap();
+        let html = results(&[p.clone()], &matrix).unwrap();
+        assert!(html.contains("### Retired"));
+        assert!(html.contains("old&lt;&amp;"));
+        assert!(html.contains("abc123; actual &lt;build&gt;"));
+        assert!(html.contains("v3 dev 2026-10-14 &lt;local&gt;</td>"));
+        let mut tagged = doc.clone();
+        tagged["retired"][0]["release"] = "v3.0.0-rc5".into();
+        let tagged = Matrix::parse(&tagged.to_string()).unwrap();
+        assert!(results(&[p.clone()], &tagged).unwrap().contains("v3.0.0-rc5</td>"));
+        assert!(html.contains("benchmarks/deepseek_v41/old/card.svg"));
+        assert!(!html.contains("<th>5090</th>"));
+        let newer = marked("newer", 1, None);
+        assert!(results(&[newer], &matrix).unwrap_err().to_string().contains("missing retired report"));
+        p.report.profile = "speed".into();
+        assert!(results(&[p], &matrix).is_err());
+        for (key, bad) in [("report", "../escape"), ("config", "examples/configs/../bad.config"),
+            ("release", ""), ("release", " \t"), ("release", "v3\ninvalid"), ("release_note", ""), ("name", "")] {
+            let mut invalid = doc.clone();
+            invalid["retired"][0][key] = bad.into();
+            assert!(Matrix::parse(&invalid.to_string()).is_err(), "{key}");
+        }
+        let mut duplicate = doc.clone();
+        duplicate["retired"].as_array_mut().unwrap().push(doc["retired"][0].clone());
+        assert!(Matrix::parse(&duplicate.to_string()).is_err());
+        let mut unknown = doc;
+        unknown["retired"][0]["typo"] = true.into();
+        assert!(Matrix::parse(&unknown.to_string()).is_err());
+    }
+
+    #[test]
+    fn current_exports_dry_render_only_adds_retired_section() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
+        let placed = scan(&root).unwrap();
+        let rendered = results(&placed, &matrix).unwrap();
+        let readme = std::fs::read_to_string(root.join("README.md")).unwrap();
+        let existing = readme.split_once(RESULTS_BEGIN).unwrap().1.split_once(RESULTS_END).unwrap().0.trim();
+        let current = rendered.split_once("\n### Retired").unwrap().0.trim();
+        // Once the generated README carries Retired, compare the same main section.
+        assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
+        assert_eq!(matrix.retired.len(), 20);
+        let retired = rendered.split_once("\n### Retired").unwrap().1;
+        assert!(!retired.contains("nearest final release"));
+        for entry in &matrix.retired {
+            let report = &placed.iter().find(|p| p.dir == entry.report).unwrap().report;
+            let expected = report.server.build.release.clone()
+                .unwrap_or_else(|| format!("v3 dev {}", &report.created[..10]));
+            assert_eq!(entry.release, expected, "{} must name the actual build", entry.name);
+            assert!(retired.contains(&format!(">{}</td>", crate::render::svg::escape(&expected))));
+            assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
+        }
+        let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+            root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
+    }
+
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
     fn write_matrix(root: &Path, rows: &[MatrixRow]) -> PathBuf {
         let path = root.join(MATRIX_FILE);
@@ -1147,7 +1343,7 @@ mod tests {
             default: None, source: "cli".into(),
         });
         assert_eq!(coordinator_budget(&p.report), Some(31.8));
-        assert!(short_hardware(&p.report).contains("simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
+        assert!(short_hardware(&p.report).starts_with("simulated 5090"));
         assert!(p.report.server.hardware_line().contains("RTX PRO 6000 (188 SMs) capped at 31.8 GiB"));
         assert!(crate::render::card::card_svg(&p.report).contains("simulated 5090"));
         p.report.server.configuration.settings.last_mut().unwrap().value = Some("NaN".into());
@@ -1269,11 +1465,16 @@ mod tests {
         assert!(!panel.contains("FIDELITY FAILURE"), "{panel}");
         let report = std::fs::read_to_string(dir.join("report.svg")).unwrap();
         assert!(!report.contains("QUALITY GATE FAILED"), "{report}");
-        // The exports are never edited after publication: the rasterized card
-        // follows the SVG, and the data behind it is the file that was placed,
-        // byte for byte.
-        assert_eq!(std::fs::read(dir.join("report.json")).unwrap(), fixture["report.json"],
-            "publishing rewrote the run's data");
+        // Publishing sets the verdict once and slims the data: the stored failure
+        // becomes the calibrated W4A4 info status, the measured numbers stay.
+        let stored: Value = serde_json::from_slice(&fixture["report.json"]).unwrap();
+        let written: Value = serde_json::from_slice(&std::fs::read(dir.join("report.json")).unwrap()).unwrap();
+        let fidelity = |r: &Value| r["baseline"]["quality"]["checks"].as_array().unwrap().iter()
+            .find(|c| c["id"] == "fidelity").unwrap().clone();
+        assert_eq!(fidelity(&written)["status"], "info");
+        assert_eq!(fidelity(&written)["note"], crate::quality::CALIBRATED_W4A4);
+        assert_eq!(fidelity(&written)["metrics"]["kl"], fidelity(&stored)["metrics"]["kl"]);
+        assert_eq!(written["baseline"]["card"], stored["baseline"]["card"]);
         assert_ne!(std::fs::read(dir.join("card.png")).unwrap(), fixture["card.png"],
             "the stale card PNG was kept");
         // The caption under its image follows: no stored failure is republished.
@@ -1436,15 +1637,15 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_matrix_resolves_one_pinned_card_per_pro_cell() {
+    fn checked_in_matrix_resolves_every_row_to_a_pinned_pro_card() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let placed = scan(&root).unwrap();
         let matrix = Matrix::load(&root.join(MATRIX_FILE)).unwrap();
         let rows = select(&placed, &matrix).unwrap();
-        assert_eq!(rows.len(), 12);
+        assert_eq!(rows.len(), matrix.rows.len());
         for row in rows {
             assert!(matches!(row.cells[0], Resolved::Card(_) | Resolved::Na(_)));
-            // One release card per checkpoint; the other PRO column is n/a.
+            // Every published checkpoint has at least one PRO card; other cells say why not.
             assert!(row.cells[1..].iter().any(|c| matches!(c, Resolved::Card(_))));
             assert!(row.cells[1..].iter().all(|c| matches!(c, Resolved::Card(_) | Resolved::Na(_))));
         }
@@ -1588,4 +1789,23 @@ mod tests {
         assert!(publish(root.path(), &[], &missing).is_err());
         assert_eq!(std::fs::read_to_string(root.path().join("README.md")).unwrap(), before);
     }
+
+    #[test]
+    fn slim_drops_per_row_records_and_baseline_fabric_only() {
+        let mut report = serde_json::json!({
+            "fabric": [{"name": "decode/code/c1"}],
+            "baseline": {"fabric": [{"name": "decode/code/c1"}], "quality": {"status": "pass", "checks": [
+                {"id": "fidelity", "metrics": {"kl": 0.01, "probe": {"rows": [{"position": 0}], "cold": true},
+                    "run": {"score": {"kl": 0.01, "records": [{"position": 0}]}}}},
+                {"id": "cache", "metrics": {"restored": 2}}]}}});
+        super::slim(&mut report);
+        assert!(report["baseline"].get("fabric").is_none());
+        assert_eq!(report["fabric"][0]["name"], "decode/code/c1");
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["records"], serde_json::json!([]));
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["run"]["score"]["kl"], 0.01);
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["probe"]["rows"], serde_json::json!([]));
+        assert_eq!(report["baseline"]["quality"]["checks"][0]["metrics"]["probe"]["cold"], true);
+        assert_eq!(report["baseline"]["quality"]["checks"][1]["metrics"]["restored"], 2);
+    }
+
 }

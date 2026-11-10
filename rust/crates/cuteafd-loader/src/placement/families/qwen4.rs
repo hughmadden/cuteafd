@@ -3,6 +3,7 @@
 //! here. Startup graphs depend on the admitted pool, so resolve their shape
 //! before publishing the final placement, without taking another CUDA sample.
 use crate::families::qwen4::Qwen4Attention;
+use crate::serving_capacity::Exl3Epilogue;
 use crate::placement::*;
 use crate::serving_capacity::qwen_graphs::{qwen_admission, qwen_startup_graphs, QwenAdmissionInputs, QWEN_UNIT_ROWS};
 use cuteafd_core::memory_layout::{Basis, Category, ItemLifetime};
@@ -23,6 +24,7 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub admission: QwenAdmissionInputs<'a>,
@@ -63,10 +65,19 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     let mut fixed = admission.items.iter().map(|&(category, group, bytes)|
         Demand::new(0, category, group, bytes, Basis::Formula)).collect::<Vec<_>>();
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
+    if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
+        // Runtime creates SparkLink before sampling free memory. Only the
+        // header-only planner still needs to reserve its return planes and codec.
+        fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
+            crate::serving_capacity::prefill_return_bytes_with_format(
+                inputs.admission.prefill_shape.map_or(1, |shape| shape.waves),
+                inputs.admission.prefill_shape.map_or(inputs.admission.prefill_rows.max(64), |shape| shape.unit_rows),
+                inputs.spark_ranks as u64, inputs.admission.cfg.hidden as u64, inputs.spark_reply_format)?, Basis::Formula));
+    }
     if inputs.pending_code_bytes > 0 {
         fixed.push(Demand::new(0, Category::Runtime, "loaded code", inputs.pending_code_bytes, Basis::Formula));
     }
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: inputs.capacity_bytes,
             headroom_bytes: admission.headroom, baseline: inputs.baseline }],
             spark_ranks: inputs.spark_ranks, peer_access: false },
@@ -99,7 +110,7 @@ pub fn placement(inputs: &QwenInputs<'_>) -> anyhow::Result<Placement> {
         }
         return Ok(result);
     };
-    anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
+    cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     let tokens = solve(&request(inputs, 0)?)?.pool_tokens;
     super::super::settle_pool((tokens, ()), |tokens, _| {
         let graphs = qwen_startup_graphs(usize::try_from(inputs.max_context)?, usize::try_from(tokens)?,
@@ -129,7 +140,7 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
             } else {
                 use crate::formats::fp8_experts::{Fp8Projection, Slicing};
                 let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs EXL3/FP8/NVFP4 tensors"))?
-                    .for_layer(layer)?;
+                    .for_layer(layer)?.for_coordinator();
                 tensors.validate_layer(layer)?;
                 let slicing = if world == 2 { Slicing::Blocks(128) } else { Slicing::Padded };
                 Fp8Projection::ALL.iter().try_fold(0u64, |total, &projection| {
@@ -156,8 +167,8 @@ pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path
         let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
         Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
     } else {
-        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?;
-        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?.for_coordinator();
+        let root = root.join("fp8").join(tensors.format().package_name("qwen4"));
         let rank = |rank| -> anyhow::Result<_> {
             Ok(root.join(format!("tp2-w{}", tensors.rank_width(2, rank,
                 crate::formats::fp8_experts::Slicing::Blocks(128))?)))
@@ -189,7 +200,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
                 && m["capacity"].as_u64() == Some(capacity), "Qwen MTP package geometry: {}", path.display());
             Ok(m)
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true)? + rows * shape.hidden as u64 * 2)
+        (resident, crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)? + rows * shape.hidden as u64 * 2)
     } else {
         let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen MTP format unsupported"))?.for_layer(shape.layers)?;
         tensors.validate_layer(shape.layers)?;
@@ -198,7 +209,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
             let scales = tensors.scale_region_bytes_with(projection, 1, 0, Slicing::Padded)?;
             Ok::<_, anyhow::Error>(total + weights as u64 * shape.experts as u64 + scales as u64)
         })?;
-        let root = root.join("fp8").join(format!("fp8-qwen4{}", if tensors.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 { "-nvfp4a4" } else { tensors.format().package_suffix() }));
+        let root = root.join("fp8").join(tensors.format().package_name("qwen4"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
         let info = &manifest["layouts"]["tp1"];
         let weights = match tensors.format() {
@@ -237,7 +248,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
         let width = if let Some(exl3) = catalog.exl3() {
             exl3.residency(crate::V41Exl3Layer::Backbone(0), 2, rank)?.intermediate as u64
         } else {
-            catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert format is unsupported"))?
+            catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert format is unsupported"))?.for_coordinator()
                 .rank_width(2, rank, Slicing::Blocks(128))? as u64
         };
         let scratch = if catalog.exl3().is_some() {
@@ -254,7 +265,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
                     "Qwen EXL3 TP2 rank {rank} package geometry mismatch: {}", path.display());
                 Ok(value)
             }).collect::<anyhow::Result<Vec<_>>>()?;
-            crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?
+            crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?
         } else {
             let tensors = catalog.fp8().unwrap();
             let parent = package.parent().ok_or_else(|| anyhow::anyhow!("Qwen TP2 package has no parent"))?;
@@ -471,7 +482,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     for bytes in &mut overhead { *bytes = bytes.div_ceil(QWEN_UNIT_ROWS as u64) * QWEN_UNIT_ROWS as u64; }
     let mut fixed = inputs.fixed.clone();
     for gpu in 0..2 {
-        let owner = QwenAdmissionInputs { cfg: a.cfg, layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
+        let owner = QwenAdmissionInputs { prefill_shape: None, cfg: a.cfg, layers: a.layers, mtp: a.mtp, kv_format: a.kv_format,
             manifest: inputs.owner_manifests[gpu].or(a.manifest), prefill_rows: a.prefill_rows,
             slots: a.slots, mark_bytes: a.mark_bytes, full_prefill_logits: a.full_prefill_logits,
             ple: a.ple, future_expert_bytes: a.future_expert_bytes, headroom: a.headroom };
@@ -503,7 +514,7 @@ pub fn dual_request(inputs: &QwenDualInputs<'_>, graph_bytes: [u64; 2]) -> anyho
     let mut pool = PoolPolicy::resolve(&capacities, inputs.max_context, inputs.requested_pool,
         QWEN_UNIT_ROWS as u64, inputs.spark_ranks == 0).with_automatic_context(inputs.automatic_context);
     pool.ceiling = pool.target;
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         inventory: Inventory { gpus: inputs.gpus.to_vec(), spark_ranks: inputs.spark_ranks, peer_access: true },
         attention_placement: Some(AttentionPlacement::Layers), context_buffers: ContextBuffers::default(), layers_first_gpu: 0,
         pool_bounded: Vec::new(),
@@ -543,7 +554,7 @@ pub fn dual_placement(inputs: &QwenDualInputs<'_>) -> anyhow::Result<Placement> 
         }
         return Ok(result);
     };
-    anyhow::ensure!(sequences <= 16, "Qwen startup graphs support at most 16 concurrent sequences");
+    cuteafd_core::concurrency::validate("qwen4", sequences as u64)?;
     let result = solve(&dual_request(inputs, [0; 2])?)?;
     super::super::settle_pool((result.pool_tokens, owners(&result)?), |tokens, layer_owners| {
         check_dual_layer_owners(layer_owners)?;
@@ -609,8 +620,8 @@ mod tests {
         let resident = crate::families::qwen4::resident::Qwen4CheckpointResident {
             ple_table_bytes: 1 << 30, ..Default::default() };
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
-        let inputs = QwenInputs { automatic_context: false,
-            admission: QwenAdmissionInputs { cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
+        let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+            admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false, kv_format: Qwen4KvCache::Bf16,
                 manifest: None, prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                 ple: None, future_expert_bytes: 0, headroom: 0 },
             capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 96 << 30 },
@@ -631,7 +642,9 @@ mod tests {
             layer.kv_unit = ModeBytes::replicated((1 << 30) / 4096).into();
             layer.extra = extra;
         }
-        for (entry, cut, owner) in [(0, 2, 0), (4 << 30, 1, 1)] {
+        // Charge enough entry pressure to move the capacity-maximizing cut,
+        // rather than balancing only the bytes of the requested 2M pool.
+        for (entry, cut, owner) in [(0, 2, 0), (64 << 30, 1, 1)] {
             req.fixed = vec![Demand::new(0, Category::Weights, "entry", entry, Basis::Exact)];
             let placement = solve(&req).unwrap();
             assert_eq!(placement.pool_tokens, 2 << 20);
@@ -845,7 +858,7 @@ mod tests {
                     Demand::new(0, Category::Experts, "MTP expert workspace", 64 << 20, Basis::Formula)]);
             }
             let inputs = QwenDualInputs { automatic_context: false, owner_manifests: [None, None],
-                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format: Qwen4KvCache::Bf16, manifest: None,
+                admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format: Qwen4KvCache::Bf16, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
                 gpus: [0, 1].map(|_| GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 3 << 30,
@@ -905,7 +918,7 @@ mod tests {
                 cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64, None, None).unwrap()).unwrap();
             let inputs = |measured| QwenDualInputs { automatic_context: false,
                 owner_manifests: manifests.each_ref().map(Some),
-                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
+                admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 0, headroom: 3 << 30 },
                 gpus: [0, 1].map(|_| GpuBudget { capacity_bytes: 96 << 30, headroom_bytes: 3 << 30,
@@ -977,8 +990,8 @@ mod tests {
                 for requested in [None, Some(32768), Some(2097152)] {
                     let context = requested.unwrap_or(131072).min(131072);
                     let context_bytes = 586_416_128;
-                    let inputs = |baseline| QwenInputs { automatic_context: false,
-                        admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
+                    let inputs = |baseline| QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                             prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                             ple: Some((160, true)), future_expert_bytes: 0, headroom: 3 << 30 },
                         capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: context,
@@ -1008,14 +1021,57 @@ mod tests {
     }
 
     #[test]
+    fn spark_intake_is_charged_once_across_planned_and_measured_baselines() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let (total, context_bytes, loaded_bytes) = (32_u64 << 30, 1_u64 << 30, 23_u64 << 30);
+        for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+            cuteafd_core::SparkReplyFormat::Nvfp4] {
+        for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 }),
+            Some(crate::serving_capacity::PrefillShape { unit_rows: 4096, waves: 2 })] {
+            let inputs = |baseline| QwenInputs { spark_reply_format: format, automatic_context: false,
+                admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
+                    kv_format: Qwen4KvCache::Fp8, manifest: None,
+                    prefill_rows: shape.map_or(4096, |s| s.slot_rows()), slots: 16,
+                    mark_bytes: 0, full_prefill_logits: 0, ple: Some((160, true)),
+                    future_expert_bytes: 0, headroom: 0 },
+                capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: 1048576,
+                requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
+            let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
+            let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
+            // Fused reduction reads packed replies in the BF16 fallback planes.
+            let rows = shape.map_or(4096, |s| s.slot_rows());
+            assert_eq!(intake.bytes, 4
+                * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * 2560 * 2).unwrap());
+            let measured = inputs(Baseline::Measured {
+                free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
+            let runtime = request(&measured, 0).unwrap();
+            assert!(!runtime.fixed.iter().any(|d| d.group == "Spark intake planes"));
+            let (p, r) = (solve(&planned).unwrap(), solve(&runtime).unwrap());
+            assert_eq!(p.pool_tokens, r.pool_tokens);
+            assert!(r.pool_tokens < runtime.pool.target, "fixture must be memory limited");
+            let mut double_charged = runtime;
+            double_charged.fixed.push(intake.clone());
+            let old = solve(&double_charged).unwrap();
+            let delta = r.pool_tokens - old.pool_tokens;
+            let per_token = qwen_admission(&measured.admission).unwrap().per_token;
+            assert!(delta > 0);
+            assert!((delta * per_token).abs_diff(intake.bytes) < 256 * per_token,
+                "only one pool allocation unit may be lost to rounding");
+            println!("Qwen Spark intake {:?}: {} bytes, pool {} -> {} (+{delta} tokens)",
+                shape, intake.bytes, old.pool_tokens, r.pool_tokens);
+        }
+        }
+    }
+
+    #[test]
     fn qwen_pool_demands_match_geometry_and_lazily_loaded_experts() {
         let mut config = crate::plan::testing::qwen4_config(48);
         config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
         let cfg = Qwen4Config::from_hf(&config).unwrap();
         for (mtp, kv_format) in [false, true].into_iter().flat_map(|mtp|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (mtp, format))) {
-            let inputs = QwenInputs { automatic_context: false,
-                admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
+            let inputs = QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp, kv_format, manifest: None,
                     prefill_rows: 4096, slots: 16, mark_bytes: 256 << 20, full_prefill_logits: 0,
                     ple: None, future_expert_bytes: 10 << 30, headroom: 3 << 30 },
                 capacity_bytes: 96 << 30, baseline: Baseline::Measured { free_bytes: 70 << 30 },

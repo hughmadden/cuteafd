@@ -75,7 +75,7 @@ pub struct ModelPlan {
     /// `(compressor, index, device identity, model page)` for pages to copy.
     pub copies: Vec<(u8, u32, DevicePageId, u32)>,
     /// Per compressor, in logical order, the page references (shared or newly allocated).
-    pub pages: [Vec<u32>; COMPRESSORS],
+    pub pages: [Vec<u32>; cuteafd_hostcache::PAGE_BANKS],
     pub slab_bytes: u64,
 }
 
@@ -108,9 +108,9 @@ impl Model {
     pub fn plan(
         &mut self,
         meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
+        device_pages: &[Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS],
     ) -> Key {
-        let mut pages: [Vec<u32>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+        let mut pages: [Vec<u32>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
         let mut copies = Vec::new();
         let mut slab_bytes = self.layout.tail as u64;
         if self.layout.scores > 0 {
@@ -129,7 +129,7 @@ impl Model {
                         self.next_page += 1;
                         self.page_device.insert(page, id);
                         self.page_refs.insert(page, 0);
-                        page_bytes += self.layout.page as u64;
+                        page_bytes += self.layout.page_size(compressor) as u64;
                         copies.push((compressor as u8, index as u32, id, page));
                         page
                     }
@@ -200,7 +200,7 @@ impl Model {
     pub fn store(
         &mut self,
         meta: &SnapshotMeta,
-        device_pages: &[Vec<DevicePageId>; COMPRESSORS],
+        device_pages: &[Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS],
     ) -> Key {
         let key = self.plan(meta, device_pages);
         self.commit(key)
@@ -244,7 +244,7 @@ impl Model {
             if self.mapped.get(&device) == Some(&page) {
                 self.mapped.remove(&device);
             }
-            self.bytes -= self.layout.page as u64;
+            self.bytes -= self.layout.page_size(device.compressor as usize) as u64;
         }
     }
 
@@ -272,18 +272,35 @@ impl Model {
         (evicted, freed)
     }
 
+    /// Independent pairwise oracle: unlike production's sorted-path scan, compare every
+    /// resident against every other path, including the not-yet-admitted store.
+    pub fn eviction_candidates(&self, incoming: Option<&SnapshotMeta>) -> Vec<Key> {
+        match self.order {
+            EvictionOrder::LeastRecent => {
+                let mut candidates: Vec<_> = self.snapshots.iter()
+                    .filter(|(_, snapshot)| snapshot.pins == 0).collect();
+                candidates.sort_unstable_by_key(|(_, snapshot)| {
+                    let extends = |tokens: &[u32]| tokens.len() > snapshot.tokens.len()
+                        && tokens.starts_with(&snapshot.tokens);
+                    let ancestor = self.snapshots.values().any(|other| extends(&other.tokens))
+                        || incoming.is_some_and(|meta| extends(&meta.tokens));
+                    (ancestor, snapshot.last_use)
+                });
+                candidates.into_iter().map(|(&key, _)| key).collect()
+            }
+            EvictionOrder::Banks => [SnapshotKind::Prompt, SnapshotKind::Turn].into_iter()
+                .flat_map(|kind| self.retention.bank(kind).eviction_order().into_iter().copied())
+                .filter(|key| self.snapshots.get(key).is_some_and(|s| s.pins == 0)).collect(),
+        }
+    }
+
     /// Evict the next unpinned snapshot in the model's order; `None` when only pinned
     /// snapshots remain. Mirrors `Snapshots::evict_one`.
     pub fn evict_one(&mut self) -> Option<(Key, u64)> {
         let before = self.bytes;
         let key = match self.order {
             EvictionOrder::LeastRecent => {
-                let key = self
-                    .snapshots
-                    .iter()
-                    .filter(|(_, snapshot)| snapshot.pins == 0)
-                    .min_by_key(|(_, snapshot)| snapshot.last_use)
-                    .map(|(&key, _)| key)?;
+                let key = self.eviction_candidates(None).into_iter().next()?;
                 self.remove(key);
                 key
             }
@@ -402,8 +419,8 @@ pub enum Op {
 }
 
 /// Spread a flat page list across the compressor banks, as the engine's page lists are.
-fn distribute(pages: &[DevicePageId]) -> [Vec<DevicePageId>; COMPRESSORS] {
-    let mut device_pages: [Vec<DevicePageId>; COMPRESSORS] = std::array::from_fn(|_| Vec::new());
+fn distribute(pages: &[DevicePageId]) -> [Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS] {
+    let mut device_pages: [Vec<DevicePageId>; cuteafd_hostcache::PAGE_BANKS] = std::array::from_fn(|_| Vec::new());
     for (index, &id) in pages.iter().enumerate() {
         device_pages[index % COMPRESSORS].push(id);
     }
@@ -540,12 +557,21 @@ pub fn apply(
     }
 }
 
-/// Mirror the cache's eviction-on-exhaustion: while planning a store the cache may evict
-/// unpinned snapshots, so bring the model's resident set down to the cache's.
-pub fn reconcile<P>(cache: &HostCache<StubCopyEngine, P>, model: &mut Model) {
-    while model.snapshots.len() > cache.metrics().resident_snapshots as usize {
-        if model.evict_one().is_none() {
-            break;
-        }
+/// Admission's slab fragmentation determines how many entries leave, but the independent
+/// oracle determines exactly which ones. Freeze its ranking for the same bulk admission pass.
+pub fn reconcile<P>(cache: &HostCache<StubCopyEngine, P>, model: &mut Model,
+    incoming: &SnapshotMeta) {
+    let resident = cache.metrics().resident_snapshots as usize;
+    let count = model.snapshots.len().checked_sub(resident).expect("unexpected resident growth");
+    let candidates = model.eviction_candidates(Some(incoming));
+    assert!(count <= candidates.len(), "admission evicted pinned entries");
+    for key in candidates.into_iter().take(count) {
+        assert!(cache.snapshot_tokens(key).is_none(), "wrong admission victim: expected {key}");
+        assert!(model.remove(key));
+    }
+    assert_eq!(model.snapshots.len(), resident, "admission resident count");
+    for (&key, snapshot) in &model.snapshots {
+        assert_eq!(cache.snapshot_tokens(key), Some(snapshot.tokens.as_slice()),
+            "unexpected admission victim {key}");
     }
 }

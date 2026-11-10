@@ -38,8 +38,8 @@ impl V41Tp4Tcp {
         world: SparkWorld,
     ) -> Result<Self> {
         ensure!(
-            peers.len() == executors.len() && (1..=6).contains(&peers.len()),
-            "native TP/EP requires 1..=6 matching peers and executors"
+            peers.len() == executors.len() && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers.len()),
+            "native TP/EP requires 1..=8 matching peers and executors"
         );
         if let Some(topology) = world.ownership_topology() {
             ensure!(

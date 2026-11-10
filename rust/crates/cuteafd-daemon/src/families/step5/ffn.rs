@@ -1,4 +1,5 @@
-//! Admitted post-attention dense FFN. This is not a serving executor.
+//! Admitted post-attention dense FFN owner used by target and MTP serving blocks.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
@@ -6,15 +7,34 @@ use cuteafd_core::{DType, FfnActivation};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
+    families::step5::{Config, coordinator::{LayerContract, RankWeightLayout, WeightOperand}},
 };
 
 const HIDDEN: usize = 4096;
 const DENSE: usize = 13824;
 
+fn native_stage_pointers(
+    stage: usize,
+    planes: &[*mut std::ffi::c_void],
+    weights: &[*mut std::ffi::c_void],
+    gate: *mut std::ffi::c_void,
+    up: *mut std::ffi::c_void,
+) -> Vec<*mut std::ffi::c_void> {
+    // Native gate/up/down live outside the legacy weight list, which holds only norm.
+    match stage {
+        0 => vec![planes[0], weights[0], weights[0], weights[0], weights[0], weights[0], planes[1]],
+        1 | 3 => Vec::new(),
+        2 => vec![gate, up, planes[3]],
+        4 => vec![planes[0], planes[4], planes[5]],
+        _ => unreachable!("validated dense stage"),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Admission {
     rows: usize,
+    /// Rows of every in-flight unit held by the live planes (`span >= rows`).
+    span: usize,
     planes: [usize; 6],
     bytes: u64,
 }
@@ -30,26 +50,9 @@ impl Admission {
             rows > 0 && rows <= 4096,
             "Step-5 dense row capacity must be 1..=4096"
         );
-        let shapes = [
-            (HIDDEN, 4),
-            (HIDDEN, 2),
-            (2 * DENSE, 2),
-            (DENSE, 2),
-            (HIDDEN, 2),
-            (HIDDEN, 4),
-        ];
-        let mut planes = [0; 6];
-        let mut bytes = 0u64;
-        for (plane, (width, elem)) in planes.iter_mut().zip(shapes) {
-            *plane = rows
-                .checked_mul(width)
-                .and_then(|n| n.checked_mul(elem))
-                .context("dense workspace overflow")?
-                .max(256);
-            bytes = bytes
-                .checked_add(*plane as u64)
-                .context("dense workspace overflow")?;
-        }
+        let planes = cuteafd_loader::plan::families::step5::native::dense_planes(rows)?;
+        let mut bytes = planes.iter().try_fold(0u64, |n, &v| n.checked_add(v as u64))
+            .context("dense workspace overflow")?;
         for weight in weights {
             bytes = bytes
                 .checked_add(weight.allocation_bytes)
@@ -65,6 +68,7 @@ impl Admission {
         );
         Ok(Self {
             rows,
+            span: rows,
             planes,
             bytes,
         })
@@ -75,14 +79,20 @@ struct DenseWeights<'a> {
     weights: Vec<Allocation<'a>>,
     programs: Vec<Program<'a>>,
     epsilon: f32,
+    /// EXL3 gate, up, down; programs are then [norm, split activation, residual].
+    native: Option<[super::native::NativeLinear<'a>; 3]>,
 }
 
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
     stream: Stream<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
+    /// The rank's serialized native projection scratch (native FFNs only).
+    native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
     immutable: std::rc::Rc<DenseWeights<'a>>,
+    /// Row offset of the selected prefill unit inside the live planes.
+    unit: std::cell::Cell<usize>,
 }
 
 pub(super) struct DensePlan {
@@ -91,6 +101,9 @@ pub(super) struct DensePlan {
     admission: Admission,
     activation: String,
     epsilon: f32,
+    /// Native gate/up/down `.weight` names when the checkpoint stores them EXL3.
+    native: Option<[String; 3]>,
+    layer: usize,
 }
 
 impl DensePlan {
@@ -99,7 +112,20 @@ impl DensePlan {
     }
 
     pub fn workspace_bytes(&self) -> u64 {
-        self.admission.planes.iter().map(|&n| n as u64).sum()
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+    /// Live planes hold `span` rows (every in-flight unit); scratch holds one.
+    pub(super) fn with_span(mut self, span: usize) -> Result<Self> {
+        ensure!(span >= self.admission.rows, "Step-5 dense span smaller than unit capacity");
+        let live = cuteafd_loader::plan::families::step5::native::dense_planes(span)?;
+        for plane in 0..6 {
+            if cuteafd_loader::plan::families::step5::native::dense_live(plane) {
+                self.admission.planes[plane] = live[plane];
+            }
+        }
+        self.admission.span = span;
+        Ok(self)
     }
 
     pub fn prepare(
@@ -123,10 +149,21 @@ impl DensePlan {
         reservations: &[u64],
         rank: usize,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        _contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         ensure!(ownership.layer(layer, rank)?.ffn, "Step-5 dense FFN is not owned by rank {rank}");
         Self::prepare_layout(programs, checkpoint, layer, rows, available, reservations,
-            RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
+            layout.clone())
+    }
+
+    pub(super) fn for_mtp_stage(
+        programs: &Programs<'_>, checkpoint: &Checkpoint, stage: usize, rows: usize,
+        available: u64, reservations: &[u64], contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract,
+    ) -> Result<Self> {
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::prepare_layout(programs, checkpoint, cfg.layers + stage, rows, available,
+            reservations, layout)
     }
 
     fn prepare_layout(
@@ -138,20 +175,25 @@ impl DensePlan {
         reservations: &[u64],
         layout: RankWeightLayout,
     ) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer_contract = contract
-            .layers
-            .get(layer)
-            .context("dense target layer out of range")?;
+        let cfg = Config::parse(checkpoint)?;
+        let layer_contract = LayerContract::from_config(&cfg, layer)?;
         let Some(FfnActivation::SiluPostClampFp32Product { limit }) =
             layer_contract.dense_activation
         else {
-            anyhow::bail!("Step-5 dense chain requires a dense target layer");
+            anyhow::bail!("Step-5 dense chain requires a dense layer");
         };
         ensure!(
             limit == 7.0 || limit == 10.0,
             "unsupported Step-5 dense clamp {limit}"
         );
+        let native_names = ["gate", "up", "down"].map(|p| format!("model.layers.{layer}.mlp.{p}_proj.weight"));
+        let native = native_names.iter().all(|name| layout.core.contains_key(name));
+        ensure!(native || native_names.iter().all(|name| !layout.core.contains_key(name)),
+            "Step-5 layer {layer} dense FFN mixes native and BF16 operands");
+        if native {
+            return Self::prepare_native(programs, checkpoint, layer, rows, available, reservations, layout,
+                limit, native_names, cfg.norm_eps);
+        }
         // Each admitted owner executes a whole native FFN; no collective is implied.
         let names = [
             format!("model.layers.{layer}.post_attention_layernorm.weight"),
@@ -239,12 +281,50 @@ impl DensePlan {
             weights,
             admission,
             activation,
-            epsilon: contract.norms.post_attention,
+            epsilon: cfg.norm_eps,
+            native: None,
+            layer,
         })
+    }
+
+    /// EXL3 gate/up/down: the same planes, one compressed projection per
+    /// stage and the split post-SiLU clamp over separately stored gate/up rows.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_native(programs: &Programs<'_>, checkpoint: &Checkpoint, layer: usize, rows: usize,
+        available: u64, reservations: &[u64], layout: RankWeightLayout, limit: f32,
+        names: [String; 3], epsilon: f32) -> Result<Self> {
+        let _ = checkpoint;
+        let norm = layout.operands.iter().find(|w| w.name == format!("model.layers.{layer}.post_attention_layernorm.weight"))
+            .context("dense norm operand missing")?.clone();
+        ensure!(norm.dtype == DType::F32 && norm.shape == [HIDDEN], "Step-5 dense norm shape/dtype");
+        for (name, shape) in names.iter().zip([[DENSE, HIDDEN], [DENSE, HIDDEN], [HIDDEN, DENSE]]) {
+            let core = &layout.core[name];
+            ensure!(core.shape == shape && core.ranks == 1, "{name}: native dense FFN must be whole [N,K]={shape:?}");
+        }
+        let mut admission = Admission::new(rows, &[&norm], available, reservations)?;
+        // Native weights are compressed; count their exact resident bytes.
+        admission.bytes = names.iter().try_fold(admission.bytes, |n, name| n.checked_add(layout.core[name].bytes as u64))
+            .context("dense native admission overflow")?;
+        let activation = format!("step5_post_silu_split_w13824_c{}", limit as u32);
+        let spec = programs.spec(&activation)?;
+        ensure!(spec.pointers == ["gate", "up", "out"] && spec.scalar_kinds == b"i"
+            && spec.capacity_rows as usize >= rows && spec.scratch.is_empty()
+            && spec.geometry["width"] == DENSE && spec.geometry["limit"].as_f64() == Some(limit as f64),
+            "{activation}: split post-SiLU ABI/geometry");
+        for name in ["step5_hidden_norm", "step5_residual_bf16"] {
+            ensure!(programs.spec(name)?.capacity_rows as usize >= rows, "{name}: dense capacity");
+        }
+        Ok(Self { layout, weights: vec![norm], admission, activation, epsilon,
+            native: Some(names), layer })
     }
 }
 
 impl<'a> DenseFfn<'a> {
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+
+
     pub fn load(
         device: Device<'a>,
         programs: &'a Programs<'a>,
@@ -268,13 +348,68 @@ impl<'a> DenseFfn<'a> {
         checkpoint: &'a Checkpoint,
         plan: DensePlan,
     ) -> Result<Self> {
+        Self::load_plan_in(device, programs, checkpoint, plan, None)
+    }
+
+    pub(super) fn load_plan_in(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        plan: DensePlan,
+        arena: Option<(&Arena<'a>, usize)>,
+    ) -> Result<Self> {
+        Self::load_plan_shared(device, programs, checkpoint, plan, arena, None)
+    }
+
+    /// `native_scratch` is the rank's shared projection scratch; a native FFN
+    /// without one (standalone diagnostics) allocates its own at admitted rows.
+    pub(super) fn load_plan_shared(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        plan: DensePlan,
+        arena: Option<(&Arena<'a>, usize)>,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+    ) -> Result<Self> {
         let DensePlan {
             layout,
             weights,
             admission,
             activation,
             epsilon,
+            native,
+            layer: _,
         } = plan;
+        if let Some(names) = native {
+            let definitions: [(&str, &[&str], &[u8]); 3] = [
+                ("step5_hidden_norm", &["x", "weight", "bias", "cos", "sin", "positions", "out"], b"if"),
+                (&activation, &["gate", "up", "out"], b"i"),
+                ("step5_residual_bf16", &["residual", "delta", "out"], b"i"),
+            ];
+            let resolved = definitions.iter()
+                .map(|(name, pointers, _)| device.run(|| programs.program(name, pointers)))
+                .collect::<Result<Vec<_>>>()?;
+            let mut core = super::native::NativeLayer::load(device, programs, checkpoint, &layout, admission.rows,
+                |name| names.iter().any(|n| n == name))?;
+            let scratch = match native_scratch {
+                Some(scratch) => scratch,
+                None => std::rc::Rc::new(super::native::NativeScratch::allocate(device,
+                    &core.scratch_layout(admission.rows)?.context("native dense scratch")?)?),
+            };
+            ensure!(scratch.scratch.rows >= admission.rows, "Step-5 native dense scratch rows");
+            let take = |core: &mut super::native::NativeLayer<'a>, name: &str| -> Result<super::native::NativeLinear<'a>> {
+                std::rc::Rc::try_unwrap(core.linears.remove(name).context("native dense operand")?)
+                    .map_err(|_| anyhow::anyhow!("native dense operand shared"))
+            };
+            let linears = [take(&mut core, &names[0])?, take(&mut core, &names[1])?, take(&mut core, &names[2])?];
+            let loaded = weights.into_iter().map(|w| load_operand(device, checkpoint, &layout, &w))
+                .collect::<Result<Vec<_>>>()?;
+            let mut owner = Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
+                weights: loaded, programs: resolved, epsilon, native: Some(linears),
+            }), arena)?;
+            owner.native_scratch = Some(scratch);
+            return Ok(owner);
+        }
         let definitions: [(&str, &[&str], &[u8]); 5] = [
             (
                 "step5_hidden_norm",
@@ -295,22 +430,29 @@ impl<'a> DenseFfn<'a> {
             .map(|w| load_operand(device, checkpoint, &layout, &w))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
-            weights: loaded, programs: resolved, epsilon,
-        }))
+            weights: loaded, programs: resolved, epsilon, native: None,
+        }), arena)
     }
 
     /// The caller admits all lanes together before creating any workspace.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+        let mut lane = Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)?;
+        // A private lane owns private native scratch: lanes may run concurrently.
+        if let Some(shared) = &self.native_scratch {
+            lane.native_scratch = Some(shared.sibling(self.stream.device)?);
+        }
+        Ok(lane)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<DenseWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<DenseWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
-        let planes = admission.planes.iter().map(|&bytes| Allocation::new(device, bytes))
-            .collect::<Result<Vec<_>>>()?;
+        let spans = cuteafd_loader::plan::families::step5::native::dense_layout(admission.rows, admission.span)?;
+        ensure!(spans.iter().zip(&admission.planes).all(|(span, &bytes)| span.1 == bytes),
+            "Step-5 dense region layout differs from admission");
+        let planes = scratch::region_planes(device, &spans, arena)?;
         let stream = Stream::new(device)?;
-        Ok(Self { stream, planes, admission, immutable })
+        Ok(Self { stream, planes, native_scratch: None, admission, immutable, unit: std::cell::Cell::new(0) })
     }
 
     pub fn enqueue(&mut self, rows: usize) -> Result<()> {
@@ -318,7 +460,7 @@ impl<'a> DenseFfn<'a> {
             rows > 0 && rows <= self.admission.rows,
             "dense live rows exceed admitted capacity"
         );
-        for stage in 0..self.immutable.programs.len() {
+        for stage in 0..5 {
             self.enqueue_stage(stage, rows)?;
         }
         Ok(())
@@ -328,11 +470,27 @@ impl<'a> DenseFfn<'a> {
         super::weights::validate_live_weights(device.id, &self.immutable.weights)
     }
 
+    /// Live planes (INPUT, OUTPUT) are viewed at the selected unit's rows.
+    fn plane(&self, index: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        let buffer = self.planes[index].buffer;
+        if !cuteafd_loader::plan::families::step5::native::dense_live(index) { return buffer; }
+        let offset = self.unit.get() * (buffer.bytes / self.admission.span);
+        cuteafd_ffi::CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes: buffer.bytes - offset, ..buffer }
+    }
+
+    /// Selects a prefill unit's rows of the live planes; whole steps use row 0.
+    pub(super) fn select_unit(&self, start: usize, rows: usize) -> Result<()> {
+        ensure!(start.checked_add(rows).is_some_and(|end| end <= self.admission.span) && rows <= self.admission.rows,
+            "Step-5 dense unit rows outside admitted span");
+        self.unit.set(start);
+        Ok(())
+    }
+
     pub fn input(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[0].buffer
+        self.plane(0)
     }
     pub fn output(&self) -> cuteafd_ffi::CuteafdDeviceBuffer {
-        self.planes[5].buffer
+        self.plane(5)
     }
 
     pub(super) fn diagnostic_planes(&self) -> [(cuteafd_ffi::CuteafdDeviceBuffer, bool); 4] {
@@ -379,9 +537,7 @@ impl<'a> DenseFfn<'a> {
                     .is_some_and(|end| end <= self.admission.rows),
             "dense stage/capacity mismatch"
         );
-        let p = self
-            .planes
-            .iter()
+        let p = (0..6).map(|index| self.plane(index))
             .zip([
                 HIDDEN * 4,
                 HIDDEN * 2,
@@ -390,7 +546,7 @@ impl<'a> DenseFfn<'a> {
                 HIDDEN * 2,
                 HIDDEN * 4,
             ])
-            .map(|(a, stride)| a.buffer.ptr.wrapping_byte_add(start * stride))
+            .map(|(a, stride)| a.ptr.wrapping_byte_add(start * stride))
             .collect::<Vec<_>>();
         let w = self
             .immutable
@@ -398,6 +554,39 @@ impl<'a> DenseFfn<'a> {
             .iter()
             .map(|a| a.buffer.ptr)
             .collect::<Vec<_>>();
+        if let Some(native) = &self.immutable.native {
+            // Stages: norm, gate|up (native, two row blocks of GATE_UP), split
+            // activation, down (native), residual. Planes and strides are unchanged.
+            let scratch = &self.native_scratch.as_ref().context("native dense scratch")?.scratch;
+            let plane = |index: usize, width: usize| -> cuteafd_ffi::CuteafdDeviceBuffer {
+                let base = self.plane(index);
+                cuteafd_ffi::CuteafdDeviceBuffer { ptr: base.ptr.wrapping_byte_add(start * width),
+                    bytes: rows * width, ..base }
+            };
+            let gate = plane(2, 2 * DENSE * 2);
+            let up = cuteafd_ffi::CuteafdDeviceBuffer { ptr: gate.ptr.wrapping_byte_add(rows * DENSE * 2),
+                bytes: rows * DENSE * 2, ..gate };
+            let gate = cuteafd_ffi::CuteafdDeviceBuffer { bytes: rows * DENSE * 2, ..gate };
+            let pointers = native_stage_pointers(stage, &p, &w, gate.ptr, up.ptr);
+            return self.stream.device.run(|| {
+                let scalars = [Scalar::I32(rows as i32)];
+                match stage {
+                    0 => unsafe {
+                        // SAFETY: admitted same-device planes retained beyond the drain.
+                        self.immutable.programs[0].launch(&pointers, &[scalars[0], Scalar::F32(self.immutable.epsilon)], stream.raw)
+                    },
+                    1 => {
+                        native[0].launch(rows, plane(1, HIDDEN * 2), gate, scratch, stream.raw)?;
+                        native[1].launch(rows, plane(1, HIDDEN * 2), up, scratch, stream.raw)
+                    }
+                    // SAFETY: as above; gate/up are disjoint row blocks of the GATE_UP plane.
+                    2 => unsafe { self.immutable.programs[1].launch(&pointers, &scalars, stream.raw) },
+                    3 => native[2].launch(rows, plane(3, DENSE * 2), plane(4, HIDDEN * 2), scratch, stream.raw),
+                    // SAFETY: as above.
+                    _ => unsafe { self.immutable.programs[2].launch(&pointers, &scalars, stream.raw) },
+                }
+            });
+        }
         let pointers = [
             vec![p[0], w[0], w[0], w[0], w[0], w[0], p[1]],
             vec![p[1], w[1], p[2]],
@@ -423,6 +612,28 @@ impl<'a> DenseFfn<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_dense_stage_selection_needs_only_norm_weight() {
+        let mut storage = [0u8; 9];
+        let p = (0..6).map(|i| storage.as_mut_ptr().wrapping_add(i).cast())
+            .collect::<Vec<_>>();
+        let norm = storage.as_mut_ptr().wrapping_add(6).cast();
+        let gate = storage.as_mut_ptr().wrapping_add(7).cast();
+        let up = storage.as_mut_ptr().wrapping_add(8).cast();
+        // EXL3 keeps norm here; gate/up/down are owned by NativeLinear instead.
+        let weights = [norm];
+        let expected = [
+            vec![p[0], norm, norm, norm, norm, norm, p[1]],
+            vec![],
+            vec![gate, up, p[3]],
+            vec![],
+            vec![p[0], p[4], p[5]],
+        ];
+        for (stage, expected) in expected.iter().enumerate() {
+            assert_eq!(&native_stage_pointers(stage, &p, &weights, gate, up), expected);
+        }
+    }
 
     #[test]
     fn dense_admission_charges_capacity_and_allocator_floors() -> Result<()> {

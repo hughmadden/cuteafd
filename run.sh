@@ -40,9 +40,10 @@ container-name characters, [A-Za-z0-9_.-].
   --restart                     replace this instance's deployment
   --all                         with --restart, sweep worker ports on selected hosts
   --dry-run                     validate a DeepSeek V4.1 launch without changing services
+  --total-capacity              with --dry-run, plan against total GPU capacity (or COORDINATOR_GPU_BUDGET_GIB) without reading live free memory
 
 DeepSeek V4.1 keys (cuteafd.config documents each): RTX_GPUS, RTX_EXPERT_LAYERS,
-CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
+GPU_EXPERT_TIER, GPU_EXPERT_TIER_PROFILE, CONCURRENCY, HTTP_QUEUE_DEPTH, HTTP_QUEUE_WAIT_MS, POOL_TOKENS, EMBEDDING,
 KV_POOL_SIZE, HOST_CACHE_BYTES, MEMORY_RESERVATION, PREFIX_CACHE_ENTRIES,
 MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS, PREFILL_BATCH_TOKENS, SPECULATOR (dspark|off),
 DSPARK_DRAFT_LIMIT (1..7), TP2_ATTENTION, TP2_QUERY_PROJECTION,
@@ -52,7 +53,8 @@ TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
   CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
-  CUTEAFD_VERBS_APP_IB_PORT_NUM, CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
+  CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES. The RDMA port and source GID
+  always follow the address that reaches each peer.
 This is how a multi-homed six-rank launch pins the rail per host.
 
 Every remote step shares one SSH option set with the release build scripts:
@@ -87,7 +89,7 @@ while [[ $# -gt 0 ]]; do
     --embedding-placement) family_args+=(--embedding-placement "${2:?$1 requires host or gpu}"); shift 2 ;;
     --wip) family_args+=(--wip "${2:?$1 requires SLOT}"); shift 2 ;;
     --rotate-console-secret) exec "$repo_root/scripts/launch/console-secret.sh" rotate ;;
-    --restart|--all|--dry-run) family_args+=("$1"); shift ;;
+    --restart|--all|--dry-run|--total-capacity) family_args+=("$1"); shift ;;
     -h|--help) usage; exit 0 ;;
     --dspark|--no-dspark|--tp2-*|--no-tp2-*)
       release_die "$1 was removed: set the configuration key instead (--set SPECULATOR=dspark|off, --set TP2_<OPTION>=on|off)" ;;
@@ -100,5 +102,8 @@ done
 # Every family launches through scripts/launch/run-family.sh (same config file,
 # same container names, so ./stop.sh stops it); the family comes from the
 # checkpoint's config.json.
+if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" && -d "$CUTEAFD_NAMESPACE_ROOT/hf-home" ]]; then
+  export HF_HOME="$(readlink -f "$CUTEAFD_NAMESPACE_ROOT")/hf-home"
+fi
 family="$(release_config_family "$config")"
 exec "$repo_root/scripts/launch/run-family.sh" --config "$config" --family "$family" ${family_args[@]+"${family_args[@]}"}

@@ -25,6 +25,7 @@ impl Opened {
         }
         for program in &programs {
             program.capacities().require_context("qwen4", args.max_context)?;
+            super::programs::validate_all(&self.cfg, program, args.max_context)?;
             for name in required_fp8_programs(args) { program.spec(&name)?; }
         }
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library,
@@ -78,9 +79,13 @@ impl Opened {
             layer_weights: &weights.resident.layer_bytes, layer_experts: &experts.costs,
             layer_extra: &weights.layer_extra, fixed, tp2_workspace: experts.workspace, pending_code_bytes: pending,
             max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
-            spark_ranks: 0, onboard: args.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
+            spark_ranks: 0,
+            onboard: args.onboard.map(|setting| setting.resolve(catalog.routed_experts().routed_layers()))
+                .unwrap_or(Onboard::Auto),
+            startup_graph_modes: args.planner_graph_modes.filter(|_| enabled),
         })?;
         inventory.record("qwen4", &inventory.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
+        cuteafd_bench::context::set_rtx_expert_layers(placement.onboard_layers);
         tracing::info!(placement = %placement.summary(), pool_tokens = placement.pool_tokens,
             "Qwen dual shared solver admission before allocation");
         let owners = placement.layers.iter().map(|layer| match layer.mode {
@@ -89,7 +94,8 @@ impl Opened {
         qwen4::check_dual_layer_owners(&owners)?;
         let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
-            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw };
+            fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,
+            dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)) };
         let ranks = [(devices[0], streams[0].raw), (devices[1], streams[1].raw)];
         let (embedding, model) = crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
             args.token_io.embed_placement, || {
@@ -104,7 +110,7 @@ impl Opened {
             "Qwen dual selectable weight residency disagrees with admission");
         let ple = match self.cfg.ple_layers.first().copied().filter(|&layer| layer < layers) {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
-                &self.cfg, layer, &args.table, args.prefill_rows.max(engine::DECODE_ROWS)))?), None => None,
+                &self.cfg, layer, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
         };
         // Load the independent full-width draft before the target halves, with
         // its admitted arena rather than a post-allocation free-memory guess.
@@ -137,6 +143,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         let result = body(&engine);
         engine.drain_state()?;

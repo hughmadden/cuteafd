@@ -169,6 +169,9 @@ pub struct DeviceLayout {
     pub kind: DeviceKind,
     pub index: u32,
     pub capacity_bytes: u64,
+    /// CUDA allocation ceiling for a Spark worker, before host-inclusive ledger
+    /// capacity adjustments. Zero on RTX devices, which do not launch workers.
+    pub worker_budget_bytes: u64,
     pub items: Vec<Item>,
     /// KV tokens this device holds records for (its share of the pool).
     pub kv_tokens: u64,
@@ -245,6 +248,13 @@ impl HostLayout {
             headroom_bytes: available.saturating_sub(required).min(total.saturating_sub(all)),
             shortfall_bytes: required.saturating_sub(available).max(all.saturating_sub(total)), items })
     }
+}
+
+/// A named, not-yet-allocated pinned table. The family owns the byte formula;
+/// offline and live host admission share its category and future lifetime.
+pub fn host_table_item(name: impl Into<String>, bytes: u64) -> Item {
+    Item::new(Category::Staging, name, "pinned", bytes, Basis::Formula)
+        .with_lifetime(ItemLifetime::PostReadyReserve)
 }
 
 /// Host gather plus one lane download can coexist. Single-lane scoring returns
@@ -366,6 +376,20 @@ mod tests {
     }
 
     #[test]
+    fn named_host_table_keeps_its_future_owner_and_serialized_lifetime() {
+        let item = host_table_item("synthetic/ordered-table", 1024);
+        assert_eq!(item.category, Category::Staging);
+        assert_eq!(item.group, "synthetic/ordered-table");
+        assert_eq!(item.bytes, 1024);
+        assert_eq!(item.basis, Basis::Formula);
+        assert_eq!(item.lifetime, ItemLifetime::PostReadyReserve);
+        let encoded = serde_json::to_value(&item).unwrap();
+        assert_eq!(encoded["group"], "synthetic/ordered-table");
+        assert_eq!(encoded["lifetime"], "post_ready_reserve");
+        assert_eq!(serde_json::from_value::<Item>(encoded).unwrap(), item);
+    }
+
+    #[test]
     fn host_sizes_are_checked_and_logits_include_only_the_live_lane_peak() {
         assert_eq!(host_logits_bytes(4096, 4096, 154880), Some(2_537_553_920));
         assert_eq!(host_logits_bytes(8192, 4096, 154880), Some(7_612_661_760));
@@ -413,6 +437,19 @@ mod tests {
         assert_eq!(Category::of_scope("v41/kv"), Category::Kv);
         assert_eq!(Category::of_scope("v41/draft weights"), Category::Drafter);
         assert_eq!(Category::of_scope("v41/allocated KV cache"), Category::Kv);
+    }
+
+    #[test]
+    fn spark_worker_budget_is_required_and_independent_of_host_capacity() {
+        let device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+            capacity_bytes: 121 << 30, worker_budget_bytes: 108 << 30,
+            items: vec![], kv_tokens: 0 };
+        let encoded = serde_json::to_value(&device).unwrap();
+        assert_eq!(encoded["worker_budget_bytes"], 108u64 << 30);
+        assert_eq!(serde_json::from_value::<DeviceLayout>(encoded.clone()).unwrap(), device);
+        let mut missing = encoded;
+        missing.as_object_mut().unwrap().remove("worker_budget_bytes");
+        assert!(serde_json::from_value::<DeviceLayout>(missing).is_err());
     }
 
     #[test]

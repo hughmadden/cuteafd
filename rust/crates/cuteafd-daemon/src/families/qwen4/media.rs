@@ -30,7 +30,7 @@ impl RemoteVision {
             "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
         let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
             .context("--vision-peers requires --encoder-plan-hash")?)?;
         let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
@@ -77,7 +77,7 @@ impl ReadyVision {
             warn_cache_capacity(cache_bytes, preparer.config().max_image_tokens, width)?;
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: max_tokens as u32 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "Qwen tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
@@ -136,8 +136,7 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
             let mut spans = Vec::with_capacity(images.len());
             for (span, image) in probe.spec.media.iter().zip(&images) {
                 let end = span.start.checked_add(span.len).context("probe media extent")?;
-                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key), "probe prepared image identity differs");
+                span.verify_image(image)?;
                 anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
                     && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
                     "probe image rows/marker boundaries differ");
@@ -159,6 +158,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
             cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
                 key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
+                identity: Some(cuteafd_api::openai::probe::ProbeImageIdentity::prepared(image)),
+                input_key: probe.spec.media.get(i).filter(|s| s.identity.is_some()).map(|s| s.key.clone()),
                 fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
         }).collect();
         probe.media(echo);
@@ -347,7 +348,7 @@ mod tests {
         assert!(RemoteVision::from_args(&args).is_err());
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
+        NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
     }
@@ -356,7 +357,7 @@ mod tests {
             "vision_start_token_id": 4, "vision_end_token_id": 6})
     }
     fn image() -> Arc<PreparedImage> {
-        Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 768]), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
@@ -364,7 +365,7 @@ mod tests {
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
             media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
         let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
         let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
@@ -564,7 +565,7 @@ mod tests {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
             image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
         let run = |span: ProbeMedia, tokens: Vec<u32>| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });

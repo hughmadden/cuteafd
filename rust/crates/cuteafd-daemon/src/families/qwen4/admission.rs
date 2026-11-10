@@ -8,16 +8,16 @@ use cuteafd_loader::serving_capacity::qwen_cache_geometry;
 use cuteafd_loader::serving_capacity::qwen_graphs::QwenAdmissionInputs;
 use cuteafd_loader::placement::{families::qwen4, Baseline};
 
-pub(super) fn spark_model(rows: usize, bf16: bool)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
+    rows: usize, waves: u64, bf16: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     let capacity = u32::try_from(rows)?;
     let ingress = if bf16 { cuteafd_core::SparkIngress::Bf16 }
         else { cuteafd_core::SparkIngress::Fp8K32 };
-    Ok(cuteafd_transport::worker_selection::ModelAdmission {
-        capacity, compiled_capacity: capacity,
-        endpoints: vec![cuteafd_core::SparkEndpoint { capacity, ingress }],
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
-    })
+    let executions = cuteafd_loader::plan::spark_executions::admit_family("qwen4", &backend.exports(), None,
+        rows as u64, waves)?;
+    cuteafd_transport::worker_selection::ModelAdmission::new(
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
+        crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 
 /// The shared admission inputs (`serving_capacity::qwen_graphs::qwen_admission`) at serve's arguments.
@@ -25,12 +25,42 @@ pub(super) fn spark_model(rows: usize, bf16: bool)
 pub(super) fn inputs<'a>(args: &EngineArgs, cfg: &'a Qwen4Config, layers: usize, mtp: bool,
     manifest: Option<&'a serde_json::Value>, ple: Option<(u64, bool)>, future_expert_bytes: u64) -> Result<QwenAdmissionInputs<'a>> {
     let geometry = qwen_cache_geometry(cfg, layers, mtp, args.kv_format)?;
+    let shape = args.resolved_prefill()?;
     let marks = args.planner_prefix_bytes.unwrap_or(geometry.ranks[0].retained_mark_bytes * qwen4::DEFAULT_MARK_SLOTS);
     let logits = if args.full_prefill_logits { cuteafd_loader::plan::layout::full_prefill_logits_bytes(
-        "qwen4", args.prefill_rows as u64, cfg.vocab_size as u64) } else { 0 };
-    Ok(QwenAdmissionInputs { cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: args.prefill_rows as u64,
+        "qwen4", shape.span_rows, cfg.vocab_size as u64) } else { 0 };
+    Ok(QwenAdmissionInputs { prefill_shape: args.prefill_shape()?, cfg, layers, mtp, kv_format: args.kv_format, manifest, prefill_rows: shape.span_rows,
         slots: args.slots as u64, mark_bytes: marks, full_prefill_logits: logits, ple, future_expert_bytes,
         headroom: cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes.max(3 << 30) })
+}
+
+pub(super) use cuteafd_loader::families::qwen4::StepTableBytes;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct HostWorkspaceBytes {
+    pub staging: u64,
+    pub uploads: cuteafd_loader::shared::token_table::UploadShape,
+    pub logits: u64,
+}
+
+impl HostWorkspaceBytes {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(cfg: &Qwen4Config, rows: usize, decode: bool, pages: usize, pool_pages: usize,
+        units: usize, spark: bool, mtp: bool, ple_ids: bool, logits: usize) -> Result<Self> {
+        use anyhow::Context;
+        let uploads = cuteafd_loader::families::qwen4::upload_shape(rows, decode, pages, pool_pages,
+            cfg.ple_rows(), cfg.layers, units, spark, mtp, ple_ids)?;
+        Ok(Self { staging: uploads.capacity_bytes()? as u64, uploads,
+            logits: logits.checked_mul(cfg.vocab_size).and_then(|n| n.checked_mul(4))
+                .context("Qwen pinned logits overflow")? as u64 })
+    }
+    pub fn mtp(cfg: &Qwen4Config, rows: usize, pages: usize, pools: usize, calls: usize) -> Result<Self> {
+        use anyhow::Context;
+        let uploads = cuteafd_loader::families::qwen4::mtp_upload_shape(rows, pages, pools, calls)?;
+        Ok(Self { staging: uploads.capacity_bytes()? as u64, uploads,
+            logits: cfg.vocab_size.checked_mul(4).context("Qwen MTP pinned logits overflow")? as u64 })
+    }
+
 }
 
 /// Admission follows the selected executor, not unused configured peers.
@@ -78,7 +108,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
     let sample = library.cuda_memory_info();
     library.cuda_set_device(current)?;
     let (available, total) = sample?;
-    let admission = QwenAdmissionInputs { cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
+    let admission = QwenAdmissionInputs { prefill_shape: inputs.prefill_shape, cfg: inputs.cfg, layers: inputs.layers, mtp: inputs.mtp, kv_format: inputs.kv_format,
         manifest: inputs.manifest, prefill_rows: inputs.prefill_rows, slots: inputs.slots,
         mark_bytes: inputs.mark_bytes, full_prefill_logits: inputs.full_prefill_logits,
         ple: inputs.ple, future_expert_bytes: inputs.future_expert_bytes, headroom: inputs.headroom };
@@ -90,7 +120,7 @@ pub(super) fn pool_tokens(library: &NativeLibrary, args: &EngineArgs, inputs: &Q
 
 fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, source: ExpertSource,
     (available, total): (u64, u64), pending: u64, graphs_enabled: bool, automatic_context: bool) -> qwen4::QwenInputs<'a> {
-    qwen4::QwenInputs { automatic_context: automatic_context, admission, capacity_bytes: total,
+    qwen4::QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false), automatic_context: automatic_context, admission, capacity_bytes: total,
         baseline: Baseline::Measured { free_bytes: available }, pending_code_bytes: pending,
         max_context: args.max_context as u64, requested_pool: (args.pool_tokens > 0).then_some(args.pool_tokens as u64),
         spark_ranks: source.spark_ranks(),
@@ -176,12 +206,145 @@ mod tests {
     use cuteafd_loader::serving_capacity::qwen_graphs::*;
 
     #[test]
+    fn host_tables_match_full_destination_extents() -> anyhow::Result<()> {
+        for rows in [1usize, 64, 512, 2048, 2752, 4096] {
+            for decode in [false, true] {
+                let tables = super::StepTableBytes::new(rows, decode, 32768, 8192, 9)?;
+                assert_eq!(tables.positions, rows * 8);
+                assert_eq!(tables.rope_positions, rows * 12);
+                assert_eq!(tables.page_table, if decode { rows } else { 1 } * 32768 * 4);
+                assert_eq!(tables.pool_table, if decode { rows } else { 1 } * 8192 * 4);
+                assert_eq!(tables.ple_ids, rows * 9 * 8);
+            }
+        }
+        assert!(super::StepTableBytes::new(usize::MAX, false, 1, 1, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn public_planner_retained_tables_equal_runtime_at_forced_32gib() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::{plan, testing, ExpertPlacement, PlanOptions};
+        use cuteafd_loader::plan::layout::LayoutOptions;
+        use cuteafd_loader::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};
+        for mapped_ple in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let mut config = testing::qwen4_config(4);
+            if mapped_ple {
+                config["text_config"]["ple_layer_ids"] = serde_json::json!([2]);
+                config["text_config"]["ple_embed_dim"] = 2560.into();
+                config["text_config"]["ngram_size"] = 3.into();
+                config["text_config"]["heads_per_ngram"] = 8.into();
+            }
+            let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(&config)?;
+            let mut tensors = testing::qwen4_coordinator(&config, false);
+            if mapped_ple {
+                tensors.push(testing::t("model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
+                    "F8_E4M3", &[100, 160]));
+            }
+            testing::write_snapshot(dir.path(), &config, &tensors, None);
+            // Exercise explicit serial and pipelined metadata owners.
+            for (rows, waves) in [(4096, 1), (2048, 2), (4096, 2)] {
+                let report = plan(dir.path(), &PlanOptions {
+                    placement: ExpertPlacement::Sparks { ranks: 4 },
+                    layout: Some(LayoutOptions { rtx_bytes: vec![32 << 30], prefill_rows: rows,
+                        prefill_waves: waves, prefill_lanes: waves, context_tokens: 32768, prefix_slots: Some(0),
+                        host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)),
+                        ..Default::default() }), ..Default::default()
+                })?;
+                assert!(report.solver_placement.is_some(), "{}", cuteafd_loader::plan::render(&report));
+                assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
+                    (Some(rows), Some(waves), Some(rows * waves)));
+                let pool = usize::try_from(report.memory_layout.as_ref().unwrap().pool_tokens)?;
+                let pages = qwen_pool_pages(pool).unwrap().max(QWEN_UNIT_PAGES);
+                let runtime = super::HostWorkspaceBytes::new(&cfg, rows as usize, false, pages, pages / QWEN_UNIT_PAGES,
+                    if waves > 1 { waves as usize } else { 0 }, true, false, !mapped_ple, 1)?;
+                let expected = cuteafd_loader::families::qwen4::upload_shape(rows as usize, false,
+                    pages, pages / QWEN_UNIT_PAGES, cfg.ple_rows(), cfg.layers,
+                    if waves > 1 { waves as usize } else { 0 }, true, false, !mapped_ple)?;
+                assert_eq!(runtime.staging as usize, expected.capacity_bytes()?);
+                let decode = super::HostWorkspaceBytes::new(&cfg, super::super::engine::DECODE_ROWS, true,
+                    pages, pages / QWEN_UNIT_PAGES, 0, true, false, !mapped_ple, 64)?;
+                let planned = report.host_ledger.as_ref().expect("host admission ledger").items.iter()
+                    .filter(|item| item.group == "staging/tables-and-sync").map(|item| item.bytes).sum::<u64>();
+                assert_eq!(planned, runtime.staging + decode.staging,
+                    "host source ledger must cover exactly the lazy runtime owners");
+                let shape = (waves > 1).then_some(cuteafd_loader::serving_capacity::PrefillShape {
+                    unit_rows: rows, waves,
+                });
+                let runtime = qwen_admission(&QwenAdmissionInputs {
+                    cfg: &cfg, layers: 4, mtp: false,
+                    kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::default(),
+                    manifest: None, prefill_rows: rows * waves, prefill_shape: shape,
+                    slots: 8, mark_bytes: 0, full_prefill_logits: 0,
+                    ple: mapped_ple.then_some((160, true)), future_expert_bytes: 0, headroom: 0,
+                })?;
+                for (_, name, bytes) in runtime.items.iter().filter(|item| item.1.ends_with("step")) {
+                    let planned = report.memory_layout.as_ref().unwrap().devices[0].items.iter()
+                        .filter(|item| item.group == *name).map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(planned, *bytes, "{rows}x{waves}, {name}, mapped PLE {mapped_ple}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn host_workspace_charges_all_lazy_consumers_for_serial_and_spark_owners() -> anyhow::Result<()> {
+        use super::HostWorkspaceBytes;
+        let cfg = cuteafd_loader::families::qwen4::Qwen4Config::from_hf(
+            &cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let (pages, pools) = (32768usize, 8192usize);
+        for rows in [64usize, 512, 4096] {
+            for decode in [false, true] {
+                for spark in [false, true] {
+                    let host = HostWorkspaceBytes::new(&cfg, rows, decode, pages, pools,
+                        if !decode && spark { 3 } else { 0 }, spark, true, false, if decode { 64 } else { 1 })?;
+                    let expected = cuteafd_loader::families::qwen4::upload_shape(rows, decode, pages, pools,
+                        cfg.ple_rows(), cfg.layers, if !decode && spark { 3 } else { 0 }, spark, true, false)?;
+                    assert_eq!(host.staging as usize, expected.capacity_bytes()?);
+                    assert_eq!(host.uploads, expected);
+                    assert_eq!(host.logits as usize, (if decode { 64 } else { 1 }) * cfg.vocab_size * 4);
+                }
+            }
+        }
+        let full = HostWorkspaceBytes::new(&cfg, 4096, false, pages, pools, 3, true, true, false, 8192)?;
+        assert_eq!(full.logits, 8192 * cfg.vocab_size as u64 * 4);
+        assert!(HostWorkspaceBytes::new(&cfg, usize::MAX, false, pages, pools,
+            3, true, true, false, 1).is_err());
+        Ok(())
+    }
+
+
+    fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
+        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
+            prefill_waves: waves, ..Default::default() };
+        cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
+    }
+
+    #[test]
+    fn planner_and_serve_admit_identical_spark_owners() -> anyhow::Result<()> {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for backend in [SparkBackend::Fp8, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
+            for (waves, unit) in [(1u64, 4096usize), (2, 2048), (2, 4096)] {
+                assert_eq!(super::spark_model(backend, unit, waves, false)?.executions,
+                    planned("qwen4", backend, None, unit as u64, waves));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn spark_contract_matches_single_link_capacity_and_checkpoint_ingress() -> anyhow::Result<()> {
-        for rows in [64, 2048, 4096] {
+        use cuteafd_loader::plan::spark_executions::SparkBackend;
+        for (rows, waves) in [(64, 1), (2048, 2), (4096, 2)] {
             for bf16 in [false, true] {
-                let model = super::spark_model(rows, bf16)?;
+                let model = super::spark_model(SparkBackend::Fp8, rows, waves, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (rows as u32, rows as u32));
+                let compiled = cuteafd_core::covering_export(&SparkBackend::Fp8.exports(), rows as u32).unwrap();
+                assert_eq!((model.capacity(), model.compiled_capacity()), (rows.max(64) as u32, compiled));
+                assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units),
+                    (rows as u32, waves as u8));
                 assert_eq!(model.endpoints.len(), 1);
                 assert_eq!(model.endpoints[0].capacity, rows as u32);
                 assert_eq!(model.endpoints[0].ingress, if bf16 { cuteafd_core::SparkIngress::Bf16 }
@@ -216,7 +379,7 @@ mod tests {
                     .join(format!("rtx-tp2-rank{rank}/m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let manifest = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "output_dtype": "fp32",
                     "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false},
@@ -247,8 +410,7 @@ mod tests {
             engine: super::super::EngineArgs,
         }
         let argv = ["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so"];
-        let args = Cli::try_parse_from(argv)?.engine;
-        assert!(args.table.prefetch);
+        Cli::try_parse_from(argv)?;
         let mut config = cuteafd_loader::plan::testing::qwen4_config(48);
         config["text_config"]["ple_layer_ids"] = serde_json::json!([24]);
         config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
@@ -265,10 +427,11 @@ mod tests {
         let experts = vec![None; 48];
         // Even enough capacity for the full table must retain mapped residency.
         for capacity in [96u64 << 30, 192u64 << 30] {
-            for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 2 << 20 }] {
+            let onboard = Onboard::Auto;
+            {
                 let mut inputs = qwen4::QwenDualInputs { automatic_context: false,
                     owner_manifests: [None; 2],
-                    admission: QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: false,
+                    admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
                         kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096,
                         slots: 16, mark_bytes: 0, full_prefill_logits: 0,
                         ple: Some((resident.ple_row_bytes, false)), future_expert_bytes: 0, headroom: 3 << 30 },
@@ -303,7 +466,8 @@ mod tests {
                 assert!(!planned.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
             }
         }
-        for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0")] {
+        for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0"),
+            ("--table-threads", "16"), ("--table-prefetch", "true")] {
             assert!(Cli::try_parse_from(argv.into_iter().chain([option, value])).is_err());
         }
         Ok(())
@@ -451,7 +615,7 @@ mod tests {
                 let path = packages[rank].join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": width, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "output_dtype": "fp32",
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "output_dtype": "fp32",
                     "tile": [64, 128, 64, 128], "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * width,
                         "dtype": "f16", "zero_on_create": false}}});
@@ -464,7 +628,7 @@ mod tests {
                 let path = draft_package.join(format!("m{capacity}"));
                 std::fs::create_dir_all(&path)?;
                 let m = serde_json::json!({"hidden": 2560, "intermediate": 640, "experts": 512,
-                    "top_k": 10, "capacity": capacity, "tile": [64, 128, 64, 128],
+                    "top_k": 10, "capacity": capacity, "decode_capacity": true, "tile": [64, 128, 64, 128],
                     "trellis_lut": {"bytes": 32},
                     "buffers": {"scratch": {"allocation": "scratch", "bytes": capacity * 640,
                         "dtype": "f16", "zero_on_create": false}}});
@@ -475,25 +639,28 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(dir.path())?;
         let mut args = Cli::try_parse_from(["serve", "--snapshot", dir.path().to_str().unwrap(),
             "--native-lib", lib.to_str().unwrap(), "--local-experts", "--split-device", "1",
-            "--prefill-rows", "16", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
+            "--prefill-rows", "64", "--max-context", "131072", "--pool-tokens", "0"])?.engine;
         args.mtp = if mtp { 3 } else { 0 };
         args.planner_prefix_bytes = Some(0);
         args.planner_graph_modes = Some((8, true));
-        for (host, fp8_projections, fp8_head, attention_rows) in [(false, false, true, None),
-            (true, false, true, None), (false, true, true, None), (false, false, false, None),
-            (false, false, true, Some(64))] {
-            for capacities in [[101_973_491_712; 2], [32 << 30, 101_973_491_712], [101_973_491_712, 32 << 30]] {
+        for (host, fp8_projections, fp8_head, attention_rows, capacities) in [
+            (false, false, true, None, [101_973_491_712; 2]),
+            (true, false, true, None, [32 << 30, 101_973_491_712]),
+            (false, true, true, None, [101_973_491_712, 32 << 30]),
+            (false, false, false, None, [101_973_491_712; 2]),
+            (false, false, true, Some(64), [101_973_491_712; 2]),
+        ] {
             args.attention_plan_rows = attention_rows;
             let reduction = super::super::attention_plan(&args, mtp)?;
             let manifests = qwen4::dual_program_manifests(&manifest,
-                capacities.map(|bytes| cuteafd_loader::placement::ArchContext::for_device("sm_120", bytes).sms), reduction)?;
+                capacities.map(|bytes| cuteafd_loader::placement::ArchContext::for_device(cuteafd_core::GpuArch::Sm120, bytes).sms), reduction)?;
             args.fp8_decode = fp8_projections;
             args.mtp_fp8_head = fp8_head;
             args.token_io.embed_placement = if host { crate::shared::token_io::EmbedPlacement::Host }
                 else { crate::shared::token_io::EmbedPlacement::Gpu };
             let report = plan(dir.path(), &PlanOptions { placement: ExpertPlacement::Local,
-                layout: Some(LayoutOptions { rtx_bytes: capacities.to_vec(),
-                    context_tokens: 131072, prefill_rows: 16, concurrency: 8, state_slots: Some(8),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: capacities.to_vec(),
+                    context_tokens: 131072, prefill_rows: 64, concurrency: 8, state_slots: Some(8),
                     prefix_slots: Some(0), native_mtp_layers: args.mtp, host_embedding: host,
                     qwen_attention_plan_rows: attention_rows,
                     qwen_representation: cuteafd_loader::families::qwen4::resident::Qwen4Representation { fp8_projections, fp8_head },
@@ -505,7 +672,7 @@ mod tests {
             let experts = super::dual_experts(&args, &catalog, 4)?;
             let mut fixed = weights.fixed;
             fixed.extend(experts.transport);
-            if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, 16)?); }
+            if mtp { fixed.extend(qwen4::dual_draft_demands(&catalog, &lib, args.prefill_rows as u64)?); }
             let admission = super::inputs(&args, &cfg, 4, mtp, Some(&manifests[0]), None, 0)?;
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs { automatic_context: false, owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
@@ -525,7 +692,6 @@ mod tests {
                     .cloned().collect::<Vec<_>>();
                 assert_eq!(runtime.items[rank], planned, "rank {rank}, MTP={mtp}, attention={attention_rows:?}");
             }
-        }
         }
         std::fs::remove_file(packages[1].join("m80/v41_exl3.json"))?;
         assert!(super::dual_experts(&args, &catalog, 4).is_err());
@@ -558,12 +724,13 @@ mod tests {
         let cfg = cuteafd_loader::families::qwen4::Qwen4Config::read(snapshot.path())?;
         for (capacity, kv_format) in [32_u64 << 30, 101_973_491_712].into_iter().flat_map(|capacity|
             [Qwen4KvCache::Bf16, Qwen4KvCache::Fp8].map(|format| (capacity, format))) {
-            for pool in [None, Some(32768)] {
+            for (pool, concurrency) in [None, Some(32768)].into_iter()
+                .flat_map(|pool| [1, 16, 17, 32, 64].map(|c| (pool, c))) {
                 let context = pool.unwrap_or(131072);
                 let report = plan(snapshot.path(), &PlanOptions {
                     placement: ExpertPlacement::Local,
-                    layout: Some(LayoutOptions { rtx_bytes: vec![capacity], context_tokens: context,
-                        pool_tokens: pool, qwen_kv: kv_format, concurrency: 8, state_slots: Some(8), prefix_slots: Some(0),
+                    layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![capacity], context_tokens: context,
+                        pool_tokens: pool, qwen_kv: kv_format, concurrency, state_slots: Some(concurrency), prefix_slots: Some(0),
                         ..Default::default() }), ..Default::default()
                 })?;
                 assert!(report.placement_supported, "{}", cuteafd_loader::plan::render(&report));
@@ -574,16 +741,36 @@ mod tests {
                     "marks" | "graphs" | "graph growth" | "decode step" | "prefill step"))
                     .map(|i| i.bytes).sum::<u64>();
                 let mut args = Cli::try_parse_from(["serve", "--snapshot", snapshot.path().to_str().unwrap(),
-                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(), "--slots", "8",
+                    "--native-lib", "/nonexistent/lib.so", "--max-context", &context.to_string(),
+                    "--slots", &concurrency.to_string(),
                     "--pool-tokens", &pool.unwrap_or(0).to_string(), "--kv-cache", &kv_format.to_string()])?.engine;
                 args.planner_prefix_bytes = Some(0);
-                args.planner_graph_modes = Some((8, true));
+                args.planner_graph_modes = Some((concurrency as usize, true));
                 let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
-                let placement = qwen4::placement(&qwen4::QwenInputs { automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                let placement = qwen4::placement(&qwen4::QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
                     baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
                     max_context: context, requested_pool: pool, spark_ranks: 0,
                     startup_graph_modes: args.planner_graph_modes })?;
                 assert_eq!(placement.pool_tokens, layout.pool_tokens);
+                let pool = layout.pool_tokens as usize;
+                let executables = super::super::engine::serving_graph_count(context as usize, pool,
+                    cfg.dense_context(), concurrency as usize, true, cfg.layers)?;
+                let graphs = qwen_startup_graphs(context as usize, pool, cfg.dense_context(),
+                    concurrency as usize, true, cfg.layers).unwrap();
+                assert_eq!(graphs.ranks[0].executables, executables as u64);
+                let admitted = device.items.iter().filter(|item| matches!(item.group.as_str(), "graphs" | "graph growth"))
+                    .map(|item| item.bytes).sum::<u64>();
+                assert_eq!(admitted, graphs.bytes(0));
+                let inputs = super::inputs(&args, &cfg, 48, false, None, None, 0)?;
+                let mut invalid = qwen4::QwenInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false, admission: inputs, capacity_bytes: capacity,
+                    baseline: Baseline::Measured { free_bytes: capacity - baseline }, pending_code_bytes: 0,
+                    max_context: context, requested_pool: Some(layout.pool_tokens), spark_ranks: 0,
+                    startup_graph_modes: Some((65, true)) };
+                let error = qwen4::placement(&invalid).unwrap_err();
+                let error = error.downcast_ref::<cuteafd_core::concurrency::ConcurrencyError>().unwrap();
+                assert_eq!((error.requested, error.capacity), (65, 64));
+                invalid.startup_graph_modes = Some((0, true));
+                assert!(qwen4::placement(&invalid).is_err());
                 for item in &placement.items[0] {
                     assert!(device.items.contains(item), "runtime item absent in plan: {item:?}");
                 }
@@ -621,6 +808,8 @@ mod tests {
             let peers = input(&with_peers, source, pending)?;
             assert_eq!(peers.pending_code_bytes, pending);
             assert_eq!(peers.spark_ranks, 0);
+            assert_eq!(with_peers.resolved_prefill()?.waves, 1);
+            assert_eq!(with_peers.resolved_prefill()?, local.resolved_prefill()?);
             assert_eq!(qwen4::request(&plain, 0)?, qwen4::request(&peers, 0)?);
             assert_eq!(qwen4::placement(&plain)?, qwen4::placement(&peers)?);
         }
@@ -628,6 +817,12 @@ mod tests {
         assert_eq!(spark.code_key(), "none");
         // The selected transport's actual world, not the configured two peers.
         assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
+        // Runtime's measured baseline already includes the selected transport.
+        let request = qwen4::request(&input(&with_peers, spark, 0)?, 0)?;
+        assert!(matches!(request.inventory.gpus[0].baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
+        assert!(request.fixed.iter().all(|d| d.group != "Spark intake planes"));
+        assert!(qwen4::request(&input(&local, ExpertSource::LocalExl3, 0)?, 0)?.fixed.iter()
+            .all(|d| d.group != "Spark intake planes"));
         assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
         let shared = super::super::engine::Experts::SharedOnly;
         assert_eq!(ExpertSource::selected(Some(&shared))?, ExpertSource::None);

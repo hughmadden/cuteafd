@@ -35,10 +35,28 @@ def save():
 host = os.environ.get('STUB_HOST', 'raptor')
 def find(name):
     return next((i for i, n in names.items() if n['name'] == name or i == name), None)
+def images():
+    path = os.environ.get('STUB_DOCKER_IMAGES')
+    return json.loads(Path(path).read_text()) if path and Path(path).exists() else {}
+def image(ref):
+    table = images().get(host) or images().get('*')
+    if table is None:  # no per-host table: every image exists with one common identity
+        return {'id': ref, 'layers': ['sha256:default']}
+    return table.get(ref) or next((entry for entry in table.values() if entry.get('id') == ref), None)
 if args[:2] == ['image', 'inspect']:
     if args[2] == '-f':
-        print(args[4]); sys.exit(0)
+        ref = args[4]
+        if '.RootFS.Layers' in args[3]:
+            entry = image(ref)
+            if not entry:
+                sys.exit(1)
+            print(json.dumps(entry.get('layers', []))); sys.exit(0)
+        entry = image(ref)
+        print(entry['id'] if entry else ref); sys.exit(0)
     print(json.dumps([{'Id': args[2], 'RepoTags': ['cuteafd-coordinator-dev:test']}])); sys.exit(0)
+if args[:2] == ['image', 'ls']:
+    table = images().get(host) or images().get('*') or {}
+    print('\n'.join(entry['id'] for entry in table.values())); sys.exit(0)
 if args[:2] == ['container', 'inspect']:
     sys.exit(0 if find(args[2]) else 1)
 if args[:1] == ['logs']:
@@ -272,8 +290,10 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert [call[i + 1] for i, a in enumerate(call) if a == '--device'
                 and call[i + 1].startswith('nvidia.com/gpu=')] == ['nvidia.com/gpu=0', 'nvidia.com/gpu=1']
         assert call[call.index('--ipc') + 1] == 'host' and 'memlock=-1:-1' in call
+        assert call[call.index('--security-opt') + 1].endswith('/docker/seccomp-code-bench.json')
         mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
-        assert f"{env['tmp']}/hub:/hf/hub:ro" in mounts
+        assert "/mnt/sparknest:/mnt/sparknest:ro" in mounts
+        assert f"{env['tmp'] / 'hub'}:{env['tmp'] / 'hub'}:ro" in mounts
         assert any(m.endswith(':/opt/cuteafd/lib/libcuteafd_native.so:ro') for m in mounts)
         assert any(m.endswith(':/opt/cuteafd/share:ro') for m in mounts)
         assert any(m.endswith(f'/gr/golden/{mode}/r1:/out') for m in mounts)
@@ -282,7 +302,7 @@ def test_env_per_arm_and_container_mounts(env, monkeypatch):
         assert (tail[-2:] == ['--trace', '/out/t']) == (mode == 'heads')
         if mode == 'heads':
             tail = tail[:-2]
-        assert tail[-8:] == ['glm-golden', '--snapshot', '/hf/hub/models--org--model/snapshots/rev1', '--device', '0',
+        assert tail[-8:] == ['glm-golden', '--snapshot', str(env['tmp'] / 'hub/models--org--model/snapshots/rev1'), '--device', '0',
                              '--split-device', '1', '--skip-routed-experts', '--nll'][-8:]
     out = env['home'] / '.cache/cuteafd/builds/gr/golden'
     record = json.loads((out / 'heads/r1/argv.json').read_text())
@@ -367,6 +387,19 @@ def test_compare_logits_byte_identical_arms(env, monkeypatch):
     assert '| a | b | 1 | logits/logits.bin | True | 4 | 0.0000e+00 |' in summary
 
 
+def test_require_identical_fails_on_differing_logits(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    logits = env['tmp'] / 'logits.bin'
+    np.arange(32, dtype='<f4').tofile(logits)
+    monkeypatch.setattr(golden, 'compare_pairs',
+                        lambda *a: [{'a': 'a', 'b': 'b', 'repeat': 1, 'file': 'logits.bin', 'byte_identical': False, 'rows': 0}])
+    monkeypatch.setenv('STUB_LOGITS', str(logits))
+    argv = BASE + ['--arm', 'a=i1:s1', '--arm', 'b=i1:s1', '--compare-logits', 'a:b'] + GOLDEN + \
+        ['--save-logits', '{out}/logits']
+    assert golden.main(argv) == 0  # report-only by default
+    assert golden.main(argv[:len(BASE)] + ['--require-identical', '--overwrite'] + argv[len(BASE):]) == 1
+
+
 def test_compare_tool_on_synthetic_logits(tmp_path):
     rng = np.random.default_rng(0)
     a = rng.normal(size=(130, 50)).astype('<f4')
@@ -391,9 +424,85 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert cli.returncode == 0 and 'byte-identical: True' in cli.stdout
 
 
+def log_probs(values) -> np.ndarray:
+    """Row-wise log-softmax: the probe's `log_probs` tensor is already normalized."""
+    values = np.asarray(values, dtype=np.float64)
+    top = values.max(axis=-1, keepdims=True)
+    return (values - top - np.log(np.exp(values - top).sum(axis=-1, keepdims=True))).astype('<f4')
+
+
+def write_row(path: Path, values) -> None:
+    """One row as the probe writes it: the safetensors header from rows.rs."""
+    data = np.asarray(values, dtype='<f4').tobytes()
+    header = json.dumps({'log_probs': {'dtype': 'F32', 'shape': [len(values)],
+                                       'data_offsets': [0, len(data)]}}).encode()
+    header += b' ' * (-len(header) % 8)
+    path.write_bytes(len(header).to_bytes(8, 'little') + header + data)
+
+
+def test_compare_tool_reads_safetensors_rows(tmp_path):
+    rng = np.random.default_rng(1)
+    rows = log_probs(rng.normal(size=(3, 40)))
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    for index, row in enumerate(rows):
+        write_row(a / f'row-{index:08}.safetensors', row)
+        write_row(b / f'row-{index:08}.safetensors', row)
+    same = compare.compare_paths(a, b)
+    assert same['layout'] == 'rows' and same['rows'] == 3 and same['byte_identical']
+    assert same['max_abs_diff'] == 0 and same['mean_kl'] == 0 and same['top1_agreement'] == 1
+    # Perturb one row into a new top-1: the row is named and its metrics are its own.
+    perturbed = rows[1].copy()
+    perturbed[3] = perturbed.max() + 2
+    write_row(b / 'row-00000001.safetensors', log_probs(perturbed))
+    diff = compare.compare_paths(a, b)
+    assert not diff['byte_identical'] and diff['rows'] == 3 and diff['vocab'] == 40
+    assert diff['worst_row'] == 'row-00000001.safetensors'
+    assert diff['worst_abs_diff_row'] == 'row-00000001.safetensors'
+    assert diff['top1_agreement'] == pytest.approx(2 / 3)
+    # Only one row moved, so its KL is the mean's three times over.
+    assert diff['mean_kl'] == pytest.approx(diff['max_kl'] / 3)
+    assert diff['max_kl'] > 0 and diff['max_abs_diff'] > 0
+    # A row only one side wrote is a difference, and a width mismatch names its row.
+    (b / 'row-00000002.safetensors').unlink()
+    missing = compare.compare_paths(a, b)
+    assert missing['only_a'] == 1 and missing['rows'] == 2 and not missing['byte_identical']
+    write_row(b / 'row-00000001.safetensors', np.zeros(39))
+    with pytest.raises(ValueError, match='widths differ'):
+        compare.compare_paths(a, b)
+    cli = subprocess.run([sys.executable, str(COMPARE), str(a), str(b)], capture_output=True, text=True)
+    assert cli.returncode == 2 and 'widths differ' in cli.stderr
+
+
+def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
+    root = tmp_path / 'golden'
+    rows = log_probs(np.random.default_rng(2).normal(size=(2, 24)))
+    for arm in ('a', 'b'):
+        (root / arm / 'r1' / 'logits').mkdir(parents=True)
+        for index, row in enumerate(rows):
+            write_row(root / arm / 'r1' / 'logits' / f'row-{index:08}.safetensors', row)
+    state = dict(root=str(root), task='t', family='kimi', snapshot='org/model', gpus='0', locks='gpu0',
+                 golden=['kimi-golden'], mode='golden', vocab=24, slots={})
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert len(results) == 1 and not results[0].get('error')
+    assert results[0]['file'] == 'logits' and results[0]['rows'] == 2 and results[0]['byte_identical']
+    golden.write_summary(state, [], results)
+    assert '| a | b | 1 | logits | True | 2 |' in (root / 'summary.md').read_text()
+    bad = rows[1].copy()
+    bad[0] = bad.max() + 3
+    write_row(root / 'b/r1/logits/row-00000001.safetensors', log_probs(bad))
+    results = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert results[0]['worst_row'] == 'row-00000001.safetensors'
+    golden.write_summary(state, [], results)
+    table = next(line for line in (root / 'summary.md').read_text().splitlines()
+                 if line.startswith('| a | b |') and 'repeat' not in line)
+    assert '| False |' in table and 'row-00000001.safetensors' in table
+
+
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
-    assert container == '/hf/hub/models--org--model/snapshots/rev1' and not extra
+    assert container == str(host) and extra == [str(host)]
     assert golden.vocab_size(host) == 8
 
 
@@ -464,6 +573,41 @@ def ssh_calls(env):
     return [json.loads(line) for line in env['ssh'].read_text().splitlines()] if env['ssh'].exists() else []
 
 
+SEALED_LAYERS = ['sha256:' + '11' * 32, 'sha256:' + '22' * 32]
+SEALED_ID = 'sha256:' + 'cd' * 32
+
+
+def local_id(host):
+    return 'sha256:' + hashlib.sha256(host.encode()).hexdigest()
+
+
+def seal_spark_layers(home, layers, instance='i1', slot='s1'):
+    """Reseal the spark-expert slot's META with its store-independent layer list."""
+    root = home / '.cache/cuteafd/builds' / f'wip-{instance}' / 'slots' / slot / 'spark-expert'
+    meta = json.loads((root / 'META.json').read_text())
+    meta['base_image_layers'] = layers
+    data = json.dumps(meta).encode()
+    (root / 'META.json').write_bytes(data)
+    (root / 'FINGERPRINT').write_text(hashlib.sha256(data).hexdigest() + '\n')
+
+
+def stub_images(env, monkeypatch, per_host):
+    """The docker stub's per-host images: {host: {ref: {'id': ..., 'layers': [...]}}}."""
+    path = env['tmp'] / 'spark-images.json'
+    path.write_text(json.dumps(per_host))
+    monkeypatch.setenv('STUB_DOCKER_IMAGES', str(path))
+
+
+def worker_images(env):
+    images = []
+    for host, command in ssh_calls(env):
+        if 'expertd-native' not in command:
+            continue
+        argv = shlex.split(command)
+        images.append((host, argv[argv.index('--entrypoint') + 2]))
+    return images
+
+
 def spark_argv(env, *extra, hosts='dodo,emu,rhea,moa'):
     test = env['tmp'] / 'chain-test'
     if not test.exists():
@@ -480,7 +624,7 @@ PASSED = 'running 1 test\ntest families::step5::chain::tests::native_step5_layer
 
 
 @pytest.mark.parametrize('hosts,match', [
-    ('oliver', 'Kimi'),
+    ('maxq', 'not a pool Spark'),
     ('kakapo', 'build seed'), ('dodo,dodo', 'repeats'), ('emu,nosuch', 'not a pool Spark'), (' , ', 'no host'),
 ])
 def test_spark_hosts_refused(hosts, match):
@@ -565,7 +709,7 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_GOLDEN_PEERS'] == '10.9.0.1:19451,10.9.0.2:19451,10.9.0.3:19451,10.9.0.4:19451'
     assert run_env['CUTEAFD_GOLDEN_SPARK_WORLD'] == '4' and run_env['CUTEAFD_GOLDEN_EXPERT_LAYERS'] == '3'
-    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
+    assert run_env['CUTEAFD_GOLDEN_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
     assert run_env['CUTEAFD_PROGRAM_MANIFEST'] == '/opt/cuteafd/share/PROGRAMS.json'
     assert run_env['CUTEAFD_GOLDEN_SPARK_PACKAGES'] == '/opt/cuteafd/spark'
     assert run_env['CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS'] == '2400'
@@ -589,6 +733,62 @@ def test_real_experts_start_before_and_stop_before_locks_release(spark_env, monk
     summary = (out.parent / 'summary.md').read_text()
     assert 'Spark expert ranks: 0=dodo, 1=emu, 2=rhea, 3=moa' in summary
     assert 'test result: ok. 1 passed' in summary and 'dodo: ready; 0 error lines' in summary
+
+
+def test_spark_dev_image_is_matched_by_layers_not_store_ids(spark_env, monkeypatch):
+    """The seed's store-local .Id differs from each target's: only layers identify the image."""
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    stub_images(env, monkeypatch, {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 0
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_spark_dev_image_with_different_layers_is_refused(spark_env, monkeypatch, capsys):
+    env = spark_env
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    table = {host: {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}} for host in SPARKS}
+    table['emu']['spark:tc']['layers'] = ['sha256:' + 'ff' * 32]
+    stub_images(env, monkeypatch, table)
+    assert golden.main(spark_argv(env)) == 2
+    assert 'emu: dev image spark:tc does not match the sealed spark-expert image layers' in capsys.readouterr().err
+    assert not runs(env)
+
+
+def test_spark_dev_image_accepts_an_identical_local_copy_under_another_name(spark_env, monkeypatch):
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    seal_spark_layers(env['home'], SEALED_LAYERS)
+    stub_images(env, monkeypatch, {host: {'loaded-' + host: {'id': local_id(host), 'layers': SEALED_LAYERS}}
+                                    for host in SPARKS})
+    assert golden.main(spark_argv(env)) == 0
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_older_slot_without_layers_uses_the_seed_image_layers(spark_env, monkeypatch):
+    """A slot sealed before base_image_layers: the coordinator looks the sealed ID's
+    layers up on the build seed (kakapo); the targets carry them under other IDs."""
+    env = spark_env
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    table = {'kakapo': {SEALED_ID: {'id': SEALED_ID, 'layers': SEALED_LAYERS}}}
+    for host in SPARKS:
+        table[host] = {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+    stub_images(env, monkeypatch, table)
+    assert golden.main(spark_argv(env)) == 0
+    assert any(host == 'kakapo' for host, _ in ssh_calls(env))
+    assert worker_images(env) == [(host, local_id(host)) for host in SPARKS]
+
+
+def test_older_slot_without_layers_and_no_seed_image_is_refused(spark_env, monkeypatch, capsys):
+    env = spark_env
+    table = {'kakapo': {'other:tag': {'id': 'sha256:' + 'ee' * 32, 'layers': ['sha256:other']}}}
+    for host in SPARKS:
+        table[host] = {'spark:tc': {'id': local_id(host), 'layers': SEALED_LAYERS}}
+    stub_images(env, monkeypatch, table)
+    assert golden.main(spark_argv(env)) == 2
+    assert f'dodo: dev image {SEALED_ID} is missing' in capsys.readouterr().err
 
 
 @pytest.mark.parametrize('output,problem', [
@@ -637,7 +837,7 @@ def test_run_timeout_tears_down_workers(spark_env, monkeypatch):
     # The workers bound themselves too: in-container timeout beyond the run's budget.
     command = next(c[1] for c in ssh_calls(spark_env) if 'expertd-native' in c[1])
     argv = shlex.split(command)
-    image = argv.index('sha256:' + 'cd' * 32)
+    image = argv.index('spark:tc')
     assert argv[argv.index('--entrypoint') + 1] == 'timeout' and argv[image + 1:image + 3] == ['--kill-after=30', str(1 + 1500 + 120)]
 
 
@@ -720,8 +920,8 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert call[-5:] == ['python3', '-m', 'pytest', '-q', 'python/tests/test_step5_chain_fixture.py']
     run_env = json.loads((env['tmp'] / 'run-env.json').read_text())
     assert run_env['CUTEAFD_STEP5_CHAIN_FIXTURE_DIR'] == str(fixtures) == run_env['CUTEAFD_GOLDEN_FIXTURES']
-    assert run_env['STEP5_QUANT_SNAPSHOT'] == '/hf/hub/models--org--model/snapshots/rev1'
-    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == '/hf/hub/models--x/snapshots/r'
+    assert run_env['STEP5_QUANT_SNAPSHOT'] == str(env['tmp'] / 'hub/models--org--model/snapshots/rev1')
+    assert run_env['STEP5_REFERENCE_SNAPSHOT'] == str(env['tmp'] / 'hub/models--x/snapshots/r')
     assert run_env['PYTHONDONTWRITEBYTECODE'] == '1' and '/workspace/cuteafd/python/reference' in run_env['PYTHONPATH']
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
 
@@ -749,11 +949,29 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-def test_raw_family_requires_raw_mode(env, capsys):
+@pytest.mark.parametrize('family', ['kimi', 'muse'])
+def test_raw_family_requires_raw_mode(env, capsys, family):
     write_slot(env['home'], 'i1')
-    argv = ['--task', 'gr', '--family', 'kimi', '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
+    argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
     assert golden.main(argv) == 2
     assert 'has no golden subcommand' in capsys.readouterr().err
+
+
+def test_muse_command_runs_from_sealed_slot_without_sparks(env):
+    write_slot(env['home'], 'i1')
+    command = ['python3', '-m', 'pytest', '-q',
+               'python/tests/test_dense_trellis_k6_exports.py::test_muse_f32_head_chunk_row_invariance']
+    argv = ['--task', 'gr', '--family', 'muse', '--model', 'org/model', '--arm', 'a=i1:s1',
+            '--gpus', '0', '--command', '--env', 'CUTEAFD_MUSE_HEAD_GPU_TEST=1', '--', *command]
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert call[-len(command):] == command
+    assert call[call.index('-w') + 1] == '/workspace/cuteafd'
+    assert '--network' not in call
+    assert any('/coordinator/workspace:/workspace/cuteafd:ro' in arg for arg in call)
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['mode'] == 'command' and record['gpus'] == [0]
+    assert record['arm_env']['CUTEAFD_MUSE_HEAD_GPU_TEST'] == '1'
 
 
 def test_dense_native_test_without_sparks(env, monkeypatch):
@@ -777,6 +995,19 @@ def test_dense_native_test_without_sparks(env, monkeypatch):
     assert f'{fixtures}:{fixtures}:ro' in mounts and '--network' not in call
 
 
+def test_rdma_loopback_native_test_without_sparks(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    test = env['tmp'] / 'loopback-test'
+    test.write_text('#!/bin/sh\n')
+    test.chmod(0o755)
+    argv = SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1', '--native-test', str(test),
+                         '--rdma', '--', 'transport::tests::loopback', '--exact', '--ignored']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert '--network' in call and '--device=/dev/infiniband' in call
+
+
 def test_spark_port_checked_only_at_grant():
     """A run queued behind another golden must not fail preflight on its port."""
     import inspect
@@ -784,3 +1015,46 @@ def test_spark_port_checked_only_at_grant():
     assert "if at_grant else '-'" in source
     assert "if port!='-':" in golden.REMOTE_CHECK
     assert inspect.signature(golden.preflight).parameters['at_grant'].default is True
+
+
+def test_namespace_root_keeps_mount_loading_paths_identical(env, monkeypatch):
+    root = env['tmp'] / 'namespace'
+    snapshot = root / 'hf-home/hub/models--org--model/snapshots/rev1'
+    snapshot.mkdir(parents=True)
+    (snapshot / 'config.json').write_text('{"vocab_size": 8}')
+    monkeypatch.setenv('CUTEAFD_NAMESPACE_ROOT', str(root))
+    monkeypatch.setenv('CUTEAFD_HF_HUB', str(root / 'hf-home/hub'))
+    host, container, extra = golden.resolve_model(str(snapshot))
+    assert str(host) == container == str(snapshot)
+    assert not extra
+    assert (Path(container) / 'config.json').read_bytes() == (host / 'config.json').read_bytes()
+    assert golden.hub_root() == root / 'hf-home/hub'
+
+
+def test_command_mode_does_not_auto_mount_host_executables_and_prefers_usr_local_bin(env):
+    write_slot(env['home'], 'i1')
+    host_exe = env['tmp'] / 'host-nsys'
+    host_exe.write_text('#!/bin/sh\n')
+    host_exe.chmod(0o755)
+    data_file = env['tmp'] / 'inputs.bin'
+    data_file.write_bytes(b'data')
+    argv = BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--command', '--',
+                   '/usr/local/bin/nsys', '/usr/bin/env', str(host_exe), f'--input={data_file}']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    mounts = [call[i + 1] for i, a in enumerate(call) if a == '-v']
+    assert not any('/usr/local/bin/nsys:' in m for m in mounts)
+    assert not any('/usr/bin/env:' in m for m in mounts)
+    assert f'{host_exe}:{host_exe}:ro' not in mounts
+    assert f'{data_file}:{data_file}:ro' in mounts
+    assert call[-4:] == ['/usr/local/bin/nsys', '/usr/bin/env', str(host_exe), f'--input={data_file}']
+    path_env = next(call[i + 1].split('=', 1)[1] for i, a in enumerate(call)
+                    if a == '-e' and call[i + 1].startswith('PATH=')).split(':')
+    assert path_env.index('/usr/local/bin') < path_env.index('/usr/local/cuda/bin')
+
+    # Explicit --mount mounts a host executable when the caller asks for it.
+    explicit = BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--command', '--overwrite',
+                       '--mount', str(host_exe), '--', str(host_exe)]
+    assert golden.main(explicit) == 0
+    mounts = [runs(env)[-1][i + 1] for i, a in enumerate(runs(env)[-1]) if a == '-v']
+    assert f'{host_exe}:{host_exe}:ro' in mounts

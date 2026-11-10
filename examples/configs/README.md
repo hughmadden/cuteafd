@@ -23,20 +23,24 @@ One file per v2.0.0 release card: `<model>-<quant>-<min|max>.config`, on the
 natural minimum (1 RTX + the fewest Sparks it fits) and the maximum
 (2 RTX + 4 or 6 Sparks). Each names the checkpoint revision, speculator,
 drafter, KV pool, media and expert placement the card ran with, so starting
-from one reproduces the published card. Replace the `REPLACE-ME-spark-N` hosts
+from one reproduces the published card, except that V4.1 MXFP4 max now uses
+six Sparks and keeps its four-Spark release layout as a reference.
+Replace the `REPLACE-ME-spark-N` hosts
 and the `192.0.2.N` (RFC 5737 documentation) RoCE addresses with your own,
 download the checkpoint and its drafter, then `--dry-run` and `--restart`.
 Cards and quality findings are in the main README and each family doc.
 
 | Model · quant | Min | Max | Speculator | `POOL_TOKENS` |
 | --- | --- | --- | --- | --- |
-| [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| [DeepSeek V4.1 Flash · MXFP4](../../docs/models/deepseek_v41.md) | [1 RTX + 3 Spark (TP3)](deepseek-v41-mxfp4-min.config) | [2 RTX + 6 Spark](deepseek-v41-mxfp4-max.config) | `DSPARK=on` | `auto` (exception, below) |
+| DeepSeek V4.1 Flash · StridedPLE (byte-identical FP8 Engram) | [1 RTX + 3 Spark](v41-flash-strided-min.config) | [2 RTX + 6 Spark](v41-flash-strided-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Flash · MXFP4](../../docs/models/deepseek_v4.md) | [1 RTX + 2 Spark](deepseek-v4-flash-mxfp4-min.config) | [2 RTX + 4 Spark](deepseek-v4-flash-mxfp4-max.config) | `dspark` | `auto` |
 | [DeepSeek V4 Pro · EXL3 K2](../../docs/models/deepseek_v4.md) | [1 RTX + 4 Spark](deepseek-v4-pro-exl3-min.config) | [2 RTX + 6 Spark](deepseek-v4-pro-exl3-max.config) | `dspark` | `auto` |
 | [GLM 5.3 · EXL3 K4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-exl3-min.config) | [2 RTX + 6 Spark](glm53-exl3-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
 | [GLM 5.3 · NVFP4](../../docs/models/glm5.md) | [1 RTX + 4 Spark](glm53-nvfp4-min.config) | [2 RTX + 6 Spark](glm53-nvfp4-max.config) | `dflash2` `incoai/GLM-5.3-DFlash2` | `auto` |
 | [GLM 5.3 Flash · FP8](../../docs/models/glm5_flash.md) | [1 RTX + 4 Spark](glm53-flash-fp8-min.config) | [2 RTX + 4 Spark](glm53-flash-fp8-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [GLM 5.3 Flash · EXL3 K3.25](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-exl3-min.config) | [2 RTX + 4 Spark](glm53-flash-exl3-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
+| [GLM 5.3 Flash · EXL3 K4 + Core K6](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-exl3-k6-min.config) | [2 RTX, 0 Spark](glm53-flash-exl3-k6-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [GLM 5.3 Flash · NVFP4](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-nvfp4-min.config) | [2 RTX + 4 Spark](glm53-flash-nvfp4-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [GLM 5.3 Flash · tr3 4bpw](../../docs/models/glm5_flash.md) | [1 RTX + 2 Spark](glm53-flash-tr3-min.config) | [2 RTX + 4 Spark](glm53-flash-tr3-max.config) | `dflash2` `incoai/GLM-5.3-Flash-DFlash2` | `auto` |
 | [MiMo V2.6 Flash MOPD · MXFP4](../../docs/models/mimo_v2.md) | [1 RTX + 2 Spark](mimo-v26-flash-mxfp4-min.config) | [2 RTX + 4 Spark](mimo-v26-flash-mxfp4-max.config) | `dflash2` (bundled `dflash/`) | `auto` |
@@ -57,16 +61,23 @@ step S5 unifies this default with the other families'.
 
 ## Families under qualification
 
-These have no release card yet. `run-family.sh` serves them only from a
-`./wip.sh` slot whose binary has the family's serve command (`--wip SLOT`),
-and refuses a release image or an older slot. Text only, no drafter, automatic
-attention placement.
+These have no release card yet. Use a `./wip.sh` slot containing the path
+under qualification (`--wip SLOT`); the image keys remain the promoted pair
+for consistency, not a support claim. Speculator and placement choices are
+listed per recipe. New families without a release serve command are refused
+outside a matching WIP slot.
 
 | Model · quant | Config | Layout |
 | --- | --- | --- |
+| GLM 5.3 · EXL3 K4 + native K6 core | [min](glm53-exl3-k6core-min.config) · [max](glm53-exl3-k6core-max.config) | 1 RTX + 4 Spark / 2 RTX + 6 Spark, DFlash2, pool-first |
+| GLM 5.3 Flash · EXL3 K4 + native K6 core | [min](glm53f-exl3-k4-core-k6-min.config) · [max](glm53f-exl3-k4-core-k6-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2, admitted KV pool |
 | Kimi K3 · EXL3 K2 (#273) | [max](kimi-k3-exl3-max.config) | 2 RTX (TP2 attention) + 6 Spark (TP6 experts), 5 routed layers on the RTX |
+| Kimi K3 · EXL3 K2 + K6 core (#1178) | [min](kimi-k3-exl3-k6-min.config) · [max](kimi-k3-exl3-k6-max.config) | 1 RTX + 6 Spark (110 GiB Spark budget) / 2 RTX + 6 Spark; native K6 core, automatic pool and placement, DFlash2 |
+| Mistral Large 4 · EXL3 K4 + native K6 core (#924) | [min](mistral-large4-exl3-k4-core-k6-min.config) · [max](mistral-large4-exl3-k4-core-k6-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark depth 3, pool-first; TP2 qualification pending |
 | Step-5-Preview · FP8 (#274) | [max](step5-fp8-max.config) | 2 RTX + 6 Spark |
 | Step-5-Preview · NVFP4 (#274) | [min](step5-nvfp4-min.config) | 1 RTX + 4 Spark |
+| Muse Spark · EXL3 K4 + Core K6 (#923) | [min](muse-spark-exl3-min.config) · [max](muse-spark-exl3-max.config) | 1 RTX + 4 Spark text qualified / 2 RTX + 6 Spark planned; pinned NVIDIA DFlash2, pool-first; media off |
+| Step-5-Preview · EXL3 K4 + Core K6 (#911) | [min](step5-exl3-k6core-min.config) · [max](step5-exl3-k6core-max.config) | 1 RTX + 3 Spark · 2 RTX + 6 Spark |
 
 ## TP x EP layout examples (DeepSeek V4.1)
 
@@ -81,12 +92,10 @@ The remaining files are V4.1 Spark topology experiments.
 | `SPARK_EP` | number of replicated expert groups (each group holds every expert) |
 
 `SPARK_TP` and `SPARK_EP` are optional and **all-or-none**. When both are
-absent the launcher keeps the legacy geometry (`TP = SPARK_COUNT`, `EP = 1`) for
-the legacy counts `0`/`2`/`4`; count `3` with no keys is the **compact EXL3
-TP3** layout (see below), never a native one — a native three-rank launch must
-name both keys (`SPARK_TP=3 SPARK_EP=1`). A six-rank configuration has **no**
-legacy geometry: `SPARK_COUNT=6` requires both keys explicitly and is rejected
-without them. The rank map is group-major:
+absent the planner chooses the checkpoint's canonical topology. Native V4.1
+three- and six-rank deployments select the ownership wire with both keys
+(`SPARK_TP=3 SPARK_EP=1` or `SPARK_TP=6 SPARK_EP=1`).
+The rank map is group-major:
 
 ```
 group   = global_rank / SPARK_TP
@@ -115,19 +124,11 @@ release-support promise is made.
 
 ## v10 TP3 profiles
 
-`tp3ep1-native.config` (explicit native `TP3xEP1`, one unreplicated group of
-three ranks) and `exl3-compact-tp3.config` (implicit compact EXL3 TP3:
-`SPARK_COUNT=3` with **no** `SPARK_TP`/`SPARK_EP` keys, the checkpoint-native
-`wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1` mixed-projection staged-trellis
-checkpoint — bit family `[3,4]`, launcher tag `k34` — on one RTX under the hard
-32 GiB ceiling, non-paired disjoint packages, KV 2 GiB and prefill 256) are the
-**v10 TP3 profiles**. Every example now names the promoted `:v1.0.0` pair
-and is checked against `cuteafd.config` by the same published-pair equality. Packaging is not
-qualification: neither file carries a memory, correctness, performance or
-readiness claim — see the
+`tp3ep1-native.config` selects explicit native `TP3xEP1`, one unreplicated
+group of three ranks. Packaging is not qualification: the file carries no
+memory, correctness, performance or readiness claim — see the
 [native TP3 status report](../../docs/release-v10-tp3-official-1x-3spark.md)
-(its own banner governs) and the
-[compact EXL3 TP3 report](../../docs/release-v10-tp3-exl3-compact-1x-3spark.md).
+(its own banner governs). DeepSeek V4/V4.1 Flash EXL3 is unsupported.
 
 The native profile pins `RTX_EXPERT_LAYERS=5`: the RTX holds the first five
 routed layers and each Spark starts at layer 5 to hold the other 35. The coordinator derives the exact per-rank assignment from checkpoint headers
@@ -143,9 +144,8 @@ derives the `v1.0.0` tag from it. Pull the coordinator image on the RTX host
 and the Spark image on every selected rank before `./run.sh`; the launcher
 does not pull images.
 
-Explicit topologies require the official native checkpoint. EXL3 and NVFP4
-checkpoints are rejected before any service change; their existing non-topology
-paths are unchanged.
+Explicit topologies require native experts; NVFP4 also supports pure TP3/4/6.
+DeepSeek V4/V4.1 Flash EXL3 checkpoints are rejected before any service change.
 
 ## Images and roles
 
@@ -201,3 +201,10 @@ reports them. Weight-only overflow is rejected before any service change. See
 The TP×EP overlays set `SPARK_DEVICE_BUDGET_BYTES=109119320064`, the tested
 fleet-wide floor (minimum of `MemTotal - 20 GiB` across the six hosts); the
 `tp4ep1` control carries no override and keeps the 100 GiB default fallback.
+
+StridedPLE packs each Engram row as 256 FP8 bytes followed by eight scale bytes.
+`MAPPED_SCALE_PRELOAD_GIB` preloads both complete interleaved tables, across all
+parts, when their full payload fits the cap and available host memory. Smaller
+caps leave them mapped: there is no separate scale-only preload. `ENGRAM_WARM`
+warms the complete mapped interleaved table. The original
+checkpoint and its main release card remain unchanged.

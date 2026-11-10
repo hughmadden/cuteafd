@@ -30,6 +30,7 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "retained" => retained(doc, t, latest, w),
         "prefix_cache" => prefix_cache(doc, t, latest, w),
         "context_load" => context_load(doc, t, latest, w),
+        "shared_prefix" => shared_prefix(doc, t, latest, w),
         "fidelity" | "fidelity_full" => fidelity(doc, t, latest, w),
         "structured" => structured(doc, t, latest, w),
         "needle" => needle(doc, t, latest, w),
@@ -42,6 +43,39 @@ pub fn body(doc: &mut Doc, t: &Theme, id: &str, panel: &PanelResult, w: f64) -> 
         "startup" => startup(doc, t, latest, w),
         _ => return None,
     })
+}
+
+fn shared_prefix(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
+    let Some(points) = v["points"].as_array().filter(|p| !p.is_empty()) else {
+        return empty(doc, t, "no measurements yet");
+    };
+    let widths = [0.27, 0.06, 0.16, 0.16, 0.17, 0.18];
+    let headers = ["case", "C", "agg tok/s", "med tok/s", "TTFT ms", "end-to-end s"];
+    let mut y = 16.0;
+    let mut x = 0.0;
+    for (name, fraction) in headers.iter().zip(widths) {
+        doc.text(x, y, Font::new(10.0, t.ink2).weight(600), name);
+        x += w * fraction;
+    }
+    y += 10.0;
+    doc.line(0.0, y, w, y, t.line, 1.0);
+    for point in points {
+        y += 24.0;
+        let values = [
+            point["kind"].as_str().unwrap_or("-").to_string(),
+            point["c"].as_u64().map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            num(point, "aggregate_tok_s").map(rate).unwrap_or_else(|| "-".into()),
+            num(point, "per_request_tok_s").map(rate).unwrap_or_else(|| "-".into()),
+            num(point, "ttft_s").map(|s| format!("{:.1}", s * 1e3)).unwrap_or_else(|| "-".into()),
+            num(point, "end_to_end_s").map(|s| format!("{s:.2}")).unwrap_or_else(|| "-".into()),
+        ];
+        x = 0.0;
+        for (value, fraction) in values.iter().zip(widths) {
+            doc.text(x, y, Font::new(11.0, t.ink), &super::svg::fit(value, 11.0, w * fraction - 6.0));
+            x += w * fraction;
+        }
+    }
+    y + 12.0
 }
 
 // Multiple incomparable units belong in a table, not on competing axes.
@@ -127,6 +161,10 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.end();
     y += 22.0;
     let mut notes = Vec::new();
+    if let Some(precision) = v["decode"]["precision"].as_object().or_else(|| v["prefill"]["precision"].as_object())
+        .and_then(|p| serde_json::from_value::<crate::fidelity_precision::Precision>(Value::Object(p.clone())).ok()) {
+        notes.push(precision.label());
+    }
     if dataset["qualification"] == "reference" {
         notes.push("reference".to_string());
     }
@@ -786,6 +824,20 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 #[cfg(test)]
 mod context_load_tests {
     #[test]
+    fn fidelity_panel_shows_recorded_precision_and_root_reason() {
+        let mut value = serde_json::json!({"decode":{}});
+        for root in [false, true] {
+            let p = crate::fidelity_precision::Precision::new(4.0, "test", root, "test").unwrap();
+            value["decode"]["precision"] = serde_json::json!(p);
+            let mut doc = super::Doc::new(900.0, 300.0);
+            super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, 900.0);
+            let svg = doc.finish();
+            assert!(svg.contains("4.0 bpw"));
+            assert!(svg.contains(if root { "reference-root format" } else { "tier:" }));
+        }
+    }
+
+    #[test]
     fn fidelity_card_labels_reference() {
         let value = serde_json::json!({"dataset":{"config":"dense-bf16","revision":"a".repeat(40),
             "qualification":"reference"}});
@@ -846,6 +898,18 @@ mod context_load_tests {
         assert!(super::draft_mix(&mut doc, &super::super::theme::NORMAL, &v, 700.0) > 100.0);
         let svg = doc.finish();
         for label in ["C16 MIXED PROMPTS", "per-request median", "C1 COPY-HEAVY REWRITE", "5.4 tokens/round", "91% accepted"] {
+            assert!(svg.contains(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn shared_prefix_card_exposes_cached_followup_latency() {
+        let v = serde_json::json!({"points": [{"kind": "cached follow-up", "c": 1,
+            "aggregate_tok_s": 100.0, "per_request_tok_s": 100.0, "ttft_s": 0.2, "end_to_end_s": 5.32}]});
+        let mut doc = super::Doc::new(900.0, 300.0);
+        assert!(super::shared_prefix(&mut doc, &super::super::theme::NORMAL, &v, 900.0) > 0.0);
+        let svg = doc.finish();
+        for label in ["cached follow-up", "TTFT ms", "end-to-end s", "200.0", "5.32"] {
             assert!(svg.contains(label), "{label}");
         }
     }

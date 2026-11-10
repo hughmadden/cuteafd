@@ -17,12 +17,15 @@ thread_local! {
     static PROJECTION_READ_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn projection_read(file: &File, destination: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+pub(crate) fn projection_read(file: &impl crate::expert_reader::PositionedRead, destination: &mut [u8], offset: u64) -> std::io::Result<()> {
     file.read_exact_at(destination, offset)?;
     PROJECTION_READ_BYTES.with(|counter| counter.set(counter.get().saturating_add(destination.len())));
     Ok(())
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("--dspark requires bundled dSpark tensors in the checkpoint")]
+pub struct MissingBundledDspark;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum V41TensorPlacement {
@@ -70,6 +73,12 @@ pub struct RoutedExpertShape {
 }
 
 impl RoutedExpertShape {
+    /// Routed-expert layers of the target model (`RTX_EXPERT_LAYERS=all`).
+    /// Drafter and MTP stages are not part of this extent.
+    pub fn routed_layers(&self) -> usize {
+        self.layers.saturating_sub(self.first_layer)
+    }
+
     pub(crate) fn of_v41(config: &OfficialV41Config) -> Self {
         let text = config.text();
         Self {
@@ -98,6 +107,7 @@ impl RoutedExpertShape {
 
 #[derive(Debug)]
 pub struct OfficialV41Catalog {
+    reader: crate::expert_reader::ExpertReader,
     format: crate::plan::checkpoint::CheckpointFormat,
     /// The strict V4.1 contract; `None` for other families, which only expose
     /// their routed experts through this catalog.
@@ -106,6 +116,7 @@ pub struct OfficialV41Catalog {
     snapshot: PathBuf,
     tensors: Vec<V41Tensor>,
     exl3: Option<crate::V41Exl3Manifest>,
+    exl3_arena_bytes: std::sync::Mutex<BTreeMap<(usize, usize), Vec<u64>>>,
     nvfp4: Option<crate::V41Nvfp4Contract>,
     fp8: Option<crate::formats::fp8_experts::Fp8ExpertTensors>,
 }
@@ -140,9 +151,44 @@ impl V41CoordinatorTensorReader {
 }
 
 impl OfficialV41Catalog {
+    /// Transport tests use miniature payloads, never a serving admission contract.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn exlr8_transport_fixture(snapshot: &Path, experts: RoutedExpertShape) -> Self {
+        Self { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+            config: None, experts, snapshot: snapshot.into(), tensors: Vec::new(),
+            exl3: None, nvfp4: None, fp8: None }
+    }
+
+    pub(crate) fn shard_file(&self, shard: &str) -> std::io::Result<crate::expert_reader::ShardFile> {
+        if let Some(fp8) = &self.fp8 { return fp8.shard_file(shard); }
+        self.reader.open(&self.snapshot.join(shard))
+    }
+
+    /// Release loader-only handles and I/O workers after every staging read has joined.
+    pub fn finish_expert_reads(&self) {
+        self.reader.clear();
+        if let Some(fp8) = &self.fp8 { fp8.finish_reads(); }
+    }
+
+    /// Resolve bundled dSpark from the checkpoint's own spec and catalog, not its family name.
+    pub fn bundled_dspark_ownership(&self, requested: bool) -> Result<crate::plan::spec::DraftOwnership> {
+        use crate::plan::{spec::{DraftOwnership, SpeculatorSpec}, Component};
+        if !requested { return Ok(DraftOwnership::None); }
+        let checkpoint = crate::plan::Checkpoint::inventory(&self.snapshot)?;
+        let family = crate::plan::family::detect(&checkpoint).context("catalog family")?;
+        let model = family.open(&checkpoint)?;
+        let bundled = matches!(model.spec().speculator, Some(SpeculatorSpec::BundledDspark { .. }))
+            && self.tensors.iter().any(|tensor| family.classify(model.spec(), &tensor.metadata.name)
+                .is_some_and(|role| role.component == Component::Speculator));
+        if !bundled { return Err(MissingBundledDspark.into()); }
+        Ok(DraftOwnership::BundledDspark)
+    }
+
     /// Restrict the coordinator catalog to the selected checkpoint drafter.
     /// Spark workers always select `None`: bundled draft experts are local.
     pub fn select_draft(&mut self, ownership: crate::plan::spec::DraftOwnership) -> Result<()> {
+        self.exl3_arena_bytes.get_mut().expect("catalog arena cache poisoned").clear();
         if self.format == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
             ensure!(!ownership.uses_checkpoint(), "EXLR8 MTP drafter not wired; use the default GLM DFlash2 external drafter");
             self.experts.draft_stages = 0;
@@ -169,9 +215,25 @@ impl OfficialV41Catalog {
 
     pub fn format(&self) -> crate::plan::checkpoint::CheckpointFormat { self.format }
 
+    /// Package-fixed MXFP4 scale layout. Other native families retain UE8M0
+    /// until their packages adopt the same checked transform.
+    pub fn mxfp4_scale_codes(&self) -> bool { self.config.is_some() }
+
     pub fn exl3(&self) -> Option<&crate::V41Exl3Manifest> {
         self.exl3.as_ref()
     }
+
+    /// Private catalog headers are immutable between explicit draft selections.
+    /// Reuse each layer's validated rank costs across admission candidates.
+    pub(crate) fn exl3_spark_arena_bytes(&self, layer: usize, world: usize) -> Result<Vec<u64>> {
+        let mut cache = self.exl3_arena_bytes.lock().expect("catalog arena cache poisoned");
+        if let Some(bytes) = cache.get(&(layer, world)) { return Ok(bytes.clone()); }
+        let manifest = self.exl3().context("Spark EXL3 budget needs EXL3 headers")?;
+        let bytes = manifest.resident_arena_bytes_all_ranks(crate::V41Exl3Layer::Backbone(layer), world, true)?;
+        cache.insert((layer, world), bytes.clone());
+        Ok(bytes)
+    }
+
     /// The checkpoint's own FP8 routed experts (E4M3 + FP32 128x128 block
     /// scales), served without re-quantization by the `fp8` family.
     pub fn fp8(&self) -> Option<&crate::formats::fp8_experts::Fp8ExpertTensors> {
@@ -180,14 +242,6 @@ impl OfficialV41Catalog {
     /// Validated ModelOpt NVFP4 expert contract, when the checkpoint has one.
     pub fn nvfp4(&self) -> Option<&crate::V41Nvfp4Contract> {
         self.nvfp4.as_ref()
-    }
-    /// True when the draft (MTP) routed experts load as native FP4 weights:
-    /// either the checkpoint is not EXL3 at all, or it is a raw EXL3
-    /// publication that kept its draft experts at source precision.
-    pub fn native_dspark_experts(&self) -> bool {
-        self.exl3
-            .as_ref()
-            .is_none_or(|manifest| manifest.mtp_experts_are_source())
     }
     pub fn coordinator_tensor_reader(&self, name: &str) -> Result<V41CoordinatorTensorReader> {
         let tensor = self.tensor(name)?;
@@ -242,11 +296,10 @@ impl OfficialV41Catalog {
     /// One complete physical projection read, counted at the I/O boundary.
     /// TP2 callers validate that the union of their slices covers this extent.
     pub fn read_projection_once(&self, name: &str, destination: &mut [u8]) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         let tensor = self.tensor(name)?;
         let bytes = usize::try_from(tensor.metadata.byte_length)?;
         ensure!(destination.len() == bytes, "projection staging size mismatch for {name}");
-        projection_read(&File::open(self.snapshot.join(&tensor.shard))?, destination, tensor.metadata.byte_offset)
+        projection_read(&self.shard_file(&tensor.shard)?, destination, tensor.metadata.byte_offset)
             .with_context(|| format!("shared TP2 projection read {name}"))?;
         Ok(bytes)
     }
@@ -322,9 +375,8 @@ impl OfficialV41Catalog {
                 dst.len() >= bytes,
                 "replicated expert scalar {name} needs {bytes} bytes"
             );
-            use std::os::unix::fs::FileExt;
             let tensor = self.tensor(name)?;
-            File::open(self.snapshot.join(&tensor.shard))?
+            self.shard_file(&tensor.shard)?
                 .read_exact_at(&mut dst[..bytes], tensor.metadata.byte_offset)
                 .with_context(|| format!("staging replicated expert scalar {name}"))?;
             return Ok(bytes);
@@ -366,14 +418,13 @@ impl OfficialV41Catalog {
         &self, name: &str, spark_rank: Option<usize>, partitions: usize, axis: Option<usize>, bytes: usize,
         dst: &mut [u8], scratch: &mut [u8],
     ) -> Result<usize> {
-        use std::os::unix::fs::FileExt;
         ensure!(
             dst.len() >= bytes,
             "tensor staging buffer for {name} needs {bytes} bytes"
         );
         let tensor = self.tensor(name)?;
         let metadata = &tensor.metadata;
-        let file = File::open(self.snapshot.join(&tensor.shard))?;
+        let file = self.shard_file(&tensor.shard)?;
         match axis {
             Some(0) => {
                 let offset = metadata
@@ -422,6 +473,18 @@ impl OfficialV41Catalog {
         Ok(bytes)
     }
 
+    /// Bytes of one Engram row as the row cache stores it (weight then scale),
+    /// from the checkpoint's own headers: 264 for FP8, 144 for NVFP4.
+    pub fn engram_row_bytes(&self) -> Result<usize> {
+        let layer = *self.config().text().engram_layer_ids.first().context("checkpoint has no engram layer")?;
+        if self.config().strided_engram() { return Ok(264); }
+        ["weight", "scale"].iter().try_fold(0, |sum, suffix| {
+            let metadata = &self.tensor(&format!("layers.{layer}.engram.embed.{suffix}"))?.metadata;
+            ensure!(metadata.shape.len() == 2, "engram tensor {suffix} is not 2-D");
+            Ok(sum + metadata.shape[1])
+        })
+    }
+
     /// # Safety
     /// Checkpoint files must remain immutable for the lifetime of the returned maps.
     pub unsafe fn map_engram(&self, layer: usize) -> Result<crate::EngramTable> {
@@ -446,19 +509,18 @@ impl OfficialV41Catalog {
             table.name_stats(format!("engram.{layer}.{suffix}"));
             Ok(table)
         };
-        if let Some(ple) = self.exl3.as_ref().and_then(|m| m.ple_quantization.as_ref()) {
-            use std::os::unix::fs::FileExt;
-            let prefix = format!("layers.{layer}.engram.embed");
-            let tensor = self.tensor(&format!("{prefix}.weight_scale_2"))?;
-            let mut bytes = [0; 4];
-            File::open(self.snapshot.join(&tensor.shard))?.read_exact_at(&mut bytes, tensor.metadata.byte_offset)?;
-            let global = f32::from_le_bytes(bytes);
-            let declared = ple["tensors"][&prefix]["global_scale"].as_f64().context("missing NVFP4 global scale")? as f32;
-            ensure!(global.to_bits() == declared.to_bits(), "NVFP4 global scale differs from metadata");
-            crate::EngramTable::new_nvfp4(map("weight")?, map("weight_scale")?, global)
-        } else {
-            crate::EngramTable::new(map("weight")?, map("scale")?)
+        if self.config().strided_engram() {
+            let parts = self.config().engram_parts(layer).iter().map(|part| {
+                let tensor = self.tensor(&part.tensor)?;
+                Ok(crate::TablePart { path: self.snapshot.join(&tensor.shard),
+                    offset: tensor.metadata.byte_offset, rows: part.rows as u64 })
+            }).collect::<Result<Vec<_>>>()?;
+            // SAFETY: forwarded from this function's immutable checkpoint contract.
+            let table = unsafe { crate::MappedTable::open(&parts, crate::RowFormat::of(DType::U8, 264)?)? };
+            table.name_stats(format!("engram.{layer}.strided"));
+            return crate::EngramTable::new_strided(table);
         }
+        crate::EngramTable::new(map("weight")?, map("scale")?)
     }
 
     /// Physical checkpoint bytes only; packing, caches and execution scratch are additional.
@@ -629,40 +691,37 @@ fn placement(name: &str) -> V41TensorPlacement {
     }
 }
 
-/// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
 pub fn read_official_v41_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
-    read_official_v41_catalog_filtered(snapshot, None)
+    read_official_v41_role_catalog(snapshot, "full catalog", |_| true)
 }
 
 /// Official-format worker inventory, without opening coordinator-only shards.
 pub fn read_official_v41_spark_catalog(snapshot: &Path, rank: usize, world: usize) -> Result<OfficialV41Catalog> {
     ensure!(rank < world, "Spark rank {rank} outside TP{world}");
-    read_official_v41_catalog_filtered(snapshot,
-        Some(format!("spark{rank} (TP{world})")))
+    read_official_v41_role_catalog(snapshot, &format!("spark{rank} (TP{world})"),
+        |name| name.starts_with("layers.") && name.contains(".ffn.experts."))
 }
 
-fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String>) -> Result<OfficialV41Catalog> {
+/// Inventory for a role that reads only the tensors `needed` selects. The
+/// index is checked in full, but only shards holding a needed tensor are
+/// opened and validated, so a host may omit the rest (e.g. the
+/// coordinator-only Engram shards).
+pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl Fn(&str) -> bool)
+    -> Result<OfficialV41Catalog> {
     let raw_config: serde_json::Value = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
-    let exl3 = if raw_config["quantization_config"]["quant_method"] == "exl3" {
-        Some(crate::read_v41_exl3_manifest(snapshot)?)
-    } else { None };
-    let nvfp4 = if exl3.is_none() {
-        crate::read_v41_nvfp4_contract(snapshot)?
-    } else { None };
-    let config = match (&exl3, &nvfp4) {
-        (Some(manifest), _) => manifest
-            .config
-            .clone()
-            .context("V4.1 EXL3 manifest lacks the official configuration")?,
-        (None, Some(contract)) => contract.config.clone(),
-        (None, None) => read_official_v41_config(snapshot)?,
+    ensure!(raw_config["quantization_config"]["quant_method"] != "exl3",
+        "unsupported: EXL3 for DeepSeek V4/V4.1 Flash");
+    let nvfp4 = crate::read_v41_nvfp4_contract(snapshot)?;
+    let config = match &nvfp4 {
+        Some(contract) => contract.config.clone(),
+        None => read_official_v41_config(snapshot)?,
     };
     #[derive(Deserialize)]
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
     let mut bytes = Vec::new();
-    File::open(snapshot.join("model.safetensors.index.json"))?
+    File::open(crate::plan::checkpoint::index_path(snapshot)?)?
         .take(64 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(
@@ -671,27 +730,20 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
     );
     let index: Index = serde_json::from_slice(&bytes)?;
     let mut expected = expected_tensors()?;
-    if let Some(manifest) = &exl3 {
-        // Raw publications keep their MTP draft experts at the native FP4
-        // source precision, so only backbone expert tensors leave the
-        // official contract; staged snapshots quantize drafts too.
-        let keep_native_mtp = manifest.mtp_experts_are_source();
-        expected.retain(|name, _| {
-            !name.contains(".ffn.experts.") || (keep_native_mtp && name.starts_with("mtp."))
-        });
-        for projection in manifest.projections.values() {
-            for (suffix, dtype, shape, bytes) in [
-                ("trellis", DType::I16, projection.trellis_shape().to_vec(), projection.trellis_bytes()),
-                ("suh", DType::F16, vec![projection.input_features], projection.input_features * 2),
-                ("svh", DType::F16, vec![projection.output_features], projection.output_features * 2),
-                ("mcg", DType::I32, vec![], 4),
-            ] {
-                expected.insert(format!("{}.{suffix}", projection.name),
-                    ExpectedTensor { dtype, shape, bytes: bytes as u64 });
+    if config.strided_engram() {
+        ensure!(nvfp4.is_none(), "strided FP8 engram requires native official quantization");
+        for layer in &config.text().engram_layer_ids {
+            let prefix = format!("layers.{layer}.engram.embed");
+            let weight = expected.remove(&format!("{prefix}.weight")).context("missing engram weight")?;
+            let scale = expected.remove(&format!("{prefix}.scale")).context("missing engram scale")?;
+            let parts = config.engram_parts(*layer);
+            ensure!(parts.iter().map(|part| part.rows).sum::<usize>() == weight.shape[0]
+                && weight.bytes + scale.bytes == weight.shape[0] as u64 * 264, "invalid strided row count");
+            for part in parts {
+                expected.insert(part.tensor.clone(), ExpectedTensor {
+                    dtype: DType::U8, shape: vec![part.rows, 264], bytes: part.rows as u64 * 264,
+                });
             }
-        }
-        if let Some(ple) = &manifest.ple_quantization {
-            apply_nvfp4_ple_contract(&mut expected, ple, config.text().engram_layer_ids.as_slice())?;
         }
     }
     if let Some(contract) = &nvfp4 {
@@ -707,12 +759,20 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
         expected.len(),
         index.weight_map.len()
     );
-    let shard_count = if exl3.is_some() {
-        index.weight_map.values().collect::<BTreeSet<_>>().len()
-    } else { 48 };
-    let allowed_shards: BTreeSet<_> = (1..=shard_count)
-        .map(|i| format!("model-{i:05}-of-{shard_count:05}.safetensors"))
+    let mut allowed_shards: BTreeSet<String> = (1..=48u32)
+        .map(|i| format!("model-{i:05}-of-00048.safetensors"))
         .collect();
+    if config.strided_engram() {
+        for layer in &config.text().engram_layer_ids {
+            for (number, part) in config.engram_parts(*layer).iter().enumerate() {
+                let shard = format!("engram-{layer:02}-part-{number:05}.safetensors");
+                ensure!(index.weight_map.get(&part.tensor) == Some(&shard),
+                    "strided part {} must be in {shard}", part.tensor);
+                allowed_shards.insert(shard);
+            }
+        }
+    }
+    let shard_count = allowed_shards.len();
     let mut shards: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (name, shard) in &index.weight_map {
         ensure!(
@@ -733,13 +793,12 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
         "checkpoint requires all {shard_count} shards"
     );
     let mut tensors = Vec::with_capacity(expected.len());
-    let needed = |name: &str| spark_role.is_none() || name.starts_with("layers.") && name.contains(".ffn.experts.");
     for (shard, names) in shards {
         let Some(first_needed) = names.iter().find(|name| needed(name)) else { continue };
         let path = snapshot.join(&shard);
         let metadata = read_safetensors_metadata(&path).with_context(|| format!(
-            "role {} needs tensor {first_needed} in shard {shard} at snapshot {}",
-            spark_role.as_deref().unwrap_or("full catalog"), snapshot.display()))?;
+            "role {role} needs tensor {first_needed} in shard {shard} at snapshot {}",
+            snapshot.display()))?;
         ensure!(
             metadata.len() == names.len(),
             "index/header tensor count mismatch in {shard}"
@@ -753,10 +812,7 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
             );
             let spec = &expected[&tensor.name];
             validate_tensor(&tensor, spec)?;
-            let target = if exl3.is_some() && tensor.name.starts_with("layers.")
-                && tensor.name.contains(".ffn.experts.") {
-                V41TensorPlacement::BackboneExl3
-            } else if nvfp4.is_some() && tensor.name.starts_with("layers.")
+            let target = if nvfp4.is_some() && tensor.name.starts_with("layers.")
                 && tensor.name.contains(".ffn.experts.") {
                 nvfp4_placement(&tensor.name)
             } else { placement(&tensor.name) };
@@ -799,12 +855,12 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
         );
     }
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         experts: RoutedExpertShape::of_v41(&config),
         config: Some(config),
         snapshot: snapshot.to_path_buf(),
         tensors,
-        exl3,
+        exl3: None,
         nvfp4,
         fp8: None,
     })
@@ -816,13 +872,37 @@ fn read_official_v41_catalog_filtered(snapshot: &Path, spark_role: Option<String
 pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     let config: serde_json::Value =
         crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
+    read_expert_catalog_with_checkpoint(snapshot, &config, None)
+}
+
+pub(crate) fn expert_catalog_from_checkpoint(checkpoint: &crate::plan::Checkpoint,
+    validation: &Result<(), String>) -> Result<OfficialV41Catalog> {
+    if checkpoint.config["quantization_config"]["quant_method"] == "exl3" {
+        validation.as_ref().map_err(|error| anyhow::anyhow!("{error}"))?;
+        ensure!(checkpoint.missing_shards.is_empty(), "expert catalog needs readable shards: {:?}", checkpoint.missing_shards);
+    }
+    read_expert_catalog_with_checkpoint(&checkpoint.snapshot, &checkpoint.config, Some(checkpoint))
+}
+
+fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if kimi_catalog_config(config) {
+        return read_kimi_expert_catalog(snapshot, config, checkpoint);
+    }
+    if crate::families::muse_spark::MuseSparkConfig::is_muse_spark(config) {
+        return read_muse_spark_expert_catalog(snapshot, config, checkpoint);
+    }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
-        return read_glm_dsa_expert_catalog(snapshot, &config);
+        return read_glm_dsa_expert_catalog(snapshot, config, checkpoint);
     }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
-        return read_qwen4_expert_catalog(snapshot, &config);
+        return read_qwen4_expert_catalog(snapshot, config, checkpoint);
+    }
+    if config.get("model_type").and_then(serde_json::Value::as_str) == Some("mistral_large4") {
+        return read_mistral_large4_expert_catalog(snapshot, config, checkpoint);
     }
     if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
+        let checkpoint_arg = checkpoint;
         let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
         let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
         // The final target layer is dense; bundled MTP stages are separately owned.
@@ -831,17 +911,21 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
         ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
         let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
             topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
+        if crate::plan::families::step5::exl3::is_exl3(&checkpoint) {
+            // K4 experts with K6 tails: the shared two-tier package exl3-step5-k46.
+            return exl3_catalog_or_read(snapshot, shape, &[4, 6], checkpoint_arg);
+        }
         let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape,
             &(first_layer..end).collect())?;
-        return Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
+        return Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),
             tensors: Vec::new(), exl3: None, nvfp4: None, fp8: Some(fp8) });
     }
     if config.get("text_config").is_some() {
         return read_official_v41_catalog(snapshot);
     }
     match config.get("model_type").and_then(serde_json::Value::as_str) {
-        Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot),
-        Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, &config),
+        Some("deepseek_v4") => read_deepseek_v4_expert_catalog(snapshot, checkpoint),
+        Some("glm_moe_dsa") => read_glm_dsa_expert_catalog(snapshot, config, checkpoint),
         Some("mimo_v2_flash" | "mimo_v2") => read_mimo_v2_expert_catalog(snapshot, &config),
         other => anyhow::bail!(
             "the Spark expert service does not know model_type {other:?}; add a family \
@@ -851,11 +935,69 @@ pub fn read_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     }
 }
 
+fn exl3_catalog_or_read(snapshot: &Path, shape: RoutedExpertShape, tiers: &[usize],
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    if let Some(checkpoint) = checkpoint {
+        return deepseek_v4_exl3_catalog_input(snapshot, &checkpoint.weight_map, shape, tiers, Some(checkpoint));
+    }
+    #[derive(Deserialize)]
+    struct Index { weight_map: BTreeMap<String, String> }
+    let index: Index = serde_json::from_value(crate::families::deepseek_v41::v41_exl3::read_json(
+        &crate::plan::checkpoint::index_path(snapshot)?, 64 * 1024 * 1024)?)?;
+    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
+}
+
+fn kimi_catalog_config(config: &serde_json::Value) -> bool {
+    matches!(config["model_type"].as_str(), Some("kimi_k3" | "kimi_linear"))
+        || config["architectures"].as_array().is_some_and(|architectures| architectures.iter().any(|name|
+            matches!(name.as_str(), Some("KimiK3ForConditionalGeneration" | "KimiLinearForCausalLM"))))
+}
+
+fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::kimi_k3::config::KimiK3Config::from_hf(config)?;
+    cfg.release_geometry()?;
+    ensure!(config["quantization_config"]["quant_method"] == "exl3",
+        "Kimi Spark experts require the checkpoint's native EXL3 K2/K3 format");
+    let first_layer = cfg.dense.iter().position(|dense| !dense).context("Kimi config has no routed layers")?;
+    ensure!(cfg.dense[first_layer..].iter().all(|dense| !dense), "Kimi routed layers must follow dense layers");
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.latent, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    let catalog = if let Some(checkpoint) = checkpoint {
+        deepseek_v4_exl3_catalog_input(snapshot, &checkpoint.weight_map, shape, &[2, 3], Some(checkpoint))?
+    } else {
+        let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
+        deepseek_v4_exl3_catalog(snapshot, &checkpoint.weight_map, shape, &[2, 3])?
+    };
+    ensure!(catalog.experts.draft_stages == 0, "Kimi K3 has no native draft expert stages");
+    Ok(catalog)
+}
+
+/// Muse Spark routed experts: every layer is MoE and the experts run at the
+/// `moe_hidden_size` width of the coordinator's `pre_expert_proj` stream. Only
+/// EXL3 publications (split per expert, `model.language_model.layers.L.mlp.
+/// experts.E.{gate,up,down}_proj`) have an expert package; the BF16 release
+/// fuses each layer's experts into `[256, ...]` tensors.
+fn read_muse_spark_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
+    ensure!(config["quantization_config"]["quant_method"] == "exl3",
+        "Muse Spark routed experts serve from an EXL3 publication (K4 experts + K6 core); \
+         the BF16 release's fused [256, ...] expert tensors have no expert package");
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    // muse:exl3-k45 (uniform K4 publishes with the adjacent empty K5 tier).
+    exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint)
+}
+
 /// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
 /// the Sparks today (the official FP8 experts need ~675 GiB); dense layers
 /// come first, and the MTP layer after the backbone keeps its experts on the
 /// coordinator.
-fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     // The geometry from the coordinator's own config readers, so the Spark
     // ranks and serve-glm / serve-glmf agree on the routed layers.
     let (dense, shape) = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
@@ -880,13 +1022,14 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         draft_experts: 0,
     };
     if crate::plan::checkpoint::CheckpointFormat::detect(snapshot)? == crate::plan::checkpoint::CheckpointFormat::Exlr8 {
-        ensure!(config["model_type"] == "glm_moe_dsa", "EXLR8 requires GLM DSA");
+        let (_, _, family) = crate::plan::exlr8::native::family_geometry(config)?;
         crate::plan::Checkpoint::inventory(snapshot)?;
         let draft_layers = crate::plan::exlr8::draft_layers(snapshot, config)?;
         let mut shape = shape;
-        shape.draft_stages = draft_layers.len();
-        shape.draft_experts = if draft_layers.is_empty() { 0 } else { shape.experts };
-        return Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
+        // Flash uses an external drafter; its published MTP is not a worker owner.
+        shape.draft_stages = if family == cuteafd_ffi::exlr8::KernelFamily::GlmFlash { 0 } else { draft_layers.len() };
+        shape.draft_experts = if shape.draft_stages == 0 { 0 } else { shape.experts };
+        return Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::Exlr8,
             config: None, experts: shape, snapshot: snapshot.into(), tensors: Vec::new(),
             exl3: None, nvfp4: None, fp8: None });
     }
@@ -903,19 +1046,13 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
         "GLM routed experts serve from EXL3 publications (e.g. wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1), \
          ModelOpt NVFP4 releases or, coordinator-local, from the official FP8 checkpoint"
     );
-    #[derive(Deserialize)]
-    struct Index {
-        weight_map: BTreeMap<String, String>,
-    }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     // The tier pair of the family's expert packages (glmf:exl3-k34, glm:exl3-k45).
     let tiers: &[usize] = if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         &[3, 4]
     } else {
         &[4, 5]
     };
-    deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
+    exl3_catalog_or_read(snapshot, shape, tiers, checkpoint)
 }
 
 /// Qwen 3.8 Flash Next (qwen4_exp) routed experts: every layer is MoE (512
@@ -930,7 +1067,7 @@ fn read_glm_dsa_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> R
 pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<OfficialV41Catalog> {
     let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
     if config["quantization_config"]["quant_method"] == "exl3" {
-        return read_qwen4_expert_catalog(snapshot, &config);
+        return read_qwen4_expert_catalog(snapshot, &config, None);
     }
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config)?;
     ensure!(stages > 0 && stages <= cfg.mtp_layers, "Qwen MTP role requests {stages} stages, config provides {}", cfg.mtp_layers);
@@ -939,11 +1076,12 @@ pub fn read_qwen4_mtp_expert_catalog(snapshot: &Path, stages: usize) -> Result<O
     let layers = (cfg.layers..cfg.layers + stages).collect();
     let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape, &layers)?;
     for layer in layers { fp8.for_layer(layer)?; }
-    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
+    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(), tensors: Vec::new(),
         exl3: None, nvfp4: None, fp8: Some(fp8) })
 }
 
-fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Result<OfficialV41Catalog> {
+fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     let cfg = crate::families::qwen4::Qwen4Config::from_hf(config)?;
     let shape = RoutedExpertShape {
         layers: cfg.layers,
@@ -965,15 +1103,8 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
         return fp8_catalog(snapshot, shape);
     }
     if quant["quant_method"] == "exl3" {
-        #[derive(Deserialize)]
-        struct Index {
-            weight_map: BTreeMap<String, String>,
-        }
-        let index: Index =
-            crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-                .and_then(|value| Ok(serde_json::from_value(value)?))?;
         // qwen4:exl3-k45.
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, &[4, 5]);
+        return exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint);
     }
     if quant.get("config_groups").is_some() || quant["quant_method"] == "modelopt" {
         anyhow::bail!("Qwen ModelOpt routed experts other than NVFP4 have no expert package: serve the \
@@ -981,6 +1112,33 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value) -> Res
     }
     anyhow::bail!("Qwen BF16 routed experts are fused [512, ...] tensors with no expert package: serve the \
         FP8 (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release")
+}
+
+/// Mistral Large 4 routed experts in consolidated naming
+/// (`layers.{L}.experts.{E}.w1|w3|w2`), layers 1..72. Spark ranks serve the
+/// EXL3 K4 + Core-K6 publication (ml4:exl3-k45); the official FP8 block-128
+/// release is only the quantization source and fidelity root.
+fn read_mistral_large4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::mistral_large4::Ml4Config::from_hf(config)?;
+    let shape = RoutedExpertShape {
+        layers: cfg.layers,
+        first_layer: cfg.first_moe_layer,
+        experts: cfg.experts,
+        topk: cfg.topk,
+        hidden: cfg.hidden,
+        intermediate: cfg.moe_intermediate,
+        // The bundled mtp_dspark drafter is dense: no draft experts.
+        draft_stages: 0,
+        draft_experts: 0,
+    };
+    match config["quantization_config"]["quant_method"].as_str() {
+        Some("exl3") => exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint),
+        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + Core-K6 publication \
+            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6); the official FP8 release is the \
+            quantization source and fidelity root, with no Spark expert package"),
+        other => anyhow::bail!("Mistral Large 4 routed experts stored as {other:?} have no expert package"),
+    }
 }
 
 /// MiMo V2 (mimo_v2_flash) routed experts: the checkpoint's FP8 E4M3 weights
@@ -1035,7 +1193,7 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"),
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?,
         64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
     let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
         .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
@@ -1043,7 +1201,7 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
         .map(|(shard, metadata)| V41Tensor { shard, metadata, placement: V41TensorPlacement::CoordinatorRtx })
         .collect();
     coordinator.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: shape,
         snapshot: snapshot.to_path_buf(),
@@ -1056,14 +1214,9 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
 
 /// DeepSeek V4 routed experts; every other tensor stays with the coordinator
 /// and is not validated here.
-fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
+fn read_deepseek_v4_expert_catalog(snapshot: &Path,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
     let v4 = crate::families::deepseek_v4::DeepseekV4Config::read(snapshot, 0)?;
-    #[derive(Deserialize)]
-    struct Index {
-        weight_map: BTreeMap<String, String>,
-    }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
-        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let (hidden, intermediate) = (v4.dim, v4.moe_inter_dim);
     ensure!(
         hidden % 32 == 0 && intermediate % 32 == 0,
@@ -1081,9 +1234,16 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     };
     let raw_config = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     if raw_config["quantization_config"]["quant_method"] == "exl3" {
+        ensure!(hidden != 4096, "unsupported: EXL3 for DeepSeek V4/V4.1 Flash");
         // dsv4p:exl3-k23.
-        return deepseek_v4_exl3_catalog(snapshot, &index.weight_map, backbone, &[2, 3]);
+        return exl3_catalog_or_read(snapshot, backbone, &[2, 3], checkpoint);
     }
+    #[derive(Deserialize)]
+    struct Index {
+        weight_map: BTreeMap<String, String>,
+    }
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?, 64 * 1024 * 1024)
+        .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let draft_stages = index.weight_map.keys()
         .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())
         .max()
@@ -1113,9 +1273,8 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     for (shard, names) in shards {
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
-        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
         for tensor in metadata {
-            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
             let placement = match expect(&tensor.name) {
                 Some((dtype, shape)) => {
                     ensure!(
@@ -1138,7 +1297,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
         v4.n_routed_experts
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: RoutedExpertShape {
             layers: v4.n_layers,
@@ -1158,11 +1317,15 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path) -> Result<OfficialV41Catalog
     })
 }
 
-/// The decoder layer of a Hugging Face tensor name (`model.layers.{L}.` or
-/// `model.language_model.layers.{L}.`).
+/// Read a decoder layer from the actual header name, independent of its wrapper.
+/// Separate MTP modules are draft stages, not backbone layers.
 fn hf_layer(name: &str) -> Option<usize> {
-    name.strip_prefix("model.layers.").or_else(|| name.strip_prefix("model.language_model.layers."))?
-        .split('.').next()?.parse().ok()
+    if name.starts_with("mtp.") { return None; }
+    let mut segments = name.split('.');
+    while let Some(segment) = segments.next() {
+        if segment == "layers" { return segments.next()?.parse().ok(); }
+    }
+    None
 }
 
 /// Every tensor header of the shards `weight_map` names, each in its shard.
@@ -1178,9 +1341,8 @@ fn read_index_headers(
     for (shard, names) in shards {
         let metadata = read_safetensors_metadata(&snapshot.join(shard))
             .with_context(|| format!("reading {shard}"))?;
-        ensure!(metadata.len() == names.len(), "index/header tensor count mismatch in {shard}");
+        crate::plan::checkpoint::validate_index_headers(shard, &names, &metadata)?;
         for tensor in metadata {
-            ensure!(names.contains(tensor.name.as_str()), "tensor {} appears in unexpected shard {shard}", tensor.name);
             headers.push((shard.to_string(), tensor));
         }
     }
@@ -1198,7 +1360,16 @@ fn deepseek_v4_exl3_catalog(
     backbone: RoutedExpertShape,
     tiers: &[usize],
 ) -> Result<OfficialV41Catalog> {
-    let headers = read_index_headers(snapshot, weight_map)?;
+    deepseek_v4_exl3_catalog_input(snapshot, weight_map, backbone, tiers, None)
+}
+
+fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String, String>,
+    backbone: RoutedExpertShape, tiers: &[usize], checkpoint: Option<&crate::plan::Checkpoint>)
+    -> Result<OfficialV41Catalog> {
+    let headers = match checkpoint {
+        Some(checkpoint) => checkpoint.tensors.iter().map(|tensor| (tensor.shard.clone(), tensor.meta.clone())).collect(),
+        None => read_index_headers(snapshot, weight_map)?,
+    };
     let manifest = crate::families::deepseek_v41::v41_exl3::read_deepseek_v4_exl3_manifest(
         snapshot,
         backbone,
@@ -1226,9 +1397,12 @@ fn deepseek_v4_exl3_catalog(
             None => {
                 // Experts past the backbone (a native MTP layer) stay on the coordinator.
                 let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
+                // Only numbered expert projections are EXL3 modules; per-layer
+                // expert-side tensors (Muse Spark's post_expert_norm) are not.
+                let numbered = tensor.name.split_once(".experts.").is_some_and(|(_, tail)|
+                    tail.split('.').next().is_some_and(|id| id.parse::<usize>().is_ok()));
                 ensure!(
-                    past_backbone
-                        || (!tensor.name.contains(".mlp.experts.") && !tensor.name.contains(".ffn.experts.")),
+                    past_backbone || !numbered,
                     "routed expert tensor {} is not in the EXL3 storage map",
                     tensor.name
                 );
@@ -1243,7 +1417,7 @@ fn deepseek_v4_exl3_catalog(
         manifest.projections.len()
     );
     tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-    Ok(OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+    Ok(OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
         config: None,
         experts: manifest.experts,
         snapshot: snapshot.to_path_buf(),
@@ -1276,39 +1450,6 @@ fn validate_tensor(tensor: &SafetensorsTensorMetadata, spec: &ExpectedTensor) ->
         spec.bytes,
         tensor.byte_length
     );
-    Ok(())
-}
-
-fn apply_nvfp4_ple_contract(expected: &mut BTreeMap<String, ExpectedTensor>,
-    ple: &serde_json::Value, layers: &[usize]) -> Result<()> {
-    ensure!(ple["schema"] == "cuteafd.nvfp4-ple.v1" && ple["format"] == "nvfp4"
-        && ple["block_size"] == 16 && ple["packing"] == "even-element-low-nibble"
-        && ple["scale_layout"] == "row-major"
-        && ple["reconstruction"] == "E2M1(weight) * FP8_E4M3(weight_scale) * FP32(weight_scale_2)",
-        "unsupported NVFP4 PLE storage contract");
-    let tables = ple["tensors"].as_object().context("missing NVFP4 PLE tables")?;
-    ensure!(tables.len() == layers.len(), "NVFP4 PLE must cover exactly the original tables");
-    for &layer in layers {
-        let prefix = format!("layers.{layer}.engram.embed");
-        let table = tables.get(&prefix).with_context(|| format!("missing {prefix} PLE metadata"))?;
-        let original = expected.get(&format!("{prefix}.weight")).context("missing original PLE weight")?;
-        let shape = original.shape.clone();
-        ensure!(shape.len() == 2 && shape[1] % 16 == 0
-            && table["logical_shape"] == serde_json::to_value(&shape)?
-            && table["weight_dtype"] == "uint8" && table["weight_scale_dtype"] == "float8_e4m3fn"
-            && table["weight_scale_2_dtype"] == "float32"
-            && table["global_scale"].as_f64().is_some_and(|s| s.is_finite() && s > 0.0),
-            "invalid NVFP4 PLE geometry or scale for {prefix}");
-        let rows = shape[0]; let columns = shape[1];
-        ensure!(expected.remove(&format!("{prefix}.scale")).is_some(), "missing original PLE scales");
-        for (suffix, dtype, shape, bytes) in [
-            ("weight", DType::U8, vec![rows, columns / 2], rows as u64 * columns as u64 / 2),
-            ("weight_scale", DType::F8E4M3, vec![rows, columns / 16], rows as u64 * columns as u64 / 16),
-            ("weight_scale_2", DType::F32, vec![], 4),
-        ] {
-            expected.insert(format!("{prefix}.{suffix}"), ExpectedTensor { dtype, shape, bytes });
-        }
-    }
     Ok(())
 }
 
@@ -1378,16 +1519,307 @@ fn apply_nvfp4_expert_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
     pub(super) fn official_config() -> OfficialV41Config {
-        OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
-            .unwrap()
+        OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap()
     }
+
+    #[test]
+    fn native_layer_census_checks_every_expert_and_source_header() {
+        let config = official_config();
+        let mut shape = RoutedExpertShape::of_v41(&config);
+        shape.layers = 1;
+        shape.experts = 2;
+        let mut tensors = Vec::new();
+        for expert in 0..shape.experts {
+            for (slot, suffix) in ["w1.weight", "w3.weight", "w2.weight", "w1.scale", "w3.scale", "w2.scale"]
+                .into_iter().enumerate() {
+                let divisor = if slot < 3 { 2 } else { 32 };
+                let name = format!("layers.0.ffn.experts.{expert}.{suffix}");
+                tensors.push(V41Tensor { shard: "unused".into(), placement: placement(&name),
+                    metadata: SafetensorsTensorMetadata { name,
+                        dtype: if slot < 3 { DType::I8 } else { DType::F8E8M0 },
+                        shape: if slot % 3 == 2 { vec![shape.hidden, shape.intermediate / divisor] }
+                            else { vec![shape.intermediate, shape.hidden / divisor] },
+                        byte_offset: 0, byte_length: (shape.hidden * shape.intermediate / divisor) as u64 } });
+            }
+        }
+        tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+            format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+            config: Some(config), experts: shape, snapshot: PathBuf::new(), tensors,
+            exl3: None, nvfp4: None, fp8: None };
+        catalog.validate_native_spark_layer(0).unwrap();
+        for index in 0..catalog.tensors.len() {
+            let valid = catalog.tensors[index].clone();
+            catalog.tensors[index].metadata.dtype = DType::Bf16;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].metadata.shape.swap(0, 1);
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].metadata.byte_length -= 1;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].placement = V41TensorPlacement::CoordinatorRtx;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid;
+        }
+        catalog.tensors.pop();
+        assert!(catalog.validate_native_spark_layer(0).is_err());
+        assert!(catalog.validate_native_spark_layer(1).is_err());
+    }
+
+    #[test]
+    fn exact_k32_mount_and_push_reconstruct_every_source_plane() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        use crate::push_load::builder::{Builder, Destination};
+        let hidden = 256;
+        for intermediate in [2048, 2304, 3072] {
+            let dir = tempfile::tempdir()?;
+            let suffixes = ["w1.weight", "w3.weight", "w2.weight", "w1.scale", "w3.scale", "w2.scale"];
+            let descriptions = suffixes.iter().enumerate().map(|(slot, suffix)| {
+                let divisor = if slot < 3 { 2 } else { 32 };
+                let shape = if slot % 3 == 2 { vec![hidden, intermediate / divisor] }
+                    else { vec![intermediate, hidden / divisor] };
+                (format!("layers.0.ffn.experts.0.{suffix}"),
+                    if slot < 3 { "I8" } else { "F8_E8M0" }, shape)
+            }).collect::<Vec<_>>();
+            let path = dir.path().join("fixture.safetensors");
+            crate::plan::testing::write_safetensors(&path, &descriptions);
+            let metadata = crate::read_safetensors_metadata(&path)?;
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            let mut originals = std::collections::BTreeMap::new();
+            for tensor in &metadata {
+                let slot = suffixes.iter().position(|suffix| tensor.name.ends_with(suffix)).unwrap();
+                let pitch = tensor.shape[1];
+                let bytes = (0..tensor.byte_length as usize).map(|i|
+                    ((i / pitch * 73 + i % pitch * 37 + (i % pitch) / 251 + slot * 53) % 251 + 1) as u8)
+                    .collect::<Vec<_>>();
+                file.write_all_at(&bytes, tensor.byte_offset)?;
+                originals.insert(slot, bytes);
+            }
+            // Alias one six-plane safetensors payload at every absolute layer;
+            // only ownership changes, so reconstruction has an independent oracle.
+            let mut tensors = Vec::new();
+            for layer in 0..8 { for expert in 0..2 { for source in &metadata {
+                let mut metadata = source.clone();
+                metadata.name = metadata.name.replace("layers.0.", &format!("layers.{layer}."))
+                    .replace("experts.0.", &format!("experts.{expert}."));
+                let axis = usize::from(metadata.name.contains(".w2."));
+                tensors.push(V41Tensor { shard: "fixture.safetensors".into(), metadata,
+                    placement: V41TensorPlacement::BackboneExpertTp4 { layer, expert, axis } });
+            }}}
+            tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+            let catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+                format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+                config: None, experts: RoutedExpertShape { layers: 8, first_layer: 0, experts: 2,
+                    topk: 1, hidden, intermediate, draft_stages: 0, draft_experts: 0 },
+                snapshot: dir.path().into(), tensors, exl3: None, nvfp4: None, fp8: None };
+            for world in 2..=8 { for layer in 0..world {
+                let mut reconstructed = originals.values().map(|bytes| vec![0u8; bytes.len()]).collect::<Vec<_>>();
+                let mut coverage = vec![0u8; intermediate / 32];
+                for rank in 0..world {
+                    let unit = cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world);
+                    let units = intermediate / unit;
+                    let canonical = if units % world == 0 { rank } else { (rank + world - layer) % world };
+                    let first = (canonical * (units / world) + canonical.min(units % world)) * unit;
+                    let width = (units / world + usize::from(canonical < units % world)) * unit;
+                    coverage[first / 32..(first + width) / 32].iter_mut().for_each(|n| *n += 1);
+                    let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneTp {
+                        layer, expert: rank % 2, world, rank })?;
+                    assert_eq!(staging.intermediate_size(), width);
+                    let mut raw = vec![0; staging.staging_bytes()];
+                    staging.prefetch()?;
+                    staging.read_into(&mut raw, &mut vec![0; staging.minimum_read_scratch_bytes() * hidden])?;
+                    let mut builder = Builder::new(dir.path(), vec![raw.len() as u64]);
+                    builder.v41_regions(&catalog, staging.tensor_names(), staging.tensor_ranges(),
+                        world as u32, rank as u32, Destination { rank: 0, offset: 0, bytes: raw.len() as u64 })?;
+                    let pushed = builder.finish()?;
+                    let mut landed = vec![0; raw.len()];
+                    let file = File::open(&path)?;
+                    for entry in &pushed.plan.entries {
+                        for (source, destination) in pushed.plan.patterns[entry.pattern as usize].runs() {
+                            let start = (entry.dst_base + destination) as usize;
+                            let bytes = pushed.plan.patterns[entry.pattern as usize].run as usize;
+                            file.read_exact_at(&mut landed[start..start + bytes], entry.src_base + source)?;
+                        }
+                    }
+                    assert_eq!(landed, raw, "I{intermediate} TP{world} L{layer} R{rank}: push/mount");
+                    for (slot, range) in staging.tensor_ranges().iter().enumerate() {
+                        let divisor = if slot < 3 { 2 } else { 32 };
+                        let down = slot % 3 == 2;
+                        let pitch = if down { intermediate / divisor } else { hidden / divisor };
+                        let count = if down { hidden } else { width };
+                        let row_width = if down { width / divisor } else { pitch };
+                        let offset = if down { first / divisor } else { first * pitch };
+                        assert_eq!(range.len(), count * row_width);
+                        for row in 0..count {
+                            let source = offset + row * pitch;
+                            let actual = &raw[range.start + row * row_width..range.start + (row + 1) * row_width];
+                            assert_eq!(actual, &originals[&slot][source..source + row_width],
+                                "I{intermediate} TP{world} L{layer} R{rank} plane{slot} row{row}");
+                            reconstructed[slot][source..source + row_width].copy_from_slice(actual);
+                        }
+                    }
+                }
+                assert!(coverage.iter().all(|&n| n == 1));
+                for slot in 0..6 { assert_eq!(reconstructed[slot], originals[&slot]); }
+            }}
+            // Equal NVFP4 geometry remains explicitly separate from MXFP4 rotation.
+            for world in [5, 7] {
+                assert!(super::super::v41_expert_staging::V41BackboneTpGeometry::equal(
+                    intermediate, hidden, world, 0).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn kimi_dispatch_uses_declared_family_before_v41_text_config() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let v41: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;
+        assert!(!kimi_catalog_config(&v41));
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&v41)?)?;
+        let direct = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
+        let dispatched = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert_eq!(dispatched, direct, "V4.1 must retain its official catalog route");
+        let mut kimi = crate::plan::testing::kimi_k3_config();
+        assert!(kimi_catalog_config(&kimi));
+        kimi["quantization_config"]["quant_method"] = "unsupported".into();
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&kimi)?)?;
+        let error = format!("{:#}", read_expert_catalog(dir.path()).unwrap_err());
+        assert!(error.contains("Kimi Spark experts require"), "{error}");
+        kimi.as_object_mut().unwrap().remove("model_type");
+        assert!(kimi_catalog_config(&kimi), "declared architecture also identifies Kimi");
+        assert!(!kimi_catalog_config(&serde_json::json!({"text_config": {"hidden_size": 7168}})),
+            "nested shape alone cannot choose Kimi");
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "CPU-only isolated startup RSS trace; requires CUTEAFD_KIMI_EXL3_SNAPSHOT"]
+    fn mounted_expert_startup_host_rss() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("checkpoint required")?;
+        let snapshot = Path::new(&snapshot);
+        let sample = |phase: &str| -> Result<()> {
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            let fields = status.lines().filter(|line| line.starts_with("VmRSS:") || line.starts_with("VmHWM:"))
+                .collect::<Vec<_>>().join(" ");
+            eprintln!("expert startup CPU RSS: phase={phase} {fields}");
+            Ok(())
+        };
+        sample("start")?;
+        // Mirror the shared worker's host-only startup, stopping before native load.
+        let inventory = crate::plan::Checkpoint::inventory(snapshot)?;
+        sample("inventory")?;
+        let catalog = read_expert_catalog(snapshot)?;
+        sample("catalog_before_native")?;
+        let identity = crate::plan::checkpoint::identity::CheckpointIdentity::from_snapshot(snapshot, None)?;
+        assert!(!identity.fingerprint.is_empty());
+        sample("identity")?;
+        let status = std::fs::read_to_string("/proc/self/status")?;
+        let peak_kib: u64 = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+            .context("peak RSS unavailable")?.split_whitespace().next().context("peak RSS empty")?.parse()?;
+        ensure!(peak_kib < 1536 * 1024, "metadata startup exceeded 1.5 GiB peak: {peak_kib} KiB");
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        assert!(inventory.weight_map.len() > 900_000);
+        drop(inventory);
+        sample("inventory_dropped")?;
+        drop(catalog);
+        sample("catalog_dropped")?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_KIMI_EXL3_SNAPSHOT; reads headers and metadata, not weight payloads"]
+    fn mounted_kimi_exl3_catalog_and_six_rank_residency() -> Result<()> {
+        let snapshot = std::env::var_os("CUTEAFD_KIMI_EXL3_SNAPSHOT").context("Kimi snapshot not set")?;
+        let snapshot = Path::new(&snapshot);
+        let mut catalog = read_expert_catalog(snapshot)?;
+        catalog.select_draft(crate::plan::spec::DraftOwnership::None)?;
+        assert_eq!(catalog.routed_experts().geometry()?.family(), Some("kimik3"));
+        let manifest = catalog.exl3().context("Kimi EXL3 manifest absent")?;
+        assert_eq!(manifest.projections.len(), 92 * 896 * 3);
+        assert_eq!(manifest.decoder_tiers(), &[2, 3]);
+        for layer in 1..=4 {
+            for rank in 0..6 {
+                let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 6, rank)?;
+                assert_eq!((plan.experts, plan.intermediate, plan.intermediate_start), (896, 512, rank * 512));
+                plan.device_arena_layout()?;
+                for load in &plan.loads {
+                    let tensor = catalog.tensor(&load.tensor)?;
+                    ensure!(tensor.placement == V41TensorPlacement::BackboneExl3,
+                        "Kimi expert was not assigned to Spark residency");
+                    let stem = load.tensor.rsplit_once('.').context("missing tensor suffix")?.0;
+                    manifest.projections[stem].validate_tensor(&tensor.metadata)?;
+                    catalog.exl3_tensor_slice(&load.tensor, 6, rank)?;
+                }
+            }
+        }
+        let headers = crate::plan::files::open_role(snapshot, crate::plan::files::ReadRole::Spark { rank: 0, world: 6 })?;
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&headers, 6, &[1, 2, 3, 4])?;
+        assert_eq!(recipe.widths, vec![512; 6]);
+        let spark_manifest = std::env::var_os("CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST")
+            .context("set CUTEAFD_KIMI_SPARK_PROGRAM_MANIFEST to the sealed Spark inventory")?;
+        let spark_manifest = Path::new(&spark_manifest);
+        let packages = std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE")
+            .context("set CUTEAFD_KIMI_SPARK_PACKAGE to the sealed Spark package")?;
+        let packages = Path::new(&packages);
+        crate::families::kimi_k3::validate_expert_inventory(spark_manifest, packages)?;
+        for rank in 0..6 {
+            recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;
+        }
+        eprintln!("Kimi CPU startup gate: {} projections; six ranks x four hosted layers; recipe {:?}",
+            manifest.projections.len(), recipe.required_layouts);
+        Ok(())
+    }
+
+    #[test]
+    fn layer_ordinals_follow_header_segments_not_a_wrapper_allowlist() {
+        for prefix in ["model", "model.language_model", "language_model.model", "custom.encoder.text"] {
+            assert_eq!(hf_layer(&format!("{prefix}.layers.17.block_sparse_moe.experts.895.gate_proj.trellis")), Some(17));
+        }
+        for name in ["mtp.layers.0.mlp.experts.0.gate_proj.trellis", "model.layers.bad.weight", "layers_not.2.weight"] {
+            assert_eq!(hf_layer(name), None);
+        }
+    }
+
     fn assert_glm_coordinator_tensors(catalog: &OfficialV41Catalog) {
         for name in ["model.embed_tokens.weight", "lm_head.weight", "model.norm.weight"] {
             let tensor = catalog.tensor(name).unwrap();
             assert_eq!(tensor.placement, V41TensorPlacement::CoordinatorRtx);
             assert_eq!(tensor.metadata.dtype, DType::Bf16);
         }
+    }
+
+    #[test]
+    fn bundled_dspark_selection_keeps_all_published_ml4_names_only_when_requested() -> Result<()> {
+        use crate::plan::{spec::DraftOwnership, testing};
+        let dir = tempfile::tempdir()?;
+        testing::write_mistral_large4_snapshot(dir.path(), None, true);
+        let published: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/ml4-published-native-headers.json"))?;
+        let names = published["headers"].as_object().unwrap().keys()
+            .filter(|name| name.starts_with("mtp_dspark.")).collect::<Vec<_>>();
+        assert_eq!(names.len(), 38);
+        let checkpoint = crate::plan::Checkpoint::inventory(dir.path())?;
+        let family = crate::plan::family::detect(&checkpoint).unwrap();
+        let model = family.open(&checkpoint)?;
+        assert!(matches!(model.spec().speculator,
+            Some(crate::plan::spec::SpeculatorSpec::BundledDspark { layers: 3 })));
+        for requested in [false, true] {
+            let mut selected = read_expert_catalog(dir.path())?;
+            let ownership = selected.bundled_dspark_ownership(requested)?;
+            assert_eq!(ownership, if requested { DraftOwnership::BundledDspark } else { DraftOwnership::None });
+            selected.select_draft(ownership)?;
+            for name in &names { assert_eq!(selected.tensor(name).is_ok(), requested, "{name}"); }
+        }
+        let mut missing = read_expert_catalog(dir.path())?;
+        missing.tensors.retain(|tensor| !names.iter().any(|name| **name == tensor.metadata.name));
+        assert!(missing.bundled_dspark_ownership(true).unwrap_err().is::<MissingBundledDspark>());
+        Ok(())
     }
 
     #[test]
@@ -1406,12 +1838,17 @@ mod tests {
                 tensors.extend(fp8(&format!("model.layers.{layer}.mlp.experts.0.{projection}"), rows, cols, None));
             }
         }
-        write_snapshot(dir.path(), &glm5_config(), &tensors, None);
+        let mut config = glm5_config();
+        config["num_nextn_predict_layers"] = serde_json::json!(1);
+        write_snapshot(dir.path(), &config, &tensors, None);
         let mut catalog = read_expert_catalog(dir.path()).unwrap();
         assert_glm_coordinator_tensors(&catalog);
         assert!(catalog.tensor("model.layers.1.mlp.experts.0.gate_proj.weight").is_err());
         assert!(catalog.tensor("model.layers.2.enorm.weight").is_ok());
-        catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+        assert_eq!(catalog.bundled_dspark_ownership(false).unwrap(), crate::plan::spec::DraftOwnership::None,
+            "external DFlash2 does not claim target checkpoint drafter tensors");
+        assert!(catalog.bundled_dspark_ownership(true).unwrap_err().is::<MissingBundledDspark>());
+        catalog.select_draft(catalog.bundled_dspark_ownership(false).unwrap()).unwrap();
         assert_glm_coordinator_tensors(&catalog);
         assert!(catalog.tensor("model.layers.2.enorm.weight").is_err());
         assert!(catalog.fp8().unwrap().has_layer(1));
@@ -1471,21 +1908,21 @@ mod tests {
             "weight_map": names.iter().map(|name| (*name, "fixture.safetensors")).collect::<BTreeMap<_, _>>()
         }).to_string()).unwrap();
         let shape = RoutedExpertShape::of_v41(&cfg);
-        let mut catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(cfg), experts: shape, snapshot: dir.path().to_path_buf(),
             tensors: names.iter().map(|name| V41Tensor {
                 shard: "fixture.safetensors".into(), placement: placement(name),
                 metadata: SafetensorsTensorMetadata { name: (*name).into(), dtype: DType::Bf16,
                     shape: vec![128], byte_offset: 0, byte_length: 256 },
             }).collect(), exl3: Some(crate::V41Exl3Manifest {
-                config: None, experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
+                experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
                 projections: names[..2].iter().map(|name| {
                     let name = name.strip_suffix(".weight").unwrap().to_owned();
                     (name.clone(), crate::V41Exl3Projection { name, kind: crate::V41Exl3ProjectionKind::Gate,
                         bits: 4, input_features: 128, output_features: 128 })
-                }).collect(), decoder_tiers: vec![4], ple_quantization: None,
-                mtp_experts: crate::families::deepseek_v41::v41_exl3::V41Exl3MtpExperts::Exl3,
+                }).collect(), decoder_tiers: vec![4],
                 storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,
+                resident_bytes: Default::default(),
             }), nvfp4: None, fp8: None,
         };
         catalog.select_draft(DraftOwnership::selected("deepseek_v41", "dspark")).unwrap();
@@ -1503,6 +1940,164 @@ mod tests {
         assert!(manifest.projections.keys().all(|name| !name.starts_with("mtp.")));
         assert_eq!(manifest.experts.draft_stages, 0);
         assert_eq!(manifest.experts.draft_experts, 0);
+    }
+
+    #[test]
+    fn role_catalog_opens_only_shards_with_needed_tensors() {
+        use std::io::Write;
+        // Shard 1 holds the vision tensors and is the only shard on disk; the
+        // rest (Engram included) are indexed but absent, as on a Spark host.
+        let vision = |name: &str| name.starts_with("vision.") || name.starts_with("aligner.")
+            || name.starts_with("image_");
+        let expected = expected_tensors().unwrap();
+        let shard = |i: usize| format!("model-{i:05}-of-00048.safetensors");
+        let weight_map: BTreeMap<_, _> = expected.keys().enumerate().map(|(i, name)| {
+            (name.clone(), if vision(name) { shard(1) } else { shard(2 + i % 47) })
+        }).collect();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), include_bytes!("official-v41-config.json")).unwrap();
+        std::fs::write(dir.path().join("model.safetensors.index.json"),
+            serde_json::json!({ "weight_map": weight_map }).to_string()).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut offset = 0u64;
+        for (name, spec) in expected.iter().filter(|(name, _)| vision(name)) {
+            let dtype = match spec.dtype { DType::Bf16 => "BF16", DType::F32 => "F32", _ => unreachable!() };
+            header.insert(name.clone(), serde_json::json!({
+                "dtype": dtype, "shape": spec.shape, "data_offsets": [offset, offset + spec.bytes] }));
+            offset += spec.bytes;
+        }
+        let header = serde_json::Value::Object(header).to_string();
+        let mut file = File::create(dir.path().join(shard(1))).unwrap();
+        file.write_all(&(header.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(header.as_bytes()).unwrap();
+        file.set_len(8 + header.len() as u64 + offset).unwrap();
+
+        let error = format!("{:#}", read_official_v41_catalog(dir.path()).unwrap_err());
+        assert!(error.contains("role full catalog needs tensor") && error.contains(&shard(2)), "{error}");
+        let catalog = read_official_v41_role_catalog(dir.path(), "vision", vision).unwrap();
+        assert_eq!(catalog.tensors().len(), expected.keys().filter(|name| vision(name)).count());
+        let norm = catalog.tensor("vision.norm.weight").unwrap();
+        assert_eq!((norm.shard.as_str(), norm.metadata.dtype.clone()), (shard(1).as_str(), DType::Bf16));
+        let error = format!("{:#}", read_official_v41_role_catalog(dir.path(), "vision",
+            |name| vision(name) || name == "layers.1.engram.embed.scale").unwrap_err());
+        assert!(error.contains("role vision needs tensor layers.1.engram.embed.scale"), "{error}");
+    }
+    #[test]
+    fn strided_role_catalog_requires_declared_exact_headers_and_maps_one_table() -> Result<()> {
+        use std::io::Write;
+        let dir = tempfile::tempdir()?;
+        let mut config: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;
+        let mut parts = serde_json::Map::new();
+        let mut expected = expected_tensors()?;
+        for layer in [1, 14] {
+            let prefix = format!("layers.{layer}.engram.embed");
+            let weight = expected.remove(&format!("{prefix}.weight")).unwrap();
+            expected.remove(&format!("{prefix}.scale")).unwrap();
+            let chunk = weight.shape[0].div_ceil(3);
+            let mut declared = Vec::new();
+            for number in 0..3 {
+                let rows = chunk.min(weight.shape[0] - number * chunk);
+                let name = format!("{prefix}.strided_{number:05}");
+                declared.push(serde_json::json!({"tensor": name, "rows": rows}));
+                expected.insert(name, ExpectedTensor { dtype: DType::U8,
+                    shape: vec![rows, 264], bytes: rows as u64 * 264 });
+            }
+            parts.insert(layer.to_string(), declared.into());
+        }
+        config["engram_storage"] = serde_json::json!({"layout": "fp8_row_interleaved_v1",
+            "weight_bytes": 256, "scale_bytes": 8, "tensor_suffix": "strided", "parts": parts});
+        std::fs::write(dir.path().join("config.json"), config.to_string())?;
+        let selected = |name: &str| name.contains(".engram.embed.strided_");
+        let shard = |i: usize| format!("model-{i:05}-of-00048.safetensors");
+        let part_shard = |name: &str| {
+            let fields: Vec<_> = name.split('.').collect();
+            format!("engram-{:02}-part-{}.safetensors", fields[1].parse::<usize>().unwrap(),
+                fields[4].strip_prefix("strided_").unwrap())
+        };
+        let mut weight_map: BTreeMap<_, _> = expected.keys().enumerate().map(|(i, name)| {
+            (name.clone(), if selected(name) { part_shard(name) } else { shard(1 + i % 48) })
+        }).collect();
+        let index = dir.path().join("model.safetensors.index.json");
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        let write_header = |dtype: &str, width: usize| -> Result<()> {
+            for (name, spec) in expected.iter().filter(|(name, _)| selected(name)) {
+                let header = serde_json::to_vec(&serde_json::json!({name: {"dtype": dtype,
+                    "shape": [spec.shape[0], width], "data_offsets": [0, spec.bytes]}}))?;
+                let mut file = File::create(dir.path().join(part_shard(name)))?;
+                file.write_all(&(header.len() as u64).to_le_bytes())?;
+                file.write_all(&header)?;
+                file.set_len(8 + header.len() as u64 + spec.bytes)?;
+            }
+            Ok(())
+        };
+        write_header("U8", 264)?;
+        let catalog = read_official_v41_role_catalog(dir.path(), "engram", selected)?;
+        assert_eq!(catalog.tensors().len(), 6);
+        // SAFETY: this immutable sparse fixture outlives both mapped tables.
+        let table = unsafe { catalog.map_engram(1)? };
+        assert!(table.is_strided());
+        assert!(table.scales().is_none());
+        assert_eq!(table.weights().row_bytes(), 264);
+        drop(table);
+        let mut generic = cuteafd_core::TensorCatalog {
+            model_id: "synthetic-strided".into(), snapshot_path: dir.path().to_string_lossy().into(),
+            facts: Default::default(), tensors: catalog.tensors().iter().filter(|t| t.metadata.name.starts_with("layers.1.")).map(|t| {
+                cuteafd_core::TensorInfo { name: t.metadata.name.clone(), file: t.shard.clone(),
+                    dtype: t.metadata.dtype.clone(), shape: t.metadata.shape.clone(),
+                    byte_offset: t.metadata.byte_offset, byte_length: t.metadata.byte_length,
+                    role: cuteafd_core::TensorRole::Other, layer_id: Some(1), expert_id: None,
+                    is_quantization_metadata: false }
+            }).collect(),
+        };
+        // SAFETY: the sparse fixture is immutable while this mapped table is alive.
+        let generic_table = unsafe { crate::EngramTable::from_catalog(&generic, 1)? };
+        assert_eq!(generic_table.weights().rows(), 384_006_168);
+        let boundary = generic.tensors[0].shape[0] as u64;
+        let mut gathered = [1; 4 * 264];
+        generic_table.weights().gather_into(&[boundary - 1, boundary, boundary + 1, 384_006_167], &mut gathered)?;
+        assert_eq!(gathered, [0; 4 * 264]);
+        drop(generic_table);
+        generic.tensors[1].shape[0] -= 1;
+        // SAFETY: unchanged fixture; invalid catalog is rejected before mapping.
+        assert!(unsafe { crate::EngramTable::from_catalog(&generic, 1) }.is_err());
+        write_header("I8", 264)?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        write_header("U8", 263)?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        write_header("U8", 264)?;
+        weight_map.insert("layers.1.engram.embed.weight".into(), shard(1));
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        weight_map.remove("layers.1.engram.embed.weight");
+        std::fs::write(&index, serde_json::json!({"weight_map": weight_map}).to_string())?;
+        config.as_object_mut().unwrap().remove("engram_storage");
+        std::fs::write(dir.path().join("config.json"), config.to_string())?;
+        assert!(read_official_v41_role_catalog(dir.path(), "engram", selected).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_catalog_arena_cache_matches_native_ranks_and_draft_selection_clears_it() -> Result<()> {
+        let manifest = super::super::v41_exl3_residency::tests::fixture_geometry(&[2, 3], 5120, 2304, 16);
+        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(),
+            format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+            config: None, experts: manifest.experts, snapshot: PathBuf::new(), tensors: Vec::new(),
+            exl3: Some(manifest), nvfp4: None, fp8: None };
+        for world in [1, 2, 4, 6] {
+            let expected = (0..world).map(|rank| {
+                let plan = catalog.exl3().unwrap().balanced_residency(crate::V41Exl3Layer::Backbone(0), world, rank)?;
+                Ok(plan.device_arena_layout()?.1 as u64)
+            }).collect::<Result<Vec<_>>>()?;
+            for _ in 0..3 { assert_eq!(catalog.exl3_spark_arena_bytes(0, world)?, expected); }
+        }
+        assert_eq!(catalog.exl3_arena_bytes.lock().unwrap().len(), 4);
+        assert!(catalog.exl3_spark_arena_bytes(catalog.experts.layers, 6).is_err());
+        assert!(catalog.exl3_spark_arena_bytes(0, 0).is_err());
+        assert!(catalog.exl3_spark_arena_bytes(0, 9).is_err());
+        catalog.select_draft(crate::plan::spec::DraftOwnership::selected("deepseek_v41", "dspark"))?;
+        assert!(catalog.exl3_arena_bytes.lock().unwrap().is_empty());
+        assert_eq!(catalog.exl3_spark_arena_bytes(0, 6)?.len(), 6);
+        Ok(())
     }
 
     #[test]
@@ -1540,7 +2135,7 @@ mod tests {
         file.write_all_at(&(0u8..32).collect::<Vec<_>>(), offset)
             .unwrap();
         let name = "layers.0.ffn.experts.0.w2.weight";
-        let mut catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let mut catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,
@@ -1671,35 +2266,7 @@ mod tests {
         );
     }
 
-    #[test]
-    #[ignore = "requires CUTEAFD_EXL3_RAW_SNAPSHOT pointing to a raw local publication"]
-    fn raw_publication_catalog_keeps_native_draft_experts() {
-        let path = std::env::var_os("CUTEAFD_EXL3_RAW_SNAPSHOT").expect("CUTEAFD_EXL3_RAW_SNAPSHOT");
-        let catalog =
-            read_official_v41_catalog(Path::new(&path))
-                .unwrap();
-        assert!(catalog.exl3().is_some());
-        assert!(catalog.native_dspark_experts());
-        let mut backbone_exl3 = 0usize;
-        let mut native_mtp = 0usize;
-        for tensor in &catalog.tensors {
-            match tensor.placement {
-                V41TensorPlacement::BackboneExl3 => backbone_exl3 += 1,
-                V41TensorPlacement::CoordinatorRtx
-                    if tensor.metadata.name.starts_with("mtp.") && tensor.metadata.name.contains(".ffn.experts.") =>
-                {
-                    native_mtp += 1
-                }
-                _ => {}
-            }
-        }
-        assert_eq!(backbone_exl3, 4 * 46_080);
-        assert_eq!(native_mtp, 6 * 3 * 128);
-        println!(
-            "raw catalog: {} tensors, {backbone_exl3} EXL3 backbone, {native_mtp} native draft",
-            catalog.tensors.len()
-        );
-    }
+
 }
 
 #[cfg(test)]
@@ -1751,7 +2318,7 @@ mod expert_staging_tests {
             offset += spec.bytes;
         }
         tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
-        let catalog = OfficialV41Catalog { format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+        let catalog = OfficialV41Catalog { reader: Default::default(), exl3_arena_bytes: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
             config: Some(official_config()),
             experts: RoutedExpertShape::of_v41(&official_config()),
             exl3: None,

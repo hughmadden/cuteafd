@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
     python3 -m pip install uv && \
     uv pip install --system --break-system-packages \
       safetensors \
-      huggingface-hub \
+      "huggingface-hub>=2.2,<3" \
       "nvidia-cutlass-dsl[cu13]==4.6.2" \
       "apache-tvm-ffi==0.1.12" \
       "cuda-tile==1.5.0" \
@@ -35,7 +35,8 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
       "ninja==1.13.0" \
       "nvidia-ml-py==13.610.43" \
       "tabulate==0.10.0" \
-      "transformers==5.13.0" \
+      "transformers==5.18.0" \
+      "datasets==5.1.0" \
       "rich==15.0.0" && \
     uv pip install --system --break-system-packages --no-deps \
       "flashinfer-python==0.6.14" && \
@@ -145,6 +146,8 @@ COPY .cuteafd-release-image/XGRAMMAR_PROVENANCE.json /opt/cuteafd/share/XGRAMMAR
 COPY .cuteafd-release-image/XGRAMMAR_LICENSE /opt/cuteafd/share/XGRAMMAR_LICENSE
 COPY .cuteafd-release-image/XGRAMMAR_SHA256SUMS /opt/cuteafd/share/XGRAMMAR_SHA256SUMS
 COPY python /opt/cuteafd/python
+# The archive, image and fixture staging share the scope derivation dependency closure.
+RUN --mount=type=bind,target=/cuteafd-source python3 -c 'import json, pathlib, shutil, sys; source, destination = map(pathlib.Path, sys.argv[1:]); inputs = json.loads((source / "scripts/build/spark-package-ranges.json").read_text())["shared_inputs"]; [( (destination / name).parent.mkdir(parents=True, exist_ok=True), shutil.copyfile(source / name, destination / name)) for name in inputs]' /cuteafd-source /opt/cuteafd
 COPY scripts/build/kernel-cache-identity.py /opt/cuteafd/scripts/build/kernel-cache-identity.py
 COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 
@@ -156,6 +159,7 @@ COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 # schema only, no new verifier. Kernel execution and numerical/device
 # qualification remain the hardware gate the release checklist records.
 RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
+      [ -d "$exl3_family" ] || continue; \
       python3 /opt/cuteafd/python/tools/aot/package_exl3_aot.py verify \
         --package "$exl3_family" --sparkinfer-revision "$CUTEAFD_SPARKINFER_COMMIT" \
         --role "$CUTEAFD_ROLE" --runtime "$(python3 -m cutlass.cute.export.aot_config --libdir)/libcute_dsl_runtime.so"; \

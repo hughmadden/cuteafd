@@ -1,6 +1,8 @@
 """Opt-in BF16 input packages must survive staging and retain their build identity."""
 from __future__ import annotations
 
+import ast
+from types import SimpleNamespace
 import hashlib
 import importlib.util
 import json
@@ -32,7 +34,7 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     layouts = package_tool.spark_layouts(intermediate)
     for tp in range(1, 9):
         widths = package_tool.exact_widths(intermediate, tp)
-        if tp > 6 or tp > intermediate // 128:
+        if tp > intermediate // 128:
             assert not widths
             assert f"tp{tp}" not in layouts
             continue
@@ -47,11 +49,11 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     assert package_tool.exact_widths(intermediate, 9) == []
 
 
-@pytest.mark.parametrize("tp", [7, 8])
+@pytest.mark.parametrize("tp", [0, 9])
 def test_packager_rejects_deleted_world_before_geometry_or_compilation(tp):
     assert package_tool.exact_widths(2048, tp) == []
     assert not any(layout.startswith(f"tp{tp}") for layout in package_tool.spark_layouts(2048))
-    with pytest.raises(SystemExit, match="Spark TP must be in 1..6"):
+    with pytest.raises(SystemExit, match="Spark TP must be in 1..8"):
         package_tool.layout_geometry(None, f"tp{tp}")
 
 
@@ -62,8 +64,10 @@ def test_qwen_tp5_exact_slice_has_no_padding():
 
 
 def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
+    assert package_tool.exact_widths(2048, 3) == [768, 640, 640]
+    assert package_tool.exact_widths(2048, 3, 32) == [704, 672, 672]
     assert package_tool.exact_widths(2048, 6, 32) == [352, 352, 352, 352, 320, 320]
-    assert package_tool.exact_widths(2048, 6, 16) == []
+    assert package_tool.exact_widths(2048, 6, 16) == [352, 352, 336, 336, 336, 336]
     # Importing geometry is CPU-only; no exporter or CUDA context is involved.
     from dataclasses import dataclass, replace
 
@@ -71,6 +75,7 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
     class Geometry:
         intermediate: int = 2048
         weights: str = "mxfp4"
+        hidden: int = 4096
         tp: int = 1
 
         def with_tp(self, tp):
@@ -83,6 +88,16 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
         assert geometry.slice == width
     with pytest.raises(SystemExit, match="no rank"):
         package_tool.layout_geometry(base, "tp6-w336")
+    for width in (768, 640, 704, 672):
+        tp, geometry = package_tool.layout_geometry(base, f"tp3-w{width}")
+        assert tp == 3
+        assert geometry.slice == width
+    pro = replace(base, hidden=6144)
+    assert package_tool.layout_geometry(pro, "tp6-w352")[1].slice == 352
+    assert package_tool.layout_geometry(pro, "tp6-w320")[1].slice == 320
+    for width in (656, 688, 736):
+        with pytest.raises(SystemExit, match="no rank"):
+            package_tool.layout_geometry(base, f"tp3-w{width}")
 
 
 @pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),
@@ -100,7 +115,7 @@ def test_cmake_requested_counts_preserve_defaults_and_select_both_input_forms(tm
     assert source.count('${exact_slices} ${requested_layouts}') >= 2
 
 
-def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
+def test_step5_nvfp4_keeps_exporter_geometry_and_canonical_a4_package(tmp_path):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("set(CUTEAFD_FP8_MOE_ENTRIES)\n", 1)[1].split(
         "foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)", 1)[0]
@@ -111,6 +126,9 @@ def test_step5_nvfp4_has_one_package_not_an_a4_alias(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "ENTRIES=step5:nvfp4;glm:nvfp4;glm:nvfp4a4" in result.stderr
     assert "step5_nvfp4a4" not in TOOL.read_text()
+    branch = source.split('elseif(entry STREQUAL "step5:nvfp4")', 1)[1].split("elseif(", 1)[0]
+    assert 'set(geometry "step5_nvfp4")' in branch
+    assert '/fp8/fp8-step5-nvfp4a4")' in branch
 
 
 def test_step5_bf16_alone_enables_package_exporter(tmp_path):
@@ -136,7 +154,7 @@ def test_step5_bf16_bypasses_native_slice_exporter(tmp_path):
     assert "NATIVE=\n" in result.stderr
 
 
-@pytest.mark.parametrize("counts", ["0", "7", "8", "9", "5;bad"])
+@pytest.mark.parametrize("counts", ["0", "9", "5;bad"])
 def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
@@ -145,24 +163,24 @@ def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body)
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
-    assert "requires counts 1..6" in result.stderr
+    assert "requires counts 1..8" in result.stderr
 
 
 @pytest.mark.parametrize("geometry,blocks", [("qwen4", 5), ("glm", 16), ("glmf", 16),
-                                             ("dsv4f", 16), ("dsv4p", 24)])
+                                             ("kimik3", 24), ("dsv4p", 24)])
 @pytest.mark.parametrize("count", range(1, 9))
 def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry, blocks, count):
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split(
         '  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\nset(CUTEAFD_EXL3_ROLE spark)\n'
                       f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\n'
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS {count})\n' + body
                       + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n'
                       + 'message("PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
-    if count > 6 or count > blocks:
+    if count > blocks:
         assert result.returncode != 0
         assert "requires a nonempty H128 slice" in result.stderr
         return
@@ -174,12 +192,10 @@ def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry,
 
 
 def test_coordinator_exports_tp2_for_every_routed_weight_format():
-    for layouts in (package_tool.ROLE_LAYOUTS, package_tool.MXFP4_ROLE_LAYOUTS,
-                    package_tool.NVFP4_ROLE_LAYOUTS):
-        assert layouts["coordinator"] == ("tp1", "tp2")
+    assert package_tool.ROLE_LAYOUTS["coordinator"] == ("tp1", "tp2")
     assert package_tool.ROLE_INPUT["coordinator"] == "bf16"
     # Unequal coordinator slices must not pass through Spark's default filter.
-    assert 'elif args.role == "spark" and not args.layouts' in TOOL.read_text()
+    assert 'else list(ROLE_LAYOUTS[args.role])' in TOOL.read_text()
     cmake = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     assert 'set(exact_slices "--exact-slices")' in cmake
 
@@ -197,6 +213,8 @@ def test_capacity_scratch_reserves_largest_retained_form_like_runtime_abi():
         {"capacity": 1024, "scratch_bytes": 163779584},
         {"capacity": 4096, "scratch_bytes": 734346240},
     ]
+    programs.append({"capacity": 16384, "form": "auto", "scratch": 2000000000, "segmented": True})
+    assert [item["capacity"] for item in package_tool.capacity_scratch(programs)] == [16, 1024, 4096]
     source = TOOL.read_text()
     assert '"capacities": capacity_scratch(programs)' in source
     assert "kPrograms[i].scratch > *bytes" in source
@@ -251,12 +269,28 @@ static void mock_launch(void** args, int) {{
   *static_cast<int*>(args[13]) = optins.count({{kernel_library, device}}) ? 0 : 1;
 }}
 """)
-    source = package_tool.bridge_source(
-        [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
+    # Execute the pinned selector's actual metadata method without importing CUDA.
+    route_source = REPO / "third_party/sparkinfer/b12x/integration/cuteafd/fp8_moe.py"
+    tree = ast.parse(route_source.read_text())
+    owner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "_Fp8Moe")
+    method = next(n for n in owner.body if isinstance(n, ast.FunctionDef) and n.name == "arithmetic_routes")
+    env = {"_Route": type("Route", (), {}), "_StreamRoute": type("Stream", (), {})}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(route_source), "exec"), env)
+    decode = env["_Route"]()
+    decode.route = "decode"
+    routes = env["arithmetic_routes"](SimpleNamespace(route="auto", threshold=37,
+        decode=decode, prefill=env["_StreamRoute"]()), "nvfp4" if "nvfp4" in geometry else "mxfp4", 80)
+    programs = [{"stem": stem, "capacity": 80, "scratch": 65536, "form": "auto", "entry": "mock_launch",
+          "arithmetic_routes": routes,
           "weight_read_grouping": ({"contract": "conservative_route_upper_bound",
               "segments": [{"end_rows": 80, "group_rows": 1}]} if "nvfp4" in geometry else
               {"contract": "exact_grouping", "segments": [
-                  {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}],
+                  {"end_rows": 16, "group_rows": 16}, {"end_rows": 80, "group_rows": 64}]})}]
+    segmented = geometry in ("mimo", "mimof")
+    if segmented:
+        programs.append({**programs[0], "capacity": 16384, "segmented": True,
+                         "minimum_rows": 769, "act_row_bytes": 2048})
+    source = package_tool.bridge_source(programs,
         [5 | (5 if geometry == "step5_bf16" else 4 if "nvfp4" in geometry else 1) << 8 | 1 << 16 | 1 << 24, 6144, 1024, 384, 8, 2048, 2, 1, 0, 1, 80, 0, 0, 0, 0, 0])
     (tmp_path / "bridge.cc").write_text(source)
     library = tmp_path / "bridge.so"
@@ -265,6 +299,25 @@ static void mock_launch(void** args, int) {{
                               text=True, capture_output=True, timeout=30)
     assert compiled.returncode == 0, compiled.stderr
     lib = ctypes.CDLL(str(library))
+    maximum, minimum, act = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+    assert lib.cuteafd_fp8moe_segment_info(0, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) == 0
+    assert (maximum.value, minimum.value, act.value) == ((16384, 769, 2048) if segmented else (0, 0, 0))
+    scratch = ctypes.c_uint64()
+    if segmented:
+        align = lambda n: (n + 1023) // 1024 * 1024
+        pairs, bound, experts = 8256 * 8, 16384 * 8, 384
+        tiles = (pairs + 127) // 128 + experts
+        expected = align(4 * (4 + 3 * experts + (bound + 127) // 128 + experts))
+        expected += 2 * align(pairs * 4) + align(tiles * 128 * 2048) + align(pairs * 6144 * 2)
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) == 0
+        assert scratch.value == expected
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(16384, ctypes.byref(scratch)) == 0
+        assert scratch.value > expected
+    else:
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(8256, ctypes.byref(scratch)) != 0
+    for rows in (0, 16385):
+        assert lib.cuteafd_fp8moe_segment_scratch_bytes(rows, ctypes.byref(scratch)) != 0
+    assert lib.cuteafd_fp8moe_segment_info(3, ctypes.byref(maximum), ctypes.byref(minimum), ctypes.byref(act)) != 0
     lib.cuteafd_fp8moe_destroy.argtypes = [ctypes.c_void_p]
     lib.cuteafd_fp8moe_launch.argtypes = [ctypes.c_void_p, ctypes.c_uint,
         ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
@@ -276,6 +329,16 @@ static void mock_launch(void** args, int) {{
             assert lib.cuteafd_fp8moe_weight_read_group(80, form, rows, ctypes.byref(group), ctypes.byref(contract)) == 0
             assert (group.value, contract.value) == ((1, 2) if "nvfp4" in geometry else (expected, 1))
     assert lib.cuteafd_fp8moe_weight_read_group(80, 0, 81, ctypes.byref(group), ctypes.byref(contract)) != 0
+    lib.cuteafd_fp8moe_arithmetic_route.argtypes = lib.cuteafd_fp8moe_weight_read_group.argtypes
+    route, end = ctypes.c_uint(), ctypes.c_uint()
+    for form in (0, 1, 2):  # absent forms must use launch's auto fallback
+        for rows in (1, 37, 38, 80):
+            assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) == 0
+            assert (route.value, end.value) == ((0, 80) if "nvfp4" in geometry else
+                (1, 37) if rows <= 37 else (3, 80))
+        # Rows 37 and 38 share a traffic group, but select different arithmetic.
+        for rows in (0, 81):
+            assert lib.cuteafd_fp8moe_arithmetic_route(80, form, rows, ctypes.byref(route), ctypes.byref(end)) != 0
     assert lib.mock_initialized() == 0  # The contract query must not initialize CUDA.
     contexts = []
     for rank in (0, 1):
@@ -283,11 +346,16 @@ static void mock_launch(void** args, int) {{
         context = ctypes.c_void_p()
         assert lib.cuteafd_fp8moe_create(ctypes.byref(context)) == 0
         contexts.append(context)
-    assert lib.mock_initialized() == 1
+    program_count = 2 if segmented else 1
+    assert lib.mock_initialized() == program_count
     pointers = (ctypes.c_void_p * 11)(*([1] * 11))
     for rank in (0, 1):
         lib.mock_device(rank)
         assert lib.cuteafd_fp8moe_launch(contexts[rank], 80, pointers, 80, None) == 0
+    lib.cuteafd_fp8moe_launch_segments.argtypes = [ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_void_p]
+    assert (lib.cuteafd_fp8moe_launch_segments(contexts[1], pointers, 8256, None) == 0) == segmented
+    assert lib.cuteafd_fp8moe_launch(contexts[1], 16384, pointers, 8256, None) != 0
     for index in range(11):
         pointers[index] = None
         status = lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None)
@@ -303,17 +371,17 @@ static void mock_launch(void** args, int) {{
     lib.mock_device(1)
     assert lib.cuteafd_fp8moe_launch(contexts[1], 80, pointers, 80, None) == 0
     lib.cuteafd_fp8moe_destroy(contexts[1])
-    assert lib.mock_unloaded() == 1
+    assert lib.mock_unloaded() == program_count
     lib.mock_device(2)
     assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 1
-    assert lib.mock_unloaded() == 2
+    assert lib.mock_unloaded() == program_count + 1
     lib.mock_fail(-1)
     lib.mock_device(0)
     assert lib.cuteafd_fp8moe_create(ctypes.byref(failed)) == 0
-    assert lib.mock_initialized() == 3
+    assert lib.mock_initialized() == 2 * program_count + 1
     assert lib.cuteafd_fp8moe_launch(failed, 80, pointers, 80, None) == 0
     lib.cuteafd_fp8moe_destroy(failed)
-    assert lib.mock_unloaded() == 3
+    assert lib.mock_unloaded() == 2 * program_count + 1
 
 
 def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVISION, weights="fp8"):
@@ -351,7 +419,7 @@ def stage(tmp_path: Path, kind: str, *, requested="mimo", role="expert", revisio
         write_package(native / name, input_kind="bf16", role=owner, weights="nvfp4")
     write_package(native / "fp8-step5", input_kind=wire, role=owner)
     write_package(native / "fp8-step5-bf16-weights", input_kind="bf16", role=owner, weights="bf16")
-    write_package(native / "fp8-step5-nvfp4", input_kind="bf16", role=owner, weights="nvfp4")
+    write_package(native / "fp8-step5-nvfp4a4", input_kind="bf16", role=owner, weights="nvfp4")
     if role == "coordinator":
         write_package(native / "fp8-qwen4", input_kind=wire, role=owner)
     write_package(native / "fp8-mimo-bf16", input_kind="bf16", revision=revision)
@@ -377,7 +445,7 @@ def test_step5_stages_native_weights_and_one_nvfp4_package(tmp_path, kind, role)
                            families="step5:fp8;step5:bf16;step5:nvfp4")
     assert result.returncode == 0, result.stderr
     assert {p.name for p in output.iterdir()} == {
-        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4", "fp8-mimo-bf16"}
+        "fp8-step5", "fp8-step5-bf16-weights", "fp8-step5-nvfp4a4", "fp8-mimo-bf16"}
     package_tool.verify(output / "fp8-step5-bf16-weights", revision=REVISION,
                         role=role, input_kind="bf16")
 
@@ -526,7 +594,7 @@ def test_cmake_exl3_family_counts_only_apply_to_their_family(tmp_path, counts, g
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\nset(CUTEAFD_EXL3_ROLE spark)\n'
                       f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\nset(CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp1-rank0)\n'
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body
                       + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n')
@@ -539,7 +607,8 @@ def test_cmake_exl3_own_family_invalid_count_still_fails(tmp_path):
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY qwen4)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\n'
+                      'set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY qwen4)\n'
                       'set(CUTEAFD_GENERIC_SPARK_COUNTS "qwen4=6")\n' + body)
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode != 0 and "requires a nonempty H128 slice" in result.stderr

@@ -82,8 +82,8 @@ if [[ -n "$spark_tp_roles" ]]; then
   IFS=';' read -ra spark_tp_role_list <<<"$spark_tp_roles"
   for spark_tp_role in "${spark_tp_role_list[@]}"; do
     case "$spark_tp_role" in
-      tp2|tp3|tp6) ;;
-      *) echo "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got: $spark_tp_role" >&2; exit 2 ;;
+      tp2|tp3|tp5|tp6|tp7|tp8) ;;
+      *) echo "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8, got: $spark_tp_role" >&2; exit 2 ;;
     esac
   done
   [[ "$role" == expert ]] ||
@@ -106,9 +106,7 @@ for bf16_family in "${bf16_family_list[@]}"; do
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
-# v7 ships both EXL3 decoder families by default: the uniform K=2 raw
-# publication family (2,3) and the staged K3.25 family (3,4).
-exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4}"
+# Package each supported checkpoint decoder family, including K4/K5.
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
@@ -204,6 +202,7 @@ cuteafd_build_cache_cargo_offline "$build_root/source/rust/Cargo.toml"
 # coordinator ships a portable x86-64-v2 base plus an x86-64-v4 variant. Each
 # daemon builds into its own target directory; the variants build side by side.
 source "$(dirname "${BASH_SOURCE[0]}")/host-isa.sh"
+cuteafd_build_parallelism
 host_isa_text="$(cuteafd_host_isa_list release "${CUTEAFD_RELEASE_HOST_ISA:-}")"
 mapfile -t host_isas <<<"$host_isa_text"
 host_isa_cmake="${host_isa_text//$'\n'/;}"
@@ -213,9 +212,16 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 # CUTEAFD_RELEASE_RUST_LTO / _CODEGEN_UNITS opt in (e.g. thin / 1).
 [[ -z "${CUTEAFD_RELEASE_RUST_LTO:-}" ]] || export CARGO_PROFILE_RELEASE_LTO="$CUTEAFD_RELEASE_RUST_LTO"
 [[ -z "${CUTEAFD_RELEASE_RUST_CODEGEN_UNITS:-}" ]] || export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CUTEAFD_RELEASE_RUST_CODEGEN_UNITS"
+# Coordinator-only Cargo features. Keep tuned glibc by default; explicitly set
+# CUTEAFD_RELEASE_COORDINATOR_FEATURES=jemalloc for allocator comparisons.
+cargo_feature_args=()
+if [[ "$role" == coordinator ]]; then
+  coordinator_features="${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}"
+  [[ -z "$coordinator_features" ]] || cargo_feature_args=(--features "$coordinator_features")
+fi
 host_isa_jobs=()
 for host_isa in "${host_isas[@]}"; do
-  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" &
+  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" ${cargo_feature_args[@]+"${cargo_feature_args[@]}"} &
   host_isa_jobs+=("$!")
 done
 for host_isa_job in "${host_isa_jobs[@]}"; do wait "$host_isa_job"; done
@@ -239,14 +245,13 @@ cmake \
   -DCUTEAFD_FP8_MOE_BF16_FAMILIES="$bf16_families" \
   -DCUTEAFD_ENABLE_V41_NVFP4_AOT="${CUTEAFD_RELEASE_NVFP4_AOT:-ON}" \
   -DCUTEAFD_ENABLE_EXL3_PACKAGES=ON \
-  -DCUTEAFD_V41_EXL3_BIT_FAMILIES="$exl3_bit_families" \
   -DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_FP8_AOT="$coordinator_aot" \
   -DCUTEAFD_DSV4_MAX_CONTEXT="${CUTEAFD_RELEASE_DSV4_MAX_CONTEXT:-1048576}" \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_DSV4_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLM_AOT:-OFF}" || echo OFF)" \
-  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_RELEASE_GLM_AOT:-OFF}" == ON || "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_RELEASE_DSV4_AOT:-ON}" == ON ) ]] && echo "${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
+  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_RELEASE_GLM_AOT:-OFF}" == ON || "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_RELEASE_DSV4_AOT:-ON}" == ON || "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" == ON ) ]] && echo "${CUTEAFD_RELEASE_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MIMO_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_RELEASE_MIMO_GEOMETRIES:-mimo,mimo2,mimop,mimop2}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_GLMF_AOT:-OFF}" || echo OFF)" \
@@ -254,7 +259,10 @@ cmake \
   -DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_QWEN_DENSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_STEP5_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_STEP5_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_KIMIK3_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_KIMIK3_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
+  -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_HC_LAGGED_AOT="$coordinator_aot" \
   -DCUTEAFD_ENABLE_V41_NARROW_AOT="$coordinator_aot" \
@@ -277,22 +285,10 @@ if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
   python3 "$(dirname "${BASH_SOURCE[0]}")/write-compiler-provenance.py" \
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 fi
-exl3_family_tags=()
-IFS=';' read -ra exl3_family_list <<<"$exl3_bit_families"
-for exl3_family in "${exl3_family_list[@]}"; do
-  exl3_family_tags+=("k${exl3_family//,/}")
-done
-# Families nest under exl3/ so images keep one well-known EXL3 root; the
-# daemon resolves exl3/exl3-kXX by checkpoint tiers and treats a direct
-# layout child of exl3/ as the legacy single-family package.
-for exl3_tag in "${exl3_family_tags[@]}"; do
-  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" install \
-    --package "$build_root/native/exl3-$exl3_tag" --output "$output_dir/exl3/exl3-$exl3_tag"
-  python3 "$build_root/source/python/tools/aot/package_exl3_aot.py" verify \
-    --package "$output_dir/exl3/exl3-$exl3_tag" --role "$role"
-done
-# Other expert geometries (FAMILY:exl3-kTIERS entries) ship as exl3-FAMILY-kTIERS.
 IFS=';' read -ra release_family_list <<<"$expert_families"
+# Like fp8/, the exl3/ directory always exists so the release image can COPY it
+# when the scope ships no EXL3 family (a deepseek_v41-scoped build has none).
+install -d "$output_dir/exl3"
 for release_family in "${release_family_list[@]}"; do
   [[ "$release_family" == *:exl3-k* ]] || continue
   release_package="exl3-${release_family%%:*}-${release_family#*:exl3-}"
@@ -321,6 +317,7 @@ for release_family in "${release_family_list[@]}"; do
   case "$release_family" in
     *:fp8) release_package="fp8-${release_family%%:*}" ;;
     step5:bf16) release_package="fp8-step5-bf16-weights" ;;
+    step5:nvfp4) release_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
     *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;
@@ -362,6 +359,10 @@ if [[ "$coordinator_aot" == ON ]]; then
         "$output_dir/V41_EXPERT_WORKSPACES/nvfp4_${expert_role}.json"
     fi
   done
+  if [[ -f "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" ]]; then
+    install -m 0644 "$build_root/native/v41_dspark_tp2_experts/v41_experts.json" \
+      "$output_dir/V41_EXPERT_WORKSPACES/mxfp4_dspark_tp2.json"
+  fi
 fi
 # Always write the built-role manifest, including the empty-role default, so
 # the release Dockerfile can COPY it unconditionally. Every listed role is
@@ -388,8 +389,9 @@ PY_CHECK
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"
 fi
-# DeepSeek V4 coordinator program manifest (an empty table when not built).
-if [[ -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
+# Every expert release enables native V4.1 and EXL3 packages, so its codec
+# table must exist. Do not silently publish an empty manifest on build failure.
+if [[ "$role" == expert || -s "$build_root/native/dsv4_programs/dsv4_programs.json" ]]; then
   install -m 0644 "$build_root/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else
   printf '%s\n' '{"schema":1,"programs":[]}' >"$output_dir/PROGRAMS.json"
@@ -431,7 +433,8 @@ test -s "$output_dir/libcuteafd_native.so"
 # its manifest, and the role's EXLR8 programs must all be present.
 if [[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" == ON ]]; then
   "$output_dir/cuteafd" programs-check --native-lib "$output_dir/libcuteafd_native.so" \
-    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)"
+    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
+    --exlr8-family "${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}"
 fi
 test -s "$output_dir/V41_EXPERT_TP_AOT.json"
 test -s "$output_dir/THIRD_PARTY_NOTICES.md"

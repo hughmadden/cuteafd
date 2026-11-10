@@ -47,6 +47,7 @@ impl Family for DFlash2 {
 impl DFlash2 {
     fn spec(&self, checkpoint: &Checkpoint) -> Result<ModelSpec> {
         let c = &checkpoint.config;
+        crate::formats::dflash::validate_topk_vocab(usize_field(c, "vocab_size")? as u64)?;
         let dflash = c.get("dflash_config").cloned().unwrap_or(Value::Null);
         let window = opt_usize_field(c, "sliding_window").unwrap_or(0);
         let layer = LayerSpec {

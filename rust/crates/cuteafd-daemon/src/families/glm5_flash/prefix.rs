@@ -146,7 +146,14 @@ pub(crate) struct GlmfPrefix<'e, 'a> {
     /// The loaded CUDA runtime's batched copy, which moves a pool mark in one call per rank
     /// (without it, one copy per segment).
     runtime: Option<CudaRuntime>,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream. The
+    /// remote DFlash drafter reads tapped hidden rows, never prefix pages or KDA state, so it
+    /// is not a reader.
+    copies: crate::shared::prefix::PrefixCopies<'a>,
 }
+
+/// Device copies `(rank, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
 
 impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// The family over `engine`'s buffers, its marks in a device arena of `slots(mark_bytes)`
@@ -200,7 +207,11 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
                 copy = if runtime.is_some() { "cuda-memcpy-batch" } else { "per-segment" },
                 "GLM 5.3 Flash prefix marks in pool units");
         }
-        Ok(Self { engine, paged, mark_bytes, page_bytes, arenas, slots, mark_units, runtime })
+        let copies = crate::shared::prefix::PrefixCopies::new(engine.library, (0..engine.ranks())
+            .map(|rank| Ok(vec![crate::shared::prefix::Reader {
+                device: engine.on(rank, || engine.library.cuda_get_device())?, stream: engine.stream_of(rank) }]))
+            .collect::<Result<_>>()?)?;
+        Ok(Self { engine, paged, mark_bytes, page_bytes, arenas, slots, mark_units, runtime, copies })
     }
 
     pub fn mark_bytes(&self) -> usize {
@@ -242,15 +253,12 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         self.mark_units
     }
 
-    /// A copy on rank `rank`'s stream.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live engine allocations of that rank's GPU (checked by
-        // `view`); the copy is ordered on its stream with every forward pass that reads or
-        // writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
+    /// Queues `copies` on their ranks' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: every view lies inside a live engine allocation of its rank (checked by `view`,
+        // or a registered replica range); the cache drains the copy streams before it hands any
+        // of that storage to someone else.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// One unit's views on rank `rank`, per MLA layer: records, token keys (`--index-cache keys`),
@@ -303,26 +311,22 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
         Ok(())
     }
 
-    /// `copies` on rank `rank`'s stream (`template`: one of that rank's buffers).
+    /// `copies` on rank `rank`'s prefix copy stream (`template`: one of that rank's buffers).
     fn copy_batch(&self, rank: usize, template: CuteafdDeviceBuffer, copies: &[SpanCopy]) -> Result<()> {
         let Some(runtime) = &self.runtime else {
-            for copy in copies {
-                let at = |addr: usize| CuteafdDeviceBuffer { ptr: addr as *mut c_void, bytes: copy.bytes, ..template };
-                self.copy(rank, at(copy.dst), at(copy.src))?;
-            }
-            return Ok(());
+            let at = |addr: usize, bytes| CuteafdDeviceBuffer { ptr: addr as *mut c_void, bytes, ..template };
+            return self.submit(&copies.iter().map(|copy| (rank, at(copy.dst, copy.bytes), at(copy.src, copy.bytes)))
+                .collect());
         };
         let dsts: Vec<*mut c_void> = copies.iter().map(|c| c.dst as *mut c_void).collect();
         let srcs: Vec<*const c_void> = copies.iter().map(|c| c.src as *const c_void).collect();
         let sizes: Vec<usize> = copies.iter().map(|c| c.bytes).collect();
         // SAFETY: every range lies inside a live engine allocation of that rank's GPU (the slot
         // regions, and the mark's units checked by `view`); the destinations are disjoint (a
-        // mark's own units, or one KDA slot's regions); the batch is ordered on the rank's
-        // stream with every forward pass that reads or writes them, and the cache drains that
-        // stream before it hands the units or the slot to anyone else.
-        self.engine.on(rank, || unsafe {
-            runtime.memcpy_batch_async(&dsts, &srcs, &sizes, self.engine.stream_of(rank))
-        })
+        // mark's own units, or one KDA slot's regions); the copy stream is fenced against every
+        // forward pass on both sides, and the cache drains it before it hands the units or the
+        // slot to anyone else.
+        self.copies.ordered(rank, |stream| unsafe { runtime.memcpy_batch_async(&dsts, &srcs, &sizes, stream) })
     }
 
     /// The pool mark in `pages`, rank by rank (checks).
@@ -363,19 +367,16 @@ impl<'e, 'a> GlmfPrefix<'e, 'a> {
     /// Copy every KDA layer's state of KDA slot `kda` to or from mark `slot` (each rank its heads).
     fn move_mark(&self, slot: MarkSlot, kda: i32, capture: bool) -> Result<()> {
         ensure!(kda >= 0 && (kda as usize) < self.engine.slots, "KDA slot {kda} of {}", self.engine.slots);
+        let mut copies = Copies::new();
         for (rank, part) in self.mark_parts(slot)? {
             let mut offset = 0;
             for region in self.engine.slot_regions_on(rank, kda as usize) {
                 let mark = view(part, offset, region.bytes)?;
-                if capture {
-                    self.copy(rank, mark, region)?;
-                } else {
-                    self.copy(rank, region, mark)?;
-                }
+                copies.push(if capture { (rank, mark, region) } else { (rank, region, mark) });
                 offset += region.bytes;
             }
         }
-        Ok(())
+        self.submit(&copies)
     }
 
     /// Mark `slot`'s bytes, rank by rank (checks).
@@ -408,6 +409,12 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
 
     fn pages<'p>(&self, placement: &'p GlmfPlacement) -> &'p [u32] {
         &placement.units
+    }
+
+    /// The step tables are rebuilt from the expanded pages every step.
+    fn extend_pages(&self, placement: &mut GlmfPlacement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
     }
 
     fn commit_point(&self, placement: &GlmfPlacement) -> usize {
@@ -455,26 +462,27 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
             return Err(format!("tail copy {copy:?} crosses GPUs").into());
         }
         let copy = TailCopy { from, to, ..copy };
+        let mut copies = Copies::new();
         for &(rank, layer) in self.paged.iter().filter(|(rank, _)| !self.parity() || *rank == from_rank) {
             let pool_keys = layer.pools;
             for (buffer, row) in std::iter::once((layer.records, RECORD_BYTES)).chain(layer.keys.map(|k| (k, KEY_BYTES))) {
-                self.copy(rank, view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
-                    view(buffer, copy.from as usize * rows * row, copy.rows * row)?)?;
+                copies.push((rank, view(buffer, copy.to as usize * rows * row, copy.rows * row)?,
+                    view(buffer, copy.from as usize * rows * row, copy.rows * row)?));
             }
             // The complete pools: their E4M3 keys, then their scales.
             if pools > 0 {
                 let (from, to) = (copy.from as usize * POOL_PAGE_BYTES, copy.to as usize * POOL_PAGE_BYTES);
-                self.copy(rank, view(pool_keys, to, pools * POOL_KEY_BYTES)?,
-                    view(pool_keys, from, pools * POOL_KEY_BYTES)?)?;
-                self.copy(rank, view(pool_keys, to + POOL_SCALES, pools * 4)?,
-                    view(pool_keys, from + POOL_SCALES, pools * 4)?)?;
+                copies.push((rank, view(pool_keys, to, pools * POOL_KEY_BYTES)?,
+                    view(pool_keys, from, pools * POOL_KEY_BYTES)?));
+                copies.push((rank, view(pool_keys, to + POOL_SCALES, pools * 4)?,
+                    view(pool_keys, from + POOL_SCALES, pools * 4)?));
             }
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        Ok(self.engine.synchronize()?)
+        Ok(self.copies.drain()?)
     }
 
     fn page_device(&self, page: u32) -> Option<u8> {
@@ -498,17 +506,17 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
     }
 
     fn copy_replicas(&self, copies: &[(DeviceRange, DeviceRange)]) -> Result<(), BoxError> {
-        self.engine.on(1, || {
-            for &(src, dst) in copies {
-                let template = self.paged.iter().find(|(rank, _)| *rank == 1).context("missing replica owner")?.1.records;
-                let source = CuteafdDeviceBuffer { ptr: src.addr as *mut c_void, bytes: src.bytes,
-                    device_id: self.engine.device, ..template };
-                let target = CuteafdDeviceBuffer { ptr: dst.addr as *mut c_void, bytes: dst.bytes, ..template };
-                // SAFETY: registered page views stay live until the destination stream drains.
-                unsafe { self.engine.library.copy_d2d_async(target, source, src.bytes, self.engine.stream_of(1))?; }
-            }
-            Ok(())
-        }).map_err(Into::into)
+        if copies.is_empty() { return Ok(()); }
+        let template = self.paged.iter().find(|(rank, _)| *rank == 1).context("missing replica owner")?.1.records;
+        let mut batch = Copies::new();
+        for &(src, dst) in copies {
+            if src.bytes != dst.bytes { return Err("replica ranges differ in length".into()); }
+            let source = CuteafdDeviceBuffer { ptr: src.addr as *mut c_void, bytes: src.bytes,
+                device_id: self.engine.device, ..template };
+            let target = CuteafdDeviceBuffer { ptr: dst.addr as *mut c_void, bytes: dst.bytes, ..template };
+            batch.push((1, target, source));
+        }
+        Ok(self.submit(&batch)?)
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
@@ -946,7 +954,7 @@ mod tests {
         assert_eq!(page.iter().map(|r| r.bytes).sum::<usize>(), unit);
         let marks = (0..2).map(|gpu| DeviceRange { addr: (gpu * gpu_bytes + unit * 2) as u64, bytes: 17 })
             .collect::<Vec<_>>();
-        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 };
+        let layout = Layout { page: unit, tail: 34, draft: 0, scores: 0 , draft_page: 0};
         let config = Config { bytes: 1 << 26, chunk_bytes: 1 << 22, min_tokens: 1, ..Default::default() };
         for (src, dst) in &replicas {
             memory.write_device(*src, &vec![5; src.bytes]);
@@ -956,7 +964,7 @@ mod tests {
         let mut host = HostCache::with_rule(config, layout, memory, ReuseRule::EXACT,
             cuteafd_hostcache::snapshot::EvictionOrder::LeastRecent).unwrap();
         for (kind, tokens) in [(SnapshotKind::Prompt, vec![1, 2]), (SnapshotKind::Turn, vec![1, 2, 3])] {
-            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::COMPRESSORS] = Default::default();
+            let mut pages: [Vec<DevicePage>; cuteafd_hostcache::PAGE_BANKS] = Default::default();
             pages[0].push(DevicePage { id: DevicePageId { compressor: 0, page: 1, generation: 1 }, segments: page.clone() });
             let snapshot = DeviceSnapshot { meta: SnapshotMeta { kind, end: tokens.len() as u32, tokens: tokens.clone(),
                 has_draft: false }, pages: pages.clone(), tail: marks.clone(), draft: None, scores: vec![] };
@@ -1053,8 +1061,9 @@ mod tests {
         let mark = kda * (state + conv);
         let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16, DECODE_ROWS).0 + conv);
         assert_eq!((mark, bf16, kda * replay, mla * 64 * KEY_BYTES), (147_619_840, 76_316_672, 321_421_312, 360_448));
-        let prefix = Cli::parse_from(["serve"]).prefix;
-        for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 18, 28), (16, 34, 34), (64, 130, 130)] {
+        let mut prefix = Cli::parse_from(["serve"]).prefix;
+        prefix.resolve_entries(16);
+        for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 14, 28), (16, 14, 28), (64, 14, 28)] {
             for (index, state, mark, slots) in [(IndexCache::Keys, KdaState::F32, mark, f32_slots),
                 (IndexCache::Compact, KdaState::F32, mark + mla * TAIL_BYTES, f32_slots),
                 (IndexCache::Keys, KdaState::Bf16, bf16, bf16_slots),
@@ -1062,24 +1071,34 @@ mod tests {
                 let planned = super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state)
                     .unwrap();
                 let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
-                    prefix.prefix_cache_mark_mib << 20);
+                    prefix.prefix_cache_mark_mib << 20, prefix.host_cache_bytes.enabled());
                 assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes, {index:?}, {state:?}");
             }
         }
-        // What either admission now reserves is the arena the ledger measured as `prefix`: FP32 at 8
-        // and 16 sequences, compact at 16, BF16 at 8 and 16 (a flat 18-mark reserve left 16 FP32
-        // marks, 2,361,917,440 B, out at 16 sequences).
+        let hosted = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
+        for lanes in [1, 16, 64] {
+            for (index, state) in [(IndexCache::Keys, KdaState::F32), (IndexCache::Compact, KdaState::Bf16)] {
+                let bytes = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64)
+                    .unwrap().ranks[0].retained_mark_bytes;
+                let planned = super::ArenaMarks::Rule(hosted.mark_rule(lanes))
+                    .slots_on(&cfg, cfg.layers, index, state).unwrap();
+                assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_with_host(lanes as u64,
+                    hosted.prefix_cache_entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20, true));
+                assert_eq!(planned, 2);
+            }
+        }
+        // Device-only arenas stay within the byte budget at every concurrency.
         let arena = |lanes, index: IndexCache, state: KdaState| {
             let mark = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64).unwrap()
                 .ranks[0].retained_mark_bytes as usize;
             super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state).unwrap() * mark
         };
-        assert_eq!(arena(8, IndexCache::Keys, KdaState::F32), 2_657_157_120);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32), 5_019_074_560);
-        assert_eq!(arena(16, IndexCache::Compact, KdaState::F32), 5_019_655_008);
+        assert_eq!(arena(8, IndexCache::Keys, KdaState::F32), 2_066_677_760);
+        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32), 2_066_677_760);
+        assert_eq!(arena(16, IndexCache::Compact, KdaState::F32), 2066916768);
         assert_eq!(arena(8, IndexCache::Keys, KdaState::Bf16), 2_136_866_816);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::Bf16), 2_594_766_848);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32) - 18 * mark, 2_361_917_440);
+        assert_eq!(arena(16, IndexCache::Keys, KdaState::Bf16), 2_136_866_816);
+        assert!(arena(16, IndexCache::Keys, KdaState::F32) <= 2 << 30);
         let off = PrefixArgs { prefix_cache_entries: 0, ..prefix };
         assert_eq!(super::ArenaMarks::Rule(off.mark_rule(16))
             .slots_on(&cfg, cfg.layers, IndexCache::Keys, KdaState::F32).unwrap(), 0);

@@ -28,7 +28,7 @@ else:
 '''
 
 class PlacementHandoffTest(unittest.TestCase):
-    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None):
+    def run_startup(self, gpus, plan, options=(), spark_count=4, local_layers="auto", encoder=None, dspark_experts=None):
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
         block=source[source.index('# Workers bootstrap first;'):source.index('api_url=')]
         with tempfile.TemporaryDirectory() as directory:
@@ -54,7 +54,7 @@ PREFILL_BATCH_TOKENS=2048
 CONCURRENCY=16
 PREFIX_CACHE_ENTRIES=20
 MAX_CONTEXT_TOKENS=1048576
-MAX_OUTPUT_TOKENS=393216
+MAX_OUTPUT_TOKENS=131072
 HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
@@ -75,7 +75,8 @@ dspark_draft_limit=
 TP2_ATTENTION=off
 TP2_QUERY_PROJECTION=off
 TP2_OUTPUT_PROJECTION=off
-TP2_DSPARK_EXPERTS=off
+TP2_DSPARK_EXPERTS=
+release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 topology_explicit=0
 spark_ep=1
 spark_admission=not-applicable
@@ -84,6 +85,8 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+site_hub=0
+namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
 SPARK_DEVICE_BUDGET_BYTES=1000000
@@ -102,6 +105,10 @@ shared_env_args=(-e CUTEAFD_SPARK_INTAKE=auto -e CUTEAFD_CONSOLE_TEXT=true -e CU
 shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on)
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
+v41_l2_prefetch=
+v41_engram_warm=off
+v41_decode_lanes=
+resolved_decode_lanes=2
 '''
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
@@ -112,6 +119,8 @@ v41_fp8_head_args=()
             if spark_count == 2:
                 setup+='MEMORY_RESERVATION=32GiB\nKV_POOL_SIZE=2GiB\npeers=10.55.0.1:19441,10.55.0.2:19441\n'
             setup+=''.join(f'\nTP2_{option}=on\n' for option in options)
+            if dspark_experts is not None:
+                setup+=f'\nTP2_DSPARK_EXPERTS={dspark_experts}\n'
             count_plan = {**(encoder or {}), "spark_admission": "coordinator_authoritative"}
             setup += "\ncount_plan=" + __import__("shlex").quote(json.dumps(count_plan)) + "\n"
             result=subprocess.run(['bash','-c',setup+block,'test',str(gpus)],env=env,cwd=ROOT,capture_output=True,text=True,timeout=10)
@@ -146,7 +155,7 @@ v41_fp8_head_args=()
                               if tool == 'ssh' and '-s' in args]
                     self.assertEqual(len(starts), 4)
                     tails = [self.worker_tail(args) for _, args in starts]
-                    self.assertTrue(all(len(tail) == 16 for tail in tails), tails)
+                    self.assertTrue(all(len(tail) == 15 for tail in tails), tails)
                     self.assertTrue(all(tail[7:11] == ['4', '0', '4', '1'] for tail in tails))
                     ready = [i for i, (tool, args) in enumerate(events)
                              if tool == 'ssh' and any('native worker bootstrap ready' in arg for arg in args)]
@@ -175,9 +184,9 @@ v41_fp8_head_args=()
         self.assertEqual(coordinator[coordinator.index('--encoder-plan-hash')+1],'ab'*32)
         tails=[self.worker_tail(args) for tool,args in events if tool=='ssh' and '-s' in args]
         self.assertEqual(len(tails),4)
-        self.assertTrue(all(tail[16:]==['2','19541','ab'*32,
+        self.assertTrue(all(tail[15:]==['2','19541','ab'*32,
             '0123456789012345678901234567890123456789'] for tail in tails))
-        self.assertIn('if [[ "$rank" == "${17:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
+        self.assertIn('if [[ "$rank" == "${16:--1}" ]]', (ROOT/'scripts/launch/run-family.sh').read_text())
 
     def test_compact_starts_exactly_two_workers_and_passes_ceiling(self):
         result,events=self.run_startup(1,dict(version=1,rtx_gpus=1,nonce="fresh",rtx_expert_layers=0,spark_first_layer=0),spark_count=2)
@@ -209,7 +218,11 @@ v41_fp8_head_args=()
         """The former --tp2-* flags are configuration keys: run.sh --set reaches the
         loader as the file would, and the loader rejects a bad value."""
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
-        block=source[source.index('# The release loader validates every key'):source.index('release_validate_tp2_options\n')]
+        loader=source[source.index('# The release loader validates every key'):]
+        # Test the loader and TP2 validator, not intervening family launch setup
+        # (which also uses the shared config reader for optional Spark budgets).
+        block=loader[:loader.index('release_load_config "$config"\n') + len('release_load_config "$config"\n')]
+        block+='release_validate_tp2_options\n'
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
             config=Path(directory)/'recipe.config'
@@ -238,7 +251,14 @@ v41_fp8_head_args=()
                 self.assertEqual(result.returncode,0,result.stderr)
                 args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
                 for option,flag in zip(options,flags):
-                    self.assertEqual(flag in args,option in enabled)
+                    self.assertEqual(flag in args,option in enabled or option == 'DSPARK_EXPERTS')
+
+    def test_explicit_dspark_experts_off_reaches_coordinator(self):
+        result,events=self.run_startup(2,{},dspark_experts='off')
+        self.assertEqual(result.returncode,0,result.stderr)
+        args=next(args for tool,args in events if tool=='docker' and 'serve-native' in args)
+        self.assertNotIn('--tp2-dspark-experts',args)
+        self.assertEqual(args[args.index('--rtx-gpus')+1],'2')
 
     def test_filesystem_plan_is_not_a_startup_input(self):
         # A stale/invalid filesystem payload is ignored; the daemon validates

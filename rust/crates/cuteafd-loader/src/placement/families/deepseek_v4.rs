@@ -13,8 +13,6 @@ use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cos
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Prefill lanes of the V4 engine (`engine::PREFILL_LANES`).
-pub const PREFILL_LANES: u64 = 2;
 /// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
 /// segment graphs by the exact compressed-table width, so the set grows with
 /// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
@@ -36,6 +34,7 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 /// checkpoint, the program manifest and the CLI.
 #[derive(Debug, Clone)]
 pub struct V4Inputs<'a> {
+    pub spark_reply_format: cuteafd_core::SparkReplyFormat,
     /// True only when the operator left context automatic.
     pub automatic_context: bool,
     pub cfg: &'a DeepseekV4Config,
@@ -43,17 +42,18 @@ pub struct V4Inputs<'a> {
     pub weights: crate::families::deepseek_v4::resident::WeightInventory,
     /// dSpark stages that hold caches (all the checkpoint's stages).
     pub cache_stages: usize,
-    /// Per-GPU total bytes and baseline; one or two entries. The V4 reserve
-    /// becomes each GPU's headroom.
+    /// Per-GPU total bytes and baseline; one or two entries. Exact workspaces
+    /// use a fixed headroom floor unless the caller requests a larger envelope.
     pub gpus: Vec<(u64, Baseline)>,
     /// Lower bound for that reserve (`plan --headroom-gib`).
     pub headroom_floor: u64,
     pub spark_ranks: usize,
     pub sequences: u64,
     pub prefill_rows: u64,
+    pub prefill_waves: u64,
     pub decode_rows: u64,
     pub max_context: u64,
-    /// `--reserve-gib` in bytes.
+    /// `--reserve-gib` in bytes; values above the default retain a total envelope.
     pub reserve_bytes: u64,
     /// Prefix mark slots (`MarkArena::slots_for`), 0 without a prefix cache.
     pub mark_slots: u64,
@@ -136,9 +136,9 @@ pub fn context_workspace(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64,
     let mut out = vec![("candidates", decode_rows * cfg.index_topk as u64 * 8),
         ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
-        ("gather tables", 2 * half * 4), ("local selected lengths", decode_rows * 4),
+        ("gather tables", (prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64) * 2 * half * 4), ("local selected lengths", decode_rows * 4),
         ("empty window lengths", decode_rows * 4)];
-    out.extend((0..prefill_lanes).map(|_| ("commit blocks", commit)));
+    out.extend((0..prefill_lanes + crate::serving_capacity::V4_PACKED_MEMBERS as u64).map(|_| ("commit blocks", commit)));
     let scratch_units = context_scratch_units(decode_rows);
     for _ in cfg.compress_ratios.iter().filter(|&&ratio| ratio == 4) {
         out.push(("C4 scratch records", scratch_units * 37_440));
@@ -159,14 +159,19 @@ pub fn context_buffers(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64, d
             .iter().map(|&(_, bytes)| bytes.max(256)).sum() }
 }
 
-/// Prefix mark slots of the V4 arena (`MarkArena::slots_for` over every
-/// rank's mark), 0 without prefix entries.
+/// Replicated TP2 Heads snapshots cannot use the single-owner host copy path.
+/// Keep retention on device until host restore can restore both replicas.
+pub fn host_marks_enabled(gpus: usize, partitioned: bool, host: bool) -> bool {
+    host && (gpus == 1 || partitioned)
+}
+
+/// Prefix mark slots over every rank's mark, 0 without prefix entries.
 pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_stages: usize, sequences: u64,
-    entries: u64, budget_bytes: u64) -> Result<u64, PlacementError> {
+    entries: u64, budget_bytes: u64, host: bool) -> Result<u64, PlacementError> {
     let geometry = deepseek_v4_cache_geometry(cfg, gpus, prefill_rows, cache_stages)
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let mark: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-    Ok(cuteafd_core::prefix::mark_slots_for(sequences, entries, mark, budget_bytes))
+    Ok(cuteafd_core::prefix::mark_slots_with_host(sequences, entries, mark, budget_bytes, host))
 }
 
 /// Owner-local route ring of the shared draft probe; pinned host bytes have the same extent.
@@ -184,7 +189,8 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
-    let tables = PREFILL_LANES * inputs.prefill_rows + inputs.decode_rows;
+    let tables = inputs.prefill_waves.checked_mul(crate::serving_capacity::V4_PACKED_MEMBERS as u64)
+        .and_then(|n| n.checked_add(inputs.decode_rows)).ok_or(PlacementError::Overflow("V4 packed lane tables"))?;
     let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
     let mut overhead = Vec::new();
@@ -197,10 +203,13 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            PREFILL_LANES * inputs.spark_ranks as u64 * 4096 * hidden * 2
+            crate::serving_capacity::prefill_return_bytes_with_format(inputs.prefill_waves, inputs.prefill_rows,
+                inputs.spark_ranks as u64, hidden, inputs.spark_reply_format)
+                .map_err(|_| PlacementError::Inventory("V4 Spark reply width or allocation overflow"))?
+                + crate::serving_capacity::spark_intake_bytes(1, inputs.spark_ranks as u64, inputs.decode_rows, hidden)
         } else { 0 };
         let exchange = if gpus == 2 {
-            deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank)
+            deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
         let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(inputs.cfg, inputs.decode_rows)? } else { 0 };
@@ -224,7 +233,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
-                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32)
+                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32, inputs.prefill_waves)
                     .map_err(|_| PlacementError::Overflow("V4 peer exchange"))?, Basis::Formula));
             demands.push(Demand::new(gpu, Category::Transport, "expert peer exchange", exchange, Basis::Formula));
         }
@@ -282,14 +291,21 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
             inputs.draft.iter().map(|c| Bytes2 { resident: c.resident_bytes, staging: c.staging_bytes }).collect(), 0)
             .movable(gpus)?]
     };
+    let payload = crate::serving_capacity::deepseek_v4_tp2_payload_bytes(inputs.cfg.dim as u64,
+        inputs.prefill_rows, inputs.decode_rows, inputs.prefill_waves)
+        .map_err(|_| PlacementError::Overflow("V4 TP2 payload"))?;
+    let mut tp2_workspace = inputs.tp2_workspace;
+    for bytes in &mut tp2_workspace {
+        *bytes = bytes.checked_add(payload).ok_or(PlacementError::Overflow("V4 TP2 workspace"))?;
+    }
     let geometry_unit = 256;
-    Ok(PlacementRequest {
+    Ok(PlacementRequest { expert_tier: None,
         pool_bounded: Vec::new(),
         attention_placement: inputs.attention,
         layers_first_gpu: 0,
         // Exactly what the engine allocates under context (charged only when a layer runs it).
         context_buffers: context_buffers(inputs.cfg, inputs.max_context, inputs.prefill_rows, inputs.decode_rows,
-            PREFILL_LANES, context.unwrap_or_default()),
+            inputs.prefill_waves, context.unwrap_or_default()),
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
@@ -300,7 +316,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         startup: Vec::new(),
         movables,
         expert_workspace: inputs.expert_workspace,
-        tp2_workspace: inputs.tp2_workspace,
+        tp2_workspace,
         onboard: inputs.onboard,
         minimum_expert_layers: 0,
         expert_gpus: if gpus == 2 && inputs.experts_half.is_empty() { 0 } else { 1 },
@@ -312,7 +328,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
         // broadcast of the embedding rows into GPU1's step input.
         hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
-            lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
+            lanes: inputs.prefill_waves, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
         // A build without the C4 context programs runs heads only.
         executor: if context.is_some() { super::DEEPSEEK_V4 }
             else { ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
@@ -327,10 +343,10 @@ pub fn code_experts(catalog: &crate::OfficialV41Catalog) -> &'static str {
 }
 
 /// Each coordinator GPU's measured loaded code (`placement::inventory::LOADED_CODE`) for a V4
-/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs.
-pub fn code_bytes(dim: usize, experts: &str, gpus: usize) -> Vec<u64> {
+/// model of hidden size `dim` with `experts` (`code_experts`) on `gpus` GPUs of `arch`.
+pub fn code_bytes(dim: usize, experts: &str, gpus: usize, arch: cuteafd_core::GpuArch) -> Vec<u64> {
     let family = if dim == 4096 { "dsv4f" } else { "dsv4p" };
-    let arch = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES);
+    let arch = crate::placement::ArchContext::for_device(arch, crate::placement::inventory::ArchContext::reference_total_bytes(arch));
     (0..gpus).map(|rank| crate::placement::inventory::loaded_code_allowance(
         family, experts, gpus == 2, rank as u8, arch, None).bytes).collect()
 }
@@ -364,6 +380,43 @@ mod default_tests {
     }
 
     #[test]
+    fn combined_reply_formats_reuse_bf16_capacity_for_flash_and_pro() {
+        for (hidden, heads, topk) in [(4096, 64, 512), (7168, 128, 1024)] {
+            let mut cfg = context_cfg();
+            cfg.dim = hidden;
+            cfg.n_heads = heads;
+            cfg.index_topk = topk;
+            for gpus in [1, 2] {
+                let mut input = V4Inputs {
+                    spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, automatic_context: false,
+                    cfg: &cfg, weights: crate::families::deepseek_v4::resident::WeightInventory {
+                        c4_attention: Vec::new(), fixed: Vec::new() },
+                    cache_stages: 0, gpus: vec![(96 << 30, Baseline::Planned {
+                        context_bytes: 0, loaded_bytes: 0 }); gpus], headroom_floor: 0,
+                    spark_ranks: 6, sequences: 16, prefill_rows: 2752, prefill_waves: 3,
+                    decode_rows: 64, max_context: 262144, reserve_bytes: 3 << 30, mark_slots: 0,
+                    workspace: None, experts: Vec::new(), draft: Vec::new(), experts_half: Vec::new(),
+                    tp2_workspace: [0; 2], exchange_f32: false, expert_workspace: 0,
+                    first_routed: 0, requested_pool: Some(262144), onboard: Onboard::Layers(0),
+                    full_prefill_logits: 0, code_bytes: Vec::new(), context: None, attention: None,
+                };
+                let baseline = fixed_demands(&input).unwrap().0;
+                for format in [cuteafd_core::SparkReplyFormat::Bf16, cuteafd_core::SparkReplyFormat::Fp8,
+                    cuteafd_core::SparkReplyFormat::Nvfp4] {
+                    input.spark_reply_format = format;
+                    let fixed = fixed_demands(&input).unwrap().0;
+                    for rank in 0..gpus {
+                        let steps = |items: &[Demand]| items.iter().find(|d|
+                            d.gpu == rank as u8 && d.group == "steps").unwrap().bytes;
+                        assert_eq!(steps(&fixed) - steps(&baseline),
+                            0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn draft_probe_extent_matches_the_owner_local_ring() {
         let cfg = context_cfg();
         assert_eq!(draft_probe_bytes(&cfg, 64).unwrap(), 43 * 64 * 6 * 4);
@@ -389,7 +442,7 @@ mod default_tests {
                 assert_eq!(buffers.partial_row_bytes, heads as u64 / 2 * 1028);
                 assert_eq!(buffers.candidate_row_bytes, topk as u64 * 8);
                 assert_eq!(buffers.workspace_bytes, workspace.iter().map(|&(_, n)| n.max(256)).sum::<u64>());
-                assert_eq!(workspace.iter().filter(|&&(name, _)| name == "commit blocks").count(), 2);
+                assert_eq!(workspace.iter().filter(|&&(name, _)| name == "commit blocks").count(), 2 + crate::serving_capacity::V4_PACKED_MEMBERS);
                 assert!(workspace.iter().filter(|&&(name, _)| name == "commit blocks")
                     .all(|&(_, n)| n == 4 * 3 * 9 * 8));
                 let scratch_bytes: u64 = workspace.iter().filter(|&&(name, _)| name.starts_with("C4 scratch"))

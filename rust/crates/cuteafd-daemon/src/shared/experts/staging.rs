@@ -85,6 +85,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn step5_k32_prefill_unit_uses_wire_bytes_not_bf16() -> Result<()> {
+        let rows = 2752;
+        let wire = 4096 + 4096 / 32;
+        let unit = RouteStaging::new(rows, 8, wire)?;
+        assert_eq!(unit.bytes, 11_800_576);
+        assert_eq!(3 * unit.bytes, 35_401_728);
+        assert_eq!(RouteStaging::new(rows, 8, 4096 * 2)?.bytes, 22_720_512);
+        assert!(unit.bytes <= 11_998_816, "registered per-slot egress arena");
+        Ok(())
+    }
+
+    #[test]
     fn legacy_arena_offsets_copy_order_and_route_bits_are_unchanged() -> Result<()> {
         for (hidden, topk) in [(7168, 8), (6144, 8), (3584, 16)] {
             for rows in [1, 16, 4096] {

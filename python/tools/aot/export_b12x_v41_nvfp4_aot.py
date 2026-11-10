@@ -35,6 +35,7 @@ from pathlib import Path
 
 import _pinned_sparkinfer
 from expert_grouping import native_group_macros
+from mxfp4_layouts import native_export_capacities
 
 # role -> (experts, intermediate, topk, capability)
 ROLES = {
@@ -163,6 +164,8 @@ def export(
     manifest = {
         "schema": 1,
         "role": role,
+        "family": "v41",
+        "decode_capacities": [n for n in rows if n <= max(native_export_capacities("v41", role)[1])],
         "quant_mode": "nvfp4",
         "source_format": "modelopt_nvfp4",
         "input_format": "bf16",

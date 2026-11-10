@@ -13,8 +13,13 @@ use std::rc::Rc;
 pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>) -> Result<()> {
+    // `all` becomes the expert inventory's exact count inside admission; this
+    // load-time floor only asserts that one routed layer stays resident. The
+    // GPU expert tier replaces whole layers (it pins `--rtx-expert-layers`
+    // whole layers inside it), so it has no mandatory prefix.
     let minimum_expert_layers = match args.rtx_expert_layers {
-        admission::LocalLayers::Auto | admission::LocalLayers::ExpertsFirst => 1,
+        _ if args.gpu_expert_tier.enabled() => 0,
+        admission::LocalLayers::Auto | admission::LocalLayers::All => 1,
         admission::LocalLayers::Count(count) => {
             ensure!((1..=40).contains(&count), "dual RTX expert layers must be 1..=40");
             count as usize
@@ -39,17 +44,21 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     };
     memory_checkpoint("CUDA contexts and peer access")?;
     let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
+    cuteafd_bench::context::set_family(catalog.config().family_id());
     let topology = crate::shared::spark_topology::resolve(
         args.spark_tp,
         args.spark_ep,
         args.peers.len(),
         "serve-native",
     )?;
-    // Reject an explicit non-native checkpoint before any expert allocation,
-    // KV reservation or readiness publication.
-    let topology = crate::shared::spark_topology::for_checkpoint(
-        topology, args.peers.len(), catalog.exl3().is_some());
     let spark_world = crate::shared::spark_topology::world(topology, args.peers.len())?;
+    let tier_ask = admission::TierAsk::of(&args, &catalog)?;
+    if tier_ask.is_some() {
+        // Coordinator-owned routes ride the owned wire's owner field.
+        ensure!(topology.is_some(), "--gpu-expert-tier needs an owned Spark topology: pass --spark-tp and --spark-ep");
+        ensure!(catalog.nvfp4().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none(),
+            "the GPU expert tier holds native MXFP4 expert halves");
+    }
     crate::shared::spark_topology::require_world(spark_world, &catalog,
         &(catalog.routed_experts().first_layer..catalog.routed_experts().layers).collect::<Vec<_>>())?;
     lib.v41_compact_reducer()?.require_rank_count(spark_world.topology().world_size() as u32)?;
@@ -57,36 +66,26 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let started = Instant::now();
     // Sum resident storage plus the largest transient loading excess.
     let format = crate::families::deepseek_v41::v41_experts::ExpertFormat::of(&catalog);
-    let compressed = format.is_exl3();
-    let exl3_tiers: &[usize] = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
-    let exl3_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(&args.native_lib, exl3_tiers, "rtx-tp2");
-    if compressed {
-        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::exl3_device_bytes(&exl3_directory, capacity, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
-        tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "EXL3 TP2 expert workspace plan");
-    } else if format.is_nvfp4() {
-        let per_lane = crate::shared::experts::rtx::pair::OwnerPair::device_bytes(&lib, capacity, true, cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
-        tracing::info!(per_gpu_per_lane_bytes=per_lane, capacity, "NVFP4 W4A4 TP2 expert workspace plan");
-    }
-    let mut exl3_modules = [None, None];
+    // Two private decode lanes at decode width, and `slots` prefill slots on
+    // one shared storage set per GPU (PLAN "Prefill contract"). The prefill
+    // slots' TP2 FFN is one execution arena per GPU at the unit cap.
+    let prefill_shape = super::AdmittedPrefill::resolve(&args)?;
+    ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
+        prefill_shape.unit_cap);
+    let slots = prefill_shape.waves;
+    let decode_rows = super::DECODE_LANE_ROWS;
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
-        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some(),compressed)?;
-        if compressed {
-            exl3_modules[gpu as usize] = Some(admission::preload_exl3(&lib, &exl3_directory, capacity, 2)?);
-        }
+        admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
         Ok(())
     })?;
     memory_checkpoint("after native preload")?;
-    let [mut decode_modules, mut prefill_modules] = [0, 1].map(|_| [None, None]);
-    for (rank, modules) in exl3_modules.into_iter().enumerate() {
-        if let Some([decode, prefill]) = modules {
-            decode_modules[rank] = Some(decode);
-            prefill_modules[rank] = Some(prefill);
-        }
-    }
-    let mut lane_modules = [decode_modules, prefill_modules].into_iter();
     let expert_demands=admission::expert_demands(&lib,&catalog,capacity,2)?;
-    let weights = BackboneLaneWeights::load_distributed_with_split(
+    // Dense owners allocate exactly as through the mount; with coordinator push
+    // possible their bytes are recorded and arrive in the Spark push group.
+    let pushing = super::coordinator_push::wanted(&args, &catalog)?;
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(pushing)?;
+    let mut weights = BackboneLaneWeights::load_distributed_with_split(
         &lib,
         &catalog,
         map,
@@ -95,18 +94,21 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         args.tp2_query_projection,
         args.tp2_output_projection,
     )?;
+    // Each layer's router runs on its attention GPU (layers 0-19 on GPU0,
+    // 20-39 on GPU1), which counts it.
+    let census = super::route_census(&lib, &args, &[0, 1], &mut weights)?;
     let query_shards=if args.tp2_query_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::QueryB,rank,
-                Weights::load_peak_device_bytes(Kind::QueryB))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib,Kind::QueryB)?)).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     let output_shards=if args.tp2_output_projection {
         use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Weights};
         Some([0usize,1].map(|rank| (0..40).map(|layer|
             Weights::load(devices[rank],&catalog,layer,Kind::OutputB,rank,
-                Weights::load_peak_device_bytes(Kind::OutputB))).collect::<Result<Vec<_>>>())
+                Weights::load_peak_device_bytes(&lib,Kind::OutputB)?)).collect::<Result<Vec<_>>>())
             .into_iter().collect::<Result<Vec<_>>>()?)
     } else { None };
     memory_checkpoint("attention mHC router weights")?;
@@ -154,7 +156,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         )
     })?;
     memory_checkpoint("head normalization weights")?;
-    let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = [0, 1]
+    let mut shared_owned: [Vec<SharedWeights<'_>>; 2] = [0, 1]
         .map(|r| {
             (0..40)
                 .map(|l| {
@@ -166,19 +168,23 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                     )
                 })
                 .collect::<Result<Vec<_>>>()
-                .map(Rc::new)
+                
         })
         .into_iter()
         .collect::<Result<Vec<_>>>()?
         .try_into()
         .ok()
         .expect("two ranks");
+    let mut records = recorder.map(|r| r.finish());
     memory_checkpoint("weights")?;
     tracing::info!(capacity, backbone_lane_bytes=BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
         producer_bytes=?crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(&lib, map, capacity)?,
         "dual RTX per-lane workspace plan");
-    let make_pass = |decoder_capacity: u32| -> Result<DistributedTargetPass<'_, '_>> {
-        let mut lanes = [
+    // A decode lane: every owner private at decode width.
+    let make_pass = |capacity: u32| -> Result<DistributedTargetPass<'_, '_>> {
+        let decoder_capacity = capacity;
+        let d = super::DECODE_LANES_SCOPE;
+        let mut lanes = admission::scoped(d, "backbone", || Ok([
             BackboneLane::new_on_device(
                 &weights,
                 capacity,
@@ -191,7 +197,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 BackboneLane::placed_workspace_bytes_with_split(&lib, capacity,args.tp2_query_projection,args.tp2_output_projection)?,
                 1,
             )?,
-        ];
+        ]))?;
         if let Some(shards)=&query_shards {
             use crate::families::deepseek_v41::v41_projection_tp2::{Kind,Wave};
             for (owner,lane) in lanes.iter_mut().enumerate() {
@@ -208,7 +214,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                 tracing::info!(owner,capacity,per_gpu_bytes=?budgets,"TP2 output projection workspace");
             }
         }
-        let indices = [
+        let indices = admission::scoped(d, "index", || Ok([
             Some(IndexLane::new_on_device(
                 &iw,
                 capacity,
@@ -225,62 +231,140 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
                     .sum(),
                 1,
             )?),
-        ];
+        ]))?;
         DistributedTargetPass::new(
             map,
-            devices[0].own(|| {
+            admission::scoped(d, "embedding", || devices[0].own(|| {
                 TargetEmbeddingWave::new(
                     &lib,
                     &table,
                     capacity as usize,
                     TargetEmbeddingWave::device_bytes(capacity as usize)?,
                 )
-            })?,
+            }))?,
             lanes,
             indices,
-            DistributedExecution::new(
+            admission::scoped(d, "cache producers", || DistributedExecution::new(
                 &producers,
                 capacity,
                 crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerWaves::device_bytes(
                     &lib, map, capacity,
                 )?,
-            )?,
-            PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?)?,
-            DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
-                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?)?,
-            devices[1]
-                .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?))?,
+            ))?,
+            admission::scoped(d, "engram", || PlacedEngram::new(&ew, capacity as usize, PlacedEngram::device_bytes(&lib, map, capacity as usize)?))?,
+            admission::scoped(d, "target head", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]], cuteafd_core::V41_VERIFY_ROWS,
+                DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?))?,
+            admission::scoped(d, "target taps", || devices[1]
+                .own(|| TargetTapWave::new(&lib, decoder_capacity as usize, TargetTapWave::device_bytes(decoder_capacity as usize)?)))?,
             Duration::from_secs(120),
         )
     };
-    let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
-        args.attention_plan_rows)?;
-    let mut pass = make_pass(capacity).context("constructing first distributed target lane")?;
+    let attention_plan = super::attention_plan(&lib, 0, &args)?;
+    let mut pass = make_pass(decode_rows).context("constructing first distributed decode lane")?;
     if args.tp2_attention { pass.enable_dual_attention()?; }
-    memory_checkpoint("first target lane")?;
-    // Both lanes also produce source 20 from every encoder row on GPU1, so
-    // backbone/query and producer buffers retain full prefill capacity there.
-    // Only the first pass handles decoder replay and full cached continuation;
-    // lane 1's GPU1 index selection and taps serve at most 64 verify rows.
-    // TP2 expert workspaces remain full capacity on both GPUs and lanes.
-    let mut second = make_pass(80).context("constructing second distributed target lane")?;
+    let mut second = make_pass(decode_rows).context("constructing second distributed decode lane")?;
     if args.tp2_attention { second.enable_dual_attention()?; }
+    // Decode lanes only: prefill slots keep their copy-engine transfers.
+    let peer_push = crate::families::deepseek_v41::v41_peer_push::mode()?
+        == crate::families::deepseek_v41::v41_peer_push::Mode::Push;
+    tracing::info!(peer_push, "V4.1 dual decode transfers ({})", crate::families::deepseek_v41::v41_peer_push::MODE_ENV);
+    let busy_lanes = super::scheduler::busy_lanes::mode()?;
+    tracing::info!(?busy_lanes, "V4.1 busy decode lanes ({})", super::scheduler::busy_lanes::ENV);
+    if peer_push {
+        pass.enable_peer_push()?;
+        second.enable_peer_push()?;
+    }
+    memory_checkpoint("decode lanes")?;
+    // The prefill slots: one storage set per GPU (row planes at the reserve,
+    // scratch at the unit cap), each slot's host objects on it.
+    let reserve = prefill_shape.reserve_rows();
+    let prefill_reserve = reserve as u64;
+    let both = [0, 1];
+    let p = super::PREFILL_SLOTS_SCOPE;
+    let lane_storage = admission::scoped(p, "lane", || { let [a, b] = [0usize, 1].map(|gpu| devices[gpu].own(||
+        crate::families::deepseek_v41::v41_backbone_lane::LaneStorage::new(&weights, prefill_reserve as u32, capacity, &both)));
+        Ok([a?, b?]) })?;
+    let index_storage = admission::scoped(p, "index", || { let [a, b] = [0usize, 1].map(|gpu|
+        IndexLane::storage_on_device(&iw, prefill_reserve as u32, capacity, gpu, &both)); Ok([a?, b?]) })?;
+    let producer_storage = admission::scoped(p, "cache producers", ||
+        crate::families::deepseek_v41::v41_backbone_execution::PlacedProducerStorage::new(&lib, map, reserve, capacity as usize))?;
+    let embedding_storage = admission::scoped(p, "embedding", || devices[0].own(|| TargetEmbeddingWave::storage(&lib, reserve, capacity as usize)))?;
+    let engram_storage = admission::scoped(p, "engram", || PlacedEngram::storage(&ew, reserve, capacity as usize))?;
+    let tap_storage = admission::scoped(p, "target taps", || devices[1].own(|| TargetTapWave::storage(&lib, reserve, capacity as usize)))?;
+    use crate::families::deepseek_v41::v41_projection_tp2::{Kind, Storage as ProjectionStorage};
+    let projection_storage = |kind: Kind, enabled: bool| -> Result<Option<[Rc<ProjectionStorage<'_>>; 2]>> {
+        if !enabled { return Ok(None); }
+        Ok(Some([ProjectionStorage::new(devices, kind, capacity, 0)?, ProjectionStorage::new(devices, kind, capacity, 1)?]))
+    };
+    let query_storage = projection_storage(Kind::QueryB, args.tp2_query_projection)?;
+    let output_storage = projection_storage(Kind::OutputB, args.tp2_output_projection)?;
+    let dual_storage = if args.tp2_attention {
+        Some([crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionStorage::new(devices, capacity as usize)?,
+            crate::families::deepseek_v41::v41_sparse_attention::dual::DualAttentionStorage::new([devices[1], devices[0]], capacity as usize)?])
+    } else { None };
+    let mut slot_passes = (0..slots).map(|_| -> Result<_> {
+        let mut lanes = [BackboneLane::on_storage_on_device(&weights, lane_storage[0].get().clone())?,
+            BackboneLane::on_storage_on_device(&weights, lane_storage[1].get().clone())?];
+        for (owner, lane) in lanes.iter_mut().enumerate() {
+            let device = lane.device;
+            if let (Some(shards), Some(storage)) = (&query_shards, &query_storage) {
+                device.run(|| lane.get_mut().enable_tp2_query_on_storage([&shards[0], &shards[1]], storage[owner].clone()))?;
+            }
+            if let (Some(shards), Some(storage)) = (&output_shards, &output_storage) {
+                device.run(|| lane.get_mut().enable_tp2_output_on_storage([&shards[0], &shards[1]], storage[owner].clone()))?;
+            }
+            if let Some(storage) = &dual_storage {
+                device.run(|| lane.get_mut().enable_dual_attention_on_storage(storage[owner].clone()))?;
+            }
+        }
+        let indices = [Some(IndexLane::on_storage_on_device(&iw, index_storage[0].get().clone())?),
+            Some(IndexLane::on_storage_on_device(&iw, index_storage[1].get().clone())?)];
+        DistributedTargetPass::new(
+            map,
+            devices[0].own(|| TargetEmbeddingWave::on_storage(&lib, &table, embedding_storage.get().clone()))?,
+            lanes,
+            indices,
+            DistributedExecution::on_storage(&producers, &producer_storage)?,
+            PlacedEngram::on_storage(&ew, &engram_storage)?,
+            admission::scoped(p, "target heads", || DistributedTargetHead::new(devices, &hw, [&vocab[0], &vocab[1]],
+                cuteafd_core::V41_VERIFY_ROWS, DistributedTargetHead::device_bytes(cuteafd_core::V41_VERIFY_ROWS, 64640)?))?,
+            devices[1].own(|| TargetTapWave::on_storage(tap_storage.get().clone()))?,
+            Duration::from_secs(120),
+        )
+    }).collect::<Result<Vec<_>>>().context("constructing distributed prefill slots")?;
+    // The slots hold their components' storage; the set itself owns nothing
+    // more (WP7: a held LaneStorage would keep the replaced sparse arena alive).
+    drop((lane_storage, index_storage, producer_storage, embedding_storage, engram_storage, tap_storage,
+        query_storage, output_storage, dual_storage));
+    let packed_suffix = admission::scoped(p, "encoder suffix", ||
+        slot_passes[0].new_packed_storage(&lib, capacity as usize, args.concurrency as usize))?;
+    let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
+        .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
+    // Plan == runtime (WP6), unless the experimental TP2 attention/projections
+    // replace or add owners the planner does not model.
+    if !(args.tp2_attention || args.tp2_query_projection || args.tp2_output_projection) {
+        admission::verify_target_charges(&lib, &args.native_lib, &[0, 1], decode_rows, reserve as u64, capacity, slots,
+            args.concurrency)?;
+    }
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
-    memory_checkpoint("second target lane")?;
+    for slot in &mut slot_passes { slot.install_attention_plan(attention_plan)?; }
+    // L2 prefetch serves decode/verify steps only: the decode lanes.
+    if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
+        pass.enable_l2_prefetch(budget)?;
+        second.enable_l2_prefetch(budget)?;
+    }
+    memory_checkpoint("prefill slots")?;
     // dSpark is admitted before it exists (#65): plan every retained owner from
     // the native plans and AOT packages, sample with no draft allocation, solve
     // with the drafter as a shared Movable, then load with the admitted bytes.
     let draft_width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
-    let dspark_directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(
-        &args.native_lib, exl3_tiers, "dspark");
-    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
+    ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
+    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
             &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
-            Some(&dspark_directory), 64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
+            64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
     let mut vision = crate::families::deepseek_v41::v41_vision_encoder::Encoder::load(&args, &catalog)?;
@@ -290,27 +374,41 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("target snapshot arenas")?;
     // Every other persistent owner is now live. Reserve both transport lanes,
     // minimum routed weights, KV and setup headroom before filling extra layers.
-    let per_lane = match format {
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => {
-            tp2_ffn::Wave::exl3_device_bytes(&exl3_directory, &lib, capacity)?
-        }
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => {
-            tp2_ffn::Wave::nvfp4_device_bytes(&lib, capacity)?
-        }
-        crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => tp2_ffn::Wave::device_bytes(&lib, capacity)?,
-    };
+    // TP2 FFN arenas per GPU: the prefill slots' one shared arena (planes at
+    // the reserve, scratch at the unit) and each decode lane's own.
+    let ffn_bytes = |rows: u32, unit: u32| -> Result<usize> { match format {
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Exl3 => unreachable!("Flash EXL3 refused by the loader"),
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Nvfp4 => tp2_ffn::Storage::storage_bytes(&lib, rows, unit, true),
+        crate::families::deepseek_v41::v41_experts::ExpertFormat::Native => tp2_ffn::Storage::storage_bytes(&lib, rows, unit, false),
+    } };
+    let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
+    admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
+        slots, prefill_reserve, ffn_arenas as u64)?;
+    // Each TP2 FFN's GPU expert tier (both decode lanes', the prefill
+    // slots') adds its slot tables and slots on both GPUs (the planner's
+    // `tier_lane_bytes`); its routed pair and result plane are the FFN's own,
+    // already in `ffn_arenas`.
+    let routed_shape = catalog.routed_experts();
+    let lane_bytes = |rows: u32| cuteafd_loader::placement::families::deepseek_v41::tier_lane_bytes(
+        routed_shape.layers as u64, routed_shape.experts as u64, u64::from(rows));
+    let tier_lanes = if tier_ask.is_some() { 2 * lane_bytes(decode_rows) + lane_bytes(capacity) } else { 0 };
+    let expert_workspace = ffn_arenas as u64 + tier_lanes;
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
     let spark_ranks = args.peers.len();
-    let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
+    // Decode lanes' links at their own width (P3); the prefill link at the unit.
+    let wave_bytes = NativeTp4Wave::device_bytes_for(decode_rows, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, (2 * wave_bytes) as u64)?;
+        2, cuteafd_loader::placement::families::deepseek_v41::owners::transports_bytes(u64::from(decode_rows), u64::from(capacity), spark_ranks, slots, cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested(), false))?)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
-    let pool=admission::resolve_with_owners(&args,&memory,expert_demands,(2*per_lane) as u64,&[0; 2],
-        minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref())?;
+    // The plan's coordinator weight cap, over the loaded backbone and the
+    // drafter as the plan counts them.
+    let cap = admission::WeightCap::loaded(&args, &catalog, 2, memory[0].1, dspark_inventory.as_ref())?;
+    let pool=admission::resolve_tiered(&args,&memory,expert_demands,expert_workspace,&[0; 2],
+        minimum_expert_layers,&deferred,&draft_load,dspark_inventory.as_ref(),tier_ask.as_ref(),Some(&cap))?;
     // The loaders re-check the admitted load phase (their own conservative
     // peak is part of it); retained owners are the Movable's exact bytes.
     let draft_budgets = |gpu: usize| -> usize { draft_load.iter().filter(|d| usize::from(d.gpu) == gpu)
@@ -318,14 +416,116 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if args.dspark {
         ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
     }
-    let draft_weights = if args.dspark {
+    let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
+    let prepared_draft = if args.dspark && args.tp2_dspark_experts && records.is_some() {
+        Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::prepare_serving_tp2(
+            &lib, &catalog, args.concurrency, [draft_budgets(0), draft_budgets(1)], 16 << 20, draft_width))?)
+    } else { None };
+    let draft_expert_bytes = prepared_draft.as_ref().map_or(0, |draft| draft.expert_resident_bytes());
+    let mut draft_weights = if args.dspark && prepared_draft.is_none() {
         Some(if args.tp2_dspark_experts {
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
                 capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
-            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width, Some(&dspark_directory)))?})
+            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width))?})
     } else { None };
+    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
+    pass.bind_execution_plan(&pool.placement)?;
+    second.bind_execution_plan(&pool.placement)?;
+    for slot in &mut slot_passes { slot.bind_execution_plan(&pool.placement)?; }
+    let expert_layers=pool.placement.onboard_layers;
+    cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
+    // The routed arena's peak less its workspace: whole TP2 layers', or the
+    // GPU expert tier's (its resident halves plus one expert's staging).
+    let peak_bytes: [u64; 2] = match (&tier_ask, &pool.placement.expert_tier) {
+        (None, _) => pool.placement.tp2.context("dual RTX admission has no routed arena")?.peak_bytes,
+        (Some(_), Some(tier)) => tier.peak_bytes.as_slice().try_into().context("a two-GPU expert tier")?,
+        (Some(_), None) => anyhow::bail!("dual RTX admission has no GPU expert tier"),
+    };
+    let rank_budgets=std::array::from_fn(|gpu| peak_bytes[gpu].saturating_sub(expert_workspace) as usize);
+    tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
+        pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
+    // The tier's halves load (or, pushing, record for the push group with
+    // the dense owners) before the push is planned; the push or the mount
+    // fill then delivers them with those owners.
+    let tier_loaded = match (&tier_ask, &pool.placement.expert_tier) {
+        (Some(_), Some(placed)) => {
+            use crate::families::deepseek_v41::v41_experts::tier;
+            let residency = std::sync::Arc::new(tier::TierResidency::new(routed_shape.experts, placed.resident.clone())?);
+            let charged = tier::resident_bytes(&lib, &catalog, residency.resident())?;
+            ensure!((0..2).all(|gpu| charged[gpu] as u64 == placed.resident_bytes[gpu]),
+                "GPU expert tier halves: planned {:?} B per GPU, the loader allocates {charged:?} B", placed.resident_bytes);
+            let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
+            let loaded = tier::load_halves(devices, &catalog, residency.resident(), rank_budgets);
+            if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
+            tracing::info!(experts = residency.total(), layers = residency.resident_layers().len(),
+                resident_bytes = ?charged, pushing = records.is_some(), "GPU expert tier halves");
+            Some((residency, loaded?))
+        }
+        _ => None,
+    };
+    if tier_loaded.is_some() { memory_checkpoint("GPU expert tier halves")?; }
+    let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity,
+        topology)?;
+    // Coordinator ranks join only a pushing group, planned before membership:
+    // a planning error leaves them out (the Sparks still push).
+    let coordinator = crate::shared::experts::rtx::push::PushPolicy::for_snapshot(&args.snapshot)?.plan(|| {
+        ensure!(spark_plan.as_ref().is_some_and(|spark| spark.coordinator_pushes()),
+            "V4.1 Spark admission did not select required push");
+        let records = records.as_ref().context("V4.1 required dense push records")?;
+        super::coordinator_push::plan(&args.snapshot, &catalog, devices, records, expert_layers, rank_budgets, draft_expert_bytes,
+            args.peers.len())
+    })?;
+    let (coordinator, ranks) = match coordinator {
+        Some((planned, streams, ranks)) => (Some(planned), Some((streams, ranks))),
+        None => (None, None),
+    };
+    let spark_admission = spark_plan.map(|plan| plan.start_with(&args.peers, ranks)).transpose()?;
+    eprintln!("loading bottom {expert_layers} expert layers as TP2");
+    let pushed = match coordinator {
+        Some(planned) => planned.receive(devices, &catalog)?,
+        None => None,
+    };
+    if pushed.is_none() { if let Some(records) = &records { super::coordinator_push::fill(&lib, records)?; } }
+    // TP2 dSpark under push: its stages follow the backbone layers in the
+    // committed native arena; their views become the drafter's halves.
+    let pushed = if let Some(prepared) = prepared_draft {
+        let [left, right] = pushed.context("V4.1 TP2 dSpark requires committed push")?;
+        let mut weights = [left.native()?, right.native()?];
+        ensure!(weights.iter().all(|rank| rank.len() == expert_layers + 3), "mixed draft inventory differs from admission");
+        let stages = weights.each_mut().map(|rank| rank.split_off(expert_layers));
+        draft_weights = Some(devices[1].own(|| prepared.into_inner().install(stages))?);
+        Some(weights.map(crate::shared::experts::rtx::push::PushedExperts::Native))
+    } else { pushed };
+    // The GPU expert tier's halves are the routed weights of a tier layout
+    // (no whole TP2 layer), delivered with the dense owners above.
+    let tier_halves = tier_loaded.map(|(residency, halves)|
+        crate::families::deepseek_v41::v41_experts::tier::TierHalves::new(residency, halves, capacity as usize))
+        .transpose()?;
+    if let Some(halves) = &tier_halves {
+        use crate::families::deepseek_v41::v41_experts::tier::TierLane;
+        let lanes = (2 * TierLane::table_bytes(&halves.residency, decode_rows)
+            + TierLane::table_bytes(&halves.residency, capacity)) as u64;
+        ensure!(lanes == tier_lanes, "GPU expert tier lanes: planned {tier_lanes} B per GPU, allocate {lanes} B");
+    }
+    let routed = match (&tier_halves, pushed) {
+        (Some(halves), _) => halves.weights.clone(),
+        (None, Some(pushed)) if expert_layers > 0 => {
+            let [left, right] = pushed;
+            tp2_ffn::pushed_routed_weights(devices, &catalog, expert_layers, capacity, rank_budgets,
+                [left.native()?, right.native()?])?
+        }
+        _ => tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
+            rank_budgets)?,
+    };
+    drop(records);
+    // Every recorded scale pack ran (Done or mount fill): release raw scales.
+    for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
+    for shards in [&query_shards, &output_shards].into_iter().flatten() {
+        for weights in shards.iter().flatten() { weights.release_raw_scales(); }
+    }
+    if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
         // pre-load inventory used; any divergence is an accounting defect.
@@ -350,40 +550,60 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
     let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
     memory_checkpoint("draft runtime and marks")?;
-    pass.bind_execution_plan(&pool.placement)?;
-    second.bind_execution_plan(&pool.placement)?;
-    let expert_layers=pool.placement.onboard_layers;
-    let admitted=pool.placement.tp2.context("dual RTX admission has no routed arena")?;
-    let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
-    tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
-        pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
-    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && spark_world.supports_device_exchange()
-        && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
-        && expert_layers < 40;
-    let spark_admission = admission::start_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
-        topology, if device_exchange { 2 } else { 0 })?;
-    eprintln!("loading bottom {expert_layers} expert layers as TP2");
-    let routed = tp2_ffn::load_routed_weights(devices, &catalog, expert_layers, capacity,
-        rank_budgets, &exl3_directory)?;
+    let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
-    let mut make_transport = || {
-        let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
-        let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
-            NativeTp4Wave::new(&lib, roce, wave_bytes)
-        })?;
-        transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
-        if device_exchange {
-            // Verification waves (up to 80 rows) on the device-driven exchange.
-            devices[1].run(|| transport.get_mut().install_device_link(&args.peers, 80.min(capacity as usize), 39,
-                cuteafd_transport::TcpTransportConfig { timing, timeout: Duration::from_secs(120),
-                    max_frame_bytes: 64 << 20 }))?;
-        }
-        Ok::<_, anyhow::Error>(transport)
+    let lanes = crate::shared::serve::lanes::LaneSet::default();
+    let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
+    // The prefill slots' TP2 FFN: one execution arena per GPU at the unit cap,
+    // its planes at the reserve (WP7), every slot's wave on it.
+    let ffn_storage = match &tier_halves {
+        Some(halves) => tp2_ffn::Storage::tiered(halves, shared.clone(), prefill_reserve as u32, capacity)?,
+        None => tp2_ffn::Storage::new(routed.clone(), shared.clone(), expert_layers, prefill_reserve as u32,
+            capacity, [None, None])?,
     };
-    let mut transport = make_transport()?;
-    let mut second_transport = make_transport()?;
+    // Decode lanes own a link each at decode width; prefill slot 0 holds the
+    // one prefill link (endpoint after the lanes'), every slot's units send on it.
+    let mut decode_transport = |lane: usize| -> Result<_> {
+        let mut transport = devices[1].own(|| NativeTp4Wave::new(&lib, super::spark_transport(&args.peers, decode_rows,
+            timing, spark_world, u32::try_from(lane)?)?, wave_bytes))?;
+        let wave = match &tier_halves {
+            Some(halves) => tp2_ffn::Wave::tiered(halves, shared.clone(), decode_rows)?,
+            None => tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, decode_rows, [None, None])?,
+        };
+        if peer_push { wave.enable_peer_push(decode_rows as usize)?; }
+        transport.install_tp2(wave)?;
+        // Before the link's first request (bootstrap below).
+        if tier_halves.is_some() { devices[1].run(|| transport.get_mut().enable_tier())?; }
+        Ok(transport)
+    };
+    let [mut transport, mut second_transport] = lanes.try_map(|lane| decode_transport(lane.index()))?;
+    let mut prefill_link = Some(devices[1].own(|| crate::families::deepseek_v41::v41_experts::coordinator::V41Link::prefill(&lib,
+        super::spark_transport(&args.peers, capacity, timing, spark_world, 2)?, slots, capacity))?);
+    let slot_transports = (0..slots).map(|slot| -> Result<_> {
+        let mut transport = match slot {
+            0 => devices[1].own(|| NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?.into_inner()))?,
+            _ => devices[1].own(|| NativeTp4Wave::unlinked(&lib, capacity))?,
+        };
+        transport.install_tp2(tp2_ffn::Wave::on_storage(ffn_storage.clone()))?;
+        // Slot 0 holds the prefill link: its units leave the tier's experts
+        // to the slots' TP2 FFN (checked as a decode lane's), before bootstrap.
+        if slot == 0 && tier_halves.is_some() { devices[1].run(|| transport.get_mut().enable_tier())?; }
+        Ok(transport)
+    }).collect::<Result<Vec<_>>>()?;
+    drop(ffn_storage);
+    if expert_layers < 40 {
+        // The workers serve their layers: open the sessions and start each
+        // link's exchange worker (the first remote layer sizes the rings).
+        for transport in [&mut transport, &mut second_transport] {
+            devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
+        }
+    }
+    let mut prefill_slots = super::prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
+        slots: slot_passes.into_iter().zip(slot_transports).collect() };
+    if expert_layers < 40 {
+        let link = &mut prefill_slots.slots[0].1;
+        devices[1].run(|| link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
+    }
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second
@@ -396,30 +616,27 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         cache_bytes=?pool.cache_bytes,reservation_bytes=?pool.reservation_bytes,snapshot_slots,snapshot_bytes,
         rtx_expert_layers=expert_layers,"dual RTX cache reservation after fixed allocations");
     let cache_bytes: [usize;2]=pool.cache_bytes.clone().try_into().map_err(|_|anyhow::anyhow!("dual cache budgets"))?;
-    let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
-    let rows = capacity as usize;
-    let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&catalog, token_map, rows,
-        2 * cuteafd_core::ENGRAM_LAYERS.len(), rows * 64 * 1024,
-            cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
-    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
+    let pipeline = super::engram_pipeline(&lib, &catalog, &args, capacity as usize, slots)?;
     let mut requests = if args.tp2_attention {
         Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
+    for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }
     requests.use_engine_pages()?;
     memory_checkpoint("allocated KV cache")?;
-    crate::shared::memory_report::release_load_staging(&lib);
+    crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
-    scheduler::publish_capacity(&requests, &prefixes);
+    scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
     memory_checkpoint("ready")?;
     ready.take().context("startup readiness missing")?.send(Ok(vision.health_handle()))
         .map_err(|_| anyhow::anyhow!("API startup cancelled"))?;
     scheduler::serve(&lib, &args, &runtime, &mut receive, &mut pass, &mut second, &mut requests,
-        &mut transport, &mut second_transport, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes)
+        &mut transport, &mut second_transport, &mut prefill_slots, draft.as_mut().map(|d| d.get_mut()), &mut vision, stats, prefixes,
+        census.as_ref())
 }
 
 
@@ -446,7 +663,7 @@ mod tests {
         } else { "What is two plus two? Answer briefly.".into() };
         for text in [arithmetic.as_str(), "Write a Python function that adds two numbers.", arithmetic.as_str()] {
             let (events, output) = mpsc::unbounded_channel();
-            send.blocking_send(NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
+            send.blocking_send(NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: format!("<｜begin▁of▁sentence｜><｜User｜>{text}<｜Assistant｜></think>"),
                 constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 8, sampling: Default::default(), stop_token_ids: vec![cuteafd_api::openai::DEEPSEEK_EOS_TOKEN_ID], events, usage: None, probe: None })?;
             outputs.push(output);
         }

@@ -3,7 +3,7 @@
 use super::{normalization_lut, EncodeJob, EncoderService, EncoderTicket};
 use cuteafd_engine::media::{self, EncodeInput, EncodeOutput, EncoderClient, MediaError};
 use cuteafd_loader::media::ProcessorConfig;
-use std::{collections::VecDeque, sync::Arc, time::Instant};
+use std::{collections::VecDeque, sync::Arc};
 
 struct Pending {
     id: media::EncoderTicket,
@@ -12,7 +12,6 @@ struct Pending {
 struct Running {
     pending: Pending,
     ticket: EncoderTicket,
-    started: Instant,
 }
 pub struct LocalEncoder {
     service: EncoderService,
@@ -20,6 +19,8 @@ pub struct LocalEncoder {
     width: usize,
     max_tokens: usize,
     patch_size: usize,
+    /// A span-writing tower (Mistral's Pixtral) emits a marker row per merged row.
+    span_markers: bool,
     queue: VecDeque<Pending>,
     running: Option<Running>,
     next: u64,
@@ -27,6 +28,7 @@ pub struct LocalEncoder {
 impl LocalEncoder {
     pub fn new(service: EncoderService, config: &ProcessorConfig, width: usize, max_tokens: usize) -> Self {
         Self { service, lut: normalization_lut(config), width, max_tokens, patch_size: config.patch as usize,
+            span_markers: config.family == cuteafd_loader::media::ImageFamily::Mistral,
             queue: VecDeque::new(), running: None, next: 0 }
     }
     pub fn healthy(&self) -> bool { self.service.healthy() }
@@ -35,13 +37,15 @@ impl LocalEncoder {
         job.validate()?;
         if job.hidden_width != self.width { return Err(MediaError::Features); }
         let EncodeInput::Image { grid: [t, h, w], rgb8 } = &job.input else {
-            return if self.service.audio_ledger.is_some() { Ok(()) }
+            return if matches!(&job.input, EncodeInput::Audio { geometry, .. } if Some(*geometry) == self.service.audio_geometry())
+                && self.service.audio_ledger.is_some() { Ok(()) }
                 else { Err(MediaError::Encoder("audio encoder not loaded".into())) };
         };
         let (t, h, w) = (*t, *h, *w);
         let patches = (h as usize).checked_mul(w as usize).ok_or(MediaError::Features)?;
         if t != 1 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
-            || job.tokens != patches / 4 || job.tokens > self.max_tokens
+            || job.tokens != cuteafd_ffi::vision::output_rows([h as usize, w as usize], self.span_markers)
+            || job.tokens > self.max_tokens
             || job.hidden_width != self.width
             || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
                 .and_then(|bytes| patches.checked_mul(bytes)) != Some(rgb8.len()) {
@@ -63,17 +67,16 @@ impl EncoderClient for LocalEncoder {
     fn poll(&mut self, id: media::EncoderTicket) -> Option<Result<EncodeOutput, MediaError>> {
         if self.running.is_none() {
             let pending = self.queue.pop_front()?;
-            let started = Instant::now();
             let output = vec![0; pending.job.tokens * self.width];
             let submitted = match &pending.job.input {
                 EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
                     rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
                     lut: self.lut.clone(), output }),
-                EncodeInput::Audio { pcm } => self.service.submit_audio(super::audio::AudioEncodeJob {
-                    pcm: pcm.clone(), fp32_scratch: vec![0.0; output.len()], output }),
+                EncodeInput::Audio { pcm, .. } => self.service.submit_audio(super::audio::AudioEncodeJob {
+                    pcm: pcm.clone(), fp32_scratch: if self.service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; output.len()] } else { Vec::new() }, output }),
             };
             match submitted {
-                Ok(ticket) => self.running = Some(Running { pending, ticket, started }),
+                Ok(ticket) => self.running = Some(Running { pending, ticket }),
                 Err(super::VisionError::QueueFull) => {
                     // Cancelled work still drains on the owner. Backpressure is not a failed encode.
                     self.queue.push_front(pending);
@@ -101,7 +104,7 @@ impl EncoderClient for LocalEncoder {
         Some(result.map(|output| EncodeOutput {
             key: running.pending.job.key,
             features: output.into_iter().flat_map(u16::to_le_bytes).collect::<Vec<_>>().into(),
-            elapsed_ms: running.started.elapsed().as_secs_f64() * 1000.0,
+            elapsed_ms: running.ticket.encode_ms(),
         }))
     }
     fn cancel(&mut self, id: media::EncoderTicket) {
@@ -116,15 +119,59 @@ impl EncoderClient for LocalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
     use cuteafd_core::ImageKey;
     use std::sync::{atomic::Ordering, mpsc};
+
+    #[test]
+    fn pcm_audio_uses_shared_owner_without_fp32_scratch() {
+        use cuteafd_core::media::AudioTokenGeometry;
+        let geometry = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
+        let owner = std::thread::spawn(move || {
+            while let Ok(work) = jobs.recv() {
+                let super::super::EncoderJob::Audio(mut job) = work.job else {
+                    panic!("expected PCM job");
+                };
+                assert!(job.fp32_scratch.is_empty());
+                assert_eq!(job.output.len(), job.pcm.len().div_ceil(1920) * 8192);
+                job.output.fill(0x3f80);
+                work.encode_ns.store(1_250_000, Ordering::Release);
+                let _ = work.reply.send(Ok(job.output));
+            }
+        });
+        let service = EncoderService {
+            queue: Some(queue), owner: Some(owner), ledger: Default::default(),
+            audio_ledger: Some(Default::default()), audio_geometry: Some(geometry),
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
+        let mut encoder = LocalEncoder::new(service, &config, 8192, 256);
+        let wrong = media::EncodeJob::audio(media::AudioKey([0; 32]), vec![0.0; 1921].into(), 1, 8192);
+        assert!(encoder.submit(wrong).is_err());
+        let job = media::EncodeJob::audio_with_geometry(media::AudioKey([1; 32]),
+            vec![0.0; 1921].into(), 2, 8192, geometry);
+        let id = encoder.submit(job).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(output) = encoder.poll(id) {
+                let output = output.unwrap();
+                assert_eq!(output.elapsed_ms, 1.25, "must use native owner timing, not poll latency");
+                assert_eq!(output.features.len(), 2 * 8192 * 2);
+                assert!(output.features.chunks_exact(2).all(|v| v == [0x80, 0x3f]));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
 
     #[test]
     fn rgb_extent_uses_the_processor_patch_size() {
         use cuteafd_loader::media::ImageFamily;
         for family in [ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
             let (queue, _jobs) = mpsc::sync_channel::<super::super::Work>(2);
-            let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None,
+            let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, audio_geometry: None,
                 healthy: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
             let config = ProcessorConfig::for_family(family);
             let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -144,7 +191,7 @@ mod tests {
         let owner_health = health.clone();
         let owner = std::thread::spawn(move || { let _health = super::super::OwnerHealth(owner_health); });
         owner.join().unwrap();
-        let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, healthy: health };
+        let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: health };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::new(service, &config, 2, 256);
         assert!(!encoder.healthy());
@@ -163,7 +210,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         for n in 0..2 {
@@ -197,7 +244,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         let mut ids = (0..64u8).map(|i| encoder.submit(media::EncodeJob::image(ImageKey([i; 32]), [1, 2, 2], vec![i; 3072].into(), 1, 2)).unwrap()).collect::<Vec<_>>();

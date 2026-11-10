@@ -15,8 +15,28 @@ mod families {
 mod shared {
     pub(crate) mod decode_graph;
     pub(crate) mod fp8_linear;
+    pub(crate) mod fp8_load_quant;
     pub(crate) mod memory;
+    pub(crate) mod packed_head;
     pub(crate) mod target_head;
+    pub(crate) mod experts {
+        pub(crate) mod layer;
+        pub(crate) mod paired_load;
+        pub(crate) mod rtx {
+            pub(crate) mod dense;
+            // The query fixture has no push receiver, only dense plan records.
+            pub(crate) mod push {
+                pub(crate) struct DensePlan {
+                    pub base: u64,
+                    pub host_bytes: u64,
+                    pub host_staging: super::dense::HostStaging,
+                    pub peer_copies: Vec<super::dense::PeerCopy>,
+                    pub append: Box<dyn Fn(&mut cuteafd_loader::push_load::builder::Builder,
+                        u32, u64) -> anyhow::Result<()> + Send>,
+                }
+            }
+        }
+    }
 }
 use families::deepseek_v41::{v41_attention_query, v41_hc, v41_tensors};
 use anyhow::{ensure, Result};

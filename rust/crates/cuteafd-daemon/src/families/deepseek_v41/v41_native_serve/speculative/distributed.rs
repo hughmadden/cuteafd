@@ -11,14 +11,14 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     pub fn with_distributed_requests(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, shards: [&'w VocabularyShard<'a>; 2],
         capacity: u32, requests: u32) -> Result<DeviceOwner<'a, Self>> {
-        ensure!((1..=16).contains(&requests), "invalid draft request limit");
+        ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
         devices[1].own(|| {
             let lib = devices[1].library;
             let lane_count = if requests == 1 { 1 } else { 2 };
             let lane_requests = requests.div_ceil(lane_count as u32);
             let lane_bytes = DistributedDsparkChain::device_bytes(weights, lane_requests, shards[0].tokens().end)?;
             let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
-            if lane_count > 1 { mains.push(weights.main_context(80, DsparkMainContext::device_bytes(lib, 80)?)?); }
+            if lane_count > 1 { mains.push(weights.main_context(cuteafd_core::V41_VERIFY_ROWS as u32, DsparkMainContext::device_bytes(lib, cuteafd_core::V41_VERIFY_ROWS as u32)?)?); }
             let chains = (0..lane_count).map(|_| DistributedDsparkChain::new(devices, weights, table,
                 shards, lane_requests, lane_bytes)).collect::<Result<Vec<_>>>()?;
             let window = || DsparkWindow::new(lib, requests as usize, capacity,
@@ -71,9 +71,8 @@ mod tests {
         let shards = [devices[0].own(|| VocabularyShard::load(&lib, &catalog, 0..64640, 1 << 30, 16 << 20))?,
             devices[1].own(|| VocabularyShard::load(&lib, &catalog, 64640..129280, 1 << 30, 16 << 20))?];
         let full = devices[1].own(|| VocabularyHead::load(&lib, &catalog, 2 << 30, 16 << 20))?;
-        let exl3_directory = std::env::var_os("CUTEAFD_EXL3_AOT").map(std::path::PathBuf::from);
         let weights = devices[1].own(|| DsparkWeights::load_serving_with_width(&lib, &catalog,
-            80, 16, 32usize << 30, 16 << 20, 5, exl3_directory.as_deref()))?;
+            80, 16, 32usize << 30, 16 << 20, 5))?;
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
             [&shards[0], &shards[1]], 80, 16)?;
         let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;

@@ -59,9 +59,19 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let (first, last) = step5_routed(text_config(config))?;
             ("step5", first, Some(last))
         }
+        "mistral_large4" => {
+            let cfg = crate::families::mistral_large4::Ml4Config::from_hf(config)?;
+            // The bundled mtp_dspark drafter is dense: Sparks serve backbone layers only.
+            ("mistral_large4", cfg.first_moe_layer, Some(cfg.layers - 1))
+        }
         "kimi_k3" => {
             let (first, last) = kimi_routed(text_config(config))?;
             ("kimi_k3", first, Some(last))
+        }
+        // Every Muse decoder layer is a MoE (`mlp_layer_types` all sparse).
+        "muse_spark" => {
+            let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
+            ("muse_spark", 0, Some(cfg.layers - 1))
         }
         other => bail!("unsupported model_type {other:?}"),
     };

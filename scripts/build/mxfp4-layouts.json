@@ -1,0 +1,403 @@
+{
+  "schema": 1,
+  "decode_capacities": [1, 16, 80],
+  "prefill_capacities": [256, 1024, 4096],
+  "stream_prefill": [
+    {
+      "sm": 120,
+      "min_work": null
+    },
+    {
+      "sm": 121,
+      "min_work": 24576,
+      "source": "#1000 realistic GB10 work crossover; #1010 kakapo random E384/top6 screen excludes V4.1 (5120,768,121) at default 2752@4096: 0.98403x beyond 0.1000% control spread; I576 1.05912x and I1152 1.08513x pass"
+    }
+  ],
+  "atomic_slices": [
+    {
+      "hidden": 7168,
+      "min_capacity": 256
+    }
+  ],
+  "storage_holds": [],
+  "native_slices": [
+    {
+      "hidden": 5120,
+      "width": 384,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "fc1_k_splits": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "source": "PR217 GB10 legacy192/split1 to legacy128/split2: 1.36/1.29/1.28x; TP6 standard-v2 fidelity passed; PR219 ordered STREAM prefill"
+    },
+    {
+      "hidden": 5120,
+      "width": 288,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; strict F32 and invariants"
+    },
+    {
+      "hidden": 5120,
+      "width": 352,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; padded-matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 320,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 448,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 576,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        64,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 288,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 320,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 352,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        32,
+        32,
+        32
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 416,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 672,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 704,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 7168,
+      "width": 416,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 7168,
+      "width": 448,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 7168,
+      "width": 608,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 384,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 512,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 1024,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 1152,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 7168,
+      "width": 768,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    },
+    {
+      "hidden": 7168,
+      "width": 1024,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    },
+    {
+      "hidden": 7168,
+      "width": 1536,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "prefill": [
+        256,
+        1024,
+        4096
+      ],
+      "source": "#994 equal widths; realistic GB10 per-expert work crossover from #1000"
+    }
+  ],
+  "ownership": [
+    {
+      "intermediate": 2304,
+      "world": 5,
+      "unit": 64,
+      "source": "#928 GB10 composed barrier blend: 1.013/0.999/1.000 at C1/16/80; K32 C80 loses"
+    }
+  ],
+  "generic_storage_holds": []
+}

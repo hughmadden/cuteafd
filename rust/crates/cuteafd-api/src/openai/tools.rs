@@ -40,6 +40,13 @@ pub(super) enum ToolSyntax {
     /// Qwen3-Coder `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n</function>\n</tool_call>`
     /// (XGrammar's `qwen_xml` style, as its `qwen_3_5` structural tag).
     QwenXml,
+    /// Kimi XTML; assisted decoding uses its native JSON-object call form.
+    KimiXtml,
+    /// Muse `<atem:function_calls>` in a tool-addressed message
+    /// (`muse_tool_schema`, the project's native atem parameter grammar).
+    MuseAtem,
+    /// Mistral `[TOOL_CALLS]NAME[ARGS]{json}`, calls back to back.
+    MistralCalls,
 }
 
 pub(super) struct ToolConstraints {
@@ -51,6 +58,18 @@ pub(super) struct ToolConstraints {
     pub triggered: Option<Value>,
     parallel: bool,
     validators: BTreeMap<String, Option<jsonschema::JSONSchema>>,
+}
+
+/// The template's `esc_header`: a recipient name as the header prints it.
+pub(super) fn muse_header(name: &str) -> String {
+    name.replace("<|", "< |").replace("<image>", "< image>").replace("<video>", "< video>")
+        .replace("<audio>", "< audio>").replace(['\r', '\n'], " ")
+}
+
+/// The template's `esc_attr`: a name as the invoke attribute prints it.
+pub(super) fn muse_attribute(name: &str) -> String {
+    muse_header(name).replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&#39;")
+        .replace('<', "&lt;").replace('>', "&gt;")
 }
 
 impl ToolConstraints {
@@ -69,6 +88,14 @@ impl ToolConstraints {
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
             tags.push(match syntax {
+                ToolSyntax::KimiXtml => json!({"type":"tag",
+                    "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
+                    "content":{"type":"sequence", "elements":[
+                        {"type":"regex", "pattern":"[1-9][0-9]*"},
+                        {"type":"const_string", "value":"\"<|sep|><|open|>json type=\"object\"<|sep|>"},
+                        {"type":"ds41_json_schema", "strict":strict, "json_schema":schema},
+                        {"type":"const_string", "value":"<|close|>json<|sep|>"}]},
+                    "end":"<|close|>call<|sep|>"}),
                 ToolSyntax::Dsml => json!({"type":"tag", "begin":format!("<｜DSML｜ invoke name=\"{}\">", tool.name),
                     "content":{"type":"ds41_tool_schema", "strict":strict, "json_schema":schema},
                     "end":"</｜DSML｜ invoke>"}),
@@ -82,15 +109,39 @@ impl ToolConstraints {
                         "content":{"type":"json_schema", "json_schema":schema, "style":"glm_xml", "any_order":false},
                         "end":"</tool_call>"})
                 }
+                // The JSON object closes the call: the next call, or the end of the turn, follows it.
+                ToolSyntax::MistralCalls => json!({"type":"tag", "begin":format!("[TOOL_CALLS]{}[ARGS]", tool.name),
+                    "content":{"type":"ds41_json_schema", "strict":strict, "json_schema":schema}, "end":""}),
                 ToolSyntax::QwenXml => json!({"type":"tag", "begin":format!("<tool_call>\n<function={}>\n", tool.name),
                     "content":{"type":"json_schema", "json_schema":schema, "style":"qwen_xml", "any_order":false},
                     "end":"\n</function>\n</tool_call>"}),
+                // One tool message (the template's render_atem), opened after `<|start|>assistant`.
+                ToolSyntax::MuseAtem => json!({"type":"tag",
+                    "begin":format!(" to={}<|message|><atem:function_calls>\n<atem:invoke name=\"{}\">\n",
+                        muse_header(&tool.name), muse_attribute(&tool.name)),
+                    "content":{"type":"muse_tool_schema", "strict":strict, "json_schema":schema},
+                    "end":"\n</atem:invoke>\n</atem:function_calls>"}),
             });
         }
         if !(assistance || strict_requested || required) {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            // Parallel calls are consecutive tool messages; the response
+            // composition (`muse_response_constraint`) owns the optional branch.
+            ToolSyntax::MuseAtem => {
+                let calls = json!({"type":"tags_with_separator", "tags":tags, "separator":"<|eom|><|start|>assistant",
+                    "at_least_one":true, "stop_after_first":!parallel});
+                (calls.clone(), calls)
+            }
+            ToolSyntax::KimiXtml => {
+                let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
+                    "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
+                        "at_least_one":true, "stop_after_first":!parallel},
+                    "end":"<|close|>tools<|sep|>"});
+                // XTML response composition owns the optional/required branch.
+                (calls.clone(), calls)
+            }
             ToolSyntax::Dsml => {
                 let calls = json!({"type":"tag",
                     "begin":"<｜DSML｜ calls>",
@@ -107,6 +158,12 @@ impl ToolConstraints {
                 json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
                     "stop_after_first":!parallel}),
                 json!({"type":"triggered_tags", "triggers":["<tool_call>"], "tags":tags, "at_least_one":false,
+                    "stop_after_first":!parallel}),
+            ),
+            ToolSyntax::MistralCalls => (
+                json!({"type":"tags_with_separator", "tags":tags, "separator":"", "at_least_one":true,
+                    "stop_after_first":!parallel}),
+                json!({"type":"triggered_tags", "triggers":["[TOOL_CALLS]"], "tags":tags, "at_least_one":false,
                     "stop_after_first":!parallel}),
             ),
             ToolSyntax::QwenXml => (
@@ -183,7 +240,7 @@ impl CompletionValidator {
 
 // serde_json::Value normally keeps the last duplicate property. Reject duplicates
 // recursively, including escaped aliases, before validating argument schemas.
-fn unique_json(text: &str) -> Result<Value> {
+pub(super) fn unique_json(text: &str) -> Result<Value> {
     use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
     struct Unique(Value);
     struct UniqueVisitor;

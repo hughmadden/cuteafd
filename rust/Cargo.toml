@@ -36,6 +36,7 @@ rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+signal-hook = "0.3"
 tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
@@ -45,3 +46,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.test.package.cuteafd-loader]
+opt-level = 2

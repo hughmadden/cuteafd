@@ -12,8 +12,8 @@ pub const GRAPH_MARGIN_PERCENT: u64 = 20;
 pub const GRAPH_RANK_MARGIN_BYTES: u64 = 64 << 20;
 // WP9 SM120 measurements; retained until a selected-program ledger separates cuBLAS ownership.
 pub const WORKSPACE_RUNTIME_OVERHEAD_BYTES: u64 = 72 << 20;
-pub fn workspace_runtime_overhead(lanes: usize, drafter: bool) -> u64 {
-    WORKSPACE_RUNTIME_OVERHEAD_BYTES * (1 + lanes + usize::from(drafter)) as u64
+pub fn workspace_runtime_overhead(_waves: usize, drafter: bool) -> u64 {
+    WORKSPACE_RUNTIME_OVERHEAD_BYTES * (2 + usize::from(drafter)) as u64
 }
 
 pub fn verify_budget(decode_rows: usize, sms: usize) -> usize {

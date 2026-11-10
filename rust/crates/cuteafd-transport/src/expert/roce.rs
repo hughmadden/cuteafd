@@ -7,8 +7,45 @@ use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
     TcpTransportConfig, VerbsHostProtocolV2ResponsePayload,
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// When a receive loop that has not yet seen its responses hands the executor to
+/// other lanes. A zero quantum (decode) yields on every empty poll and never reads
+/// the clock; a nonzero one spins and reads the clock only once per
+/// [`PollBackoff::SPINS`] polls, since a clock read costs as much as a poll.
+struct PollBackoff {
+    quantum: std::time::Duration,
+    /// Set once the first wait has yielded; the quantum's start (unused at zero).
+    since: Option<std::time::Instant>,
+    spins: u32,
+}
+
+impl PollBackoff {
+    const SPINS: u32 = 64;
+
+    fn new(quantum: std::time::Duration) -> Self { Self { quantum, since: None, spins: 0 } }
+
+    /// After an empty poll: whether to yield now (the first wait always does).
+    fn yield_now(&mut self) -> bool {
+        let Some(since) = self.since else { return true };
+        if self.quantum.is_zero() { return true; }
+        self.spins += 1;
+        if self.spins < Self::SPINS { return false; }
+        self.spins = 0;
+        since.elapsed() >= self.quantum
+    }
+
+    /// The executor came back: restart the quantum. A zero quantum never reads the clock.
+    fn yielded(&mut self) {
+        self.spins = 0;
+        if self.since.is_none() || !self.quantum.is_zero() {
+            self.since = Some(std::time::Instant::now());
+        }
+    }
+}
 
 fn poll_quantum(rows: &[ExpertProtocolV2RowDescriptor]) -> std::time::Duration {
     let decode = !rows.is_empty()
@@ -27,8 +64,12 @@ pub struct SparkExperts {
     capacity: u32,
     max_frame_bytes: usize,
     world: SparkWorld,
-    /// A [`SparkExpertWave`] was dispatched and not yet received.
-    wave_open: bool,
+    /// [`SparkExpertWave`]s dispatched and not yet received, oldest first by
+    /// sequence; at most the clients' admitted wave count.
+    open_waves: VecDeque<u64>,
+    wave_sequence: u64,
+    /// Detached receivers must be dropped before cancelled queues can be reset.
+    wave_tickets: Arc<()>,
     /// The opt-in route log (`PROFILE=expert-routes`); `None` when off.
     route_tap: Option<crate::route_log::Tap>,
 }
@@ -41,6 +82,8 @@ pub struct SparkExperts {
 pub struct SparkExpertWave {
     receiver: V41Tp4ChunkReceiver,
     poll_quantum: std::time::Duration,
+    sequence: u64,
+    _ticket: Arc<()>,
 }
 
 /// How a received wave's rank planes arrived.
@@ -49,20 +92,26 @@ pub struct WaveReceipt {
     /// Bit r: rank r's whole plane landed in its device range (GPU landing);
     /// the sink saw none of its rows. Other ranks' rows all went to the sink.
     pub landed: u8,
+    /// Per rank: the worker's measured (busy µs, idle µs) for this unit on
+    /// its prefill owner, from the reply header (#762); None for decode
+    /// owners and for workers that report none.
+    pub pace: [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD],
 }
 
 impl SparkExperts {
-    /// Rank identity and request encoding are declared before connecting.
+    /// Rank identity, request encoding and decode execution lane are fixed
+    /// before connecting. Prefill requests always use the singleton owner.
     pub fn new_world(
         world: SparkWorld,
         peers: &[SocketAddr],
         capacity: u32,
         config: TcpTransportConfig,
+        execution_lane: u32,
     ) -> Result<Self> {
         ensure!(peers.len() == world.topology().world_size(),
             "Spark world requires exactly its physical rank count");
         let executors = world.topology().executor_ids();
-        let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone());
+        let clients = LocalTp4Client::new_ranks(peers.to_vec(), config.clone(), execution_lane);
         Self::with_clients(peers, &executors, capacity, &config, clients, world)
     }
 
@@ -74,8 +123,8 @@ impl SparkExperts {
         mut clients: LocalTp4Client,
         world: SparkWorld,
     ) -> Result<Self> {
-        ensure!(peers.len() == executors.len() && (1..=6).contains(&peers.len()),
-            "native TP/EP requires 1..=6 matching peers and executors");
+        ensure!(peers.len() == executors.len() && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&peers.len()),
+            "native TP/EP requires 1..=8 matching peers and executors");
         if let Some(topology) = world.ownership_topology() {
             ensure!(
                 peers.len() == topology.world_size(),
@@ -108,16 +157,45 @@ impl SparkExperts {
             capacity,
             max_frame_bytes: config.max_frame_bytes,
             world,
-            wave_open: false,
+            open_waves: VecDeque::new(),
+            wave_sequence: 0,
+            wave_tickets: Arc::new(()),
             route_tap: crate::route_log::Tap::from_global(),
         })
     }
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
+    /// Decode/MTP owner identity, fixed at construction and kept on reconnect.
+    pub fn execution_lane(&self) -> u32 { self.clients.execution_lane() }
+    /// The RDMA device, port and source GID that reach this transport's first
+    /// rank: the RoCE v2 GID of the address the kernel routes it from, as its
+    /// control connection binds. Probes that run beside the transport (GPU
+    /// landing) use it instead of any device or GID table order.
+    pub fn rdma_route(&self) -> Result<crate::fabric::RdmaSelection> {
+        let peer = *self.clients.peers().first().context("Spark transport has no ranks")?;
+        crate::fabric::select_rdma_route(&crate::fabric::discover()?.ports, peer)
+    }
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }
+    /// Bind this transport to one immutable ModelAdmission endpoint on every
+    /// rank before bootstrap or dispatch. Reconnect retains the same identity;
+    /// missing, incompatible or busy endpoints fail without automatic fallback.
+    pub fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
+        ensure!(self.open_waves.is_empty(), "cannot bind endpoint with waves in flight");
+        self.clients.bind_model_endpoint(endpoint)
+    }
+    /// Admit up to `waves` outstanding [`SparkExpertWave`]s, received oldest
+    /// first. The workers already serve each QP's requests in post order.
+    pub fn set_max_waves(&mut self, waves: usize) -> Result<()> {
+        ensure!(self.open_waves.is_empty(), "cannot change wave admission with waves in flight");
+        self.clients.set_max_waves(waves)
+    }
+    pub fn max_waves(&self) -> usize { self.clients.max_waves() }
+    /// The response deadline every wave is held to.
+    pub fn timeout(&self) -> std::time::Duration { self.clients.timeout() }
+    pub fn open_waves(&self) -> usize { self.open_waves.len() }
     /// Immutable metadata returned by the workers' completed persistent bootstrap.
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
         self.clients.installed_grouping()
@@ -132,7 +210,7 @@ impl SparkExperts {
     /// transport will dispatch — the same one its start-up warm-up sends. Only
     /// the control bootstrap reaches a worker; the rows are never sent.
     pub fn bootstrap(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        ensure!(!self.wave_open, "cannot bootstrap a Spark transport with a wave in flight");
+        ensure!(self.open_waves.is_empty(), "cannot bootstrap a Spark transport with a wave in flight");
         ensure!(request.header.row_count <= self.capacity,
             "Spark bootstrap request of {} rows exceeds the transport's {}-row capacity",
             request.header.row_count, self.capacity);
@@ -143,10 +221,29 @@ impl SparkExperts {
     pub fn ownership_topology(&self) -> Option<SparkTopology> {
         self.world.ownership_topology()
     }
-    /// Reset persistent QPs before a new admission. Pending dispatches borrow this
-    /// owner exclusively, so an in-flight wave cannot be reset through this API.
+    /// Reset persistent QPs. Detached wave queue entries are retained; reusable
+    /// intake owners use `reset_drained` after dropping every detached ticket.
     pub fn reset_connections(&mut self) {
         self.clients.reset();
+    }
+
+    /// Checks that cancelled detached waves no longer have live receivers.
+    /// Terminal-owned transports require terminal quiescence/release, not reuse.
+    pub fn require_drained_reset(&self) -> Result<()> {
+        ensure!(Arc::strong_count(&self.wave_tickets) == 1,
+            "cannot reset a Spark transport with outstanding wave tickets");
+        ensure!(!self.terminal_owned(), "terminal-owned Spark transport cannot be reset for reuse");
+        Ok(())
+    }
+
+    /// Reset after all CPU/GPU consumers have drained. Dropped unread waves may
+    /// leave queue entries, but a live ticket makes this a non-mutating error.
+    pub fn reset_drained(&mut self) -> Result<()> {
+        self.require_drained_reset()?;
+        self.clients.reset();
+        self.open_waves.clear();
+        self.wave_sequence = 0;
+        Ok(())
     }
 
     /// Opt-in owner contract for a terminal engine. Error paths retain pending
@@ -183,48 +280,8 @@ impl SparkExperts {
             }
             None => vec![None; world],
         };
-        self.wave_open = false;
+        self.open_waves.clear();
         self.clients.set_landing(landing)
-    }
-
-    /// Write mode from the next connection on (`None` restores receives):
-    /// rank r's responses are RDMA-written into `targets[r]` and flagged
-    /// there; [`Self::post_written`] posts a wave and returns.
-    ///
-    /// # Safety
-    /// Every target range stays allocated until this transport is dropped or
-    /// its targets are replaced; the planes are written from each post until
-    /// the rank's flag shows its request id.
-    pub unsafe fn set_write_targets(&mut self, targets: Option<Vec<crate::DeviceWriteTarget>>) -> Result<()> {
-        let world = self.world_size();
-        let write = match targets {
-            Some(targets) => {
-                ensure!(targets.len() == world, "write mode needs one target per rank");
-                targets.into_iter().map(Some).collect()
-            }
-            None => vec![None; world],
-        };
-        self.wave_open = false;
-        self.clients.set_write_targets(write)
-    }
-
-    /// Write mode: posts `request` to every rank without waiting for anything.
-    pub fn post_written(&mut self, request: &ExpertProtocolV2Request) -> Result<()> {
-        if std::mem::take(&mut self.wave_open) {
-            self.reset_connections();
-        }
-        ensure!((request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0)
-                == self.world.ownership_topology().is_some(),
-            "Spark request ownership flag differs from its declared wire");
-        crate::health::ensure_available()?;
-        let result = self.clients.post_written(request);
-        if let Err(error) = &result { crate::health::record_failure(format!("expert write failed: {error:#}")); }
-        if result.is_err() {
-            self.reset_connections();
-        } else if let Some(tap) = &mut self.route_tap {
-            tap.record(request, self.executors.len());
-        }
-        result
     }
 
     /// Zero-copy request egress: allocates a pinned, device-mapped buffer of
@@ -232,11 +289,9 @@ impl SparkExperts {
     /// on). Requests whose hidden payload comes from [`Self::egress_payload`]
     /// are sent without copying it into each rank's send ring. Returns the
     /// buffer, for the engine's D2H target.
-    /// `stagger`: post the ranks' requests one after another, each once the
-    /// previous rank's has left, instead of all at once.
-    pub fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
-        self.wave_open = false;
-        self.clients.enable_egress(bytes, stagger)
+    pub fn enable_egress(&mut self, bytes: usize) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
+        self.open_waves.clear();
+        self.clients.enable_egress(bytes)
     }
 
     /// The egress buffer to write the next wave's payload into: fails unless
@@ -254,6 +309,12 @@ impl SparkExperts {
     /// (connections open on the first dispatch after a reset).
     pub fn gpu_landing_ranks(&self) -> Vec<bool> {
         self.clients.landing_ranks()
+    }
+
+    /// Per rank: reply frames its session can leave with a consumer at once
+    /// (the receive ring depth; 0 when replies are copied out instead).
+    pub fn retained_reply_slots(&self) -> Vec<usize> {
+        self.clients.retained_reply_slots()
     }
 
     /// Send the same canonical request to all ranks and accept every route row.
@@ -277,7 +338,10 @@ impl SparkExperts {
         &'c mut self,
         request: &'r ExpertProtocolV2Request,
     ) -> Result<SparkExpertPending<'c, 'r>> {
-        let receiver = self.post(request)?;
+        ensure!(self.open_waves.is_empty() || self.clients.max_waves() == 1,
+            "a borrowed Spark dispatch cannot follow outstanding waves");
+        if !self.open_waves.is_empty() { self.open_waves.clear(); self.reset_connections(); }
+        let receiver = self.post(request, None)?;
         Ok(SparkExpertPending {
             receiver,
             poll_quantum: poll_quantum(&request.rows),
@@ -289,10 +353,22 @@ impl SparkExperts {
 
     /// [`Self::dispatch`] returning an owned [`SparkExpertWave`]. The clients
     /// keep their own copy of the request, so it need not outlive the wave.
+    /// Up to [`Self::max_waves`] may be outstanding; receive them in dispatch order.
     pub fn dispatch_wave(&mut self, request: &ExpertProtocolV2Request) -> Result<SparkExpertWave> {
-        let receiver = self.post(request)?;
-        self.wave_open = true;
-        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows) })
+        self.dispatch_wave_at(request, None)
+    }
+
+    /// [`Self::dispatch_wave`] whose payload lands, on every rank with a
+    /// placed GPU landing ([`DeviceLanding::placed`]), at that rank's
+    /// `landing` slice of its registered range. A transport with a placed
+    /// landing requires the slices; other ranks ignore theirs.
+    pub fn dispatch_wave_at(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<SparkExpertWave> {
+        let receiver = self.post(request, landing)?;
+        self.wave_sequence += 1;
+        self.open_waves.push_back(self.wave_sequence);
+        Ok(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows), sequence: self.wave_sequence,
+            _ticket: self.wave_tickets.clone() })
     }
 
     /// Accepts every row of `wave`, which this transport dispatched; the sink
@@ -312,57 +388,136 @@ impl SparkExperts {
     where
         F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
     {
+        ensure!(self.open_waves.front() == Some(&wave.sequence),
+            "Spark waves must be received in dispatch order");
         // Keep the polling loop in this owned receive future: decode previously
         // lost ~3% when an extra drain future sat on this hot path. All shared
         // Spark intakes use this path, including device-landing receipts.
         let mut receipt = WaveReceipt::default();
-        let mut quantum = std::time::Instant::now();
-        let mut first_wait = true;
+        let mut backoff = PollBackoff::new(wave.poll_quantum);
         let result = loop {
-            let polled = self.clients.poll(|chunk| {
-                if chunk.landed {
-                    let rank = wave.receiver.push_landed(&chunk)?;
-                    ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
-                    receipt.landed |= 1 << rank;
-                    return Ok(());
-                }
-                let mut location = None;
-                wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
-                    ensure!(rank == chunk.stream_id,
-                        "native executor identity does not match its RoCE peer");
-                    location = Some((rank, start));
-                    Ok(())
-                })?;
-                let (rank, start) = location.expect("validated chunk has a location");
-                sink(rank, start, chunk.partial_output_payload)
-            });
-            match polled {
+            match self.poll_once(&mut wave, &mut receipt, &mut sink) {
                 Err(error) => break Err(error),
-                Ok(true) => break if wave.receiver.complete() { Ok(receipt) }
-                    else { Err(anyhow::anyhow!("native TP RoCE response coverage is incomplete")) },
+                Ok(true) => break Ok(receipt),
                 Ok(false) => {}
             }
             // Let another lane run at the first wait; later polls keep this
             // wave's existing decode/prefill quantum. Ready responses never yield.
-            if first_wait || quantum.elapsed() >= wave.poll_quantum {
-                first_wait = false;
+            if backoff.yield_now() {
                 tokio::task::yield_now().await;
-                quantum = std::time::Instant::now();
+                backoff.yielded();
             } else {
                 std::hint::spin_loop();
             }
         };
-        if let Err(error) = &result {
-            crate::health::record_failure(format!("expert receive failed: {error:#}"));
-            self.reset_connections();
-        }
-        self.wave_open = false;
+        self.finish_receive(&result);
         result
     }
 
-    fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {
+    /// One non-blocking progress pass over `wave`, the oldest outstanding
+    /// wave: completed chunks go to `sink`, landed ranks into `receipt`.
+    /// `Ok(true)` once every rank's rows arrived; the wave is then retired.
+    /// An error resets the transport as [`Self::receive_wave_owned`] does.
+    /// A prefill transport worker interleaves these passes with posting the
+    /// next waves, so it never blocks inside one receive.
+    pub fn poll_wave<F>(&mut self, wave: &mut SparkExpertWave, receipt: &mut WaveReceipt, mut sink: F)
+        -> Result<bool>
+    where
+        F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+    {
+        let result = (|| {
+            ensure!(self.open_waves.front() == Some(&wave.sequence),
+                "Spark waves must be received in dispatch order");
+            self.poll_once(wave, receipt, &mut sink)
+        })();
+        match result {
+            Ok(false) => Ok(false),
+            Ok(true) => { self.finish_receive(&Ok(())); Ok(true) }
+            Err(error) => { let failed = Err(error); self.finish_receive(&failed); failed.map(|()| false) }
+        }
+    }
+
+    fn poll_once<F>(&mut self, wave: &mut SparkExpertWave, receipt: &mut WaveReceipt, sink: &mut F) -> Result<bool>
+    where
+        F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+    {
+        let polled = self.clients.poll(|chunk| {
+            if chunk.landed {
+                let rank = wave.receiver.push_landed(&chunk)?;
+                ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
+                receipt.landed |= 1 << rank;
+                receipt.pace[rank] = chunk.header.pace;
+                return Ok(());
+            }
+            if let Some(pace) = chunk.header.pace {
+                // Every chunk of a unit's reply follows its fence; keep the last.
+                let rank = chunk.stream_id;
+                ensure!(rank < receipt.pace.len(), "Spark reply rank {rank} outside the world");
+                receipt.pace[rank] = Some(pace);
+            }
+            let mut location = None;
+            wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
+                ensure!(rank == chunk.stream_id,
+                    "native executor identity does not match its RoCE peer");
+                location = Some((rank, start));
+                Ok(())
+            })?;
+            let (rank, start) = location.expect("validated chunk has a location");
+            sink(rank, start, chunk.partial_output_payload)
+        })?;
+        ensure!(!polled || wave.receiver.complete(), "native TP RoCE response coverage is incomplete");
+        Ok(polled)
+    }
+
+    fn finish_receive<T>(&mut self, result: &Result<T>) {
+        if let Err(error) = result {
+            crate::health::record_failure(format!("expert receive failed: {error:#}"));
+            self.open_waves.clear();
+            self.reset_connections();
+        } else {
+            self.open_waves.pop_front();
+        }
+    }
+
+    /// Gives up every outstanding wave (their tickets were dropped unread):
+    /// records the failure and resets the QPs exactly as a failed receive
+    /// does. A terminal-owned transport keeps its owners for quiescence.
+    pub fn abandon_waves(&mut self, reason: &str) {
+        if self.open_waves.is_empty() { return; }
+        crate::health::record_failure(format!("expert waves abandoned: {reason}"));
+        self.open_waves.clear();
+        self.reset_connections();
+    }
+
+    /// Gives up every outstanding wave for a deliberate reset (a cancelled
+    /// request): the QPs reset as [`Self::abandon_waves`] does, but nothing
+    /// failed, so the process stays healthy. The link reconnects next.
+    pub fn cancel_waves(&mut self) {
+        if self.open_waves.is_empty() { return; }
+        self.open_waves.clear();
+        self.reset_connections();
+    }
+
+    /// The registered zero-copy request ring, one staging arena per admitted
+    /// wave slot (empty before bootstrap or without egress): requests whose
+    /// payload views a slot go out from it on every rank without a per-rank
+    /// copy. A slot is rewritten only once its wave landed (every rank had
+    /// received that request by then) and no request views it.
+    pub fn egress_arenas(&self) -> Result<Vec<crate::StagingArena>> {
+        self.clients.egress_arenas()
+    }
+
+    fn post(&mut self, request: &ExpertProtocolV2Request, landing: Option<&[crate::LandingSlice]>)
+        -> Result<V41Tp4ChunkReceiver> {
         crate::health::ensure_available()?;
-        if std::mem::take(&mut self.wave_open) {
+        // A dropped wave is not received; at single-wave admission the next
+        // post resets its QPs as before. Past the admitted count, refuse.
+        if !self.open_waves.is_empty() && self.open_waves.len() >= self.clients.max_waves() {
+            if self.clients.max_waves() > 1 {
+                anyhow::bail!("Spark transport has {} outstanding waves, the admitted maximum",
+                    self.open_waves.len());
+            }
+            self.open_waves.clear();
             self.reset_connections();
         }
         let flagged = request.header.flags & V41_NATIVE_GROUP_REQUEST_FLAG != 0;
@@ -402,7 +557,7 @@ impl SparkExperts {
                 }
             }
         };
-        self.clients.dispatch(request)?;
+        self.clients.dispatch(request, landing)?;
         if let Some(tap) = &mut self.route_tap {
             tap.record(request, self.executors.len());
         }
@@ -436,8 +591,7 @@ impl SparkExpertPending<'_, '_> {
         // Borrowed legacy callers retain their inline loop. Shared intake uses
         // receive_wave_owned's inline loop; neither adds a separate drain future
         // (that extra future previously cost ~3% at C1, 153.5 -> 148.4 tok/s).
-        let mut quantum = std::time::Instant::now();
-        let mut first_wait = true;
+        let mut backoff = PollBackoff::new(self.poll_quantum);
         loop {
             let receiver = &mut self.receiver;
             if self.owner.clients.poll(|chunk| {
@@ -455,10 +609,9 @@ impl SparkExpertPending<'_, '_> {
             })? {
                 break;
             }
-            if first_wait || quantum.elapsed() >= self.poll_quantum {
-                first_wait = false;
+            if backoff.yield_now() {
                 tokio::task::yield_now().await;
-                quantum = std::time::Instant::now();
+                backoff.yielded();
             } else {
                 std::hint::spin_loop();
             }
@@ -490,12 +643,53 @@ mod tests {
         let config = TcpTransportConfig { timing: false,
             timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000,
         };
-        let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config.clone())?;
+        let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, 2, config.clone(), 0)?;
         assert_eq!(client.world_size(), 2);
         client.reset_connections();
         assert_eq!(client.world_size(), 2);
-        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone()).is_err());
+        assert!(SparkExperts::new_world(crate::expert::SparkWorld::canonical((&[peers[0]; 2]).len())?, &[peers[0]; 2], 2, config.clone(), 0).is_err());
         assert_eq!(client.world().topology().executor_ids(), [5, 6]);
+        Ok(())
+    }
+
+    #[test]
+    fn drained_reset_refuses_live_waves_but_recovers_dropped_unread_waves() -> Result<()> {
+        let peers = ["127.0.0.1:19441".parse()?, "127.0.0.1:19442".parse()?];
+        let config = TcpTransportConfig { timing: false,
+            timeout: std::time::Duration::from_secs(1), max_frame_bytes: 200_000 };
+        let request = super::super::tests::request(2);
+        for waves in 1..=4 {
+            let mut client = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config.clone(), 0)?;
+            client.set_max_waves(waves)?;
+            let mut unread = Vec::new();
+            for sequence in 1..=waves as u64 {
+                // Build the real detached tickets without opening hardware sessions.
+                let receiver = V41Tp4ChunkReceiver::from_owned_ranks(&request, 2, &client.executors, 200_000)?;
+                client.open_waves.push_back(sequence);
+                client.wave_sequence = sequence;
+                unread.push(SparkExpertWave { receiver, poll_quantum: poll_quantum(&request.rows),
+                    sequence, _ticket: client.wave_tickets.clone() });
+            }
+            assert!(client.require_drained_reset().is_err());
+            assert!(client.reset_drained().is_err());
+            assert_eq!(client.open_waves(), waves);
+            assert_eq!(client.wave_sequence, waves as u64);
+            let last = unread.pop().unwrap();
+            drop(unread);
+            assert!(client.reset_drained().is_err(), "one live ticket must still block reuse");
+            drop(last);
+            client.reset_drained()?;
+            assert_eq!(client.open_waves(), 0);
+            assert_eq!(client.wave_sequence, 0);
+            assert_eq!(client.max_waves(), waves);
+            assert_eq!(client.capacity(), 2);
+            client.set_max_waves(waves)?;
+            client.reset_drained()?;
+        }
+        let mut terminal = SparkExperts::new_world(SparkWorld::canonical(2)?, &peers, 2, config, 0)?;
+        terminal.enable_terminal_ownership()?;
+        assert!(terminal.reset_drained().is_err(), "terminal owners must quiesce/release, never reset for reuse");
+        assert!(terminal.terminal_ready_for_test());
         Ok(())
     }
 
@@ -555,6 +749,23 @@ mod tests {
             );
         }
         assert_eq!(poll_quantum(&[]).as_micros(), 250);
+    }
+
+    #[test]
+    fn decode_backoff_yields_every_empty_poll_and_prefill_spins_between_clock_reads() {
+        let mut decode = PollBackoff::new(std::time::Duration::ZERO);
+        for _ in 0..3 {
+            assert!(decode.yield_now());
+            decode.yielded();
+        }
+        let mut prefill = PollBackoff::new(std::time::Duration::from_secs(3600));
+        assert!(prefill.yield_now(), "the first wait always yields");
+        prefill.yielded();
+        assert!((0..4 * PollBackoff::SPINS).all(|_| !prefill.yield_now()), "an unexpired quantum keeps spinning");
+        let mut expired = PollBackoff::new(std::time::Duration::from_nanos(1));
+        expired.yielded();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!((0..PollBackoff::SPINS).any(|_| expired.yield_now()), "an expired quantum yields within one clock read");
     }
 
     #[test]
@@ -633,7 +844,7 @@ mod tests {
             let mut client = SparkExperts::new_world(crate::expert::SparkWorld::canonical(peers.len())?, &peers, capacity, TcpTransportConfig { timing: false,
                     timeout: std::time::Duration::from_secs(10),
                     max_frame_bytes: 64 * 1024 * 1024,
-                })?;
+                }, 0)?;
             for rows in shapes {
                 let base = super::super::tests::request(rows);
                 let mut payload = Vec::new();
@@ -752,6 +963,62 @@ mod tests {
         host.landed = false;
         let mut fresh = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
         assert!(fresh.push_landed(&host).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn eight_rank_landed_receipt_uses_all_bits_without_overflow() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = BackboneRequest::parse(&frame, 2)?;
+        let executors = super::SparkWorld::canonical(cuteafd_core::MAX_SPARK_WORLD)?.topology().executor_ids();
+        let mut receiver = V41Tp4ChunkReceiver::new_ranks(&native, &executors, 200_000)?;
+        let plane = vec![7u8; native.plane_bytes()?];
+        let mut receipt = WaveReceipt::default();
+        for rank in (0..executors.len()).rev() {
+            let encoded = native.response(executors[rank], &plane)?.to_owned()?.encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(
+                &encoded[..crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?;
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank, header, row_indices: None,
+                partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(), landed: true };
+            let selected = receiver.push_landed(&chunk)?;
+            assert_eq!(selected, rank);
+            receipt.landed |= 1 << selected;
+        }
+        assert!(receiver.complete());
+        assert_eq!(receipt.landed, u8::MAX);
+        Ok(())
+    }
+
+    /// #762: a worker's paced reply passes the coordinator's whole-plane and
+    /// chunk receivers unchanged and its pace reaches the header both ways.
+    #[test]
+    fn paced_replies_keep_their_receivers_and_carry_the_pace() -> Result<()> {
+        let request = super::super::tests::request(2);
+        let frame = request.encode()?;
+        let native = BackboneRequest::parse(&frame, 2)?;
+        let plane = vec![7u8; native.plane_bytes()?];
+        let mut landed = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        let mut host = V41Tp4ChunkReceiver::new(&native, [1, 2, 3, 4], 200_000)?;
+        for rank in 0..4 {
+            let encoded = native.response(rank as u64 + 1, &plane)?.to_owned()?
+                .with_pace(Some((1_000 + rank, rank))).encode()?;
+            let header = crate::ExpertProtocolV2ResponseView::parse_landed_header(
+                &encoded[..crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN])?;
+            assert_eq!(header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(Vec::new()),
+                wire_bytes: encoded.len(), landed: true };
+            assert_eq!(landed.push_landed(&chunk)?, rank as usize);
+            let view = crate::ExpertProtocolV2ResponseView::parse(&encoded)?;
+            assert_eq!(view.header.pace, Some((1_000 + rank, rank)));
+            let chunk = VerbsHostProtocolV2ResponseChunk { stream_id: rank as usize, header: view.header.clone(),
+                row_indices: None, partial_output_payload: VerbsHostProtocolV2ResponsePayload::from_owned(
+                    view.partial_output_payload().to_vec()), wire_bytes: encoded.len(), landed: false };
+            host.push_rdma(&chunk, |_, _, _| Ok(()))?;
+        }
+        assert!(landed.complete() && host.complete());
         Ok(())
     }
 

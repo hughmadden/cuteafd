@@ -181,6 +181,12 @@ def test_fused_diagnostic_load_fails_before_cuda_initialization_on_sm170():
 #include "cuda_runtime.h"
 inline int initializes=0;
 inline void counted_init(void** args) { ++initializes; init(args); }
+inline int recorded_sms=0;
+inline void runtime_launch(void** args, int count) {
+ assert(count==5); recorded_sms=*static_cast<int32_t*>(args[2]);
+ *static_cast<int32_t*>(args[4])=0;
+}
+#define CUTEAFD_DSV4_CC_MAJOR 12
 #define CUTEAFD_DSV4_CC_MINOR 0
 #define CUTEAFD_DSV4_PROGRAMS \
  {"flash",counted_init,load,noop,1,"i",188}, \
@@ -189,7 +195,8 @@ inline void counted_init(void** args) { ++initializes; init(args); }
  {"glmf",counted_init,load,noop,1,"i",188}, \
  {"m16",counted_init,load,noop,1,"i",11}, \
  {"ordinary",counted_init,load,noop,1,"i",0}, \
- {"dual",counted_init,load,plan170,1,"i",0,counted_init,load,plan188}
+ {"dual",counted_init,load,plan170,1,"i",0,counted_init,load,plan188}, \
+ {"runtime",counted_init,load,runtime_launch,1,"is",0}
 ''')
         (directory / "main.cc").write_text(r'''
 #include <cassert>
@@ -222,11 +229,26 @@ int main() {
   assert(cuteafd_dsv4_program_launch(6,pointers,scalars,nullptr)==0);
   assert(recorded_plan==(dev==2 ? 170 : 188));
  }
+ cuteafd_dsv4_program_info_t info{};
+ assert(cuteafd_dsv4_program_info(7,&info)==0);
+ assert(info.scalars==1 && std::strcmp(info.scalar_kinds,"i")==0);
+ for (int dev : {2,5}) {
+  device=dev; override_sms=dev==2 ? 170 : 188;
+  assert(cuteafd_dsv4_program_load(7)==0);
+  attribute_error=999;
+  assert(cuteafd_dsv4_program_launch(7,pointers,scalars,nullptr)==0);
+  assert(recorded_sms==(dev==2 ? 170 : 188));
+  attribute_error=0;
+ }
  attribute_error=999;
  assert(cuteafd_dsv4_program_load(6)==999);
  attribute_error=0;
  override_sms=0; minor=1;
  assert(cuteafd_dsv4_program_load(5)==cudaErrorNoKernelImageForDevice);
+ // The table's major is checked too (an sm_89 table on SM120, or the reverse).
+ minor=0; major=8;
+ assert(cuteafd_dsv4_program_load(5)==cudaErrorNoKernelImageForDevice);
+ major=12;
 }
 '''.replace("SOURCE", str(ROOT / "native/shared/src/dsv4_programs.cc")))
         subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
@@ -236,8 +258,101 @@ int main() {
         subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
+def test_runtime_sms_absent_and_false_generate_identical_native_abi(monkeypatch):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "runtime_sms_test_export", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    scalars = [("rows", "int32"), ("width", "int64")]
+    old = exporter.native_scalar_abi("old", {}, scalars)
+    assert old == exporter.native_scalar_abi("new", {"runtime_sm_count": False}, scalars)
+    assert old == ("il", scalars)
+    hidden = scalars + [("device_sm_count", "int32")]
+    assert exporter.native_scalar_abi("runtime", {"runtime_sm_count": True}, hidden) == ("ils", scalars)
+    for invalid in ([], scalars, hidden + [("extra", "int32")], hidden + hidden[-1:]):
+        with pytest.raises(ValueError, match="last int32 scalar"):
+            exporter.native_scalar_abi("bad", {"runtime_sm_count": True}, invalid)
+    for invalid in (None, 0, 1, "false"):
+        with pytest.raises(ValueError, match="must be a boolean"):
+            exporter.native_scalar_abi("bad", {"runtime_sm_count": invalid}, scalars)
+
+
+@pytest.mark.parametrize("options,message", [
+    (dict(bits=(3, 4, 5)), "export requires two distinct K2..K6 decoder tiers"),
+    # Compact warp specialization is a measured Spark prefill cell, so the
+    # remaining rejection is a contract the kernel cannot run (8-row blocks).
+    (dict(warp_specialized=True, route_block=8),
+     "warp-specialized prefill requires a disjoint two-tier export"),
+])
+def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(
+        monkeypatch, tmp_path, options, message):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "compact_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    kwargs = dict(bits=(3, 4), routing="packed", compact_weights=True)
+    kwargs.update(options)
+    with pytest.raises(ValueError, match=message):
+        exporter.export(tmp_path, 384, 256, 16, **kwargs)
+
+
+@pytest.mark.parametrize("bits", [(2, 3, 4), (2, 3, 4, 5), (4, 5, 6)])
+def test_exl3_export_refuses_multitier_before_cuda(monkeypatch, tmp_path, bits):
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "multitier_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    with pytest.raises(ValueError, match="requires two distinct K2..K6 decoder tiers"):
+        exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed")
+
+
+@pytest.mark.parametrize("bits,compact", [((3, 4), True), ((3, 4), False)])
+def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path, bits, compact):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "schedule_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    observed = []
+
+    class Compiled(Exception):
+        pass
+
+    def compile_kernel(**kwargs):
+        observed.append(kwargs)
+        raise Compiled
+
+    modules = {
+        "torch": dict(int32="int32", cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(
+            major=12, minor=0, multi_processor_count=170, shared_memory_per_block_optin=101376))),
+        "b12x.moe._shared.kernels.w4a16.host": dict(route_pack_capacity=lambda *a, **k: (0, 128)),
+        "b12x.moe._shared.kernels.w4a16.mixed_trellis": dict(
+            EXL3_AOT_MAX_SMS={(12, 0): 188}, compile_mixed_trellis=compile_kernel,
+            make_mixed_trellis_buffers=None),
+        "b12x.moe.fused_moe._impl": dict(_projection_mixed_direct_topk_routes=lambda *a, **k: False,
+            _projection_mixed_tile_config=lambda *a, **k: (64, 128, 64, 128)),
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+    schedule = "l2=2,pf1=0,pf2=0,pdl=1"
+    with pytest.raises(Compiled):
+        exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed",
+                        compact_weights=compact, decode_schedule=schedule)
+    assert observed[0]["decode_schedule"] == schedule
+    if compact:
+        assert observed[0]["compact_weights"] is True
+
+
 @pytest.mark.parametrize("blocks", [1, 2])
-def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks):
+@pytest.mark.parametrize("compact", [False, True])
+def test_exl3_generated_bridge_uses_runtime_sms_and_propagates_errors(monkeypatch, blocks, compact):
     compiler = shutil.which("g++")
     if not compiler:
         pytest.skip("native bridge qualification needs a C++ compiler")
@@ -271,7 +386,8 @@ inline int wrapper_{role}(cuteafd_{label}_Kernel_Module_t*, void*, int32_t, int3
                 "int32_t active_m", "int32_t grid_x", "cudaStream_t stream"]))
         exporter.write_bridge(directory, dict(blocks_per_sm=blocks, sms=188, compute=[12, 0],
             capacity=16, hidden=128, intermediate=128, experts=4, top_k=2,
-            bits=[3, 4], output_dtype="bf16", objects=objects))
+            bits=[3, 4], output_dtype="bf16", objects=objects,
+            **(dict(descriptor_rows=7, native_info_version=3) if compact else {})))
         (directory / "main.cc").write_text(r'''
 #include <algorithm>
 #include <cassert>
@@ -279,6 +395,8 @@ inline int wrapper_{role}(cuteafd_{label}_Kernel_Module_t*, void*, int32_t, int3
 #include <initializer_list>
 #include "v41_exl3_bridge.cc"
 int main() {
+ uint32_t info[16]{};
+ assert(cuteafd_exl3_info(info,16)==0 && info[0]==VERSION && info[6]==2);
  for (int dev : {2,5}) {
   device=dev; void* handle=nullptr;
   assert(cuteafd_exl3_create(&handle)==0);
@@ -304,7 +422,7 @@ int main() {
  override_sms=0; minor=1;
  assert(cuteafd_exl3_create(&handle)==cudaErrorInvalidDevice && handle==nullptr);
 }
-'''.replace("BLOCKS", str(blocks)))
+'''.replace("BLOCKS", str(blocks)).replace("VERSION", str(3 if compact else 2)))
         subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
                         str(directory / "main.cc"), "-o", str(directory / "test")],
                        check=True, timeout=750)
@@ -336,6 +454,152 @@ def test_capability_only_admission_and_live_launch_caps(family, device):
         # A single small translation unit in a private temp dir: no build.lock, so a
         # long compile elsewhere can't time this test out.
         subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        "-I", str(ROOT / "native/shared/include"),
+                        "-I", str(ROOT / "native/families/deepseek_v41/include"),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
+
+
+SM89_FP8_HEADER = r"""
+#pragma once
+#define CUTEAFD_V41_FP8_SMS 128
+#define CUTEAFD_V41_FP8_CC_MAJOR 8
+#define CUTEAFD_V41_FP8_CC_MINOR 9
+#define CUTEAFD_V41_FP8_PLAIN_SCALES 1
+inline void plan114(void**, int) { recorded_plan=114; }
+inline void plan128(void**, int) { recorded_plan=128; }
+static const uint32_t grids[] = {512};
+#define CUTEAFD_V41_FP8_VARIANTS \
+ {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan114},{init,load,noop},grids,0,1,1,0,114,1,1}, \
+ {{1,1,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan128},{init,load,noop},grids,0,1,1,0,128,1,1}, \
+ {{1,16,32,32,64,0,16,16,1},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,0,16,0}
+#define CUTEAFD_V41_HC_PROJECT_MODULE {init,load,noop}
+"""
+
+SM89_FP8_MAIN = r"""
+#include <cassert>
+#include "SOURCE"
+extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*,uint16_t*,int32_t,void*) { return 0; }
+extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*,uint16_t*,int32_t,int32_t,int32_t,void*) { return 0; }
+extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*,uint64_t,float*,void*) { return 0; }
+int main() {
+ void* h=nullptr;
+ // An SM89 bundle refuses SM120 devices and admits compute 8.9.
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
+ major=8; minor=9;
+ cuteafd_v41_fp8_info_t info;
+ // Another SM89 card has no plan for a card-planned shape and is refused;
+ // shapes with one plan for every card still describe themselves.
+ override_sms=142;
+ assert(cuteafd_v41_fp8_matrix_info(1,32,32,&info)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==cudaErrorInvalidDevice && h==nullptr);
+ assert(cuteafd_v41_fp8_matrix_initialize(1,32,64,&h)==cudaErrorInvalidValue && h==nullptr);
+ assert(cuteafd_v41_fp8_matrix_info(16,32,32,&info)==0);
+ // Each supported card runs its own plan; grids are capped at four CTAs per SM.
+ for (int dev : {2,5}) {
+  device=dev; override_sms=dev==2 ? 114 : 128;
+  assert(cuteafd_v41_fp8_matrix_info(1,32,32,&info)==0 && info.mma_scales_offset==info.row_scales_offset);
+  assert(info.packed_weight_scale_bytes==1);
+  assert(cuteafd_v41_fp8_matrix_initialize(1,32,32,&h)==0 && handle(h)->device_sms==override_sms);
+  assert(cuteafd_v41_fp8_launch(h,reinterpret_cast<uint16_t*>(0x10000),
+    reinterpret_cast<uint8_t*>(0x20000),reinterpret_cast<uint8_t*>(0x30000),
+    reinterpret_cast<void*>(0x40000),64,reinterpret_cast<float*>(0x50000),
+    reinterpret_cast<uint16_t*>(0x60000),1,nullptr)==0);
+  assert(recorded_plan==override_sms && recorded_grid==std::min(512,4*override_sms));
+  assert(cuteafd_v41_fp8_matrix_initialize(16,32,32,&h)==0 && handle(h)->device_sms==override_sms);
+  assert(cuteafd_v41_hc_project_initialize()==0);
+ }
+}
+"""
+
+
+def test_sm89_bundle_runs_each_card_plan_and_refuses_other_cards():
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("native bridge qualification needs a C++ compiler")
+    subprocess.run(["python3", str(ROOT / "scripts/build/assert-build-filesystem.py"), str(BUILD_ROOT)], check=True)
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=BUILD_ROOT) as temp:
+        directory = Path(temp)
+        (directory / "cuda_runtime.h").write_text(CUDA)
+        (directory / "v41_fp8_variants.h").write_text(SM89_FP8_HEADER)
+        source = ROOT / "native/families/deepseek_v41/src/v41_fp8.cc"
+        (directory / "main.cc").write_text(SM89_FP8_MAIN.replace("SOURCE", str(source)))
+        subprocess.run([compiler, "-std=c++17", "-pthread", "-I", str(directory),
+                        "-I", str(ROOT / "native/shared/include"),
+                        "-I", str(ROOT / "native/families/deepseek_v41/include"),
+                        str(directory / "main.cc"), "-o", str(directory / "test")],
+                       check=True, timeout=750)
+        subprocess.run([str(directory / "test")], check=True, timeout=30)
+
+
+SM89_EXPERT_HEADER = r"""
+#pragma once
+#define CUTEAFD_V41_SMS 128
+#define CUTEAFD_V41_CC_MAJOR 8
+#define CUTEAFD_V41_CC_MINOR 9
+#define CUTEAFD_V41_GROUP_ROWS(capacity, rows) ((capacity)==1 ? 16u : 0u)
+#define CUTEAFD_V41_VARIANTS \
+ {{2,0,128,5120,2304,2304,3,1,64,1,1,3,3,128,1},init,load,expert_launch,{}}
+"""
+
+SM89_INPUT_QUANT_HEADER = r"""
+#pragma once
+static const uint32_t cuteafd_v41_input_quant_grids[] = {1024};
+#define _mlir_cuteafd_v41_expert_input_quant_cuda_init ::init
+#define _mlir_cuteafd_v41_expert_input_quant_cuda_load_to_device ::load
+#define CUTEAFD_V41_INPUT_QUANT_ENTRY quant
+"""
+
+SM89_EXPERT_MAIN = r"""
+#include <cassert>
+#include "SOURCE"
+extern "C" int32_t cuteafd_initialize_scratch_storage_async(void*,uint64_t,uint64_t,uint64_t,uint32_t,void*) { return 0; }
+int main() {
+ void* h=nullptr;
+ // An SM89 expert table refuses SM120/SM121 devices and admits compute 8.9.
+ assert(cuteafd_v41_expert_initialize(1,&h)==cudaErrorInvalidDevice && h==nullptr);
+ assert(cuteafd_v41_expert_input_quant_initialize(&h)==cudaErrorInvalidDevice && h==nullptr);
+ // Capacity is sized for the largest supported SM89 card (128 SMs).
+ major=8; minor=9; override_sms=142;
+ assert(cuteafd_v41_expert_initialize(1,&h)==cudaErrorInvalidDevice && h==nullptr);
+ override_sms=TEST_SMS;
+ assert(cuteafd_v41_expert_initialize(1,&h)==0 && by_handle(h)->device_sms==TEST_SMS);
+ cuteafd_expert_launch_t args{};
+ for (auto& p : args.tensors) p=reinterpret_cast<void*>(0x10000);
+ args.num_tokens=1; args.scatter_rows=3; args.max_rows=1;
+ args.rows_padded=1; args.max_tasks=3; args.max_phys_tiles=3;
+ // Launch capacity never exceeds the runtime card's SMs.
+ for (int cap : {256,128,114,57}) {
+  args.max_active_clusters=cap;
+  assert(cuteafd_v41_expert_launch(h,&args)==0 && recorded_cap==std::min(cap,TEST_SMS));
+ }
+ args.max_active_clusters=257;
+ assert(cuteafd_v41_expert_launch(h,&args)==cudaErrorInvalidValue);
+ assert(cuteafd_v41_expert_input_quant_initialize(&h)==0);
+ assert(cuteafd_v41_expert_input_quantize_async(h,reinterpret_cast<uint16_t*>(0x10000),
+   reinterpret_cast<uint8_t*>(0x20000),1,nullptr)==0);
+ assert(recorded_grid==std::min(1024,4*TEST_SMS));
+}
+"""
+
+
+@pytest.mark.parametrize("sms", [114, 128])
+def test_sm89_expert_table_admits_every_supported_card(sms):
+    compiler = shutil.which("g++")
+    if not compiler:
+        pytest.skip("native bridge qualification needs a C++ compiler")
+    subprocess.run(["python3", str(ROOT / "scripts/build/assert-build-filesystem.py"), str(BUILD_ROOT)], check=True)
+    BUILD_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=BUILD_ROOT) as temp:
+        directory = Path(temp)
+        (directory / "cuda_runtime.h").write_text(CUDA)
+        (directory / "v41_expert_variants.h").write_text(SM89_EXPERT_HEADER)
+        (directory / "v41_input_quant_dispatch.h").write_text(SM89_INPUT_QUANT_HEADER)
+        source = ROOT / "native/shared/src/v41_experts.cc"
+        (directory / "main.cc").write_text(SM89_EXPERT_MAIN.replace("SOURCE", str(source)))
+        subprocess.run([compiler, "-std=c++17", "-pthread", f"-DTEST_SMS={sms}", "-I", str(directory),
                         "-I", str(ROOT / "native/shared/include"),
                         "-I", str(ROOT / "native/families/deepseek_v41/include"),
                         str(directory / "main.cc"), "-o", str(directory / "test")],

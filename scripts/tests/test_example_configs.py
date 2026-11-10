@@ -1,4 +1,4 @@
-"""The per-family starting configs in examples/configs/ (one per v2.0.0 release card).
+"""The per-family starting configs in examples/configs/ (current serving recipes).
 
 Each one parses through the real launcher's dry-run or argv path (CPU only:
 docker, ssh, nvidia-smi and nest are stubs that print their argv), and its
@@ -20,11 +20,16 @@ ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = ROOT / "examples" / "configs"
 STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)\.config$")
 TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
-         "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config",
-         "exl3-compact-tp3.config"}
+         "tp3ep2-native.config", "tp4ep1-explicit-native.config", "tp6ep1-native.config"}
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
-QUALIFICATION = {"kimi-k3-exl3-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
+ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
+QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
+                 "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
+                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION
+V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
+           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
+           "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 
@@ -44,26 +49,47 @@ NVFP4_GROUPS = {"config_groups": {"group_0": {"weights": {"num_bits": 4, "type":
 CHECKPOINTS = {
     "deepseek-ai/DeepSeek-V4.1-Flash": {"model_type": "deepseek_v41"},
     "deepseek-ai/DeepSeek-V4.1-Flash-1017": {"model_type": "deepseek_v41"},
+    "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE": {"model_type": "deepseek_v41"},
     "nvidia/DeepSeek-V4.1-Flash-NVFP4": {"model_type": "deepseek_v41",
                                          "quantization_config": {"moe_quant_algo": "NVFP4"}},
     "deepseek-ai/DeepSeek-V4-Flash-0731": DSV4,
     "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1": {**DSV4, "quantization_config": {"quant_method": "exl3"}},
     "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1": GLM5,
+    "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6": {**GLM5, "quantization_config": {
+        "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "nvidia/GLM-5.3-NVFP4": GLM5,
     "zai-org/GLM-5.3-Flash": GLMF,
-    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1": GLMF,
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
+        "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "brandonmusic/GLM-5.3-Flash-tr3-4bpw": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
     "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1": {**QWEN, "quantization_config": {"quant_method": "exl3"}},
     "nvidia/Qwen3.8-Flash-Next-NVFP4": {**QWEN, "quantization_config": {"quant_method": "modelopt", **NVFP4_GROUPS}},
+    "kindlingai/glm-5.3-exlr8-k2-k3-k4": GLM5,
+    "Qwen/Qwen3.5-9B": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 4096, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "Qwen/Qwen3.8-27B": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 5120, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "Qwen/Qwen3.8-27B-FP8": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 5120, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
+    "RadixArk/Qwen3.8-27B-DSpark": {"speculators_model_type": "dspark"},
+    "stepfun-ai/Step-5-Preview": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
 }
 FAMILY_DOCS = {"deepseek_v41": "deepseek_v41", "deepseek_v4": "deepseek_v4", "glm5": "glm5",
-               "glm5_flash": "glm5_flash", "mimo_v2": "mimo_v2", "qwen4": "qwen4"}
+               "glm5_flash": "glm5_flash", "mimo_v2": "mimo_v2", "qwen4": "qwen4",
+               "kimi_k3": "kimi_k3", "qwen3_5": "qwen3_5", "step5": "step5"}
 # Launcher keys that select the speculator and the KV pool.
 SPECULATOR_KEYS = ("SPECULATOR", "SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH")
 POOL_KEYS = ("POOL_TOKENS",)
@@ -75,7 +101,7 @@ POOL_EXCEPTIONS = {("deepseek_v41", "POOL_TOKENS"): "auto"}
 
 
 def starting_configs() -> list[Path]:
-    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION)
+    return sorted(p for p in EXAMPLES.glob("*.config") if p.name not in TP_EP | QUALIFICATION | V4_PREP)
 
 
 def keys(path: Path) -> dict[str, str]:
@@ -95,9 +121,12 @@ def _hub(tmp_path: Path) -> Path:
     for model, config in CHECKPOINTS.items():
         root = hf / "hub" / f"models--{model.replace('/', '--')}"
         (root / "refs").mkdir(parents=True)
-        (root / "refs" / "main").write_text("abc")
+        (root / "refs" / "main").write_text("a" * 40)
         (root / "snapshots" / "abc").mkdir(parents=True)
+        (root / "snapshots" / ("a" * 40)).symlink_to(root / "snapshots" / "abc")
         (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
+    draft = hf / "hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots"
+    (draft / "85ef153be924f17ce4bf62726954eeaa4a73e854").symlink_to(draft / "abc")
     return hf
 
 
@@ -124,10 +153,10 @@ def _stubs(tmp_path: Path) -> Path:
         (bin_dir / tool).write_text(body)
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
-    (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo 98304 ;; '
-                                        '*memory.free*) echo 97000 ;; *) printf "%s\\n" 0 1 ;; esac\n')
-    for tool in ("curl", "nvidia-smi"):
-        (bin_dir / tool).chmod(0o755)
+    (bin_dir / "curl").chmod(0o755)
+    from launcher_sandbox import fake_nvidia_smi, stub_cuda_python
+    fake_nvidia_smi(bin_dir)
+    stub_cuda_python(bin_dir, 98304 * 2**20)
     return bin_dir
 
 
@@ -155,13 +184,20 @@ report = json.loads(REPORT)
 family, first, last = FAMILY, FIRST, LAST
 print(json.dumps(dict(report, version=1, family=family, executable=True, report=report,
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
-    spark_admission="coordinator_authoritative",
+    spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
-    speculator=value("--speculator", "off"))))
+    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    # Match DeviceLayout's allocation ceiling, independently of host-inclusive capacity.
+    memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
+                                for i in range(int(value("--rtx", "1")))] +
+                               [dict(kind="spark", index=i, capacity_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     worker_budget_bytes=int(float(value("--spark-budget-gib", "108")) * 2**30),
+                                     items=[], kv_tokens=0) for i in range(report["spark_ranks"])]))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
         docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')
-    env = {**os.environ, "HF_HOME": str(hf), "HOME": str(tmp_path / "home"),
+    from launcher_sandbox import fake_gpus
+    env = {**os.environ, "HF_HOME": str(hf), "HOME": str(tmp_path / "home"), "FAKE_GPUS": json.dumps(fake_gpus(2)),
            "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     return subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config)], cwd=ROOT, env=env,
                           capture_output=True, text=True, timeout=60)
@@ -183,6 +219,8 @@ def _coordinator(result: subprocess.CompletedProcess[str]) -> str:
 
 # Encoder plans for families with towers: Spark-first vision on rank 0, or off.
 SPARK_PLAN = {"placement_supported": True, "fits": True, "spark_ranks": 2, "encoder_plan_hash": "ab" * 32,
+              "prefill_unit_rows": 4096, "prefill_waves": 1, "prefill_span_rows": 4096,
+              "prefill_reserve_rows": 8192,
               "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
               "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}
 LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"}, "replicas": []}}
@@ -191,8 +229,8 @@ LOCAL_PLAN = {**SPARK_PLAN, "spark_ranks": 0, "encoder": {"kind": {"kind": "off"
 def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
-        "deepseek-v41-mxfp4", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
-        "glm53-exl3", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
+        "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
+        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-exl3-k6", "glm53-flash-nvfp4",
         "glm53-flash-tr3", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
@@ -205,7 +243,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
     matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
     assert matrix["profile"] == "smoke"
     entries = matrix["entries"]
-    assert len(entries) == 26
+    assert len(entries) == 28
     assert len({entry["name"] for entry in entries}) == len(entries)
     defaults = matrix["defaults"]["set"]
     stale = {"CONCURRENCY", "MAX_CONTEXT_TOKENS", "HOST_CACHE_BYTES", "BENCH_SIMULATED",
@@ -223,7 +261,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             for rank in range(len(entry["sparks"])):
                 assert values[f"SPARK_{rank}_LANE_B"].startswith("10.55.1.")
         assert int(values["RTX_GPUS"]) == len(entry["gpus"])
-        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
         assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
         assert len(entry["gpus"]) == (1 if entry["name"].endswith("-min") else 2)
         for rank, host in enumerate(entry["sparks"]):
@@ -241,8 +279,53 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             assert values[key] not in ports
             ports.add(values[key])
         models.setdefault(values["MODEL_ID"], set()).add(len(entry["gpus"]))
-    assert len(models) == 13
+    assert len(models) == 14
     assert all(columns == {1, 2} for columns in models.values())
+
+
+def test_glm_k6_core_cards_preserve_native_checkpoint_and_topology() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/release-smoke.example.json").read_text())
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    for size, gpus, sparks in (("min", [1], 4), ("max", [0, 1], 6)):
+        name = f"glm53-exl3-k6core-{size}"
+        entry = entries[name]
+        values = keys(ROOT / entry["config"])
+        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6"
+        assert values["MODEL_REVISION"] == "5a4e83a09a11f3145332ed632d28a9894ea88225"
+        assert values["SPECULATOR"] == "dflash2"
+        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-DFlash2"
+        assert values["POOL_TOKENS"] == "auto"
+        assert "RTX_EXPERT_LAYERS" not in values
+        assert entry["gpus"] == gpus and len(entry["sparks"]) == sparks
+        baseline = entries[f"glm53-exl3-{size}"]
+        assert entry["sparks"] == baseline["sparks"]
+        assert entry["family"] == baseline["family"] == "glm5"
+
+
+def test_v41_max_uses_six_sparks_and_keeps_tp4_reference() -> None:
+    pool = ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]
+    config = keys(ROOT / "examples/configs/deepseek-v41-mxfp4-max.config")
+    assert config["RTX_GPUS"] == "2" and config["SPARK_COUNT"] == "6"
+    for rank in range(6):
+        assert config[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert config[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+    for path in ("scripts/bench/kits/gate/matrix-gate.json",
+                 "scripts/bench/release-smoke.example.json"):
+        matrix = json.loads((ROOT / path).read_text())
+        entries = {entry["name"]: entry for entry in matrix["entries"]}
+        maximum = entries["v41-flash-max"]
+        assert maximum["gpus"] == [0, 1] and maximum["sparks"] == pool
+        assert maximum["set"]["SPARK_COUNT"] == "6"
+        assert [maximum["set"][f"SPARK_{rank}_HOST"] for rank in range(6)] == pool
+        if "v41-flash-ref-tp4" in entries:
+            reference = entries["v41-flash-ref-tp4"]
+            assert reference["gpus"] == [0, 1] and reference["sparks"] == pool[:4]
+            assert reference["set"]["SPARK_COUNT"] == "4"
+            for key in ("ADDR", "EXPERT_PORT"):
+                assert sum(entry.get("set", {}).get(key) == reference["set"][key]
+                           for entry in entries.values()) == 1
+        elif "matrix-gate" in path:
+            pytest.fail("gate kit must retain the TP4 reference card")
 
 
 def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090() -> None:
@@ -263,7 +346,7 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
         assert entry["family"] in FAMILY_DOCS
         assert "BENCH_SIMULATED" not in values
         assert int(values["RTX_GPUS"]) == len(entry["gpus"])
-        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
         assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
         assert values["SPECULATOR"] in {"dspark", "dflash2", "mtp"}
         assert values["POOL_TOKENS"] in {"auto", "2097152"}
@@ -314,16 +397,32 @@ def test_v3_5090_precheck_requires_real_hardware(tmp_path: Path, gpu_name: str, 
         assert result.returncode == expected, entry["name"]
 
 
+def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> None:
+    model = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
+    revision = "d31ebc921f1f098b4a56d37aaccb3cdef4096184"
+    for filename in ("scripts/bench/release-smoke.example.json", "scripts/bench/release-smoke-v3.json",
+                     "scripts/bench/kits/gate/matrix-gate.json"):
+        matrix = json.loads((ROOT / filename).read_text())
+        entries = [entry for entry in matrix["entries"] if entry["family"] == "glm5_flash"
+                   and "exl3" in entry["name"]]
+        assert entries, filename
+        for entry in entries:
+            effective = {**keys(ROOT / entry["config"]), **matrix.get("defaults", {}).get("set", {}),
+                         **entry.get("set", {})}
+            assert effective["MODEL_ID"] == model, entry["name"]
+            assert effective["MODEL_REVISION"] == revision, entry["name"]
+
+
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 12
+    assert len(matrix["cells"]) == 17
     for row in matrix["cells"]:
         # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
         assert row["5090"]["status"] in ("current", "na")
         if row["5090"]["status"] == "current":
             assert row["5090"]["report"].endswith("-5090")
         current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
-        # v3 publishes one card per checkpoint (two for V4.1 and GLM Flash EXL3).
+        # Each published checkpoint has at least one PRO card; the other column says why not.
         assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
         for cell in current:
             assert (ROOT / cell["report"] / "report.json").is_file()
@@ -355,13 +454,14 @@ def test_family_doc_and_readme_link_every_starting_config(path: Path) -> None:
     assert f"({path.name})" in (EXAMPLES / "README.md").read_text()
 
 
-V41 = [p for p in starting_configs() if p.name.startswith("deepseek-v41-")]
-FAMILY = [p for p in starting_configs() if not p.name.startswith("deepseek-v41-")]
+V41 = [p for p in starting_configs() if CHECKPOINTS[keys(p)["MODEL_ID"]]["model_type"] == "deepseek_v41"]
+FAMILY = [p for p in starting_configs() if p not in V41]
 
 
-@pytest.mark.parametrize("entry", json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())["entries"],
+@pytest.mark.parametrize("entry", [entry for filename in ("release-smoke-v3.json", "release-smoke-v4.json")
+                                     for entry in json.loads((ROOT / "scripts/bench" / filename).read_text())["entries"]],
                          ids=lambda entry: entry["name"])
-def test_v3_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Path) -> None:
+def test_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Path) -> None:
     matrix = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
     values = {**keys(ROOT / entry["config"]), **matrix.get("defaults", {}).get("set", {}),
               **entry.get("set", {})}
@@ -436,7 +536,9 @@ def test_family_starting_config_matches_the_launcher_defaults(path: Path, tmp_pa
     keep = _coordinator(_family_launch(tmp_path / "example", path))
     bare = _strip(path, tmp_path, SPECULATOR_KEYS + POOL_KEYS)
     default = _coordinator(_family_launch(tmp_path / "bare", bare))
-    assert _speculation(keep) == _speculation(default)
+    # Separate sandbox roots now remain visible at their original container paths.
+    assert _speculation(keep.replace(str(tmp_path / "example"), "<root>")) == _speculation(
+        default.replace(str(tmp_path / "bare"), "<root>"))
     assert _speculation(keep), keep
     assert re.findall(r"--pool-tokens \S+", keep) == re.findall(r"--pool-tokens \S+", default)
 
@@ -463,6 +565,52 @@ def test_v41_starting_config_matches_the_launcher_defaults(path: Path, tmp_path:
             assert values[key] == defaults[key], key
 
 
+@pytest.mark.parametrize("name", sorted(ML4_QUALIFICATION))
+def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp_path: Path) -> None:
+    from test_run_family_dispatch import _family_launch_result
+
+    path = EXAMPLES / name
+    values = keys(path)
+    minimum = name.endswith("-min.config")
+    assert values["MODEL_ID"] == "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6"
+    assert values["MODEL_REVISION"] == "03c80aebaa483d55760703ae5bc0c9734c9d67d6"
+    assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    assert not {"SPECULATOR_MODEL_ID", "SPECULATOR_DEPTH", "RTX_EXPERT_LAYERS"}.intersection(values)
+    assert values["SPARK_COUNT"] == ("5" if minimum else "6")
+    assert values["RTX_GPUS"] == ("1" if minimum else "2")
+    assert f"./run.sh --config examples/configs/{name} --dry-run" in path.read_text()
+    assert not any(needle in path.read_text().lower() for needle in PRIVATE)
+    for rank in range(int(values["SPARK_COUNT"])):
+        assert values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
+        assert values[f"SPARK_{rank}_LANE_A"] == f"192.0.2.{rank + 1}"
+    checkpoint = {"model_type": "mistral_large4", "text_config": {
+        "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
+    launches = []
+    for label, drop in (("example", ()), ("bare", SPECULATOR_KEYS + POOL_KEYS)):
+        config = "".join(f"{k}={v}\n" for k, v in values.items()
+                         if k not in ("MODEL_ID", "MODEL_REVISION", *drop))
+        result = _family_launch_result(tmp_path / label, checkpoint, values["MODEL_ID"], config,
+                                      extra_args=("--wip", "ml4-test"))
+        launch = _coordinator(result)
+        assert "serve-glm" in launch and "--dspark" in launch and "--draft " not in launch
+        assert "--pool-tokens 0" in launch
+        assert result.stderr.count("cuteafd expertd-native") == int(values["SPARK_COUNT"])
+        launches.append(_speculation(launch))
+    assert launches[0] == launches[1]
+
+
+def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:
+    matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-ml4.json").read_text())
+    entries = {entry["name"]: entry for entry in matrix["entries"]}
+    for size, gpus, sparks in (("min", [1], 5), ("max", [0, 1], 6)):
+        entry = entries[f"ml4-exl3-{size}"]
+        assert entry["config"] == f"examples/configs/mistral-large4-exl3-k4-core-k6-{size}.config"
+        assert entry["family"] == "mistral_large4" and entry["gpus"] == gpus
+        assert len(entry["sparks"]) == sparks and entry["set"]["SPARK_COUNT"] == str(sparks)
+        assert not any(k.startswith(f"SPARK_{sparks}_") for k in entry["set"])
+        assert keys(ROOT / entry["config"])["SPECULATOR"] == "dspark"
+
+
 def test_tp_ep_examples_are_left_alone() -> None:
     assert TP_EP <= {p.name for p in EXAMPLES.glob("*.config")}
 
@@ -485,15 +633,25 @@ def test_qualification_configs_exist_and_are_listed() -> None:
     ({"model_type": "mimo_v2", "num_hidden_layers": 5, "moe_layer_freq": [0, 1, 0, 1, 1]}, 3),
     ({"model_type": "mimo_v2_flash", "num_hidden_layers": 48}, 47),
 ])
-@pytest.mark.parametrize("value", ["auto", "max", "all", "50%", "100%", "0"])
-def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value):
+@pytest.mark.parametrize("value", ["auto", "all", "0"])
+def test_checkpoint_onboarding_accepts_auto_all_and_counts(tmp_path, config, count, value):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value, str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    expected = {"all": str(count), "100%": str(count), "50%": str(int(count * 0.5 + 0.5))}.get(value, value)
-    assert result.stdout.strip() == expected
+    # `all` stays unresolved; the engine resolves it from the checkpoint itself.
+    assert result.stdout.strip() == value
+    # The checkpoint's own routed-layer count is a valid exact pin; one more is
+    # refused with that count.
+    exact = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                            "--onboard", str(count), str(path)], capture_output=True, text=True)
+    assert exact.returncode == 0, exact.stderr
+    assert exact.stdout.strip() == str(count)
+    over = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
+                           "--onboard", str(count + 1), str(path)], capture_output=True, text=True)
+    assert over.returncode != 0
+    assert f"checkpoint has {count} routed layers" in over.stderr
     bounded = subprocess.run(["bash", "-c", 'source "$1"; release_onboard "$2" test/model pinned',
                               "test", str(ROOT / "scripts/lib/release-common.sh"), value],
                              env={**os.environ, "HF_HOME": str(tmp_path / "hf")},
@@ -503,9 +661,120 @@ def test_checkpoint_onboarding_count_and_rounding(tmp_path, config, count, value
     assert bounded.stdout.strip() == value
 
 
-@pytest.mark.parametrize("value", ["-1", "101%", "NaN%", "inf%", "half", "5x", ""])
+@pytest.mark.parametrize("value", ["-1", "max", "50%", "101%", "NaN%", "inf%", "half", "5x", ""])
 def test_checkpoint_onboarding_rejects_invalid_grammar(value):
     result = subprocess.run(["python3", str(ROOT / "scripts/lib/checkpoint-family.py"),
                              "--onboard", value], capture_output=True, text=True)
     assert result.returncode != 0
     assert "RTX_EXPERT_LAYERS must be" in result.stderr
+
+
+@pytest.mark.parametrize("name", sorted(V4_PREP))
+def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
+    path = EXAMPLES / name
+    values = keys(path)
+    text = path.read_text()
+    assert f"./run.sh --config examples/configs/{name}" in text and "--dry-run" in text
+    if name.startswith("glm53f-exl3-k4-core-k6"):
+        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"
+        assert values["SPECULATOR"] == "dflash2"
+        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
+        assert values["SPARK_COUNT"] == ("2" if "-min" in name else "0")
+        assert values["RTX_GPUS"] == ("1" if "-min" in name else "2")
+        assert values["POOL_TOKENS"] == "auto"
+        assert not any(needle in text.lower() for needle in PRIVATE)
+        return
+    assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
+    assert not any(needle in text.lower() for needle in PRIVATE)
+    assert "EXLR8_DENSE_FROM" not in values
+    if name.startswith("glm53"):
+        assert values["EXLR8_MANIFEST"] == "up1"
+        assert values["MODEL_ID"] == "kindlingai/glm-5.3-exlr8-k2-k3-k4"
+        assert "RTX_EXPERT_LAYERS" not in values
+        assert values["SPARK_COUNT"] == ("4" if "-min" in name else "6")
+        assert values["ATTENTION_PLACEMENT"] == ("heads" if "-min" in name else "context")
+        # Native-dense launcher integration is owned by #659/#663, not this prep.
+        # The smoke-entry loader test above still validates every config key.
+    else:
+        assert values["SPARK_COUNT"] == "0" and values["RTX_GPUS"] == "1"
+        speculator = "off" if name.startswith("qwen35-9b") else "dspark"
+        assert values["SPECULATOR"] == speculator
+        from test_run_family_dispatch import _family_launch_result, _snapshot
+        _snapshot(tmp_path / "hf", "RadixArk/Qwen3.8-27B-DSpark",
+                  {"speculators_model_type": "dspark"}, "85ef153be924f17ce4bf62726954eeaa4a73e854")
+        launch_values = {k: v for k, v in values.items() if k not in ("MODEL_ID", "MODEL_REVISION")}
+        result = _family_launch_result(tmp_path, CHECKPOINTS[values["MODEL_ID"]], values["MODEL_ID"],
+            "".join(f"{k}={v}\n" for k, v in launch_values.items()),
+            extra_args=("--wip", "dense-test"), encoder_plan=LOCAL_PLAN)
+        launch = _coordinator(result)
+        assert "serve-qwen35" in launch
+        assert ("--draft " in launch) == (speculator == "dspark")
+        assert "--peers " not in launch
+
+
+def test_v4_matrix_card_set_and_retired_pins() -> None:
+    v3 = json.loads((ROOT / "scripts/bench/release-smoke-v3.json").read_text())
+    v4 = json.loads((ROOT / "scripts/bench/release-smoke-v4.json").read_text())
+    entries = {entry["name"]: entry for entry in v4["entries"]}
+    assert len(entries) == len(v4["entries"])
+    for entry in v3["entries"]:
+        if entry["name"].endswith("-5090") and entry["name"] != "qwen38-nvfp4-5090":
+            candidate = {**entries[entry["name"]], "set": dict(entries[entry["name"]]["set"])}
+            candidate["set"].pop("SPARK_EXPERT_DOCKER_INFERENCE", None)
+            assert candidate == entry
+    assert entries["qwen38-exl3-5090"]["set"]["SPARK_COUNT"] == "1"
+    for name, gpus, sparks in [
+        ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
+        ("v4-flash-reference-tp4", 1, 4), ("glm53-exl3-max", 2, 6),
+        ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6), ("glm53-exlr8-a8-max", 2, 6),
+        ("kimi-k3-min", 1, 6), ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
+        ("step5-nvfp4-min", 1, 4), ("step5-exl3-k6core-min", 1, 3), ("step5-exl3-k6core-max", 2, 6),
+        ("qwen38-27b-bf16-min", 1, 0),
+        ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
+        ("qwen38-27b-bf16-min-nospec", 1, 0), ("qwen38-27b-fp8-min-nospec", 1, 0),
+    ]:
+        assert len(entries[name]["gpus"]) == gpus
+        assert len(entries[name]["sparks"]) == sparks
+        assert entries[name]["set"]["SPARK_COUNT"] == str(sparks)
+    a8 = entries["glm53-exlr8-a8-max"]
+    assert a8 == {**entries["glm53-exlr8-max"], "name": "glm53-exlr8-a8-max", "set": {
+        **entries["glm53-exlr8-max"]["set"], "EXLR8_PREFILL_ACTIVATIONS": "a8",
+        "ADDR": a8["set"]["ADDR"], "EXPERT_PORT": a8["set"]["EXPERT_PORT"]}}
+    dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
+    assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
+        "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",
+        "qwen38-27b-fp8-min": "dspark", "qwen38-27b-bf16-min-nospec": "off",
+        "qwen38-27b-fp8-min-nospec": "off"}
+    for quant in ("bf16", "fp8"):
+        base = entries[f"qwen38-27b-{quant}-min"]
+        nospec = entries[f"{base['name']}-nospec"]
+        assert nospec == {**base, "name": f"{base['name']}-nospec", "set": {
+            **base["set"], "SPECULATOR": "off", "ADDR": nospec["set"]["ADDR"]}}
+    assert "SPARK_EXPERT_DOCKER_INFERENCE" not in v4["defaults"]["set"]
+    for entry in v4["entries"]:
+        assert ("SPARK_EXPERT_DOCKER_INFERENCE" in entry["set"]) == bool(entry["sparks"])
+    for entry in dense:
+        assert "EXPERT_PORT" not in entry["set"]
+        assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
+                   for other in v4["entries"]) == 1
+    assert not any(name.startswith("qwen38-nvfp4") for name in entries)
+    retired = v4["retired"]
+    assert len(retired) == 20
+    assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
+    assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
+    assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]
+    reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
+    for entry in retired:
+        assert (ROOT / entry["config"]).is_file()
+        report = json.loads((ROOT / entry["report"] / "report.json").read_text())
+        assert report["profile"] == "smoke" and report["baseline"]
+        build = report["server"]["build"]
+        expected = build["release"] or f"v3 dev {report['created'][:10]}"
+        assert entry["release"] == expected and entry["release_note"]
+        assert "nearest" not in entry["release_note"].lower()
+        if entry["name"] == "glm53f-exl3-v1":
+            candidates = [d for _, d in reports if d["profile"] == "smoke" and
+                          d["server"]["model"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"]
+        else:
+            candidates = [d for p, d in reports if d["profile"] == "smoke" and p.parent.name.endswith("-" + entry["name"])]
+        assert report["created"] == max(d["created"] for d in candidates)

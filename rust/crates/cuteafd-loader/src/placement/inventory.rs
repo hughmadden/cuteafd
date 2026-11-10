@@ -14,6 +14,7 @@
 //! graphs are growth ([`Lifetime::Growth`]): reserved, but outside the ready
 //! ledger. S3's `GraphBank` consumes the same set as its warm list.
 use cuteafd_core::memory_layout::{Basis, Category};
+use cuteafd_core::GpuArch;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -26,8 +27,7 @@ const MIB: u64 = 1 << 20;
 /// A coordinator GPU class the planner can lay out without a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ArchContext {
-    /// `sm_120`, `sm_121`.
-    pub arch: &'static str,
+    pub arch: GpuArch,
     /// Card class: physical memory at most this many bytes (CUDA total).
     pub max_total_bytes: u64,
     /// The CUDA-reported total of the class's reference card (`cudaMemGetInfo`),
@@ -60,20 +60,28 @@ pub struct ArchContext {
 /// 2026-10-10): SM120 PRO 586,416,128 B context + 71,303,168 B cuBLAS =
 /// 657,719,296 B (rc3 MiMo `non_engine` samples agree: 586,416,128 /
 /// 596,901,888 B); GB10 by MemAvailable deltas (unified memory) 189-257 MiB
-/// context + 150-160 MiB cuBLAS, recorded at the larger sample.
+/// context + 150-160 MiB cuBLAS, recorded at the larger sample; RTX 4090 D 48 GB
+/// (SM89, 2026-11-04, driver 615.71.09) 374,472,704 B context + 11,534,336 B cuBLAS,
+/// identical on two cards and repeat runs.
+/// Every architecture ends with an unbounded class, so [`ArchContext::for_device`]
+/// always finds one (tested).
 pub const ARCH_CONTEXTS: &[ArchContext] = &[
-    ArchContext { arch: "sm_120", max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
+    ArchContext { arch: GpuArch::Sm120, max_total_bytes: 34 << 30, total_bytes: 0, sms: 170, context_bytes: 586_416_128,
         cublas_bytes: 71_303_168,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX 5090 class: SM120 PRO probe on the same driver/CUDA 13.2; SM count from the 5090 spec" },
-    ArchContext { arch: "sm_120", max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
+    ArchContext { arch: GpuArch::Sm120, max_total_bytes: u64::MAX, total_bytes: 101_973_491_712, sms: 188,
         context_bytes: 586_416_128, cublas_bytes: 71_303_168,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "595.91.07",
         source: "RTX PRO 6000 Blackwell probe (CUDA 13.2); Qwen 12,397 graphs = 1,855,979,520 B" },
-    ArchContext { arch: "sm_121", max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
+    ArchContext { arch: GpuArch::Sm121, max_total_bytes: u64::MAX, total_bytes: 130_594_156_544, sms: 48,
         context_bytes: 257 << 20, cublas_bytes: 160 << 20,
         peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "580.178.04",
         source: "GB10 probe (CUDA 13.0, MemAvailable deltas): context 189-257 MiB + cuBLAS 150-160 MiB; graph bytes from SM120" },
+    ArchContext { arch: GpuArch::Sm89, max_total_bytes: u64::MAX, total_bytes: 50_950_569_984, sms: 114,
+        context_bytes: 374_472_704, cublas_bytes: 11_534_336,
+        peer_context_bytes: 0, graph_executable_bytes: 149_712, driver: "615.71.09",
+        source: "RTX 4090 D 48 GB probe (CUDA 13.2, cuda-context-probe.cu, 2026-11-04); graph bytes from SM120" },
 ];
 
 /// The coordinator GPU budget `cuteafd plan` lays out without a device or a
@@ -82,19 +90,27 @@ pub const ARCH_CONTEXTS: &[ArchContext] = &[
 pub const PRO_TOTAL_BYTES: u64 = 101_973_491_712;
 
 impl ArchContext {
-    /// The class of a device with `total_bytes` of memory on `arch`, or the
-    /// PRO entry when nothing matches.
-    pub fn for_device(arch: &str, total_bytes: u64) -> &'static ArchContext {
+    /// The class of a device with `total_bytes` of memory on `arch`: the first
+    /// class of that architecture whose memory bound holds it. Unknown
+    /// architectures cannot reach this; they fail where they are parsed
+    /// ([`GpuArch::from_compute_capability`], [`GpuArch`]'s `FromStr`).
+    pub fn for_device(arch: GpuArch, total_bytes: u64) -> &'static ArchContext {
         ARCH_CONTEXTS.iter().find(|c| c.arch == arch && total_bytes <= c.max_total_bytes)
-            .unwrap_or(&ARCH_CONTEXTS[1])
+            .expect("ARCH_CONTEXTS ends every architecture with an unbounded class")
     }
 
-    /// The planner's coordinator class: SM120, sized by its card budget. A
+    /// The planner's coordinator class on `arch`, sized by its card budget. A
     /// simulated small card (`--coordinator-gpu-budget-gib` on a PRO) keeps the
-    /// PRO's SM count: the simulation caps memory only.
-    pub fn coordinator(total_bytes: u64, simulated_on: Option<&'static ArchContext>) -> ArchContext {
-        let class = *Self::for_device("sm_120", total_bytes);
+    /// physical card's SM count: the simulation caps memory only.
+    pub fn coordinator(arch: GpuArch, total_bytes: u64, simulated_on: Option<&'static ArchContext>) -> ArchContext {
+        let class = *Self::for_device(arch, total_bytes);
         match simulated_on { Some(physical) => ArchContext { sms: physical.sms, ..class }, None => class }
+    }
+
+    /// The CUDA-reported total of `arch`'s reference card: what `cuteafd plan`
+    /// lays out without a device or an explicit budget.
+    pub fn reference_total_bytes(arch: GpuArch) -> u64 {
+        Self::for_device(arch, u64::MAX).total_bytes
     }
 }
 
@@ -278,14 +294,15 @@ impl ProgramSet {
     /// Selected runtime program names use the same prefix filter as PROGRAMS.json.
     pub fn from_names<'a>(families: &[&str], names: impl IntoIterator<Item = &'a str>) -> Self {
         Self { families: families.iter().map(|f| f.to_string()).collect(),
-            names: names.into_iter().filter(|name| name.split_once('_')
-                .is_some_and(|(prefix, _)| families.contains(&prefix))).map(str::to_string).collect(),
+            names: names.into_iter().filter(|name| cuteafd_core::coordinator_programs::program_namespace(name)
+                .is_some_and(|prefix| families.contains(&prefix))).map(str::to_string).collect(),
             scratch: Vec::new() }
     }
 
     /// Programs of `families` in `manifest` (PROGRAMS.json).
     pub fn from_manifest(manifest: &Value, families: &[&str]) -> Self {
-        let keep = |name: &str| name.split_once('_').is_some_and(|(prefix, _)| families.contains(&prefix));
+        let keep = |name: &str| cuteafd_core::coordinator_programs::program_namespace(name)
+            .is_some_and(|prefix| families.contains(&prefix));
         let mut names = Vec::new();
         let mut scratch = Vec::new();
         for program in manifest["programs"].as_array().into_iter().flatten() {
@@ -306,10 +323,12 @@ impl ProgramSet {
         -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         ensure!((1..=4096).contains(&rows) && sms > 0, "invalid V4.1 FP8 plan geometry");
-        let compiled = [1, 16, 80, 256, 1024, 4096].into_iter().find(|&n| n >= rows).unwrap();
-        let capacities: Vec<_> = [1, 16, 80].into_iter().filter(|&n| n < compiled).chain([compiled]).collect();
+        let covers = if rows == 40 || rows == cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { [1, 16, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64, cuteafd_core::V41_DRAFT_WIDE_ROWS as u64, 1024, 4096] } else { cuteafd_core::V41_TARGET_CAPACITIES };
+        let compiled = covers.into_iter().find(|&n| n >= rows).unwrap();
+        let capacities: Vec<_> = covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled]).collect();
         let variants = manifest["variants"].as_array().context("missing V4.1 FP8 variants")?;
-        let card = if sms >= 188 { 188 } else { 170 };
+        // Exact SM count: a card without its own plan fails closed below.
+        let card = u64::from(sms);
         let mut names = Vec::new();
         let mut scratch = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
@@ -363,7 +382,8 @@ impl ProgramSet {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        name.split_once('_').is_some_and(|(prefix, _)| self.families.iter().any(|f| f == prefix))
+        cuteafd_core::coordinator_programs::program_namespace(name)
+            .is_some_and(|prefix| self.families.iter().any(|f| f == prefix))
     }
 
     /// Module bytes the family's programs take on one device: measured
@@ -544,16 +564,14 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
     format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
-    use crate::formats::fp8_experts::ExpertFormat;
-    let a4 = (format == ExpertFormat::Nvfp4).then(|| format!("fp8-{family}-nvfp4a4"));
-    let name = a4.unwrap_or_else(|| format!("fp8-{family}{}", format.package_suffix()));
+    let name = format.package_name(family);
     let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
     Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
 }
 
 /// Mandatory native W4A4 dense package; missing exports never select W4A16.
 pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::path::PathBuf {
-    lib.join("fp8").join(format!("fp8-{geometry}-nvfp4a4")).join("tp1")
+    lib.join("fp8").join(crate::formats::fp8_experts::ExpertFormat::Nvfp4.package_name(geometry)).join("tp1")
 }
 
 pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
@@ -573,16 +591,36 @@ pub fn image_lib(manifest: Option<&std::path::Path>) -> std::path::PathBuf {
 /// every exported capacity up to the first at or above `rows`, each once.
 /// Multi-row decode also admits m80 for canonical m1 reduction geometry.
 pub fn exl3_capacities(rows: u64) -> Vec<u64> {
-    const CAPACITIES: [u64; 6] = [1, 16, 80, 256, 1024, 4096];
+    let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let required = if rows > 1 { rows.max(80) } else { 1 };
-    let top = CAPACITIES.into_iter().find(|&c| c >= required).unwrap_or(4096);
-    CAPACITIES.into_iter().filter(|&c| c <= top).collect()
+    let top = capacities.into_iter().find(|&c| c >= required).unwrap_or(4096);
+    capacities.into_iter().filter(|&c| c <= top).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_package_names_and_scratch_share_the_format_contract() {
+        use crate::formats::fp8_experts::ExpertFormat;
+        let dir = tempfile::tempdir().unwrap();
+        for family in ["glm", "glmf", "qwen4", "step5"] {
+            let name = ExpertFormat::Nvfp4.package_name(family);
+            assert_eq!(name, format!("fp8-{family}-nvfp4a4"));
+            let root = dir.path().join("fp8").join(&name);
+            std::fs::create_dir_all(root.join("tp1")).unwrap();
+            std::fs::write(root.join("manifest.json"), json!({"layouts":{"tp1":{
+                "capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16),
+                Some((name, 1024)));
+            assert_eq!(dense_package_directory(dir.path(), family), root.join("tp1"));
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).is_none());
+            std::fs::remove_file(root.join("manifest.json")).unwrap();
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
+        }
+    }
 
     #[test]
     fn startup_keys_match_planner_shapes_and_v41_rank_bytes() {
@@ -709,7 +747,8 @@ mod tests {
 
     #[test]
     fn exl3_capacities_list_4096_once() {
-        assert_eq!(exl3_capacities(4096), [1, 16, 80, 256, 1024, 4096]);
+        assert_eq!(exl3_capacities(4096), [1, 16, 80, 256, 1024, 2048, 2752, 4096]);
+        assert_eq!(exl3_capacities(2752), [1, 16, 80, 256, 1024, 2048, 2752]);
         assert_eq!(exl3_capacities(64), [1, 16, 80]);
         assert_eq!(exl3_capacities(1), [1]);
         assert_eq!(exl3_capacities(2), [1, 16, 80]);
@@ -753,8 +792,30 @@ mod tests {
     }
 
     #[test]
+    fn plain_glm_excludes_native_stage_names_scratch_and_module_charge() {
+        let manifest = json!({"programs": std::iter::once(json!({"name": "glm_producer_m64",
+            "scratch_bytes_at_capacity": {"scratch": 7}})).chain((0..32).map(|i| json!({
+                "name": format!("glm_stage_native_{i}"), "scratch_bytes_at_capacity": {"scratch": 999}
+            }))).chain(std::iter::once(json!({"name": "glm2_stage_swiglu_i1024"}))).collect::<Vec<_>>()});
+        for families in [&["glm"][..], &["glm", "glm2"][..]] {
+            let set = ProgramSet::from_manifest(&manifest, families);
+            let from_names = ProgramSet::from_names(families,
+                manifest["programs"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()));
+            assert_eq!(set.names, ["glm_producer_m64"]);
+            assert_eq!(set.names, from_names.names);
+            assert_eq!(set.scratch, [("glm_producer_m64".into(), 7)]);
+            assert_eq!(set.module_bytes(), 34 * MIB);
+            assert!(!set.contains("glm_stage_native_0") && !set.contains("glm2_stage_swiglu_i1024"));
+        }
+        let native = ProgramSet::from_manifest(&manifest, &["glm", "glm2", "glm_stage", "glm2_stage"]);
+        assert_eq!(native.names.len(), 34);
+        assert_eq!(native.module_bytes(), 38 * MIB);
+        assert!(native.contains("glm_stage_native_0") && native.contains("glm2_stage_swiglu_i1024"));
+    }
+
+    #[test]
     fn v41_fp8_retains_aligned_capacity_arenas_and_selects_physical_sms() {
-        let variants = [1, 16, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
+        let variants = [1, 16, 64, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
             let plans: &[u64] = if capacity <= 16 { &[170, 188] } else { &[0] };
             plans.iter().map(move |&sms| json!({"capacity": capacity, "plan_sms": sms,
                 "input_dim": 5120, "output_dim": 1280,
@@ -763,8 +824,9 @@ mod tests {
         }).collect::<Vec<_>>();
         let manifest = json!({"variants": variants});
         let expected = |rows: u64, sms: u64| {
-            let compiled = [1,16,80,256,1024,4096].into_iter().find(|&n| n >= rows).unwrap();
-            [1,16,80].into_iter().filter(|&n| n < compiled).chain([compiled])
+            let covers = if matches!(rows, 40 | 80) { [1,16,80,256,1024,4096] } else { [1,16,64,256,1024,4096] };
+            let compiled = covers.into_iter().find(|&n| n >= rows).unwrap();
+            covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled])
                 .map(|n| (n * 257 + if n <= 16 { sms } else { 0 }).div_ceil(256) * 256)
                 .sum::<u64>()
         };
@@ -799,7 +861,7 @@ mod tests {
     #[test]
     fn v41_output_reduction_is_immutable_across_retained_capacities() {
         for n in [2560, 5120] {
-            let variants = [1,16,80,256,1024,4096].into_iter().map(|capacity|
+            let variants = [1,16,64,80,256,1024,4096].into_iter().map(|capacity|
                 json!({"capacity":capacity, "plan_sms":0, "input_dim":8192, "output_dim":n,
                     "label":format!("v41_output_{n}_m{capacity}"), "scratch_bytes":capacity * 257,
                     "expected_m":if capacity <= 80 {16} else {capacity},
@@ -812,7 +874,8 @@ mod tests {
             for (field, value) in [("expected_m", json!(80)), ("split_k_slices", json!(2)),
                 ("all_rows", json!(false))] {
                 let mut changed = manifest.clone();
-                changed["variants"][2][field] = value;
+                changed["variants"][2][field] = value.clone();
+                changed["variants"][3][field] = value;
                 assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 80,188).is_err(), "{field}");
                 assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 4096,188).is_err(), "{field}");
             }
@@ -824,9 +887,23 @@ mod tests {
 
     #[test]
     fn simulated_small_cards_keep_the_physical_sm_count() {
-        let pro = ArchContext::for_device("sm_120", 96 << 30);
+        let pro = ArchContext::for_device(GpuArch::Sm120, 96 << 30);
         assert_eq!(pro.sms, 188);
-        assert_eq!(ArchContext::coordinator(32 << 30, Some(pro)).sms, 188);
-        assert_eq!(ArchContext::coordinator(32 << 30, None).sms, 170);
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm120, 32 << 30, Some(pro)).sms, 188);
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm120, 32 << 30, None).sms, 170);
+    }
+
+    #[test]
+    fn every_arch_has_a_class_and_ada_is_not_planned_as_a_pro() {
+        for arch in GpuArch::ALL {
+            assert_eq!(ArchContext::for_device(arch, u64::MAX).arch, arch);
+            assert_eq!(ArchContext::for_device(arch, 0).arch, arch);
+        }
+        let ada = ArchContext::for_device(GpuArch::Sm89, 50_950_569_984);
+        assert_eq!((ada.sms, ada.total_bytes), (114, 50_950_569_984));
+        assert_eq!(ArchContext::coordinator(GpuArch::Sm89, 47 << 30, None).sms, 114);
+        assert_eq!(ArchContext::reference_total_bytes(GpuArch::Sm89), 50_950_569_984);
+        assert_eq!(ArchContext::reference_total_bytes(GpuArch::Sm120), PRO_TOTAL_BYTES);
+        assert_eq!(serde_json::to_value(ada).unwrap()["arch"], "sm_89");
     }
 }

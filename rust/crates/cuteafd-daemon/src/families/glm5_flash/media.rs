@@ -11,26 +11,45 @@ pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Resu
     Ok(config.get("vision_config").is_some().then_some(config))
 }
 
-pub(super) struct RemoteVision {
+pub(crate) fn local_vision_gpu(mode: MediaMode, device: i32, split_device: Option<i32>) -> Result<i32> {
+    // Explicit CLI indices name CUDA devices; only defaults use logical ranks.
+    if let MediaMode::Rtx(Some(gpu)) = mode { return Ok(i32::try_from(gpu)?); }
+    let rank = cuteafd_loader::plan::encoder::rtx_encoder_gpu(mode, false, 1 + usize::from(split_device.is_some()));
+    Ok(if rank == 0 { device } else { split_device.context("vision peer GPU")? })
+}
+
+pub(crate) struct RemoteVision {
     addresses: Vec<std::net::SocketAddr>,
     plan_hash: [u8; 32],
     revision: String,
 }
 impl RemoteVision {
+    pub(crate) fn revision(&self) -> &str { &self.revision }
+    pub(crate) fn plan_hash(&self) -> [u8; 32] { self.plan_hash }
+    /// Connects every replica with the coordinator's expected handshake.
+    pub(crate) fn connect(self, expected: crate::shared::vision::remote::EncoderHandshake) -> Result<Encoder> {
+        Ok(Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect(self.addresses, expected,
+            std::time::Duration::from_secs(60))?))
+    }
     pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
-        let Some(peers) = &args.vision_peers else {
-            anyhow::ensure!(args.encoder_plan_hash.is_none() && args.encoder_revision.is_none(),
+        Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())
+    }
+    /// The planner-resolved Spark encoder endpoints from their CLI values (any serve family).
+    pub(crate) fn from_parts(vision: MediaMode, peers: Option<&str>, plan_hash: Option<&str>, revision: Option<&str>)
+        -> Result<Option<Self>> {
+        let Some(peers) = peers else {
+            anyhow::ensure!(plan_hash.is_none() && revision.is_none(),
                 "encoder plan hash/revision require --vision-peers");
             return Ok(None);
         };
-        anyhow::ensure!(matches!(args.vision, MediaMode::Auto | MediaMode::Spark(_)),
+        anyhow::ensure!(matches!(vision, MediaMode::Auto | MediaMode::Spark(_)),
             "--vision-peers requires Spark/auto vision placement");
         let addresses = peers.split(',').map(|peer| peer.trim().parse()
             .context("vision peer must be an IP:port")).collect::<Result<Vec<_>>>()?;
-        anyhow::ensure!((1..=6).contains(&addresses.len()), "vision needs 1..6 replicas");
-        let plan_hash = crate::shared::vision::worker::parse_plan_hash(args.encoder_plan_hash.as_deref()
+        anyhow::ensure!((1..=8).contains(&addresses.len()), "vision needs 1..8 replicas");
+        let plan_hash = crate::shared::vision::worker::parse_plan_hash(plan_hash
             .context("--vision-peers requires --encoder-plan-hash")?)?;
-        let revision = args.encoder_revision.clone().context("--vision-peers requires --encoder-revision")?;
+        let revision = revision.context("--vision-peers requires --encoder-revision")?.to_owned();
         anyhow::ensure!(!revision.is_empty(), "encoder revision must not be empty");
         Ok(Some(Self { addresses, plan_hash, revision }))
     }
@@ -58,7 +77,7 @@ impl ReadyVision {
             anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "GLM Flash tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,
@@ -67,11 +86,11 @@ impl ReadyVision {
             return Ok((Some(Self { encoder: Encoder::Remote(encoder), preparer, cache_bytes }), prefix));
         }
         let gpu = match mode {
-            MediaMode::Rtx(gpu) => gpu.map(|gpu| i32::try_from(gpu)).transpose()?.unwrap_or(args.device),
+            MediaMode::Rtx(_) => local_vision_gpu(mode, args.device, args.split_device)?,
             MediaMode::Auto => {
                 anyhow::ensure!(args.peers.is_none() || args.local_experts,
                     "auto vision with Spark experts requires planner-resolved --vision-peers");
-                args.device
+                local_vision_gpu(mode, args.device, args.split_device)?
             },
             MediaMode::Spark(_) => anyhow::bail!("Spark vision placement requires --vision-peers, --encoder-plan-hash and --encoder-revision"),
             MediaMode::Off => unreachable!(),
@@ -102,7 +121,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
+pub(crate) enum Encoder {
     Local(crate::shared::vision::local::LocalEncoder),
     Remote(crate::shared::vision::remote::RemoteEncoder),
     Off,
@@ -128,7 +147,7 @@ impl cuteafd_engine::media::EncoderClient for Encoder {
         match self { Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket), Self::Off => () }
     }
 }
-pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
+pub(crate) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
         cuteafd_engine::media::MediaError::Encoder(_) => cuteafd_api::openai::NativeFailure::Unavailable("vision encoder unavailable".into()),
         error @ (cuteafd_engine::media::MediaError::QueueFull | cuteafd_engine::media::MediaError::CacheFull { .. }) =>
@@ -149,22 +168,8 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         let images = job.media.iter().map(|image| image.as_ref().clone()).collect::<Vec<_>>();
         if job.probe.as_ref().is_some_and(|p| p.spec.prompt_ids.is_some() && !images.is_empty()) {
             let probe = job.probe.as_ref().unwrap();
-            probe.spec.validate_media()?;
-            anyhow::ensure!(probe.spec.media.len() == images.len() && tokens.len() <= max_context,
-                "expanded probe media count/context differs");
-            anyhow::ensure!(tokens.iter().all(|&id| id < expander.vocabulary), "probe token outside vocabulary");
-            let mut spans = Vec::with_capacity(images.len());
-            for (span, image) in probe.spec.media.iter().zip(&images) {
-                let end = span.start.checked_add(span.len).context("probe media extent")?;
-                anyhow::ensure!(span.len == image.tokens && span.grid == [image.grid.t, image.grid.h, image.grid.w]
-                    && span.key == key_hex(image.key), "probe prepared image identity differs");
-                anyhow::ensure!(span.start > 0 && end < tokens.len() && tokens[span.start - 1] == expander.start
-                    && tokens[end] == expander.end && tokens[span.start..end].iter().all(|&id| id == expander.placeholder),
-                    "probe image rows/marker boundaries differ");
-                spans.push(cuteafd_loader::media::MediaSpan { start: span.start, len: span.len, key: image.key.into() });
-            }
-            anyhow::ensure!(tokens.iter().filter(|&&id| id == expander.placeholder).count()
-                == spans.iter().map(|span| span.len).sum::<usize>(), "unbound probe image placeholders");
+            let spans = crate::shared::probe::image_spans(&probe.spec, &tokens, &images,
+                crate::shared::probe::ImageMarkers::Bounded(expander), max_context)?;
             (tokens, spans)
         } else {
             let expanded = expander.expand(&tokens, &images, max_context)?;
@@ -174,33 +179,11 @@ pub(super) fn prepare(job: NativeRequest, tokens: Vec<u32>, config: &serde_json:
         anyhow::ensure!(job.media.is_empty(), "checkpoint has no vision tower");
         (tokens, Vec::new())
     };
-    if let Some(probe) = &job.probe {
-        anyhow::ensure!(spans.len() == job.media.len(), "probe image count differs");
-        let echo = spans.iter().zip(&job.media).enumerate().map(|(i, (span, image))| {
-            cuteafd_api::openai::probe::ProbeMedia { start: span.start, len: span.len, kind: "image".into(),
-                key: key_hex(span.key), grid: [image.grid.t, image.grid.h, image.grid.w],
-                fixture: probe.spec.media.get(i).and_then(|s| s.fixture.clone()), image_url: None }
-        }).collect();
-        probe.media(echo);
-    }
+    crate::shared::probe::image_echo(&job, &spans)?;
     let media = RequestMedia::new(spans.clone(), hidden, tokens.len())?;
     let keys = MediaKeys::new(&tokens, vocabulary as u32, &spans)?;
     let jobs = job.media.iter().map(|image| EncodeJob::image(image.key, [image.grid.t, image.grid.h, image.grid.w], image.rgb8.clone(), image.tokens, hidden)).collect();
     Ok((Prompt { job, tokens, keys }, media, jobs))
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FeatureMetadata {
-    schema: String,
-    key: String,
-    grid: [u32; 3],
-    shape: [usize; 2],
-    dtype: String,
-    sha256: String,
-    tower_dtype: String,
-    fixture_sha256: String,
-    snapshot_identity: serde_json::Value,
 }
 
 fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
@@ -220,44 +203,9 @@ fn snapshot_identity(snapshot: &std::path::Path) -> Result<serde_json::Value> {
     Ok(identity)
 }
 
-fn read_bounded(path: &std::path::Path, limit: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let file = std::fs::File::open(path)?;
-    anyhow::ensure!(file.metadata()?.len() <= limit as u64, "feature file exceeds bound");
-    let mut bytes = Vec::new(); file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    anyhow::ensure!(bytes.len() <= limit, "feature file exceeds bound");
-    Ok(bytes)
-}
-
-fn feature_payload(path: &std::path::Path, bytes: usize, sha256: &str, cached: Option<&Arc<[u8]>>) -> Result<Arc<[u8]>> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    if let Some(cached) = cached {
-        // Revalidate disk bytes without allocating a second feature-sized payload on a warm hit.
-        let mut file = std::fs::File::open(path)?;
-        anyhow::ensure!(file.metadata()?.len() == bytes as u64, "reference feature payload length differs");
-        let mut hash = Sha256::new(); let mut offset = 0usize; let mut buffer = [0; 8192];
-        loop {
-            let n = file.read(&mut buffer)?; if n == 0 { break; }
-            anyhow::ensure!(offset.checked_add(n).is_some_and(|end| end <= bytes)
-                && cached.get(offset..offset + n) == Some(&buffer[..n]), "reference feature payload differs");
-            hash.update(&buffer[..n]); offset += n;
-        }
-        anyhow::ensure!(offset == bytes && format!("{:x}", hash.finalize()) == sha256, "reference feature payload hash differs");
-        return Ok(cached.clone());
-    }
-    let payload = read_bounded(path, bytes)?;
-    anyhow::ensure!(payload.len() == bytes && format!("{:x}", Sha256::digest(&payload)) == sha256,
-        "reference feature payload length/hash differs");
-    anyhow::ensure!(payload.chunks_exact(2).all(|b| (u16::from_le_bytes([b[0], b[1]]) & 0x7f80) != 0x7f80),
-        "reference features contain nonfinite BF16 values");
-    Ok(Arc::from(payload))
-}
-
-pub(super) fn reference_probe(probe: &crate::shared::probe::ProbeRef) -> bool {
-    std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR").is_some() && probe.as_ref().is_some_and(|p|
-        p.spec.cold && p.spec.no_speculation && p.spec.score_from.is_some() && !p.spec.media.is_empty())
-}
+pub(super) use crate::shared::probe::features::reference_probe;
+#[cfg(test)]
+use crate::shared::probe::features::feature_payload;
 
 /// Strict paired-G4 hook. Only scoring probes bypass the encoder; ordinary
 /// generation remains native. Separate cache identities cannot warm native images.
@@ -274,45 +222,8 @@ pub(super) fn probe_features(prompt: &Prompt, media: &mut RequestMedia,
 
 fn apply_probe_features(prompt: &Prompt, media: &mut RequestMedia,
     cache: &mut cuteafd_engine::media::EmbeddingCache, root: &std::path::Path, identity: &serde_json::Value) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    let probe = prompt.job.probe.as_ref().context("features require a probe")?;
-    anyhow::ensure!(probe.spec.cold && probe.spec.no_speculation && probe.spec.score_from.is_some()
-        && !probe.spec.media.is_empty(), "features require a cold, speculation-free media scoring probe");
-    let root = root.canonicalize()?;
-    let mut provenance = Vec::new();
-    for span in &probe.spec.media {
-        let fixture = span.fixture.as_ref().context("feature probes require fixture identity")?;
-        anyhow::ensure!(cuteafd_api::openai::probe::sha256_hex(&span.key), "invalid feature key");
-        let metadata_path = root.join(format!("{}.json", span.key)).canonicalize()?;
-        let payload_path = root.join(format!("{}.bf16", span.key)).canonicalize()?;
-        anyhow::ensure!(metadata_path.starts_with(&root) && payload_path.starts_with(&root), "feature path escapes root");
-        let raw = read_bounded(&metadata_path, 64 << 10)?;
-        let meta: FeatureMetadata = serde_json::from_slice(&raw)?;
-        anyhow::ensure!(meta.schema == "cuteafd.media.features/1" && meta.key == span.key && meta.grid == span.grid
-            && meta.shape == [span.len, media.row_bytes() / 2] && meta.dtype == "bf16-le"
-            && matches!(meta.tower_dtype.as_str(), "bf16" | "fp32")
-            && cuteafd_api::openai::probe::sha256_hex(&meta.sha256)
-            && meta.fixture_sha256 == fixture.sha256 && meta.snapshot_identity == *identity,
-            "reference feature metadata differs from prepared request/snapshot");
-        let bytes = span.len.checked_mul(media.row_bytes()).context("feature byte extent")?;
-        let mut hash = Sha256::new();
-        hash.update(b"cuteafd.probe.feature_override/1\0"); hash.update(span.key.as_bytes()); hash.update(&raw);
-        let override_key = cuteafd_loader::media::ImageKey(hash.finalize().into());
-        let image = prompt.job.media.iter().find(|i| key_hex(i.key) == span.key).context("feature span has no prepared image")?;
-        // Admission precedes payload allocation, including on a warm override-cache hit.
-        let pin = cache.reserve(override_key, bytes)?;
-        let payload = feature_payload(&payload_path, bytes, &meta.sha256, pin.features())?;
-        let lease = cache.complete(override_key, payload)?;
-        media.attach_probe_override(image.key, lease)?; drop(pin);
-        provenance.push(serde_json::from_slice::<serde_json::Value>(&raw)?);
-    }
-    probe.provenance(serde_json::json!({"mode": "reference_features", "probe_only": true,
-        "encoder_bypassed": true, "modeling_source_revision": "62d7ebd7de4938e072b7aaeb881593b79dc56835", "features": provenance}));
-    Ok(())
-}
-
-fn key_hex(key: impl Into<cuteafd_core::MediaKey>) -> String {
-    key.into().bytes().iter().map(|b| format!("{b:02x}")).collect()
+    crate::shared::probe::features::apply_probe_features(&prompt.job, media, cache, root, identity,
+        "62d7ebd7de4938e072b7aaeb881593b79dc56835")
 }
 
 #[cfg(test)]
@@ -320,6 +231,19 @@ mod tests {
     use super::*;
     use cuteafd_core::TargetSamplingParams;
     use cuteafd_loader::media::{ImageGrid, ImageKey, PreparedImage};
+
+    #[test]
+    fn local_encoder_defaults_match_planner_and_map_logical_ranks() {
+        for mode in [MediaMode::Auto, MediaMode::Rtx(None)] {
+            for (device, peer) in [(0, None), (3, None), (0, Some(1)), (1, Some(0)), (3, Some(5))] {
+                let rank = cuteafd_loader::plan::encoder::rtx_encoder_gpu(mode, false, 1 + usize::from(peer.is_some()));
+                assert_eq!(local_vision_gpu(mode, device, peer).unwrap(),
+                    if rank == 0 { device } else { peer.unwrap() });
+            }
+        }
+        assert_eq!(local_vision_gpu(MediaMode::Rtx(Some(0)), 1, Some(0)).unwrap(), 0);
+        assert_eq!(local_vision_gpu(MediaMode::Rtx(Some(3)), 0, None).unwrap(), 3);
+    }
 
     #[test]
     fn remote_options_require_complete_identity_and_valid_placement() {
@@ -360,7 +284,7 @@ mod tests {
         assert!(matches!(failure(MediaError::Features), NativeFailure::BadRequest(_)));
     }
     fn request(images: Vec<Arc<PreparedImage>>) -> NativeRequest {
-        NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
+        NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: images, audio: Vec::new(),
             max_tokens: 8, sampling: TargetSamplingParams::default(), stop_token_ids: Vec::new(),
             events: tokio::sync::mpsc::unbounded_channel().0, usage: None, probe: None }
     }
@@ -369,7 +293,7 @@ mod tests {
             "image_start_token_id": 4, "image_end_token_id": 6})
     }
     fn image() -> Arc<PreparedImage> {
-        Arc::new(PreparedImage { key: ImageKey([7; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
+        Arc::new(PreparedImage { key: ImageKey([7; 32]), encoder: cuteafd_loader::media::EncoderId([0; 32]), processor: cuteafd_loader::media::PreprocessId([0; 32]), grid: ImageGrid { t: 1, h: 4, w: 4 },
             rgb8: Arc::from(vec![0; 4 * 4 * 14 * 14 * 3]), tokens: 4 })
     }
     fn feature_request() -> (Prompt, RequestMedia, serde_json::Value) {
@@ -377,7 +301,7 @@ mod tests {
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let spec = ProbeSpec { prompt_ids: Some(tokens.clone()), cold: true, no_speculation: true, score_from: Some(7),
             media: vec![ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-                fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+                identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
                 image_url: Some(ProbeImageUrl { url: "fixture".into(), detail: None }) }], ..Default::default() };
         let mut job = request(vec![image()]); job.probe = Some(Probe::new(spec));
         let (prompt, media, _) = prepare(job, tokens, &config(), 32, 2, 16).unwrap();
@@ -571,7 +495,7 @@ mod tests {
         use cuteafd_api::openai::probe::{Probe, ProbeSpec, ProbeMedia, ProbeImageUrl, ProbeFixture};
         let tokens = vec![1, 4, 5, 5, 5, 5, 6, 2];
         let span = ProbeMedia { start: 2, len: 4, kind: "image".into(), key: "07".repeat(32), grid: [1, 4, 4],
-            fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
+            identity: None, input_key: None, fixture: Some(ProbeFixture { path: "chart.png".into(), sha256: "ab".repeat(32) }),
             image_url: Some(ProbeImageUrl { url: "data:image/png;base64,fixture".into(), detail: None }) };
         let run = |span: ProbeMedia, tokens: Vec<u32>| {
             let probe = Probe::new(ProbeSpec { prompt_ids: Some(tokens.clone()), media: vec![span], ..Default::default() });

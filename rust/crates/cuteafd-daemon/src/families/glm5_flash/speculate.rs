@@ -3,7 +3,7 @@
 //! verify-by-replay against serial steps, and the verify-step cost by rows.
 use super::engine::{Allocator, GlmfEngine, GlmfPlacement};
 use super::{bf16s, similarity, GoldenArgs, Opened};
-use crate::families::glm5::dflash::{ContextRow, DraftSeq, RING, TAP_ROWS};
+use crate::shared::speculation::dflash::{ContextRow, DraftSeq, RING, TAP_ROWS};
 use anyhow::{ensure, Context, Result};
 use std::time::Instant;
 
@@ -130,10 +130,10 @@ pub(super) fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
     Ok(())
 }
 
-/// [`crate::families::glm5::dflash::replay`] on the golden taps (mHC stream means).
+/// [`crate::shared::speculation::dflash::replay`] on the golden taps (mHC stream means).
 pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngine<'_>, start: usize) -> Result<()> {
     let drafter = engine.drafter.as_ref().context("--draft-replay needs --draft")?;
-    let (tokens, greedy) = crate::families::glm5::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
+    let (tokens, greedy) = crate::shared::speculation::dflash::golden_sequence(&args.golden, opened.cfg.vocab_size)?;
     let hidden = opened.cfg.hidden;
     let layers: Vec<Vec<u8>> = drafter.taps().iter()
         .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
@@ -148,7 +148,7 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
         }
         Ok(taps)
     };
-    crate::families::glm5::dflash::replay_with(drafter.replay(), &tokens, &greedy, &taps,
+    crate::shared::speculation::dflash::replay_with(drafter.replay(), &tokens, &greedy, &taps,
         &|t| engine.embedding.host_rows(t), &|sequences, _| {
             Ok(drafter.draft_device_diagnostic(sequences, &engine.embedding, engine.draft_head())?.into_iter()
                 .map(|draft| draft.tokens).collect())
@@ -156,17 +156,17 @@ pub(super) fn draft_replay(args: &GoldenArgs, opened: &Opened, engine: &GlmfEngi
 }
 
 /// A drafter setting: (--draft-head, --draft-linear).
-type DraftMode = (crate::families::glm5::DraftHead, crate::shared::fp8_linear::Fp8Rows);
+type DraftMode = (crate::shared::speculation::dflash::DraftHead, crate::shared::fp8_linear::Fp8Rows);
 
 /// The setting [`draft_modes`] compares against and builds every context under: the defaults.
 const REFERENCE_MODE: DraftMode =
-    (crate::families::glm5::DraftHead::Exact, crate::shared::fp8_linear::Fp8Rows::W8a16);
+    (crate::shared::speculation::dflash::DraftHead::Exact, crate::shared::fp8_linear::Fp8Rows::W8a16);
 
 /// The settings [`draft_modes`] compares: both heads under every linear mode an FP8 drafter's
 /// scratch admits (`admitted`, its load's mode, and the modes before it), the head alone for a
 /// BF16 drafter. The first is [`REFERENCE_MODE`].
 fn draft_mode_settings(fp8: bool, admitted: crate::shared::fp8_linear::Fp8Rows) -> Vec<DraftMode> {
-    use crate::families::glm5::DraftHead;
+    use crate::shared::speculation::dflash::DraftHead;
     use crate::shared::fp8_linear::Fp8Rows;
     [Fp8Rows::W8a16, Fp8Rows::Wide, Fp8Rows::W8a8].into_iter()
         .filter(|&linear| linear == Fp8Rows::W8a16 || (fp8 && linear <= admitted))
@@ -1088,7 +1088,7 @@ pub(super) fn bench_verify(args: &GoldenArgs, engine: &GlmfEngine<'_>, max_rows:
 #[cfg(test)]
 mod draft_mode_tests {
     use super::*;
-    use crate::families::glm5::DraftHead;
+    use crate::shared::speculation::dflash::DraftHead;
     use crate::shared::fp8_linear::Fp8Rows;
 
     #[test]

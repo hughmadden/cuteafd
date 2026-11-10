@@ -31,7 +31,8 @@ impl<'a> Compiler<'a> {
     pub fn matcher(&mut self, spec: &NativeConstraint) -> Result<State<'a>> {
         if self.compiler.is_none() {
             let stops: Vec<i32> = self.stops.iter().map(|&s| s as i32).collect();
-            self.compiler = Some(self.library.xgrammar_compiler(&self.tokenizer, self.vocab, &stops)?);
+            let tokenizer = grammar_tokenizer_json(&self.tokenizer)?;
+            self.compiler = Some(self.library.xgrammar_compiler_json(&tokenizer, self.vocab, &stops)?);
         }
         let grammar = if let Some(grammar) = self.grammars.get(spec) { grammar.clone() } else {
             let grammar = Arc::new(self.compiler.as_ref().unwrap().compile(
@@ -47,6 +48,15 @@ impl<'a> Compiler<'a> {
         self.order.push_back(spec.clone());
         Ok(State { matcher: grammar.matcher()?, mask: vec![0; self.vocab.div_ceil(32)], stops: self.stops.clone(),
             terminated: false })
+    }
+}
+
+fn grammar_tokenizer_json(tokenizer: &std::path::Path) -> Result<String> {
+    if tokenizer.file_name().is_some_and(|name| name == "tokenizer.json") {
+        let snapshot = tokenizer.parent().ok_or_else(|| anyhow::anyhow!("grammar tokenizer has no parent"))?;
+        cuteafd_loader::cached_tokenizer(snapshot)?.grammar_tokenizer_json()
+    } else {
+        cuteafd_loader::LoadedTokenizer::from_file(tokenizer)?.grammar_tokenizer_json()
     }
 }
 
@@ -221,6 +231,256 @@ impl State<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grammar_input_uses_loaded_tiktoken_without_tokenizer_json() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(dir.path());
+        let document = grammar_tokenizer_json(&dir.path().join("tokenizer.json"))?;
+        let value: serde_json::Value = serde_json::from_str(&document)?;
+        assert_eq!(value["model"]["type"], "BPE");
+        assert!(value["added_tokens"].as_array().unwrap().iter()
+            .any(|token| token["content"] == "<|open|>" && token["id"] == 256));
+        assert_eq!(crate::shared::prefix::marker_ids(dir.path(), &["missing", "<|open|>"])?, [256]);
+        assert!(!dir.path().join("tokenizer.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn native_grammar_accepts_tiktoken_snapshot_when_library_present() -> Result<()> {
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else { return Ok(()); };
+        // SAFETY: the library outlives every compiler and matcher in this test.
+        let library = unsafe { NativeLibrary::load(path)? };
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(dir.path());
+        let mut compiler = Compiler::with_vocab(&library, dir.path().join("tokenizer.json"), 512, vec![257]);
+        let spec = cuteafd_api::openai::NativeConstraint(serde_json::json!({
+            "type":"structural_tag", "format":{"type":"ds41_json_schema", "strict":true, "json_schema":{
+                "type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false
+            }}
+        }).to_string());
+        let mut state = compiler.matcher(&spec)?;
+        for byte in br#"{"x":"a"}"# { state.accept(u32::from(*byte))?; }
+        assert!(state.matcher.is_completed()?);
+        assert!(!dir.path().join("tokenizer.json").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kimi_xtml_constraints_use_native_string_tags() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let temp = tempfile::tempdir().unwrap();
+        let mut added = serde_json::Map::new();
+        for (id, content) in [(163587,"<|open|>"),(163588,"<|close|>"),(163589,"<|sep|>"),(163586,"<|end_of_msg|>")] {
+            added.insert(id.to_string(), json!({"content":content}));
+        }
+        std::fs::write(temp.path().join("tokenizer_config.json"), json!({"added_tokens_decoder":added}).to_string()).unwrap();
+        std::fs::write(temp.path().join("generation_config.json"), json!({"eos_token_id":163586}).to_string()).unwrap();
+        let encoding = Arc::new(openai::chat::kimi::KimiEncoding::from_snapshot(temp.path()).unwrap());
+        // Byte vocabulary makes every part of an XTML delimiter span tokens.
+        let mut vocab = serde_json::Map::new();
+        for ch in 32u8..127 { vocab.insert((ch as char).to_string(), json!(ch-32)); }
+        vocab.insert("<eos>".into(), json!(95));
+        let tokenizer = temp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, json!({"version":"1.0", "added_tokens":[],
+            "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"?"}}).to_string()).unwrap();
+        for thinking in [false, true] {
+            for required in [false, true] {
+                let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+                let profile = ModelProfile::new("kimi-fixture", ModelEncoding::Kimi(encoding.clone()));
+                let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                    std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+                let body = json!({"model":"kimi-fixture", "messages":[{"role":"user","content":"Return JSON"}],
+                    "enable_thinking":thinking, "tool_choice":if required {"required"} else {"auto"},
+                    "tools":[{"type":"function","function":{"name":"lookup","strict":true,
+                        "parameters":{"type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false}}}],
+                    "response_format":{"type":"json_object"}});
+                let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                    .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+                let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+                let mut compiler = Compiler::with_vocab(&library, tokenizer.clone(), 96, vec![95]);
+                let spec = request.constraint.as_ref().unwrap();
+                let mut state = compiler.matcher(spec).unwrap();
+                let prefix = if thinking {"reason<|close|>think<|sep|><|open|>response<|sep|>"} else {""};
+                let wire = if required {
+                    format!("{prefix}<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>{{\"x\":\"a\"}}<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>")
+                } else { format!("{prefix}{{\"ok\":true}}<|close|>response<|sep|><|close|>message<|sep|>") };
+                for (at, byte) in wire.bytes().enumerate() {
+                    state.accept((byte-32) as u32).unwrap_or_else(|e| panic!("thinking={thinking} required={required} byte {at}: {e:#}"));
+                }
+                assert!(state.matcher.is_completed().unwrap());
+                state.accept(95).unwrap();
+                // Optional assisted tools may follow visible response text too.
+                let calls = format!("{prefix}I will look it up.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"lookup\" index=\"1\"<|sep|><|open|>json type=\"object\"<|sep|>{{\"x\":\"a\"}}<|close|>json<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>");
+                let mut with_response = compiler.matcher(spec).unwrap();
+                for byte in calls.bytes() { with_response.accept((byte-32) as u32).unwrap(); }
+                assert!(with_response.matcher.is_completed().unwrap());
+                with_response.accept(95).unwrap();
+                // Schema remains active after the entire multi-token reasoning gate.
+                let mut invalid = compiler.matcher(spec).unwrap();
+                let bad = if required { wire.replace("\"a\"", "\"b\"") }
+                    else { wire.replace("{\"ok\":true}", "not-json") };
+                assert!(bad.bytes().any(|byte| invalid.accept((byte-32) as u32).is_err()));
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    /// Muse's recipient turn under constraint, through the API's own request
+    /// path and the checkpoint tokenizer: reasoning, commentary, a strict atem
+    /// call (required) or a JSON answer, the stop token at completion, and the
+    /// schema still enforced. Skips without the library or the snapshot.
+    #[tokio::test]
+    async fn muse_atem_constraints_drive_the_recipient_turn() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        let snapshots = std::path::Path::new(
+            "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
+        let Some(Ok(snapshot)) = std::fs::read_dir(snapshots).ok().and_then(|mut entries| entries.next()) else {
+            eprintln!("skipping: Muse snapshot absent");
+            return;
+        };
+        let snapshot = snapshot.path();
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let encoding = Arc::new(openai::chat::muse::MuseEncoding::from_snapshot(&snapshot).unwrap());
+        let tokenizer = cuteafd_loader::cached_tokenizer(&snapshot).unwrap();
+        let encode = |text: &str| tokenizer.encode_ids(text).unwrap();
+        for required in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("muse-fixture", ModelEncoding::Muse(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"muse-fixture", "messages":[{"role":"user","content":"Weather? Answer in JSON."}],
+                "tool_choice":if required {"required"} else {"auto"},
+                "tools":[{"type":"function","function":{"name":"get_weather","strict":true,
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer","maximum":7}},
+                        "required":["city","days"],"additionalProperties":false}}}],
+                "response_format":{"type":"json_object"}});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            let mut compiler = Compiler::with_vocab(&library, snapshot.join("tokenizer.json"), 202048,
+                encoding.tokens().eos.clone());
+            let spec = request.constraint.as_ref().unwrap();
+            let lead = " to=self<|message|>Think about it.<|eom|><|start|>assistant to=commentary<|message|>Checking.<|eom|><|start|>assistant";
+            let call = " to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n\
+                <atem:parameter name=\"city\">台北</atem:parameter>\n<atem:parameter name=\"days\">3</atem:parameter>\n\
+                </atem:invoke>\n</atem:function_calls>";
+            let answer = " to=user<|message|>{\"ok\": true}";
+            let mut run = |text: &str| -> Result<bool> {
+                let mut state = compiler.matcher(spec)?;
+                for token in encode(text) { if state.accept(token).is_err() { return Ok(false); } }
+                let done = state.matcher.is_completed()?;
+                if done { state.accept(200_008)?; }
+                Ok(done)
+            };
+            assert!(run(&format!("{lead}{call}")).unwrap(), "required={required}: the call completes");
+            assert_eq!(run(&format!("{lead}{answer}")).unwrap(), !required, "required={required}: a JSON answer");
+            assert!(!run(&format!("{lead}{}", call.replace(">3<", ">9<"))).unwrap(), "schema maximum enforced");
+            assert!(!run(&format!("{lead}{}", call.replace(">3<", ">three<"))).unwrap(), "integer type enforced");
+            assert!(!run(&format!("{lead} to=user<|message|>not json")).unwrap(), "response format enforced");
+            assert!(!run(&format!(" to=get_weather<|message|>{call}")).unwrap(), "reasoning comes first");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Mistral: optional token-delimited `[THINK]` block, then an answer or back-to-back
+    /// `[TOOL_CALLS]NAME[ARGS]{json}` calls closed by the JSON object, compiled natively.
+    #[tokio::test]
+    async fn mistral_constraints_compile_and_enforce_calls_natively() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let temp = tempfile::tempdir().unwrap();
+        // Byte vocabulary (ids 0..95 for ASCII 32..126) plus the Mistral control tokens.
+        let specials = [(95, "</s>"), (96, "[THINK]"), (97, "[/THINK]"), (98, "[TOOL_CALLS]"), (99, "[ARGS]"),
+            (100, "[INST]"), (101, "[/INST]"), (102, "[AVAILABLE_TOOLS]"), (103, "[/AVAILABLE_TOOLS]"),
+            (104, "[TOOL_RESULTS]"), (105, "[/TOOL_RESULTS]"), (106, "[SYSTEM_PROMPT]"), (107, "[/SYSTEM_PROMPT]"),
+            (108, "[MODEL_SETTINGS]"), (109, "[/MODEL_SETTINGS]"), (110, "<s>")];
+        let mut vocab = serde_json::Map::new();
+        for ch in 32u8..127 { vocab.insert((ch as char).to_string(), json!(ch - 32)); }
+        let added: Vec<_> = specials.iter().map(|(id, content)| json!({"id": id, "content": content, "special": true,
+            "single_word": false, "lstrip": false, "rstrip": false, "normalized": false})).collect();
+        let tokenizer = temp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, json!({"version":"1.0", "added_tokens": added,
+            "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"?"}}).to_string()).unwrap();
+        std::fs::write(temp.path().join("tokenizer_config.json"), json!({"bos_token":"<s>","eos_token":"</s>"}).to_string()).unwrap();
+        std::fs::write(temp.path().join("generation_config.json"), json!({"eos_token_id":95}).to_string()).unwrap();
+        std::fs::write(temp.path().join("chat_template.jinja"), cuteafd_api::openai::chat::mistral::TEMPLATE_FOR_TESTS).unwrap();
+        let encoding = Arc::new(openai::chat::mistral::MistralEncoding::from_snapshot(temp.path()).unwrap());
+        let token = |text: &str| -> Vec<u32> {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while !rest.is_empty() {
+                if let Some((id, content)) = specials.iter().find(|(_, content)| rest.starts_with(content)) {
+                    out.push(*id); rest = &rest[content.len()..];
+                } else {
+                    out.push(u32::from(rest.as_bytes()[0] - 32)); rest = &rest[1..];
+                }
+            }
+            out
+        };
+        for required in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("mistral-fixture", ModelEncoding::Mistral(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"mistral-fixture", "messages":[{"role":"user","content":"Look it up"}],
+                "tool_choice": if required {"required"} else {"auto"},
+                "tools":[{"type":"function","function":{"name":"lookup","strict":true,
+                    "parameters":{"type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false}}}]});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            assert!(request.prompt.ends_with("[/INST]"), "{}", request.prompt);
+            assert!(request.stop_token_ids.contains(&95) && !request.stop_token_ids.contains(&98));
+            let mut compiler = Compiler::with_vocab(&library, tokenizer.clone(), 111, vec![95]);
+            let spec = request.constraint.as_ref().expect("strict tools are constrained");
+            for wire in ["[THINK]plan[/THINK][TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}[TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}",
+                "[TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}"] {
+                let mut state = compiler.matcher(spec).unwrap();
+                for (at, id) in token(wire).into_iter().enumerate() {
+                    state.accept(id).unwrap_or_else(|e| panic!("required={required} {wire} token {at}: {e:#}"));
+                }
+                state.accept(95).unwrap();
+                assert!(state.terminated());
+            }
+            // Arguments stay schema-checked; plain answers only pass when calls are optional.
+            let mut invalid = compiler.matcher(spec).unwrap();
+            assert!(token("[TOOL_CALLS]lookup[ARGS]{\"x\":\"b\"}").into_iter().any(|id| invalid.accept(id).is_err()));
+            let mut plain = compiler.matcher(spec).unwrap();
+            let plain_ok = token("[THINK]p[/THINK]Done.").into_iter().all(|id| plain.accept(id).is_ok())
+                && plain.accept(95).is_ok();
+            assert_eq!(plain_ok, !required);
+            task.abort();
+            let _ = task.await;
+        }
+    }
 
     /// The XGrammar matcher's mask buffer is reused across rows and
     /// `fill_bitmask` returns whether that row needs a mask at all. A row whose

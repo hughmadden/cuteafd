@@ -10,7 +10,7 @@ pub(crate) struct PeerAttentionInputs<'a> {
     device:Device<'a>,
     window:ProposalReplica<'a>,
     sources:[ProposalReplica<'a>;4],
-    source_bindings:[std::cell::Cell<[Option<IndexBinding>;16]>;4],
+    source_bindings:[std::cell::Cell<[Option<IndexBinding>; cuteafd_core::V41_MAX_REQUESTS]>;4],
     selected:Allocation<'a>,
     copy:V41PeerCopy<'a>,
     capacity:usize,
@@ -158,13 +158,13 @@ mod tests {
     }
 }
 pub(crate) struct PeerCacheAttention<'s> {
-    windows:[Option<WindowProposal<'s>>;16],
-    sources:[Option<IndexProposal<'s>>;16],
+    windows:[Option<WindowProposal<'s>>; cuteafd_core::V41_MAX_REQUESTS],
+    sources:[Option<IndexProposal<'s>>; cuteafd_core::V41_MAX_REQUESTS],
     positions:&'s [Vec<u64>],
 }
 impl PeerCacheAttention<'_> {
     /// Fixed stack storage; callers pass only the first returned count entries.
-    pub fn attention_requests(&self)->([AttentionRequest<'_>;16],usize) {
+    pub fn attention_requests(&self)->([AttentionRequest<'_>; cuteafd_core::V41_MAX_REQUESTS],usize) {
         let n=self.positions.len();
         (std::array::from_fn(|i| {
             let i=if i<n {i} else {0};
@@ -183,7 +183,7 @@ impl<'a> PeerAttentionInputs<'a> {
         let source_buffer=||ProposalReplica::new(source,peer,capacity,ProposalFormat::CompressedFp4);
         Ok(Self { device:peer,window:ProposalReplica::new(source,peer,capacity,ProposalFormat::WindowFp8)?,
             sources:[source_buffer()?,source_buffer()?,source_buffer()?,source_buffer()?],
-            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None;16])),selected:Allocation::new(peer,capacity*2048)?,
+            source_bindings:std::array::from_fn(|_|std::cell::Cell::new([None; cuteafd_core::V41_MAX_REQUESTS])),selected:Allocation::new(peer,capacity*2048)?,
             copy:peer.run(||peer.library.v41_peer_copy())?,capacity })
     }
     /// # Safety
@@ -194,7 +194,7 @@ impl<'a> PeerAttentionInputs<'a> {
     pub unsafe fn enqueue<'s>(&'s self,bank:&'s BackboneCache<'_>,original:&'s CacheAttention<'_>,
         stream:*mut c_void)->Result<PeerCacheAttention<'s>> {
         let n=original.windows.len();
-        ensure!(n>0 && n<=16 && original.positions.len()==n
+        ensure!(n>0 && n<=cuteafd_core::V41_MAX_REQUESTS && original.positions.len()==n
             && (original.sources.is_empty() || original.sources.len()==n),"invalid peer attention requests");
         ensure!(original.positions.iter().map(Vec::len).sum::<usize>()<=self.capacity,
             "peer attention rows exceed capacity");
@@ -214,7 +214,7 @@ impl<'a> PeerAttentionInputs<'a> {
             let bindings=std::array::from_fn(|i|original.sources.get(i).map(IndexProposal::binding));
             let changed=self.source_bindings[index].get()!=bindings;
             // Recopy after any partially failed submission; publish the key last.
-            if changed { self.source_bindings[index].set([None;16]); }
+            if changed { self.source_bindings[index].set([None; cuteafd_core::V41_MAX_REQUESTS]); }
             let state=&bank.sources[index];
             let replica=state.replica_ref().context("peer source cache absent")?;
             ensure!(replica.device().id==self.device.id,"peer source device differs");
@@ -237,4 +237,95 @@ impl<'a> PeerAttentionInputs<'a> {
         self.device.run(||unsafe { self.copy.launch(selected,original.selected,selected.bytes,stream) })?;
         unsafe { original.peer_attention(selected) }
     }
+}
+
+#[cfg(test)]
+mod shared_cache_tests {
+    use super::*;
+    use crate::shared::memory::{chain::StageChain,device::Stream,row_window::ScratchGuard};
+    fn run(guarded:bool)->Result<()> {
+        let lib=unsafe {NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)?};lib.cuda_set_device(0)?;
+        let catalog=cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        let map=CachePlacement::encoder_decoder();let source=Device {library:&lib,id:map.attention(2)? as i32};
+        let peer=Device {library:&lib,id:1-source.id};
+        let mut bank=BackboneCache::new_replicated(&lib,map,2,[2;4],BackboneCache::replicated_device_bytes(map,2,[2;4])?)?;
+        let leases=[bank.begin_request(0,42)?,bank.begin_request(1,43)?];
+        let batches=leases.map(|lease|bank.plan(&[CacheWork {lease,tokens:5,kind:ExpertV2SourceKind::Prefill}]))
+            .into_iter().collect::<Result<Vec<_>>>()?;
+        use crate::families::deepseek_v41::{v41_window::WindowWeights,v41_compressor::CompressorWeights};
+        let ww=source.own(||WindowWeights::load(&lib,&catalog,2,WindowWeights::device_bytes(&lib,&catalog,2)?,1<<20))?;
+        let cw=source.own(||CompressorWeights::load(&lib,&catalog,2,CompressorWeights::device_bytes(&catalog,2)?,1<<20))?;
+        let mut windows=[source.own(||ww.wave(16,usize::MAX))?,source.own(||ww.wave(16,usize::MAX))?];
+        let mut sources=[source.own(||cw.wave(16,usize::MAX))?,source.own(||cw.wave(16,usize::MAX))?];
+        for i in 0..2 {
+            let host:Vec<u8>=(0..5*5120).flat_map(|n| {
+                let f=((n*7+i*11)%29) as f32/32.0-0.4;((f.to_bits()>>16) as u16).to_ne_bytes()
+            }).collect();
+            source.run(||unsafe {
+                lib.copy_h2d(windows[i].input(),&host)?;lib.copy_h2d(sources[i].input(),&host)?;
+                windows[i].execute(bank.window(&batches[i],2)?,&batches[i].window_chunks(2)?)?;
+                sources[i].execute(bank.source(&batches[i],2)?,&batches[i].source_chunks(2)?)
+            })?;
+        }
+        let originals=[bank.attention(&batches[0],2,&windows[0],Some(&sources[0]))?,
+            bank.attention(&batches[1],2,&windows[1],Some(&sources[1]))?];
+        let arena=PeerAttentionInputs::new(source,peer,16,PeerAttentionInputs::device_bytes(16)?)?;
+        let writer=Stream::new(peer)?;let reader=Stream::new(peer)?;
+        let guard=ScratchGuard::new(&lib,&[source.id,peer.id])?;
+        let metadata=originals[0].sources[0].metadata(4)?;
+        let (offset,count,step)=(metadata[4] as usize,metadata[3] as usize,metadata[5] as usize);
+        assert!(count>0);
+        let bytes=(offset+(count-1)*step+1)*256;
+        let saved=[Allocation::new(peer,bytes)?,Allocation::new(peer,bytes)?];
+        let read=|buffer:CuteafdDeviceBuffer,device:Device<'_>|->Result<Vec<u8>> {
+            let mut raw=vec![0;bytes];device.run(||lib.copy_d2h(&mut raw,CuteafdDeviceBuffer {bytes,..buffer}))?;
+            Ok((0..count).flat_map(|row|raw[(offset+row*step)*256..(offset+row*step+1)*256].iter().copied()).collect())
+        };
+        let expected=[read(originals[0].sources[0].kv_values,source)?,read(originals[1].sources[0].kv_values,source)?];
+        assert_ne!(expected[0],expected[1]);
+        let copy=|index:usize,dst:CuteafdDeviceBuffer,stream:*mut c_void|->Result<()> {
+            let mirrored=unsafe {arena.enqueue(&bank,&originals[index],writer.raw)?};
+            let (requests,_)=mirrored.attention_requests();
+            let values=requests[0].source.unwrap().kv_values;
+            peer.run(||unsafe {lib.copy_d2d_async(dst,values,bytes,stream)})
+        };
+        // Exact peer copies and readers are warm before the device gate.
+        for i in 0..2 {copy(i,saved[i].buffer,writer.raw)?;writer.drain()?;}
+        let chains=[StageChain::on_devices(&lib,&[source.id,peer.id])?,StageChain::on_devices(&lib,&[source.id,peer.id])?];
+        let runtime=tokio::runtime::Builder::new_current_thread().build()?;
+        let gate=peer.run(||unsafe {cuteafd_ffi::test_support::CudaStreamGate::new(&lib,reader.raw)})?;
+        runtime.block_on(chains[0].handle().scope(async {
+            let mirrored=unsafe {arena.enqueue(&bank,&originals[0],writer.raw)?};
+            let (requests,_)=mirrored.attention_requests();let values=requests[0].source.unwrap().kv_values;
+            peer.run(||unsafe {
+                crate::shared::memory::chain::finish(&lib,writer.raw)?;
+                crate::shared::memory::chain::join(&lib,reader.raw)?;
+                lib.copy_d2d_async(saved[0].buffer,values,bytes,reader.raw)?;
+                crate::shared::memory::chain::finish(&lib,reader.raw)
+            })?;guard.release()
+        }))?;
+        runtime.block_on(chains[1].handle().scope(async {
+            if guarded {peer.run(||unsafe {guard.acquire(writer.raw)})?;}
+            copy(1,saved[1].buffer,writer.raw)?;
+            peer.run(||unsafe {crate::shared::memory::chain::finish(&lib,writer.raw)})
+        }))?;
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(if guarded {2}else {10});let mut done=false;
+        while std::time::Instant::now()<deadline {if peer.run(||unsafe {lib.cuda_stream_query(writer.raw)})? {done=true;break;}
+            std::thread::sleep(std::time::Duration::from_millis(10));}
+        peer.run(|| {drop(gate);Ok(())})?;for chain in &chains {chain.drain()?;}reader.drain()?;
+        assert_eq!(done,!guarded,"mirrored B completion before A reader release");
+        if guarded {assert_eq!(read(saved[0].buffer,peer)?,expected[0]);}
+        else {assert_ne!(read(saved[0].buffer,peer)?,expected[0],"unguarded mirror failed to clobber");}
+        assert_eq!(read(saved[1].buffer,peer)?,expected[1]);
+        // A remains live throughout B. A -> B -> A must recopy A with caching enabled.
+        copy(0,saved[0].buffer,writer.raw)?;writer.drain()?;
+        assert_eq!(read(saved[0].buffer,peer)?,expected[0]);
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires V4.1 snapshot, peer proposal kernels and two GPUs"]
+    fn mirrored_shared_cache_aba_preserves_gated_live_bindings()->Result<()> {for _ in 0..3 {run(true)?;}Ok(())}
+    #[test]
+    #[ignore = "requires V4.1 snapshot, peer proposal kernels and two GPUs"]
+    fn mirrored_without_guard_clobbers_live_binding_reader()->Result<()> {for _ in 0..3 {run(false)?;}Ok(())}
 }

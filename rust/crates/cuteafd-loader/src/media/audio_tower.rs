@@ -22,7 +22,7 @@ pub enum AudioTowerError {
     #[error("audio tower I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("audio tower config: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[from] crate::JsonFileError),
     #[error("audio weight admission needs {required} bytes, got {admitted}")]
     Admission { required: u64, admitted: u64 },
 }
@@ -176,7 +176,7 @@ fn catalog(snapshot: &Path) -> Result<Catalog> {
     files.insert(tokenizer);
     let index = snapshot.join("model.safetensors.index.json");
     if index.exists() {
-        let map: serde_json::Value = serde_json::from_reader(File::open(index)?)?;
+        let map: serde_json::Value = crate::read_json_file(&index)?;
         for (name, file) in map["weight_map"]
             .as_object()
             .ok_or_else(|| unsupported("missing safetensors weight_map"))?
@@ -246,9 +246,9 @@ impl AudioTowerPlan {
         &self.reads
     }
     pub fn from_snapshot(snapshot: &Path, storage: AudioStorage) -> Result<Self> {
-        let root: RootConfig = serde_json::from_reader(File::open(snapshot.join("config.json"))?)?;
+        let root: RootConfig = crate::read_json_file(&snapshot.join("config.json"))?;
         let tokenizer =
-            serde_json::from_reader(File::open(snapshot.join("audio_tokenizer/config.json"))?)?;
+            crate::read_json_file(&snapshot.join("audio_tokenizer/config.json"))?;
         validate_config(&root, &tokenizer)?;
         Self::from_catalog(root.hidden_size, storage, &catalog(snapshot)?)
     }

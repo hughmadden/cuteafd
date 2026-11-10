@@ -91,7 +91,13 @@ pub(crate) fn system_placement(profile: &ModelProfile) -> SystemPlacement {
             tool_names: Vec::new(), tool_choice: super::qwen4::prompt::QwenToolChoice::Auto, response_format: None }).is_err(),
         ModelEncoding::Glm(encoding) => encoding.render(&body, &super::glm5::GlmPromptOptions { thinking: false,
             reasoning_effort: None, tool_names: Vec::new(), tool_choice: super::glm5::GlmToolChoice::Auto, response_format: None }).is_err(),
-        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => false,
+        ModelEncoding::Step5(encoding) => encoding.render(&body, &super::step5::Step5PromptOptions {
+            tool_names: Vec::new(), tool_choice: super::step5::Step5ToolChoice::Auto, response_format: None }).is_err(),
+        ModelEncoding::Muse(encoding) => encoding.render(&body, &super::chat::muse::MusePromptOptions {
+            tool_names: Vec::new(), tool_choice: super::chat::muse::MuseToolChoice::Auto, response_format: None }).is_err(),
+        ModelEncoding::Mistral(encoding) => encoding.render(&body, &super::mistral::MistralPromptOptions {
+            tool_names: Vec::new(), response_format: None }).is_err(),
+        ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => false,
     };
     if rejects { SystemPlacement::FirstOnly } else { SystemPlacement::Anywhere }
 }
@@ -412,6 +418,9 @@ fn chat_body_with(turn: &TurnRequest, profile: &ModelProfile, names: &ToolNames,
     let effort = turn.reasoning.effort.as_deref().map(|e| match (e, &profile.encoding) {
         // The V4.1 adapter knows low/high/xhigh/max; medium is its high.
         ("medium", ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41) => "high",
+        // The Mistral template knows low/medium/high only.
+        ("xhigh" | "max", ModelEncoding::Mistral(_)) => "high",
+        ("minimal", ModelEncoding::Mistral(_)) => "low",
         (e, _) => e,
     });
     match turn.reasoning.enabled {

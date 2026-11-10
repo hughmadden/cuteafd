@@ -16,10 +16,16 @@ F = C.c_float
 def bind(path):
     lib = C.CDLL(path)
     signatures = {
+        "cuteafd_glmf_dspark_markov_workspace": ([I, I], C.c_uint64),
+        "cuteafd_glmf_dspark_markov_norms": ([P, P, I, I, P], I),
+        "cuteafd_glmf_dspark_markov": ([P] * 7 + [I] * 4 + [P], I),
         "cuteafd_glmf_dspark_qk_rope": ([P] * 8 + [I] * 3 + [F] * 2 + [P], I),
         "cuteafd_block_dspark_qk_rope": ([P] * 9 + [I] * 4 + [F] * 3 + [P], I),
         "cuteafd_block_dspark_attention_workspace": ([I] * 6, C.c_uint64),
         "cuteafd_block_dspark_attention": ([P] * 10 + [I] * 8 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged": ([P] * 11 + [I] * 9 + [F, P], I),
+        "cuteafd_block_dspark_attention_fp8": ([P] * 10 + [I] * 8 + [F, P], I),
+        "cuteafd_block_dspark_attention_paged_fp8": ([P] * 11 + [I] * 9 + [F, P], I),
         "cuteafd_glmf_dspark_attention_workspace": ([I] * 3, C.c_uint64),
         "cuteafd_glmf_dspark_attention": ([P] * 10 + [I] * 7 + [F, P], I),
     }
@@ -118,6 +124,52 @@ def attention_check(lib):
                     geometry = [sequences, block, heads, kvh, capacity, max_keys, int(causal)]
                     assert lib.cuteafd_block_dspark_attention(*pointers, out.data_ptr(), scratch.data_ptr(),
                         *geometry, dim, dim ** -0.5, stream) == 0
+                    # Fragmented pages must preserve the exact arithmetic of the
+                    # slot-local route, including page boundaries and peaked scores.
+                    width = (capacity + 63) // 64
+                    page_ids = torch.randperm(sequences * width, device="cuda", dtype=torch.int32)
+                    page_tables = page_ids.reshape(sequences, width)[slots.long()].contiguous()
+                    kp = torch.zeros(sequences * width, 64, kvh, dim, device="cuda", dtype=torch.bfloat16)
+                    vp = torch.zeros_like(kp)
+                    for slot in range(sequences):
+                        padded_k = torch.nn.functional.pad(kc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+                        padded_v = torch.nn.functional.pad(vc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+                        kp[page_ids.reshape(sequences, width)[slot].long()] = padded_k.reshape(width, 64, kvh, dim)
+                        vp[page_ids.reshape(sequences, width)[slot].long()] = padded_v.reshape(width, 64, kvh, dim)
+                    from draft_kv_selftest import pack
+                    compact_k = pack(kc.reshape(-1, kvh, dim))
+                    compact_v = pack(vc.reshape(-1, kvh, dim))
+                    compact_kp = torch.zeros(sequences * width, 64, compact_k.shape[-1],
+                                             device="cuda", dtype=torch.uint8)
+                    compact_vp = torch.zeros_like(compact_kp)
+                    for slot in range(sequences):
+                        for logical in range(width):
+                            first, end = logical * 64, min((logical + 1) * 64, capacity)
+                            physical = page_ids.reshape(sequences, width)[slot, logical].long()
+                            compact_kp[physical, :end - first] = compact_k[slot * capacity + first:slot * capacity + end]
+                            compact_vp[physical, :end - first] = compact_v[slot * capacity + first:slot * capacity + end]
+                    for amplitude in (1., 8.):
+                        query = (q.float() * amplitude).bfloat16()
+                        contiguous = torch.empty_like(q)
+                        paged = torch.empty_like(q)
+                        assert lib.cuteafd_block_dspark_attention(query.data_ptr(), *pointers[1:],
+                            contiguous.data_ptr(), scratch.data_ptr(), *geometry, dim, dim ** -0.5, stream) == 0
+                        paged_pointers = [query.data_ptr(), k.data_ptr(), v.data_ptr(), kp.data_ptr(), vp.data_ptr(),
+                                          slots.data_ptr(), lengths.data_ptr(), ends.data_ptr(), page_tables.data_ptr()]
+                        assert lib.cuteafd_block_dspark_attention_paged(*paged_pointers, paged.data_ptr(),
+                            scratch.data_ptr(), *geometry, dim, width, dim ** -0.5, stream) == 0
+                        torch.cuda.synchronize()
+                        assert torch.equal(contiguous, paged), "fragmented pages changed attention bytes"
+                        assert lib.cuteafd_block_dspark_attention_fp8(query.data_ptr(), k.data_ptr(), v.data_ptr(),
+                            compact_k.data_ptr(), compact_v.data_ptr(), slots.data_ptr(), lengths.data_ptr(),
+                            ends.data_ptr(), contiguous.data_ptr(), scratch.data_ptr(), *geometry, dim,
+                            dim ** -0.5, stream) == 0
+                        assert lib.cuteafd_block_dspark_attention_paged_fp8(query.data_ptr(), k.data_ptr(), v.data_ptr(),
+                            compact_kp.data_ptr(), compact_vp.data_ptr(), slots.data_ptr(), lengths.data_ptr(),
+                            ends.data_ptr(), page_tables.data_ptr(), paged.data_ptr(), scratch.data_ptr(),
+                            *geometry, dim, width, dim ** -0.5, stream) == 0
+                        torch.cuda.synchronize()
+                        assert torch.equal(contiguous, paged), "fragmented FP8 pages changed attention bytes"
                     if dim == 64:
                         legacy_size = lib.cuteafd_glmf_dspark_attention_workspace(16, kvh, max_keys)
                         assert size == legacy_size
@@ -148,14 +200,70 @@ def attention_check(lib):
     print("attention legacy64 bytes and 35-query/two-slice FP64 gate passed")
 
 
+def markov_check(lib, baseline=None):
+    stream = torch.cuda.current_stream().cuda_stream
+    vocab, rank, block = 8192, 256, 3
+    w1 = torch.randn(vocab, rank, device="cuda").bfloat16()
+    w2 = (torch.randn(vocab, rank, device="cuda") * 0.05).bfloat16()
+    norms = torch.empty(vocab, device="cuda")
+    assert lib.cuteafd_glmf_dspark_markov_norms(w2.data_ptr(), norms.data_ptr(), vocab, rank, stream) == 0
+    logits = torch.randn(64, block, vocab, device="cuda")
+    anchors = torch.randint(vocab, (64,), device="cuda", dtype=torch.int32)
+
+    def run(library, scores, previous):
+        sequences = previous.numel()
+        size = library.cuteafd_glmf_dspark_markov_workspace(sequences, block)
+        scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
+        drafts = torch.empty(sequences, block, device="cuda", dtype=torch.int32)
+        def launch():
+            assert library.cuteafd_glmf_dspark_markov(scores.data_ptr(), w1.data_ptr(), w2.data_ptr(),
+                norms.data_ptr(), previous.data_ptr(), drafts.data_ptr(), scratch.data_ptr(),
+                sequences, block, vocab, rank, stream) == 0
+        launch()
+        torch.cuda.synchronize()
+        assert torch.all(scratch[size:] == 173), "Markov workspace overrun"
+        return drafts, launch
+
+    for sequences in (1, 8, 16, 32, 33, 64):
+        actual, launch = run(lib, logits[:sequences], anchors[:sequences])
+        tiles = [run(baseline or lib, logits[first:min(first + 32, sequences)],
+                     anchors[first:min(first + 32, sequences)])[0]
+                 for first in range(0, sequences, 32)]
+        assert torch.equal(actual, torch.cat(tiles)), f"C{sequences} differs from independent C32 tiles"
+        if baseline is not None and sequences <= 32:
+            expected, old_launch = run(baseline, logits[:sequences], anchors[:sequences])
+            assert torch.equal(actual, expected), f"C{sequences} baseline bytes changed"
+            if sequences in (1, 16, 32):
+                def timing(call):
+                    call()  # warm up before timing
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    for _ in range(10):
+                        call()
+                    end.record()
+                    end.synchronize()
+                    return start.elapsed_time(end) / 10
+                old_ms, new_ms = timing(old_launch), timing(launch)
+                print(f"Markov C{sequences}: baseline={old_ms:.4f}ms candidate={new_ms:.4f}ms ratio={new_ms / old_ms:.4f}")
+        print(f"Markov C{sequences}: byte-exact independent sequence tiles; guard intact")
+    invalid = lib.cuteafd_glmf_dspark_markov(None, None, None, None, None, None, None,
+                                            65, block, vocab, rank, stream)
+    assert invalid != 0, "C65 must be rejected before launching"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
+    parser.add_argument("--baseline", help="Old native library for Markov byte/timing comparisons")
+    parser.add_argument("--markov-only", action="store_true")
     args = parser.parse_args()
+    torch.cuda.set_per_process_memory_fraction(0.1)
     torch.manual_seed(276)
     lib = bind(args.library)
-    rotary_check(lib)
-    attention_check(lib)
+    markov_check(lib, bind(args.baseline) if args.baseline else None)
+    if not args.markov_only:
+        rotary_check(lib)
+        attention_check(lib)
     print("block dSpark kernels: all checks passed")
 
 

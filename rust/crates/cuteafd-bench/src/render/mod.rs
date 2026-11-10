@@ -72,6 +72,22 @@ mod tests {
     }
 
     #[test]
+    fn always_thinking_is_recorded_and_visible_on_card_and_configuration() {
+        let mut report = crate::sample::full_report();
+        report.server.configuration.supports_thinking_off = Some(false);
+        let label = report.server.configuration.thinking_label();
+        report.baseline.as_mut().unwrap().card.thinking = Some(label.into());
+        let encoded = serde_json::to_value(&report).unwrap();
+        assert_eq!(encoded["server"]["configuration"]["supports_thinking_off"], false);
+        assert_eq!(encoded["baseline"]["card"]["thinking"], label);
+        let card = super::card::card_svg(&report);
+        assert!(card.contains(label), "{card}");
+        assert!(!card.contains("thinking off"));
+        let configuration = super::report::panel_svg(&report, "configuration");
+        assert!(configuration.contains(label), "{configuration}");
+    }
+
+    #[test]
     fn number_formats() {
         assert_eq!(super::grouped(2415.3), "2,415");
         assert_eq!(super::grouped(1234567.0), "1,234,567");
@@ -96,8 +112,8 @@ mod tests {
                 engine_sent_bytes: Some(900_000_000), engine_received_bytes: Some(0),
                 health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
         let card = super::card::card_svg(&report);
-        assert!(card.contains("Fabric OK: peak retransmits 0.025% of packets"));
-        assert!(card.contains("pause not collected"));
+        assert!(!card.contains("Fabric: peak retransmits"));
+        assert!(!card.contains("results remain valid"));
         let report = super::report::report_svg(&report);
         // The report draws the port as a small multiple with its loss verdict.
         assert!(report.contains("Fabric during this run") && report.contains("retransmits 0.025%"));

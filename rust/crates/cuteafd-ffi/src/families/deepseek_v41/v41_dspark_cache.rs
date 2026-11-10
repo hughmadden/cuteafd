@@ -30,7 +30,7 @@ impl V41DsparkCache<'_> {
     pub const ROW_BYTES: usize = 528;
     pub const SLOT_BYTES: usize = 128 * Self::ROW_BYTES;
     /// # Safety
-    /// Source is normalized and rotated finite BF16 KV. Sixteen initialized
+    /// Source is normalized and rotated finite BF16 KV. All compiled request-bank
     /// descriptors have valid source spans, unique active slots, and positions
     /// that do not overflow. Storage is distinct on the stream device and remains
     /// live and exclusively writable through completion and graph replay.
@@ -44,12 +44,12 @@ impl V41DsparkCache<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=4096).contains(&source_rows) && (1..=16).contains(&slots),
+            (1..=4096).contains(&source_rows) && (1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&slots),
             "invalid dSpark cache geometry"
         );
         for (buffer, bytes) in [
             (source, source_rows as usize * 1024),
-            (writes, 384),
+            (writes, cuteafd_core::V41_WRITE_DESCRIPTOR_BYTES),
             (ring, slots as usize * Self::SLOT_BYTES),
         ] {
             ensure!(

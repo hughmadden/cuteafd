@@ -92,7 +92,7 @@ impl V41IndexScores<'_> {
         ensure!(
             (1..=4096).contains(&queries)
                 && (1..=16384).contains(&candidates)
-                && (1..=16).contains(&slots)
+                && (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots)
                 && (1..=4096).contains(&stride)
                 && (1..=67108864).contains(&capacity),
             "invalid index scoring shape"
@@ -169,7 +169,7 @@ impl V41IndexScores<'_> {
         ensure!(
             (1..=4096).contains(&queries)
                 && (1..=16384).contains(&candidates)
-                && (1..=16).contains(&slots)
+                && (1..=cuteafd_core::V41_MAX_REQUESTS).contains(&slots)
                 && (1..=4096).contains(&stride)
                 && (1..=67108864).contains(&capacity)
                 && (1..=4096).contains(&proposal_capacity),

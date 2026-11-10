@@ -4,7 +4,7 @@ One bounded outcome.
 
 ## Base/HEAD
 
-Base: work/p0. HEAD: pending.
+Base: dev. HEAD: pending.
 
 ## Gates
 

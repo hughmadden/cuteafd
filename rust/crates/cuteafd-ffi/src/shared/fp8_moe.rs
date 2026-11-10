@@ -132,10 +132,13 @@ impl Fp8MoeInfo {
 }
 
 type Launch = unsafe extern "C" fn(*mut c_void, u32, *const *mut c_void, i32, *mut c_void) -> i32;
+type LaunchSegments = unsafe extern "C" fn(*mut c_void, *const *mut c_void, i32, *mut c_void) -> i32;
+type SegmentInfo = unsafe extern "C" fn(u32, *mut u32, *mut u32, *mut u32) -> i32;
 type Destroy = unsafe extern "C" fn(*mut c_void);
 type Scratch = unsafe extern "C" fn(u32, *mut u64) -> i32;
 type SetOptions = unsafe extern "C" fn(*mut c_void, u32) -> i32;
 type WeightReadGroup = unsafe extern "C" fn(u32, u32, u32, *mut u32, *mut u32) -> i32;
+type ArithmeticRoute = unsafe extern "C" fn(u32, u32, u32, *mut u32, *mut u32) -> i32;
 
 /// A traffic bound must never masquerade as an installed kernel tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,9 +202,12 @@ pub struct Fp8MoeModule {
     info: Fp8MoeInfo,
     scratch: Vec<usize>,
     launch: Launch,
+    launch_segments: LaunchSegments,
+    segments: Vec<Fp8MoeSegment>,
     destroy: Destroy,
     set_options: Option<SetOptions>,
     weight_read_group: Option<WeightReadGroup>,
+    arithmetic_route: Option<ArithmeticRoute>,
     prefill: Fp8MoePrefill,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -212,6 +218,52 @@ pub struct Fp8MoeModule {
 pub struct Fp8MoeMetadata {
     pub info: Fp8MoeInfo,
     scratch: Vec<usize>,
+    pub segments: Vec<Fp8MoeSegment>,
+}
+
+/// One installed wide-stream arithmetic recipe. Only constituent units at
+/// least `minimum_rows` may join; grouping cannot promote a decode tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fp8MoeSegment {
+    pub form: Fp8MoePrefill,
+    pub maximum_rows: u32,
+    pub minimum_rows: u32,
+    pub act_row_bytes: u32,
+}
+
+fn segment_scratch(info: &Fp8MoeInfo, segments: &[Fp8MoeSegment], rows: u32) -> Result<usize> {
+    segments.iter().map(|segment| {
+        cuteafd_core::spark_executions::segment_scratch_bytes(info.hidden.try_into()?, info.experts.try_into()?,
+            info.topk.try_into()?, segment.act_row_bytes, rows, segment.maximum_rows)
+            .context("invalid segmented scratch extent").and_then(|bytes| Ok(usize::try_from(bytes)?))
+    }).collect::<Result<Vec<_>>>()?.into_iter().max().context("package has no segmented stream")
+}
+
+/// Exact scratch retained by one execution slot, from the package's static ABI.
+/// This query neither initializes CUDA nor allocates device storage.
+pub fn fp8_slot_scratch_bytes(package: impl IntoIterator<Item = (usize, usize)>, capacity: usize)
+    -> Result<usize> {
+    ensure!(capacity > 0, "native slot capacity must be nonzero");
+    let mut previous = 0;
+    let mut selected = None;
+    for (compiled, scratch) in package {
+        ensure!(compiled > previous, "native package capacities must be sorted and unique");
+        if selected.is_none() && compiled >= capacity { selected = Some(scratch.max(256)); }
+        previous = compiled;
+    }
+    selected.with_context(|| format!("FP8 expert package has no capacity for {capacity} rows"))
+}
+
+/// Exact native slot input/routes/output allocation, independent of architecture.
+pub fn fp8_slot_io_bytes(hidden: usize, topk: usize, wire_input: bool, bf16_sibling: bool,
+    capacity: usize) -> Result<usize> {
+    ensure!(hidden > 0 && hidden % 32 == 0 && topk > 0 && capacity > 0,
+        "invalid native slot I/O geometry");
+    let input = if !wire_input || bf16_sibling { hidden.checked_mul(2) }
+        else { hidden.checked_add(hidden / 32) }.context("native slot input overflow")?;
+    input.checked_add(topk.checked_mul(8).context("native slot routes overflow")?)
+        .and_then(|bytes| hidden.checked_mul(2).and_then(|out| bytes.checked_add(out)))
+        .and_then(|bytes| bytes.checked_mul(capacity)).context("native slot I/O size overflow")
 }
 
 impl Fp8MoeMetadata {
@@ -242,14 +294,43 @@ impl Fp8MoeMetadata {
         // SAFETY: the query fills at most sixteen live words.
         ensure!(unsafe { query(words.as_mut_ptr(), 16) } == 0,
             "FP8 expert package info query failed");
-        Self::from_words_and_scratch(words, |capacity| {
+        let mut metadata = Self::from_words_and_scratch(words, |capacity| {
             let mut bytes = 0u64;
             // SAFETY: capacity came from the validated package info and
             // the scratch query writes exactly one live u64.
             ensure!(unsafe { scratch_bytes(capacity as u32, &mut bytes) } == 0,
                 "FP8 expert scratch query failed");
             Ok(bytes)
-        })
+        })?;
+        // SAFETY: static queries from the trusted library write only supplied scalars.
+        let (segment_info, segment_bytes) = unsafe {
+            (*library.get::<SegmentInfo>(b"cuteafd_fp8moe_segment_info")?,
+             *library.get::<Scratch>(b"cuteafd_fp8moe_segment_scratch_bytes")?)
+        };
+        for form in [Fp8MoePrefill::Auto, Fp8MoePrefill::W8a16, Fp8MoePrefill::W8a8] {
+            let (mut maximum, mut minimum, mut act_row_bytes) = (0, 0, 0);
+            // SAFETY: the query writes three live u32 values and performs no GPU work.
+            ensure!(unsafe { segment_info(form.option(), &mut maximum, &mut minimum, &mut act_row_bytes) } == 0,
+                "FP8 segment info query failed");
+            if maximum == 0 { continue; }
+            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4)
+                && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
+                && minimum > 0 && minimum <= 4096 && act_row_bytes > 0,
+                "invalid segmented stream metadata");
+            metadata.segments.push(Fp8MoeSegment { form, maximum_rows: maximum, minimum_rows: minimum, act_row_bytes });
+        }
+        if !metadata.segments.is_empty() {
+            ensure!(metadata.segments.len() == 3, "segmented package must describe every arithmetic form");
+            for rows in [1u32, 4096, 8256, cuteafd_core::spark_executions::SEGMENT_MAX_ROWS] {
+                let mut bytes = 0u64;
+                // SAFETY: the static query writes one live u64; no allocation or CUDA work.
+                ensure!(unsafe { segment_bytes(rows, &mut bytes) } == 0,
+                    "FP8 segmented scratch query failed");
+                ensure!(u64::try_from(metadata.segment_scratch_bytes(rows)?)? == bytes,
+                    "FP8 installed segmented scratch disagrees with shared geometry");
+            }
+        }
+        Ok(metadata)
     }
 
     fn from_words_and_scratch(words: [u32; 16], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
@@ -259,7 +340,16 @@ impl Fp8MoeMetadata {
         let scratch = info.capacities.iter().map(|&capacity| {
             usize::try_from(query(capacity)?).context("FP8 expert scratch does not fit this process")
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { info, scratch })
+        Ok(Self { info, scratch, segments: Vec::new() })
+    }
+
+    pub fn segment_scratch_bytes(&self, rows: u32) -> Result<usize> {
+        segment_scratch(&self.info, &self.segments, rows)
+    }
+
+    /// Static `(compiled capacity, scratch bytes)` records for planner/runtime admission.
+    pub fn scratch_layout(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.info.capacities.iter().copied().zip(self.scratch.iter().copied())
     }
 
     /// Scratch for the smallest compiled program holding `rows`.
@@ -285,17 +375,19 @@ impl Fp8MoeModule {
         let metadata = Fp8MoeMetadata::from_library(&library)?;
         let create = *library.get::<unsafe extern "C" fn(*mut *mut c_void) -> i32>(b"cuteafd_fp8moe_create")?;
         let launch = *library.get::<Launch>(b"cuteafd_fp8moe_launch")?;
+        let launch_segments = *library.get::<LaunchSegments>(b"cuteafd_fp8moe_launch_segments")?;
         let destroy = *library.get::<Destroy>(b"cuteafd_fp8moe_destroy")?;
         // Packages built before the W8A16 fallback forms have no options.
         let set_options = library.get::<SetOptions>(b"cuteafd_fp8moe_set_options").ok().map(|f| *f);
         let weight_read_group = library.get::<WeightReadGroup>(b"cuteafd_fp8moe_weight_read_group").ok().map(|f| *f);
-        let Fp8MoeMetadata { info, scratch } = metadata;
+        let arithmetic_route = library.get::<ArithmeticRoute>(b"cuteafd_fp8moe_arithmetic_route").ok().map(|f| *f);
+        let Fp8MoeMetadata { info, scratch, segments } = metadata;
         let mut context = std::ptr::null_mut();
         let status = create(&mut context);
         ensure!(status == 0, "FP8 expert package initialization failed with CUDA status {status}");
         let context = NonNull::new(context).context("FP8 expert package returned a null context")?;
-        Ok(Self { _library: library, context, info, scratch, launch, destroy, set_options,
-            weight_read_group, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
+        Ok(Self { _library: library, context, info, scratch, launch, launch_segments, segments, destroy, set_options,
+            weight_read_group, arithmetic_route, prefill: Fp8MoePrefill::Auto, _owner_thread: PhantomData })
     }
 
     /// Selects the programs large row counts run. A package without the
@@ -315,6 +407,11 @@ impl Fp8MoeModule {
 
     pub fn info(&self) -> &Fp8MoeInfo {
         &self.info
+    }
+
+    /// Static `(compiled capacity, scratch bytes)` records, identical to CPU metadata.
+    pub fn scratch_layout(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.info.capacities.iter().copied().zip(self.scratch.iter().copied())
     }
 
     /// The loaded capacity and selected form's static traffic contract.
@@ -340,11 +437,56 @@ impl Fp8MoeModule {
         Fp8MoeTrafficContract::from_words(group, contract)
     }
 
+    /// Arithmetic identity and inclusive interval end of the selected program.
+    /// Missing/unknown metadata disables exact packing, not ordinary execution.
+    pub fn arithmetic_route_for_capacity(&self, capacity: usize, rows: usize)
+        -> Result<Option<(u32, usize)>> {
+        ensure!(self.info.capacities.contains(&capacity) && (1..=capacity).contains(&rows),
+            "FP8 arithmetic query names an uninstalled row/capacity");
+        let Some(query) = self.arithmetic_route else { return Ok(None); };
+        let (mut route, mut end) = (0u32, 0u32);
+        // SAFETY: static function belongs to the live library and writes two live
+        // words without CUDA/context access, exactly like the traffic query.
+        let status = unsafe { query(u32::try_from(capacity)?, self.prefill.option(),
+            u32::try_from(rows)?, &mut route, &mut end) };
+        ensure!(status == 0, "FP8 arithmetic route query failed ({status})");
+        ensure!(route <= 3 && (rows..=capacity).contains(&(end as usize)),
+            "invalid FP8 arithmetic route interval");
+        Ok((route != 0).then_some((route, end as usize)))
+    }
+
     /// Scratch bytes of the program for `capacity`.
     pub fn scratch_bytes(&self, capacity: usize) -> Result<usize> {
         let index = self.info.capacities.iter().position(|&c| c == capacity)
             .with_context(|| format!("FP8 expert package has no capacity {capacity}"))?;
         Ok(self.scratch[index])
+    }
+
+    pub fn segment_minimum_rows(&self) -> Option<u32> {
+        self.segments.iter().map(|segment| segment.minimum_rows).min()
+    }
+
+    pub fn segment_recipe(&self) -> Option<Fp8MoeSegment> {
+        self.segments.iter().find(|segment| segment.form == self.prefill).copied()
+    }
+
+    pub fn segment_scratch_bytes(&self, rows: u32) -> Result<usize> {
+        segment_scratch(&self.info, &self.segments, rows)
+    }
+
+    /// # Safety
+    /// Input/output are device-readable row-address tables, retained with all
+    /// addressed rows and other operands until this stream completes. Tables
+    /// must be populated before launch and scratch sized at the admitted sum.
+    pub unsafe fn launch_segments(&self, pointers: &[*mut c_void; FP8_MOE_POINTERS], rows: usize,
+        stream: *mut c_void) -> Result<()> {
+        let recipe = self.segment_recipe().context("package has no selected segmented recipe")?;
+        ensure!(rows > 0 && rows <= recipe.maximum_rows as usize, "segmented rows exceed code extent");
+        // SAFETY: caller guarantees ordered, live operands; context belongs to this library.
+        let status = unsafe { (self.launch_segments)(self.context.as_ptr(), pointers.as_ptr(),
+            i32::try_from(rows)?, stream) };
+        ensure!(status == 0, "FP8 segmented launch failed ({status})");
+        Ok(())
     }
 
     /// Runs the smallest program holding `rows`.
@@ -374,6 +516,36 @@ impl Drop for Fp8MoeModule {
 #[cfg(test)]
 mod metadata_tests {
     use super::*;
+
+    #[test]
+    fn slot_scratch_selects_capacity_and_rejects_invalid_manifests() {
+        let package = [(16, 0), (2048, 8192), (4096, 32768)];
+        for (rows, bytes) in [(1, 256), (16, 256), (17, 8192), (2048, 8192),
+            (2752, 32768), (4096, 32768)] {
+            assert_eq!(fp8_slot_scratch_bytes(package, rows).unwrap(), bytes);
+        }
+        assert!(fp8_slot_scratch_bytes(package, 0).is_err());
+        assert!(fp8_slot_scratch_bytes(package, 4097).is_err());
+        for package in [vec![], vec![(0, 1)], vec![(16, 1), (16, 2)], vec![(32, 1), (16, 2)]] {
+            assert!(fp8_slot_scratch_bytes(package, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn slot_io_matches_retained_buffers_with_checked_arithmetic() {
+        for rows in [1, 16, 2048, 2752, 4096] {
+            assert_eq!(fp8_slot_io_bytes(4096, 8, true, false, rows).unwrap(),
+                rows * (4096 + 128 + 8 * 8 + 4096 * 2));
+            for (wire, sibling) in [(false, false), (true, true)] {
+                assert_eq!(fp8_slot_io_bytes(4096, 8, wire, sibling, rows).unwrap(),
+                    rows * (4096 * 4 + 8 * 8));
+            }
+        }
+        for (hidden, topk, rows) in [(0, 8, 1), (33, 8, 1), (128, 0, 1), (128, 8, 0),
+            (128, usize::MAX, 1), (usize::MAX - 31, 8, 1), (128, 8, usize::MAX)] {
+            assert!(fp8_slot_io_bytes(hidden, topk, true, false, rows).is_err());
+        }
+    }
 
     fn words() -> [u32; 16] {
         // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
@@ -417,18 +589,20 @@ mod metadata_tests {
     #[test]
     fn exact_k32_slices_require_mxfp4_and_balanced_unit_widths() {
         for input in [1, 7] {
-            for width in [256, 320, 352, 384] {
+            for (tp, width) in [(6, 256), (6, 320), (6, 352), (6, 384),
+                (3, 640), (3, 672), (3, 704), (3, 768)] {
                 let mut w = words();
                 w[2] = width;
                 w[3] = 384;
-                w[6] = 6;
+                w[6] = tp;
                 w[7] = input;
                 assert_eq!(Fp8MoeInfo::from_words(w).unwrap().slice, width as usize);
             }
-            for width in [0, 288, 336, 368, 416] {
+            for (tp, width) in [(6, 0), (6, 288), (6, 336), (6, 368), (6, 416),
+                (3, 656), (3, 688), (3, 736)] {
                 let mut w = words();
                 w[2] = width;
-                w[6] = 6;
+                w[6] = tp;
                 w[7] = input;
                 assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| {
                     panic!("invalid slice must not query workspace")
@@ -436,11 +610,11 @@ mod metadata_tests {
             }
         }
         for format in [1, 4, 5] {
-            for width in [320, 352] {
+            for (tp, width) in [(6, 320), (6, 352), (3, 672), (3, 704)] {
                 let mut w = words();
                 w[0] = 5 | format << 8 | 1 << 16 | 1 << 24;
                 w[2] = width;
-                w[6] = 6;
+                w[6] = tp;
                 assert!(Fp8MoeInfo::from_words(w).is_err());
             }
         }

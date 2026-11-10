@@ -1,4 +1,5 @@
 //! Admitted final BF16 narrowing, zero-centered norm and shared vocabulary head.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
@@ -7,12 +8,12 @@ use crate::shared::{
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
 use cuteafd_ffi::{
-    programs::{Program, Programs, Scalar, VocabularyHead, VOCABULARY_HEAD_WORKSPACE},
+    programs::{Program, Programs, Scalar, VocabularyHead},
     CuteafdDeviceBuffer,
 };
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
+    families::step5::{Config, coordinator::{RankWeightLayout, WeightOperand}},
 };
 
 const H: usize = 4096;
@@ -22,34 +23,55 @@ const POINTERS: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "o
 pub(super) struct HeadPlan {
     layout: RankWeightLayout,
     weights: Vec<WeightOperand>,
+    /// The native vocabulary head's `.weight` name (EXL3 checkpoints).
+    native: Option<String>,
     planes: [usize; 4],
     rows: usize,
     epsilon: f32,
     bytes: u64,
+    predictor: bool,
+    kernel_rows: usize,
 }
 
 impl HeadPlan {
     fn plane_bytes(rows: usize) -> Result<[usize; 4]> {
-        ensure!((1..=4096).contains(&rows), "Step-5 head row capacity must be 1..4096");
-        Ok([rows * H * 2, rows * H * 2, rows * V * 4, VOCABULARY_HEAD_WORKSPACE])
+        cuteafd_loader::plan::families::step5::native::head_planes(rows)
     }
 
     pub fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize) -> Result<Self> {
-        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, None, rows.min(4096))
     }
 
     pub fn for_execution(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
-        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership) -> Result<Self> {
-        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::for_execution(checkpoint,
-            ownership.execution().spec().head_gpu as usize, ownership)?)
+        ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        layout: &RankWeightLayout) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows, layout.clone(), None, ownership.execution().spec().rows as usize)
     }
 
-    fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize, layout: RankWeightLayout) -> Result<Self> {
+    pub(super) fn for_mtp_stage(programs: &Programs<'_>, checkpoint: &Checkpoint,
+        stage: usize, rows: usize, contract: &cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows,
+            RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?, Some(stage), rows)
+    }
+
+    fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
+        layout: RankWeightLayout, stage: Option<usize>, kernel_rows: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&kernel_rows), "Step-5 head kernel row capacity");
         let planes = Self::plane_bytes(rows)?;
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let weights = [("model.norm.weight", DType::F32, vec![H]),
-            ("lm_head.weight", DType::Bf16, vec![V, H])]
-            .into_iter().map(|(name, dtype, shape)| {
+        let cfg = Config::parse(checkpoint)?;
+        let names = if let Some(stage) = stage {
+            let layer = cfg.layers + stage;
+            [format!("model.layers.{layer}.transformer.shared_head.norm.weight"),
+                format!("model.layers.{layer}.transformer.shared_head.output.weight")]
+        } else { ["model.norm.weight".into(), "lm_head.weight".into()] };
+        let native = layout.core.get(&names[1]).map(|core| {
+            ensure!(core.shape == [V, H] && core.ranks == 1, "Step-5 native head geometry");
+            Ok(names[1].clone())
+        }).transpose()?;
+        let bf16: &[(&str, DType, Vec<usize>)] = &[(names[1].as_str(), DType::Bf16, vec![V, H])];
+        let weights = [(names[0].as_str(), DType::F32, vec![H])].into_iter()
+            .chain(if native.is_some() { &[][..] } else { bf16 }.iter().cloned())
+            .map(|(name, dtype, shape)| {
                 let weight = layout.operands.iter().find(|w| w.name == name)
                     .context("Step-5 final operand missing")?;
                 ensure!(weight.dtype == dtype && weight.shape == shape,
@@ -59,14 +81,26 @@ impl HeadPlan {
         let spec = programs.spec("step5_final_norm")?;
         let g = &spec.geometry;
         ensure!(spec.pointers == POINTERS && spec.scalar_kinds == b"if"
-            && spec.capacity_rows as usize >= rows && spec.scratch.is_empty()
+            && spec.capacity_rows as usize >= kernel_rows && spec.scratch.is_empty()
             && g["width"] == H && g["heads"] == 1 && g["zero_centered"] == true
             && g["subtract_mean"] == false && g["bias"] == false && g["rotary"] == 0
             && g["epsilon"] == "runtime_float32", "Step-5 final norm ABI/geometry mismatch");
-        let bytes = weights.iter().map(|w| w.allocation_bytes)
-            .chain(planes.iter().map(|&n| n as u64))
-            .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")?;
-        Ok(Self { layout, weights, planes, rows, epsilon: contract.norms.final_norm, bytes })
+        let bytes = Self::owner_bytes(&weights, native.as_ref().map(|name| &layout.core[name]),
+            &planes, kernel_rows)?;
+        Ok(Self { layout, weights, native, planes, rows, epsilon: cfg.norm_eps, bytes,
+            predictor: stage.is_some(), kernel_rows })
+    }
+
+    fn owner_bytes(weights: &[WeightOperand], native: Option<&cuteafd_loader::formats::trellis_core::CoreWeightLayout>,
+        planes: &[usize; 4], kernel_rows: usize) -> Result<u64> {
+        let native_bytes = native.map(|core| -> Result<u64> {
+            (core.bytes as u64).checked_add(
+                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.bytes()? as u64)
+                .context("Step-5 native head overflow")
+        }).transpose()?.unwrap_or(0);
+        weights.iter().map(|w| w.allocation_bytes)
+            .chain(planes.iter().map(|&n| n as u64)).chain([native_bytes])
+            .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")
     }
 
     pub fn bytes(&self) -> u64 { self.bytes }
@@ -83,21 +117,33 @@ impl HeadPlan {
 struct HeadWeights<'a> {
     norm: Program<'a>,
     weights: Vec<Allocation<'a>>,
+    /// Native vocabulary projection (F32 logits) and its admitted scratch.
+    native: Option<(super::native::NativeLinear<'a>, super::native::NativeScratch<'a>)>,
     epsilon: f32,
+    predictor: bool,
+    kernel_rows: usize,
 }
 
 pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
     stream: Stream<'a>,
     head: VocabularyHead<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     rows: usize,
     immutable: std::rc::Rc<HeadWeights<'a>>,
 }
 
 impl<'a> TargetHeadOwner<'a> {
+    pub(super) fn device(&self) -> Device<'a> { self.stream.device }
+    pub(super) fn workspace_bytes(&self) -> u64 { HeadPlan::plane_bytes(self.rows).expect("admitted rows").iter().sum::<usize>() as u64 }
+
     pub fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         plan: HeadPlan, available: u64, reservations: &[u64]) -> Result<Self> {
+        Self::load_in(device, programs, checkpoint, plan, available, reservations, None)
+    }
+
+    pub(super) fn load_in(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        plan: HeadPlan, available: u64, reservations: &[u64], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let total = reservations.iter().try_fold(plan.bytes, |n, v| n.checked_add(*v))
             .context("Step-5 final head reservation overflow")?;
         ensure!(total <= available, "Step-5 final head and reservations exceed admission");
@@ -105,22 +151,30 @@ impl<'a> TargetHeadOwner<'a> {
             let norm = programs.program("step5_final_norm", POINTERS)?;
             let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w))
                 .collect::<Result<Vec<_>>>()?;
+            let native = plan.native.as_ref().map(|name| -> Result<_> {
+                let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
+                    plan.kernel_rows, |n| n == name)?;
+                let layout = cuteafd_loader::formats::head::native_private_scratch(
+                    plan.layout.core[name].shape, plan.kernel_rows)?;
+                let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
+                    .map_err(|_| anyhow::anyhow!("native head aliased"))?;
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+            }).transpose()?;
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
-                norm, weights, epsilon: plan.epsilon,
-            }))
+                norm, weights, native, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
+            }), arena)
         })
     }
 
     /// Every lane has its own BLAS handle, stream, norm/logit planes and scratch.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.rows, self.immutable.clone())
+        Self::workspace(self.stream.device, self.rows, self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, rows: usize,
-        immutable: std::rc::Rc<HeadWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<HeadWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         device.run(|| {
-            let planes = HeadPlan::plane_bytes(rows)?.iter().map(|&n| Allocation::new(device, n))
-                .collect::<Result<Vec<_>>>()?;
+            let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena)?;
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };
@@ -137,32 +191,68 @@ impl<'a> TargetHeadOwner<'a> {
             f32::from_bits(u32::from(u16::from_le_bytes(b.try_into().unwrap())) << 16)).collect())
     }
 
-    /// Caller drains the target chain first; this method drains before releasing its input borrow.
-    pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
-        ensure!(input.bytes >= self.rows * H * 4, "Step-5 final hidden extent");
-        let mut guard = self.stream.cancellation_guard("Step-5 final head input borrow");
-        self.stream.device.run(|| {
-            let library = self.stream.device.library;
+    /// The transaction retains this owner and input through the lane stream's drain.
+    pub(super) fn device_logits_on(&self, input: CuteafdDeviceBuffer, rows: usize,
+        stream: &Stream<'a>) -> Result<crate::shared::token_io::DeviceLogits> {
+        super::transaction::validate_active_rows(rows, self.rows)?;
+        ensure!(!input.ptr.is_null() && input.bytes >= rows * H * 4
+            && input.device_id == self.stream.device.id && stream.device.id == input.device_id
+            && std::ptr::eq(stream.device.library, self.stream.device.library),
+            "Step-5 final hidden extent/device/stream");
+        let mut guard = stream.cancellation_guard("Step-5 final head input borrow");
+        stream.device.run(|| {
+            let library = stream.device.library;
             let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
             let weight = self.immutable.weights[0].buffer.ptr;
-            // SAFETY: all extents were admitted; disjoint owners and input remain live until drain.
+            // The shared target arena preserves the F32 residual until narrowing
+            // completes; only the later logits/scratch writes may alias that input.
+            // SAFETY: admitted lane-private planes, head handle and input stay live
+            // through the transaction drain; runtime rows never exceed capacity.
             unsafe {
-                library.cuda_f32_to_bf16_async(input, self.planes[0].buffer,
-                    self.rows * H, self.stream.raw)?;
-                self.immutable.norm.launch(&[p[0], weight, weight, weight, weight, weight, p[1]],
-                    &[Scalar::I32(self.rows as i32), Scalar::F32(self.immutable.epsilon)], self.stream.raw)?;
-                target_head::launch(TargetHead::configured(), &self.head, p[1],
-                    self.immutable.weights[1].buffer.ptr, p[2].cast(), self.rows, self.stream.raw)?;
+                library.cuda_f32_to_bf16_async(input, self.planes[0].buffer, rows * H, stream.raw)?;
+                // The span-sized logit planes retain all scoring rows, but the
+                // masked norm export runs at most its compiled unit capacity.
+                for start in (0..rows).step_by(self.immutable.kernel_rows) {
+                    let count = (rows - start).min(self.immutable.kernel_rows);
+                    let input = p[0].wrapping_byte_add(start * H * 2);
+                    let output = p[1].wrapping_byte_add(start * H * 2);
+                    self.immutable.norm.launch(&[input, weight, weight, weight, weight, weight, output],
+                        &[Scalar::I32(count as i32), Scalar::F32(self.immutable.epsilon)], stream.raw)?;
+                }
+                for start in (0..rows).step_by(self.immutable.kernel_rows) {
+                    let count = (rows - start).min(self.immutable.kernel_rows);
+                    let input = p[1].wrapping_byte_add(start * H * 2);
+                    let output: *mut f32 = p[2].wrapping_byte_add(start * V * 4).cast();
+                    if let Some((linear, scratch)) = &self.immutable.native {
+                        // The head's scratch is shared by lanes on this one stream; lanes run
+                        // their heads in stream order on the head rank.
+                        let buffer = |ptr: *mut std::ffi::c_void, bytes| CuteafdDeviceBuffer { ptr, bytes,
+                            device_id: stream.device.id, flags: 0 };
+                        linear.launch(count, buffer(input, count * H * 2), buffer(output.cast(), count * V * 4),
+                            &scratch.scratch, stream.raw)?;
+                    } else if self.immutable.predictor {
+                        crate::shared::draft::launch_bf16_head(&self.head, input.cast(),
+                            self.immutable.weights[1].buffer.ptr.cast(), output, count, stream.raw)?;
+                    } else {
+                        target_head::launch(TargetHead::configured(), &self.head, input,
+                            self.immutable.weights[1].buffer.ptr, output, count, stream.raw)?;
+                    }
+                }
             }
-            self.stream.drain()?;
             guard.complete = true;
-            let mut bytes = vec![0; self.rows * V * 4];
-            library.copy_d2h(&mut bytes, self.planes[2].buffer)?;
-            let values = bytes.chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
-            ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
-            Ok(values)
+            Ok(crate::shared::token_io::DeviceLogits { ptr: p[2].cast_const(), rows, vocab: V,
+                stride: V, stream: stream.raw, greedy: None })
         })
+    }
+
+    /// Caller drains the target chain first; this diagnostic downloads all rows.
+    pub fn logits(&self, input: CuteafdDeviceBuffer) -> Result<Vec<f32>> {
+        let mut guard = self.stream.cancellation_guard("Step-5 diagnostic head input borrow");
+        let logits = self.device_logits_on(input, self.rows, &self.stream)?;
+        let values = self.stream.device.run(|| logits.to_host(self.stream.device.library))?;
+        guard.complete = true;
+        ensure!(values.iter().all(|v| v.is_finite()), "nonfinite Step-5 logits");
+        Ok(values)
     }
 }
 
@@ -172,8 +262,8 @@ pub(super) mod tests {
     pub(in super::super) fn admission_plan(rows: usize) -> HeadPlan {
         let planes = HeadPlan::plane_bytes(rows).unwrap();
         HeadPlan {
-            layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 },
-            weights: vec![], planes, rows, epsilon: 1e-5,
+            layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 },
+            weights: vec![], native: None, planes, rows, epsilon: 1e-5, predictor: false, kernel_rows: rows.min(4096),
             bytes: ((H * 4 + V * H * 2) as u64) + planes.iter().map(|&n| n as u64).sum::<u64>(),
         }
     }
@@ -207,11 +297,48 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn native_k6_head_plan_matches_private_owner_and_reusable_planes() -> Result<()> {
+        use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook,
+            trellis_core::CoreWeightLayout};
+        use cuteafd_loader::plan::families::step5::coordinator::WeightSlice;
+        let core_bytes = V * H * 6 / 8 + 2 * (V + H);
+        let native = CoreWeightLayout { stem: "lm_head".into(), side: TrellisSide::Output,
+            rank: 0, ranks: 1, shape: [V, H], bytes: core_bytes, bits: 6,
+            codebook: Exl3Codebook::Mcg };
+        let norm = WeightOperand { name: "model.norm.weight".into(), sources: vec![], dtype: DType::F32,
+            shape: vec![H], slice: WeightSlice::Replicated, allocation_bytes: (H * 4) as u64 };
+        for (unit, logits, private_scratch) in [(64, 64, 165511240), (256, 64, 400128072),
+            (256, 256, 400128072)] {
+            let planes = HeadPlan::plane_bytes(logits)?;
+            let weights = vec![norm.clone()];
+            let bytes = HeadPlan::owner_bytes(&weights, Some(&native), &planes, unit)?;
+            let plan = HeadPlan { layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![],
+                core: [("lm_head.weight".into(), native.clone())].into(), resident_bytes: 0 },
+                weights, native: Some("lm_head.weight".into()), planes, rows: logits,
+                epsilon: 1e-5, bytes, predictor: false, kernel_rows: unit };
+            let owner_layout = cuteafd_loader::formats::head::native_private_scratch(native.shape, unit)?;
+            assert_eq!(owner_layout.rows, unit);
+            assert_eq!(owner_layout.bytes()? as u64, private_scratch);
+            assert_eq!(plan.immutable_bytes(), (H * 4 + core_bytes) as u64 + private_scratch);
+            assert_eq!(plan.workspace_bytes(), (logits * (H * 4 + V * 4) + (4 << 20)) as u64);
+            assert_eq!(plan.bytes(), plan.immutable_bytes() + plan.workspace_bytes());
+            // The private owner survives while only the logit planes alias this larger arena.
+            let arena = plan.workspace_bytes() + 1024;
+            let admitted = super::super::execution::RankAdmission { immutable: 1000, workspace: arena }
+                .with_head(&plan)?;
+            assert_eq!(admitted.immutable, 1000 + plan.immutable_bytes());
+            assert_eq!(admitted.workspace, arena);
+            assert_eq!(admitted.bytes()?, 1000 + plan.immutable_bytes() + arena);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn final_planes_charge_both_bf16_boundaries_logits_and_head_workspace() {
-        for rows in [1, 64, 640, 4096] {
+        for rows in [1, 64, 640, 4096, 8192, 8256] {
             let planes = HeadPlan::plane_bytes(rows).unwrap();
             assert_eq!(planes, [rows * H * 2, rows * H * 2, rows * V * 4, 4 << 20]);
         }
-        for rows in [0, 4097, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
+        for rows in [0, 8257, usize::MAX] { assert!(HeadPlan::plane_bytes(rows).is_err()); }
     }
 }

@@ -5,10 +5,13 @@ use cuteafd_core::{DType, FfnActivation};
 use crate::plan::{checkpoint::Checkpoint, family::*, format::QuantOperand, names::indexed, spec::*};
 
 mod placement;
+pub mod admission;
+pub mod exl3;
+pub mod native;
 pub mod coordinator;
 pub mod ownership;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub struct Step5;
 pub static STEP5: Step5 = Step5;
@@ -42,6 +45,9 @@ pub struct Config {
 }
 
 impl Config {
+    /// The planner's canonical family for this validated configuration.
+    pub fn family_id(&self) -> &'static str { STEP5.id() }
+
     pub fn parse(checkpoint: &Checkpoint) -> Result<Self> {
         let v = checkpoint.config.get("text_config").unwrap_or(&checkpoint.config);
         ensure!(v["model_type"] == "step5", "expected nested text_config.model_type=step5");
@@ -168,20 +174,84 @@ pub(super) struct Model {
     bytes: BTreeMap<Component, u64>,
     complete: bool,
     formats: Vec<String>,
+    /// Header-native EXL3 dense core (empty for the official FP8/NVFP4 releases).
+    pub(super) core: exl3::CoreInventory,
+    /// Per routed target layer, the EXL3 width its experts are stored at.
+    pub(super) expert_bits: BTreeMap<usize, usize>,
 }
 
 impl Model {
+    /// Routed EXL3 widths as one two-tier decoder family (`exl3-k46`). A
+    /// uniform checkpoint takes the empty adjacent tier, as the kernels expect.
+    pub(super) fn exl3_tiers(&self) -> Option<Vec<usize>> {
+        let mut bits = self.expert_bits.values().copied().collect::<Vec<_>>();
+        bits.sort_unstable();
+        bits.dedup();
+        match bits.as_slice() {
+            [] => None,
+            [only] => Some(if *only == 6 { vec![5, 6] } else { vec![*only, only + 1] }),
+            [low, high] => Some(vec![*low, *high]),
+            _ => None,
+        }
+    }
+
+    pub(super) fn exl3_package(&self) -> Option<String> {
+        Some(format!("exl3-k{}", self.exl3_tiers()?.iter().map(usize::to_string).collect::<String>()))
+    }
+
+    pub fn is_exl3(&self) -> bool { !self.expert_bits.is_empty() }
+
+    fn accepts_exl3(&self, role: &TensorRole, stem: &str, operand: &QuantOperand, bits: usize) -> Result<(), String> {
+        let trellis = self.tensors.get(&format!("{stem}.trellis"))
+            .ok_or_else(|| format!("{stem}: Step-5 keeps this tensor native; EXL3 storage is outside the recipe"))?;
+        if trellis.role != *role {
+            return Err(format!("{stem}: EXL3 operand role {:?} differs from its contract {:?}", role, trellis.role));
+        }
+        if operand.stored != trellis.shape || trellis.shape.get(2) != Some(&(16 * bits)) {
+            return Err(format!("{stem}: EXL3 K{bits} storage {:?}, expected {:?}", operand.stored, trellis.shape));
+        }
+        if role.component == Component::RoutedExpert {
+            let layer = role.layer.ok_or("routed EXL3 operand without a layer")?;
+            if self.expert_bits.get(&layer) != Some(&bits) {
+                return Err(format!("{stem}: layer {layer} routed experts mix EXL3 widths (K{bits} vs K{:?})",
+                    self.expert_bits.get(&layer)));
+            }
+            return Ok(());
+        }
+        let projection = self.core.get(stem).ok_or_else(|| format!("{stem}: not in the native dense core inventory"))?;
+        if projection.bits != bits { return Err(format!("{stem}: core K{} disagrees with headers K{bits}", projection.bits)); }
+        Ok(())
+    }
+
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
+        let _construction = tracing::debug_span!("step5_model_open").entered();
         let cfg = Config::parse(checkpoint)?;
+        let exl3 = exl3::is_exl3(checkpoint);
+        let core = exl3::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut tensors = BTreeMap::new();
+        // A header-native EXL3 projection replaces the `.weight` contract of its
+        // stem with the standard trellis/suh/svh/mcg set at its own width.
         let mut add = |name: String, component, layer, shape: Vec<usize>, dtype| {
-            tensors.insert(name, Tensor { role: TensorRole { component, layer, expert: None }, shape, dtype });
+            let role = TensorRole { component, layer, expert: None };
+            if let Some(projection) = name.strip_suffix(".weight").and_then(|stem| core.get(stem)) {
+                let stem = &projection.stem;
+                for (suffix, dtype, shape) in [
+                    ("trellis", DType::I16, vec![shape[1] / 16, shape[0] / 16, 16 * projection.bits]),
+                    ("suh", DType::F16, vec![shape[1]]), ("svh", DType::F16, vec![shape[0]]),
+                    ("mcg", DType::I32, vec![])] {
+                    tensors.insert(format!("{stem}.{suffix}"), Tensor { role: role.clone(), shape, dtype });
+                }
+            } else {
+                tensors.insert(name, Tensor { role, shape, dtype });
+            }
         };
         let (h, v, d, e, i) = (cfg.hidden, cfg.vocab, cfg.dim, cfg.experts, cfg.intermediate);
         add("model.embed_tokens.weight".into(), Component::Embedding, None, vec![v, h], DType::Bf16);
         add("lm_head.weight".into(), Component::LmHead, None, vec![v, h], DType::Bf16);
         add("model.norm.weight".into(), Component::Norm, None, vec![h], DType::F32);
         let mut formats = Vec::new();
+        let mut expert_bits = BTreeMap::new();
+        let mut experts: Vec<(String, Tensor)> = Vec::new();
         for layer in 0..cfg.layers + cfg.mtp {
             let base = format!("model.layers.{layer}");
             let draft = layer >= cfg.layers;
@@ -212,10 +282,30 @@ impl Model {
             for (prefix, inter, component, stacked) in if cfg.moe[layer] {
                 vec![("moe", i, Component::RoutedExpert, true), ("share_expert", cfg.shared, Component::SharedExpert, false)]
             } else { vec![("mlp", cfg.dense, role(Component::DenseFfn), false)] } {
+                if stacked && exl3 {
+                    // Per-expert standard EXL3 modules; the width is the checkpoint's own.
+                    let bits = exl3_expert_bits(checkpoint, &format!("{base}.moe.experts.0.gate_proj"))?;
+                    ensure!(exl3::declared_expert_bits(checkpoint, layer).is_none_or(|declared| declared == bits),
+                        "{base}: routed experts are K{bits}; quantization_config declares K{:?}",
+                        exl3::declared_expert_bits(checkpoint, layer));
+                    expert_bits.insert(layer, bits);
+                    let label = format!("exl3-k{bits}");
+                    if !formats.contains(&label) { formats.push(label); }
+                    for expert in 0..e {
+                        for (proj,n,k) in [("gate",inter,h), ("up",inter,h), ("down",h,inter)] {
+                            let stem = format!("{base}.moe.experts.{expert}.{proj}_proj");
+                            for (suffix, dtype, shape) in [("trellis", DType::I16, vec![k/16, n/16, 16*bits]),
+                                ("suh", DType::F16, vec![k]), ("svh", DType::F16, vec![n]), ("mcg", DType::I32, vec![])] {
+                                experts.push((format!("{stem}.{suffix}"), Tensor { role: TensorRole::expert(component, layer, expert), shape, dtype }));
+                            }
+                        }
+                    }
+                    continue;
+                }
                 for (proj,n,k) in [("gate",inter,h), ("up",inter,h), ("down",h,inter)] {
                     let stem = format!("{base}.{prefix}.{proj}_proj");
                     let name = format!("{stem}.weight");
-                    let actual = checkpoint.tensors.iter().find(|t| t.meta.name == name);
+                    let actual = header(checkpoint, &name);
                     let dtype = if stacked { actual.map(|t| t.meta.dtype.clone()).unwrap_or_else(|| {
                         if checkpoint.contains_tensor(&format!("{stem}.weight_scale_inv")) { DType::F8E4M3 }
                         else if checkpoint.contains_tensor(&format!("{stem}.weight_scale_2")) { DType::U8 }
@@ -280,15 +370,16 @@ impl Model {
             }
             vision_tensor("vit_large_projector.weight".into(), vec![h,6144]);
         }
+        tensors.extend(experts);
         for (name, contract) in &tensors {
             ensure!(checkpoint.contains_tensor(name), "Step-5 checkpoint lacks required tensor {name}");
-            if let Some(actual) = checkpoint.tensors.iter().find(|t| &t.meta.name == name) {
+            if let Some(actual) = header(checkpoint, name) {
                 ensure!(actual.meta.shape == contract.shape && actual.meta.dtype == contract.dtype,
                     "{name}: expected {:?} {:?}, found {:?} {:?}", contract.dtype, contract.shape, actual.meta.dtype, actual.meta.shape);
             }
         }
         // A layer has one expert storage format across all three projections.
-        for layer in 3..91 {
+        for layer in (3..91).filter(|_| !exl3) {
             let dtype = &tensors[&format!("model.layers.{layer}.moe.gate_proj.weight")].dtype;
             for proj in ["up", "down"] {
                 let name = format!("model.layers.{layer}.moe.{proj}_proj.weight");
@@ -296,7 +387,7 @@ impl Model {
             }
         }
         let complete = checkpoint.missing_shards.is_empty() && tensors.keys().all(|name|
-            checkpoint.tensors.iter().any(|t| &t.meta.name == name));
+            header(checkpoint, name).is_some());
         let mut bytes = BTreeMap::new();
         for tensor in &checkpoint.tensors {
             let contract = tensors.get(&tensor.meta.name)
@@ -317,7 +408,7 @@ impl Model {
                 "CSA compresses index keys only: one E4M3 proxy256 summary per eight tokens, original GQA K/V retained; provider-group top-512 regions".into(),
                 "FP32 residual and zero-centered norms; post-SiLU clamp + FP32 product, one BF16 round, for routed/shared/dense FFNs".into(),
                 "ssmax_s [64] FP32 is retained and validated, unused by released kernels; ordinary attention scale 1/sqrt(192)".into(),
-                "Header-only memory lower bounds; no executable kernels, runtime workspace/prefix/graph admission or serving-fit claim".into(),
+                "Eager native admission on qualified WIP cards; native MTP defaults to depth 3, with exact predictor header contracts; no release or media qualification".into(),
             ] };
         let mut spec = spec;
         if complete {
@@ -330,13 +421,44 @@ impl Model {
                 }
             }
         }
-        Ok(Self { cfg, spec, tensors, bytes, complete, formats })
+        Ok(Self { cfg, spec, tensors, bytes, complete, formats, core, expert_bits })
     }
 }
 
+/// `Checkpoint::tensors` is sorted by name; EXL3 publications carry ~376k headers.
+fn header<'c>(checkpoint: &'c Checkpoint, name: &str) -> Option<&'c crate::plan::checkpoint::CheckpointTensor> {
+    checkpoint.tensors.binary_search_by(|t| t.meta.name.as_str().cmp(name)).ok().map(|at| &checkpoint.tensors[at])
+}
+
+/// A routed EXL3 module's width from its own trellis header (index-only
+/// inventories read that one header).
+fn exl3_expert_bits(checkpoint: &Checkpoint, stem: &str) -> Result<usize> {
+    let name = format!("{stem}.trellis");
+    let shape = match header(checkpoint, &name) {
+        Some(t) => t.meta.shape.clone(),
+        None => {
+            let shard = checkpoint.weight_map.get(&name)
+                .with_context(|| format!("Step-5 EXL3 checkpoint lacks {name}"))?;
+            crate::read_safetensors_metadata(&checkpoint.snapshot.join(shard))?.into_iter()
+                .find(|m| m.name == name).with_context(|| format!("{shard} lacks indexed {name}"))?.shape
+        }
+    };
+    ensure!(shape.len() == 3 && shape[2] % 16 == 0 && (2..=6).contains(&(shape[2] / 16)),
+        "{name}: EXL3 trellis shape {shape:?} is not K2..K6");
+    Ok(shape[2] / 16)
+}
+
 impl Family for Step5 {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "a second lane needs its own decode link, separate from the shared prefill link; low priority (#744)" }
+    }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        // Step-5 decode/verify steps send at most 64 rows (`rows.min(64)`).
+        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+    }
     fn id(&self) -> &'static str { "step5" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
         checkpoint.architectures().iter().any(|a| matches!(a.as_str(), "Step5ForConditionalGeneration" | "Step5ForCausalLM"))
             || matches!(checkpoint.model_type(), Some("step5_vl" | "step5"))
@@ -353,6 +475,9 @@ impl Family for Step5 {
         if layer >= spec.layers.len() {
             return (layer < spec.layers.len()+3).then(|| TensorRole::layer(Component::Speculator, layer));
         }
+        if let Some((expert, _)) = indexed(rest, "moe.experts.") {
+            return Some(TensorRole::expert(Component::RoutedExpert, layer, expert));
+        }
         let component = if rest.starts_with("moe.gate_proj.") || rest.starts_with("moe.up_proj.") || rest.starts_with("moe.down_proj.") { Component::RoutedExpert }
             else if rest.starts_with("moe.gate.") || rest == "moe.router_bias" { Component::Router }
             else if rest.starts_with("share_expert.") { Component::SharedExpert }
@@ -364,33 +489,42 @@ impl Family for Step5 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
-        let exports = match component {
-            Component::RoutedExpert => "shared stacked FP8 block128 / NVFP4 W4A4 expert-axis reader and native BF16-tail backend; step5 H4096 E352 K8 I1536 TP6(256)/TP4(384) exports; post-SiLU clamp/FP32 product",
-            Component::Attention => "BF16 GQA192 projections, Q/K norms, sigmoid head gate, SWA512 + verify slack, provider-group sparse paged GQA192 prefill/decode/verify exports",
-            Component::Indexer | Component::Compressor => "CSA-8 summarize/commit/rollback, index norm/RoPE/E4M3 rounding, signed weighted-ReLU scores and deterministic provider top-512 region expansion exports",
-            Component::DenseFfn | Component::SharedExpert => "shared BF16 FFN exports with post-SiLU clamp and FP32 product (not existing pre-SiLU clamp kernels)",
-            Component::Vision => "official perception encoder QuickGELU/LayerScale, two downsamplers, BF16 projector and crop/token ordering exports",
-            Component::Speculator => "three BF16 SWA/dense MTP stage exports and independent heads; shared draft policy and exact rollback/prefix adapter",
-            _ => "FP32 residual/zero-centered norm and FP32 sigmoid router with selection-only bias and factor3 primitives",
-        };
-        Some(Hint { what: format!("Step-5 {} kernels/exports missing", component.label()), how: format!("Add {exports}; gate SM120 + SM121 and exact state before enabling runtime.") })
+        match component {
+            Component::Vision => Some(Hint { what: "Step-5 bundled vision is not qualified".into(),
+                how: "Use text-only serving; qualify the official bundled encoder before enabling media.".into() }),
+            _ => None,
+        }
     }
+    fn optional(&self, component: Component) -> bool {
+        matches!(component, Component::Vision | Component::Speculator)
+    }
+    fn expert_catalog(&self) -> bool { true }
+
 }
 
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
+    fn native_serving_admission(&self) -> bool { true }
+    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
+        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
+    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         let layout = crate::serving_capacity::step5::Step5CacheLayout::new(
-            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64))?;
+            &self.cfg, options.coordinator_ranks, self.cfg.max_context, options.native_mtp_layers, options.prefill_rows.max(64),
+            options.prefill_rows.max(64), options.step5_kv)?;
         Ok(Some(layout.geometry))
     }
     fn activation(&self, layer: usize, shared: bool) -> Option<FfnActivation> {
         if shared { self.cfg.shared_activation.get(layer) } else { self.cfg.activation.get(layer) }.copied()
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
-        if !self.tensors.contains_key(stem) && !self.tensors.contains_key(&format!("{stem}.weight")) {
+        if !self.tensors.contains_key(stem) && !self.tensors.contains_key(&format!("{stem}.weight"))
+            && !self.tensors.contains_key(&format!("{stem}.trellis")) {
             return Err(format!("{stem}: unknown Step-5 tensor; add a validated header contract"));
+        }
+        if let Some(bits) = operand.exl3_bits() {
+            return self.accepts_exl3(role, stem, operand, bits);
         }
         if role.component == Component::RoutedExpert {
             let contract = self.tensors.get(&format!("{stem}.weight"));
@@ -401,6 +535,17 @@ impl FamilyModel for Model {
                 && operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
                 return Ok(());
             }
+            if contract.is_some_and(|tensor| tensor.role == *role && tensor.dtype == DType::U8
+                    && tensor.shape == operand.stored)
+                && role.layer.is_some_and(|layer| (3..88).contains(&layer))
+                && operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+                    scale.encoding == crate::plan::format::ScaleEncoding::F32)
+                && operand.companions.is_empty()
+                && operand.stored.len() == 3 && operand.logical.len() == 3
+                && operand.logical[..2] == operand.stored[..2]
+                && operand.stored[2].checked_mul(2) == Some(operand.logical[2]) {
+                return Ok(());
+            }
             if shape_matches && role.layer.is_some_and(|layer| (88..91).contains(&layer))
                 && contract.is_some_and(|tensor| tensor.dtype == DType::Bf16)
                 && operand.encoding == crate::plan::format::Encoding::Bf16
@@ -409,12 +554,46 @@ impl FamilyModel for Model {
                 return Ok(());
             }
         }
-        let hint = STEP5.component_hint(role.component).expect("every component has a hint");
-        Err(format!("{stem}: {}: {}", hint.what, hint.how))
+        // Predictor headers in this same contract are the three qualified SWA/dense
+        // stages, including their private EH projection, norms and shared head.
+        if !matches!(role.component, Component::RoutedExpert | Component::Vision) {
+            if let Some(tensor) = self.tensors.get(stem).or_else(|| self.tensors.get(&format!("{stem}.weight"))) {
+                let encoding = match tensor.dtype {
+                    DType::Bf16 => Some(crate::plan::format::Encoding::Bf16),
+                    DType::F32 => Some(crate::plan::format::Encoding::F32),
+                    _ => None,
+                };
+                // The index key norm groups its validated FP32 bias with the weight.
+                let companions = operand.companions.is_empty()
+                    || (operand.companions == ["bias"]
+                        && stem.ends_with(".self_attn.sparse_indexer_k_norm")
+                        && self.tensors.get(&format!("{stem}.bias")).is_some_and(|bias|
+                            bias.role == *role && bias.dtype == DType::F32 && bias.shape == tensor.shape));
+                let container = role.component != Component::Speculator || matches!(
+                    (&tensor.dtype, operand.container.as_str()), (DType::Bf16, "bf16") | (DType::F32, "f32"));
+                if tensor.role == *role && tensor.shape == operand.logical && tensor.shape == operand.stored
+                    && container && encoding == Some(operand.encoding) && operand.scale.is_none()
+                    && operand.global_scale.is_none() && operand.input_scale.is_none() && companions {
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("{stem}: Step-5 {:?} operand is outside the validated native contract", role.component))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
+        if operand.exl3_bits().is_some() {
+            let package = format!("step5:{}", self.exl3_package()?);
+            return Some(ExpertContract {
+                spark_worlds: crate::plan::experts::spark_worlds(&package, self.cfg.intermediate),
+                package, block: 128,
+                local: Ok("serve-step5 RTX expert onboarding (EXL3 rtx-tp1/rtx-tp2 package)".into()),
+            });
+        }
         let package = if operand.is_fp8_block(128, &[crate::plan::format::ScaleEncoding::F32]) {
             "step5:fp8"
+        } else if operand.is_nvfp4() && operand.input_scale.is_some_and(|scale|
+            scale.encoding == crate::plan::format::ScaleEncoding::F32) {
+            "step5:nvfp4"
         } else if operand.encoding == crate::plan::format::Encoding::Bf16
             && operand.scale.is_none() && operand.global_scale.is_none()
             && operand.input_scale.is_none() && operand.companions.is_empty() {
@@ -426,9 +605,36 @@ impl FamilyModel for Model {
             local: Err("Step-5 coordinator-local routed experts are not qualified".into()),
         })
     }
-    fn placement(&self, _input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+        options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
-        Some(Ok(placement::layout(self, report, options, requested)))
+        Some(placement::layout(self, input, report, options, requested))
     }
+}
+
+/// Whether this checkpoint admits `ranks` real Spark experts: the planner's
+/// own verdict for that world (a packaged layout, nonempty whole slices, the
+/// Spark range and every Spark device's full memory layout), so a golden
+/// accepts exactly the worlds `cuteafd plan --layout` does instead of keeping
+/// its own list. RTX columns are the caller's (golden sizes its own chain).
+pub fn spark_world_admitted(snapshot: &std::path::Path, programs: &std::path::Path, ranks: usize)
+    -> anyhow::Result<()> {
+    use cuteafd_core::memory_layout::DeviceKind;
+    anyhow::ensure!(ranks > 0, "Step-5 golden needs real Spark experts");
+    let report = crate::plan::plan(snapshot, &crate::plan::PlanOptions {
+        placement: crate::plan::ExpertPlacement::from_spark_ranks(ranks),
+        draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
+        layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            workspace_manifest: Some(programs.to_path_buf()), ..Default::default() }),
+        ..Default::default() })?;
+    let spark_over = report.memory_layout.as_ref().map_or(Vec::new(), |memory| memory.devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark && d.used_bytes() > d.capacity_bytes)
+        .map(|d| format!("{} needs {} of {} bytes", d.name(), d.used_bytes(), d.capacity_bytes)).collect());
+    let laid_out = report.memory_layout.as_ref().is_some_and(|m| m.devices.iter().any(|d| d.kind == DeviceKind::Spark));
+    if report.placement_supported && report.spark_range_refusal.is_none() && laid_out && spark_over.is_empty() {
+        return Ok(());
+    }
+    let hints = report.hints.iter().map(|h| h.what.as_str()).chain(spark_over.iter().map(String::as_str))
+        .collect::<Vec<_>>().join("; ");
+    anyhow::bail!("Step-5 checkpoint does not admit {ranks} Spark ranks: {hints}")
 }

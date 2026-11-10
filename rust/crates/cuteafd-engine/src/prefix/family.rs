@@ -225,9 +225,80 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     type Placement;
 
     fn layout(&self) -> FamilyLayout;
+    /// Full-context draft pages use their own host slab class, under the same quota.
+    fn draft_page_bytes(&self) -> usize { 0 }
+    /// Reserve live growth and private proposal/tail credit before request publication.
+    fn admit_draft_pages(&self, placement: &mut Self::Placement, capacity: usize) -> Result<(), BoxError> {
+        let _ = (placement, capacity);
+        Ok(())
+    }
+    /// The drafter's live page reservation for `placement` (`DraftPagePool::reservation`), when
+    /// the family reserves full-context draft pages with its target pages.
+    fn draft_demand(&self, placement: &Self::Placement) -> Option<crate::reserve::DraftDemand> {
+        let _ = placement;
+        None
+    }
+    /// Draft pages live reservations can still claim (`DraftPagePool::reservable`); `None`
+    /// without a full-context drafter.
+    fn draft_reservable(&self) -> Option<usize> { None }
+    /// Rows one request's reservation can ever reach in the draft pool
+    /// ([`crate::reserve::draft_lifetime_rows`]); `None` without a full-context drafter.
+    fn draft_lifetime_rows(&self) -> Option<usize> { None }
+    /// The draft page reservation a fresh admission at `origin` starts from.
+    fn draft_admission(&self, origin: usize) -> Option<crate::reserve::DraftDemand> {
+        let _ = origin;
+        None
+    }
+    /// A retired retained attachment may be reclaimed by the drafter's live admission.
+    fn draft_pages_valid(&self, attachment: &super::DraftPageAttachment) -> bool {
+        let _ = attachment;
+        true
+    }
+    /// Restore leases and pending copy events must prevent draft-only LRU eviction too.
+    fn draft_pages_revocable(&self, attachment: &super::DraftPageAttachment) -> bool {
+        let _ = attachment;
+        false
+    }
+    fn retain_draft_pages(&self, attachment: &super::DraftPageAttachment) -> Result<(), BoxError> {
+        let _ = attachment;
+        Ok(())
+    }
+    /// Capture returns owned immutable page references. Any tail copies are ordered
+    /// before publication together with the target snapshot's copies.
+    fn capture_draft_pages(&self, placement: &Self::Placement, len: usize)
+        -> Result<Option<super::DraftPageAttachment>, BoxError> {
+        let _ = (placement, len);
+        Ok(None)
+    }
+    fn release_draft_pages(&self, attachment: &super::DraftPageAttachment) -> Result<(), BoxError> {
+        let _ = attachment;
+        Err("family has no draft page release binding".into())
+    }
+    fn restore_draft_pages(&self, attachment: Option<&super::DraftPageAttachment>,
+        placement: &mut Self::Placement, frontier: usize) -> Result<(), BoxError> {
+        let _ = (placement, frontier);
+        if attachment.is_some() { return Err("family has no draft page restore binding".into()); }
+        Ok(())
+    }
+    /// Reserve destination pages for a host promotion. The returned references
+    /// stay unpublished until target and draft DMA have both completed.
+    fn promote_draft_pages(&self, saved: &super::DraftPageAttachment)
+        -> Result<super::DraftPageAttachment, BoxError> {
+        let _ = saved;
+        Err("family has no draft page restore binding".into())
+    }
+    fn draft_page_segments(&self, page: super::DraftPageId) -> Vec<DeviceRange> {
+        let _ = page;
+        Vec::new()
+    }
     /// Record schema carried by host snapshots; formats cannot share restored bytes.
     fn record_format(&self) -> &'static str {
         "opaque_v1"
+    }
+    /// Earliest retained row a continuing writer may change. Lagging predictors can write
+    /// before the target frontier; capture and restore must privately copy those pages.
+    fn write_frontier(&self, len: usize) -> usize {
+        len
     }
     /// The metadata of a snapshot of `placement` at `len`, taken with its mark.
     fn capture_meta(&self, placement: &Self::Placement, len: usize) -> Result<M, BoxError> {
@@ -306,6 +377,14 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// The placement's pages, in row order.
     fn pages<'p>(&self, placement: &'p Self::Placement) -> &'p [u32];
+    /// Append freshly allocated pages to a live placement (a decode reservation top-up,
+    /// [`PrefixCache::extend`]) and install them wherever the family keeps the placement's page
+    /// list (derived page tables, a bound slot). Runs between rounds only: no queued work reads
+    /// the old list. Nothing has written the new pages. On error the cache releases them.
+    fn extend_pages(&self, placement: &mut Self::Placement, pages: &[u32]) -> Result<(), BoxError> {
+        let _ = (placement, pages);
+        Err("family cannot grow a live placement".into())
+    }
     /// Committed rows: the length a snapshot of this placement may capture (a speculative
     /// family reports the rows its state is consistent at, not rows still being verified).
     fn commit_point(&self, placement: &Self::Placement) -> usize;

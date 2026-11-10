@@ -24,6 +24,44 @@ uint32_t cuteafd_expert_hidden(void);
 int32_t cuteafd_expert_packed_sizes(uint32_t intermediate, uint64_t bytes[4]);
 int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
     uint8_t* const destinations[4], uint32_t intermediate, void* stream);
+/* Payload-only form for packages that generate coded scales independently.
+ * Sources W1/W3/W2 and destinations W13/W2 use the same layouts and lifetimes. */
+int32_t cuteafd_pack_expert_weights_async(const uint8_t* const sources[3],
+    uint8_t* const destinations[2], uint32_t intermediate, void* stream);
+/* Zero disjoint row tails on the current device. pitch >= width; the full
+ * pitched extent must fit destination_bytes and stay live through completion. */
+int32_t cuteafd_zero_pitched_async(void* destination, uint64_t destination_bytes,
+    uint64_t pitch, uint64_t width, uint64_t rows, void* stream);
+
+/* Per-plane form of the same pack. W13/S13 sources are [up;gate] with
+ * independently zero-padded halves; W2/S2 sources retain logical K pitch.
+ * Plane is 0..3; byte extents and non-overlap are checked before launch. */
+int32_t cuteafd_pack_expert_plane_async(const uint8_t* source, uint64_t source_bytes,
+    uint8_t* destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t plane, void* stream);
+/* Tile-aligned rows of one weight projection, using the same pack kernel.
+ * Projection 0 gate, 1 up, 2 down; source contains only [first, first+rows).
+ * Destination is the full native W13/W2 plane. Each launch writes only its
+ * rows' uint32 lanes, including final padding, even for shared FC1 tiles. */
+int32_t cuteafd_pack_expert_window_async(const uint8_t* source, uint64_t source_bytes,
+    uint8_t* destination, uint64_t destination_bytes, uint32_t intermediate,
+    uint32_t projection, uint32_t first, uint32_t rows, void* stream);
+/* Load-time V4.1 scales: uint16 K128 offsets in N256 lane-major order,
+ * followed by stored_rows uint8 row bases. The caller zeros omitted rows.
+ * Sources are device-visible (device or mapped pinned memory); the jobs table
+ * is mapped pinned host memory. Output planes are device allocations; the
+ * uint64 error word is device-visible and read by the host only after draining.
+ * Initialize error to UINT64_MAX; on span >15 it receives the first
+ * (job_index << 32 | source_row). A failed load must never publish its output.
+ * No allocation or synchronization; all storage lives through completion. */
+typedef struct cuteafd_scale_code_job_t {
+  const uint8_t* source;
+  uint8_t* destination;
+  uint64_t source_bytes, destination_bytes, pitch;
+  uint32_t rows, columns, stored_rows, start_row;
+} cuteafd_scale_code_job_t;
+int32_t cuteafd_v41_pack_scale_codes_async(const cuteafd_scale_code_job_t* jobs,
+    uint32_t count, uint64_t* error, void* stream);
 /* Pointer slots follow the exported dynamic W4A8 C ABI; see the manifest. */
 typedef struct cuteafd_expert_launch_t {
   void* tensors[CUTEAFD_V41_EXPERT_POINTERS];
@@ -41,7 +79,8 @@ typedef struct cuteafd_expert_info_t {
   uint32_t abi_version;
   uint32_t role; /* 0: coordinator dSpark; 1: Spark TP4 shard; 2: full RTX backbone; 3: backbone TP2;
                     4: dSpark TP2; 5: Spark TP2 shard (intermediate 1152); 6: Spark TP3 shard (intermediate 768);
-                    7: Spark TP6 shard (intermediate 384, no padding) */
+                    7: Spark TP6 shard (intermediate 384, no padding)
+// 8: Spark TP8 shard (intermediate 288, stored 384) */
   uint32_t experts;
   uint32_t hidden_size;
   uint32_t logical_intermediate;
@@ -71,6 +110,7 @@ int32_t cuteafd_v41_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_r
 int32_t cuteafd_v41_spark_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 
 /* Prewarm before graph capture. Quantize BF16 [rows,5120] into contiguous
  * 5280-byte rows: 5120 E4M3 bytes then 160 UE8M0 K32 scales, amax floor 1e-4.
@@ -132,6 +172,15 @@ int32_t cuteafd_v41_spark_tp6_expert_bind_scratch(void* kernel, void* storage,
 int32_t cuteafd_v41_spark_tp6_expert_initialize_scratch_async(void* kernel, void* storage,
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp6_expert_output_kind(int32_t capacity, uint32_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_initialize(int32_t capacity, void** out_kernel);
+int32_t cuteafd_v41_spark_tp8_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
+int32_t cuteafd_v41_spark_tp8_expert_bind_scratch(void* kernel, void* storage,
+    uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]);
+int32_t cuteafd_v41_spark_tp8_expert_initialize_scratch_async(void* kernel, void* storage,
+    uint64_t bytes, void* stream);
+int32_t cuteafd_v41_spark_tp8_expert_output_kind(int32_t capacity, uint32_t* out);
 
 /* Reduce contiguous FP32 [rows,topk,5120] route planes into BF16 [rows,5120].
  * Supported geometries: ranks=1 or 2/topk=3 (RTX dSpark), ranks=4/topk=6 (backbone).

@@ -1,4 +1,5 @@
 //! Layer-selected SWA projections and transaction-owned cache reads.
+use super::scratch::{self, Arena, Plane};
 use super::{
     ffn::{DenseFfn, DensePlan},
     rope::TargetTables,
@@ -8,13 +9,14 @@ use super::{
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::DType;
+use cuteafd_loader::families::qwen4::Qwen4KvCache;
 use cuteafd_ffi::{
     programs::{Program, Programs, Scalar},
     CuteafdDeviceBuffer,
 };
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout},
+    families::step5::{Config, coordinator::{CoordinatorContract, LayerContract, RankWeightLayout}},
 };
 
 const H: usize = 4096;
@@ -66,32 +68,12 @@ impl Admission {
         reservations: &[u64],
     ) -> Result<Self> {
         ensure!(matches!(heads, 32 | 64), "SWA native query head count");
-        let q = heads * 192;
-        let kv = heads / 16 * 192;
         ensure!(
             (1..=4096).contains(&rows),
             "SWA row capacity must be 1..=4096"
         );
         let pages = rows.div_ceil(64);
-        let planes = [
-            rows * H * 4,
-            rows * H * 2,
-            rows * q * 2,
-            rows * kv * 2,
-            pages * 64 * kv * 2,
-            rows * q * 2,
-            pages * 64 * kv * 2,
-            rows * heads * 2,
-            rows * q * 2,
-            rows * q * 2,
-            rows * H * if heads == 32 { 4 } else { 2 },
-            rows * 8,
-            rows * 4,
-            pages * 4,
-            rows * 512 * 4,
-            rows * H * 4,
-        ]
-        .map(|n| n.max(256));
+        let planes = cuteafd_loader::plan::families::step5::native::swa_planes(rows, heads)?;
         let bytes = planes
             .iter()
             .map(|&n| n as u64)
@@ -165,24 +147,35 @@ const DEFS: [(&str, &[&str], &[u8]); 12] = [
 ];
 
 struct SwaWeights<'a> {
+    kv_format: Qwen4KvCache,
     rope: std::rc::Rc<TargetTables<'a>>,
+    attention_rope: std::rc::Rc<crate::shared::rope::Table<'a>>,
     layer: usize,
-    weights: Vec<Allocation<'a>>,
+    extent: usize,
+    weights: Vec<Option<Allocation<'a>>>,
     programs: Vec<Program<'a>>,
     epsilon: f32,
     heads: usize,
+    /// EXL3 q, k, v, o (replacing operand slots 1, 2, 3, 7, which then hold
+    /// no BF16 allocation); the o projection is K-split when heads are split.
+    native: Option<super::native::NativeAttention<'a>>,
 }
 
 pub(super) struct SwaLayer<'a> {
     // This stream drains before every composed owner, including the FFN.
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
+    native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
     immutable: std::rc::Rc<SwaWeights<'a>>,
 }
 
 impl<'a> SwaLayer<'a> {
+    pub(super) fn device(&self) -> Device<'a> { self.stream.device }
+    pub(super) fn rows(&self) -> usize { self.admission.rows }
+    pub(super) fn heads(&self) -> usize { self.immutable.heads }
+
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Self::workspace_for_heads(rows, 64)
     }
@@ -200,9 +193,10 @@ impl<'a> SwaLayer<'a> {
         rope: Option<std::rc::Rc<TargetTables<'a>>>,
         available: u64,
         reservations: &[u64],
+        kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None, None)
     }
 
     pub fn for_execution(
@@ -215,12 +209,29 @@ impl<'a> SwaLayer<'a> {
         available: u64,
         reservations: &[u64],
         rank: usize,
+        arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
+        kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: &CoordinatorContract, layout: &RankWeightLayout,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false)
+            reservations, layout.clone(), heads, false, Some((arena, 0)),
+            kv_format, native_scratch, Some(contract))
+    }
+
+    pub(super) fn for_mtp_stage(
+        device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
+        available: u64, reservations: &[u64], arena: &Arena<'a>, kv_format: Qwen4KvCache,
+        contract: &CoordinatorContract,
+    ) -> Result<Self> {
+        let layout = RankWeightLayout::mtp_stage_from_contract(checkpoint, contract, stage)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None, Some(contract))
     }
 
     fn load_layout(
@@ -235,28 +246,34 @@ impl<'a> SwaLayer<'a> {
         layout: RankWeightLayout,
         heads: usize,
         include_dense: bool,
+        arena: Option<(&Arena<'a>, usize)>,
+        kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
+        contract: Option<&CoordinatorContract>,
     ) -> Result<Self> {
-        let q = heads * 192;
-        let kv = heads / 16 * 192;
-        let name = |full: &str| if heads == 32 { full.replacen("step5_", "step52_", 1) }
-            else { full.to_owned() };
+        let name = |full: &str| {
+            let name = if heads == 32 { full.replacen("step5_", "step52_", 1) }
+                else { full.to_owned() };
+            if full == "step5_swa_attention" && kv_format == Qwen4KvCache::Fp8 {
+                format!("{name}_fp8")
+            } else { name }
+        };
         let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer = contract
-            .layers
-            .get(layer_id)
-            .context("SWA layer outside target")?;
+        let owned;
+        let contract = match contract { Some(contract) => contract, None => {
+            owned = CoordinatorContract::from_checkpoint(checkpoint)?; &owned
+        }};
+        let cfg = Config::parse(checkpoint)?;
+        let layer = LayerContract::from_config(&cfg, layer_id)?;
         if let Some(rope) = &rope {
             ensure!(
                 rope.tables.plan == contract.rope_tables,
                 "SWA rotary plan mismatch"
             );
+            let table = rope.tables.get(layer.rope)?;
             ensure!(
-                rope.layers[layer_id].attention.cos.device.id == device.id
-                    && std::ptr::eq(
-                        rope.layers[layer_id].attention.cos.device.library,
-                        device.library
-                    ),
+                table.cos.device.id == device.id
+                    && std::ptr::eq(table.cos.device.library, device.library),
                 "SWA rotary device mismatch"
             );
         }
@@ -278,16 +295,26 @@ impl<'a> SwaLayer<'a> {
             "self_attn.g_proj.weight",
             "self_attn.o_proj.weight",
         ];
+        let native_slots = super::native::ATTENTION_SLOTS.iter()
+            .filter(|&&slot| layout.core.contains_key(&format!("model.layers.{layer_id}.{}", suffixes[slot])))
+            .count();
+        ensure!(native_slots == 0 || native_slots == 4, "SWA layer {layer_id} mixes native and BF16 q/k/v/o");
+        let native_layer = native_slots == 4;
+        // Native slots carry no BF16 operand; the remaining slots keep their indices.
         let weights = suffixes
             .iter()
-            .map(|suffix| {
+            .enumerate()
+            .map(|(slot, suffix)| {
+                if native_layer && super::native::ATTENTION_SLOTS.contains(&slot) { return Ok(None); }
                 layout
                     .operands
                     .iter()
                     .find(|w| w.name == format!("model.layers.{layer_id}.{suffix}"))
-                    .context("SWA operand missing")
+                    .context("SWA operand missing").map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
+        let q = heads * 192;
+        let kv = heads / 16 * 192;
         for (weight, (dtype, shape)) in weights.iter().zip([
             (DType::F32, vec![H]),
             (DType::Bf16, vec![q, H]),
@@ -298,20 +325,30 @@ impl<'a> SwaLayer<'a> {
             (DType::Bf16, vec![heads, H]),
             (DType::Bf16, vec![H, q]),
         ]) {
+            let Some(weight) = weight else { continue };
             ensure!(
                 weight.dtype == dtype && weight.shape == shape,
                 "SWA weight shape/dtype"
             );
         }
         let dense = layer.dense_activation.filter(|_| include_dense)
-            .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
-            .transpose()?;
+            .map(|_| {
+                if layer_id < cfg.layers {
+                    DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[])
+                } else {
+                    DensePlan::for_mtp_stage(programs, checkpoint, layer_id - cfg.layers,
+                        rows, u64::MAX, &[], contract)
+                }
+            }).transpose()?;
         let admission = Admission::for_heads(
             rows,
             heads,
             &weights
                 .iter()
+                .flatten()
                 .map(|w| w.allocation_bytes)
+                .chain(super::native::ATTENTION_SLOTS.iter().filter(|_| native_layer).map(|&slot|
+                    layout.core[&format!("model.layers.{layer_id}.{}", suffixes[slot])].bytes as u64))
                 .collect::<Vec<_>>(),
             dense.as_ref().map_or(0, DensePlan::bytes),
             if rope.is_none() {
@@ -343,7 +380,7 @@ impl<'a> SwaLayer<'a> {
             ("step5_attn_kv", H, kv),
             ("step5_attn_gate", H, heads),
             ("step5_attn_out", q, H),
-        ] {
+        ].into_iter().filter(|(full, ..)| !native_layer || *full == "step5_attn_gate") {
             let is_partial = heads == 32 && full == "step5_attn_out";
             let name = if is_partial { output.to_owned() } else { name(full) };
             let g = &programs.spec(&name)?.geometry;
@@ -369,6 +406,10 @@ impl<'a> SwaLayer<'a> {
             );
         }
         let g = &programs.spec(&name("step5_swa_attention"))?.geometry;
+        let stride = match kv_format {
+            Qwen4KvCache::Bf16 => kv,
+            Qwen4KvCache::Fp8 => kv_format.plane_record_bytes(heads / 16, 192),
+        };
         ensure!(
             g["query_heads"] == heads
                 && g["kv_heads"] == heads / 16
@@ -376,8 +417,10 @@ impl<'a> SwaLayer<'a> {
                 && g["selection_width"] == 512
                 && g["selection_groups"] == 1
                 && g["head_dim"] == 192
-                && g["key_strides"] == serde_json::json!([64 * kv, kv, 192])
-                && g["value_strides"] == serde_json::json!([64 * kv, kv, 192]),
+                && g["kv_format"] == kv_format.to_string()
+                && g["record_bytes"] == kv_format.plane_record_bytes(heads / 16, 192)
+                && g["key_strides"] == serde_json::json!([64 * stride, stride, 192])
+                && g["value_strides"] == serde_json::json!([64 * stride, stride, 192]),
             "SWA attention geometry"
         );
         ensure!(
@@ -406,45 +449,67 @@ impl<'a> SwaLayer<'a> {
             )?),
         };
         let ffn = dense
-            .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
+            .map(|plan| {
+                let attention_bytes = usize::try_from(
+                    cuteafd_loader::plan::families::step5::native::plane_bytes(&admission.planes)?)?;
+                let ffn_arena = arena.map(|(arena, offset)| (arena, offset + attention_bytes));
+                DenseFfn::load_plan_in(device, programs, checkpoint, plan, ffn_arena)
+            })
             .transpose()?;
+        let native = super::native::NativeAttention::load(device, programs, checkpoint, &layout, layer_id,
+            rows, q, kv, H)?;
+        ensure!(native.is_some() == native_layer, "SWA native attention inventory");
+        // Native layers keep slot indices; replaced slots hold an empty placeholder
+        // only in the index map, never a device allocation.
         let weights = weights
             .into_iter()
-            .map(|w| load_operand(device, checkpoint, &layout, w))
+            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
             .collect::<Result<Vec<_>>>()?;
-        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, layer: layer_id, weights,
-            programs: resolved, epsilon: contract.norms.input, heads }), ffn)
+        let attention_rope = rope.tables.get(layer.rope)?;
+        let mut owner = Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
+            layer: layer_id, extent: contract.rope_tables.extent as usize, weights,
+            programs: resolved, epsilon: cfg.norm_eps, heads, native }), ffn, arena)?;
+        owner.native_scratch = match (&owner.immutable.native, native_scratch) {
+            (None, _) => None,
+            (Some(_), Some(shared)) => Some(shared),
+            (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
+                &native.scratch_layout(rows)?)?)),
+        };
+        Ok(owner)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn)
+        let mut lane = Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)?;
+        if let Some(shared) = &self.native_scratch { lane.native_scratch = Some(shared.sibling(self.stream.device)?); }
+        Ok(lane)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>) -> Result<Self> {
-        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
-            .collect::<Result<Vec<_>>>()?;
+        immutable: std::rc::Rc<SwaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         let rows = admission.rows;
-        let owner = Self { stream, ffn, planes, admission, immutable };
-        for (plane, bytes) in [
-            (
-                POSITIONS,
-                (0..rows as i64)
-                    .flat_map(i64::to_le_bytes)
-                    .collect::<Vec<_>>(),
-            ),
-            (REQUESTS, vec![0; rows * 4]),
-            (
-                TABLE,
-                (0..owner.admission.pages as i32)
-                    .flat_map(i32::to_le_bytes)
-                    .collect(),
-            ),
-        ] {
-            device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &bytes))?;
+        let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
+        if arena.is_none() {
+            for (plane, bytes) in [
+                (
+                    POSITIONS,
+                    (0..rows as i64)
+                        .flat_map(i64::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+                (REQUESTS, vec![0; rows * 4]),
+                (
+                    TABLE,
+                    (0..owner.admission.pages as i32)
+                        .flat_map(i32::to_le_bytes)
+                        .collect(),
+                ),
+            ] {
+                device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &bytes))?;
+            }
         }
         Ok(owner)
     }
@@ -488,7 +553,7 @@ impl<'a> SwaLayer<'a> {
         self.dense_on(rows, &self.stream)
     }
 
-    fn project_on(
+    pub(super) fn project_on(
         &self,
         rows: usize,
         positions: CuteafdDeviceBuffer,
@@ -499,19 +564,28 @@ impl<'a> SwaLayer<'a> {
             "SWA rows exceed capacity"
         );
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
+        let w = |i: usize| self.weight(i);
         let scalars = [Scalar::I32(rows as i32)];
         let norm = [Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)];
-        let (cos, sin) = self.immutable.rope.layers[self.immutable.layer].attention.buffers();
+        let (cos, sin) = self.immutable.attention_rope.buffers();
         self.launch_on(
             stream,
             0,
             &[p(X), w(0), w(0), w(0), w(0), w(0), p(NORM)],
             &norm,
         )?;
-        self.launch_on(stream, 1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
-        self.launch_on(stream, 2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
-        self.launch_on(stream, 2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
+        if let Some(native) = &self.immutable.native {
+            let scratch = &self.native_scratch.as_ref().context("SWA native scratch")?.scratch;
+            let view = |i: usize, width: usize| CuteafdDeviceBuffer { bytes: rows * width * 2, ..self.planes[i].buffer };
+            let (q, kv) = (self.immutable.heads * 192, self.immutable.heads / 16 * 192);
+            native.q.launch(rows, view(NORM, H), view(QRAW, q), scratch, stream.raw)?;
+            native.k.launch(rows, view(NORM, H), view(KRAW, kv), scratch, stream.raw)?;
+            native.v.launch(rows, view(NORM, H), view(VPAGES, kv), scratch, stream.raw)?;
+        } else {
+            self.launch_on(stream, 1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
+            self.launch_on(stream, 2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
+            self.launch_on(stream, 2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
+        }
         self.launch_on(stream, 3, &[p(NORM), w(6), p(LOGITS)], &scalars)?;
         self.launch_on(
             stream,
@@ -544,12 +618,24 @@ impl<'a> SwaLayer<'a> {
         Ok(())
     }
 
-    fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
+    pub(super) fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
         self.launch_on(stream, 8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
-        self.launch_on(stream, 9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
+        if let Some(native) = &self.immutable.native {
+            let scratch = &self.native_scratch.as_ref().context("SWA native scratch")?.scratch;
+            let q = self.immutable.heads * 192;
+            let gated = CuteafdDeviceBuffer { bytes: rows * q * 2, ..self.planes[GATED].buffer };
+            let delta = self.planes[DELTA].buffer;
+            if self.immutable.heads == 32 {
+                // K-split: F32 core partial, exchanged and reduced before one svh egress.
+                native.o.partial(rows, gated, CuteafdDeviceBuffer { bytes: rows * H * 4, ..delta }, scratch, stream.raw)?;
+            } else {
+                native.o.launch(rows, gated, CuteafdDeviceBuffer { bytes: rows * H * 2, ..delta }, scratch, stream.raw)?;
+            }
+        } else {
+            self.launch_on(stream, 9, &[p(GATED), self.weight(7), p(DELTA)], &scalars)?;
+        }
         if self.immutable.heads == 64 {
             self.launch_on(stream, 10, &[p(X), p(DELTA), p(POST)], &scalars)?;
         }
@@ -566,6 +652,30 @@ impl<'a> SwaLayer<'a> {
             ffn.enqueue_on(rows, stream)?;
         }
         Ok(())
+    }
+
+    /// The predictor transaction retains this layer and its external stream
+    /// through drainage; target transactions never stage these planes as MTP.
+    pub(super) fn predictor_projection(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
+        ensure!(self.immutable.layer >= 92 && self.immutable.heads == 64 && self.ffn.is_some(),
+            "Step-5 predictor requires an independent whole SWA/dense owner");
+        Ok([self.planes[KPAGES].buffer, self.planes[VPAGES].buffer])
+    }
+
+    #[cfg(test)]
+    pub(super) fn predictor_trace(&self) -> [(&'static str, CuteafdDeviceBuffer, usize); 9] {
+        [("input_norm", NORM, H), ("qraw", QRAW, Q), ("kraw", KRAW, KV),
+            ("value", VPAGES, KV), ("query", QUERY, Q), ("key", KPAGES, KV),
+            ("attention", ATTN, Q), ("gated", GATED, Q), ("attention_delta", DELTA, H)]
+            .map(|(name, plane, width)| (name, self.planes[plane].buffer, width))
+    }
+
+    pub(super) fn predictor_finish_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        self.predictor_projection()?;
+        let (rows, stream) = (read.inputs.rows, read.inputs.stream);
+        self.read_attention_on(read)?;
+        self.finish_on(rows, stream)?;
+        self.dense_on(rows, stream)
     }
 
     pub fn attention_output(&self) -> CuteafdDeviceBuffer {
@@ -615,11 +725,17 @@ impl<'a> SwaLayer<'a> {
             super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
                 stream.device, self.planes[POST].buffer, rows, false)?;
         }
-        stream.device.run(|| {
-            // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
-            unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
-                self.planes[NORM].buffer, rows * H, stream.raw) }
-        })?;
+        if let Some(native) = &self.immutable.native {
+            // The ordered F32 sum of the two native core partials, then one svh egress.
+            native.o.egress(rows, CuteafdDeviceBuffer { bytes: rows * H * 4, ..self.planes[POST].buffer },
+                CuteafdDeviceBuffer { bytes: rows * H * 2, ..self.planes[NORM].buffer }, stream.raw)?;
+        } else {
+            stream.device.run(|| {
+                // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
+                unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
+                    self.planes[NORM].buffer, rows * H, stream.raw) }
+            })?;
+        }
         self.launch_on(stream, 10, &[p(X), p(NORM), p(POST)], &[Scalar::I32(rows as i32)])
     }
 
@@ -639,18 +755,15 @@ impl<'a> SwaLayer<'a> {
             &self.planes[VPAGES],
             None,
         )?;
-        step.attend(rank, self.immutable.layer, &*self, |layer, read| {
-            let rows = read.inputs.rows;
-            let stream = read.inputs.stream;
-            layer.read_on(read)?;
-            layer.dense_on(rows, stream)
+        step.attend(rank, self.immutable.layer, &*self, |layer, read| layer.read_attention_on(read))?;
+        step.compose(rank, &*self, |layer, input| {
+            layer.finish_on(input.rows, input.stream)?;
+            layer.dense_on(input.rows, input.stream)
         })
     }
 
     pub fn enqueue_attention_step<'e, E: cuteafd_hostcache::copy::CopyEngine>(
-        &'e self,
-        step: &mut Step<'e, 'a, E>,
-        rank: usize,
+        &'e self, step: &mut Step<'e, 'a, E>, rank: usize,
     ) -> Result<()> {
         ensure!(self.ffn.is_none(), "shared SWA pipeline must own its FFN separately");
         step.project(rank, self.immutable.layer, self, |layer, input| {
@@ -658,52 +771,69 @@ impl<'a> SwaLayer<'a> {
             layer.project_on(input.rows, input.positions, input.stream)
         })?;
         step.stage(rank, self.immutable.layer, &self.planes[KPAGES], &self.planes[VPAGES], None)?;
-        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_on(read))
+        step.attend(rank, self.immutable.layer, self, |layer, read| layer.read_attention_on(read))?;
+        step.compose(rank, self, |layer, input| {
+            layer.finish_on(input.rows, input.stream)
+        })
     }
 
     fn check_input(&self, input: &StepInputs<'_, 'a>) -> Result<()> {
         ensure!(
             input.heads == self.immutable.heads
+                && input.kv_format == self.immutable.kv_format
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
-                && input
-                    .base
-                    .checked_add(input.rows)
-                    .is_some_and(|end| end <= self.immutable.rope.tables.plan.extent as usize),
+                && input.extent <= self.immutable.extent,
             "SWA owner device/head/rotary extent mismatch"
         );
         Ok(())
     }
 
     fn read_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        let rows = read.inputs.rows;
+        let stream = read.inputs.stream;
+        ensure!(read.start == 0, "SWA diagnostic must start at row zero");
+        self.read_attention_on(read)?;
+        self.finish_on(rows, stream)
+    }
+
+    fn read_attention_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
         self.check_input(&read.inputs)?;
         let input = &read.inputs;
+        ensure!(read.start.checked_add(input.rows).is_some_and(|end| end <= self.admission.rows),
+            "SWA sequence row extent");
+        let positions = CuteafdDeviceBuffer { ptr: input.positions.ptr.wrapping_byte_add(read.start * 8),
+            bytes: input.positions.bytes - read.start * 8, ..input.positions };
+        let requests = CuteafdDeviceBuffer { ptr: input.requests.ptr.wrapping_byte_add(read.start * 4),
+            bytes: input.requests.bytes - read.start * 4, ..input.requests };
         self.launch_on(
             input.stream,
             6,
             &[
-                input.positions.ptr,
-                input.requests.ptr,
+                positions.ptr,
+                requests.ptr,
                 self.planes[SELECTED].buffer.ptr,
             ],
             &[Scalar::I32(input.rows as i32)],
         )?;
         self.attend_on(
+            read.start,
             input.rows,
-            input.positions,
-            input.requests,
+            positions,
+            requests,
             read.key,
             read.value,
             read.table,
             read.table_width,
             read.pages,
             input.stream,
-        )?;
-        self.finish_on(input.rows, input.stream)
+        )
     }
 
     fn attend(&self, rows: usize) -> Result<()> {
+        ensure!(self.immutable.kv_format == Qwen4KvCache::Bf16, "SWA raw projection diagnostic requires BF16 reader");
         self.attend_on(
+            0,
             rows,
             self.planes[POSITIONS].buffer,
             self.planes[REQUESTS].buffer,
@@ -718,6 +848,7 @@ impl<'a> SwaLayer<'a> {
 
     fn attend_on(
         &self,
+        start: usize,
         rows: usize,
         positions: CuteafdDeviceBuffer,
         requests: CuteafdDeviceBuffer,
@@ -729,22 +860,24 @@ impl<'a> SwaLayer<'a> {
         stream: &Stream<'a>,
     ) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
+        let query = p(QUERY).wrapping_byte_add(start * self.immutable.heads * 192 * 2);
+        let output = p(ATTN).wrapping_byte_add(start * self.immutable.heads * 192 * 2);
         self.launch_on(
             stream,
             7,
             &[
-                p(QUERY),
+                query,
                 key.ptr,
                 value.ptr,
-                p(QUERY),
-                p(QUERY),
+                query,
+                query,
                 table.ptr,
                 requests.ptr,
                 p(SELECTED),
                 positions.ptr,
-                p(QUERY),
-                p(QUERY),
-                p(ATTN),
+                query,
+                query,
+                output,
             ],
             &[
                 Scalar::I64(pages as i64),
@@ -758,7 +891,13 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.immutable.weights)
+        let live = self.immutable.weights.iter().flatten().map(|w| w.buffer).collect::<Vec<_>>();
+        super::weights::validate_live_buffers(device.id, &live)
+    }
+
+    /// A BF16 operand slot; native slots never reach a BF16 program.
+    fn weight(&self, slot: usize) -> *mut std::ffi::c_void {
+        self.immutable.weights[slot].as_ref().map_or(std::ptr::null_mut(), |w| w.buffer.ptr)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -921,8 +1060,7 @@ mod tests {
             513,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             manifest["epsilon"].as_f64().map(|v| v as f32) == Some(chain.immutable.epsilon),
             "SWA epsilon mismatch"
@@ -935,8 +1073,7 @@ mod tests {
             513,
             None,
             chain.admission.bytes - 1,
-            &[]
-        )
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)
         .is_err());
         assert!(chain.enqueue(514).is_err());
         let boundaries = [
@@ -1023,7 +1160,7 @@ mod tests {
                     stage,
                     &[
                         chain.planes[input_plane].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.weight(weight),
                         chain.planes[plane].buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32)],
@@ -1047,13 +1184,13 @@ mod tests {
             {
                 let source = if stage == 4 { "qraw" } else { "kraw" };
                 device.run(|| library.copy_h2d(chain.planes[input].buffer, &load(source)?))?;
-                let (cos, sin) = chain.immutable.rope.layers[layer].attention.buffers();
+                let (cos, sin) = chain.immutable.attention_rope.buffers();
                 chain.launch(
                     stage,
                     &[
                         chain.planes[input].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.weight(weight),
+                        chain.weight(weight),
                         cos.ptr,
                         sin.ptr,
                         chain.planes[POSITIONS].buffer.ptr,
@@ -1211,8 +1348,7 @@ mod tests {
             total,
             None,
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         let source = fixture(&root, &manifest, "r513_residual")?;
         let residual: Vec<u8> = source.iter().copied().cycle().take(total * H * 4).collect();
         device.run(|| library.copy_h2d(chain.input(), &residual))?;
@@ -1350,8 +1486,7 @@ mod tests {
             1,
             Some(std::rc::Rc::clone(&chain.immutable.rope)),
             u64::MAX,
-            &[],
-        )?;
+            &[], cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16)?;
         ensure!(
             std::rc::Rc::ptr_eq(&routed.immutable.rope, &chain.immutable.rope) && routed.ffn.is_none(),
             "SWA shared layer binding"

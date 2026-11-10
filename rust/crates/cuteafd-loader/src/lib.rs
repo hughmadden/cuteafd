@@ -1,22 +1,26 @@
+mod expert_reader;
+pub use expert_reader::EXPERT_READ_WINDOW_BYTES;
 pub mod kda;
 pub mod families;
 pub mod media;
 pub mod formats;
+pub mod shared;
 pub mod serving_capacity;
 pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
 pub use families::deepseek_v41::engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
+    EngramStagingShape, EngramStagingError, ENGRAM_DEVICE_ROW_BYTES,
 };
 pub use families::deepseek_v41::engram_staging::{EngramBatchStaging, EngramGatherView};
 pub use families::deepseek_v41::v41_expert_staging::{V41ExpertSelection, V41ExpertStaging};
 pub use families::deepseek_v41::v41_catalog::{
-    read_expert_catalog, read_official_v41_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
+    read_expert_catalog, read_official_v41_catalog, read_official_v41_role_catalog, read_official_v41_spark_catalog, read_qwen4_mtp_expert_catalog, OfficialV41Catalog, RoutedExpertShape,
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
 pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
-pub use families::deepseek_v41::v41_exl3_staging::V41Exl3TensorSlice;
-pub use families::deepseek_v41::v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
-    V41Exl3ProjectionKind, V41_EXL3_SCHEMA};
+pub use families::deepseek_v41::v41_exl3_staging::{V41Exl3TensorGather, V41Exl3TensorSlice};
+pub use families::deepseek_v41::v41_exl3::{V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
+    V41Exl3ProjectionKind};
 pub use families::deepseek_v41::v41_nvfp4::{
     is_v41_nvfp4_publication, read_v41_nvfp4_contract, V41Nvfp4Contract, V41Nvfp4ExpertLayout,
 };
@@ -28,11 +32,14 @@ pub use families::deepseek_v41::v41_config::{
     V41TextConfig, V41VisionConfig,
 };
 pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
-pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
+pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramTable};
+pub use families::deepseek_v41::engram_lookahead::EngramLookahead;
+pub use formats::mapped_table::lookahead::{LookaheadHandle, UnitPlan as TableUnitPlan};
 pub use formats::mapped_table::{
-    AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
-    GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,
-    TablePrefetchTicket, TablePrefetcher, MappedTableStatsReader, TableStats, TableStatsSnapshot, mapped_table_stats, mapped_table_stats_with_intervals,
+    GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
+    GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart,
+    MappedTableStatsReader, TableStats, TableStatsSnapshot, WarmReport, mapped_table_stats,
+    mapped_table_stats_with_intervals,
 };
 mod catalog;
 mod snapshot;
@@ -40,6 +47,7 @@ mod tensors;
 mod tokenizer;
 pub mod plan;
 pub mod placement;
+pub mod push_load;
 
 pub use formats::attention_format::{
     native_deepseek_v4_attention_tensor_specs, validate_native_deepseek_v4_attention_catalog,
@@ -48,7 +56,7 @@ pub use formats::attention_format::{
 };
 pub use catalog::{
     build_catalog, build_catalog_for_snapshot, classification_summary_markdown, read_model_facts,
-    read_safetensors_metadata, SafetensorsTensorMetadata,
+    read_safetensors_metadata, read_json_file, JsonFileError, SafetensorsTensorMetadata,
 };
 pub use formats::dspark_format::{
     native_deepseek_v4_dspark_tensor_specs, validate_native_deepseek_v4_dspark_catalog,
@@ -83,8 +91,8 @@ pub use tensors::{
     LoadedTensorSummary, TensorLoadOptions,
 };
 pub use tokenizer::{
-    decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
-    LiteralSpans, LiteralTokens,
+    cached_tokenizer, decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
+    LiteralSpans, LiteralTokens, PromptEncodingError,
     StreamingTokenDecoder, TokenizerDecodeSummary, TokenizerEncodingSummary,
 };
 

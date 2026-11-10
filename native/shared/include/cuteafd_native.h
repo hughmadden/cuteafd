@@ -29,6 +29,9 @@ typedef enum cuteafd_xgrammar_kind_t {
 cuteafd_status_t cuteafd_xgrammar_compiler_create(
     const char* tokenizer_json_path, size_t vocab_size, const int32_t* stop_token_ids,
     size_t stop_token_count, void** out_compiler, char* error, size_t error_bytes);
+cuteafd_status_t cuteafd_xgrammar_compiler_create_json(
+    const char* tokenizer_json, size_t vocab_size, const int32_t* stop_token_ids,
+    size_t stop_token_count, void** out_compiler, char* error, size_t error_bytes);
 cuteafd_status_t cuteafd_xgrammar_compiler_destroy(void* compiler);
 cuteafd_status_t cuteafd_xgrammar_compile(
     void* compiler, cuteafd_xgrammar_kind_t kind, const char* grammar_json, int strict,
@@ -280,6 +283,8 @@ cuteafd_status_t cuteafd_cuda_device_info(int device_id, cuteafd_cuda_device_inf
 cuteafd_status_t cuteafd_cuda_memory_info(size_t* free_bytes, size_t* total_bytes);
 // Device selection is host-thread-local. Restore it before yielding a task.
 cuteafd_status_t cuteafd_cuda_get_device(int* device_id);
+// Query a live stream independently of the calling thread's current device.
+cuteafd_status_t cuteafd_cuda_stream_device(void* cuda_stream, int* device_id);
 cuteafd_status_t cuteafd_cuda_set_device(int device_id);
 // Enable current-device access to peer. Idempotent; does not silently stage via host.
 cuteafd_status_t cuteafd_cuda_enable_peer(int peer_device_id);
@@ -295,9 +300,14 @@ cuteafd_status_t cuteafd_copy_device_rows_async(cuteafd_device_buffer_t dst,
     cuteafd_device_buffer_t src, size_t width, size_t rows,
     size_t dst_pitch, size_t src_pitch, void* cuda_stream);
 cuteafd_status_t cuteafd_alloc_host_buffer(size_t bytes, cuteafd_host_buffer_t* out);
+// Caller-owned shared mappings: unregister never frees the mapping.
+cuteafd_status_t cuteafd_register_host_mapping(void* ptr, size_t bytes);
+cuteafd_status_t cuteafd_unregister_host_mapping(void* ptr);
 cuteafd_status_t cuteafd_cuda_host_buffer_device_alias(cuteafd_host_buffer_t host,
                                                     cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_free_host_buffer(cuteafd_host_buffer_t* buf);
+// Recommended allocation granularity for a whole device dma-buf SEND allocation.
+cuteafd_status_t cuteafd_cuda_dmabuf_allocation_granularity(size_t* out);
 cuteafd_status_t cuteafd_alloc_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_alloc_managed_device_buffer(size_t bytes, cuteafd_device_buffer_t* out);
 cuteafd_status_t cuteafd_free_device_buffer(cuteafd_device_buffer_t* buf);
@@ -311,11 +321,29 @@ cuteafd_status_t cuteafd_cuda_stream_query(void* cuda_stream, int32_t* ready);
 cuteafd_status_t cuteafd_cuda_stream_wait_event(void* cuda_stream, void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_event);
+// Ordering event whose synchronize sleeps instead of spinning (per-step waits).
+cuteafd_status_t cuteafd_cuda_event_create_blocking(void** out_cuda_event);
 cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event);
 cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 // Retains a timestamp-producing event node inside captured profiling graphs.
 cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
+// Returns immediately: ready=0 means the event's work is pending; asynchronous
+// errors remain errors. Safe from any host thread on the event's device.
+cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
+// Stream memory operations on one u32 word of mapped pinned host memory
+// (`cuteafd_alloc_host_buffer`): a host thread and the GPU exchange sequence
+// numbers through it with no host wait. `word` is the host address; the call
+// resolves its device alias on the stream's device. Both are queued eagerly
+// (between graph replays), never captured: the counters' values are runtime
+// state, not graph parameters.
+// wait: later work on `cuda_stream` starts only once (int32_t)(*word - value)
+// >= 0 (cyclic, wraparound-safe). Where the device can flush remote writes
+// the wait also orders GPUDirect RDMA writes that preceded the host's store.
+cuteafd_status_t cuteafd_cuda_stream_wait_value32(void* cuda_stream, const uint32_t* word, uint32_t value);
+// write: stores `value` to `word` once `cuda_stream`'s earlier work (copies
+// into host memory included) is complete and visible to the host.
+cuteafd_status_t cuteafd_cuda_stream_write_value32(void* cuda_stream, uint32_t* word, uint32_t value);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained
 // at later span calls; the bounded pending queue drops samples under overload.
@@ -467,27 +495,19 @@ cuteafd_status_t cuteafd_rdma_register_host_buffer_probe(void* ptr, size_t bytes
 cuteafd_status_t cuteafd_rdma_create_rc_qp_probe(uint32_t port_num, uint32_t send_wr,
                                              uint32_t recv_wr, uint32_t max_sge,
                                              cuteafd_rdma_rc_qp_probe_t* out);
-cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(uint32_t port_num, size_t bytes,
+// Every RC QP binds the source GID its caller names: the RoCE v2 GID whose
+// IPv4 address reaches the peer (the control connection's local address, or
+// for a loopback probe an address on the port). The library never picks a
+// GID from table order, which on a port carrying several IPv4 addresses
+// (a management LAN beside the RoCE rail) is not stable.
+cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(const char* device_name,
+                                                      uint32_t port_num, uint32_t gid_index,
+                                                      size_t bytes,
                                                       cuteafd_rdma_rc_send_recv_probe_t* out);
 cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
-    uint32_t port_num, const void* request_frame, size_t request_bytes,
-    const void* response_frame, size_t response_bytes,
+    const char* device_name, uint32_t port_num, uint32_t gid_index, const void* request_frame,
+    size_t request_bytes, const void* response_frame, size_t response_bytes,
     cuteafd_rdma_rc_protocol_v2_loopback_probe_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, cuteafd_rdma_rc_endpoint_info_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create_with_buffer_flags(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, uint64_t host_buffer_flags,
-    cuteafd_rdma_rc_endpoint_info_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags(
-    const char* device_name, uint32_t port_num, uint32_t local_psn,
-    size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes,
-    uint32_t max_send_wr, uint32_t max_recv_wr, uint32_t max_sge,
-    uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
     const char* device_name, uint32_t port_num, uint32_t gid_index, uint32_t local_psn,
     size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
@@ -520,24 +540,22 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_read_wait(void* handle, size_t offset_
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
+// One receive: header into the host slot at `offset_bytes`, payload into
+// [landing + landing_offset, + landing_bytes) of the range registered with
+// `cuteafd_rdma_rc_endpoint_set_recv_landing`; the landing rotation is not used.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_landing_at(void* handle, size_t offset_bytes,
+                                                           size_t bytes, uint64_t wr_id,
+                                                           size_t landing_offset,
+                                                           size_t landing_bytes);
 // Receives scatter their first `header_bytes` into the host slot and the rest
-// into [device_ptr, device_ptr + bytes) (dma-buf MR); a null range restores
-// host-only receives. Applies to receives posted afterwards.
+// into equal `slot_bytes` ranges of [device_ptr, device_ptr + bytes) (dma-buf
+// MR), rotating in successful receive-post order. A null range restores host
+// receives. Register before posting; the caller fences consumers before reuse.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
-                                                       size_t bytes, size_t header_bytes);
-// Registers [device_ptr, device_ptr + bytes) for remote RDMA writes on this
-// endpoint (dma-buf, no relaxed ordering) and returns its rkey; a null range
-// removes the registration.
-cuteafd_status_t cuteafd_rdma_rc_endpoint_expose_device(void* handle, void* device_ptr, size_t bytes,
-                                                    uint32_t* rkey);
-// RDMA-writes `bytes` at `offset_bytes` of the send buffer to `remote_addr`
-// (unsignaled), then the 8-byte `flag_value` to `flag_remote_addr` (signaled
-// with `wr_id`); the flag lands after the data. `bytes` may be 0 (flag only).
-cuteafd_status_t cuteafd_rdma_rc_endpoint_post_write_flagged(
-    void* handle, size_t offset_bytes, size_t bytes, uint64_t remote_addr, uint32_t rkey,
-    uint64_t flag_value, uint64_t flag_remote_addr, uint32_t flag_rkey, uint64_t wr_id);
+                                                       size_t bytes, size_t header_bytes, size_t slot_bytes);
 cuteafd_status_t cuteafd_rdma_gpu_landing_probe(const char* device_name, uint32_t port_num,
-                                            size_t bytes, uint32_t iterations,
+                                            uint32_t gid_index, size_t bytes,
+                                            uint32_t iterations,
                                             cuteafd_rdma_gpu_landing_probe_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
@@ -568,6 +586,9 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_copy_recv_at(void* handle, void* out, 
 // a send gathers its header from a send-ring slot and its payload from a region.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* ptr, size_t bytes,
                                                       uint32_t* region);
+// Device range must be host-page aligned and retained until endpoint destruction.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_register_device_region(
+    void* handle, void* ptr, size_t bytes, uint32_t* region);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);
@@ -1088,13 +1109,6 @@ cuteafd_status_t cuteafd_cuda_linear_bf16_cublas_async(
 cuteafd_status_t cuteafd_cuda_linear_bf16_f32_cublas_async(
     const uint16_t* input, const uint16_t* weight, float* output, size_t rows,
     size_t input_dim, size_t output_dim, void* cuda_stream);
-// M=2..8 shared-weight BF16 projection selected from the recurrent M=1
-// cuBLASLt plan. The first live launch self-qualifies bitwise parity against
-// repeated M=1 cuBLAS calls and retains that exact fallback if the local
-// driver/toolkit selects an incompatible plan.
-cuteafd_status_t cuteafd_cuda_linear_bf16_m1_parity_batched_cublaslt_async(
-    const uint16_t* input, const uint16_t* weight, uint16_t* output,
-    size_t rows, size_t input_dim, size_t output_dim, void* cuda_stream);
 // One-row GEMV over losslessly packed BF16 weights. Each 1,024-value tile uses
 // one sign/mantissa byte per value, two four-bit exponent codes per byte, and a
 // metadata row whose header is base | (escape_count << 8). Remaining metadata

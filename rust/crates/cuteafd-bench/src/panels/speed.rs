@@ -3,7 +3,7 @@
 use super::common::{self, aggregate, plain, sized_prompt, table, wave};
 use super::{Ctx, Panel, Rates};
 use crate::report::ServerInfo;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::probe::ProbeSpec;
 use serde_json::{json, Value};
@@ -33,10 +33,62 @@ pub const CONTENT: [(&str, &str); 8] = [
 
 const DECODE_TOKENS: u64 = 256;
 
-/// Distinct code prompts per stream, shared by the sweep and basic card.
-pub(crate) fn code_batch(client: &crate::client::Client, width: usize, tokens: u64)
+/// Request styles of the concurrent waves, thinking off: code, prose, JSON,
+/// lists, tables, SQL, dialogue and worked numbers.
+const STYLES: [&str; 16] = [
+    "Explain {topic} to a curious fourteen-year-old, with one concrete example.",
+    "Write a short story in which {topic} changes the main character's day.",
+    "Write a Python module about {topic} with type hints, docstrings and three pytest tests. Output only the code.",
+    "Compare two competing approaches to {topic} and say when you would choose each.",
+    "Give a numbered, step-by-step plan for a beginner getting started with {topic}.",
+    "Summarize the history of {topic} in four paragraphs.",
+    "Write a dialogue between a sceptic and an expert about {topic}.",
+    "Return a JSON object listing five common misconceptions about {topic}, each with a correction. Output only the JSON.",
+    "List the twelve most important terms in {topic}, each with a one-line definition.",
+    "Write a friendly email recommending that a colleague learn about {topic}, and explain why.",
+    "Design a five-day lesson plan that teaches {topic}, day by day.",
+    "Describe a realistic problem involving {topic} and work through its solution with numbers.",
+    "Write a product description for an imaginary gadget built around {topic}.",
+    "Write a SQL schema and four example queries for an app that tracks {topic}. Output only the SQL.",
+    "Produce a markdown table of ten facts about {topic} with columns fact, field and confidence.",
+    "Argue for, then against, the claim that {topic} matters more than people think.",
+];
+
+const TOPICS: [&str; 24] = [
+    "the Rust borrow checker", "tidal energy", "medieval castles", "coral reefs", "sorting algorithms",
+    "coffee brewing", "black holes", "supply chains", "learning a second language", "suspension bridges",
+    "index funds", "vaccines", "origami", "rocket propulsion", "electric cars", "honeybees", "typography",
+    "glaciers", "neural networks", "fermentation", "the Silk Road", "home networking", "marathon training",
+    "recycling",
+];
+
+/// The prompt set every concurrent point records. Bump it with any change to
+/// [`STYLES`], [`TOPICS`] or [`distinct_prompt`]: points from different sets
+/// are not comparable.
+pub const DISTINCT_PROMPTS: &str = "distinct-v1";
+
+/// Stream `stream` of wave `wave` gets its own style and topic. Neighbouring
+/// streams differ in both, and up to 32 streams of one wave never repeat a
+/// pair, so a wave routes and drafts like independent users rather than N
+/// copies of one request (which share their experts and drafts).
+pub(crate) fn distinct_prompt(wave: usize, stream: usize) -> String {
+    let (style, topic) = distinct_pair(wave, stream);
+    STYLES[style].replace("{topic}", TOPICS[topic])
+}
+
+/// Style and topic indices of [`distinct_prompt`]. 7 is coprime with the 24
+/// topics, and the 5-topic wave offset can never meet a 1-style shift, so the
+/// warm-up wave shares no pair with the timed one.
+fn distinct_pair(wave: usize, stream: usize) -> (usize, usize) {
+    ((stream + wave) % STYLES.len(), (stream * 7 + wave * 5) % TOPICS.len())
+}
+
+/// One concurrent wave of `width` streams with distinct prompts, shared by the
+/// sweep and the basic card. Waves 0 (timed) and 1 (warm-up) use different sets.
+pub(crate) fn distinct_batch(client: &crate::client::Client, width: usize, tokens: u64, wave_index: usize)
     -> Vec<Result<common::Timed>> {
-    let bodies = (0..width).map(|_| plain(&format!("[{}] {}", nonce(), CONTENT[0].1), tokens)).collect();
+    let bodies = (0..width)
+        .map(|i| plain(client, &format!("[{}] {}", nonce(), distinct_prompt(wave_index, i)), tokens)).collect();
     wave(client, bodies)
 }
 
@@ -69,7 +121,7 @@ impl Panel for DecodeContent {
             let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
             let before = common::draft_counters(ctx.client);
-            let chat = ctx.client.chat(plain(&format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
+            let chat = ctx.client.chat(plain(ctx.client, &format!("[{}] {prompt}", nonce()), DECODE_TOKENS), None)
                 .with_context(|| format!("{content} decode"))?;
             let acceptance = common::acceptance(before, common::draft_counters(ctx.client));
             rows.push(json!({"content": content, "tok_s": chat.timing.decode_tok_s(),
@@ -95,8 +147,8 @@ impl Panel for Concurrency {
     fn id(&self) -> &'static str { "concurrency" }
     fn title(&self) -> &'static str { "Concurrency sweep" }
     fn description(&self) -> &'static str {
-        "Aggregate and per-request decode tok/s and TTFT from C1 to C32 (up to the server's concurrency), code \
-         prompts, thinking off."
+        "Aggregate and per-request decode tok/s and TTFT from C1 to C32 (up to the server's concurrency), a \
+         distinct prompt per stream, thinking off."
     }
     fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
         Self::levels(info).iter().map(|&c| 2.0 * rates.seconds(120.0 * c as f64, 192.0) * (1.0 + 0.08 * c as f64)).sum()
@@ -108,12 +160,12 @@ impl Panel for Concurrency {
             ctx.progress.step(i as f64 / levels.len() as f64, format!("C{c}"));
             ctx.client.check()?;
             // Prime each width before measuring: graphs, workspaces and mapped tables.
-            code_batch(ctx.client, c, 192).into_iter().collect::<Result<Vec<_>>>()
+            distinct_batch(ctx.client, c, 192, 1).into_iter().collect::<Result<Vec<_>>>()
                 .with_context(|| format!("C{c} warm-up"))?;
             ctx.client.check()?;
             let fabric_mark = ctx.client.fabric_mark();
             let table_before = common::mapped_counters(ctx.client);
-            let results = code_batch(ctx.client, c, 192);
+            let results = distinct_batch(ctx.client, c, 192, 0);
             let errors = results.iter().filter(|r| r.is_err()).count();
             let ok: Vec<_> = results.into_iter().filter_map(Result::ok).collect();
             let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
@@ -122,7 +174,7 @@ impl Panel for Concurrency {
             // per-token counters (mapped-table reads), since EOS can shorten requests.
             let tokens: u64 = ok.iter().map(|r| r.chat.timing.completion_tokens).sum();
             points.push(json!({"c": c, "aggregate_tok_s": aggregate(&ok), "per_request_tok_s": common::median(&mut per),
-                "ttft_s": common::median(&mut ttft), "errors": errors, "tokens": tokens,
+                "ttft_s": common::median(&mut ttft), "errors": errors, "tokens": tokens, "prompts": DISTINCT_PROMPTS,
                 "mapped_tables": common::mapped_interval(&table_before, &common::mapped_counters(ctx.client)),
                 "fabric": ctx.client.fabric_since(fabric_mark, &format!("{}/{}", self.id(), i), true)}));
             ctx.progress.partial(json!({"points": points}));
@@ -153,7 +205,7 @@ impl Panel for DraftMix {
         let mut waves = Vec::new();
         for wave_index in 0..2 {
             ctx.progress.step(0.4 * wave_index as f64, format!("C{width} mixed, wave {}", wave_index + 1));
-            let bodies = (0..width).map(|i| plain(&format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
+            let bodies = (0..width).map(|i| plain(ctx.client, &format!("[{}] {}", nonce(), CONTENT[(i + wave_index) % CONTENT.len()].1),
                 MIX_TOKENS)).collect();
             let fabric_mark = ctx.client.fabric_mark();
             let results = wave(ctx.client, bodies);
@@ -175,7 +227,7 @@ impl Panel for DraftMix {
             let fabric_mark = ctx.client.fabric_mark();
             let before = common::round_counters(ctx.client);
             let drafts = common::draft_counters(ctx.client);
-            let chat = ctx.client.chat(plain(&prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
+            let chat = ctx.client.chat(plain(ctx.client, &prompt, 1600u64.min(ctx.max_output)), None).context("rewrite decode")?;
             let after = common::round_counters(ctx.client);
             let per_round = before.zip(after).and_then(|((r0, t0), (r1, t1))| (r1 > r0).then(|| (t1 - t0) / (r1 - r0)));
             rewrites.push(json!({"tok_s": chat.timing.decode_tok_s(), "tokens": chat.timing.completion_tokens,
@@ -207,17 +259,21 @@ impl Panel for Prefill {
          except its last 256 tokens."
     }
     fn estimate_s(&self, rates: &Rates, _info: &ServerInfo) -> f64 {
-        Self::lengths(131_072).iter().map(|&l| rates.seconds(l as f64 * 1.15, 2.0) + 1.0).sum()
+        Self::lengths(131_072).iter().map(|&l| rates.seconds(l as f64 * 2.15, 3.0) + 1.0).sum()
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let lengths = Self::lengths(ctx.max_context);
         let mut points = Vec::new();
         for (i, &target) in lengths.iter().enumerate() {
             ctx.progress.step(i as f64 / lengths.len() as f64, format!("{}K", target / 1024));
+            // Warm each length without retaining a prefix or charging its fabric traffic.
+            let warm = sized_prompt(ctx, 2000 + i as u64, target, "Reply with the single word OK.");
+            ctx.client.chat(plain(ctx.client, &warm, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))
+                .with_context(|| format!("{target}-token prefill warm-up"))?;
             let text = sized_prompt(ctx, 1000 + i as u64, target, "Reply with the single word OK.");
             // Cold: a fresh prompt; its ids come back for the cached run.
             let fabric_mark = ctx.client.fabric_mark();
-            let cold = ctx.client.chat(plain(&text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
+            let cold = ctx.client.chat(plain(ctx.client, &text, 1), Some(ProbeSpec { cold: true, ..ProbeSpec::default() }))?;
             let ids = cold.probe.as_ref().filter(|r| r.engine.is_some()).map(|r| r.prompt_ids.clone());
             let mut point = json!({"target": target, "prompt_tokens": cold.timing.prompt_tokens,
                 "cold_ttft_s": cold.timing.ttft_s, "cold_tok_s": cold.timing.prefill_tok_s(),
@@ -225,10 +281,10 @@ impl Panel for Prefill {
             if let Some(ids) = ids.filter(|ids| ids.len() > 512) {
                 // Cached: retain all but the last 256 tokens, then send the whole prompt.
                 let cut = ids.len() - 256;
-                ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
+                ctx.client.chat(plain(ctx.client, "prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids[..cut].to_vec()),
                     ..ProbeSpec::default() }))?;
                 let fabric_mark = ctx.client.fabric_mark();
-                let cached = ctx.client.chat(plain("prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids.clone()),
+                let cached = ctx.client.chat(plain(ctx.client, "prefix", 1), Some(ProbeSpec { prompt_ids: Some(ids.clone()),
                     ..ProbeSpec::default() }))?;
                 point["cached_fabric"] = json!(ctx.client.fabric_since(fabric_mark, &format!("prefill/{target}/cached"), true));
                 point["cached_tokens"] = json!(cached.timing.cached_tokens);
@@ -274,7 +330,7 @@ impl Panel for Retained {
             let text = if context == 0 { format!("[{}] {question}", nonce()) }
                 else { sized_prompt(ctx, 2000 + i as u64, context, &question) };
             let fabric_mark = ctx.client.fabric_mark();
-            let chat = ctx.client.chat(plain(&text, 160), None)?;
+            let chat = ctx.client.chat(plain(ctx.client, &text, 160), None)?;
             points.push(json!({"context": context, "prompt_tokens": chat.timing.prompt_tokens,
                 "decode_tok_s": chat.timing.decode_tok_s(), "ttft_s": chat.timing.ttft_s,
                 "tokens": chat.timing.completion_tokens,
@@ -299,14 +355,14 @@ impl Panel for PrefixCache {
     }
     fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
         let mut history = vec![json!({"role": "system", "content": format!("[{}] You are a concise assistant. \
-            Reference notes follow.\n\n{}", nonce(), filler(4242, 700))})];
+            Reference notes follow.\n\n{}", nonce(), corpus(4242, 700))})];
         let mut turns = Vec::new();
         let tiers_before = common::prefix_tier_counters(ctx.client);
         for turn in 1..=6 {
             ctx.progress.step((turn - 1) as f64 / 6.0, format!("turn {turn}"));
             history.push(json!({"role": "user", "content": format!("Question {turn}: {} Answer in three sentences.",
-                filler(turn as u64 * 77, 120))}));
-            let body = json!({"messages": history, "max_tokens": 64, "temperature": 0, "thinking": {"type": "disabled"}});
+                corpus(turn as u64 * 77, 120))}));
+            let body = super::context_load::body(&ctx.info.configuration, json!(history), 64);
             // From turn 2 the history carries the model's own answers, so the
             // prompt is model-determined and differs between arms by design.
             let derived = turn > 1;
@@ -333,5 +389,141 @@ impl Panel for PrefixCache {
             json!(t["cold_ttft_s"].as_f64().map(|v| v * 1e3))]).collect();
         Ok(json!({"turns": turns, "tiers": tiers,
             "table": table(&["turn", "prompt", "cached", "source", "TTFT ms", "cold TTFT ms"], rows)}))
+    }
+}
+
+pub static SHARED_PREFIX: SharedPrefix = SharedPrefix;
+pub struct SharedPrefix;
+
+fn identical_prompts(c: usize) -> Vec<String> {
+    let prompt = format!("[{}] {}", nonce(), CONTENT[0].1);
+    vec![prompt; c]
+}
+
+fn identical_bodies(client: &crate::client::Client, c: usize, tokens: u64) -> Vec<Value> {
+    identical_prompts(c).iter().map(|prompt| plain(client, prompt, tokens)).collect()
+}
+
+fn prefix_card_options(limit: usize) -> super::context_load::Options {
+    super::context_load::Options {
+        lengths: vec![32768],
+        levels: [1, 4, 16].into_iter().filter(|&c| c <= limit).collect(),
+        suffix_tokens: 0,
+    }
+}
+
+fn prefix_card_record(identical: &[Value], retained: Value) -> Value {
+    let points: Vec<_> = identical.iter().cloned().map(|mut p| {
+        p["kind"] = json!("identical");
+        p
+    }).chain(retained["points"].as_array().into_iter().flatten().cloned().map(|mut p| {
+        p["kind"] = json!("cached follow-up");
+        p
+    })).collect();
+    let rows = points.iter().map(|p| vec![p["kind"].clone(), p["c"].clone(),
+        p["aggregate_tok_s"].clone(), p["per_request_tok_s"].clone(),
+        json!(p["ttft_s"].as_f64().map(|s| s * 1e3)), p["end_to_end_s"].clone()]).collect();
+    json!({"identical": identical, "retained": retained, "points": points,
+        "table": table(&["case", "C", "aggregate tok/s", "median tok/s", "TTFT ms", "end-to-end s"], rows)})
+}
+
+impl Panel for SharedPrefix {
+    fn id(&self) -> &'static str { "shared_prefix" }
+    fn title(&self) -> &'static str { "Shared-prefix release guard" }
+    fn description(&self) -> &'static str {
+        "Identical full prompts at C4/C16, then fresh follow-up suffixes over a retained 32K base at C1/C4/C16. Warm before timing; cached follow-ups emit up to 512 tokens."
+    }
+    fn estimate_s(&self, rates: &Rates, info: &ServerInfo) -> f64 {
+        let limit = common::concurrency(info).max(1);
+        let shared = [4, 16].into_iter().filter(|&c| c <= limit)
+            .map(|c| 2.0 * rates.seconds(120.0 * c as f64, 192.0) * (1.0 + 0.08 * c as f64)).sum::<f64>();
+        shared + rates.seconds(32768.0, 1.0) + 6.0 * rates.seconds(128.0, 512.0)
+    }
+    fn run(&self, ctx: &Ctx<'_>) -> Result<Value> {
+        let limit = common::concurrency(ctx.info).max(1);
+        let mut identical = Vec::new();
+        for c in [4, 16].into_iter().filter(|&c| c <= limit) {
+            wave(ctx.client, identical_bodies(ctx.client, c, 192.min(ctx.max_output)))
+                .into_iter().collect::<Result<Vec<_>>>()?;
+            let timed = wave(ctx.client, identical_bodies(ctx.client, c, 192.min(ctx.max_output)))
+                .into_iter().collect::<Result<Vec<_>>>()?;
+            let mut ttft: Vec<_> = timed.iter().map(|r| r.chat.timing.ttft_s).collect();
+            let mut per: Vec<_> = timed.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
+            let mut total: Vec<_> = timed.iter().map(|r| r.chat.timing.total_s).collect();
+            identical.push(json!({"c": c, "aggregate_tok_s": aggregate(&timed),
+                "per_request_tok_s": common::median(&mut per), "ttft_s": common::median(&mut ttft),
+                "end_to_end_s": common::median(&mut total),
+                "requests": timed.iter().map(|r| &r.chat.timing).collect::<Vec<_>>()}));
+            ctx.progress.partial(json!({"identical": identical}));
+        }
+        let options = prefix_card_options(limit);
+        let retained_ctx = Ctx { context_load: &options, ..*ctx };
+        let retained = super::context_load::CONTEXT_LOAD.run_with_output(&retained_ctx, 512)?;
+        anyhow::ensure!(retained["points"].as_array().is_some_and(|points|
+            !points.is_empty() && points.iter().all(|p| p["status"] == "ok")),
+            "shared-prefix release guard requires successful retained-prefix points");
+        Ok(prefix_card_record(&identical, retained))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn release_guard_covers_identical_and_retained_followup_cells() {
+        let warm = identical_prompts(16);
+        let timed = identical_prompts(16);
+        assert!(warm.iter().all(|p| p == &warm[0]));
+        assert!(timed.iter().all(|p| p == &timed[0]));
+        assert_ne!(warm[0], timed[0]);
+        let options = prefix_card_options(16);
+        assert_eq!(options.lengths, vec![32768]);
+        assert_eq!(options.levels, vec![1, 4, 16]);
+        assert_eq!(prefix_card_options(4).levels, vec![1, 4]);
+        assert_eq!(prefix_card_options(1).levels, vec![1]);
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn release_guard_records_cached_c1_latency_and_decode() {
+        let retained = json!({"points": [{"c": 1, "status": "ok", "max_tokens": 512,
+            "aggregate_tok_s": 100.0, "per_request_tok_s": 100.0,
+            "ttft_s": 0.2, "end_to_end_s": 5.32}]});
+        let record = prefix_card_record(&[], retained.clone());
+        assert_eq!(record["retained"], retained);
+        assert_eq!(record["points"][0]["kind"], "cached follow-up");
+        assert_eq!(record["table"]["rows"][0], json!(["cached follow-up", 1, 100.0, 100.0, 200.0, 5.32]));
+        let request = super::super::context_load::request(&crate::report::Configuration::default(),
+            &json!([]), "card", "timed", 1, 0, 512, 0);
+        assert_eq!(request["max_tokens"], 512);
+    }
+
+    #[test]
+    fn concurrent_waves_give_every_stream_its_own_prompt() {
+        for wave_index in 0..2 {
+            for width in [2usize, 4, 8, 16, 32] {
+                let pairs: HashSet<_> = (0..width).map(|i| distinct_pair(wave_index, i)).collect();
+                let prompts: HashSet<_> = (0..width).map(|i| distinct_prompt(wave_index, i)).collect();
+                assert_eq!((pairs.len(), prompts.len()), (width, width), "wave {wave_index} C{width}");
+            }
+            for stream in 0..31 {
+                let (a, b) = (distinct_pair(wave_index, stream), distinct_pair(wave_index, stream + 1));
+                assert!(a.0 != b.0 && a.1 != b.1, "neighbours {stream} share a style or topic");
+            }
+        }
+        let timed: HashSet<_> = (0..32).map(|i| distinct_pair(0, i)).collect();
+        assert!((0..32).all(|i| !timed.contains(&distinct_pair(1, i))), "warm-up repeats a timed prompt");
+        assert!((0..32).all(|i| !distinct_prompt(0, i).contains("{topic}")));
+    }
+
+    #[test]
+    fn distinct_prompt_set_changes_only_with_its_version() {
+        // Every concurrent point records DISTINCT_PROMPTS; bump it with this digest.
+        let digest = (0..2).flat_map(|w| (0..32).map(move |i| distinct_prompt(w, i)))
+            .flat_map(|p| p.into_bytes().into_iter().chain([b'\n']))
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        assert_eq!((DISTINCT_PROMPTS, format!("{digest:016x}")), ("distinct-v1", "39f446641a12c590".to_string()));
     }
 }

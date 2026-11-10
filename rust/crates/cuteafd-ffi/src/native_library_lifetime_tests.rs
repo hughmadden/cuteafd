@@ -8,6 +8,61 @@ use crate::native_library_lifetime_fixture::Fixture;
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn symbols_resolve_once_and_optional_exports_stay_lazy() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    assert!(library.symbols.cuteafd_cuda_stream_query.get().is_none());
+    assert!(library.symbols.cuteafd_xgrammar_compile.get().is_none());
+    let first = library.cuteafd_cuda_stream_query()?;
+    let second = library.cuteafd_cuda_stream_query()?;
+    assert_eq!(first as usize, second as usize);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let library = &library;
+            scope.spawn(move || assert_eq!(
+                library.cuteafd_cuda_stream_query().unwrap() as usize, first as usize));
+        }
+    });
+    // SAFETY: the CPU fixture accepts a null synthetic stream and writes ready.
+    assert!(!unsafe { library.cuda_stream_query(std::ptr::null_mut())? });
+    assert!(library.cuteafd_xgrammar_compile().is_err());
+    let first_error = library.symbols.cuteafd_xgrammar_compile.get().unwrap().as_ref().unwrap_err();
+    let error = library.cuteafd_xgrammar_compile().unwrap_err();
+    let cached_error = error.downcast_ref::<Arc<libloading::Error>>().unwrap();
+    assert!(Arc::ptr_eq(first_error, cached_error), "missing exports are cached too");
+    assert!(error.to_string().contains("cuteafd_xgrammar_compile"));
+    drop(library);
+    assert!(!fixture.resident()?, "the cache must not retain a healthy module");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn cached_k6_wire_owners_match_diagnostic_rounding() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let narrow = library.f32_bf16_narrow()?;
+    let add = library.bf16_f32_add()?;
+    let source = [f32::from_bits(0x3f808000), f32::from_bits(0x3f818000), f32::INFINITY, f32::NEG_INFINITY];
+    let mut rank0 = [0u16; 4];
+    let rank1 = [0xbf80u16, 0xbf80, 0x7f80, 0xff80];
+    let mut output = [0f32; 4];
+    let view = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: 0, flags: 0 };
+    // SAFETY: the fixture uses live, disjoint host arrays and a synthetic stream.
+    unsafe {
+        narrow.launch(source.as_ptr().cast(), rank0.as_mut_ptr().cast(), 4, std::ptr::null_mut())?;
+        add.launch(view(rank0.as_mut_ptr().cast(), 8), view(rank1.as_ptr().cast_mut().cast(), 8),
+            view(output.as_mut_ptr().cast(), 16), 4, std::ptr::null_mut())?;
+    }
+    assert_eq!(rank0, [0x3f80, 0x3f82, 0x7f80, 0xff80]);
+    assert_eq!(output.map(f32::to_bits), [0, 0x3c800000, 0x7f800000, 0xff800000]);
+    assert!(library.symbols.cuteafd_load_narrow_f32_bf16.get().unwrap().is_ok());
+    assert!(library.symbols.cuteafd_bf16_f32_add_async.get().unwrap().is_ok());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;
@@ -29,6 +84,51 @@ fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
         assert_eq!(std::slice::from_raw_parts(b.ptr.cast::<u8>(), 4), &[5, 6, 7, 8]);
     }
     assert!(fixture.events()?.contains("CAQR"));
+    library.free_device_buffer(&mut a)?;
+    library.free_device_buffer(&mut b)?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn ordered_upload_sizes_staging_once_and_refuses_growth() -> Result<()> {
+    // Pinned staging is created once per destination at the destination's whole
+    // extent. A later upload never frees/reallocates it: cudaFreeHost would
+    // synchronize the device while a peer wait may be queued (slot reuse).
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let mut a = library.alloc_device_buffer(16)?;
+    let mut b = library.alloc_device_buffer(16)?;
+    let stream = 1usize as *mut c_void;
+    let allocations = |events: &str| events.matches('A').count();
+    // SAFETY: the CPU fixture owns both buffers and accepts a synthetic stream.
+    unsafe {
+        let before = allocations(&fixture.events()?);
+        library.copy_h2d_ordered(a, &[1; 4], stream)?;
+        let first = allocations(&fixture.events()?);
+        assert_eq!(first, before + 1, "first upload creates the destination's staging");
+        library.copy_h2d_ordered(a, &[2; 16], stream)?;
+        assert_eq!(allocations(&fixture.events()?), first, "a longer source reuses whole-extent staging");
+        // A view narrowed below the first source's extent shares the key but not the size.
+        let narrow = CuteafdDeviceBuffer { bytes: 4, ..b };
+        library.copy_h2d_ordered(narrow, &[3; 4], stream)?;
+        let events = fixture.events()?;
+        let error = library.copy_h2d_ordered(b, &[4; 16], stream).unwrap_err().to_string();
+        assert!(error.contains("exceeds the 4-byte staging"), "{error}");
+        assert_eq!(fixture.events()?, events, "a refused grow neither frees nor allocates host memory");
+        // Reservation before readiness sizes the staging with no copy.
+        let mut c = library.alloc_device_buffer(32)?;
+        library.reserve_h2d_ordered(c, stream)?;
+        let reserved = fixture.events()?;
+        library.reserve_h2d_ordered(c, stream)?;
+        library.copy_h2d_ordered(CuteafdDeviceBuffer { bytes: 8, ..c }, &[5; 8], stream)?;
+        library.copy_h2d_ordered(c, &[6; 32], stream)?;
+        assert_eq!(allocations(&fixture.events()?), allocations(&reserved), "reserved staging is never replaced");
+        assert!(!fixture.events()?[reserved.len()..].contains('F'));
+        library.release_ordered_h2d_staging()?;
+        assert_eq!(std::slice::from_raw_parts(c.ptr.cast::<u8>(), 32), &[6; 32]);
+        library.free_device_buffer(&mut c)?;
+    }
     library.free_device_buffer(&mut a)?;
     library.free_device_buffer(&mut b)?;
     Ok(())
@@ -167,5 +267,30 @@ fn failed_drain_marker_retains_module_and_pinned_staging() -> Result<()> {
     assert_eq!(healthy.events()?, "AFU");
     assert!(!healthy.resident()?);
     assert!(fixture.resident()?);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn event_waiters_retain_module_until_workers_join() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let event = library.cuda_event_create()?;
+    let destroy = library.cuteafd_cuda_event_destroy()?;
+    // SAFETY: the fixture event is live and the fixture accepts a null stream.
+    unsafe { library.cuda_event_record(event, std::ptr::null_mut())?; }
+    let mut waiters = crate::event_waiters::EventWaiters::new(&library, 0, 4)?;
+    drop(library);
+    assert!(fixture.resident()?, "idle workers must retain their function pointers' DSO");
+    // SAFETY: workers retain the DSO; the recorded event stays live until completion.
+    unsafe { waiters.submit(0, event, 37)?; }
+    assert_eq!(waiters.complete()?, 37);
+    assert!(fixture.resident()?);
+    assert!(!fixture.events()?.contains('U'));
+    // SAFETY: successful completion drained this event and workers retain destroy's DSO.
+    assert_eq!(unsafe { destroy(event) }, 0);
+    waiters.join()?;
+    assert!(!fixture.resident()?, "joined workers must release the healthy DSO");
+    assert!(fixture.events()?.ends_with("EU"));
     Ok(())
 }

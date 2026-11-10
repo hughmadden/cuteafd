@@ -115,9 +115,17 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
 }
 
 impl Family for MiMo {
+    fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
+        crate::plan::decode_lanes::LaneSupport::One {
+            reason: "measured: a second lane runs MiMo Pro at 0.91-0.93x (C4-C8; duplicated coordinator weight reads) and MiMo Flash at 0.66-0.73x (C4-C16) (#709, #723, #744)" }
+    }
+    fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
+        Some(crate::plan::spark_executions::SparkDecode { rows: crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u32 })
+    }
     fn id(&self) -> &'static str {
         "mimo_v2"
     }
+    fn media_cache_headroom(&self) -> bool { true }
     fn runtime(&self) -> RuntimeStatus {
         RuntimeStatus::Serving
     }
@@ -203,9 +211,9 @@ impl Family for MiMo {
                     prefill; FP8_EXPERT_PREFILL=w8a16 keeps BF16 down.", i / 2, i / 4),
             }),
             Component::RoutedExpert if mxfp4 => {
-                // TP6: whole 32-blocks per rank (352/320 of 2048), stored zero-padded to 128.
+                // TP6 owns whole K32 blocks; physical storage follows the measured policy.
                 let widest = (i / 32).div_ceil(6) * 32;
-                let padded = widest.div_ceil(128) * 128;
+                let stored = cuteafd_core::mxfp4_layouts::generic_stored_width(h, widest);
                 let per_rank = |slice: usize| (spec.moe_layers() * e * 3 * slice * h) as f64 * (0.5 + 1.0 / 32.0) / GIB;
                 Some(Hint {
                     what: format!("sigmoid top-{k} routed experts, no shared expert, MXFP4 (packed E2M1 U8 [N, K/2], \
@@ -213,13 +221,13 @@ impl Family for MiMo {
                     how: format!("Exact family `mimop:fp8` (b12x fp8_moe weights=mxfp4: E2M1 x 2^(s-127); \
                         packages fp8-mimop tp1 coordinator, tp6/tp2 Spark, \
                         python/tools/aot/package_fp8_moe_aot.py --geometry mimop [--cross-sm121]). Spark layout TP6 \
-                        over six ranks: whole 32-blocks per rank ({widest}/{} rows) zero-padded to {padded}, \
+                        over six ranks: whole 32-blocks per rank ({widest}/{} rows), widest stored width {stored}, \
                         {:.1} GiB per rank (TP2xEP3: {:.1} GiB, but a decode step reads all of a row's experts \
                         that land on one EP group). The SM121 Spark package streams MXFP8 x MXFP4 gate/up \
                         above 640 live rows, and its down projection quantizes the BF16 SwiGLU rows per K32 to \
                         MXFP8 for block-scaled MXFP8 x MXFP4 MMAs (FP8_EXPERT_PREFILL=w8a16 keeps BF16 down); \
                         smaller row counts use the grouped route.",
-                        widest - 32, per_rank(padded), per_rank(i / 2) / 3.0),
+                        widest - 32, per_rank(stored), per_rank(i / 2) / 3.0),
                 })
             }
             Component::RoutedExpert => Some(Hint {
@@ -418,7 +426,7 @@ impl FamilyModel for MimoModel {
     }
 
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
-        options: &crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
         -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
         Some(Ok(crate::plan::layout::mimo::layout(report, self, input, options)))
     }

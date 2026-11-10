@@ -38,19 +38,9 @@ pub(crate) fn resolve(
     Ok(Some(topology))
 }
 
-/// Compact V4.1 EXL3 TP3 always uses the existing EP1 ownership contract,
-/// including direct CLI and golden callers that omit explicit topology flags.
-pub(crate) fn for_checkpoint(
-    topology: Option<SparkTopology>,
-    world: usize,
-    v41_exl3: bool,
-) -> Option<SparkTopology> {
-    topology.or_else(|| (v41_exl3 && world == 3).then_some(SparkTopology::NATIVE_TP3_EP1))
-}
-
 /// Resolve the declared wire independently from the physical TP/EP layout.
-/// Omitted CLI keys choose canonical pure TP, except the compact V4.1 TP3
-/// ownership protocol. No transport derives rank identities from a fallback.
+/// Omitted CLI keys choose canonical pure TP. No transport derives rank
+/// identities from a fallback.
 pub(crate) fn world(topology: Option<SparkTopology>, ranks: usize) -> Result<SparkWorld> {
     let world = match topology {
         Some(topology) => SparkWorld::owned(topology)?,
@@ -71,14 +61,16 @@ pub(crate) fn require_supported(
     if let Some(topology) = topology {
         ensure!(catalog.fp8().is_none(),
             "generic expert programs require canonical Spark wire");
-        ensure!(if catalog.exl3().is_some() {
-            topology == SparkTopology::NATIVE_TP3_EP1
-                && catalog.routed_experts().geometry()?.family() == Some("v41")
-        } else {
-            catalog.nvfp4().is_none()
-                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))
-        }, "unsupported Spark ownership wire {}x{} for this checkpoint; supported: native experts on TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3; NVFP4 on TP3EP1, TP4EP1, TP6EP1; compact V4.1 EXL3 on TP3EP1",
+        let nvfp4 = catalog.nvfp4().is_some();
+        ensure!(catalog.exl3().is_none() && (!nvfp4
+                || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
+            "unsupported Spark ownership wire {}x{} for this checkpoint; NVFP4 on TP3EP1, TP4EP1, TP6EP1 only; EXL3 requires canonical wire",
             topology.tp(), topology.ep());
+        let geometry = catalog.routed_experts().geometry()?;
+        let family = geometry.family().unwrap_or("v41");
+        ensure!(cuteafd_core::tp_units::spark_package_worlds(family,
+                if nvfp4 { "nvfp4" } else { "mxfp4" }).contains(&(topology.tp() as usize)),
+            "checkpoint has no native Spark width-class recipe for TP{}", topology.tp());
         SparkWorld::owned(topology)?;
     }
     Ok(())
@@ -88,15 +80,17 @@ pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> R
     if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
         ensure!(world.ownership_topology().is_none(),
             "EXLR8 unit ownership requires canonical Spark wire");
-        ensure!((1..=6).contains(&world.topology().world_size()), "EXLR8 requires 1..=6 ranks");
+        ensure!((1..=8).contains(&world.topology().world_size()), "EXLR8 requires 1..=8 ranks");
         return Ok(());
     }
     require_supported(world.ownership_topology(), catalog)?;
-    let family = catalog.routed_experts().geometry()?.family();
-    if world.ownership_topology().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none() {
-        ensure!(world.topology().tp() == 4
-            || (family == Some("dsv4f") && world.topology().tp() == 2),
-            "native Spark experts outside TP4 require ownership wire (except V4 Flash TP2)");
+    if catalog.exl3().is_none() && catalog.fp8().is_none() {
+        let geometry = catalog.routed_experts().geometry()?;
+        let family = geometry.family().unwrap_or("v41");
+        let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+        ensure!(cuteafd_core::tp_units::spark_package_worlds(family, format)
+                .contains(&(world.topology().tp() as usize)),
+            "checkpoint has no native Spark width-class recipe for TP{}", world.topology().tp());
     }
     Ok(())
 }
@@ -140,15 +134,352 @@ mod tests {
     }
 
     #[test]
-    fn native_world_requires_owned_wire_outside_tp4() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        require_world(SparkWorld::canonical(4)?, &catalog)?;
-        require_world(SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?, &catalog)?;
-        for ranks in [3, 6] {
-            let error = require_world(SparkWorld::canonical(ranks)?, &catalog).unwrap_err();
-            assert!(error.to_string().contains("native Spark experts outside TP4 require ownership wire"));
+    fn eight_rank_user_launch_chain_has_no_hidden_count_caps() -> Result<()> {
+        use clap::Parser;
+        use cuteafd_loader::plan::{testing, ExpertPlacement, PlanOptions,
+            deployment::{DeploymentOptions, DeploymentSpec}, layout::LayoutOptions};
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let data: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../scripts/build/spark-package-ranges.json"))?;
+        let python = source.join(".venv/bin/python");
+        let python = if python.is_file() { python } else {
+            let common = std::process::Command::new("git").arg("-C").arg(&source)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"]).output()?;
+            anyhow::ensure!(common.status.success(), "cannot locate checkout Python environment");
+            std::path::Path::new(std::str::from_utf8(&common.stdout)?.trim())
+                .parent().unwrap().join(".venv/bin/python")
+        };
+        let mut tested = Vec::new();
+        for (key, _) in data["entries"].as_object().unwrap() {
+            let (family, format) = key.split_once(':').unwrap();
+            let worlds = cuteafd_core::tp_units::spark_package_worlds(family, format);
+            if !worlds.iter().any(|n| *n >= 7) { continue; }
+            assert!(worlds.contains(&8), "{key}: add N7 contract if N8 is genuinely unavailable");
+            eprintln!("N8 launch-chain: {key}");
+            let root = tempfile::tempdir()?;
+            let snapshot = root.path().join("snapshot");
+            std::fs::create_dir(&snapshot)?;
+            match (family, format) {
+                ("v41", _) => testing::write_v41_snapshot(&snapshot),
+                ("dsv4f", _) => testing::write_v4_snapshot(&snapshot),
+                ("dsv4p", "mxfp4") => testing::write_v4_pro_mxfp4_snapshot(&snapshot),
+                ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
+                ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
+                ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
+                ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
+                ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
+                ("mimop", _) => testing::write_snapshot(&snapshot, &testing::mimo_pro_config(), &testing::mimo_pro_tensors(), Some(8)),
+                ("glm", _) => {
+                    let mut config = testing::glm5_config();
+                    if format == "exl3" { config["quantization_config"] = testing::exl3_compact(4); }
+                    testing::write_snapshot(&snapshot, &config,
+                        &testing::glm5_tensors(|name, n, k| if format == "exl3" {
+                            testing::exl3(name, n, k, 4)
+                        } else { testing::fp8(name, n, k, None) }), None);
+                }
+                ("glmf", _) => {
+                    let mut config = testing::glm5_flash_config(3);
+                    let mut tensors = testing::glm5_flash_tensors(&config);
+                    if format == "exl3" {
+                        tensors.retain(|(name, ..)| !name.contains(".mlp.experts."));
+                        for layer in 1..3 { for expert in 0..288 {
+                            for (proj, n, k) in [("gate_proj", 2048, 4096), ("up_proj", 2048, 4096), ("down_proj", 4096, 2048)] {
+                                tensors.extend(testing::exl3(&format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}"), n, k, 3 + expert % 2));
+                            }
+                        } }
+                        config["quantization_config"] = testing::exl3_compact(3);
+                    }
+                    testing::write_snapshot(&snapshot, &config, &tensors, None);
+                }
+                // The full release header inventory (every expert layer), EXL3 K4 + Core-K6.
+                ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
+                _ => anyhow::bail!("missing full launch fixture for covered {key}"),
+            }
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4") {
+                expand_eight_rank_fixture(&snapshot)?;
+            }
+            let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
+            let gpus = if family == "kimik3" { 2 } else { 1 };
+            let manifest = if family == "v41" { Some(testing::write_v41_workspaces(&snapshot)) }
+                else if family == "kimik3" { Some(testing::write_kimi_installed_inventory(root.path(), false)) }
+                else if family == "ml4" {
+                    // Its K6 core plans against the native programs of its own geometry.
+                    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&snapshot)?;
+                    let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
+                    let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+                    let path = root.path().join("PROGRAMS.json");
+                    std::fs::write(&path, testing::glm_k6_programs(&cfg, &core)?.to_string())?;
+                    Some(path)
+                }
+                else { None };
+            let options = PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(8),
+                draft_ownership: Some(cuteafd_loader::plan::spec::DraftOwnership::None),
+                vision: cuteafd_loader::plan::MediaMode::Off, audio: cuteafd_loader::plan::MediaMode::Off,
+                mapped_scale_host_budget_bytes: Some(64 << 30),
+                layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; gpus], host_cache_bytes: Some(0), pool_tokens: Some(262_144),
+                    context_tokens: 262_144, prefill_rows: 4096, prefill_lanes: 1,
+                    workspace_manifest: manifest, glm5_drafter_disabled: true, glmf_drafter_disabled: true,
+                    ..Default::default() }), ..Default::default()
+            };
+            let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            // Coverage follows each family's own runtime status: a Planned family must
+            // be refused at deployment until it serves; flipping it to Serving puts it
+            // through the whole chain below (and requires its launch dispatch).
+            if report.runtime == Some(cuteafd_loader::plan::RuntimeStatus::Planned) {
+                let refused = DeploymentOptions { rtx_gpus: gpus,
+                    peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
+                    speculator: "off".into(), ..Default::default() };
+                let deployment = DeploymentSpec::from_report(&report, &refused)?;
+                assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
+                eprintln!("N8 launch-chain: {key} planned; refused at deployment");
+                tested.push(key.clone());
+                continue;
+            }
+            assert!(report.fits && report.placement_supported, "{key}: {:?}", report.hints);
+            let deployment_options = DeploymentOptions { rtx_gpus: gpus,
+                peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
+                speculator: "off".into(), ..Default::default() };
+            let deployment = DeploymentSpec::from_report(&report, &deployment_options)?;
+            assert!(deployment.executable, "{key}: {:?}", report.hints);
+            let spark_devices = deployment.memory_layout.devices.iter()
+                .filter(|device| device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
+            assert_eq!(spark_devices.len(), 8, "{key}");
+            for device in spark_devices {
+                assert_eq!(device.worker_budget_bytes, 108 << 30, "{key}");
+                assert!(device.worker_budget_bytes <= device.capacity_bytes && device.worker_budget_bytes <= 121 << 30,
+                    "{key}: worker ceiling exceeds device capacity");
+            }
+            let deployment_path = root.path().join("deployment.json");
+            std::fs::write(&deployment_path, serde_json::to_vec(&deployment)?)?;
+            let temporary = root.path().join("launch");
+            std::fs::create_dir(&temporary)?;
+            let output = std::process::Command::new(&python).args(["-I", "-c", r#"
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_real_eight_rank_launch
+print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
+"#]).arg(&source).arg(&snapshot).arg(&deployment_path).arg(&temporary).output()?;
+            assert!(output.status.success(), "{key}: {}", String::from_utf8_lossy(&output.stderr));
+            let captured: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let argv = captured["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
+            let cli = crate::cli::Cli::try_parse_from(&argv)?;
+            use crate::cli::Commands;
+            let (peers, tp, ep) = match cli.command {
+                Commands::ServeNative(a) => (a.peers.len(), a.spark_tp, a.spark_ep),
+                Commands::ServeDsv4(a) => (a.engine.peers.split(',').count(), None, None),
+                Commands::ServeGlm(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
+                Commands::ServeGlmf(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
+                Commands::ServeMimo(a) => (a.engine.peers.as_deref().unwrap().split(',').count(), None, None),
+                Commands::ServeKimi(a) => (a.peers.len(), None, None),
+                Commands::ServeMuse(a) => {
+                    assert_eq!(family, "muse", "{key}: wrong Muse dispatch");
+                    assert_eq!(a.prefill_waves, Some(deployment.prefill_waves as _),
+                        "{key}: launch must preserve the admitted prefill wave count");
+                    assert_eq!(a.prefill_waves, Some(1), "{key}: fixture requests one prefill lane");
+                    (a.peers.len(), None, None)
+                }
+                other => anyhow::bail!("{key}: wrong dispatch {other:?}"),
+            };
+            assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
+            require_world(world(resolve(tp, ep, peers, "launch-chain")?, peers)?, &catalog)?;
+            if family == "v41" {
+                // TP8 retains logical/stored S288: payloads plus coded K32 scales.
+                let (hidden, width, experts) = (5120u64, 288u64, 384u64);
+                let payloads = hidden * width * 3 / 2;
+                let scales = 2 * width * (1 + 2 * (hidden / 128))
+                    + hidden * (1 + 2 * (width / 32).div_ceil(4));
+                assert_eq!(captured["layer_bytes"], experts * (payloads + scales));
+            }
+            let hidden = catalog.routed_experts().geometry()?.hidden as u64;
+            let rows = deployment.prefill_unit_rows;
+            let waves = deployment.prefill_waves;
+            let intake = cuteafd_loader::serving_capacity::prefill_return_bytes(waves, rows, peers as u64, hidden);
+            assert_eq!(intake, 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(waves * rows * hidden * 2)?, "{key}");
+            if family == "v41" {
+                use cuteafd_loader::placement::families::deepseek_v41::owners;
+                let charged = owners::transports_bytes(64, rows, peers, waves as usize, cuteafd_core::SparkReplyFormat::Bf16)?;
+                assert_eq!(charged, 2 * (8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(64 * 5120 * 2)?
+                    + 2 * 64 * 5120 * 2) + rows * waves * 5120 * 2
+                    + 8 * cuteafd_core::serving_capacity::spark_intake_allocation_bytes(rows * waves * 5120 * 2)?);
+            }
+            if family != "kimik3" {
+                let host = report.host_ledger.as_ref().expect("full host intake ledger");
+                let (group, expected) = if matches!(family, "mimo" | "mimof" | "mimop") {
+                    ("mimo/spark-intake-upper-bound", (rows * waves + 64) * hidden * 2 * 8)
+                } else if family == "muse" {
+                    use cuteafd_loader::families::muse_spark::{MuseSparkConfig, replies::Cutoff};
+                    let checkpoint = cuteafd_loader::plan::Checkpoint::open(&snapshot)?;
+                    let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+                    let layout = options.layout.as_ref().unwrap();
+                    let prefill = cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan {
+                        unit_rows: rows, waves, span_rows: rows * waves,
+                    };
+                    let cutoff = Cutoff::with_wide(layout.muse_partial_bf16_max_rows,
+                        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+                        layout.resolved_spark_reply_format(true).into())?;
+                    let transport = cuteafd_loader::placement::families::muse_spark::host_transport(
+                        &cfg, prefill, cutoff, layout.resolved_state_slots("muse_spark") as usize, peers)?;
+                    ("spark-intake", transport.intake)
+                } else {
+                    let endpoints = cuteafd_loader::plan::layout::spark_endpoints(
+                        report.family.as_deref().unwrap(), report.prefill_transports.unwrap()) as u64;
+                    ("spark-intake", rows * waves * hidden * 2 * 8 * endpoints)
+                };
+                let charge = host.items.iter().filter(|item| item.group == group).collect::<Vec<_>>();
+                assert_eq!(charge.len(), 1, "{key}: missing/duplicate {group}");
+                assert_eq!(charge[0].bytes, expected, "{key}: host intake omits a rank");
+            }
+            if family == "kimik3" {
+                let demand = crate::families::kimi_k3::spark::admitted_demand(waves as usize, rows as usize, 0, peers, cuteafd_core::SparkReplyFormat::Bf16)?;
+                assert_eq!(demand.bytes, intake);
+                let charged = report.memory_layout.as_ref().unwrap().devices.iter().flat_map(|d| &d.items)
+                    .filter(|item| item.group == demand.group).collect::<Vec<_>>();
+                assert_eq!(charged.len(), 1);
+                assert_eq!(charged[0].bytes, demand.bytes);
+            }
+            tested.push(key.clone());
+        }
+        assert!(!tested.is_empty());
+        eprintln!("N8 real config -> launch -> clap -> topology -> intake: {}", tested.join(", "));
+        Ok(())
+    }
+
+    // Small family fixtures intentionally understate routed bytes. Complete all
+    // experts and extend real layer templates so the N8 size policy applies.
+    fn expand_eight_rank_fixture(snapshot: &std::path::Path) -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+        let inference_path = snapshot.join("inference/config.json");
+        let native = inference_path.is_file();
+        let text = if config.get("text_config").is_some() { &mut config["text_config"] } else { &mut config };
+        let old_layers = if native { 4 } else { text["num_hidden_layers"].as_u64().unwrap() as usize };
+        let layers = 48;
+        let experts = if native {
+            let mut args: serde_json::Value = serde_json::from_slice(&std::fs::read(&inference_path)?)?;
+            args["n_layers"] = layers.into();
+            let ratios = args["compress_ratios"].as_array().unwrap().clone();
+            args["compress_ratios"] = (0..layers).map(|i| ratios[i.min(old_layers - 1)].clone()).collect();
+            let experts = args["n_routed_experts"].as_u64().unwrap() as usize;
+            std::fs::write(&inference_path, serde_json::to_vec(&args)?)?;
+            experts
+        } else {
+            text["num_hidden_layers"] = layers.into();
+            for key in ["layer_types", "mlp_layer_types", "hybrid_layer_pattern", "moe_layer_freq", "indexer_types"] {
+                if let Some(original) = text.get(key).and_then(|v| v.as_array()).cloned() {
+                    text[key] = (0..layers).map(|i| original[i.min(old_layers - 1)].clone()).collect();
+                }
+            }
+            text["n_routed_experts"].as_u64().unwrap() as usize
+        };
+        let mut index: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("model.safetensors.index.json"))?)?;
+        let shard = index["weight_map"].as_object().unwrap().values().next().unwrap().as_str().unwrap().to_owned();
+        use std::io::Read;
+        let mut file = std::fs::File::open(snapshot.join(&shard))?;
+        let mut length = [0u8; 8]; file.read_exact(&mut length)?;
+        let mut bytes = vec![0; u64::from_le_bytes(length) as usize]; file.read_exact(&mut bytes)?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes)?;
+        let mut globals = Vec::new();
+        let mut templates = std::collections::BTreeMap::<usize, Vec<testing::Tensor>>::new();
+        for (name, tensor) in header.as_object().unwrap() {
+            if name == "__metadata__" { continue; }
+            let dtype = match tensor["dtype"].as_str().unwrap() {
+                "BF16" => "BF16", "F16" => "F16", "F32" => "F32", "I32" => "I32", "F8_E4M3" => "F8_E4M3",
+                "F8_E8M0" => "F8_E8M0", "I8" => "I8", "U8" => "U8", "I16" => "I16", "I64" => "I64",
+                other => anyhow::bail!("unhandled fixture dtype {other}"),
+            };
+            let shape = tensor["shape"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect::<Vec<_>>();
+            let item = testing::t(name, dtype, &shape);
+            if let Some((_, tail)) = name.split_once("layers.") {
+                let layer = tail.split('.').next().unwrap().parse::<usize>()?;
+                templates.entry(layer).or_default().push(item);
+            } else { globals.push(item); }
+        }
+        let mut map = serde_json::Map::new();
+        for layer in 0..layers {
+            let template = layer.min(old_layers - 1);
+            let mut tensors = if layer == 0 { globals.clone() } else { Vec::new() };
+            let complete_experts = templates[&template].iter().any(|(name, ..)| name.contains(".experts.1."));
+            for (name, dtype, shape) in &templates[&template] {
+                let name = name.replacen(&format!("layers.{template}."), &format!("layers.{layer}."), 1);
+                if name.contains(".experts.0.") && !complete_experts {
+                    for expert in 0..experts { tensors.push(testing::t(name.replace(".experts.0.", &format!(".experts.{expert}.")), dtype, shape)); }
+                } else { tensors.push(testing::t(name, dtype, shape)); }
+            }
+            let filename = format!("eight-rank-{layer:03}.safetensors");
+            testing::write_safetensors(&snapshot.join(&filename), &tensors);
+            for (name, ..) in tensors { map.insert(name, filename.clone().into()); }
+        }
+        std::fs::write(snapshot.join("config.json"), serde_json::to_vec(&config)?)?;
+        index["weight_map"] = map.into();
+        std::fs::write(snapshot.join("model.safetensors.index.json"), serde_json::to_vec(&index)?)?;
+        std::fs::remove_file(snapshot.join(shard))?;
+        Ok(())
+    }
+
+    #[test]
+    fn native_worlds_share_serve_transport_and_launch_qualification() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for (family, write) in [
+            ("v41", testing::write_v41_snapshot as fn(&std::path::Path)),
+            ("dsv4f", testing::write_v4_snapshot),
+            ("dsv4p", testing::write_v4_pro_mxfp4_snapshot),
+        ] {
+            let root = tempfile::tempdir()?;
+            write(root.path());
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            let supported = cuteafd_core::tp_units::spark_package_worlds(family, "mxfp4");
+            for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+                let canonical = require_world(SparkWorld::canonical(ranks)?, &catalog);
+                assert_eq!(canonical.is_ok(), supported.contains(&ranks), "{family} TP{ranks}: {canonical:?}");
+                if supported.contains(&ranks) {
+                    require_world(SparkWorld::owned(SparkTopology::new(ranks as u8, 1)?)?, &catalog)?;
+                }
+                launch_check(ranks, supported.contains(&ranks), true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_check(ranks: usize, supported: bool, owned: bool) -> Result<()> {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let output = std::process::Command::new("bash")
+            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; SPARK_COUNT=$2; SPARK_TP=$3; SPARK_EP=$4; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; release_validate_spark_topology", "launch-test"])
+            .arg(source).arg(ranks.to_string())
+            .arg(if owned { ranks.to_string() } else { String::new() })
+            .arg(if owned { "1" } else { "" }).output()?;
+        // Launch checks only wire qualification; checkpoint recipes are checked
+        // by serve, so another native family's valid width may pass the shell.
+        let expected = if owned { cuteafd_core::tp_units::spark_ownership_topology(ranks, 1) } else { true };
+        assert_eq!(output.status.success(), expected, "TP{ranks} supported={supported}: {}", String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_worlds_share_serve_and_launch_qualification() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for family in ["mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "dsv4p", "kimik3"] {
+            let root = tempfile::tempdir()?;
+            let (format, intermediate) = match family {
+                "mimo" => { testing::write_snapshot(root.path(), &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None); ("fp8", 2048) }
+                "mimof" => { testing::write_snapshot(root.path(), &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), None); ("fp8", 2048) }
+                "mimop" => { testing::write_snapshot(root.path(), &testing::mimo_pro_config(), &testing::mimo_pro_tensors(), None); ("fp8", 2048) }
+                "glm" => { testing::write_snapshot(root.path(), &testing::glm5_config(), &testing::glm5_tensors(|name, n, k| testing::fp8(name, n, k, None)), None); ("fp8", 2048) }
+                "glmf" => { let cfg = testing::glm5_flash_config(3); testing::write_snapshot(root.path(), &cfg, &testing::glm5_flash_tensors(&cfg), None); ("fp8", 2048) }
+                "qwen4" => { let (tensors, _) = testing::qwen4_exl3(3, 4); testing::write_snapshot(root.path(), &testing::qwen4_config(3), &tensors, None); ("exl3-k4", 640) }
+                "dsv4p" => { testing::write_v4_pro_exl3_snapshot(root.path()); ("exl3-k23", 3072) }
+                "kimik3" => { testing::write_kimi_snapshot(root.path(), true); ("exl3-k23", 3072) }
+                _ => unreachable!(),
+            };
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+                let expected = cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"), intermediate, ranks).is_ok();
+                let served = require_world(SparkWorld::canonical(ranks)?, &catalog);
+                assert_eq!(served.is_ok(), expected, "{family} TP{ranks}: {served:?}");
+                launch_check(ranks, expected, false)?;
+            }
         }
         Ok(())
     }
@@ -170,7 +501,7 @@ mod tests {
         for exl3 in [false, true] {
             let root = tempfile::tempdir()?;
             if exl3 {
-                cuteafd_loader::plan::testing::write_v41_exl3_snapshot(root.path(), 3);
+                cuteafd_loader::plan::testing::write_v4_pro_exl3_snapshot(root.path());
             } else {
                 cuteafd_loader::plan::testing::write_v41_nvfp4_snapshot(root.path());
             }
@@ -179,7 +510,6 @@ mod tests {
                 .unwrap_err().to_string();
             assert!(error.contains("ownership wire 2x1"), "{error}");
             assert!(error.contains("NVFP4 on TP3EP1, TP4EP1, TP6EP1"), "{error}");
-            assert!(error.contains("compact V4.1 EXL3 on TP3EP1"), "{error}");
         }
         Ok(())
     }
@@ -219,21 +549,11 @@ mod tests {
         let error = world(Some(SparkTopology::NATIVE_TP3_EP1), 4).unwrap_err().to_string();
         assert!(error.contains("topology 3x1"), "{error}");
         assert!(error.contains("needs 3 physical ranks but 4 were given"), "{error}");
-        for count in [0, 7, 8] { assert!(world(None, count).is_err()); }
-    }
-
-    #[test]
-    fn compact_exl3_tp3_is_always_the_same_ep1_topology() {
-        let tp3 = Some(SparkTopology::NATIVE_TP3_EP1);
-        assert_eq!(for_checkpoint(None, 3, true), tp3);
-        assert_eq!(for_checkpoint(tp3, 3, true), tp3);
-        assert_eq!(for_checkpoint(None, 3, false), None);
-        for world in [0, 1, 2, 4, 6] {
-            assert_eq!(for_checkpoint(None, world, true), None);
-        }
-        for rank in 0..3 {
-            assert_eq!(tp3.unwrap().executor_id(rank).unwrap(), 7 + rank as u64);
-            assert_eq!(tp3.unwrap().group(rank).unwrap(), 0);
+        for count in [0, cuteafd_core::MAX_SPARK_WORLD + 1] { assert!(world(None, count).is_err()); }
+        for count in [7, 8] {
+            let resolved = world(None, count).unwrap();
+            assert_eq!(resolved.topology().world_size(), count);
+            assert!(!resolved.supports_device_exchange());
         }
     }
 
@@ -245,7 +565,7 @@ mod tests {
 
     #[test]
     fn approved_layouts_require_their_exact_rank_count() {
-        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (2, 2), (3, 2), (2, 3)] {
+        for (tp, ep) in [(1u8, 1u8), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1), (7, 1), (8, 1), (2, 2), (3, 2), (2, 3)] {
             let expected = topology(tp, ep);
             let resolved = resolve(Some(tp), Some(ep), expected.world_size(), "serve-native")
                 .unwrap()
@@ -258,7 +578,7 @@ mod tests {
 
     #[test]
     fn unapproved_layouts_and_ranges_are_rejected() {
-        for (tp, ep) in [(7u8, 1u8), (8, 1), (9, 1), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
+        for (tp, ep) in [(9u8, 1u8), (2, 4), (4, 2), (3, 3), (0, 1), (6, 2), (6, 3)] {
             let world = tp as usize * ep as usize;
             assert!(resolve(Some(tp), Some(ep), world, "serve-native").is_err(), "{tp}x{ep}");
         }

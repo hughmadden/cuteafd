@@ -31,10 +31,11 @@
 #include <cuda_runtime.h>
 #include <stdint.h>
 
+#include "gemv_tiles.cuh"
+
 namespace {
 
-constexpr int kWarps = 4;
-constexpr int kMaxRows = 64;
+using namespace cuteafd::gemv_tiles;
 
 // Smallest power of two >= x (x > 0). Keep libdevice's edge behavior for
 // subnormals and the top exponent, without its calls on ordinary norm rows.
@@ -199,14 +200,6 @@ __device__ __forceinline__ void mma(float (&d)[4], const uint32_t (&a)[4], uint3
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
-__device__ __forceinline__ uint4 load_stream(const uint4* p) {
-  uint4 v;
-  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-               : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-               : "l"(p));
-  return v;
-}
-
 // One warp per (16-row tile, K split). GROUPS 8-row activation groups.
 template <int GROUPS>
 __global__ void __launch_bounds__(kWarps * 32) gemv_kernel(
@@ -305,27 +298,6 @@ __global__ void reduce_kernel(const float* __restrict__ partial, const float* __
     }
   }
 }
-
-int sm_count() {
-  static int count = 0;
-  if (count == 0) {
-    int device = 0;
-    cudaGetDevice(&device);
-    cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device);
-    if (count <= 0) count = 128;
-  }
-  return count;
-}
-
-void split_plan(int n, int k, int* kb_per_split, int* splits) {
-  const int tiles = n / 16, kbs = k / 128;
-  const int wanted = (sm_count() * 16 + tiles - 1) / tiles;
-  int s = wanted < 1 ? 1 : (wanted > kbs ? kbs : wanted);
-  *kb_per_split = (kbs + s - 1) / s;
-  *splits = (kbs + *kb_per_split - 1) / *kb_per_split;
-}
-
-size_t align256(size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 // --- cuteafd_fp8_linear's wide and W8A8 passes ------------------------------
 

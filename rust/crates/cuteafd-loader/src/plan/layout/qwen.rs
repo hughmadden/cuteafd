@@ -12,11 +12,18 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// Qwen plan adapter: a dual 0-Spark layout runs whole-layer TP2 owners
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
-    input: &super::super::PlanInput, options: &LayoutOptions) -> MemoryLayout {
-    let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
-    if options.rtx_bytes.len() == 2 && options.head_split && report.placement == ExpertPlacement::Local {
+    input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    let local = report.placement == ExpertPlacement::Local;
+    let prefill = match resolve_prefill(input, report, options, report.spark_ranks,
+        crate::families::qwen4::prefill_limits(local)) {
+        Ok(shape) => shape,
+        Err(error) => return unsupported_prefill(report, error),
+    };
+    let shape = Shape::resolve(input, report, model, options, ShapePolicy::manifest_bounded());
+    report.prefill_span_rows = Some(prefill.span_rows);
+    if options.rtx_bytes.len() == 2 && options.head_split && local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
-            shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());
+            shape.context_tokens, shape.native_layers > 0, shape.manifest.as_deref());
     }
     single_layout(report, model, input, options, shape)
 }
@@ -42,7 +49,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let gpus = options.rtx_bytes.len().clamp(1, 2);
     let mut devices: Vec<DeviceLayout> = options.rtx_bytes.iter().take(gpus).enumerate()
         .map(|(index, &bytes)| DeviceLayout { kind: DeviceKind::Rtx, index: index as u32,
-            capacity_bytes: bytes.saturating_sub(options.headroom_bytes.max(3 * GIB)), items: Vec::new(), kv_tokens: 0 })
+            capacity_bytes: bytes.saturating_sub(options.headroom_bytes.max(3 * GIB)), worker_budget_bytes: 0, items: Vec::new(), kv_tokens: 0 })
         .collect();
     let mut waste = Vec::new();
     let mut notes = vec![format!("resolved context {} tokens (checkpoint {})", shape.context_tokens, shape.checkpoint_context),
@@ -53,7 +60,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let exl3 = report.experts.as_ref().is_some_and(|e| e.package.contains("exl3"));
     let package = report.experts.as_ref().map(|e| e.package.as_str());
     let reference = gpus == 1 && (94 * GIB..=96 * GIB).contains(&options.rtx_bytes[0])
-        && mtp && options.local_expert_layers.is_none() && local && package == Some("qwen4:exl3-k45")
+        && mtp && options.onboard.is_none_or(|mode| mode == crate::placement::OnboardSetting::Auto) && local && package == Some("qwen4:exl3-k45")
         && model.spec().hidden == 2560 && model.spec().layers.len() == 48
         && shape.prefill_rows == 4096 && shape.concurrency == 8 && matches!(options.prefix_slots, None | Some(18))
         && matches!(shape.context_tokens, 0 | 32768);
@@ -132,8 +139,8 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     if options.drafter_bytes > 0 {
         devices[0].items.push(Item::new(Category::Drafter, "drafter", "", options.drafter_bytes, basis));
     }
-    devices[0].items.push(runtime_item(shape.manifest.as_ref(), &program_families("qwen4", false),
-        local_package(report), false, 0, options.rtx_bytes[0]));
+    devices[0].items.push(runtime_item(shape.manifest.as_deref(), &program_families("qwen4", false),
+        local_package(report), false, 0, options.coordinator_arch, options.rtx_bytes[0]));
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
@@ -141,7 +148,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     let charges = SparkCharges { host_bytes: Some(SPARK_HOST_BYTES),
         wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
-    let mut sparks = spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut waste, &mut notes);
+    let mut sparks = spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes);
     if report.encoder.is_none() {
         let target = options.pool_tokens.filter(|&tokens| tokens != 0)
             .unwrap_or(options.target_pool_tokens.max(shape.context_tokens));
@@ -152,7 +159,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         resolve_encoder(report, &qwen_towers(report), &mut devices, &mut sparks, &[per_token * target], options, &mut notes);
     }
     let mut pool_tokens = 0;
-    match placement(input, report, options, &mut devices[0], shape.manifest.as_ref(),
+    match placement(input, report, options, &mut devices[0], shape.manifest.as_deref(),
         PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp }) {
         Ok(tokens) => pool_tokens = tokens,
         Err(error) => {
@@ -164,7 +171,7 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
     }
-    charge_spark_devices(report, model, checkpoint, options, charges, &working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, input, options, charges, &working, endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
@@ -191,8 +198,16 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
-        options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
-    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", shape.prefill_rows,
+        options.prefix_entries("qwen4"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
+    let prefill_shape = if options.prefill_waves > 1 {
+        anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+            "Qwen prefill waves require single-owner Spark experts");
+        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 4096 };
+        let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
+        Some(units)
+    } else { None };
+    let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
+    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", span,
         cfg.vocab_size as u64) } else { 0 };
     // The PLE n-gram table is mapped (each step's rows uploaded): row width ple_dim / ple_rows, one byte
     // per value in E4M3, two in BF16 (`ple::PleTable::load`).
@@ -204,18 +219,19 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
-            prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+    let inputs = crate::placement::families::qwen4::QwenInputs { spark_reply_format: options.resolved_spark_reply_format(false), automatic_context: options.context_tokens == 0,
+        admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
+            prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
         pending_code_bytes: 0, max_context: shape.context_tokens,
         requested_pool: options.pool_tokens.filter(|&n| n > 0),
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
-        startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
+        startup_graph_modes: Some((shape.concurrency as usize, true)),
     };
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
+    report.prefill_span_rows = Some(span);
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
     let pool_tokens = placement.pool_tokens;
@@ -265,12 +281,12 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &LayoutOptions, rows: u64, concurrency: u64,
     context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> MemoryLayout {
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &capacity)| {
-        let arch = crate::placement::ArchContext::for_device("sm_120", capacity);
+        let arch = crate::placement::ArchContext::for_device(options.coordinator_arch, capacity);
         let programs = manifest.map(|m| crate::placement::ProgramSet::from_manifest(m, &["qwen4"]))
             .unwrap_or_else(|| crate::placement::ProgramSet::from_names(&["qwen4"], []));
         let allowance = crate::placement::inventory::loaded_code_allowance("qwen4", local_package(report),
             true, rank as u8, arch, Some(&programs));
-        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity,
+        DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: capacity, worker_budget_bytes: 0,
             items: vec![Item::new(Category::Runtime, "context+modules", "SM120",
                 arch.context_bytes + allowance.bytes, allowance.basis)], kv_tokens: 0 }
     }).collect::<Vec<_>>();
@@ -320,7 +336,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(64,
         mtp.then_some(options.native_mtp_layers), options.qwen_attention_plan_rows)?;
     let sms = [0, 1].map(|rank| options.physical_sms.unwrap_or_else(||
-        crate::placement::ArchContext::for_device("sm_120", options.rtx_bytes[rank]).sms));
+        crate::placement::ArchContext::for_device(options.coordinator_arch, options.rtx_bytes[rank]).sms));
     let selected_manifests = manifest.map(|m| qwen4::dual_program_manifests(m, sms, plan)).transpose()?;
     let owner_manifests = [0, 1].map(|rank| selected_manifests.as_ref().map(|m| &m[rank]));
     let manifest = owner_manifests[0];
@@ -341,14 +357,14 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(concurrency,
-        options.mimo_prefix_entries, geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+        options.prefix_entries("qwen4"), geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
     let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
-            manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
+        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
+            manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },
             ple, future_expert_bytes: 0, headroom },
@@ -357,7 +373,8 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         layer_weights: &resident.layer_bytes, layer_experts: &costs, layer_extra: &extra, fixed,
         tp2_workspace: workspace, pending_code_bytes: [0; 2], mark_slots: marks, max_context: context,
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
-        onboard: options.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: Some((concurrency.min(16) as usize, true)),
+        onboard: options.resolve_onboard(catalog.routed_experts().routed_layers()).unwrap_or(Onboard::Auto),
+        startup_graph_modes: Some((concurrency as usize, true)),
     };
     let placement = qwen4::dual_placement(&inputs).context("solving Qwen owner ranges")?;
     for (rank, device) in devices.iter_mut().enumerate() {

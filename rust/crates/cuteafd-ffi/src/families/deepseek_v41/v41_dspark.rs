@@ -121,7 +121,7 @@ impl NativeLibrary {
             self.lib.get::<MarkovLaunch>(b"cuteafd_vocabulary_head_launch_tensor_invariant")
         }.ok().map(|f| *f);
         Ok(V41VocabularyProjection { _library: self, handle, launch, launch_tensor_op, launch_tensor_invariant, destroy,
-            width: 5120, max_rows: 128, vocab_rows })
+            width: 5120, max_rows: cuteafd_core::V41_VOCAB_ROWS, vocab_rows })
     }
     /// Merge local greedy candidates after the peer candidates arrive.
     ///
@@ -134,7 +134,7 @@ impl NativeLibrary {
         output: (CuteafdDeviceBuffer, CuteafdDeviceBuffer), rows: usize,
         split: usize, stream: *mut c_void,
     ) -> Result<()> {
-        ensure!((1..=128).contains(&rows) && (1..129280).contains(&split),
+        ensure!((1..=cuteafd_core::V41_VOCAB_ROWS).contains(&rows) && (1..129280).contains(&split),
             "invalid vocabulary greedy merge shape");
         for buffer in [candidates[0].0, candidates[0].1, candidates[1].0,
             candidates[1].1, output.0, output.1] {
@@ -192,7 +192,7 @@ impl NativeLibrary {
             launch_tensor_invariant,
             destroy,
             width: if full { 5120 } else { 256 },
-            max_rows: if full { 128 } else { 16 },
+            max_rows: if full { cuteafd_core::V41_VOCAB_ROWS } else { cuteafd_core::V41_MAX_LANE_MEMBERS },
             vocab_rows: 129280,
         })
     }
@@ -334,7 +334,7 @@ impl V41DraftStep<'_> {
         position: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!((1..=16).contains(&rows), "invalid draft sampling rows");
+        ensure!((1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&rows), "invalid draft sampling rows");
         ensure!(position < 7, "invalid draft position");
         for (buffer, bytes) in [
             (shared, rows * 129280 * 4),

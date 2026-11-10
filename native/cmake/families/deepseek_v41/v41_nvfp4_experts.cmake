@@ -16,7 +16,7 @@ elseif(CUTEAFD_CUDA_ARCHITECTURES STREQUAL "121")
 else()
   message(FATAL_ERROR "NVFP4 expert AOT requires a single native SM120 or SM121 target")
 endif()
-set(CUTEAFD_V41_NVFP4_CAPACITIES "1;16;80;256;1024;4096" CACHE STRING "NVFP4 expert capacities to package")
+set(CUTEAFD_V41_NVFP4_CAPACITIES "${CUTEAFD_V41_TARGET_ROWS}")
 # Keep the conservative tile-16 default until the tile ladder is GPU qualified.
 set(CUTEAFD_V41_NVFP4_TILE_M "16" CACHE STRING "NVFP4 expert tile M (auto opts into the planner ladder; GPU qualification required)")
 set_property(CACHE CUTEAFD_V41_NVFP4_TILE_M PROPERTY STRINGS auto 16 32 64 128)
@@ -58,7 +58,8 @@ foreach(role IN LISTS CUTEAFD_V41_NVFP4_ROLES)
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${nvfp4_dir}/v41_expert_variants.h"
       "${nvfp4_dir}/v41_nvfp4_${role}_variants.h"
-    DEPENDS
+    DEPENDS "${CUTEAFD_V41_CAPACITY_SOURCE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/v41_capacities.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_v41_nvfp4_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

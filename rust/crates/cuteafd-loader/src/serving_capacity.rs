@@ -3,7 +3,9 @@
 //! lane workspaces, graphs, transport or external drafter reservations.
 use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
 use crate::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-use crate::families::mimo_v2::{MimoAttention, MimoKvCache, MimoV2Config};
+use crate::families::mimo_v2::{MimoAttention, MimoKvFormats, MimoV2Config};
+#[cfg(test)]
+use crate::families::mimo_v2::MimoKvCache;
 use crate::families::qwen4::{Qwen4Attention, Qwen4Config, Qwen4KvCache};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,21 +13,25 @@ use thiserror::Error;
 
 mod deepseek;
 pub mod step5;
+mod spark_intake;
+pub mod prefill_waves;
+pub use spark_intake::{prefill_return_bytes, prefill_return_bytes_with_format, spark_intake_bytes, PrefillShape};
 mod exl3_workspace;
-pub use exl3_workspace::exl3_workspace_bytes;
+pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
+pub use exl3_workspace::{exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_spark_intake_bytes, glmf_step_scratch,
+    glmf_step_scratch, glmf_core_step_scratch, GlmfCoreScratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
-    GLMF_DEFAULT_PREFILL_LANES, GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
+    GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};
 pub mod qwen_graphs;
 mod v4_placement;
 pub use v4_placement::{deepseek_v4_expert_cost, deepseek_v4_native_workspace, deepseek_v4_tp2_expert_cost, deepseek_v4_tp2_native_workspace, deepseek_v4_tp2_workspace, V4ExpertCost};
 mod v4_workspace;
-pub use v4_workspace::{compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
+pub use v4_workspace::{V4_PACKED_MEMBERS, V4_PACKED_TABLE_EXTRA_ROWS, deepseek_v4_tap_rows, compiled_c128_width, deepseek_v4_expert_exchange_bytes, deepseek_v4_headroom_bytes, deepseek_v4_peer_exchange_bytes, deepseek_v4_tp2_payload_bytes, deepseek_v4_workspace_geometry, deepseek_v4_workspace_scratch, V4WorkspaceRank, V4WorkspaceScratch};
 pub use deepseek::{deepseek_v41_cache_bytes, deepseek_v41_cache_geometry, deepseek_v41_pool_groups,
     deepseek_v4_cache_geometry, deepseek_v4_layer_unit_bytes};
 
@@ -85,10 +91,15 @@ pub const GLMF_POOL_MARK_RESERVED_UNITS: u64 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CacheOptions {
+    /// Selected physical attention layout where a family supports multiple owners.
+    pub attention_placement: Option<crate::placement::AttentionPlacement>,
     pub coordinator_ranks: usize,
     pub native_mtp_layers: usize,
-    pub mimo_kv: MimoKvCache,
+    pub mimo_kv: MimoKvFormats,
+    pub dense_qwen_kv: crate::families::qwen4::Qwen4KvCache,
     pub qwen_kv: Qwen4KvCache,
+    pub step5_kv: Qwen4KvCache,
+    pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// DeepSeek V4's window ring holds one prefill chunk plus its window.
     pub prefill_rows: u64,
     /// GLM 5.3 Flash's DSA index cache.
@@ -103,10 +114,14 @@ pub struct CacheOptions {
 impl Default for CacheOptions {
     fn default() -> Self {
         Self {
+            attention_placement: None,
             coordinator_ranks: 1,
             native_mtp_layers: 0,
-            mimo_kv: MimoKvCache::Int8,
+            mimo_kv: MimoKvFormats::default(),
+            dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Fp8,
             qwen_kv: Qwen4KvCache::default(),
+            step5_kv: Qwen4KvCache::Bf16,
+            mla_kv: Default::default(),
             prefill_rows: 4096,
             glmf_index: GlmfIndexCache::Keys,
             kda_state_bytes: 4,
@@ -160,11 +175,11 @@ pub fn cache_requirements(
         checkpoint_max_context_tokens: checkpoint_max,
         compiled_index_extent_required: matches!(
             model.spec().family,
-            "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4"
+            "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4" | "mistral_large4"
         ),
         requested_kv_floor_tokens: requested_floor,
-        concurrency: 16,
-        state_slots: 20,
+        concurrency: cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency,
+        state_slots: cuteafd_core::concurrency::state_slots(u64::from(cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency)) as u32,
         target_only_layouts: layouts,
         unavailable_layouts: failures,
     }))
@@ -405,6 +420,40 @@ pub fn glm_cache_geometry(
         } else {
             KvPlacement::Replicated
         },
+        ranks: vec![cost; ranks],
+    })
+}
+
+/// Mistral Large 4: the GLM record layout per latent-cache owner. RoPE owners
+/// hold E4M3 latent + 4 FP32 group scales + BF16 RoPE key (656 B), NoPE owners
+/// the latent part only (528 B); shared-KV readers (39..71 <- 35) hold none.
+/// Every full indexer layer keeps its own 132-byte FP8 index key record.
+pub fn mistral_large4_cache_geometry(
+    cfg: &crate::families::mistral_large4::Ml4Config,
+    ranks: usize,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    use crate::families::mistral_large4::Ml4Indexer;
+    if ![1, 2].contains(&ranks) || cfg.kv_lora_rank != 512 || cfg.qk_rope_head_dim != 64 || cfg.index_head_dim != 128 {
+        return Err(CacheGeometryError::Unsupported {
+            family: "mistral_large4",
+            what: "record/index or coordinator rank geometry",
+        });
+    }
+    let owners = |rope: bool| cfg.kv_owners().filter(|&layer| cfg.rope[layer] == rope).count() as u64;
+    let indexers = cfg.indexers.iter().filter(|&&kind| kind == Ml4Indexer::Full).count() as u64;
+    let record_bytes = sum("Mistral Large 4 records", &[
+        product("Mistral Large 4 RoPE latent records", &[owners(true), 656])?,
+        product("Mistral Large 4 NoPE latent records", &[owners(false), 528])?,
+        product("Mistral Large 4 index records", &[indexers, 132])?,
+    ])?;
+    let cost = RankCacheGeometry {
+        persistent_unit_bytes: product("Mistral Large 4 pages", &[64, record_bytes])?,
+        context_table_bytes_per_token: product("Mistral Large 4 RoPE table", &[cfg.qk_rope_head_dim as u64, 4])?,
+        ..Default::default()
+    };
+    Ok(FamilyCacheGeometry {
+        logical_unit_rows: 64,
+        placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::Replicated },
         ranks: vec![cost; ranks],
     })
 }
@@ -706,9 +755,9 @@ pub fn qwen_cache_geometry(
                 "Qwen full/MTP pools",
                 &[full + u64::from(mtp), 256 * (kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64 + 256) + 64 * 256],
             )?,
-            pool_metadata_unit_bytes: 4,
+            pool_metadata_unit_bytes: 0,
             active_state_per_sequence_bytes: sum("Qwen active state", &[mark, mtp_pending])?,
-            retained_mark_bytes: mark,
+            retained_mark_bytes: sum("Qwen retained MTP hidden row", &[mark, if mtp { hc_width * 2 } else { 0 }])?,
             speculative_replay_bytes: sum(
                 "Qwen replay storage",
                 &[
@@ -727,7 +776,7 @@ pub fn mimo_cache_geometry(
     cfg: &MimoV2Config,
     layers: usize,
     ranks: usize,
-    kv: MimoKvCache,
+    kv: MimoKvFormats,
     mtp_stages: usize,
 ) -> Result<FamilyCacheGeometry, CacheGeometryError> {
     selected("mimo_v2", cfg.layers, layers)?;
@@ -1118,6 +1167,8 @@ mod tests {
         let plain = qwen_cache_geometry(&cfg, 48, false, Qwen4KvCache::Bf16).unwrap();
         let mtp = qwen_cache_geometry(&cfg, 48, true, Qwen4KvCache::Bf16).unwrap();
         assert_eq!(plain.ranks[0].persistent_unit_bytes / 256, 28416);
+        assert_eq!(plain.ranks[0].pool_metadata_unit_bytes, 0);
+        assert_eq!(mtp.ranks[0].pool_metadata_unit_bytes, 0);
         assert_eq!(
             mtp.ranks[0].persistent_unit_bytes - plain.ranks[0].persistent_unit_bytes,
             256 * 2368
@@ -1129,7 +1180,7 @@ mod tests {
         );
         assert_eq!(
             mtp.ranks[0].retained_mark_bytes,
-            plain.ranks[0].retained_mark_bytes
+            plain.ranks[0].retained_mark_bytes + cfg.hc_width() as u64 * 2
         );
     }
 
@@ -1204,59 +1255,98 @@ mod tests {
     #[test]
     fn mimo_pro_records_partition_heads_while_rings_and_marks_keep_the_exact_window() {
         let cfg = full_mimo(mimo_pro_config(), 10, 60);
-        let one = mimo_cache_geometry(&cfg, 70, 1, MimoKvCache::Int8, 0).unwrap();
-        let split = mimo_cache_geometry(&cfg, 70, 2, MimoKvCache::Int8, 0).unwrap();
-        assert_eq!(one.ranks[0].persistent_unit_bytes / 64, 28800);
-        assert_eq!(split.placement, KvPlacement::PartitionedHeads);
-        assert_eq!(
-            split
-                .ranks
-                .iter()
-                .map(|r| r.persistent_unit_bytes)
-                .sum::<u64>(),
-            one.ranks[0].persistent_unit_bytes
-        );
-        assert_eq!(one.ranks[0].active_state_per_sequence_bytes, 75 << 20);
-        assert_eq!(one.ranks[0].retained_mark_bytes, 75 << 19);
-        assert_eq!(
-            mimo_cache_geometry(&cfg, 70, 1, MimoKvCache::Bf16, 0)
-                .unwrap()
-                .ranks[0]
-                .persistent_unit_bytes
-                / 64,
-            51200
-        );
+        for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+            (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            let one = mimo_cache_geometry(&cfg, 70, 1, kv, 0).unwrap();
+            let split = mimo_cache_geometry(&cfg, 70, 2, kv, 0).unwrap();
+            assert_eq!(one.ranks[0].persistent_unit_bytes / 64, 28800);
+            assert_eq!(split.placement, KvPlacement::PartitionedHeads);
+            assert_eq!(
+                split
+                    .ranks
+                    .iter()
+                    .map(|r| r.persistent_unit_bytes)
+                    .sum::<u64>(),
+                one.ranks[0].persistent_unit_bytes
+            );
+            assert_eq!(one.ranks[0].active_state_per_sequence_bytes, 60 * 256 * record);
+            assert_eq!(one.ranks[0].retained_mark_bytes, 60 * 128 * record);
+            assert_eq!(
+                mimo_cache_geometry(&cfg, 70, 1, MimoKvFormats { full: MimoKvCache::Bf16, sliding: MimoKvCache::Bf16 }, 0)
+                    .unwrap()
+                    .ranks[0]
+                    .persistent_unit_bytes
+                    / 64,
+                51200
+            );
+        }
     }
 
     #[test]
     fn mimo_flash_and_native_mtp_keep_lead_rank_only_history_costs() {
         let cfg = full_mimo(mimo_flash_config(), 9, 39);
-        let plain = mimo_cache_geometry(&cfg, 48, 2, MimoKvCache::Int8, 0).unwrap();
-        let mtp = mimo_cache_geometry(&cfg, 48, 2, MimoKvCache::Int8, 3).unwrap();
-        assert_eq!(
-            plain
-                .ranks
-                .iter()
-                .map(|r| r.persistent_unit_bytes)
-                .sum::<u64>()
-                / 64,
-            12960
-        );
-        assert!(
-            mtp.ranks[0].active_state_per_sequence_bytes
-                > plain.ranks[0].active_state_per_sequence_bytes
-        );
-        assert_eq!(mtp.ranks[1], plain.ranks[1]);
-        assert_eq!(
-            mtp.ranks[0].retained_mark_bytes - plain.ranks[0].retained_mark_bytes,
-            (128 + 3 + 1) * cfg.hidden as u64 * 2
-        );
-        assert_eq!(
-            mtp.ranks[0].active_state_per_sequence_bytes
-                - plain.ranks[0].active_state_per_sequence_bytes,
-            6_029_312
-        );
-        assert_eq!(mtp.ranks[0].fixed_state_bytes, (3 << 20) + 1280);
+        for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+            (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+            let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+            let plain = mimo_cache_geometry(&cfg, 48, 2, kv, 0).unwrap();
+            let mtp = mimo_cache_geometry(&cfg, 48, 2, kv, 3).unwrap();
+            assert_eq!(
+                plain
+                    .ranks
+                    .iter()
+                    .map(|r| r.persistent_unit_bytes)
+                    .sum::<u64>()
+                    / 64,
+                12960
+            );
+            assert!(
+                mtp.ranks[0].active_state_per_sequence_bytes
+                    > plain.ranks[0].active_state_per_sequence_bytes
+            );
+            assert_eq!(mtp.ranks[1], plain.ranks[1]);
+            assert_eq!(
+                mtp.ranks[0].retained_mark_bytes - plain.ranks[0].retained_mark_bytes,
+                (128 + 3 + 1) * cfg.hidden as u64 * 2
+            );
+            assert_eq!(
+                mtp.ranks[0].active_state_per_sequence_bytes
+                    - plain.ranks[0].active_state_per_sequence_bytes,
+                3 * 256 * record + 256 * cfg.hidden as u64 * 2
+            );
+            assert_eq!(mtp.ranks[0].fixed_state_bytes, (3 << 20) + 1280);
+        }
+    }
+
+    #[test]
+    fn mimo_compact_swa_and_mtp_keep_hidden_history_bf16() {
+        for config in [mimo_flash_config(), mimo_pro_config()] {
+            let cfg = full_mimo(config, 2, 3);
+            let mut identities = std::collections::BTreeSet::new();
+            for (sliding, record) in [(MimoKvCache::Bf16, 5120u64),
+                (MimoKvCache::Int8, 2880), (MimoKvCache::Fp8, 2720)] {
+                let kv = MimoKvFormats { full: MimoKvCache::Int8, sliding };
+                assert!(identities.insert(kv.record_format()));
+                for ranks in [1, 2] {
+                    let target = mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
+                    let mtp = mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 3).unwrap();
+                    let rank_record = record / ranks as u64;
+                    for rank in 0..ranks {
+                        let a = target.ranks[rank];
+                        assert_eq!(a.persistent_unit_bytes, 2 * 64 * cfg.full_kv_heads as u64 * 360 / ranks as u64);
+                        assert_eq!(a.active_state_per_sequence_bytes, 3 * 256 * rank_record);
+                        assert_eq!(a.retained_mark_bytes, 3 * 128 * rank_record);
+                        if rank == 0 {
+                            assert_eq!(mtp.ranks[rank].active_state_per_sequence_bytes - a.active_state_per_sequence_bytes,
+                                3 * 256 * record + 256 * cfg.hidden as u64 * 2);
+                            assert_eq!(mtp.ranks[rank].retained_mark_bytes - a.retained_mark_bytes,
+                                (128 + 3 + 1) * cfg.hidden as u64 * 2);
+                            assert_eq!(mtp.ranks[rank].fixed_state_bytes, 12 * 64 * cfg.hidden as u64 + 1280);
+                        } else { assert_eq!(mtp.ranks[rank], a); }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1288,7 +1378,7 @@ mod tests {
         assert_eq!(requirements.requested_kv_floor_tokens, Some(2 << 20));
         assert_eq!(
             (requirements.concurrency, requirements.state_slots),
-            (16, 20)
+            (16, 16)
         );
         assert!(!requirements.compiled_index_extent_required);
         assert_eq!(requirements.target_only_layouts.len(), 2);

@@ -24,6 +24,11 @@ extern "C" {
 // [10 .. 10+n) capacities.
 int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
 int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
+// Static arithmetic interval for the launch-selected capacity/form (including
+// auto fallback). rows must be positive. IDs: 0 unknown, 1 decode, 2 prefill,
+// 3 stream. end_rows is inclusive. Unknown forbids exact multi-member packing.
+int32_t cuteafd_fp8moe_arithmetic_route(uint32_t capacity, uint32_t form, uint32_t rows,
+                                      uint32_t* route_id, uint32_t* end_rows);
 // Static installed traffic contract for capacity/form (same fallback as launch).
 // rows=0 queries the final segment. contract=1: exact_grouping; contract=2:
 // conservative_route_upper_bound (group_rows=1, one slice per routed occurrence).
@@ -39,6 +44,14 @@ int32_t cuteafd_fp8moe_create(void** context);
 // require BF16 input. Validate the static contract before device allocation.
 int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers, int32_t rows,
                               void* stream);
+// Separate segmented stream ABI. maximum=0 means unsupported. minimum is the
+// smallest constituent unit preserving the selected form's existing arithmetic.
+int32_t cuteafd_fp8moe_segment_info(uint32_t form, uint32_t* maximum, uint32_t* minimum,
+                                   uint32_t* act_row_bytes);
+int32_t cuteafd_fp8moe_segment_scratch_bytes(uint32_t rows, uint64_t* bytes);
+// Same operands, except x/out are uint64 row-address tables. Populate them on
+// stream before launch and retain all addressed rows until completion.
+int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* pointers, int32_t rows, void* stream);
 void cuteafd_fp8moe_destroy(void* context);
 // options: the large-row form of FP8 programs. 0 the package default (wire rows
 // W8A8: block-scaled E4M3 x E4M3 gate/up; BF16 rows W8A16, exact), 1 W8A16 (the

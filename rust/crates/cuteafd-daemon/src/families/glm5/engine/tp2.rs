@@ -18,9 +18,9 @@ impl<'a> GlmEngine<'a> {
         ensure!(
             self.tp2.is_none()
                 && self.decode_workspace.borrow().is_none()
-                && self.lane_workspaces.borrow().is_empty()
+                && self.prefill_slots.borrow().is_empty()
                 && peer.decode_workspace.borrow().is_none()
-                && peer.lane_workspaces.borrow().is_empty(),
+                && peer.prefill_slots.borrow().is_empty(),
             "install TP2 before graph/workspace allocation"
         );
         let devices = [
@@ -44,6 +44,7 @@ impl<'a> GlmEngine<'a> {
             self.cfg.hidden,
             self.cfg.topk,
             self.prefill_rows.max(DECODE_ROWS),
+            DECODE_ROWS,
             self.prefill_lanes,
             self.tp2_exchange,
         )?);
@@ -127,18 +128,11 @@ impl<'a> GlmEngine<'a> {
                 if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
                 Ok(())
             },
-            links: || {
-                let mut failures = Vec::new();
-                for lane in self.lanes.borrow_mut().iter_mut() {
-                    if let Err(error) = lane.terminal_quiesce() { failures.push(format!("{error:#}")); }
-                }
-                ensure!(failures.is_empty(), "GLM lane quiescence: {}", failures.join("; "));
-                Ok(())
-            },
-            copies: || {
-                for lane in self.lanes.borrow().iter() { lane.intake.terminal_drain_copies()?; }
-                Ok(())
-            },
+            // The engine owns no terminal Spark links: prefill waves run on the
+            // caller's prefill link through its transport worker, which drains
+            // its uploads before every call returns.
+            links: || Ok(()),
+            copies: || Ok(()),
             graphs: || {
                 for rank in 0..self.ranks() {
                     self.on(rank, || {
@@ -147,7 +141,6 @@ impl<'a> GlmEngine<'a> {
                         Ok(())
                     })?;
                 }
-                for lane in self.lanes.borrow_mut().iter_mut() { lane.terminal_release()?; }
                 Ok(())
             },
             finish: |drained| {
@@ -167,18 +160,16 @@ impl<'a> GlmEngine<'a> {
         if self.decode_workspace.borrow().is_none() {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
         }
-        while self.lane_workspaces.borrow().len() < self.prefill_lanes {
-            let w = self.workspace(self.prefill_rows, false)?;
-            self.lane_workspaces.borrow_mut().push(w);
-        }
+        self.ensure_prefill_slots()?;
         drop(self.peer_workspaces(true, 1)?);
-        drop(self.peer_workspaces(false, self.prefill_lanes)?);
         for rank in 0..2 {
+            // Slot 0: one unit's rows, the widest a backend sees.
             let owned = if rank == 0 {
-                self.lane_workspaces.borrow()
+                self.prefill_slots.borrow()
             } else {
-                self.peer()?.lane_workspaces.borrow()
+                self.peer()?.prefill_slots.borrow()
             };
+            let owned = &owned[..];
             let decode = if rank == 0 {
                 self.decode_workspace.borrow()
             } else {
@@ -209,16 +200,17 @@ impl<'a> GlmEngine<'a> {
                 } else {
                     "m64"
                 };
-                self.ffn_on(
-                    rank,
-                    w,
-                    layer,
-                    self.cfg.moe_intermediate,
-                    cap,
-                    w.shared.buffer.ptr,
-                    Scalar::I32(w.rows as i32),
-                )?;
-                let input = if pair.partial() == PartialDtype::F32 {
+                if Self::core_split(layer, "down") {
+                    self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap,
+                        w.shared.buffer.ptr, Scalar::I32(w.rows as i32))?;
+                    // SAFETY: prime uses zero x, hence zero SwiGLU/down output.
+                    // Do not queue a peer wait before the other rank is primed.
+                    unsafe { self.library.cuda_zero_bytes_async(w.shared.buffer,
+                        w.rows * self.cfg.hidden * 2, self.stream_of(rank))?; }
+                } else {
+                    self.shared_on(rank, pair.layers[0], w, layer, Scalar::I32(w.rows as i32), cap)?;
+                }
+                let input = if pair.uses_fp8_input() {
                     ExpertInput::Fp8K32(w.wire.buffer.ptr)
                 } else {
                     ExpertInput::Bf16(w.x.buffer.ptr)
@@ -253,26 +245,27 @@ impl<'a> GlmEngine<'a> {
         cap: &str,
     ) -> Result<()> {
         let pair = self.tp2.as_ref().context("TP2 experts")?;
-        self.ffn(
-            w,
-            &self.weights.layers[layer],
-            self.cfg.moe_intermediate,
-            cap,
-            w.shared.buffer.ptr,
-            Scalar::I32(rows as i32),
-        )?;
+        self.shared_on(0, layer, w, &self.weights.layers[layer], Scalar::I32(rows as i32), cap)?;
         self.moe_front_on(1, w1, &self.peer()?.layers[layer], rows)?;
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
-            // SAFETY: rank0's router ids are live on its stream until the next layer;
-            // the shared probe downloads once before the verifier's normal sync.
-            unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream)?; }
-        }
+        self.ring_local_routes(layer, w, rows)?;
         self.tp2_rank(pair, 0, layer, lane, w, rows)?;
         self.tp2_rank(pair, 1, layer, lane, w1, rows)?;
         // Rank1 has no final norm/head, but must consume every publication
         // so the next request cannot observe this step's stale FFN sequence.
         if layer + 1 == self.weights.layers.len() {
             self.exchange()?.wait(1, slot(layer, true, lane))?;
+        }
+        Ok(())
+    }
+
+    /// Rank 0's router ids of local expert `layer` into the draft probe's ring
+    /// (every executor's TP2 layers: without them the round's routes are
+    /// incomplete and the draft policy never observes a round).
+    pub(super) fn ring_local_routes(&self, layer: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.wants_ring(false)) {
+            // SAFETY: rank0's router ids are live on its stream until the next layer;
+            // the shared probe downloads once before the verifier's normal sync.
+            unsafe { probe.ring(self.library, layer, w.route_ids.buffer, rows, self.stream)?; }
         }
         Ok(())
     }
@@ -286,7 +279,7 @@ impl<'a> GlmEngine<'a> {
         w: &Workspace<'_>,
         rows: usize,
     ) -> Result<()> {
-        let input = if pair.partial() == PartialDtype::F32 {
+        let input = if pair.uses_fp8_input() {
             ExpertInput::Fp8K32(w.wire.buffer.ptr)
         } else {
             ExpertInput::Bf16(w.x.buffer.ptr)
@@ -388,6 +381,7 @@ impl<'a> GlmEngine<'a> {
                 &mut placement,
                 &tokens,
                 experts.as_mut().map(|(l, r)| (&mut **l, *r)),
+                1,
             )?;
             self.verify_device(
                 &mut [(&mut placement, 1)],

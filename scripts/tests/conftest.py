@@ -1,7 +1,20 @@
 """Fixtures shared by every script test."""
 from __future__ import annotations
 
+import builtins
+import fcntl
+import os
+import sys
+from pathlib import Path
+
 import pytest
+
+# The real hardware lock directory: flock files next to it (gpu1.lock, build.lock*)
+# and its fair-queue tickets (hwq/) exclude the cluster's jobs. No test may touch
+# them (#1048: a script-test run held the real gpu1.lock while a hardware job
+# waited). Resolved at import, before any test can point HOME elsewhere.
+REAL_LOCK_DIR = Path.home() / ".cache" / "cuteafd"
+LOCK_DIR_ATTRIBUTES = ("LOCK_DIR", "LOCKS_DIR", "LOCK_ROOT")
 
 # Startup files a shell runs before its first command: every non-interactive bash runs
 # $BASH_ENV, an interactive POSIX shell $ENV. NGC-based images export
@@ -10,6 +23,94 @@ import pytest
 # on PATH, so inside such an image every stub call ran the startup code again and called
 # itself, without end. No script test needs a startup file, so none gets one.
 SHELL_STARTUP_VARIABLES = ("BASH_ENV", "ENV")
+
+
+def _is_real_lock_path(path) -> bool:
+    """Whether `path` is a real hardware lock file or fair-queue entry."""
+    try:
+        name = os.fspath(path)
+    except TypeError:
+        return False  # an integer fd or some other object `open` accepts
+    if isinstance(name, bytes):
+        name = os.fsdecode(name)
+    real = os.path.realpath(name)
+    root = str(REAL_LOCK_DIR)
+    queue = os.path.join(root, "hwq")
+    if real == queue or real.startswith(queue + os.sep):
+        return True
+    # gpu1.lock, gpu1.lock.1, build.lock.3, ...
+    return os.path.dirname(real) == root and ".lock" in os.path.basename(real)
+
+
+def _fd_path(fd) -> str | None:
+    """The path an open descriptor refers to, when the OS exposes it."""
+    try:
+        return os.readlink(f"/proc/self/fd/{fd}")
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _refuse(action: str, path) -> None:
+    # pytest.fail raises BaseException, so code under test cannot swallow it.
+    pytest.fail(f"script test {action} the real hardware lock path {os.fsdecode(os.fspath(path))!r}; "
+                f"hardware locks are private to the run (CUTEAFD_LOCK_DIR="
+                f"{os.environ.get('CUTEAFD_LOCK_DIR')!r})")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_lock_dir(tmp_path_factory):
+    """Point every lock user at a private directory for the whole session.
+
+    `CUTEAFD_LOCK_DIR` reaches code that resolves the lock directory at call time
+    (hwlock.lock_dir, build-resource, export-placement) and every subprocess that
+    inherits the environment; modules already imported that cached a lock-dir
+    attribute get it overwritten too. xdist gives each worker its own directory."""
+    lock_dir = tmp_path_factory.mktemp("hardware-locks")
+    patch = pytest.MonkeyPatch()
+    patch.setenv("CUTEAFD_LOCK_DIR", str(lock_dir))
+    for module in list(sys.modules.values()):
+        source = getattr(module, "__file__", None)
+        if not source or not any(hasattr(module, name) for name in LOCK_DIR_ATTRIBUTES):
+            continue
+        try:
+            Path(source).resolve().relative_to(Path(__file__).resolve().parents[1])
+        except (OSError, ValueError):
+            continue  # not a script module
+        for name in LOCK_DIR_ATTRIBUTES:
+            if hasattr(module, name):
+                patch.setattr(module, name, lock_dir)
+    yield lock_dir
+    patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def no_real_hardware_locks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail a test that opens or flocks the real hardware locks anyway.
+
+    The session fixture isolates the paths every script resolves; this catches
+    code that reaches the real directory by another route (a hard-coded HOME, an
+    import that asked for the default before the session fixture ran)."""
+    real_open, real_os_open, real_flock = builtins.open, os.open, fcntl.flock
+
+    def guarded_open(file, *args, **kwargs):
+        if _is_real_lock_path(file):
+            _refuse("opened", file)
+        return real_open(file, *args, **kwargs)
+
+    def guarded_os_open(path, *args, **kwargs):
+        if _is_real_lock_path(path):
+            _refuse("opened", path)
+        return real_os_open(path, *args, **kwargs)
+
+    def guarded_flock(fd, operation):
+        path = _fd_path(fd)
+        if path is not None and _is_real_lock_path(path.removesuffix(" (deleted)")):
+            _refuse("flocked", path)
+        return real_flock(fd, operation)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+    monkeypatch.setattr(fcntl, "flock", guarded_flock)
 
 
 @pytest.fixture(autouse=True)

@@ -1,7 +1,25 @@
 use super::*;
+use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error>>;
+
+#[test]
+fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestResult {
+    for k in 1..=4 {
+        let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
+        assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
+            std::iter::repeat_n(2048 * 16 * 320, 2 * k).chain(std::iter::repeat_n(64 * 16 * 320, 2)).collect::<Vec<_>>());
+        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20));
+        assert_eq!(staging.total_bytes, 2 * (k * 2048 + 64) * 16 * 320 + staging.workspace_bytes);
+        assert_eq!(staging.slot_bytes().sum::<usize>() + staging.workspace_bytes, staging.total_bytes);
+    }
+    for (rows, k, decode, bytes) in [(0, 1, 64, 1), (1, 0, 64, 1), (1, 5, 64, 1),
+        (1, 1, 0, 1), (1, 1, 64, 0), (usize::MAX, 1, 64, 320), (usize::MAX / 2, 4, 64, 1)] {
+        assert!(MappedStaging::new(rows, k, decode, bytes).is_err());
+    }
+    Ok(())
+}
 
 #[test]
 fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
@@ -14,9 +32,8 @@ fn live_reader_loads_only_atomics_without_interval_or_device_locks() {
     let initial = reader.snapshot();
     assert_eq!(initial[0].cumulative, TableStatsSnapshot::default());
     stats.record_gather(2, 8, Duration::from_micros(4), [0; 3]);
-    stats.uring.store(true, Ordering::Relaxed);
     let fresh = reader.snapshot();
-    assert_eq!(fresh[0].backend, "mincore-routed");
+    assert_eq!(fresh[0].backend, stats.backend().to_string());
     assert_eq!(fresh[0].cumulative.gathers, 1);
     assert_eq!(fresh[0].cumulative.rows, 2);
     assert!(fresh[0].interval.is_none());
@@ -37,7 +54,7 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
         context: "injected io_uring_setup seccomp failure".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
-    assert_eq!(table.backend(), TableBackend::Mmap);
+    assert_eq!(table.backend() == TableBackend::MincoreRouted, reactor::ready());
     let mut output = [0; 12];
     table.gather_into(&[7, 2, 7], &mut output)?;
     assert_eq!(output, [7, 7, 7, 7, 2, 2, 2, 2, 7, 7, 7, 7]);
@@ -46,27 +63,20 @@ fn uring_setup_failure_falls_back_without_changing_bytes() -> TestResult {
 }
 
 #[test]
-fn runtime_ring_setup_failure_falls_back_for_demand_and_prefetch() -> TestResult {
+fn runtime_batch_failure_recovers_without_disabling_table() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: this test owns immutable files through all owned reactor reads.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.initialize_reads();
+    if table.backend() != TableBackend::MincoreRouted { return Ok(()); }
     for errno in [libc::ENOMEM, libc::EPERM] {
-        {
-            for prefetch in [false, true] {
-                let (_dir, parts) = parted([3, 3, 2])?;
-                // SAFETY: this test owns immutable shards through all gathers.
-                let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-                for part in &table.parts { part.nowait.store(true, Ordering::Relaxed); }
-                // Startup probe succeeded; the worker's first setup then fails.
-                table.initialize_with_probe(|| Ok(()));
-                uring::fail_next_setup(errno);
-                let mut output = [0; 12];
-                if prefetch { assert_eq!(table.prefetch(&[7, 2, 7], 8)?, 2); }
-                else { table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?; }
-                assert_eq!(table.backend(), TableBackend::Mmap);
-                table.gather_slots(&[7, 2, 7], &[2, 0, 1], &mut output)?;
-                assert_eq!(output, [2, 2, 2, 2, 7, 7, 7, 7, 7, 7, 7, 7]);
-                assert_eq!(table.stats().snapshot().unclassified_batches, 0);
-                assert_eq!(table.stats().snapshot().prefetch_unclassified_batches, 0);
-            }
-        }
+        let read = || uring::Read { part: &table.parts[0], row: 2, slot: 0 };
+        let mut bytes = [0; 4];
+        uring::fail_next_setup(errno);
+        assert!(uring::gather(&[read()], &mut bytes, 4, &[Some(false)]).is_err());
+        uring::gather(&[read()], &mut bytes, 4, &[Some(false)])?;
+        assert_eq!(bytes, [2; 4]);
+        assert_eq!(table.backend(), TableBackend::MincoreRouted);
     }
     Ok(())
 }
@@ -139,19 +149,19 @@ fn unclassified_waves_count_batches_not_rows() -> TestResult {
         return Ok(());
     }
     table.parts[0].nowait.store(false, Ordering::Relaxed);
-    assert_eq!(uring::MAX_BATCH, 4096);
+    assert_eq!(uring::MAX_BATCH, 2048);
     let n = uring::MAX_BATCH + 1;
     let reads: Vec<_> = (0..n).map(|i| uring::Read { part: &table.parts[0], row: (i % 3) as u64, slot: n - i - 1 }).collect();
     // Exercise mixed classified hits and unclassified reads in two waves.
     let resident: Vec<_> = (0..n).map(|i| if i % 2 == 0 { None } else { Some(true) }).collect();
     let mut output = vec![0; n * 4];
     let stats = uring::gather(&reads, &mut output, 4, &resident)?;
-    assert_eq!((stats.unclassified_rows, stats.hits, stats.misses), (2049, 2048, 0));
-    assert_eq!(stats.unclassified_bytes, 2049 * 4);
-    assert_eq!(stats.unclassified_batches, 2);
-    assert_eq!(stats.unclassified_batch_histogram.iter().sum::<u64>(), 2);
+    assert_eq!((stats.unclassified_rows, stats.hits, stats.misses), (1025, 1024, 0));
+    assert_eq!(stats.unclassified_bytes, 1025 * 4);
+    assert_eq!(stats.unclassified_batches, 1);
+    assert_eq!(stats.unclassified_batch_histogram.iter().sum::<u64>(), 1);
     assert!(stats.unclassified_batch_ns >= stats.unclassified_batch_max_ns && stats.unclassified_batch_max_ns > 0);
-    assert_eq!(stats.miss_histogram, [0; 7]);
+    assert_eq!(stats.miss_histogram.iter().sum::<u64>(), n as u64);
     for i in 0..n {
         assert_eq!(&output[(n-i-1)*4..(n-i)*4], &[(i % 3) as u8; 4]);
     }
@@ -161,11 +171,25 @@ fn unclassified_waves_count_batches_not_rows() -> TestResult {
 }
 
 #[test]
+fn every_ring_bounds_its_io_wq_workers() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: this test owns the immutable shards until the probe returns.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.initialize_reads();
+    if table.backend() != TableBackend::MincoreRouted {
+        eprintln!("SKIP io-wq bounds: kernel/seccomp disallows io_uring");
+        return Ok(());
+    }
+    assert!(Arc::ptr_eq(&reactor::global()?, &reactor::global()?));
+    assert_eq!(uring::IOWQ_MAX_WORKERS, 1024);
+    Ok(())
+}
+
+#[test]
 fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shards until both tables are dropped.
     let mmap = unsafe { MappedTable::open(&parts, u8_rows(4))? };
-    mmap.stats.uring.store(false, Ordering::Relaxed);
     // SAFETY: same immutable test files.
     let uring = unsafe { MappedTable::open(&parts, u8_rows(4))? };
     uring.initialize_reads();
@@ -232,7 +256,6 @@ fn hybrid_and_fallback_gather_identical_random_cold_and_warm_rows() -> TestResul
             // SAFETY: the test owns immutable shards until this table is dropped.
             let table = unsafe { MappedTable::open(&parts, u8_rows(width))? };
             table.initialize_reads();
-            if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
             if table.backend() != backend {
                 assert!(std::env::var("CUTEAFD_REQUIRE_URING").as_deref() != Ok("1"),
                     "required backend {backend:?} unavailable");
@@ -297,8 +320,8 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
     for backend in [TableBackend::Mmap, TableBackend::MincoreRouted] {
         // SAFETY: test file is immutable while the table lives.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
-        if backend == TableBackend::Mmap { table.stats.uring.store(false, Ordering::Relaxed); }
         if backend == TableBackend::MincoreRouted && table.backend() != backend {
             eprintln!("SKIP NOWAIT miss execution: unsupported kernel/seccomp/filesystem");
             continue;
@@ -338,6 +361,7 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
     let open = || -> Result<MappedTable> {
         // SAFETY: this test owns the immutable file until all tables drop.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
         table.parts[0].nowait.store(false, Ordering::Relaxed);
         table.stats.nowait.store(false, Ordering::Relaxed);
@@ -394,24 +418,48 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
 }
 
 #[test]
-fn mincore_routing_keeps_nowait_exact_and_falls_back_safely() -> TestResult {
+fn failed_misses_keep_initial_residency_and_copy_hits_only_once() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&vec![0x5a; 8 * page])?;
+    file.as_file().sync_all()?;
+    // SAFETY: test-owned immutable file outlives all owned reads and mappings.
+    let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    table.split_only_for_test();
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    std::hint::black_box(table.row(1)?[0]);
+    assert_eq!(table.residency(&[1, 3, 6], false)?, [true, false, false]);
+    uring::fail_next_setup(libc::EPERM);
+    let mut output = vec![0; 3 * page];
+    table.gather_into(&[1, 3, 6], &mut output)?;
+    assert!(output.iter().all(|&byte| byte == 0x5a));
+    let stats = table.stats().snapshot();
+    assert_eq!((stats.page_hits, stats.page_misses, stats.resident_copy_rows), (1, 2, 1));
+    assert_eq!(stats.miss_ns, 0);
+    Ok(())
+}
+
+#[test]
+fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.split_only_for_test();
     table.initialize_reads();
-    if table.backend() == TableBackend::MincoreRouted && table.stats.nowait.load(Ordering::Relaxed) {
+    if table.backend() == TableBackend::MincoreRouted {
         let mut output = [0; 12];
         table.gather_into(&[7, 2, 7], &mut output)?;
         let stats = table.stats().snapshot();
-        assert_eq!(table.stats.accounting(), "nowait-exact");
-        assert_eq!((stats.page_hits, stats.resident_copy_rows, stats.residency_ns), (3, 0, 0));
-        assert!(stats.nowait_batches > 0);
+        assert_eq!(table.stats.accounting(), "mincore-routed");
+        assert_eq!((stats.page_hits, stats.resident_copy_rows), (3, 3));
+        assert!(stats.residency_ns > 0);
+        assert_eq!(stats.nowait_batches, 0);
     }
     table.initialize_with_probe(|| Err(MappedTableError::Io {
         context: "injected unavailable io_uring".into(),
         source: std::io::Error::from_raw_os_error(libc::EPERM),
     }));
-    assert_eq!(table.backend(), TableBackend::Mmap);
+    assert_eq!(table.backend() == TableBackend::MincoreRouted, reactor::ready());
     let mut output = [0; 12];
     table.gather_into(&[7, 2, 7], &mut output)?;
     assert_eq!(output, [7, 7, 7, 7, 2, 2, 2, 2, 7, 7, 7, 7]);
@@ -601,26 +649,6 @@ fn checkpoint_tensors_validate_dtype_width_payload_and_paths() -> TestResult {
 }
 
 #[test]
-fn prefetcher_bounds_rows_reports_pages_and_detaches() -> TestResult {
-    let (_dir, parts) = parted([3, 3, 2])?;
-    let table: Arc<MappedTable> = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
-    let worker = TablePrefetcher::new("test-prefetch", 1, 4, 8)?;
-    assert!(worker.try_submit(table.clone(), &[8]).is_err());
-    assert!(worker.try_submit(table.clone(), &[0; 5]).is_err());
-    let ticket = worker.try_submit(table.clone(), &[1, 0, 1])?.expect("queue has room");
-    assert_eq!(ticket.wait()?, TablePrefetchOutcome::Advised(vec![1]));
-    let cancelled = worker.try_submit(table.clone(), &[7])?.expect("queue has room");
-    cancelled.cancel();
-    assert!(matches!(cancelled.wait()?, TablePrefetchOutcome::Cancelled | TablePrefetchOutcome::Advised(_)));
-    // Detached advice truncates to the row cap instead of failing.
-    while !worker.submit_detached(table.clone(), &[0, 1, 2, 3, 4, 5])? {}
-    drop(worker);
-    let stats = table.stats().snapshot();
-    assert!(stats.prefetch_jobs >= 2 && stats.prefetch_pages >= 2);
-    Ok(())
-}
-
-#[test]
 fn gather_worker_recycles_slots_and_cancels() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     let table = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
@@ -659,6 +687,151 @@ fn gather_worker_recycles_slots_and_cancels() -> TestResult {
     Ok(())
 }
 
+struct GatherTestWake(mpsc::SyncSender<()>);
+impl std::task::Wake for GatherTestWake {
+    fn wake(self: Arc<Self>) { let _ = self.0.try_send(()); }
+    fn wake_by_ref(self: &Arc<Self>) { let _ = self.0.try_send(()); }
+}
+
+fn await_gather<F: std::future::Future>(future: F) -> F::Output {
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            std::task::Poll::Ready(result) => return result,
+            std::task::Poll::Pending => receive.recv_timeout(Duration::from_secs(5)).expect("gather must wake its waiter"),
+        }
+    }
+}
+
+#[test]
+fn gather_wait_wakes_for_success_failure_and_worker_panic() -> TestResult {
+    let (started, entered) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let worker: GatherWorker<Vec<u8>, u8, &'static str> = GatherWorker::new(
+        "test-gather-wake", vec![vec![0]], move |slot, job| {
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            match job {
+                0 => { slot[0] = 42; Ok(()) }
+                1 => Err("injected gather failure"),
+                _ => panic!("injected gather panic"),
+            }
+        })?;
+    for job in 0..3 {
+        let mut ticket = worker.try_submit(job, false)?.expect("free staging slot");
+        entered.recv_timeout(Duration::from_secs(5))?;
+        let (send, receive) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut future = std::pin::pin!(ticket.wait());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        release.send(())?;
+        receive.recv_timeout(Duration::from_secs(5)).expect("worker completion must signal the async waiter");
+        let result = await_gather(future);
+        match job {
+            0 => {
+                let Ok(GatherPoll::Ready(lease)) = result else { panic!("expected completed gather") };
+                assert_eq!(lease.slot().unwrap(), &[42]);
+            }
+            1 => assert!(matches!(result, Err(GatherFailure::Job("injected gather failure")))),
+            _ => assert!(matches!(result, Err(GatherFailure::Worker(MappedTableError::Stopped(_))))),
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn gather_wait_handles_early_completion_cancellation_and_dropped_future() -> TestResult {
+    let (submitted, entered) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let worker: GatherWorker<(), (), ()> = GatherWorker::new("test-gather-cancel-wait", vec![()], move |_, _| {
+        submitted.send(()).unwrap();
+        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        Ok(())
+    })?;
+    let mut ticket = worker.try_submit((), false)?.expect("free slot");
+    entered.recv_timeout(Duration::from_secs(5))?;
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    {
+        let mut future = std::pin::pin!(ticket.wait());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+    }
+    release.send(())?;
+    receive.recv_timeout(Duration::from_secs(5))?;
+    // Completion predates the next registration, and dropping the first future
+    // must neither consume the lease nor lose the completed result.
+    let Ok(GatherPoll::Ready(lease)) = await_gather(ticket.wait()) else { panic!("expected completed gather") };
+    assert!(matches!(await_gather(ticket.wait()), Err(GatherFailure::Worker(_))));
+    drop(lease);
+    let mut cancelled = worker.try_submit((), false)?.expect("recycled slot");
+    cancelled.cancel();
+    assert!(matches!(await_gather(cancelled.wait()), Ok(GatherPoll::Cancelled)));
+    // The worker may have passed its cancellation check before cancel was called.
+    release.send(())?;
+    Ok(())
+}
+
+#[test]
+fn gather_admission_waits_for_release_and_preserves_unsubmitted_job() -> TestResult {
+    let worker: GatherWorker<Vec<u8>, u8, ()> = GatherWorker::new(
+        "test-gather-admission", vec![vec![0]], |slot, job| { slot[0] = *job; Ok(()) })?;
+    let mut first = worker.try_submit(7, false)?.expect("one free slot");
+    let Ok(GatherPoll::Ready(lease)) = await_gather(first.wait()) else { panic!("expected first gather") };
+    let (send, receive) = mpsc::sync_channel(1);
+    let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut capacity = std::pin::pin!(worker.wait_for_capacity());
+    assert!(capacity.as_mut().poll(&mut context).is_pending());
+    let mut admission = std::pin::pin!(worker.submit(19, false));
+    assert!(admission.as_mut().poll(&mut context).is_pending());
+    drop(lease);
+    receive.recv_timeout(Duration::from_secs(5)).expect("lease release must wake admission");
+    await_gather(capacity)?;
+    let mut second = await_gather(admission)?;
+    let Ok(GatherPoll::Ready(lease)) = await_gather(second.wait()) else { panic!("expected second gather") };
+    assert_eq!(lease.job(), &19);
+    assert_eq!(lease.slot().unwrap(), &[19]);
+    drop(lease);
+    await_gather(worker.wait_for_capacity())?;
+    Ok(())
+}
+
+#[test]
+fn gather_admission_prunes_dropped_waiters_and_replaces_repolled_wakers() -> TestResult {
+    let worker: GatherWorker<(), (), ()> = GatherWorker::new(
+        "test-gather-admission-drop", vec![()], |_, _| Ok(()))?;
+    let mut ticket = worker.try_submit((), false)?.expect("one free slot");
+    let Ok(GatherPoll::Ready(lease)) = await_gather(ticket.wait()) else { panic!("expected gather") };
+    for _ in 0..1000 {
+        let (send, _) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut capacity = Box::pin(worker.wait_for_capacity());
+        let mut admission = Box::pin(worker.submit((), false));
+        assert!(capacity.as_mut().poll(&mut context).is_pending());
+        assert!(admission.as_mut().poll(&mut context).is_pending());
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 2);
+        // A different task may poll the same future; replace its registration.
+        let (send, _) = mpsc::sync_channel(1);
+        let replacement = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&replacement);
+        assert!(capacity.as_mut().poll(&mut context).is_pending());
+        assert!(admission.as_mut().poll(&mut context).is_pending());
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 2);
+        drop(capacity);
+        assert_eq!(worker.slots.admission.0.lock().unwrap().len(), 1);
+        drop(admission);
+        assert!(worker.slots.admission.0.lock().unwrap().is_empty());
+    }
+    drop(lease);
+    Ok(())
+}
+
 #[test]
 fn spawned_gathers_complete_into_caller_storage() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
@@ -681,35 +854,77 @@ fn spawned_gathers_complete_into_caller_storage() -> TestResult {
 #[ignore = "CPU residency overhead measurement, run in release mode on NVMe"]
 fn residency_overhead_measurement() -> TestResult {
     use std::hint::black_box;
-    let width = 256;
-    let rows = 1usize << 26;
-    let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
-    // Sparse 16 GiB address space: random decode rows rarely share pages.
-    file.as_file().set_len((rows * width) as u64)?;
-    file.as_file().sync_all()?;
-    // SAFETY: immutable fixture survives every gather and mapping.
-    let table = unsafe { MappedTable::open(&[TablePart { path: file.path().into(), offset: 0, rows: rows as u64 }], u8_rows(width))? };
-    table.stats.uring.store(false, Ordering::Relaxed);
-    for count in [24, 384, 1536, 3072] {
-        let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
-        let mut output = vec![0; count * width];
-        table.gather_into(&ids, &mut output)?;
-        let repeats = 500;
-        let copying = Instant::now();
-        for _ in 0..repeats {
-            for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
-                slot.copy_from_slice(table.parts[0].row(row)?);
-            }
-            black_box(&output);
-        }
-        let copying = copying.elapsed();
-        let accounting = Instant::now();
-        for _ in 0..repeats { table.record_residency(black_box(&ids))?; }
-        let accounting = accounting.elapsed();
-        eprintln!("rows={count} repeats={repeats} copy_us={:.3} mincore_accounting_us={:.3}",
-            copying.as_secs_f64() * 1e6 / repeats as f64,
-            accounting.as_secs_f64() * 1e6 / repeats as f64);
+    let number = |name: &str, default: usize| -> std::result::Result<usize, Box<dyn std::error::Error>> {
+        Ok(std::env::var(name).ok().map(|value| value.parse()).transpose()?.unwrap_or(default))
+    };
+    let width = number("MAPPED_BENCH_WIDTH", 256)?;
+    let count = number("MAPPED_BENCH_ROWS", 121_465)?;
+    let repeats = number("MAPPED_BENCH_REPEATS", 10)?;
+    let offset = number("MAPPED_BENCH_OFFSET", 0)?;
+    assert!([256, 264].contains(&width) && count > 0 && repeats > 0);
+    let fixture = if std::env::var_os("MAPPED_BENCH_PATH").is_none() {
+        let file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+        file.as_file().set_len((1u64 << 26) * width as u64)?;
+        file.as_file().sync_all()?;
+        Some(file)
+    } else { None };
+    let path = std::env::var_os("MAPPED_BENCH_PATH").map(std::path::PathBuf::from)
+        .unwrap_or_else(|| fixture.as_ref().unwrap().path().into());
+    let length = std::fs::metadata(&path)?.len();
+    let rows = number("MAPPED_BENCH_TABLE_ROWS", ((length - offset as u64) / width as u64) as usize)?;
+    assert!(rows >= count && (rows as u64 * width as u64) <= length - offset as u64);
+    // SAFETY: the fixture or immutable checkpoint remains live throughout every gather.
+    let table = unsafe { MappedTable::open(&[TablePart { path: path.clone(), offset: offset as u64,
+        rows: rows as u64 }], u8_rows(width))? };
+    let ids: Vec<_> = (0..count).map(|i| (i as u64 * 7919) % rows as u64).collect();
+    let slots: Vec<_> = (0..count).collect();
+    let mut output = vec![0; count * width];
+    // Populate only the selected pages, not a whole hundred-GB table.
+    for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
+        slot.copy_from_slice(table.parts[0].row(row)?);
     }
+    table.gather_slots(&ids, &slots, &mut output)?;
+    let before = table.stats().snapshot();
+    let full = Instant::now();
+    for _ in 0..repeats { table.gather_slots(black_box(&ids), &slots, black_box(&mut output))?; }
+    let full = full.elapsed();
+    let delta = table.stats().snapshot().since(&before);
+    assert_eq!(delta.page_misses, 0, "warm benchmark must not measure table I/O");
+    assert_eq!(delta.late_major_faults, 0, "resident pages faulted during copies");
+    assert_eq!(delta.page_hits, (count * repeats) as u64);
+    let copying = Instant::now();
+    for _ in 0..repeats {
+        for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
+            slot.copy_from_slice(table.parts[0].row(row)?);
+        }
+        black_box(&output);
+    }
+    let copying = copying.elapsed();
+    let accounting = Instant::now();
+    for _ in 0..repeats { table.record_residency(black_box(&ids))?; }
+    let accounting = accounting.elapsed();
+    // Isolate the residency page collection/sort/dedup from mincore and lookup.
+    let sorting = Instant::now();
+    for _ in 0..repeats {
+        let mut pages = Vec::with_capacity(count * 2);
+        for &row in &ids { pages.extend(table.parts[0].pages(row)?); }
+        pages.sort_unstable();
+        pages.dedup();
+        black_box(pages);
+    }
+    let sorting = sorting.elapsed();
+    let validation = Instant::now();
+    for _ in 0..repeats {
+        let mut unique = BTreeSet::new();
+        for &slot in &slots { black_box(unique.insert(slot)); }
+        black_box(unique);
+    }
+    let validation = validation.elapsed();
+    let us = |elapsed: Duration| elapsed.as_secs_f64() * 1e6 / repeats as f64;
+    eprintln!("mapped_bench path={} rows={count} table_rows={rows} width={width} repeats={repeats} full_us={:.3} residency_us={:.3} accounting_us={:.3} sort_dedup_us={:.3} validation_tree_us={:.3} copy_us={:.3} hits={} misses={} late_faults={}",
+        path.display(), us(full), delta.residency_ns as f64 / repeats as f64 / 1e3,
+        us(accounting), us(sorting), us(validation), us(copying), delta.page_hits,
+        delta.page_misses, delta.late_major_faults);
     Ok(())
 }
 
@@ -721,7 +936,7 @@ fn preloaded_rows_are_exact_without_random_io_or_page_accounting() -> TestResult
     let mut expected = [0; 12];
     table.gather_into(&[7, 2, 7], &mut expected)?;
     let before = table.stats.snapshot();
-    MappedTable::preload_all(&mut [&mut table])?;
+    MappedTable::preload_all(&mut [&mut table], 2)?;
     assert_eq!(table.backend(), TableBackend::Resident);
     let mut actual = [0; 12];
     table.gather_into(&[7, 2, 7], &mut actual)?;
@@ -732,7 +947,112 @@ fn preloaded_rows_are_exact_without_random_io_or_page_accounting() -> TestResult
     assert_eq!(table.prefetch(&[7, 2, 7], 0)?, 0);
     assert!(table.prefetch(&[8], 0).is_err());
     assert!(table.gather_slots(&[0, 1], &[0, 0], &mut actual).is_err());
+    assert_eq!(table.warm_bytes(), 0);
+    assert_eq!(table.warm(4, &AtomicBool::new(false), |_| panic!("a resident table reads nothing"))?,
+        WarmReport::default());
     assert_eq!(table.stats.snapshot(), before);
+    Ok(())
+}
+
+#[test]
+fn warm_reads_exactly_each_part_payload() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: test-owned shards stay immutable while the table reads them;
+    // the truncation below is only ever read through the descriptor.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    let chunks = Mutex::new(Vec::new());
+    let before = table.stats.snapshot();
+    let report = table.warm(3, &AtomicBool::new(false), |bytes| chunks.lock().unwrap().push(bytes))?;
+    assert_eq!((report.bytes, table.warm_bytes()), (32, 32));
+    let mut chunks = chunks.into_inner()?;
+    chunks.sort_unstable();
+    // One read per part payload, never the shard header ahead of the second part.
+    assert_eq!(chunks, [8, 12, 12]);
+    // Warm reads are not gathers: no table counters move.
+    assert_eq!(table.stats.snapshot(), before);
+    // The last part's read ends exactly at its payload end: one byte short fails.
+    std::fs::OpenOptions::new().write(true).open(&parts[2].path)?.set_len(5 + 12 + 7)?;
+    assert!(matches!(table.warm(3, &AtomicBool::new(false), |_| ()), Err(MappedTableError::Io { .. })));
+    Ok(())
+}
+
+#[test]
+fn warm_splits_parts_into_chunks_across_readers_and_stops_between_chunks() -> TestResult {
+    let file = tempfile::NamedTempFile::new()?;
+    let chunk = PAYLOAD_CHUNK_BYTES as u64;
+    let row_bytes = 4096u64;
+    // Sparse fixture: an unaligned 13-byte header, then two full chunks and one row.
+    let rows = 2 * chunk / row_bytes + 1;
+    file.as_file().set_len(13 + rows * row_bytes)?;
+    // SAFETY: the sparse fixture stays immutable while the table lives.
+    let table = unsafe { MappedTable::single(file.path(), 13, rows, u8_rows(row_bytes as usize))? };
+    let chunks = Mutex::new(Vec::new());
+    let report = table.warm(4, &AtomicBool::new(false), |bytes| chunks.lock().unwrap().push(bytes))?;
+    assert_eq!(report.bytes, rows * row_bytes);
+    let mut chunks = chunks.into_inner()?;
+    chunks.sort_unstable();
+    assert_eq!(chunks, [row_bytes, chunk, chunk]);
+    // A stop set before the pass reads nothing; set during a chunk, the reader
+    // finishes that chunk and takes no other.
+    assert_eq!(table.warm(4, &AtomicBool::new(true), |_| panic!("read after stop"))?.bytes, 0);
+    let stop = AtomicBool::new(false);
+    assert_eq!(table.warm(1, &stop, |_| stop.store(true, Ordering::Release))?.bytes, chunk);
+    Ok(())
+}
+
+#[test]
+fn warm_populates_the_page_cache_without_the_mapping() -> TestResult {
+    // Disk-backed (tmpfs cannot evict clean pages), as dontneed_produces_mincore_and_nowait_misses_then_hits.
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&vec![0x5a; 8 * page])?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test file is immutable while the table lives.
+    let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    let rows: Vec<u64> = (0..8).collect();
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    assert_eq!(table.residency(&rows, false)?, [false; 8]);
+    assert_eq!(table.warm(2, &AtomicBool::new(false), |_| ())?.bytes, 8 * page as u64);
+    assert_eq!(table.residency(&rows, false)?, [true; 8]);
+    Ok(())
+}
+
+#[test]
+fn preload_releases_the_page_cache_behind_its_reads() -> TestResult {
+    // Disk-backed, as warm_populates_the_page_cache_without_the_mapping.
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&(0..8 * page).map(|i| (i / page) as u8).collect::<Vec<_>>())?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test file is immutable while the table lives.
+    let mut table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    let rows: Vec<u64> = (0..8).collect();
+    assert_eq!(table.warm(2, &AtomicBool::new(false), |_| ())?.bytes, 8 * page as u64);
+    assert_eq!(table.residency(&rows, false)?, [true; 8]);
+    // Two pages per chunk on three readers: the host keeps one copy of each row.
+    MappedTable::preload_chunked(&mut [&mut table], 3, 2 * page)?;
+    assert_eq!(table.residency(&rows, false)?, [false; 8]);
+    for row in rows {
+        assert_eq!(table.row(row)?, &vec![row as u8; page][..]);
+    }
+    Ok(())
+}
+
+#[test]
+fn parallel_preload_matches_mapped_rows_across_parts_and_chunks() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: immutable test-owned files outlive both tables.
+    let mapped = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    // SAFETY: as above.
+    let mut table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    // 3-byte chunks of 4-byte rows on 4 readers: reads straddle rows and end at part ends.
+    MappedTable::preload_chunked(&mut [&mut table], 4, 3)?;
+    assert_eq!(table.backend(), TableBackend::Resident);
+    let rows: Vec<u64> = (0..8).rev().collect();
+    let (mut expected, mut actual) = (vec![0; 32], vec![0; 32]);
+    mapped.gather_into(&rows, &mut expected)?;
+    table.gather_into(&rows, &mut actual)?;
+    assert_eq!(actual, expected);
     Ok(())
 }
 
@@ -744,10 +1064,301 @@ fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     let mut first = unsafe { MappedTable::open(&parts[..1], u8_rows(4))? };
     let mut second = unsafe { MappedTable::open(&parts[1..], u8_rows(4))? };
     std::fs::OpenOptions::new().write(true).open(&parts[1].path)?.set_len(0)?;
-    assert!(MappedTable::preload_all(&mut [&mut first, &mut second]).is_err());
+    assert!(MappedTable::preload_all(&mut [&mut first, &mut second], 2).is_err());
     assert!(first.resident.is_none());
     assert!(second.resident.is_none());
     assert_ne!(first.backend(), TableBackend::Resident);
     assert_ne!(second.backend(), TableBackend::Resident);
+    Ok(())
+}
+
+#[test]
+fn fully_preloaded_tables_never_start_the_process_reactor() -> TestResult {
+    const CHILD: &str = "CUTEAFD_TEST_PRELOADED_REACTOR_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--exact", "formats::mapped_table::tests::fully_preloaded_tables_never_start_the_process_reactor", "--nocapture"])
+            .env(CHILD, "1").status()?;
+        assert!(status.success());
+        return Ok(());
+    }
+    assert!(!table_reactor_started());
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: test-owned shards remain immutable for the table's lifetime.
+    let mut table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    assert!(!table_reactor_started(), "opening is not final placement");
+    MappedTable::preload_all(&mut [&mut table], 2)?;
+    table.prepare_reads();
+    let mut output = [0; 8];
+    table.gather_into(&[0, 7], &mut output)?;
+    assert!(!table_reactor_started(), "private gathers do not need a reactor");
+    assert_eq!(table_reactor_workspace_bytes(0), 0);
+    assert_eq!(table_reactor_workspace_bytes(8), 18 << 20);
+    Ok(())
+}
+
+#[test]
+fn split_gathers_keep_priority_selection_after_finisher_admission() -> TestResult {
+    let (prepared_tx, prepared_rx) = mpsc::channel();
+    let (finishing_tx, finishing_rx) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let worker = GatherWorker::split("split-priority", vec![0usize; 4],
+        move |_: &mut usize, job: &usize| { prepared_tx.send(*job).unwrap(); Ok::<_, ()>(()) },
+        move |_: &mut usize, job: &usize, ()| {
+            if *job <= 2 {
+                finishing_tx.send(*job).unwrap();
+                let released = blocked.0.lock().unwrap();
+                // Bound the gate even if an assertion unwinds before release.
+                let _ = blocked.1.wait_timeout_while(released, Duration::from_secs(5), |done| !*done).unwrap();
+            }
+            Ok(())
+        })?;
+    let mut tickets = Vec::new();
+    for job in 1..=2 {
+        tickets.push(worker.try_submit(job, false)?.unwrap());
+        assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, job);
+        assert_eq!(finishing_rx.recv_timeout(Duration::from_secs(5))?, job);
+    }
+    tickets.push(worker.try_submit(3, false)?.unwrap());
+    assert!(prepared_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    // No finisher permit exists: normal work must remain in the shared queue,
+    // rather than being hidden in the preparation owner's local variable.
+    assert_eq!(worker.queue.0.lock().unwrap().normal.len(), 1);
+    tickets.push(worker.try_submit_with(4, false, true)?.unwrap());
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 4);
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    for ticket in &mut tickets {
+        assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    }
+    Ok(())
+}
+
+#[test]
+fn split_gathers_prepare_second_before_first_finishes_and_bound_third() -> TestResult {
+    let (prepared_tx, prepared_rx) = mpsc::channel();
+    let (finish_tx, finish_rx) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let worker = GatherWorker::split("split-test", vec![0usize; 4],
+        move |_: &mut usize, job: &usize| { prepared_tx.send(*job).unwrap(); Ok::<_, ()>(()) },
+        move |slot: &mut usize, job: &usize, ()| {
+            finish_tx.send(*job).unwrap();
+            if *job == 1 {
+                let (lock, ready) = &*blocked;
+                let released = lock.lock().unwrap();
+                let _ = ready.wait_timeout_while(released, Duration::from_secs(5), |done| !*done).unwrap();
+            }
+            *slot = *job;
+            Ok(())
+        })?;
+    let mut first = worker.try_submit(1, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 1);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 1);
+    let mut second = worker.try_submit(2, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 2);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 2);
+    let GatherPoll::Ready(second) = second.wait_timeout(Duration::from_secs(5)).unwrap() else { panic!("second cancelled") };
+    assert_eq!(second.slot(), Some(&2));
+    assert!(matches!(first.poll(), Ok(GatherPoll::Pending)));
+    let mut third = worker.try_submit(3, false)?.unwrap();
+    assert_eq!(prepared_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    assert_eq!(finish_rx.recv_timeout(Duration::from_secs(5))?, 3);
+    assert!(matches!(third.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    assert!(matches!(first.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Ready(_))));
+    Ok(())
+}
+
+#[test]
+fn serial_and_split_preparer_panics_reject_queued_tickets_and_wake_waiters() -> TestResult {
+    for split in [false, true] {
+        let (started, entered) = mpsc::sync_channel(1);
+        let (release, resume) = mpsc::sync_channel(1);
+        let run = move |_: &mut (), _: &usize| -> std::result::Result<(), ()> {
+            started.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            panic!("injected preparation panic");
+        };
+        let worker = if split { GatherWorker::split("split-panic", vec![(); 3], run, |_, _, ()| Ok(()))? }
+            else { GatherWorker::new("serial-panic", vec![(); 3], run)? };
+        let mut active = worker.try_submit(0, false)?.unwrap();
+        entered.recv_timeout(Duration::from_secs(5))?;
+        let mut normal = worker.try_submit(1, false)?.unwrap();
+        let mut priority = worker.try_submit_with(2, false, true)?.unwrap();
+        let (send, receive) = mpsc::sync_channel(1);
+        let waker = std::task::Waker::from(Arc::new(GatherTestWake(send)));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(priority.wait());
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        release.send(())?;
+        receive.recv_timeout(Duration::from_secs(5))?;
+        assert!(matches!(await_gather(waiting), Err(GatherFailure::Worker(_))));
+        for ticket in [&mut active, &mut normal] {
+            assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+        }
+        assert!(worker.try_submit(3, false).is_err());
+        assert!(worker.queue.0.lock().unwrap().closed);
+    }
+    Ok(())
+}
+
+#[test]
+fn split_finisher_panic_keeps_other_finisher_and_preparer_live() -> TestResult {
+    let worker = GatherWorker::split("split-finish-panic", vec![0usize; 3],
+        |_: &mut usize, _: &usize| Ok::<_, ()>(()),
+        |slot: &mut usize, job: &usize, ()| {
+            if *job == 0 { panic!("injected finisher panic"); }
+            *slot = *job;
+            Ok(())
+        })?;
+    let mut first = worker.try_submit(0, false)?.unwrap();
+    assert!(matches!(first.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+    for job in 1..=4 {
+        let mut ticket = worker.try_submit(job, false)?.expect("recycled staging");
+        let Ok(GatherPoll::Ready(lease)) = ticket.wait_timeout(Duration::from_secs(5)) else { panic!("surviving finisher stopped") };
+        assert_eq!(lease.slot(), Some(&job));
+    }
+    Ok(())
+}
+
+#[test]
+fn split_both_finisher_panics_reject_prepared_and_queued_jobs() -> TestResult {
+    let (entered, finishing) = mpsc::channel();
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let blocked = Arc::clone(&gate);
+    let (preparing, prepared) = mpsc::sync_channel(1);
+    let (release, resume) = mpsc::sync_channel(1);
+    let (dropped, drops) = mpsc::channel();
+    struct Prepared(usize, mpsc::Sender<usize>);
+    impl Drop for Prepared { fn drop(&mut self) { let _ = self.1.send(self.0); } }
+    let mut worker = GatherWorker::split("split-both-panic", vec![(); 4],
+        move |_: &mut (), job: &usize| {
+            if *job == 2 {
+                preparing.send(()).unwrap();
+                resume.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            Ok::<_, ()>(Prepared(*job, dropped.clone()))
+        }, move |_, job: &usize, _: Prepared| {
+            entered.send(*job).unwrap();
+            let released = blocked.0.lock().unwrap();
+            let (released, _) = blocked.1.wait_timeout_while(released,
+                Duration::from_secs(5), |done| !*done).unwrap();
+            drop(released);
+            panic!("injected finisher panic");
+        })?;
+    let mut tickets = Vec::new();
+    for job in 0..2 {
+        tickets.push(worker.try_submit(job, false)?.unwrap());
+        assert_eq!(finishing.recv_timeout(Duration::from_secs(5))?, job);
+    }
+    tickets.push(worker.try_submit(2, false)?.unwrap());
+    tickets.push(worker.try_submit(3, false)?.unwrap());
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    prepared.recv_timeout(Duration::from_secs(5))?;
+    // With both permits in finishers, no prepared channel job can coexist.
+    // Join both dead receivers before allowing the next prepared send: it must
+    // disconnect, recycle its payload and reject the still-queued fourth job.
+    for finisher in worker.finishers.drain(..) { assert!(finisher.join().is_err()); }
+    release.send(())?;
+    for ticket in &mut tickets {
+        assert!(matches!(ticket.wait_timeout(Duration::from_secs(5)), Err(GatherFailure::Worker(_))));
+    }
+    let slots = Arc::clone(&worker.slots);
+    drop(worker);
+    let mut recycled = (0..3).map(|_| drops.recv_timeout(Duration::from_secs(5)))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    recycled.sort_unstable();
+    assert_eq!(recycled, [0, 1, 2]);
+    assert_eq!(slots.free.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
+fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
+    let (entered, started) = mpsc::channel();
+    let (release, resume) = mpsc::sync_channel(1);
+    let (dropped, drops) = mpsc::channel();
+    struct Prepared(mpsc::Sender<()>);
+    impl Drop for Prepared { fn drop(&mut self) { let _ = self.0.send(()); } }
+    let worker = GatherWorker::split("split-shutdown", vec![(); 4],
+        move |_: &mut (), job: &usize| {
+            if *job == 1 { entered.send(()).unwrap(); resume.recv_timeout(Duration::from_secs(5)).unwrap(); }
+            Ok::<_, ()>(Prepared(dropped.clone()))
+        }, |_, _, _: Prepared| Ok(()))?;
+    let mut first = worker.try_submit(1, false)?.unwrap();
+    started.recv_timeout(Duration::from_secs(5))?;
+    let mut queued = worker.try_submit(2, false)?.unwrap();
+    first.cancel();
+    assert!(matches!(first.poll(), Ok(GatherPoll::Cancelled)));
+    let slots = Arc::clone(&worker.slots);
+    let stopping = Arc::clone(&worker.shutdown);
+    let (done, joined) = mpsc::sync_channel(1);
+    let owner = std::thread::spawn(move || { drop(worker); done.send(()).unwrap(); });
+    // Observe shutdown deterministically without an unbounded gate. Once set,
+    // even the prepared job must drain/drop rather than reach its finisher.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !stopping.load(Ordering::Acquire) && Instant::now() < deadline { std::thread::yield_now(); }
+    assert!(stopping.load(Ordering::Acquire));
+    release.send(())?;
+    joined.recv_timeout(Duration::from_secs(5))?;
+    owner.join().unwrap();
+    drops.recv_timeout(Duration::from_secs(5))?;
+    assert!(matches!(queued.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Cancelled) | Err(GatherFailure::Worker(_))));
+    assert_eq!(slots.free.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
+fn copy_first_copies_resident_batches_and_switches_cold_ones_to_the_split() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    let rows = 256u64;
+    let payload: Vec<u8> = (0..rows as usize * page).map(|i| (i % 251) as u8).collect();
+    file.write_all(&payload)?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test owns the immutable file for the table's lifetime.
+    let table = unsafe { MappedTable::single(file.path(), 0, rows, u8_rows(page))? };
+    table.prepare_reads();
+    let ids: Vec<u64> = (0..rows).rev().collect();
+    let expect = |output: &[u8]| for (index, &row) in ids.iter().enumerate() {
+        assert_eq!(&output[index * page..(index + 1) * page], &payload[row as usize * page..(row as usize + 1) * page]);
+    };
+    // Warm: one plain copy, no residency split.
+    let mut output = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut output)?;
+    let mut warm = vec![0; ids.len() * page];
+    let before = table.stats().snapshot();
+    table.gather_into(&ids, &mut warm)?;
+    expect(&warm);
+    let delta = table.stats().snapshot().since(&before);
+    assert_eq!((delta.copy_switches, delta.page_misses), (0, 0));
+    // Cold: the first fault switches the rest of the batch to the split; bytes stay exact.
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    // SAFETY: advice over exactly this live mapping.
+    unsafe { libc::madvise(table.parts[0].base.as_ptr().cast(), table.parts[0].mapped_len, 21 /* MADV_PAGEOUT */) };
+    let before = table.stats().snapshot();
+    let mut cold = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut cold)?;
+    expect(&cold);
+    let delta = table.stats().snapshot().since(&before);
+    if delta.late_major_faults > 0 {
+        assert_eq!(delta.copy_switches, 1);
+        assert!(delta.page_hits <= COPY_CHECK_ROWS as u64, "at most one check interval copied before the switch");
+        // Faulted copies count as device reads, not hits.
+        assert!(delta.page_misses >= 1);
+        // The next COLD_SKIPS - 1 gathers start with the split; then one probes the copy again.
+        for _ in 1..COLD_SKIPS {
+            let before = table.stats().snapshot();
+            table.gather_into(&ids, &mut cold)?;
+            expect(&cold);
+            assert_eq!(table.stats().snapshot().since(&before).copy_switches, 0);
+        }
+        assert_eq!(table.cold_skips.load(Ordering::Relaxed), 0);
+    }
     Ok(())
 }

@@ -18,22 +18,43 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod draft;
+pub mod expert_tier;
+pub mod route_trace;
+pub mod tier_cache;
+pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
+pub mod planner;
 mod pool;
 pub mod attention;
 mod residual;
 mod solve;
 mod spark;
-pub use spark::{ComponentDemand, SparkAssignment, SparkIoBytes, SparkResidentLayout, SparkRingGeometry, SparkWorkingSet, WorkingSetComponent};
+pub use spark::{ComponentDemand, SparkAssignment, SparkBudgetInventory, SparkEndpointOwners, SparkIntakeMode, SparkIntakeOwners, SparkIoBytes, SparkLinkOwners, SparkResidentLayout, SparkRingGeometry, SparkWaveOwners, SparkWaveStaging, SparkWorkingSet, WorkingSetComponent};
 #[cfg(test)]
 mod tests;
 
 pub use inventory::{loaded_code, ArchContext, GraphRank, GraphSet, Lifetime, LoadedCode, ProgramSet, RuntimeSample, ARCH_CONTEXTS};
-pub use pool::PoolPolicy;
+pub use pool::{PoolPolicy, AGENTIC_FLOOR_TOKENS};
 pub use residual::{validate_layer_pipeline_lanes, LAYER_PIPELINE_MAX_LANES, hop_buffer_bytes, plan_hops, residual_homes, Hop, HopKind, HopPoint, HopSpec, HopStorage, LayerExecutionPlan, LayerPlanError, ResidualHome, RoutedReplication, TerminalHome, Transition, HOP_SLOTS};
-pub use solve::{solve, solve_frozen};
+pub use solve::{solve, solve_frozen, solve_with_marks, MarkSelection};
 pub use attention::{AttentionPlacement, ContextBuffers, ContextExchangeLayout, KvDemand, LayerOwnership, CONTEXT_EXCHANGES};
+pub use expert_tier::{ExpertActivation, ExpertRouteCensus, ExpertRouteProfile, ExpertTierPlacement, ExpertTierRequest,
+    ExpertTierSetting, ExpertTierShard, ExpertTierSize, ExpertTierSource, TierOrder, TierSlot, TierStepModel};
+pub use route_trace::{RouteTrace, RouteTraceLine, RouteTraceSession, RouteWindow};
+
+/// Weight residency is independent of future allocation bytes and CUDA baselines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResidentWeights(pub u64);
+
+impl ResidentWeights {
+    pub const DEFAULT_LIMIT: Self = Self(80 << 30);
+
+    pub fn checked_add(self, other: Self) -> Result<Self, PlacementError> {
+        self.0.checked_add(other.0).map(Self)
+            .ok_or(PlacementError::Overflow("resident weights"))
+    }
+}
 
 /// What a request asks of the hardware, built by a family from its own
 /// geometry; see `families::<family>`.
@@ -68,6 +89,10 @@ pub struct PlacementRequest {
     pub tp2_workspace: [u64; 2],
     /// Which fixes the plan: the pool (`Auto`) or the RTX expert layers.
     pub onboard: Onboard,
+    /// A GPU expert tier ([`expert_tier`]): per-layer residency in place of
+    /// the whole-layer prefix (a whole layer is a tier layer at 100%). Its
+    /// size, not `onboard`, then fixes the plan.
+    pub expert_tier: Option<ExpertTierRequest>,
     /// GPUs (from GPU0) whose executors can hold whole routed layers.
     pub expert_gpus: usize,
     /// Compulsory routed prefix admitted before an automatic pool.
@@ -321,6 +346,16 @@ pub struct LayerPolicy {
     /// overrides these; the solver's memory lever cannot replace them.
     pub attention: Vec<(AttentionClass, AttentionPlacement)>,
     pub ownership: LayerOwnership,
+    /// Whole-expert ownership, independent of the attention owner.
+    pub expert_ownership: ExpertOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExpertOwnership {
+    #[default]
+    Contiguous,
+    /// Alternate complete routed layers by routed ordinal, starting on GPU 0.
+    AlternatingWhole,
 }
 
 impl LayerPolicy {
@@ -408,8 +443,8 @@ pub struct MovableDemands {
     pub demands: Vec<Demand>,
 }
 
-/// How many routed-expert layers are RTX-resident (`RTX_EXPERT_LAYERS`,
-/// `--rtx-expert-layers`: `auto`, `N`, `N%`, `all`).
+/// The resolved RTX expert onboarding policy: `auto` or an exact routed-layer
+/// count.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "onboard", content = "value")]
 pub enum Onboard {
@@ -421,24 +456,14 @@ pub enum Onboard {
     /// remaining byte (clamped to the policy's ceiling) and is refused below
     /// its floor. TP2 halves count as one layer.
     Layers(usize),
-    /// This fraction of the routed layers, rounded to the nearest layer.
-    Fraction(f64),
-    /// Experts first (v2's V4 policy): the most routed layers that still
-    /// leave a pool of `pool_floor` tokens; the pool then takes what is left
-    /// up to the target. `RTX_EXPERT_LAYERS=max`.
-    ExpertsFirst { pool_floor: u64 },
 }
-
-/// v2's V4 expert-first reserve: experts fill the GPUs above a 262K pool.
-pub const EXPERTS_FIRST_POOL_FLOOR: u64 = 262_144;
 
 impl Onboard {
     /// Routed layers this onboard fixes out of `routed`, or `None` for `Auto`.
     pub fn layers(self, routed: usize) -> Option<usize> {
         match self {
-            Self::Auto | Self::ExpertsFirst { .. } => None,
+            Self::Auto => None,
             Self::Layers(n) => Some(n.min(routed)),
-            Self::Fraction(f) => Some(((routed as f64 * f.clamp(0.0, 1.0)) + 0.5).floor() as usize),
         }
     }
 }
@@ -448,8 +473,6 @@ impl std::fmt::Display for Onboard {
         match self {
             Self::Auto => f.write_str("auto"),
             Self::Layers(n) => write!(f, "{n}"),
-            Self::Fraction(x) => write!(f, "{}%", x * 100.0),
-            Self::ExpertsFirst { .. } => f.write_str("max"),
         }
     }
 }
@@ -458,16 +481,59 @@ impl std::str::FromStr for Onboard {
     type Err = String;
     fn from_str(text: &str) -> Result<Self, String> {
         let text = text.trim();
-        let invalid = || format!("RTX expert layers must be auto, max, all, N or N% (got {text:?})");
         match text {
             "auto" | "" => Ok(Self::Auto),
-            "all" => Ok(Self::Fraction(1.0)),
-            "max" => Ok(Self::ExpertsFirst { pool_floor: EXPERTS_FIRST_POOL_FLOOR }),
-            _ => match text.strip_suffix('%') {
-                Some(percent) => percent.parse::<f64>().ok().filter(|p| (0.0..=100.0).contains(p))
-                    .map(|p| Self::Fraction(p / 100.0)).ok_or_else(invalid),
-                None => text.parse().map(Self::Layers).map_err(|_| invalid()),
-            },
+            _ => text.parse().map(Self::Layers)
+                .map_err(|_| format!("RTX expert layers must be auto or N (got {text:?})")),
+        }
+    }
+}
+
+/// The `RTX_EXPERT_LAYERS` / `--rtx-expert-layers` spelling before admission
+/// resolves it against a checkpoint: `auto`, `all` (every routed layer of the
+/// target model) or an exact layer count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OnboardSetting {
+    #[default]
+    Auto,
+    /// Every routed-expert layer the target model runs; the drafter's and
+    /// MTP's own experts are not counted.
+    All,
+    Layers(usize),
+}
+
+impl OnboardSetting {
+    /// Resolve against the target's routed-expert layer count. `all` becomes
+    /// the exact count, so a layout that cannot hold every layer refuses with
+    /// that count instead of shrinking.
+    pub fn resolve(self, routed: usize) -> Onboard {
+        match self {
+            Self::Auto => Onboard::Auto,
+            Self::All => Onboard::Layers(routed),
+            Self::Layers(n) => Onboard::Layers(n),
+        }
+    }
+}
+
+impl std::fmt::Display for OnboardSetting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => f.write_str("auto"),
+            Self::All => f.write_str("all"),
+            Self::Layers(n) => write!(f, "{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for OnboardSetting {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        match text {
+            "auto" | "" => Ok(Self::Auto),
+            "all" => Ok(Self::All),
+            _ => text.parse().map(Self::Layers)
+                .map_err(|_| format!("RTX expert layers must be auto, all or N (got {text:?})")),
         }
     }
 }
@@ -485,9 +551,14 @@ pub struct Placement {
     pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
     pub onboard_layers: usize,
+    /// The pool the same solve admits with no RTX expert layers (everything
+    /// else, including the chosen attention modes, unchanged), filled to the
+    /// pool ceiling; equal to `pool_tokens` when nothing is onboarded.
+    pub max_pool_tokens_no_onboard: u64,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
-    /// Contiguous whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
+    /// Per-layer `experts` homes are authoritative; alternating owners have gaps.
     /// Under TP2 every GPU's range is empty and [`Placement::tp2`] holds the layers.
     pub expert_ranges: Vec<ExpertRange>,
     /// The residual's home at each layer boundary: before layer `i` at `i`,
@@ -498,6 +569,9 @@ pub struct Placement {
     /// TP2 RTX expert halves (placement PR 4): one contiguous range of routed
     /// layers whose halves live on both GPUs, with each GPU's arena peak.
     pub tp2: Option<Tp2Range>,
+    /// The GPU expert tier, when the request asked for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_tier: Option<ExpertTierPlacement>,
     /// Every item the solver charged, per GPU (fixed demands, KV records,
     /// expert arenas); the baseline's loaded bytes are not repeated here.
     pub items: Vec<Vec<Item>>,
@@ -546,6 +620,13 @@ impl Placement {
     }
 
     pub fn summary(&self) -> String {
+        match &self.expert_tier {
+            Some(tier) => format!("{}; {}", self.layer_summary(), tier.summary()),
+            None => self.layer_summary(),
+        }
+    }
+
+    fn layer_summary(&self) -> String {
         let attention = self.attention_summary();
         let charged = self.hops.iter().filter(|h| h.charged()).count();
         let mut hops = if charged == 0 { String::new() } else { format!("; {charged} residual hops") };
@@ -555,14 +636,17 @@ impl Placement {
             hops.push_str(&format!("; direct-input residual hops [{}] (no extra receive storage)", direct.join(", ")));
         }
         if let Some(t) = self.tp2 {
-            return format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
-                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+            return format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
+                self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
-            .map(|(gpu, r)| format!("rtx{gpu} {}..{} ({} B)", r.first, r.first + r.layers, r.peak_bytes))
+            .map(|(gpu, r)| format!("rtx{gpu} layers {:?} ({} B)", self.layers.iter().enumerate()
+                .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
+                .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
+        format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: {ranges}{hops}",
+            self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers)
     }
 }
 
@@ -611,6 +695,10 @@ pub enum PlacementError {
     RequestedBelowContext { requested: u64, floor: u64 },
     #[error("placement inventory is invalid: {0}")]
     Inventory(&'static str),
+    #[error("placement cannot retain the minimum {minimum} complete exact-restore marks after fixed floors: {reason}")]
+    PrefixMarks { minimum: u64, reason: String, #[source] source: Box<PlacementError> },
+    #[error("no legal attention owner candidate fits; best attainable KV pool is {fit} tokens with selected-layer owners rtx0={rank0}, rtx1={rank1}: {source}")]
+    OwnerCandidates { fit: u64, rank0: usize, rank1: usize, #[source] source: Box<PlacementError> },
     #[error("explicit KV pool of {requested} tokens does not fit beside admitted demands (fits {fit}); {limits}")]
     PoolDoesNotFit { requested: u64, fit: u64, limits: PoolLimits },
     #[error("{family} drafter was placed on rtx{gpu}, where this build has no executor for it")]
@@ -621,6 +709,8 @@ pub enum PlacementError {
     Mandatory { gpu: u8, what: String },
     #[error("{requested} RTX expert layers do not fit beside the fixed demands (at most {placed})")]
     ExpertLayers { requested: usize, placed: usize },
+    #[error("{requested} GPU expert tier experts do not fit beside the fixed demands (at most {placed})")]
+    ExpertTier { requested: usize, placed: usize },
     #[error("KV pool of {pool} tokens is below the {floor}-token floor after {layers} RTX expert layers (short {short} tokens); {limits}")]
     BelowFloor { pool: u64, floor: u64, layers: usize, short: u64, limits: PoolLimits },
     #[error("Spark-free layout needs every routed layer on RTX: {placed} of {layers} fit")]

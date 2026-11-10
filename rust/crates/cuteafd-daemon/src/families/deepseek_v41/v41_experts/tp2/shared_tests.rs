@@ -1,7 +1,7 @@
 //! Ignored real-checkpoint equality gates for the shared rank backends.
 use super::*;
 use crate::shared::experts::rtx::{
-    exl3::Exl3Tp2, native::NativeTp2, ExpertInput, Routes, RtxExpertLayer,
+    native::NativeTp2, ExpertInput, Routes, RtxExpertLayer,
 };
 use cuteafd_ffi::NativeLibrary;
 
@@ -287,16 +287,6 @@ fn inputs<'a>(
 #[test]
 #[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT and two GPUs"]
 fn shared_native_v41_byte_exact() -> Result<()> {
-    v41_equality(false)
-}
-
-#[test]
-#[ignore = "requires CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, CUTEAFD_EXL3_AOT and two GPUs"]
-fn shared_exl3_v41_byte_exact() -> Result<()> {
-    v41_equality(true)
-}
-
-fn v41_equality(exl3: bool) -> Result<()> {
     // SAFETY: operator-selected trusted native library, retained through all owners.
     let lib = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     lib.cuda_set_device(0)?;
@@ -327,31 +317,11 @@ fn v41_equality(exl3: bool) -> Result<()> {
         "invalid V4.1 fixture layer/capacity"
     );
     let input = inputs(devices, capacity)?;
-    let package = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT").unwrap_or_default());
-    let weights = if exl3 {
-        Exl3Tp2::load_pair_weights(
-            devices,
-            &catalog,
-            cuteafd_core::expert_geometry(),
-            [&package; 2],
-            vec![diagnostic_layer],
-            capacity,
-            [8_000_000_000; 2],
-            RtxSelectionPolicy::FirstCapacity,
-        )?
-        .map(OwnerWeights::Exl3)
-    } else {
-        NativeTp2::load_pair_weights(
-            devices,
-            &catalog,
-            vec![diagnostic_layer],
-            capacity,
-            [8_000_000_000; 2],
-            RtxSelectionPolicy::FirstCapacity,
-            NativeOutputPolicy::TokenSums,
-        )?
-        .map(OwnerWeights::Native)
-    };
+    let weights = NativeTp2::load_pair_weights(
+        devices, &catalog, vec![diagnostic_layer], capacity,
+        [8_000_000_000; 2], RtxSelectionPolicy::FirstCapacity,
+        NativeOutputPolicy::TokenSums,
+    )?.map(OwnerWeights::Native);
     let mut waves = weights
         .iter()
         .map(|weight| -> Result<Box<dyn RtxExpertLayer + '_>> {
@@ -367,36 +337,10 @@ fn v41_equality(exl3: bool) -> Result<()> {
         cuteafd_core::ExpertGeometry::DEEPSEEK_V41,
         false,
     )?;
-    let mut shared: [Box<dyn RtxExpertLayer + '_>; 2] = if exl3 {
-        let [a, b] = Exl3Tp2::load_pair(
-            devices,
-            &catalog,
-            &package,
-            vec![diagnostic_layer],
-            capacity,
-            [8_000_000_000; 2],
-        )?;
-        [Box::new(a), Box::new(b)]
-    } else {
-        [
-            Box::new(NativeTp2::load(
-                devices[0],
-                &catalog,
-                0,
-                vec![0],
-                capacity,
-                8_000_000_000,
-            )?),
-            Box::new(NativeTp2::load(
-                devices[1],
-                &catalog,
-                1,
-                vec![0],
-                capacity,
-                8_000_000_000,
-            )?),
-        ]
-    };
+    let mut shared: [Box<dyn RtxExpertLayer + '_>; 2] = [
+        Box::new(NativeTp2::load(devices[0], &catalog, 0, vec![0], capacity, 8_000_000_000)?),
+        Box::new(NativeTp2::load(devices[1], &catalog, 1, vec![0], capacity, 8_000_000_000)?),
+    ];
     let copied = [
         Allocation::new(devices[0], capacity * 5120 * 4)?,
         Allocation::new(devices[1], capacity * 5120 * 4)?,
@@ -470,20 +414,10 @@ fn v41_equality(exl3: bool) -> Result<()> {
             };
             let actual = host(devices[rank], source, source.bytes)?;
             shared_values[rank] = actual.clone();
-            if exl3 {
-                if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
-                    let directory = Path::new(&directory);
-                    std::fs::create_dir_all(directory)?;
-                    std::fs::write(
-                        directory.join(format!("v41-exl3-r{rows}-rank{rank}.f32")),
-                        &actual,
-                    )?;
-                }
-            }
             let (max_abs, rel_l2) = errors(&reference, &actual);
             eprintln!("V41_SHARED backend={} rows={rows} rank={rank} identical={} max_abs={max_abs:.9e} rel_l2={rel_l2:.9e}",
-                if exl3 {"exl3"} else {"native"}, reference==actual);
-            if rows <= 80 || exl3 {
+                "native", reference==actual);
+            if rows <= 80 {
                 ensure!(reference == actual, "V4.1 shared FP32 rank mismatch");
             } else {
                 ensure!(rel_l2 < 1e-6, "V4.1 atomic rank tolerance exceeded");
@@ -507,14 +441,6 @@ fn v41_equality(exl3: bool) -> Result<()> {
             )
         })?;
         let actual = host(devices[0], output, rows * 5120 * 2)?;
-        if exl3 {
-            if let Ok(directory) = std::env::var("CUTEAFD_TP2_FIXTURE_OUTPUT") {
-                std::fs::write(
-                    Path::new(&directory).join(format!("v41-exl3-r{rows}-owner.bf16")),
-                    &actual,
-                )?;
-            }
-        }
         let make_inputs = || {
             std::array::from_fn(|rank| OwnerInputs {
                 input: input[rank].0[0].buffer,
@@ -531,9 +457,9 @@ fn v41_equality(exl3: bool) -> Result<()> {
         let identical = expected == actual;
         eprintln!(
             "V41_SHARED_REDUCE backend={} rows={rows} identical={identical}",
-            if exl3 { "exl3" } else { "native" }
+            "native"
         );
-        if rows <= 80 || exl3 {
+        if rows <= 80 {
             ensure!(identical, "V4.1 owner reduction mismatch");
         } else {
             let production_values = [

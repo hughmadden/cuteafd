@@ -4,9 +4,20 @@ use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc};
 
 pub const ENCODER_NUMERICS: u32 = 1;
 pub const NO_VISION_OFFSET: u64 = u64::MAX;
+/// Native tower selector of Mistral Large 4's Pixtral tower (numerics 2).
+pub const MISTRAL_RESERVED: u32 = 4;
+
+/// LM rows an encode writes for a ViT patch grid: merged rows, plus one marker
+/// row per merged row for a span-writing tower.
+pub fn output_rows(grid: [usize; 2], span_markers: bool) -> usize {
+    let [h, w] = grid;
+    let (Ok(h), Ok(w)) = (u32::try_from(h), u32::try_from(w)) else { return 0; };
+    cuteafd_core::media::ImageTokenGeometry { merge: 2, row_markers: u32::from(span_markers) }
+        .extent([1, h, w]).map_or(0, |(_, _, rows)| rows)
+}
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VisionBlock {
     pub qkv: u64,
     pub qkv_bias: u64,
@@ -23,8 +34,7 @@ pub struct VisionBlock {
     pub column_order: i32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct VisionSpec {
     pub abi_version: u32,
     pub max_tokens: u32,
@@ -36,8 +46,8 @@ pub struct VisionSpec {
     pub merger_fc1: u64,
     pub merger_fc2: u64,
     pub inv_freq: u64,
-    pub blocks: [VisionBlock; 28],
-    // ABI 2 suffix. ABI 1 MiMo callers retain their original prefix/numerics.
+    pub blocks: Vec<VisionBlock>,
+    // Numerics selection is unchanged; layer storage is owned at checkpoint depth.
     pub hidden: u32,
     pub depth: u32,
     pub heads: u32,
@@ -54,11 +64,107 @@ pub struct VisionSpec {
     pub merger_fc1_bias: u64,
     pub merger_fc2_bias: u64,
     pub merger_extra: [u64; 8],
-    pub norm1_bias: [u64; 28],
-    pub norm2_bias: [u64; 28],
-    pub q_norm: [u64; 28],
-    pub k_norm: [u64; 28],
+    pub norm1_bias: Vec<u64>,
+    pub norm2_bias: Vec<u64>,
+    pub q_norm: Vec<u64>,
+    pub k_norm: Vec<u64>,
 }
+
+#[repr(C)]
+struct RawVisionSpec {
+    storage_abi: u32,
+    abi_version: u32,
+    max_tokens: u32,
+    output_width: u32,
+    reserved: u32,
+    weight_bytes: u64,
+    patch: u64,
+    merger_norm: u64,
+    merger_fc1: u64,
+    merger_fc2: u64,
+    inv_freq: u64,
+    blocks: *const VisionBlock,
+    // Numerics selection is unchanged; layer storage is owned at checkpoint depth.
+    hidden: u32,
+    depth: u32,
+    heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    intermediate: u32,
+    patch_size: u32,
+    merger_width: u32,
+    norm_eps: f32,
+    geometry_reserved: u32,
+    patch_bias: u64,
+    pos_embed: u64,
+    merger_norm_bias: u64,
+    merger_fc1_bias: u64,
+    merger_fc2_bias: u64,
+    merger_extra: [u64; 8],
+    norm1_bias: *const u64,
+    norm2_bias: *const u64,
+    q_norm: *const u64,
+    k_norm: *const u64,
+}
+
+impl VisionSpec {
+    /// Layer storage is owned and follows the checkpoint depth, never an ABI cap.
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = u32::try_from(depth).expect("vision depth must fit u32");
+        self.blocks = vec![VisionBlock::default(); depth];
+        self.norm1_bias.resize(depth, 0);
+        self.norm2_bias.resize(depth, 0);
+        self.q_norm.resize(depth, 0);
+        self.k_norm.resize(depth, 0);
+        self
+    }
+
+    // The raw view stays private and is borrowed only for synchronous FFI calls.
+    // Native registration deep-copies every layer before returning.
+    fn raw(&self) -> Result<RawVisionSpec, VisionError> {
+        let depth = self.depth as usize;
+        if depth == 0 || self.blocks.len() != depth
+            || [&self.norm1_bias, &self.norm2_bias, &self.q_norm, &self.k_norm]
+                .iter().any(|v| v.len() != depth) {
+            return Err(VisionError::InvalidInput("vision layer storage/depth mismatch"));
+        }
+        Ok(RawVisionSpec {
+            storage_abi: 3,
+            abi_version: self.abi_version,
+            max_tokens: self.max_tokens,
+            output_width: self.output_width,
+            reserved: self.reserved,
+            weight_bytes: self.weight_bytes,
+            patch: self.patch,
+            merger_norm: self.merger_norm,
+            merger_fc1: self.merger_fc1,
+            merger_fc2: self.merger_fc2,
+            inv_freq: self.inv_freq,
+            blocks: self.blocks.as_ptr(),
+            hidden: self.hidden,
+            depth: self.depth,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            intermediate: self.intermediate,
+            patch_size: self.patch_size,
+            merger_width: self.merger_width,
+            norm_eps: self.norm_eps,
+            geometry_reserved: self.geometry_reserved,
+            patch_bias: self.patch_bias,
+            pos_embed: self.pos_embed,
+            merger_norm_bias: self.merger_norm_bias,
+            merger_fc1_bias: self.merger_fc1_bias,
+            merger_fc2_bias: self.merger_fc2_bias,
+            merger_extra: self.merger_extra,
+            norm1_bias: self.norm1_bias.as_ptr(),
+            norm2_bias: self.norm2_bias.as_ptr(),
+            q_norm: self.q_norm.as_ptr(),
+            k_norm: self.k_norm.as_ptr(),
+        })
+    }
+}
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -106,8 +212,8 @@ fn check(status: i32) -> Result<(), VisionError> {
     }
 }
 
-type Required = unsafe extern "C" fn(*const VisionSpec, *mut VisionLedger) -> i32;
-type Create = unsafe extern "C" fn(*const VisionSpec, i32, u64, *mut *mut c_void) -> i32;
+type Required = unsafe extern "C" fn(*const RawVisionSpec, *mut VisionLedger) -> i32;
+type Create = unsafe extern "C" fn(*const RawVisionSpec, i32, u64, *mut *mut c_void) -> i32;
 type Upload = unsafe extern "C" fn(*mut c_void, u64, *const u8, u64) -> i32;
 type Observer = unsafe extern "C" fn(*mut c_void, i32, *const c_void, i32, i32, i32) -> i32;
 type Encode = unsafe extern "C" fn(
@@ -134,6 +240,9 @@ pub struct NativeVision {
     max_tokens: usize,
     output_width: usize,
     patch_size: usize,
+    /// Mistral's Pixtral tower (reserved 4) emits its whole LM span: one
+    /// [IMG_BREAK]/[IMG_END] row after each merged row of [IMG] rows.
+    span_markers: bool,
     // CUDA and the BLAS handle never migrate away from their owner thread.
     _thread: PhantomData<Rc<()>>,
 }
@@ -145,7 +254,7 @@ impl NativeVision {
             let library = Library::new(crate::host_isa::native_library(path))?;
             let required = library.get::<Required>(b"cuteafd_vision_required")?;
             let mut ledger = VisionLedger::default();
-            check(required(spec, &mut ledger))?;
+            check(required(&spec.raw()?, &mut ledger))?;
             Ok(ledger)
         }
     }
@@ -171,7 +280,7 @@ impl NativeVision {
             let create = *library.get::<Create>(b"cuteafd_vision_create")?;
             let upload = *library.get::<Upload>(b"cuteafd_vision_upload")?;
             let mut ledger = VisionLedger::default();
-            check(required(spec, &mut ledger))?;
+            check(required(&spec.raw()?, &mut ledger))?;
             if ledger.total_bytes() > admitted_bytes {
                 return Err(VisionError::InvalidInput(
                     "vision weight/scratch admission shortfall",
@@ -186,9 +295,10 @@ impl NativeVision {
                 max_tokens: spec.max_tokens as usize,
                 output_width: spec.output_width as usize,
                 patch_size: if spec.abi_version == 1 { 16 } else { spec.patch_size as usize },
+                span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
                 _thread: PhantomData,
             };
-            check(create(spec, device, admitted_bytes, &mut result.owner))?;
+            check(create(&spec.raw()?, device, admitted_bytes, &mut result.owner))?;
             if result.owner.is_null() {
                 return Err(VisionError::InvalidInput("null vision owner"));
             }
@@ -220,7 +330,7 @@ impl NativeVision {
             || w % 2 != 0
             || patches > self.max_tokens * 4
             || rgb.len() != patches * self.patch_size * self.patch_size * 3
-            || output.len() != patches / 4 * self.output_width
+            || output.len() != output_rows(grid, self.span_markers) * self.output_width
         {
             return Err(VisionError::InvalidInput(
                 "vision RGB/grid/output extent mismatch",
@@ -406,13 +516,34 @@ mod tests {
         .is_err());
     }
     #[test]
+    fn layer_storage_follows_depth_and_rejects_ragged_views() {
+        for depth in [24, 27, 28, 30, 50] {
+            let mut spec = VisionSpec { q_norm: vec![NO_VISION_OFFSET; depth],
+                ..Default::default() }.with_depth(depth);
+            spec.blocks[depth - 1].norm1 = 1234;
+            let raw = spec.raw().unwrap();
+            assert_eq!(raw.depth as usize, depth);
+            assert_eq!(raw.blocks, spec.blocks.as_ptr());
+            assert_eq!(spec.q_norm, vec![NO_VISION_OFFSET; depth]);
+            let cloned = spec.clone();
+            assert_ne!(cloned.blocks.as_ptr(), raw.blocks);
+            drop(spec);
+            assert_eq!(cloned.blocks[depth - 1].norm1, 1234);
+            let mut ragged = cloned;
+            ragged.k_norm.pop();
+            assert!(ragged.raw().is_err());
+        }
+        assert!(VisionSpec::default().raw().is_err());
+    }
+
+    #[test]
     fn c_header_layout_is_stable() {
         assert_eq!(std::mem::size_of::<VisionBlock>(), 96);
-        assert_eq!(std::mem::size_of::<VisionSpec>(), 3792);
         assert_eq!(std::mem::size_of::<VisionLedger>(), 40);
-        assert_eq!(std::mem::offset_of!(VisionSpec, blocks), 64);
-        assert_eq!(std::mem::offset_of!(VisionSpec, hidden), 2752);
-        assert_eq!(std::mem::offset_of!(VisionSpec, patch_bias), 2792);
-        assert_eq!(std::mem::offset_of!(VisionSpec, norm1_bias), 2896);
+        assert_eq!(std::mem::size_of::<RawVisionSpec>(), 256);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, blocks), 72);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, hidden), 80);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, patch_bias), 120);
+        assert_eq!(std::mem::offset_of!(RawVisionSpec, norm1_bias), 224);
     }
 }

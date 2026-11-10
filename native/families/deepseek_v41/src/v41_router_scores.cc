@@ -4,6 +4,11 @@
 #include "v41_router_e128.h"
 #include "v41_router_e384.h"
 
+// Compute capability (major*10+minor) of the exported router cubins.
+#ifndef CUTEAFD_V41_ROUTER_CC
+#define CUTEAFD_V41_ROUTER_CC 120
+#endif
+
 namespace {
 cuteafd_v41_router_e128_Kernel_Module_t small{};
 cuteafd_v41_router_e384_Kernel_Module_t large{};
@@ -38,7 +43,7 @@ extern "C" int32_t cuteafd_v41_router_initialize() {
   int major=0,minor=0;
   status=cudaDeviceGetAttribute(&major,cudaDevAttrComputeCapabilityMajor,device);if(status)return status;
   status=cudaDeviceGetAttribute(&minor,cudaDevAttrComputeCapabilityMinor,device);if(status)return status;
-  if(major!=12 || minor!=0)return cudaErrorInvalidDevice;
+  if(major*10+minor!=CUTEAFD_V41_ROUTER_CC)return cudaErrorInvalidDevice;
   int result=load(small.module,_mlir_cuteafd_v41_router_e128_cuda_init,
       _mlir_cuteafd_v41_router_e128_cuda_load_to_device,device);
   if(!result)result=load(large.module,_mlir_cuteafd_v41_router_e384_cuda_init,

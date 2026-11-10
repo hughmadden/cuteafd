@@ -5,6 +5,73 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// Shared prefill reserve, page alignment and fixed exchange depth. Exporters
+/// read these literal constants too; do not independently tune their wave size.
+pub const PREFILL_RESERVE_ROWS: u64 = 8192;
+pub const PREFILL_DEPTH: u64 = 3;
+pub const PREFILL_ROW_PAGE: u64 = 64;
+pub const PREFILL_MAX_WAVES: u64 = 4;
+
+/// DMA_BUF needs a host-page-aligned base and length (4 KiB on supported
+/// hosts). cudaMalloc can suballocate at sub-page bases: overallocate one
+/// page, then register the aligned interior range, retaining the raw owner.
+pub const SPARK_INTAKE_EXPORT_ALIGNMENT: u64 = 4096;
+/// Pinned intake retains at most one small wave of shared upload staging.
+pub const SPARK_INTAKE_SMALL_WAVE_BYTES: u64 = 1 << 20;
+pub const SPARK_INTAKE_MAX_RANKS: usize = 8;
+pub const SPARK_WAVE_CONTROL_LINE_BYTES: usize = 64;
+pub const SPARK_WAVE_PULL_STRIDE_BYTES: usize = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SparkIntakeAllocationError {
+    #[error("Spark intake allocation byte size overflow")]
+    Overflow,
+    #[error("Spark intake export base {ptr:#x} and length {bytes} must be nonzero and {alignment}-byte aligned")]
+    Alignment { ptr: u64, bytes: u64, alignment: u64 },
+}
+
+fn spark_intake_export_bytes(logical_bytes: u64) -> Result<u64, SparkIntakeAllocationError> {
+    let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    logical_bytes.checked_add(page - 1).map(|bytes| bytes / page * page)
+        .ok_or(SparkIntakeAllocationError::Overflow)
+}
+
+/// Raw cudaMalloc size of one whole-rank reserve, including alignment slack.
+pub fn spark_intake_allocation_bytes(logical_bytes: u64) -> Result<u64, SparkIntakeAllocationError> {
+    if logical_bytes == 0 { return Ok(0); }
+    spark_intake_export_bytes(logical_bytes)?.checked_add(SPARK_INTAKE_EXPORT_ALIGNMENT)
+        .ok_or(SparkIntakeAllocationError::Overflow)
+}
+
+/// Aligned byte offset and registered length inside the raw cudaMalloc.
+/// The raw allocation must have `spark_intake_allocation_bytes(logical_bytes)` bytes.
+pub fn spark_intake_export_range(allocation_ptr: u64, logical_bytes: u64)
+    -> Result<(u64, u64), SparkIntakeAllocationError> {
+    let bytes = spark_intake_export_bytes(logical_bytes)?;
+    let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    let aligned = allocation_ptr.checked_add(page - 1)
+        .map(|ptr| ptr / page * page).ok_or(SparkIntakeAllocationError::Overflow)?;
+    aligned.checked_add(bytes).ok_or(SparkIntakeAllocationError::Overflow)?;
+    validate_spark_intake_export(aligned, bytes)?;
+    Ok((aligned - allocation_ptr, bytes))
+}
+
+pub fn validate_spark_intake_export(ptr: u64, bytes: u64) -> Result<(), SparkIntakeAllocationError> {
+    let alignment = SPARK_INTAKE_EXPORT_ALIGNMENT;
+    if ptr == 0 || bytes == 0 || ptr % alignment != 0 || bytes % alignment != 0 {
+        return Err(SparkIntakeAllocationError::Alignment { ptr, bytes, alignment });
+    }
+    Ok(())
+}
+
+pub fn prefill_unit_rows_in(waves: u64, reserve: u64) -> u64 {
+    reserve.div_ceil(waves.clamp(2, PREFILL_MAX_WAVES)).div_ceil(PREFILL_ROW_PAGE) * PREFILL_ROW_PAGE
+}
+
+pub fn default_prefill_unit_rows() -> u64 {
+    prefill_unit_rows_in(PREFILL_DEPTH, PREFILL_RESERVE_ROWS)
+}
+
 /// Common logical GPU pool across model families; larger pools are explicit.
 pub const DEFAULT_GPU_KV_TOKENS: u64 = 2 << 20;
 
@@ -69,10 +136,7 @@ impl Default for CapacityPolicy {
 
 impl CapacityPolicy {
     pub fn state_slots(self) -> Result<u32, CapacityError> {
-        let slots = u64::from(self.concurrency)
-            .checked_mul(5)
-            .ok_or(CapacityError::Overflow("state slots"))?
-            .div_ceil(4);
+        let slots = crate::concurrency::state_slots(u64::from(self.concurrency));
         u32::try_from(slots).map_err(|_| CapacityError::Overflow("state slots"))
     }
 }
@@ -288,7 +352,7 @@ pub fn resolve_capacity_with_startup_peaks(
     hardware: &[DeviceMemory],
     startup_peaks: &[(u32, u64)],
 ) -> Result<ResolvedCapacity, CapacityError> {
-    if policy.concurrency == 0 || policy.target_pool_tokens == 0 {
+    if policy.concurrency == 0 || u64::from(policy.concurrency) > crate::concurrency::MAX_CONCURRENCY || policy.target_pool_tokens == 0 {
         return Err(CapacityError::Invalid(
             "concurrency and pool target must be positive",
         ));
@@ -434,8 +498,42 @@ pub fn resolve_capacity_with_startup_peaks(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_default_and_wave_clamp() {
+        assert_eq!(super::default_prefill_unit_rows(), 2752);
+        for (depth, expected) in [(0, 4096), (1, 4096), (3, 2752), (4, 2048), (8, 2048)] {
+            assert_eq!(super::prefill_unit_rows_in(depth, super::PREFILL_RESERVE_ROWS), expected);
+        }
+    }
+
     use super::*;
     const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn spark_intake_backing_rounds_the_whole_reserve_and_checks_export_alignment() {
+        let page = SPARK_INTAKE_EXPORT_ALIGNMENT;
+        for logical in [1, 655_360, 819_200, 287_837_184, 289_406_976] {
+            let allocation = spark_intake_allocation_bytes(logical).unwrap();
+            assert_eq!(allocation, logical.div_ceil(page) * page + page);
+            for base in [4096, 4096 + 512, 8191] {
+                let (offset, bytes) = spark_intake_export_range(base, logical).unwrap();
+                assert_eq!((base + offset) % page, 0);
+                assert_eq!(bytes, logical.div_ceil(page) * page);
+                assert!(offset < page && offset + bytes <= allocation);
+                assert!(validate_spark_intake_export(base + offset, bytes).is_ok());
+            }
+        }
+        assert_eq!(spark_intake_allocation_bytes(0), Ok(0));
+        assert_eq!(spark_intake_allocation_bytes(u64::MAX), Err(SparkIntakeAllocationError::Overflow));
+        assert!(spark_intake_export_range(u64::MAX, 4096).is_err());
+        for bytes in [655_360, 819_200, 289_406_976] {
+            assert!(validate_spark_intake_export(4096, bytes).is_ok());
+        }
+        for (ptr, bytes) in [(0, 4096), (4096, 0), (4608, 655_360), (4096, 287_837_184)] {
+            assert!(matches!(validate_spark_intake_export(ptr, bytes),
+                Err(SparkIntakeAllocationError::Alignment { .. })));
+        }
+    }
 
     #[test]
     fn default_concurrency_uses_logical_capacity_not_free_memory() {
@@ -618,7 +716,7 @@ mod tests {
         let gpu = &result.devices[0];
         assert_eq!(gpu.engine_budget_bytes, 96 * GIB * 97 / 100 - 10 * GIB);
         assert_eq!(result.allocated_gpu_kv_tokens, 63 * 64);
-        assert_eq!((result.concurrency, result.state_slots), (16, 20));
+        assert_eq!((result.concurrency, result.state_slots), (16, 16));
         assert!(gpu.non_engine_bytes + gpu.reserved_bytes + gpu.pool_bytes <= 96 * GIB * 97 / 100);
         assert!(gpu.unused_budget_bytes < GIB);
     }

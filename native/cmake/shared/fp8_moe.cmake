@@ -56,7 +56,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
   elseif(entry STREQUAL "step5:nvfp4")
     set(geometry "step5_nvfp4")
     set(count_family "step5")
-    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-step5-nvfp4")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-step5-nvfp4a4")
   elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
     if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
       continue()  # dense MLPs run on the coordinator only
@@ -89,8 +89,8 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
         endif()
         set(count "${CMAKE_MATCH_2}")
       endif()
-      if(NOT count MATCHES "^[1-6]$")
-        message(FATAL_ERROR "CUTEAFD_GENERIC_SPARK_COUNTS requires counts 1..6, got ${count}")
+      if(NOT count MATCHES "^[1-8]$")
+        message(FATAL_ERROR "CUTEAFD_GENERIC_SPARK_COUNTS requires counts 1..8, got ${count}")
       endif()
       list(APPEND requested_layouts "tp${count}")
     endforeach()
@@ -113,6 +113,8 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
       --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
     DEPENDS "${CUTEAFD_FP8_MOE_TOOL}" "${stamp}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Building exact FP8 expert package fp8-${geometry} (${CUTEAFD_FP8_MOE_ROLE})"
     VERBATIM)
@@ -130,6 +132,8 @@ or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts
         --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_FP8_MOE_CUDA_INCLUDE}"
         --cuda-libdir "$<TARGET_FILE_DIR:CUDA::cudart>" --runtime "${CUTEAFD_B12X_AOT_RUNTIME_LIBRARY}"
       DEPENDS "${CUTEAFD_FP8_MOE_TOOL}" "${stamp}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
         ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
       COMMENT "Building exact FP8 expert package fp8-${geometry}-bf16 (spark, BF16 input)"
       VERBATIM)

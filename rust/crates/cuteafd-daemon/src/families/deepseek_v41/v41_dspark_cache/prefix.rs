@@ -28,7 +28,7 @@ impl<'a> DsparkWindow<'a> {
         ensure!(copies.pending.is_none(), "draft snapshot lane is occupied");
         let stream = copies.stream.raw;
         let slot = self.validate(lease)?;
-        let mut used = [false; 16]; used[slot] = true;
+        let mut used = [false; cuteafd_core::V41_MAX_REQUESTS]; used[slot] = true;
         let reservation = self.access.reserve(used)?;
         let end = self.copy_ring(lease, destination, stream)?;
         self.prefix_copies[lane].pending = Some((lease, reservation));
@@ -104,6 +104,33 @@ impl<'a> DsparkWindow<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_ring_rows_match_cold_prefill_across_wraps_and_slot_reuse() {
+        for end in [1usize, 63, 64, 65, 127, 128, 129, 255, 256, 257, 4097] {
+            let row = V41DsparkCache::ROW_BYTES;
+            let mut cold = vec![0u8; V41DsparkCache::SLOT_BYTES];
+            let first = end.saturating_sub(128);
+            for position in first..end {
+                cold[(position % 128) * row..(position % 128 + 1) * row]
+                    .fill((position % 251 + 1) as u8);
+            }
+            let bytes = DsparkWindow::ring_bytes(end as u64);
+            let saved = cold[..bytes].to_vec();
+            let mut reused = vec![0xa5; V41DsparkCache::SLOT_BYTES];
+            reused[..bytes].copy_from_slice(&saved);
+            for position in first..end {
+                let at = (position % 128) * row;
+                assert_eq!(&reused[at..at + row], &cold[at..at + row]);
+            }
+            // The next producer overwrites the same absolute-position ring row.
+            let at = (end % 128) * row;
+            reused[at..at + row].fill(0x42);
+            cold[at..at + row].fill(0x42);
+            let initialized = DsparkWindow::ring_bytes((end + 1) as u64);
+            assert_eq!(&reused[..initialized], &cold[..initialized]);
+        }
+    }
+
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIB and CUDA"]
     fn native_queued_draft_rings_preserve_peers_and_abort() -> Result<()> {

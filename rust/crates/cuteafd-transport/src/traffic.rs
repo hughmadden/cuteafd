@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -33,10 +33,6 @@ pub struct EngineSample {
     pub peer: String,
     #[serde(default)]
     pub local_gid: String,
-    /// Subset of sent_bytes posted as one-sided writes, including their flags.
-    #[serde(default)]
-    pub written_sent_bytes: u64,
-    pub receives_writes: bool,
     pub sent_bytes: u64,
     pub received_bytes: u64,
     #[serde(default)]
@@ -51,6 +47,64 @@ pub struct EngineSample {
     pub packets_received: Option<u64>,
 }
 
+/// Host contention seen by the observer while a phase runs. Pressure is the
+/// kernel's 10 s "some" average (percent of time at least one task stalled);
+/// scan counters are cumulative pages, so a phase window yields pages/s.
+/// Every field is absent rather than zero when the kernel does not report it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HostLoad {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_some_avg10: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgscan_kswapd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgscan_direct: Option<u64>,
+    /// 1-minute load average, context for the pressure readings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+}
+
+/// Parse the `some avg10=` value out of a PSI file's first matching line.
+fn psi_some_avg10(text: &str) -> Option<f64> {
+    text.lines().find(|line| line.trim_start().starts_with("some "))?
+        .split_whitespace().find_map(|field| field.strip_prefix("avg10="))?
+        .parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+fn vmstat_pages(text: &str, prefix: &str) -> Option<u64> {
+    let mut total: Option<u64> = None;
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(name) = fields.next() else { continue };
+        // Kernels with zone lists expose pgscan_kswapd_<zone>; sum them all.
+        if name != prefix && !name.starts_with(&format!("{prefix}_")) { continue; }
+        let Some(value) = fields.next().and_then(|v| v.parse::<u64>().ok()) else { continue };
+        total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+    total
+}
+
+/// Read the coordinator host's pressure, reclaim and load counters. A file
+/// that is missing or unparsable leaves its fields absent, never zero.
+pub fn read_host_load(root: &Path) -> HostLoad {
+    let read = |relative: &str| std::fs::read_to_string(root.join(relative)).ok();
+    let load1 = read("proc/loadavg").and_then(|text| text.split_whitespace().next()?.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let mut load = HostLoad {
+        cpu_some_avg10: read("proc/pressure/cpu").as_deref().and_then(psi_some_avg10),
+        memory_some_avg10: read("proc/pressure/memory").as_deref().and_then(psi_some_avg10),
+        load1,
+        ..Default::default()
+    };
+    if let Some(text) = read("proc/vmstat") {
+        load.pgscan_kswapd = vmstat_pages(&text, "pgscan_kswapd");
+        load.pgscan_direct = vmstat_pages(&text, "pgscan_direct");
+    }
+    load
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostSample {
     /// Process incarnation; a restart must not be interpreted as a counter wrap.
@@ -62,6 +116,10 @@ pub struct HostSample {
     /// only to a worker's reply to the coordinator. Absent from older workers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpus: Option<serde_json::Value>,
+    /// Host contention at this sample, so a phase window can tell a busy
+    /// coordinator from a quiet one. Absent from older peers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_load: Option<HostLoad>,
     /// Seconds on this host's monotonic clock, never compared across hosts.
     pub sampled_s: f64,
     /// Start of the continuous demand-driven observation window, host-local.
@@ -118,7 +176,6 @@ pub enum TrafficError {
 #[derive(Debug, Default)]
 #[repr(align(64))]
 struct WireBytes {
-    written: AtomicU64,
     sent: AtomicU64,
     received: AtomicU64,
 }
@@ -132,22 +189,15 @@ pub(crate) struct WireCounter {
     path_mtu: Option<u32>,
     peer: OnceLock<String>,
     local_gid: String,
-    receives_writes: AtomicBool,
     bytes: WireBytes,
 }
 impl WireCounter {
     pub(crate) fn sent(&self, bytes: usize) { self.bytes.sent.fetch_add(bytes as u64, Ordering::Relaxed); }
-    pub(crate) fn written(&self, bytes: usize) {
-        self.sent(bytes);
-        self.bytes.written.fetch_add(bytes as u64, Ordering::Relaxed);
-    }
-    pub(crate) fn receives_writes(&self) { self.receives_writes.store(true, Ordering::Relaxed); }
     pub(crate) fn received(&self, bytes: usize) { self.bytes.received.fetch_add(bytes as u64, Ordering::Relaxed); }
     pub(crate) fn peer(&self, peer: &str) { let _ = self.peer.set(peer.into()); }
     fn sample(&self) -> EngineSample {
         EngineSample { device: self.device.clone(), port: self.port, peer: self.peer.get().cloned().unwrap_or_default(),
-            receives_writes: self.receives_writes.load(Ordering::Relaxed),
-            local_gid: self.local_gid.clone(), written_sent_bytes: self.bytes.written.load(Ordering::Relaxed),
+            local_gid: self.local_gid.clone(),
             sent_bytes: self.bytes.sent.load(Ordering::Relaxed), received_bytes: self.bytes.received.load(Ordering::Relaxed), path_mtu: self.path_mtu, ..Default::default() }
     }
 }
@@ -166,7 +216,7 @@ fn registry() -> &'static Mutex<Registry> {
 
 pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String, mtu: u32) -> Arc<WireCounter> {
     let counter = Arc::new(WireCounter { device: device.into(), port, path_mtu: (1..=5).contains(&mtu).then(|| 128u32 << mtu), peer: { let p = OnceLock::new(); if !peer.is_empty() { let _ = p.set(peer.into()); } p },
-        local_gid, receives_writes: AtomicBool::new(false), bytes: WireBytes::default() });
+        local_gid, bytes: WireBytes::default() });
     registry().lock().unwrap().counters.push(counter.clone());
     counter
 }
@@ -237,6 +287,32 @@ fn read_ports_with_net(root: &Path, net_root: &Path) -> Vec<PortSample> {
                     let key = if directory == "hw_counters" { format!("hw_counters/{name}") } else { name };
                     counters.insert(key, value);
                 }
+            }
+            let netdevs: BTreeSet<_> = std::fs::read_dir(path.join("gid_attrs/ndevs")).into_iter()
+                .flatten().flatten().filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+                .map(|name| name.trim().to_owned())
+                .filter(|name| !name.is_empty() && !name.contains('/') && name != "." && name != "..")
+                .collect();
+            // Some mlx5 netdev aliases expose the same physical PFC counters.
+            // Take one successful table, not a sum over aliases.
+            for name in &netdevs {
+                let mut pause = BTreeMap::new();
+                for directory in ["statistics", "hw_counters"] {
+                    if let Ok(entries) = std::fs::read_dir(net_root.join(name).join(directory)) {
+                        for entry in entries.flatten() {
+                            let key = entry.file_name().to_string_lossy().into_owned();
+                            if key.contains("prio") && key.ends_with("_pause") {
+                                if let Some(value) = std::fs::read_to_string(entry.path()).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
+                                    pause.insert(format!("pfc/{key}"), value);
+                                }
+                            }
+                        }
+                    }
+                }
+                if pause.is_empty() && root == Path::new("/sys/class/infiniband") {
+                    pause = crate::bond::pause_counters(name).unwrap_or_default();
+                }
+                if !pause.is_empty() { counters.extend(pause); break; }
             }
             result.push(PortSample { device: device.file_name().to_string_lossy().into_owned(), port,
                 state: std::fs::read_to_string(path.join("state")).ok().map(|s| s.trim().into()),
@@ -412,7 +488,8 @@ fn start() {
                 let mut local = HostSample { incarnation: incarnation.clone(), sampled_s: 0.0, hostname: hostname.clone(),
                     ports: read_ports(Path::new("/sys/class/infiniband")),
                     engine: counters.iter().map(|counter| counter.sample()).collect(),
-                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(), ..Default::default() };
+                    sources: sources.iter().map(|s| (s.name().into(), s.sample())).collect(),
+                    host_load: Some(read_host_load(Path::new("/"))), ..Default::default() };
                 local.sampled_s = clock.elapsed().as_secs_f64();
                 if let Some(before) = previous.as_ref() {
                     // Freeze the first quiet interval per port as its idle reference.
@@ -459,6 +536,38 @@ fn start() {
 mod tests {
     use super::*;
     #[test]
+    fn host_load_reads_pressure_vmstat_and_load() {
+        let root = std::env::temp_dir().join(format!("host-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("proc/pressure")).unwrap();
+        std::fs::write(root.join("proc/pressure/cpu"),
+            "some avg10=12.50 avg60=4.00 avg300=1.00 total=99\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
+        std::fs::write(root.join("proc/pressure/memory"),
+            "some avg10=6.25 avg60=2.00 avg300=1.00 total=9\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
+        std::fs::write(root.join("proc/vmstat"),
+            "pgscan_kswapd 1000\npgscan_kswapd_normal 500\npgscan_kswapd_dma32 250\npgscan_direct 40\npgscan_direct_normal 10\nnr_free_pages 5\n").unwrap();
+        std::fs::write(root.join("proc/loadavg"), "0.75 0.50 0.25 1/100 1234\n").unwrap();
+        let load = read_host_load(&root);
+        assert_eq!(load.cpu_some_avg10, Some(12.5));
+        assert_eq!(load.memory_some_avg10, Some(6.25));
+        // Every zone suffix and direct/kswapd split is cumulative pages scanned.
+        assert_eq!(load.pgscan_kswapd, Some(1750));
+        assert_eq!(load.pgscan_direct, Some(50));
+        assert_eq!(load.load1, Some(0.75));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_load_missing_or_unparsable_files_stay_unknown() {
+        let root = std::env::temp_dir().join(format!("host-load-missing-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("proc/pressure")).unwrap();
+        std::fs::write(root.join("proc/pressure/cpu"), "no pressure here\n").unwrap();
+        std::fs::write(root.join("proc/vmstat"), "pgscan_kswapd nope\n").unwrap();
+        let load = read_host_load(&root);
+        assert_eq!(load, HostLoad::default());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn old_worker_samples_without_hostname_or_gpus_still_parse() {
         let old = r#"{"incarnation":"1-2","sampled_s":3.5,"ports":[],"engine":[]}"#;
         let sample: HostSample = serde_json::from_str(old).unwrap();
@@ -483,7 +592,12 @@ mod tests {
         std::fs::write(port.join("gid_attrs/ndevs/0"), "net0\n").unwrap();
         std::fs::create_dir_all(root.join("net/net0")).unwrap();
         std::fs::write(root.join("net/net0/mtu"), "9000\n").unwrap();
+        std::fs::create_dir_all(root.join("net/net0/statistics")).unwrap();
+        std::fs::write(root.join("net/net0/statistics/rx_prio3_pause"), "5481796").unwrap();
+        std::fs::write(root.join("net/net0/statistics/tx_prio3_pause"), "4525150").unwrap();
         let ports = read_ports_with_net(&root, &root.join("net"));
+        assert_eq!(ports[0].counters["pfc/rx_prio3_pause"], 5_481_796);
+        assert_eq!(ports[0].counters["pfc/tx_prio3_pause"], 4_525_150);
         assert_eq!(ports[0].mtu, Some(9000));
         assert_eq!(ports[0].counters["port_xmit_data"], 492);
         assert_eq!(ports[0].counters["hw_counters/port_xmit_data"], 1824);
@@ -499,10 +613,9 @@ mod tests {
     #[test]
     fn wire_counter_is_cumulative_and_directional() {
         let counter = WireCounter { device: "nic".into(), port: 1, path_mtu: Some(4096), peer: OnceLock::from("peer".to_string()),
-            local_gid: "local".into(), receives_writes: AtomicBool::new(false), bytes: WireBytes::default() };
-        counter.sent(128); counter.sent(4096); counter.written(72); counter.received(64);
-        assert_eq!(counter.sample().sent_bytes, 4296);
-        assert_eq!(counter.sample().written_sent_bytes, 72);
+            local_gid: "local".into(), bytes: WireBytes::default() };
+        counter.sent(128); counter.sent(4096); counter.received(64);
+        assert_eq!(counter.sample().sent_bytes, 4224);
         assert_eq!(counter.sample().received_bytes, 64);
         assert_eq!(std::mem::align_of::<WireBytes>(), 64);
         assert_eq!((&counter.bytes as *const WireBytes as usize) % 64, 0);

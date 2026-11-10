@@ -39,19 +39,13 @@ def test_remote_exports_have_unique_paths_and_cleanup_owned_containers():
     assert 'flock -n "$slot_fd"' in text
 
 
-def test_seed_admission_after_reuse_and_no_gpu_queue():
+def test_seed_admission_after_reuse_and_release_before_gpu_queue():
     text = (ROOT / 'wip.sh').read_text()
-    assert text.index('((wip_build_expert == 0)) || wip_build_resource_acquire') > text.index('wip_reused_expert=1')
-    capped = text[text.index('wip_capped_export() {'):text.index('wip_capped_export_on() (')]
-    # The only GPU-lock path is the non-blocking placement hold, so it may run
-    # while the Spark leg holds its seed lease: nothing here can wait on a lock.
-    assert capped.count('export-placement.py" hold') == 1
-    assert 'wip_hwlock' not in capped and 'flock' not in capped and 'hwlock.py' not in capped
-    assert 'wip_build_resource_dir' not in capped
-    dispatch = text[text.index('    local mode exported=0'):text.index('    ((exported)) || release_die')]
-    assert 'wip_hwlock' not in dispatch and 'wait-remote)' in dispatch
-    assert '[[ "$seed_host" != kakapo ]]' not in capped
-    assert text.index('distribute_expert_slot\nwip_resource_complete=1') < text.rindex('wip_build_resource_release')
+    flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
+    assert flow.index('build_coordinator rust') < flow.index('wip_build_resource_acquire')
+    assert flow.index('build_expert') < flow.index('wip_build_resource_release')
+    assert flow.index('wip_build_resource_release') < flow.index('wip_distribute_sealed_expert') < flow.index('build_coordinator native')
+    assert text.index('wip_build_selected_roles\n') > text.index('wip_reused_expert=1')
 
 
 def test_every_fingerprinted_build_input_reaches_both_build_containers():
@@ -68,7 +62,7 @@ def test_every_fingerprinted_build_input_reaches_both_build_containers():
         if name not in consumed:
             continue
         assert name in coordinator, f'{name} is fingerprinted but not passed to the coordinator build'
-    assert 'CUTEAFD_WIP_EXL3_BITS' in spark
+    assert 'CUTEAFD_WIP_EXL3_BITS' not in spark
 
 
 def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
@@ -88,3 +82,89 @@ def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
         assert f'-e "{variable}=${{{variable}:-OFF}}"' in launcher
         build = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
         assert f'-DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${{{variable}:-OFF}}" || echo OFF)"' in build
+
+
+def test_exl3_release_exports_named_families_and_compact_companions():
+    cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
+    release = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
+    assert 'CUTEAFD_V41_EXL3_BIT_FAMILIES' not in cmake
+    assert 'CUTEAFD_RELEASE_EXL3_BIT_FAMILIES' not in release
+    assert 'release_family_list' in release
+    assert '--compact-companions' in cmake
+
+
+def test_spark_exec_forwards_context_admission_inputs():
+    wip = (ROOT / 'wip.sh').read_text()
+    remote = wip.split('ensure_remote_container() {', 1)[1].split('\nREMOTE\n}', 1)[0]
+    assert 'run -d --init --name "$container"' in remote
+    assert '--user "$(id -u):$(id -g)"' in remote
+    spark = wip.split('build_command="docker exec', 1)[1].split('\n', 1)[0]
+    assert 'CUTEAFD_EXPORT_HOST_CONTEXTS=' in spark
+    assert 'CUTEAFD_EXPORT_WORKER_RAM_MIB=' in spark
+    cards = (ROOT / 'scripts/bench/wip-cards.py').read_text()
+    scopes = cards.split('def build_scopes(cards):', 1)[1].split('def package_dir', 1)[0]
+    assert 'CMAKE_BUILD_PARALLEL_LEVEL' not in scopes
+
+
+@pytest.mark.parametrize('mode', ['release', 'wip'])
+@pytest.mark.parametrize('features', [None, '', 'jemalloc'])
+def test_coordinator_allocator_features_reach_cargo(mode, features):
+    """Execute launcher argv and the artifact script's feature selection, not grep.
+
+    Docker is replaced by a shell function that imports its actual -e arguments
+    into a clean container environment before running the real selection block.
+    No hardware, Docker daemon or compiler is contacted.
+    """
+    launcher = (ROOT / ('build.sh' if mode == 'release' else 'wip.sh')).read_text()
+    artifact = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
+    if mode == 'release':
+        start = launcher.index('timeout --foreground "$export_timeout" docker run')
+        end = launcher.index(' ||\n  coordinator_export_status=$?', start)
+        launch = launcher[start:end]
+        start = artifact.index('cargo_feature_args=()')
+        selection = artifact[start:artifact.index('\nhost_isa_jobs=()', start)]
+        setup = 'export_timeout=30\ntimeout() { shift 2; "$@"; }\n'
+        variable = 'CUTEAFD_RELEASE_COORDINATOR_FEATURES'
+    else:
+        start = launcher.index('wip_cargo_features="')
+        validation = launcher[start:launcher.index('\nwip_build_key=', start)]
+        start = launcher.index('  local -a coordinator_build=(docker exec')
+        end = launcher.index('\n  # Cargo first', start)
+        launch = launcher[start:end].replace('local -a', 'declare -a')
+        launch += '\n"${coordinator_build[@]}" rust\n'
+        start = artifact.index('cargo_features="')
+        selection = artifact[start:artifact.index('\nwip_rust_fingerprint=', start)]
+        setup = validation + '\n'
+        variable = 'CUTEAFD_WIP_CARGO_FEATURES'
+    script = '''set -eo pipefail
+release_die() { echo "$*" >&2; exit 2; }
+docker() (
+    # No host environment inheritance: the feature must cross the -e boundary.
+    unset CUTEAFD_RELEASE_COORDINATOR_FEATURES CUTEAFD_WIP_CARGO_FEATURES
+    while (($#)); do
+        if [[ "$1" == -e ]]; then export "$2"; shift 2; else shift; fi
+    done
+    role=coordinator
+''' + selection + '''
+    printf '<%s>\\n' "${cargo_feature_args[@]}"
+)
+''' + setup + launch
+    env = {k: v for k, v in os.environ.items()
+           if k not in ('CUTEAFD_RELEASE_COORDINATOR_FEATURES', 'CUTEAFD_WIP_CARGO_FEATURES')}
+    if features is not None:
+        env[variable] = features
+    result = subprocess.run(['bash', '-c', script], env=env, capture_output=True,
+                            text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == (['<--features>', '<jemalloc>'] if features else ['<>'])
+
+
+@pytest.mark.parametrize('features,expected', [('jemalloc,dev-probe', 0), ('unknown', 2)])
+def test_wip_allocator_features_keep_the_validation_allowlist(features, expected):
+    text = (ROOT / 'wip.sh').read_text()
+    start = text.index('wip_cargo_features="')
+    block = text[start:text.index('\nwip_build_key=', start)]
+    result = subprocess.run(['bash', '-c', 'release_die() { echo "$*"; exit 2; }\n' + block],
+                            env={**os.environ, 'CUTEAFD_WIP_CARGO_FEATURES': features},
+                            text=True, capture_output=True, timeout=15)
+    assert result.returncode == expected, result.stdout + result.stderr

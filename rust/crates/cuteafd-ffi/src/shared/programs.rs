@@ -128,8 +128,10 @@ pub struct Programs<'a> {
     load: LoadFn,
     launch: LaunchFn,
     programs: HashMap<String, (u32, ProgramSpec)>,
-    card_specs: HashMap<String, [ProgramSpec; 2]>,
+    /// Per-card specs of programs exported with `card_plans`, keyed by SM count.
+    card_specs: HashMap<String, Vec<(u32, ProgramSpec)>>,
     capacities: ProgramCapacities,
+    families: serde_json::Value,
 }
 
 impl NativeLibrary {
@@ -160,7 +162,7 @@ impl NativeLibrary {
             };
             programs.insert(name, (index, spec));
         }
-        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default() })
+        Ok(Programs { library: self, load, launch, programs, card_specs: HashMap::new(), capacities: ProgramCapacities::default(), families: serde_json::Value::Null })
     }
 }
 
@@ -183,6 +185,7 @@ impl<'a> Programs<'a> {
                 self.library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
         }
         self.capacities = ProgramCapacities::from_manifest(&manifest)?;
+        self.families = manifest.get("families").cloned().unwrap_or_default();
         let entries = manifest["programs"].as_array().context("manifest has no programs")?;
         ensure!(entries.len() == self.programs.len(), "manifest lists {} programs, the library {}",
             entries.len(), self.programs.len());
@@ -200,29 +203,43 @@ impl<'a> Programs<'a> {
                 spec.scratch = scratch.iter().filter_map(|(k, v)| Some((k.clone(), v.as_u64()?))).collect();
             }
             if let Some(plans) = entry["card_plans"].as_array() {
-                let mut specs = [spec.clone(), spec.clone()];
-                for (index, sms) in [170, 188].into_iter().enumerate() {
-                    let plan = plans.iter().find(|p| p["sm_count"].as_u64() == Some(sms))
-                        .context("validated card plan disappeared")?;
-                    specs[index].geometry = plan["geometry"].clone();
-                    specs[index].scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
+                let specs = plans.iter().map(|plan| {
+                    let sms = u32::try_from(plan["sm_count"].as_u64().context("card SM count")?)
+                        .context("card SM count exceeds u32")?;
+                    let mut card = spec.clone();
+                    card.geometry = plan["geometry"].clone();
+                    card.scratch = plan["scratch_bytes_at_capacity"].as_object().context("card scratch")?
                         .iter().map(|(k, v)| Ok((k.clone(), v.as_u64().context("card scratch bytes")?)))
                         .collect::<Result<_>>()?;
-                }
+                    Ok((sms, card))
+                }).collect::<Result<Vec<_>>>()?;
                 self.card_specs.insert(name.to_string(), specs);
             }
-            if name.starts_with("exlr8_") {
-                super::exlr8::validate_entry(spec, entry)?;
-                let expected: &[(&str, &str)] = match name {
-                    "exlr8_a16_grouped" => &[("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32")],
-                    "exlr8_a16_serving" | "exlr8_shared_a16_serving" => &[("rows", "int32"), ("cta_limit", "int32")],
-                    "exlr8_group" | "exlr8_shared_group" | "exlr8_grouped_group" => &[("rows", "int32"), ("cta_limit", "int32")],
-                    _ => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
-                };
-                let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
-                ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
-                    |(s, (n, t))| s["name"].as_str() == Some(*n) && s["type"].as_str() == Some(*t)),
-                    "EXLR8 scalar names or types disagree with ABI");
+            if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
+                validate_glm_stage_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_kda_projected_m")
+                || name.starts_with("glmf2_stage_kda_projected_m") {
+                super::projected_kda::validate_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_index_projected_c_m")
+                || name.starts_with("glmf2_stage_index_projected_c_m") {
+                super::projected_index::validate_entry(spec, entry)?;
+            } else if name.starts_with("glmf_stage_index_projected_keys_m")
+                || name.starts_with("glmf2_stage_index_projected_keys_m") {
+                super::projected_index::validate_keys_entry(spec, entry)?;
+            } else if (name.starts_with("glmf_stage_") || name.starts_with("glmf2_stage_"))
+                && (name.contains("_absorb_fp8_") || name.contains("_values_fp8_")) {
+                ensure!(entry["op"] == "attention_stage", "{name}: expected attention_stage");
+                super::glm_stage::validate_entry(spec, entry)?;
+            } else if name.starts_with("exlr8_dense_") {
+                // Companions (transforms, unpack, prefill GEMM, glue) by their op; the
+                // ABI-v1 linears and the embedding gather by name.
+                if super::native_dense_glue::op_of(entry)?.is_some() {
+                    super::native_dense_glue::validate_entry(spec, entry)?;
+                } else {
+                    super::native_dense::validate_entry(spec, entry)?;
+                }
+            } else if name.starts_with("exlr8_") {
+                validate_exlr8_entry(spec, entry)?;
             }
         }
         Ok(self)
@@ -240,7 +257,7 @@ impl<'a> Programs<'a> {
             if keep(&spec.name) { select(spec)?; }
         }
         for (name, specs) in &mut self.card_specs {
-            if keep(name) { for spec in specs { select(spec)?; } }
+            if keep(name) { for (_, spec) in specs { select(spec)?; } }
         }
         Ok(self)
     }
@@ -280,13 +297,20 @@ impl<'a> Programs<'a> {
         if let Some(specs) = self.card_specs.get(name) {
             let sms = self.library.sm_count()?;
             ensure!(sms > 0, "runtime SM count must be positive");
-            return Ok(&specs[usize::from(sms >= 188)]);
+            return specs.iter().find(|(count, _)| usize::try_from(*count).ok() == Some(sms)).map(|(_, spec)| spec)
+                .with_context(|| format!("program {name} has no card plan for {sms} SMs"));
         }
         Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
     }
 
     pub fn capacities(&self) -> ProgramCapacities {
         self.capacities
+    }
+
+    /// Package-owned policies accompany the program table; callers validate
+    /// their schema and linked program geometry before allocating or capturing.
+    pub fn family_metadata(&self, family: &str) -> Result<&serde_json::Value> {
+        self.families.get(family).with_context(|| format!("manifest has no family metadata for {family}"))
     }
 
     /// Resolves a program and loads its kernels on the current device.
@@ -309,6 +333,12 @@ impl<'a> Programs<'a> {
         Ok(Program { programs: self, index: *index, spec })
     }
 
+    pub fn bound(&self, name: &str, pointers: &[&str]) -> Result<BoundProgram<'a>> {
+        let program = self.program(name, pointers)?;
+        Ok(BoundProgram { _library: self.library, launch: self.launch,
+            index: program.index, spec: program.spec.clone() })
+    }
+
     pub fn library(&self) -> &'a NativeLibrary {
         self.library
     }
@@ -320,7 +350,34 @@ pub struct Program<'a> {
     spec: &'a ProgramSpec,
 }
 
-impl Program<'_> {
+/// A preloaded program whose native library, rather than the manifest reader,
+/// owns its lifetime. Useful for shared codecs retained by execution owners.
+pub struct BoundProgram<'a> {
+    _library: &'a NativeLibrary,
+    launch: LaunchFn,
+    index: u32,
+    spec: ProgramSpec,
+}
+impl BoundProgram<'_> {
+    /// # Safety
+    /// Pointers have the program's documented extents and outlive `stream`.
+    pub unsafe fn launch(&self, pointers: &[*mut c_void], scalars: &[Scalar], stream: *mut c_void) -> Result<()> {
+        ensure!(pointers.len() == self.spec.pointers.len(), "{}: pointer count", self.spec.name);
+        ensure!(scalars.len() == self.spec.scalar_kinds.len()
+            && scalars.iter().zip(&self.spec.scalar_kinds).all(|(s, k)| s.kind() == *k),
+            "{}: scalar kinds", self.spec.name);
+        let slots: Vec<u64> = scalars.iter().map(|s| s.slot()).collect();
+        // SAFETY: ABI counts/kinds checked above, extents guaranteed by caller.
+        let status = unsafe { (self.launch)(self.index, pointers.as_ptr(), slots.as_ptr(), stream) };
+        ensure!(status == 0, "{} launch failed with status {status}", self.spec.name);
+        Ok(())
+    }
+}
+impl<'a> Program<'a> {
+    pub fn bind(&self) -> BoundProgram<'a> {
+        BoundProgram { _library: self.programs.library, launch: self.programs.launch,
+            index: self.index, spec: self.spec.clone() }
+    }
     pub fn spec(&self) -> &ProgramSpec {
         self.spec
     }
@@ -347,6 +404,50 @@ impl Program<'_> {
     }
 }
 
+fn validate_glm_stage_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
+    let (name, widths) = if let Some(name) = spec.name.strip_prefix("glm_stage_") {
+        (name, [2048, 12288])
+    } else if let Some(name) = spec.name.strip_prefix("glm2_stage_") {
+        (name, [1024, 6144])
+    } else {
+        bail!("{}: unknown GLM stage table", spec.name);
+    };
+    if let Some(width) = name.strip_prefix("swiglu_i") {
+        let inter: u32 = width.parse().context("invalid GLM split-SwiGLU width")?;
+        ensure!(widths.contains(&inter) && name == format!("swiglu_i{inter}"),
+            "{}: unsupported GLM split-SwiGLU width", spec.name);
+        let op = super::native_dense_glue::validate_entry(spec, entry)?;
+        ensure!(op == super::native_dense_glue::Op::SwigluSplit { inter },
+            "{}: split-SwiGLU name and operation disagree", spec.name);
+    } else {
+        ensure!(entry["op"] == "attention_stage", "{}: expected GLM attention stage operation", spec.name);
+        super::glm_stage::validate_entry(spec, entry)?;
+    }
+    Ok(())
+}
+
+fn validate_exlr8_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<()> {
+    super::exlr8::validate_entry(spec, entry)?;
+    let (_, kind) = super::exlr8::KernelFamily::of(spec)?;
+    validate_exlr8_scalars(kind, entry)
+}
+
+fn validate_exlr8_scalars(kind: super::exlr8::KernelKind, entry: &serde_json::Value) -> Result<()> {
+    use super::exlr8::KernelKind::*;
+    let expected: &[(&str, &str)] = match kind {
+        GroupedA16 | GroupedA8 | GroupedDecode => &[
+            ("rows", "int32"), ("cta_limit", "int32"), ("unit_limit", "int32"), ("l2_bytes", "int32"),
+        ],
+        Routed | Shared | Group | SharedGroup | GroupedGroup => &[("rows", "int32"), ("cta_limit", "int32")],
+        Decode => &[("rows", "int32"), ("groups", "int32"), ("cta_limit", "int32")],
+    };
+    let scalars = entry["scalars"].as_array().context("EXLR8 scalar ABI missing")?;
+    ensure!(scalars.len() == expected.len() && scalars.iter().zip(expected).all(
+        |(s, (n, t))| s["name"].as_str() == Some(*n) && s["type"].as_str() == Some(*t)),
+        "EXLR8 scalar names or types disagree with ABI");
+    Ok(())
+}
+
 fn c_string(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
@@ -355,6 +456,149 @@ fn c_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exported_glm_stage_manifest_passes_runtime_dispatch() {
+        // Real exporter output; the Python catalogue test also rebuilds its ABI
+        // from the pinned fork's manifest builders to catch fixture drift.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/glm_stage_programs_sm120.json"
+        )).unwrap();
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 38);
+        let mut swiglu = 0;
+        for entry in entries {
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().to_owned(),
+                pointers: entry["pointers"].as_array().unwrap().iter()
+                    .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
+                scalar_kinds: b"i".to_vec(),
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                geometry: entry["geometry"].clone(),
+            };
+            validate_glm_stage_entry(&spec, entry).unwrap_or_else(|e| panic!("{}: {e}", spec.name));
+            swiglu += usize::from(entry["op"] == "swiglu_split");
+            for field in ["dtype", "shape", "role"] {
+                let mut broken = entry.clone();
+                broken["pointers"][0][field] = "invalid".into();
+                assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: {field}", spec.name);
+            }
+            let mut broken = entry.clone();
+            broken["scalars"][0]["type"] = "int64".into();
+            assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: scalar", spec.name);
+            broken = entry.clone();
+            broken["op"] = "unknown".into();
+            assert!(validate_glm_stage_entry(&spec, &broken).is_err(), "{}: op", spec.name);
+            let mut wrong_capacity = spec.clone();
+            wrong_capacity.capacity_rows = 0;
+            assert!(validate_glm_stage_entry(&wrong_capacity, entry).is_err(), "{}: capacity", spec.name);
+            let mut wrong_name = spec.clone();
+            wrong_name.name = if entry["op"] == "swiglu_split" {
+                "glm_stage_swiglu_i6144".into()
+            } else {
+                spec.name.replacen("_stage_", "_stage_unknown_", 1)
+            };
+            assert!(validate_glm_stage_entry(&wrong_name, entry).is_err(), "{}: name", spec.name);
+        }
+        assert_eq!(swiglu, 4);
+    }
+
+    #[test]
+    fn exported_exlr8_grouped_manifest_requires_runtime_l2_scalar() {
+        // Unmodified grouped entries from the SM121 p0 WIP export that exposed the seal failure.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/exlr8_grouped_programs_sm121.json"
+        )).unwrap();
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+        use super::super::exlr8::KernelFamily;
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            for exported in entries {
+                let mut entry = exported.clone();
+                if family == KernelFamily::GlmFlash {
+                    entry["name"] = entry["name"].as_str().unwrap().replacen("exlr8_", "exlr8_glmf_", 1).into();
+                    entry["geometry"]["hidden"] = 4096.into();
+                    entry["geometry"]["fc1_splits"] = 4.into();
+                    entry["geometry"]["swiglu_limit"] = 10.0.into();
+                    for pointer in entry["pointers"].as_array_mut().unwrap() {
+                        pointer["shape"] = pointer["shape"].as_str().unwrap()
+                            .replace("6144", "4096").replace(",6,", ",4,").into();
+                    }
+                    for name in ["fc1", "fc2"] {
+                        entry["scratch_bytes_at_capacity"][name] =
+                            (entry["scratch_bytes_at_capacity"][name].as_u64().unwrap() / 3 * 2).into();
+                    }
+                }
+                let spec = ProgramSpec {
+                    name: entry["name"].as_str().unwrap().to_owned(),
+                    pointers: entry["pointers"].as_array().unwrap().iter()
+                        .map(|p| p["name"].as_str().unwrap().to_owned()).collect(),
+                    scalar_kinds: b"iiii".to_vec(),
+                    scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                        .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                    capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                    geometry: entry["geometry"].clone(),
+                };
+                validate_exlr8_entry(&spec, &entry).unwrap();
+                for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
+                    let mut broken = entry.clone();
+                    let scalars = broken["scalars"].as_array_mut().unwrap();
+                    match defect {
+                        "missing" => { scalars.pop(); }
+                        "renamed" => scalars[3]["name"] = "l2_size".into(),
+                        "wrong_type" => scalars[3]["type"] = "int64".into(),
+                        "reordered" => scalars.swap(2, 3),
+                        "extra" => scalars.push(serde_json::json!({"name": "extra", "type": "int32"})),
+                        _ => unreachable!(),
+                    }
+                    let error = validate_exlr8_entry(&spec, &broken).unwrap_err();
+                    assert!(error.to_string().contains("EXLR8 scalar names or types disagree with ABI"),
+                        "{} {defect}: {error}", spec.name);
+                }
+            }
+    }
+    }
+
+    #[test]
+    fn exlr8_scalar_layouts_follow_typed_kind_for_both_families() {
+        use super::super::exlr8::{KernelFamily, KernelKind::*};
+        for family in [KernelFamily::Glm, KernelFamily::GlmFlash] {
+            for (kind, expected) in [
+                (Decode, vec!["rows", "groups", "cta_limit"]),
+                (Routed, vec!["rows", "cta_limit"]),
+                (Shared, vec!["rows", "cta_limit"]),
+                (Group, vec!["rows", "cta_limit"]),
+                (SharedGroup, vec!["rows", "cta_limit"]),
+                (GroupedGroup, vec!["rows", "cta_limit"]),
+                (GroupedA16, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+                (GroupedA8, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+                (GroupedDecode, vec!["rows", "cta_limit", "unit_limit", "l2_bytes"]),
+            ] {
+                let spec = ProgramSpec { name: family.program(kind).into(), pointers: Vec::new(),
+                    scalar_kinds: vec![b'i'; expected.len()], scratch: Default::default(),
+                    capacity_rows: 64, geometry: serde_json::json!({}) };
+                let (_, resolved) = KernelFamily::of(&spec).unwrap();
+                let entry = serde_json::json!({"scalars": expected.iter().map(|name|
+                    serde_json::json!({"name": name, "type": "int32"})).collect::<Vec<_>>()});
+                validate_exlr8_scalars(resolved, &entry).unwrap();
+                for defect in ["missing", "renamed", "wrong_type", "reordered", "extra"] {
+                    let mut broken = entry.clone();
+                    let scalars = broken["scalars"].as_array_mut().unwrap();
+                    match defect {
+                        "missing" => { scalars.pop(); }
+                        "renamed" => scalars[0]["name"] = "unknown".into(),
+                        "wrong_type" => scalars[0]["type"] = "int64".into(),
+                        "reordered" => scalars.swap(0, 1),
+                        "extra" => scalars.push(serde_json::json!({"name":"extra", "type":"int32"})),
+                        _ => unreachable!(),
+                    }
+                    assert!(validate_exlr8_scalars(resolved, &broken).is_err(), "{} {defect}", spec.name);
+                }
+            }
+        }
+    }
 
     #[test]
     fn scalar_slots() {
@@ -518,6 +762,165 @@ impl NativeLibrary {
         let f = *unsafe { self.lib.get::<Dequant>(b"cuteafd_fp8_block_dequant") }?;
         let status = unsafe { f(w, scale, out, i32::try_from(rows)?, i32::try_from(cols)?, stream) };
         ensure!(status == 0, "FP8 block dequantization failed with {status}");
+        Ok(())
+    }
+
+    /// Load-time BF16 -> E4M3 quantization of `count` scale units (the `Job`
+    /// ABI of native/shared/cuda/fp8_load_quant.h), each reading device-visible
+    /// (pinned or mapped host) source fragments and writing its final rows and
+    /// scales; bit-for-bit the coordinator loaders' host rule.
+    ///
+    /// # Safety
+    /// `jobs` holds `count` valid jobs in device-visible memory; every source,
+    /// value and scale pointer they name stays live and unaliased until the
+    /// stream drains. Values and scales are on the stream's device.
+    pub unsafe fn fp8_load_quant(&self, jobs: *const c_void, count: usize, stream: *mut c_void) -> Result<()> {
+        type Quant = unsafe extern "C" fn(*const c_void, i32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Quant>(b"cuteafd_fp8_load_quant") }?;
+        let status = unsafe { f(jobs, i32::try_from(count)?, stream) };
+        ensure!(status == 0, "FP8 load quantization failed with {status}");
+        Ok(())
+    }
+
+    /// BF16 `src` (device-visible, e.g. pinned host) widened to F32 `dst` (exact).
+    ///
+    /// # Safety
+    /// `src` holds `n` BF16 values and `dst` `n` F32 on the stream's device, live until it drains.
+    pub unsafe fn load_widen_bf16_f32(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_load_widen_bf16_f32") }?;
+        let status = unsafe { f(src, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load widening failed with {status}");
+        Ok(())
+    }
+
+    /// `n` F32 values in `src` (device-visible) narrowed to BF16 (round to
+    /// nearest even, NaN quieted) into `dst` on the current device.
+    ///
+    /// # Safety
+    /// `src` holds `n` F32 and `dst` room for `n` BF16, live through the stream.
+    pub unsafe fn load_narrow_f32_bf16(&self, src: *const c_void, dst: *mut c_void, n: usize, stream: *mut c_void)
+        -> Result<()> {
+        let narrow = self.f32_bf16_narrow()?;
+        // SAFETY: caller provides the typed live storage on the current device.
+        unsafe { narrow.launch(src, dst, n, stream) }
+    }
+
+    /// `n` BF16 pairs `a[i]`, `b[i]` (device-visible) promoted to F32 and
+    /// multiplied once into `dst` (F32) on the current device.
+    ///
+    /// # Safety
+    /// `a` and `b` hold `n` BF16 and `dst` room for `n` F32, live through the stream.
+    pub unsafe fn load_bf16_product_f32(&self, a: *const c_void, b: *const c_void, dst: *mut c_void, n: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Product = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Product>(b"cuteafd_load_bf16_product_f32") }?;
+        let status = unsafe { f(a, b, dst, i64::try_from(n)?, stream) };
+        ensure!(status == 0, "BF16 load product failed with {status}");
+        Ok(())
+    }
+
+    /// Staged EXL3 trellis rows (`rows` K16 rows of `tiles` 16x16 tiles of
+    /// `tile_bytes`, checkpoint order) reordered into a native shard `dst` of
+    /// `k16` K16 rows at local row `k0`: `side` 0 output [N128][K16][8],
+    /// 1 input [K128][N128][8][8] (`cuteafd_load_quant::trellis_tile`).
+    ///
+    /// # Safety
+    /// `src` (device-visible) holds the staged rows and `dst` (current device)
+    /// the whole shard, both live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_trellis_tiles(&self, src: *const c_void, dst: *mut c_void, rows: usize, k0: usize,
+        tiles: usize, tile_bytes: usize, side: i32, k16: usize, stream: *mut c_void) -> Result<()> {
+        type Tiles = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, i64, i64, i32, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Tiles>(b"cuteafd_load_trellis_tiles") }?;
+        let status = unsafe { f(src, dst, i64::try_from(rows)?, i64::try_from(k0)?, i64::try_from(tiles)?,
+            i64::try_from(tile_bytes)?, side, i64::try_from(k16)?, stream) };
+        ensure!(status == 0, "EXL3 trellis tile reorder failed with {status}");
+        Ok(())
+    }
+
+    /// MLA `kv_b` [heads * (nope + v), lat] (BF16, device-visible) absorbed per head
+    /// into `uk` [heads][lat][nope] and `uv` [heads][v][lat] for heads `h0..h0 + heads`.
+    ///
+    /// # Safety
+    /// `kv_b` holds the whole tensor; `uk`/`uv` hold `heads` heads on the stream's
+    /// device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_absorb(&self, kv_b: *const c_void, uk: *mut c_void, uv: *mut c_void, h0: usize,
+        heads: usize, nope: usize, v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Absorb = unsafe extern "C" fn(*const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Absorb>(b"cuteafd_load_kvb_absorb") }?;
+        let status = unsafe { f(kv_b, uk, uv, i64::try_from(h0)?, i64::try_from(heads)?, i64::try_from(nope)?,
+            i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "kv_b load absorption failed with {status}");
+        Ok(())
+    }
+
+    /// FP8 MLA `kv_b` rows of `heads` heads (E4M3 `[heads * (nope + v), lat]`, the
+    /// first at kv_b row `row0`) with the whole tensor's FP32 128x128 `grid` (both
+    /// device-visible) split per head into the GLM FP8 programs' `uk`
+    /// `[heads][lat][nope]` + `uk_scale` `[heads][lat][nope / 64]` and `uv`
+    /// `[heads][v][lat]` + `uv_scale` `[heads][v][lat / 64]`: bytes unchanged,
+    /// scales the grid entry of each 64-wide tile.
+    ///
+    /// # Safety
+    /// `kv_b` holds the staged heads' rows and `grid` the whole grid; the four outputs hold `heads`
+    /// heads on the stream's device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_split_fp8(&self, kv_b: *const c_void, grid: *const c_void, uk: *mut c_void,
+        uk_scale: *mut c_void, uv: *mut c_void, uv_scale: *mut c_void, row0: usize, heads: usize, nope: usize,
+        v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Split = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, *mut c_void,
+            *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Split>(b"cuteafd_load_kvb_split_fp8") }?;
+        let status = unsafe { f(kv_b, grid, uk, uk_scale, uv, uv_scale, i64::try_from(row0)?, i64::try_from(heads)?,
+            i64::try_from(nope)?, i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "FP8 kv_b split failed with {status}");
+        Ok(())
+    }
+
+    /// The load-quantization `Job` ABI: (job bytes, segment bytes, max columns).
+    pub fn fp8_load_quant_abi(&self) -> Result<(u64, u64, u64)> {
+        type Abi = unsafe extern "C" fn(*mut u64, *mut u64, *mut u64) -> i32;
+        let f = *unsafe { self.lib.get::<Abi>(b"cuteafd_fp8_load_quant_abi") }?;
+        let (mut job, mut segment, mut cols) = (0, 0, 0);
+        // SAFETY: three writable u64 outputs.
+        let status = unsafe { f(&mut job, &mut segment, &mut cols) };
+        ensure!(status == 0, "FP8 load quantization ABI query failed with {status}");
+        Ok((job, segment, cols))
+    }
+
+    /// FP32 128x128 block `grid` [ceil(rows/128), kb] widened to per-row scales
+    /// stored K-block major, `kmajor` [kb, rows] (exact gather).
+    ///
+    /// # Safety
+    /// Both pointers are live device memory of those shapes on the stream's device.
+    pub unsafe fn fp8_grid_kmajor(&self, grid: *const c_void, kmajor: *mut c_void, rows: usize, kb: usize,
+        stream: *mut c_void) -> Result<()> {
+        type Widen = unsafe extern "C" fn(*const c_void, *mut c_void, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Widen>(b"cuteafd_fp8_grid_kmajor") }?;
+        let status = unsafe { f(grid, kmajor, i64::try_from(rows)?, i64::try_from(kb)?, stream) };
+        ensure!(status == 0, "FP8 K-major grid widening failed with {status}");
+        Ok(())
+    }
+
+    /// Per-row FP32 scales gathered from `grid` [*, grid_cols] (columns
+    /// `col0..col0 + kb` of row `index[r]`, or zero for `u32::MAX`) into
+    /// `row_major` [rows, kb] and/or `k_major` [kb, rows] (null to skip).
+    ///
+    /// # Safety
+    /// Every non-null pointer is a live device buffer of its shape (`index`:
+    /// `rows` u32) on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_scale_gather(&self, grid: *const c_void, index: *const c_void, row_major: *mut c_void,
+        k_major: *mut c_void, rows: usize, kb: usize, grid_cols: usize, col0: usize, stream: *mut c_void) -> Result<()> {
+        type Gather = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, i64, i64, i64, i64,
+            *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Gather>(b"cuteafd_load_scale_gather") }?;
+        let status = unsafe { f(grid, index, row_major, k_major, i64::try_from(rows)?, i64::try_from(kb)?,
+            i64::try_from(grid_cols)?, i64::try_from(col0)?, stream) };
+        ensure!(status == 0, "load-time scale gather failed with {status}");
         Ok(())
     }
 

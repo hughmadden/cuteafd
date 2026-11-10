@@ -4,68 +4,11 @@
 #include <stdint.h>
 #include "cuteafd_router.h"
 #ifdef CUTEAFD_HAVE_V41_ROUTER_AOT
-#include "v41_router_dispatch.h"
 extern "C" int32_t cuteafd_v41_router_scores_aot(const uint16_t*,const uint16_t*,float*,int32_t,int32_t,void*);
 #else
 extern "C" int32_t cuteafd_v41_router_initialize() { return 0; }
 #endif
 namespace {
-__global__ void score_kernel(const __nv_bfloat16* hidden,const __nv_bfloat16* weight,float* scores,int experts) {
-  const uint64_t row=blockIdx.y,expert=blockIdx.x;
-  const int tid=threadIdx.x;
-  float sum=0;
-  for(int col=tid;col<5120;col+=256)
-    sum=fmaf(__bfloat162float(hidden[row*5120+col]),__bfloat162float(weight[expert*5120+col]),sum);
-  __shared__ float partial[256];partial[tid]=sum;__syncthreads();
-  for(int stride=128;stride;stride>>=1) {if(tid<stride) partial[tid]+=partial[tid+stride];__syncthreads();}
-  if(tid==0) {
-    const float logit=partial[0];
-    scores[row*experts+expert]=sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
-  }
-}
-// Decode-sized batches: one block per expert computes every row, so each
-// expert's weight row is read once instead of once per row. Each thread keeps
-// the same strided column subset and the same fmaf order, and the shared tree
-// is identical, so scores are bitwise equal to `score_kernel`.
-constexpr int kScoreRowsMax=16;
-__global__ void __launch_bounds__(256) score_rows_kernel(const __nv_bfloat16* hidden,
-    const __nv_bfloat16* weight,float* scores,int experts,int rows) {
-  const uint64_t expert=blockIdx.x;
-  const int tid=threadIdx.x;
-  float sum[kScoreRowsMax];
-#pragma unroll
-  for(int r=0;r<kScoreRowsMax;++r) sum[r]=0;
-  // 5120/256 = 20 columns per thread, fully unrolled so every load issues
-  // before the dependent fmaf chain (the chain order itself is unchanged).
-  float w[20];
-#pragma unroll
-  for(int k=0;k<20;++k) w[k]=__bfloat162float(weight[expert*5120+tid+256*k]);
-#pragma unroll
-  for(int r=0;r<kScoreRowsMax;++r) {
-    if(r<rows) {
-      float x[20];
-#pragma unroll
-      for(int k=0;k<20;++k) x[k]=__bfloat162float(hidden[uint64_t(r)*5120+tid+256*k]);
-#pragma unroll
-      for(int k=0;k<20;++k) sum[r]=fmaf(x[k],w[k],sum[r]);
-    }
-  }
-  __shared__ float partial[kScoreRowsMax][256];
-#pragma unroll
-  for(int r=0;r<kScoreRowsMax;++r) if(r<rows) partial[r][tid]=sum[r];
-  __syncthreads();
-  for(int stride=128;stride;stride>>=1) {
-    if(tid<stride) {
-#pragma unroll
-      for(int r=0;r<kScoreRowsMax;++r) if(r<rows) partial[r][tid]+=partial[r][tid+stride];
-    }
-    __syncthreads();
-  }
-  if(tid<rows) {
-    const float logit=partial[tid][0];
-    scores[uint64_t(tid)*experts+expert]=sqrtf(logit>20.0f?logit:log1pf(expf(logit)));
-  }
-}
 // Top-k with warp-shuffle argmax rounds. The winner of each round is the
 // largest corrected score with the lowest expert index on ties, exactly as in
 // the shared-memory tree of `select_kernel`, so selections are identical.
@@ -265,6 +208,33 @@ bool span(const void* p,uint64_t n,int alignment) {
 bool disjoint(const void* a,uint64_t n,const void* b,uint64_t m) {
   auto x=reinterpret_cast<uintptr_t>(a),y=reinterpret_cast<uintptr_t>(b);return x+n<=y || y+m<=x;
 }
+// Route census: each block bins its share of the live routes in shared memory,
+// then adds its nonzero bins to the selected plane's layer row.
+constexpr int kCensusThreads=256;
+__global__ void __launch_bounds__(kCensusThreads) route_census_kernel(const uint32_t* __restrict__ ids,
+    const uint8_t* __restrict__ live,int routes,int topk,const uint8_t* __restrict__ phase,
+    unsigned long long* __restrict__ counts,int layer,int layers,int experts) {
+  extern __shared__ uint32_t bins[];
+  for(int e=threadIdx.x;e<experts;e+=blockDim.x) bins[e]=0;
+  __syncthreads();
+  for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<routes;i+=gridDim.x*blockDim.x) {
+    const uint32_t expert=ids[i];
+    if(expert<uint32_t(experts) && (live==nullptr || live[i/topk])) atomicAdd(&bins[expert],1u);
+  }
+  __syncthreads();
+  unsigned long long* row=counts+(uint64_t(*phase!=0)*layers+layer)*uint64_t(experts);
+  for(int e=threadIdx.x;e<experts;e+=blockDim.x)
+    if(bins[e]) atomicAdd(row+e,static_cast<unsigned long long>(bins[e]));
+}
+// GPU expert tier: each route's compact slot in this layer's resident set.
+constexpr int kTierThreads=256;
+__global__ void __launch_bounds__(kTierThreads) tier_slots_kernel(const uint32_t* __restrict__ ids,
+    const int32_t* __restrict__ table,int32_t* __restrict__ slots,int routes,int experts) {
+  for(int i=blockIdx.x*blockDim.x+threadIdx.x;i<routes;i+=gridDim.x*blockDim.x) {
+    const uint32_t expert=ids[i];
+    slots[i]=expert<uint32_t(experts)?table[expert]:-1;
+  }
+}
 }
 extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* weight,
     const float* bias,const float* bias_vl,const uint8_t* image_mask,float* scores,
@@ -279,28 +249,19 @@ extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* wei
   for(int i=5;i<8;++i) for(int j=0;j<i;++j) if(n[j] && !disjoint(p[i],n[i],p[j],n[j])) return cudaErrorInvalidValue;
   auto s=reinterpret_cast<cudaStream_t>(stream);
 #ifdef CUTEAFD_HAVE_V41_ROUTER_AOT
-  const int threshold=experts==384?CUTEAFD_V41_ROUTER_E384_MIN_ROWS:CUTEAFD_V41_ROUTER_E128_MIN_ROWS;
-  // Preserve the original ABI's weaker alignment contract for direct callers.
-  if(rows>=threshold && reinterpret_cast<uintptr_t>(hidden)%16==0 &&
-      reinterpret_cast<uintptr_t>(weight)%16==0 && reinterpret_cast<uintptr_t>(scores)%16==0) {
-    auto status=cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
-    if(status)return status;
+  if(reinterpret_cast<uintptr_t>(hidden)%16 || reinterpret_cast<uintptr_t>(weight)%16 ||
+      reinterpret_cast<uintptr_t>(scores)%16) return cudaErrorInvalidValue;
+  auto status=cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
+  if(status)return status;
+  // Skinny writes activated scores; the wider MMA route still writes logits.
+  if(rows<=64)
+    select_fast_kernel<false><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
+  else
     select_fast_kernel<true><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
-    return cudaGetLastError();
-  }
-#endif
-  // The single-pass form wins only for the 384-expert target router; the
-  // 128-expert draft router keeps the per-row grid, which is faster there.
-  if(experts==384 && rows<=kScoreRowsMax) {
-    score_rows_kernel<<<experts,256,0,s>>>(reinterpret_cast<const __nv_bfloat16*>(hidden),
-        reinterpret_cast<const __nv_bfloat16*>(weight),scores,experts,rows);
-  } else {
-    score_kernel<<<dim3(experts,rows),256,0,s>>>(reinterpret_cast<const __nv_bfloat16*>(hidden),
-        reinterpret_cast<const __nv_bfloat16*>(weight),scores,experts);
-  }
-  auto status=cudaGetLastError();if(status!=cudaSuccess) return status;
-  select_fast_kernel<false><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
   return cudaGetLastError();
+#else
+  return cudaErrorNotSupported;
+#endif
 }
 extern "C" int32_t cuteafd_v41_router_select_logits(float* scores,const float* bias,
     const float* bias_vl,const uint8_t* image_mask,uint32_t* ids,float* routing,
@@ -361,4 +322,39 @@ extern "C" int32_t cuteafd_router_select_softmax(const float* logits,uint32_t* i
   softmax_select_kernel<<<rows,512,0,reinterpret_cast<cudaStream_t>(stream)>>>(logits,ids,routing,experts,topk,
       route_scale,round_bf16);
   return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_route_census_count(const uint32_t* ids,const uint8_t* live,int32_t rows,int32_t topk,
+    const uint8_t* phase,uint64_t* counts,int32_t layer,int32_t layers,int32_t experts,void* stream) {
+  static_assert(sizeof(unsigned long long)==sizeof(uint64_t),"census counts are 64-bit");
+  if(rows<1 || rows>65536 || topk<1 || topk>16 || experts<1 || experts>1024 || layers<1 || layers>1024 ||
+      layer<0 || layer>=layers) return cudaErrorInvalidValue;
+  const uint64_t routes=uint64_t(rows)*topk,planes=uint64_t(2)*layers*experts*8;
+  if(!span(ids,routes*4,4) || (live && !span(live,rows,1)) || !span(phase,1,1) || !span(counts,planes,8) ||
+      !disjoint(counts,planes,ids,routes*4) || !disjoint(counts,planes,phase,1) ||
+      (live && !disjoint(counts,planes,live,rows))) return cudaErrorInvalidValue;
+  // Four routes per thread: decode waves (<= 64 rows of 6) take one block,
+  // a 4096-row prefill unit 24; never more than 32 blocks flushing bins.
+  const uint64_t wanted=(routes+4*kCensusThreads-1)/(4*kCensusThreads);
+  const int blocks=int(wanted<32?wanted:32);
+  route_census_kernel<<<blocks,kCensusThreads,experts*sizeof(uint32_t),reinterpret_cast<cudaStream_t>(stream)>>>(
+      ids,live,int(routes),topk,phase,reinterpret_cast<unsigned long long*>(counts),layer,layers,experts);
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_v41_tier_slots(const uint32_t* ids,const int32_t* slot_of,int32_t* slots,
+    int32_t routes,int32_t layer,int32_t layers,int32_t experts,void* stream) {
+  if(routes<1 || routes>65536*16 || experts<1 || experts>1024 || layers<1 || layers>1024 || layer<0 ||
+      layer>=layers) return cudaErrorInvalidValue;
+  const uint64_t bytes=uint64_t(routes)*4,tables=uint64_t(layers)*experts*4;
+  if(!span(ids,bytes,4) || !span(slot_of,tables,4) || !span(slots,bytes,4) || !disjoint(slots,bytes,ids,bytes) ||
+      !disjoint(slots,bytes,slot_of,tables)) return cudaErrorInvalidValue;
+  // A decode wave (<= 256 routes) is one block, a 4096-row prefill unit 64.
+  const uint64_t wanted=(uint64_t(routes)+kTierThreads-1)/kTierThreads;
+  const int blocks=int(wanted<64?wanted:64);
+  tier_slots_kernel<<<blocks,kTierThreads,0,reinterpret_cast<cudaStream_t>(stream)>>>(ids,
+      slot_of+uint64_t(layer)*experts,slots,routes,experts);
+  return cudaGetLastError();
+}
+extern "C" int32_t cuteafd_route_census_select(uint8_t* phase,int32_t plane,void* stream) {
+  if(!phase || (plane!=0 && plane!=1)) return cudaErrorInvalidValue;
+  return cudaMemsetAsync(phase,plane,1,reinterpret_cast<cudaStream_t>(stream));
 }

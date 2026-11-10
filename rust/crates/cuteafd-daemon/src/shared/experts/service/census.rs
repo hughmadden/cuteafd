@@ -60,7 +60,7 @@ impl Census {
             tracked_device_bytes: ledger.total(Space::Device, device) as u64,
             tracked_pinned_bytes: ledger.total(Space::Pinned, -1) as u64,
             raw_cuda_free_bytes: library.and_then(|l| l.cuda_physical_memory_info().ok()).map(|(free, _)| free as u64),
-            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); MemAvailable residency witness; cgroup-bounded headroom is an admission constraint only on unified devices; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
+            method: "same_pid_status VmHWM and raw memory-cgroup current/peak/max (lifetime peaks, not isolated attribution); same_pid_smaps (CUDA device mapping PSS, anonymous PSS, file PSS); MemAvailable residency witness; cgroup-bounded headroom constrains host-charged bytes only; GB10 device admission uses MemAvailable; raw CUDA diagnostic only; device witness explicitly selected by integrated/discrete property; host-only maps/system agreement; quiet-host qualification external".into() });
         tracing::info!(target: "cuteafd::spark_memory", record = %serde_json::to_string(self.samples.last().unwrap())?,
             "Spark process census");
         Ok(())
@@ -81,7 +81,7 @@ impl Census {
         }
         let verdict = witness_verdict(&self.samples);
         let planned_context_bytes = cuteafd_loader::placement::ArchContext::for_device(
-            "sm_121", self.samples.first().map_or(0, |s| s.system_total_bytes)).context_bytes;
+            cuteafd_core::GpuArch::Sm121, self.samples.first().map_or(0, |s| s.system_total_bytes)).context_bytes;
         tracing::info!(target: "cuteafd::spark_memory", %verdict, planned_context_bytes,
             "Spark dual-witness census qualification (quiet-host evidence required externally)");
         Ok(SparkRuntimeDetail { load_transient: vec![], allocations, process_samples: self.samples.clone(),
@@ -303,7 +303,11 @@ mod tests {
         let tail = &source[gate..];
         assert!(tail.find("cuda_device_synchronize()?").unwrap()
             < tail.find("census.sample(\"steady_after_first_expert_request\"").unwrap());
-        assert!(source.find("if skip_compute").unwrap() < source.find("executed = request.rows() > 0").unwrap());
+        // Skip-compute answers before any expert execution and is not counted as executed.
+        let serve = &source[source.find("fn request(&mut self").unwrap()..];
+        assert!(serve.find("if self.skip_compute").unwrap() < serve.find("Served { executed: request.rows() > 0 }").unwrap());
+        assert!(serve[serve.find("if self.skip_compute").unwrap()..].find("Served { executed: false }").unwrap()
+            < serve.find("Served { executed: request.rows() > 0 }").unwrap());
     }
     #[test]
     fn process_snapshot_requires_explicit_fields_and_units() {

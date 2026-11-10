@@ -10,7 +10,6 @@ pub const RETRANSMIT_WARN_PCT: f64 = 0.5;
 /// A window that moved less than this on a port is too small to judge its
 /// retransmit rate (a handful of events on a short phase reads as a big share).
 pub const RETRANSMIT_MIN_GB: f64 = 2.0;
-pub const HIGH_UTILIZATION: f64 = 0.30;
 /// RoCE sequence and recovery counters, reported raw. They overlap: one gap
 /// raises out_of_sequence at the receiver and packet_seq_err at the sender, and
 /// roce_adp_retrans counts the resulting resend; rnr_nak_retry_err is
@@ -36,7 +35,8 @@ pub enum Verdict {
     Ok,
     Warn,
     Idle,
-    Unproven,
+    // Retained reports used this label when ECN was absent. It is telemetry, not failure.
+    #[serde(alias = "unproven")]
     #[default]
     Unknown,
 }
@@ -67,6 +67,8 @@ pub struct Health {
     pub roce_mtu: u32,
     pub missing_or_reset: Vec<String>,
     pub pause: String,
+    /// Per-priority pause deltas; missing/reset counters remain absent.
+    pub pause_counters: BTreeMap<String, u64>,
 }
 
 fn counter(port: &PortSample, key: &str) -> Option<u64> {
@@ -83,7 +85,7 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
     let mut h = Health {
         retransmit_warn_pct: RETRANSMIT_WARN_PCT,
         roce_mtu: roce_mtu(after.mtu),
-        pause: "not collected".into(),
+        pause: "unavailable".into(),
         ..Default::default()
     };
     if !seconds.is_finite()
@@ -137,37 +139,31 @@ pub fn evaluate(before: &PortSample, after: &PortSample, seconds: f64) -> Health
             pct(h.retransmit_pct), pct(Some(RETRANSMIT_WARN_PCT))
         ));
     }
-    let loaded = h.utilization.is_some_and(|u| u > HIGH_UTILIZATION);
-    if loaded && h.ecn_marked_packets == Some(0) {
-        h.reasons.push("no ECN marking under load: switch queue ECN/WRED off, or the NICs aren't sending ECN-capable traffic".into());
-    } else if loaded && h.ecn_marked_packets.is_some_and(|n| n > 0) && h.cnp_handled == Some(0) {
-        h.reasons.push(
-            "ECN marks observed under load but no CNPs handled; sender backoff not demonstrated"
-                .into(),
-        );
+    for (key, value) in &after.counters {
+        if key.contains("prio") && key.ends_with("_pause") {
+            if let Some(delta) = before.counters.get(key).and_then(|old| value.checked_sub(*old)) {
+                h.pause_counters.insert(key.clone(), delta);
+            }
+        }
+    }
+    if !h.pause_counters.is_empty() {
+        h.pause = "collected per priority".into();
+    }
+    if h.moved_gb.is_some_and(|gb| gb > 0.0)
+        && after.state.as_deref().is_some_and(|s| s.contains("DOWN")) {
+        h.reasons.push("port down while used".into());
     }
     if !h.reasons.is_empty() {
         h.verdict = Verdict::Warn;
-    } else if !h.missing_or_reset.is_empty()
-        || h.utilization.is_none()
-        || before.counter_epoch != after.counter_epoch
-    {
-        h.verdict = Verdict::Unknown;
-        h.reasons.push(
-            "missing/reset counters, observation gap or changed/unavailable link rate".into(),
-        );
-    } else if h.moved_gb == Some(0.0) {
+    } else if h.moved_gb.is_some_and(|gb| gb < RETRANSMIT_MIN_GB) {
         h.verdict = Verdict::Idle;
-        h.reasons
-            .push("idle port; congestion control not exercised".into());
-    } else if h.ecn_active == Some(true) {
-        h.verdict = Verdict::Ok;
-        h.reasons
-            .push("ECN marks and handled CNPs observed; retransmits below the warning rate".into());
+        h.reasons.push("too little traffic to judge retransmits".into());
+    } else if h.retransmit_pct.is_none() {
+        h.verdict = Verdict::Unknown;
+        h.reasons.push("retransmit counters unavailable or reset".into());
     } else {
-        h.verdict = Verdict::Unproven;
-        h.reasons
-            .push("low load; ECN/backoff not demonstrated in this window".into());
+        h.verdict = Verdict::Ok;
+        h.reasons.push("retransmits below the warning rate".into());
     }
     h.reasons.push(format!("retransmits {} of packets{} (warning above {})", pct(h.retransmit_pct),
         if h.retransmit_judged || h.moved_gb.is_none() { "" } else { ", too little traffic to judge" }, pct(Some(RETRANSMIT_WARN_PCT))));
@@ -191,7 +187,6 @@ impl Verdict {
             Self::Ok => "OK",
             Self::Warn => "warn",
             Self::Idle => "idle",
-            Self::Unproven => "unproven",
             Self::Unknown => "unknown",
         }
     }
@@ -217,7 +212,6 @@ pub fn verdict<'a>(health: impl IntoIterator<Item = &'a Health>) -> Verdict {
     for state in [
         Verdict::Warn,
         Verdict::Unknown,
-        Verdict::Unproven,
         Verdict::Ok,
         Verdict::Idle,
     ] {
@@ -316,27 +310,45 @@ mod tests {
         p
     }
     #[test]
+    fn lossless_not_ect_is_healthy_across_old_utilization_cutoff() {
+        let b = port(0, 0, 0, 0);
+        for bytes in [3_597_912_500, 3_754_262_500] {
+            let mut a = port(bytes, 0, 0, 0);
+            let mut b = b.clone();
+            b.counters.insert("pfc/rx_prio3_pause".into(), 10);
+            a.counters.insert("pfc/rx_prio3_pause".into(), 5_481_806);
+            let h = evaluate(&b, &a, 1.0);
+            assert_eq!(h.verdict, Verdict::Ok);
+            assert_eq!(h.pause_counters["pfc/rx_prio3_pause"], 5_481_796);
+            assert_eq!(h.pause, "collected per priority");
+            assert!(!h.reasons.iter().any(|r| r.contains("ECN")));
+        }
+        let mut a = port(3_754_262_500, 0, 0, 0);
+        a.state = Some("1: DOWN".into());
+        assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Warn);
+    }
+    #[test]
     fn calibrated_post_ecn_and_pre_ecn() {
         let b = port(0, 0, 0, 0);
         let healthy = evaluate(&b, &port(25_000_000_000, 300_000, 4_000, 2_000), 10.0);
         assert_eq!(healthy.verdict, Verdict::Ok);
         // 2000 gaps over 50 GB at a 4 KB RoCE MTU: 0.016% of packets.
         assert_eq!(healthy.retransmit_events, Some(2_000));
-        assert_eq!(healthy.pause, "not collected");
+        assert_eq!(healthy.pause, "unavailable");
         assert!(healthy.line().contains("retransmits 0.016% of packets"), "{}", healthy.line());
         let bad = evaluate(&b, &port(25_000_000_000, 0, 4_000, 2_000_000), 2.0);
         assert_eq!(bad.verdict, Verdict::Warn);
         assert!(bad
             .reasons
             .iter()
-            .any(|r| r.starts_with("no ECN marking under load:")));
+            .any(|r| r.starts_with("retransmits")));
     }
     #[test]
     fn boundaries_low_load_and_missing_are_not_fabricated_success() {
         let b = port(0, 0, 0, 0);
         assert_eq!(
             evaluate(&b, &port(1_000_000_000, 0, 0, 0), 10.0).verdict,
-            Verdict::Unproven
+            Verdict::Ok
         );
         assert_eq!(evaluate(&b, &b, 1.0).verdict, Verdict::Idle);
         // 2 GB moved (the minimum to judge) is 488,281 packets at 4 KB; 0.5% is 2441 gaps.
@@ -350,7 +362,7 @@ mod tests {
         );
         // Under 2 GB moved: shown, never judged, however high the share.
         let small = evaluate(&b, &port(500_000_000, 1, 1, 100_000), 1.0);
-        assert_eq!(small.verdict, Verdict::Ok);
+        assert_eq!(small.verdict, Verdict::Idle);
         assert!(!small.retransmit_judged && small.retransmit_pct.unwrap() > 0.5);
         assert!(small.line().contains("too little traffic to judge") || small.reasons.iter().any(|r| r.contains("too little traffic")));
         let mut a = port(1_000_000_000, 1, 1, 0);
@@ -360,11 +372,11 @@ mod tests {
         assert_eq!(evaluate(&a, &b, 1.0).verdict, Verdict::Unknown);
         assert_eq!(
             evaluate(&b, &port(3_750_000_000, 0, 0, 0), 1.0).verdict,
-            Verdict::Unproven
+            Verdict::Ok
         );
         assert_eq!(
             evaluate(&b, &port(3_750_000_001, 0, 0, 0), 1.0).verdict,
-            Verdict::Warn
+            Verdict::Ok
         );
     }
     #[test]
@@ -449,6 +461,6 @@ mod tests {
         assert_eq!(h.retransmit_events, Some(10));
         assert_eq!(h.moved_gb, Some(2.0));
         let a = port(5_000_000_000, 1, 0, 0);
-        assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Warn);
+        assert_eq!(evaluate(&b, &a, 1.0).verdict, Verdict::Ok);
     }
 }

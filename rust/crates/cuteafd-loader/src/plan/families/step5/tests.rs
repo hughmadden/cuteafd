@@ -2,52 +2,232 @@ use super::*;
 use crate::plan::{self, checkpoint::Checkpoint, testing::{self, Tensor as FixtureTensor}, format, *};
 use serde_json::Value;
 
-fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) {
-    let source: Value = serde_json::from_str(include_str!("fixtures/official-fp8.json")).unwrap();
-    let mut config = source["config"].clone();
-    if kind == "nvfp4" {
-        config = serde_json::from_str(include_str!("fixtures/official-nvfp4-config.json")).unwrap();
-    } else if kind == "bf16" {
-        config.as_object_mut().unwrap().remove("quantization_config");
-    }
-    let mut tensors = Vec::new();
-    for (name, value) in source["tensors"].as_object().unwrap() {
-        let dtype = value[0].as_str().unwrap();
-        let shape: Vec<usize> = value[1].as_array().unwrap().iter().map(|n| n.as_u64().unwrap() as usize).collect();
-        let dtype = match dtype { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", _ => panic!("{dtype}") };
-        if kind == "bf16" && name.ends_with("weight_scale_inv") { continue; }
-        if kind == "nvfp4" && name.ends_with("weight_scale_inv") { continue; }
-        if dtype == "F8_E4M3" && kind == "nvfp4" {
-            let stem = name.strip_suffix(".weight").unwrap();
-            let [e,n,k]: [usize;3] = shape.try_into().unwrap();
-            tensors.push(testing::t(name, "U8", &[e,n,k/2]));
-            tensors.push(testing::t(format!("{stem}.weight_scale"), "F8_E4M3", &[e,n,k/16]));
-            tensors.push(testing::t(format!("{stem}.weight_scale_2"), "F32", &[e]));
-            tensors.push(testing::t(format!("{stem}.input_scale"), "F32", &[e]));
-        } else { tensors.push((name.clone(), if kind == "bf16" { "BF16" } else { dtype }, shape)); }
-    }
-    // Only originally quantized expert matrices widen in the BF16 root;
-    // all release FP32 norms/router/index weights stay FP32.
-    if kind == "bf16" {
-        for (name,dtype,_) in &mut tensors {
-            if source["tensors"][name.as_str()][0] == "F32" { *dtype = "F32"; }
-        }
-    }
-    (config,tensors)
-}
+fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) { testing::step5_fixture(kind) }
 
-pub(super) fn snapshot(kind: &str) -> tempfile::TempDir {
+pub(crate) fn snapshot(kind: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let (config,tensors) = fixture(kind);
     testing::write_snapshot(dir.path(), &config, &tensors, None);
     dir
 }
 
+fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf { testing::step5_native_manifest(dir) }
+
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
+    report_context(dir, gpus, gib, ranks, pool, 0)
+}
+
+fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>, context: u64) -> PlanReport {
+    let manifest = native_manifest(dir);
     plan::plan(dir, &PlanOptions { placement: ExpertPlacement::from_spark_ranks(ranks),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool,
-            context_tokens: pool.filter(|&n| n > 0).unwrap_or(0), ..Default::default() }),
+        draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![gib<<30;gpus], pool_tokens: pool, context_tokens: context,
+            workspace_manifest: Some(manifest), ..Default::default() }),
         ..Default::default() }).unwrap()
+}
+
+#[test]
+fn coordinator_headers_include_native_mtp_only_when_selected() -> anyhow::Result<()> {
+    use std::collections::BTreeSet;
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let off = Checkpoint::coordinator(path, false, false)?;
+        let on = Checkpoint::coordinator(path, false, true)?;
+        let inventory = Checkpoint::inventory(path)?;
+        let model = Model::open(&inventory)?;
+        let names = |cp: &Checkpoint| cp.tensors.iter()
+            .map(|tensor| tensor.meta.name.clone()).collect::<BTreeSet<_>>();
+        let off_names = names(&off);
+        let on_names = names(&on);
+        let expected_off = inventory.tensor_names().filter(|name| {
+            model.tensors.get(*name).is_some_and(|tensor| !matches!(tensor.role.component,
+                Component::Speculator | Component::SpeculatorExpert | Component::RoutedExpert
+                    | Component::Vision | Component::Audio))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert_eq!(off_names, expected_off, "MTP-off target resident set changed");
+        let predictors = inventory.tensor_names().filter(|name| {
+            (92..95).any(|layer| name.starts_with(&format!("model.layers.{layer}.")))
+        }).map(str::to_owned).collect::<BTreeSet<_>>();
+        assert!(!predictors.is_empty());
+        assert_eq!(on_names.difference(&off_names).cloned().collect::<BTreeSet<_>>(), predictors);
+        assert!(off_names.is_subset(&on_names));
+        assert_eq!(off.weight_map, on.weight_map);
+        for stage in 0..3 {
+            let layout = coordinator::RankWeightLayout::for_mtp_stage(&on, stage)?;
+            assert_eq!(layout.operands.len(), 16);
+            for operand in &layout.operands {
+                assert!(!operand.sources.is_empty(), "native operand must retain source headers");
+                for source in &operand.sources {
+                    let header = on.tensors.iter().find(|tensor| tensor.meta.name == source.meta.name)
+                        .expect("indexed predictor source must resolve to its own shard header");
+                    assert_eq!(on.weight_map.get(&source.meta.name), Some(&header.shard));
+                    assert!(!off_names.contains(&source.meta.name));
+                }
+            }
+        }
+        assert_eq!(names(&Checkpoint::coordinator(path, false, false)?), off_names);
+        eprintln!("Step-5 coordinator headers: target={} predictor={} stages=3 index_bound=true mtp_off_unchanged=true",
+            off_names.len(), predictors.len());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn native_mtp_contract_accepts_only_validated_predictor_headers() -> anyhow::Result<()> {
+    let fixture = snapshot("fp8");
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let cp = Checkpoint::coordinator(path, false, true)?;
+        let model = Model::open(&cp)?;
+        let groups = format::group_by_stem(&cp.tensors);
+        let scale = format::TensorScale { encoding: format::ScaleEncoding::F32 };
+        let mut count = 0;
+        for (stem, members) in &groups {
+            let Some(role) = STEP5.classify(model.spec(), stem) else { continue; };
+            if role.component != Component::Speculator { continue; }
+            let operand = format::detect(members)?;
+            assert!(model.accepts(&role, stem, &mut operand.clone()).is_ok(), "{stem}");
+            for mutation in 0..8 {
+                let mut wrong = operand.clone();
+                match mutation {
+                    0 => wrong.logical[0] -= 1,
+                    1 => wrong.stored[0] -= 1,
+                    2 => wrong.encoding = format::Encoding::F16,
+                    3 => wrong.global_scale = Some(scale),
+                    4 => wrong.input_scale = Some(scale),
+                    5 => wrong.scale = Some(format::BlockScale {
+                        tensor: "weight_scale_inv".into(), encoding: format::ScaleEncoding::F32,
+                        direction: format::ScaleDirection::Multiply,
+                        rows: format::RowTiling::Uniform { rows: 128 }, cols: 128, grid: vec![1, 1],
+                    }),
+                    6 => wrong.container = "F16".into(),
+                    _ => wrong.companions.push("bias".into()),
+                }
+                assert!(model.accepts(&role, stem, &mut wrong).is_err(), "{stem} mutation {mutation}");
+            }
+            for wrong in [TensorRole::layer(Component::Speculator, 91),
+                TensorRole::layer(Component::Speculator, 95), TensorRole::layer(Component::Attention, role.layer.unwrap())] {
+                assert!(model.accepts(&wrong, stem, &mut operand.clone()).is_err(), "{stem} {wrong:?}");
+            }
+            let unknown = format!("model.layers.{}.unvalidated", role.layer.unwrap());
+            assert!(model.accepts(&role, &unknown, &mut operand.clone()).is_err());
+            count += 1;
+        }
+        assert_eq!(count, 51, "only the qualified 17 operands per stage may be admitted");
+        assert!(STEP5.component_hint(Component::Speculator).is_none());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_HEADER_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> anyhow::Result<()> {
+    use crate::placement::{inventory::{self, ArchContext}, *};
+    use super::admission::{self, MarkRule, RuntimeInputs};
+    let fixture = snapshot("fp8");
+    let checkpoint_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_SNAPSHOT")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| fixture.path().to_path_buf());
+    let cp = Checkpoint::open(&checkpoint_path)?;
+    let manifest_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_MANIFEST")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| native_manifest(fixture.path()));
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    let capacity = inventory::PRO_TOTAL_BYTES;
+    let arch = ArchContext::coordinator(cuteafd_core::GpuArch::Sm120, capacity, None);
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
+        crate::families::qwen4::Qwen4KvCache::Fp8] {
+        let inputs = RuntimeInputs { spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
+            kv_format,
+            inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
+                baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
+                headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
+            rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: 1_048_576,
+            requested_pool: Some(1_048_576),
+            marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
+            pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
+                "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
+            peer_diagnostics: false, startup: vec![], onboard: None,
+        };
+        for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
+            || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
+            let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
+            assert_eq!(admitted.cache.context, 1_048_576);
+            assert_eq!(admitted.placement.pool_tokens, 1_048_576);
+            assert_eq!(admitted.marks, 2);
+            assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
+            assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+            let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+            for rank in 0..2 {
+                let target = native::rank_admission(&cp, &admitted.ownership, rank, inputs.unit_rows(), inputs.rows, inputs.logit_rows())?;
+                let item = |group| admitted.fixed.iter().find(|item| item.gpu == rank as u8 && item.group == group)
+                    .expect("native charge").bytes;
+                assert_eq!(item("Step-5 native target and head"), target.immutable + if rank == 0 { weights } else { 0 });
+                let workspace = if rank == 0 {
+                    target.workspace.max(native::mtp_forecast_workspace(inputs.unit_rows(), depth, kv_format)?)
+                } else { target.workspace };
+                assert_eq!(item("Step-5 native workspace"), workspace);
+                assert_eq!(item("Step-5 exact retained marks"), admitted.reservations[rank].marks as u64);
+                assert_eq!(item("Step-5 active sequence state"), admitted.reservations[rank].active as u64);
+            }
+            let planned = plan::plan(&checkpoint_path, &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(6),
+                draft_ownership: if depth == 0 { Some(spec::DraftOwnership::None) } else { None },
+                layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![capacity; 2], pool_tokens: inputs.requested_pool, step5_kv: kv_format,
+                    context_tokens: inputs.context, concurrency: inputs.sequences as u64,
+                    prefill_rows: inputs.unit_rows() as u64, prefill_lanes: inputs.waves as u64, headroom_bytes: 1 << 30,
+                    native_mtp_layers: depth, workspace_manifest: Some(manifest_path.clone()),
+                    mimo_prefix_entries: inputs.marks.entries as u64,
+                    mimo_prefix_mark_bytes: inputs.marks.budget_bytes,
+                    ..Default::default()
+                }), ..Default::default()
+            })?;
+            assert!(planned.wip_launchable(), "depth {depth}: {:?}", planned.hints);
+            let memory = planned.memory_layout.as_ref().expect("depth-aware Step-5 layout");
+            assert_eq!(memory.pool_tokens, admitted.placement.pool_tokens);
+            for rank in 0..2 {
+                let device = &memory.devices[rank];
+                for category in [cuteafd_core::memory_layout::Category::Weights,
+                    cuteafd_core::memory_layout::Category::Kv,
+                    cuteafd_core::memory_layout::Category::Prefix,
+                    cuteafd_core::memory_layout::Category::Workspace] {
+                    let expected = admitted.placement.items[rank].iter()
+                        .filter(|item| item.category == category).map(|item| item.bytes).sum::<u64>();
+                    let actual = device.items.iter().filter(|item| item.category == category)
+                        .map(|item| item.bytes).sum::<u64>();
+                    assert_eq!(actual, expected, "depth {depth}, rank {rank}, {category:?}");
+                }
+            }
+            let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+                .map(|item| item.bytes).sum::<u64>();
+            let by_category = (0..2).map(|rank| {
+                let mut categories = std::collections::BTreeMap::new();
+                for item in &admitted.placement.items[rank] {
+                    *categories.entry(format!("{:?}", item.category)).or_insert(0u64) += item.bytes;
+                }
+                serde_json::json!({"rank": rank, "charged": charged(&admitted, rank),
+                    "context": arch.context_bytes, "headroom": 1u64 << 30,
+                    "remaining": capacity - arch.context_bytes - (1 << 30) - charged(&admitted, rank),
+                    "categories": categories})
+            }).collect::<Vec<_>>();
+            eprintln!("Step-5 full-context forecast {}", serde_json::json!({
+                "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
+                "sequences": inputs.sequences, "rows": inputs.rows,
+                "marks": admitted.marks, "predictor_weights": weights,
+                "owners": admitted.ownership.execution().modes().iter().map(|mode| format!("{mode:?}")).collect::<Vec<_>>(),
+                "ranks": by_category }));
+        }
+        assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
+    }
+    Ok(())
 }
 
 #[test]
@@ -59,26 +239,45 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
         let dir = snapshot(quant);
         let cp = Checkpoint::open(dir.path()).unwrap();
         let cfg = Config::parse(&cp).unwrap();
-        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64).unwrap();
+        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         // Exercise unequal owner counts, a rank with no CSA, and owned SWA.
         for (ranks, policy) in [(1, 0), (2, 0), (2, 1), (2, 2)] {
             let modes: Vec<_> = (0..cfg.layers).map(|l| {
                 if ranks == 2 && !cfg.full[l] && policy != 2 { LayerMode::HeadSplit }
-                else { LayerMode::Whole { gpu: if ranks == 1 || policy == 1 { 0 }
+                else { LayerMode::Whole { gpu: if ranks == 1 || policy != 0 { 0 }
                     else { ((l / 4) % 2) as u8 }, ffn: FfnMode::Owner } }
             }).collect();
+            if ranks == 2 && policy == 2 {
+                let alternating: Vec<_> = (0..cfg.layers).map(|layer|
+                    LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }).collect();
+                let error = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&alternating, 0, 1))
+                    .unwrap_err().to_string();
+                assert!(error.contains("without an intervening head exchange"), "{error}");
+            }
             let head = if ranks == 1 { 0 } else { 1 };
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
-            assert_eq!(owners.routed_wave_ranks().unwrap(),
-                if ranks == 1 || policy == 1 { vec![0] } else { vec![0, 1] });
-            assert_eq!(owners.routed_endpoints().unwrap(),
-                if ranks == 1 || policy == 1 { 1 } else { 2 });
-            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64).unwrap();
+            assert_eq!(owners.routed_endpoints().unwrap(), 1);
+            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });
             assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
                 diagnostic.geometry.ranks[0].persistent_unit_bytes);
             let weights: Vec<_> = (0..ranks).map(|rank| RankWeightLayout::for_execution(&cp, rank, &owners).unwrap()).collect();
+            for rank in 0..ranks {
+                let rows = owners.execution().spec().rows as usize;
+                let attention = (0..cfg.layers).filter_map(|layer| {
+                    let local = owners.layer(layer, rank).unwrap();
+                    (local.query_heads > 0).then(|| native::attention_bytes(
+                        rows, cfg.full[layer], local.query_heads).unwrap())
+                }).collect::<Vec<_>>();
+                let layer_bytes = attention.iter().map(|bytes| bytes + native::ffn_region_bytes(rows, rows).unwrap())
+                    .collect::<Vec<_>>();
+                let logits = native::head_rows(rows, false);
+                let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(logits).unwrap()).unwrap() } else { 0 };
+                let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
+                assert_eq!(native::rank_admission(&cp, &owners, rank, rows, rows, logits).unwrap().workspace, expected);
+                if layer_bytes.len() > 1 { assert!(expected < layer_bytes.iter().sum::<u64>() + head_bytes); }
+            }
             for (layer, &mode) in modes.iter().enumerate() {
                 let mut attention = Vec::new();
                 let mut ffns = Vec::new();
@@ -137,20 +336,21 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "model.embed_tokens.weight"), rank == 0);
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "lm_head.weight"), rank == head as usize);
                 for frontier in [0, 63, 64, 65, 575, 576, 1024] {
-                    let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                    let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                     let expected = 8 + state.sliding.iter().map(|s| 2 * frontier.min(512) * s.key.bytes / layout.ring.rows).sum::<u64>()
                         + state.regions.len() as u64 * (2 * 8 * 256 * 2 + frontier / 8 * 256);
                     assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
-                    let copies = layout.snapshot_copies(rank, frontier, 3, 2, 4, 3).unwrap();
+                    let copies = layout.snapshot_copies(rank, frontier, &[], 3, 2, 4, 3).unwrap();
                     assert_eq!(copies.iter().map(|s| s.active.bytes).sum::<u64>(), expected);
                     assert!(copies.iter().all(|c| c.active.offset + c.active.bytes <= state.bytes * 3
                         && c.mark.offset >= state.bytes * 3 && c.mark.offset + c.mark.bytes <= state.bytes * 4));
                     assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), cost.persistent_unit_bytes / 64 * (frontier % 64));
                 }
             }
-            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64).unwrap();
+            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             for (rank, state) in mtp.ranks.iter().enumerate() {
                 assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
+                assert_eq!(state.mtp_stage_hidden.len(), if rank == head as usize { 3 } else { 0 });
                 assert_eq!(state.sliding.iter().filter(|s| s.mtp).count(), if rank == head as usize { 3 } else { 0 });
             }
         }
@@ -182,7 +382,7 @@ fn execution_ownership_refuses_unbound_modes_and_checkpoint_changes() {
     let mut changed = cfg.clone();
     changed.full[3] = false;
     assert!(owners.validate_config(&changed).is_err());
-    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64).is_err());
+    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
 }
 
 #[test]
@@ -228,37 +428,111 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
         LayerMode::Whole { gpu: ((layer / 4) % 2) as u8, ffn: FfnMode::Owner }
     } else { LayerMode::HeadSplit }).collect();
     let ownership = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
-    let copies = ownership.routed_replications(0).unwrap();
-    assert_eq!(copies.iter().flatten().count(), 66);
-    for (ordinal, (layer, copy)) in copies.iter().enumerate().filter_map(|(l, c)| c.map(|c| (l, c))).enumerate() {
+    let copies = ownership.routed_replications().unwrap();
+    assert_eq!(copies.iter().flatten().count(), 77);
+    for (layer, copy) in copies.iter().enumerate().filter_map(|(l, c)| c.map(|c| (l, c))) {
         assert_eq!(copy.source, 0);
-        assert_eq!(copy.slot, 4 + ordinal % 2);
+        assert_eq!(copy.slot, if cfg.full[layer] { 5 } else { 4 });
         assert_eq!(copy.storage, layer + 1);
-        assert!(cfg.moe[layer] && !cfg.full[layer]);
+        assert!(cfg.moe[layer]);
     }
     ownership.execution().validate_routed_replications(&copies).unwrap();
-    assert!(ownership.routed_replications(1).is_err());
-    let mut spec = ownership.execution().spec();
-    spec.lanes = 2;
-    let mut placement = crate::placement::Placement {
-        pool_tokens: 0, pool_limits: crate::placement::PoolLimits(vec![]),
-        attention_placement: crate::placement::AttentionPlacement::Layers, attention_by_kind: vec![],
-        peer_row_bytes: 0, onboard_layers: 0,
-        layers: modes.iter().map(|&mode| crate::placement::LayerAssignment {
-            mode, experts: crate::placement::ExpertHome::Spark }).collect(),
-        movables: vec![], expert_ranges: vec![], residual: ownership.execution().homes().to_vec(),
-        hops: vec![], tp2: None, items: vec![],
-    };
-    placement.hops = crate::placement::plan_hops(&modes, &spec).unwrap();
-    let two = ExecutionOwnership::new(&cfg, 2,
-        crate::placement::LayerExecutionPlan::new(&placement, spec).unwrap()).unwrap();
-    let lanes = [two.routed_replications(0).unwrap(), two.routed_replications(1).unwrap()];
-    for copy in lanes[0].iter().flatten() {
-        assert!(lanes[1].iter().flatten().all(|peer| peer.slot != copy.slot && peer.storage != copy.storage));
+    assert_eq!(ownership.routed_endpoints().unwrap(), 1);
+}
+
+#[test]
+fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
+    for depth in 0..=3 {
+        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256, 256, kv_format).unwrap();
+        let state = &layout.ranks[0];
+        assert_eq!(state.mtp_stage_hidden.len(), depth);
+        assert!(layout.ranks[1].mtp_stage_hidden.is_empty());
+        if depth == 0 {
+            assert_eq!(layout.mtp_hidden_rows, 0);
+            assert!(state.mtp_hidden.is_none());
+            continue;
+        }
+        assert_eq!(layout.mtp_hidden_rows, 832);
+        let histories = state.mtp_stage_hidden.iter().copied().chain(state.mtp_hidden)
+            .collect::<Vec<_>>();
+        assert_eq!(histories.iter().map(|span| span.bytes).sum::<u64>(),
+            832 * 4096 * (4 * depth as u64 + 2));
+        for (index, span) in histories.iter().enumerate() {
+            assert!(histories[index + 1..].iter().all(|other|
+                span.offset + span.bytes <= other.offset || other.offset + other.bytes <= span.offset));
+            assert!(span.offset + span.bytes <= state.bytes);
+        }
+        for frontier in [0u64, 511, 512, 831, 832, 1 << 20] {
+            let stages: Vec<_> = (0..depth).map(|stage| frontier.saturating_sub(stage as u64 + 1)).collect();
+            let copies = layout.snapshot_copies(0, frontier, &stages, 16, 15, 32, 31).unwrap();
+            for (component, end) in std::iter::once((state.mtp_hidden.unwrap(), frontier))
+                .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {
+                let at = component.offset * 16 + component.bytes * 15;
+                let retained = copies.iter().filter(|c| c.active.offset >= at
+                    && c.active.offset < at + component.bytes).map(|c| c.active.bytes).sum::<u64>();
+                assert_eq!(retained, end.min(512 + depth as u64 + 1) * component.bytes / layout.mtp_hidden_rows);
+                assert!(retained < component.bytes, "proposal slack must not enter a mark");
+            }
+            assert!(layout.snapshot_spans(0, frontier, &stages).is_ok());
+        }
+        // An entire proposed wave must not overwrite any history needed by
+        // the previous frontier, including all shifted teacher-forced inputs.
+        let retained = 512 + depth as u64 + 1;
+        for base in [retained, 831, 832, 2 * 832, 1 << 20] {
+            let old = (base - retained..base).map(|p| p % layout.mtp_hidden_rows)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!((base..base + 256).all(|p| !old.contains(&(p % layout.mtp_hidden_rows))));
+        }
     }
-    assert!(two.routed_replications(2).is_err());
-    assert_eq!(ownership.routed_endpoints().unwrap(), 2);
-    assert_eq!(two.routed_endpoints().unwrap(), 4);
+    }
+}
+
+#[test]
+fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
+    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format).unwrap();
+    let state = &layout.ranks[0];
+    for stages in [[600, 0, 0], [600, 598, 0], [600, 598, 597]] {
+        let copies = layout.snapshot_copies(0, 603, &stages, 1, 0, 1, 0).unwrap();
+        for (stage, &end) in stages.iter().enumerate() {
+            let ring = state.sliding.iter().find(|s| s.layer == 92 + stage).unwrap();
+            for (component, rows, keep) in [(ring.key, layout.ring.rows, 512),
+                (ring.value, layout.ring.rows, 512),
+                (state.mtp_stage_hidden[stage], layout.mtp_hidden_rows, 516)] {
+                let stride = component.bytes / rows;
+                let mut retained = Vec::new();
+                for copy in copies.iter().filter(|c| c.active.offset >= component.offset
+                    && c.active.offset < component.offset + component.bytes) {
+                    assert_eq!(copy.active.bytes % stride, 0);
+                    for row in 0..copy.active.bytes / stride {
+                        let source = (copy.active.offset - component.offset) / stride + row;
+                        let canonical = (copy.mark.offset - component.offset) / stride + row;
+                        retained.push((canonical, source));
+                    }
+                }
+                retained.sort_unstable();
+                let expected: Vec<_> = (end.saturating_sub(keep)..end).enumerate()
+                    .map(|(canonical, logical)| (canonical as u64, logical % rows)).collect();
+                assert_eq!(retained, expected);
+                let proposed: std::collections::BTreeSet<_> = (end..end + 64).map(|p| p % rows).collect();
+                assert!(retained.iter().all(|(_, source)| !proposed.contains(source)),
+                    "rejected rows may never enter a canonical mark");
+            }
+        }
+    }
+    for invalid in [vec![], vec![600], vec![603, 0, 0], vec![600, 601, 0], vec![600, 598, 599]] {
+        assert!(layout.snapshot_spans(0, 603, &invalid).is_err());
+    }
+    }
 }
 
 #[test]
@@ -267,10 +541,24 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let dir = snapshot("fp8");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Model::open(&cp).unwrap().cfg;
+    for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
     for ranks in [1, 2] {
-        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64).unwrap();
-        assert_eq!(layout.mtp_hidden_rows, 516);
+        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64, 64, kv_format).unwrap();
+        assert_eq!(layout.mtp_hidden_rows, 640);
+        assert_eq!(layout.ranks[0].mtp_stage_hidden.len(), 3);
+        assert!(layout.ranks[0].mtp_stage_hidden.iter().all(|span| span.bytes == 640 * 4096 * 4));
         assert_eq!(layout.window(), 512);
+        assert_eq!(layout.kv_format, kv_format);
+        for state in &layout.ranks {
+            for ring in &state.sliding {
+                let groups = if ring.mtp { 4 } else { 4 / ranks };
+                let row = kv_format.plane_record_bytes(groups, 192) as u64;
+                assert_eq!(ring.key.bytes, layout.ring.rows * row);
+                assert_eq!(ring.value.bytes, layout.ring.rows * row);
+            }
+            assert!(state.regions.iter().all(|r|
+                r.page_bytes == PAGE_ROWS * kv_format.plane_record_bytes(4 / ranks, 192) as u64));
+        }
         assert_eq!(layout.capture_reach(), 0);
         assert_eq!(layout.geometry.logical_unit_rows, PAGE_ROWS);
         let summaries: u64 = layout.ranks[0].regions.iter().map(|r| r.summaries.unwrap().bytes).sum();
@@ -287,13 +575,15 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             assert_eq!(geometry.retained_mark_bytes, state.bytes);
             assert_eq!(geometry.active_state_per_sequence_bytes, state.bytes);
             for frontier in [0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1 << 20] {
-                let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
                 let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
-                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
+                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20, &vec![0; state.mtp_lengths.len()]).unwrap().iter().map(|s| s.bytes).sum();
                 let missing_rings: u64 = state.sliding.iter().filter(|s| !s.mtp)
                     .map(|s| 2 * (512 - frontier.min(512)) * s.key.bytes / layout.ring.rows).sum();
-                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings;
+                let missing_history = state.mtp_hidden.map_or(0, |span|
+                    (516 - frontier.min(516)) * span.bytes / layout.mtp_hidden_rows);
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings - missing_history;
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
@@ -301,7 +591,7 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                     for component in [ring.key, ring.value] {
                         let retained: u64 = spans.iter().filter(|s| s.offset >= component.offset
                             && s.offset < component.offset + component.bytes).map(|s| s.bytes).sum();
-                        assert_eq!(retained, if ring.mtp { component.bytes }
+                        assert_eq!(retained, if ring.mtp { 0 }
                             else { frontier.min(512) * component.bytes / layout.ring.rows });
                     }
                 }
@@ -313,17 +603,17 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             }
         }
         let (slots, arena) = layout.prefix_arena_bytes(16, 20, 2 << 30).unwrap();
-        assert_eq!(slots, 34);
-        assert!(arena.iter().sum::<u64>() > 2 << 30);
+        assert_eq!(slots, (2 << 30) / layout.ranks.iter().map(|r| r.bytes).sum::<u64>());
+        assert!(arena.iter().sum::<u64>() <= 2 << 30);
         assert_eq!(arena[0], slots * layout.ranks[0].bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
-        assert!(layout.snapshot_spans(ranks, 0).is_err());
-        assert!(layout.snapshot_spans(0, (1 << 20) + 1).is_err());
+        assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());
+        assert!(layout.snapshot_spans(0, (1 << 20) + 1, &[0; 3]).is_err());
         assert!(layout.csa_tail_bytes(0, 65).is_err());
         let mut occupied = Vec::new();
         for sequence in 0..3 {
-            let copies = layout.snapshot_copies(0, 65, 3, sequence, 4, sequence).unwrap();
-            let spans = layout.snapshot_spans(0, 65).unwrap();
+            let copies = layout.snapshot_copies(0, 65, &[0; 3], 3, sequence, 4, sequence).unwrap();
+            let spans = layout.snapshot_spans(0, 65, &[0; 3]).unwrap();
             assert_eq!(copies.len(), spans.len());
             for (copy, span) in copies.iter().zip(spans) {
                 assert!(copy.mark.offset >= sequence * layout.ranks[0].bytes
@@ -339,13 +629,14 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         }
         occupied.sort_unstable();
         assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
-        assert!(layout.snapshot_copies(0, 0, 3, 3, 4, 0).is_err());
-        assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
-        assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 3, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 0, 4, 4).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], u64::MAX, 0, 4, 0).is_err());
     }
-    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64, 64, kv_format).is_err());
+    }
 }
 
 #[test]
@@ -374,52 +665,43 @@ fn official_nested_inventory_separates_target_tail_mtp_vision() {
     assert!(result.config_error.is_none(),"{:?}",result.config_error);
     assert!(result.unclassified.is_empty(),"{:?}",result.unclassified);
     assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
-    assert!(result.components.iter().all(|c| c.status != Status::Ready));
-    assert!(result.hints.iter().any(|hint|hint.how.contains("CSA-8")));
-    assert!(result.hints.iter().any(|hint|hint.how.contains("BF16-tail")));
+    assert!(result.components.iter().any(|c| c.status != Status::Ready));
+    assert!(result.hints.iter().any(|hint|hint.what.contains("unqualified")));
     assert_eq!(result.min_spark_ranks,Some(6));
 }
 
 #[test]
 fn card_memory_conclusions_and_request_vs_pool_extent() {
     let dir = snapshot("fp8");
-    for gpus in [1,2] {
-        let r = report(dir.path(),gpus,96,6,Some(262_144));
-        assert!(r.config_error.is_none(),"{:?}",r.config_error);
-        assert!(!r.executable());
-        let memory = r.memory_layout.unwrap();
-        assert_eq!(memory.pool_tokens,262_144,"{:?}",r.hints);
-        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    let r = report_context(dir.path(), 2, 96, 6, Some(262_144), 262_144);
+    assert!(r.wip_launchable(), "{:?}", r.hints);
+    assert_eq!((r.prefill_unit_rows, r.prefill_waves, r.prefill_span_rows),
+        (Some(2752), Some(3), Some(8256)));
+    assert!(r.executable(), "{:?}", r.hints);
+    assert!(r.native_serving_admitted);
+    assert_eq!(r.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
+    assert!(r.memory_layout.as_ref().unwrap().devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+    let r = report(dir.path(), 2, 96, 6, Some(262_144));
+    assert!(!r.wip_launchable());
+    assert!(r.hints.iter().any(|h| h.what.contains("compiled/max-context floor of 1048576")), "{:?}", r.hints);
+    for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
+        let r = report(dir.path(), gpus, gib, ranks, None);
+        assert!(!r.wip_launchable() && !r.native_serving_admitted);
+        assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
     }
-    let r = report(dir.path(),1,96,6,Some(1<<20));
-    assert!(r.hints.iter().any(|h| h.what.contains("coordinator BF16 pool lower bound refused")),"{:?}",r.hints);
-    let r = report(dir.path(),2,96,6,Some(1<<20));
-    assert_eq!(r.memory_layout.unwrap().pool_tokens,1<<20);
-    let r = report(dir.path(),1,32,6,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("5090 refused")));
-    let r = report(dir.path(),1,96,4,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("TP4 refused")));
-    let r = report(dir.path(),2,96,0,None);
-    assert!(r.hints.iter().any(|h| h.what.contains("no 0-Spark")));
-    let r = plan::plan(dir.path(), &PlanOptions {
-        placement: ExpertPlacement::from_spark_ranks(6),
-        layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
-            pool_tokens: Some(32_768), context_tokens: 262_144, ..Default::default() }),
-        ..Default::default()
-    }).unwrap();
-    assert!(r.hints.iter().any(|h| h.what.contains("explicit KV pool of 32768 tokens")
-        && h.what.contains("floor of 262144 tokens")), "{:?}", r.hints);
-    let r = report(dir.path(),1,96,6,None);
+    let r = report(dir.path(), 2, 96, 6, Some(32_768));
+    assert!(!r.wip_launchable());
+    assert!(r.hints.iter().any(|h| h.what.contains("at least 256K")));
+    let r = report(dir.path(), 2, 96, 6, None);
     let memory = r.memory_layout.unwrap();
-    assert!(memory.pool_tokens >= 262_144 && memory.pool_tokens < 1<<20);
-    assert!(memory.notes.iter().any(|n| n.contains("71392 bytes/token")));
-    assert!(memory.notes.iter().any(|n| n.contains("36064 bytes/token")));
-    assert!(memory.notes.iter().any(|n| n.contains("Maximum request 1048576")));
-    assert!(memory.notes.iter().any(|n| n.contains("14155776 bytes per admitted sequence")));
+    assert!(memory.pool_tokens >= 262_144);
+    assert!(memory.notes.iter().any(|n| n.contains("zero graphs")));
+    assert!(memory.notes.iter().any(|n| n.contains("compiled extent 1048576")));
+
 }
 
 #[test]
-fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
+fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     let dir = snapshot("nvfp4");
     let cp = Checkpoint::open(dir.path()).unwrap();
     let model = Model::open(&cp).unwrap();
@@ -432,14 +714,92 @@ fn nvfp4_stacked_scales_and_bf16_root_are_named_not_executed() {
             assert_eq!(operand.scale.unwrap().grid,vec![352,1536,256]);
         }
     }
-    let result = report(dir.path(),1,96,4,Some(262_144));
-    assert!(result.config_error.is_none(),"{:?}",result.config_error);
-    assert_eq!(result.min_spark_ranks,Some(4));
-    assert_eq!(result.memory_layout.unwrap().pool_tokens,262_144);
+    for (context, pool) in [(262_144, Some(262_144)), (1_048_576, None)] {
+        let result = report_context(dir.path(), 1, 96, 4, pool, context);
+        assert!(result.config_error.is_none(), "{:?}", result.config_error);
+        assert!(result.wip_launchable() && result.native_serving_admitted, "{:?}", result.hints);
+        assert!(result.executable());
+        assert_eq!(result.min_spark_ranks, Some(4));
+        let memory = result.memory_layout.unwrap();
+        assert_eq!(memory.devices.len(), 5);
+        if let Some(tokens) = pool {
+            assert_eq!(memory.pool_tokens, tokens);
+        } else {
+            let target = crate::placement::PoolPolicy::resolve(&[96 << 30], context, None, 64, false).target;
+            assert!((context..=target).contains(&memory.pool_tokens));
+            // More free capacity must grow the same default-format pool to its cap.
+            let roomy = report_context(dir.path(), 1, 160, 4, None, context);
+            assert!(roomy.wip_launchable(), "{:?}", roomy.hints);
+            assert_eq!(roomy.memory_layout.unwrap().pool_tokens, target);
+        }
+        assert!(memory.devices.iter().all(|d| d.used_bytes() <= d.capacity_bytes));
+        // The endpoint's frames hold one unit; the intake holds the three
+        // slots, with one scratch owner.
+        let rows = result.prefill_unit_rows.expect("planned prefill unit rows");
+        assert_eq!(rows, 2752);
+        assert_eq!(result.prefill_waves, Some(3));
+        let span = result.prefill_span_rows.expect("planned prefill span rows");
+        assert_eq!(span, 3 * rows);
+        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
+        let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
+            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
+        for device in &memory.devices[1..] {
+            assert!(device.items.iter().any(|item| item.format == "W4A4"));
+            let mapped = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
+            assert_eq!(mapped.bytes, lane_rings as u64, "one main transport endpoint");
+        }
+    }
+    for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
+        let result = report(dir.path(), gpus, gib, ranks, None);
+        assert!(!result.wip_launchable() && !result.native_serving_admitted);
+        assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
+    }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
     assert!(r.config_error.is_none(),"{:?}",r.config_error);
-    assert!(r.hints.iter().any(|h| h.what.contains("TP6 refused")));
+    assert!(r.hints.iter().any(|h| h.what.contains("BF16 target format")));
+}
+
+#[test]
+fn native_owner_shares_scratch_and_sums_quant_and_bf16_tail_io() -> anyhow::Result<()> {
+    use crate::plan::layout::spark_slots::owner_bytes;
+    use crate::placement::SparkWorkingSet;
+    let prefill = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: 4096, compiled: 4096, staging_rows: 2752, buffered_units: 3 };
+    for (format, ranks, quant_scratch) in [("fp8", 6, 538_279_936), ("nvfp4", 4, 464_821_248)] {
+        let dir = snapshot(format);
+        let input = PlanInput::open(dir.path())?;
+        let mut working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: ranks,
+            prefill_lanes: 2, ..Default::default() };
+        let quant = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
+        working.spark_layers = vec![88];
+        let tail = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
+        working.spark_layers = vec![3, 88];
+        let mixed = owner_bytes(&input, &working, "step5", 0)?(prefill)?;
+        // One BF16 tail layer adds its own I/O planes; the owner's scratch is
+        // the larger group package, shared on one stream.
+        // The census bound is the maximum over every installed TP package.
+        let tail_scratch = 580_747_264;
+        let geometry = input.expert_catalog()?.routed_experts().geometry()?;
+        let quant_scratch = if format == "fp8" {
+            let width = geometry.intermediate / u32::try_from(ranks)?;
+            let segmented = cuteafd_core::spark_executions::segment_scratch_bytes(
+                geometry.hidden, geometry.experts, geometry.topk, width * 2,
+                prefill.segment_rows().unwrap(), cuteafd_core::spark_executions::SEGMENT_MAX_ROWS).unwrap();
+            assert!(segmented > quant_scratch, "admitted stream arena exceeds singleton census");
+            segmented.max(quant_scratch)
+        } else { quant_scratch };
+        assert_eq!(quant.scratch, quant_scratch);
+        assert_eq!(mixed.scratch, quant.scratch.max(tail.scratch));
+        assert_eq!(mixed.scratch, tail_scratch.max(quant_scratch));
+        assert_eq!(mixed.io, quant.io + tail.io);
+        assert_eq!(mixed.pinned_staging, quant.pinned_staging + tail.pinned_staging);
+        let segment_addresses = if format == "fp8" { u64::from(prefill.staging_rows) * 16 } else { 0 };
+        assert_eq!(mixed.pinned_staging,
+            2 * u64::from(prefill.staging_rows) * u64::from(geometry.topk) * 8 + segment_addresses);
+    }
+    Ok(())
 }
 
 #[test]
@@ -523,7 +883,7 @@ fn missing_headers_stale_index_and_direct_text_detection() {
     cp.tensors.retain(|t|t.meta.name != "model.layers.3.moe.gate_proj.weight");
     let input = PlanInput::from_checkpoint(cp);
     let result = input.plan(&PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
-        layout:Some(Default::default()), ..Default::default() }).unwrap();
+        layout:Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }), ..Default::default() }).unwrap();
     assert!(!result.executable() && !result.wip_launchable() && !result.native_serving_admitted);
     assert!(result.hints.iter().any(|h| h.what.contains("missing safetensors headers")));
 }
@@ -538,10 +898,32 @@ fn unknown_tensor_and_context_ownership_fail_closed() {
     let dir = snapshot("fp8");
     let r = plan::plan(dir.path(), &PlanOptions { placement:ExpertPlacement::Sparks { ranks:6 },
         attention_placement:Some(crate::placement::AttentionPlacement::Context),
-        layout:Some(layout::LayoutOptions { rtx_bytes:vec![96<<30;2], ..Default::default() }),
+        layout:Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes:vec![96<<30;2], ..Default::default() }),
         ..Default::default() }).unwrap();
-    assert!(!r.placement_supported);
-    assert!(r.hints.iter().any(|h|h.what.contains("context/layer ownership")));
+    assert!(!r.wip_launchable() && !r.native_serving_admitted);
+    assert!(r.config_error.as_deref().is_some_and(|e| e.contains("context")));
+    assert!(r.hints.iter().any(|h|h.what.contains("executor not implemented")));
+}
+
+#[test]
+fn planner_rejects_all_whole_swa_before_serving_admission() {
+    use crate::placement::AttentionPlacement;
+    let dir = snapshot("fp8");
+    let manifest = native_manifest(dir.path());
+    for (attention, head_split) in [(Some(AttentionPlacement::Layers), true), (None, false)] {
+        let result = plan::plan(dir.path(), &PlanOptions {
+            placement: ExpertPlacement::Sparks { ranks: 6 },
+            draft_ownership: Some(spec::DraftOwnership::None),
+            attention_placement: attention,
+            layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+                head_split, workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+            ..Default::default()
+        }).unwrap();
+        assert!(!result.wip_launchable() && !result.native_serving_admitted);
+        assert!(result.hints.iter().any(|hint| hint.what.contains(
+            "two-GPU execution requires head-split SWA with whole-owned CSA")),
+            "{:?}", result.hints);
+    }
 }
 
 #[test]
@@ -564,6 +946,47 @@ fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
             assert_eq!(tail.activation(layer), Some(FfnActivation::SiluPostClampFp32Product { limit: 7.0 }));
         }
         catalog.select_draft(crate::plan::spec::DraftOwnership::None).unwrap();
+    }
+}
+
+#[test]
+fn mixed_native_assignment_matches_each_worker_groups_exact_units() {
+    use crate::formats::fp8_experts::Slicing;
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+    let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16, partial_reply_bytes: None }];
+    let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    for kind in ["fp8", "nvfp4", "bf16"] {
+        let dir = snapshot(kind);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tensors = catalog.fp8().unwrap();
+        for world in [4, 6] {
+            let working = SparkWorkingSet { spark_layers: vec![3, 88, 89, 90],
+                spark_ranks: world, prefill_lanes: 1, ..Default::default() };
+            // Exercise either exact unit chosen from a mixed checkpoint's headers.
+            for block in [16, 128] {
+                for rank in 0..world {
+                    let assignment = SparkAssignment::from_catalog(&catalog, &working, rank,
+                        SparkResidentLayout::Fp8 { world, rank, slicing: Slicing::Blocks(block) },
+                        &endpoints, rings).unwrap();
+                    let mut resident = 0u64;
+                    for slice in &assignment.slices {
+                        let view = tensors.for_layer(slice.layer as usize).unwrap();
+                        let slicing = view.slicing_for_directory(std::path::Path::new(&format!("tp{world}")), world);
+                        assert_eq!(slicing, Slicing::Blocks(view.block()));
+                        let map = view.unit_map(world, rank, slicing).unwrap();
+                        assert_eq!(slice.unit_map, Some(map.fingerprint()),
+                            "{kind} TP{world} rank{rank} layer{} inputK{block}", slice.layer);
+                        let (first, width) = view.rank_range_with(world, rank, slicing).unwrap();
+                        assert_eq!((slice.first as usize, slice.width as usize, slice.stored_width as usize),
+                            (first, width, view.rank_width(world, rank, slicing).unwrap()));
+                        resident += (view.weight_read_bytes_with(world, rank, slicing).unwrap()
+                            * view.shape().experts) as u64;
+                    }
+                    assert_eq!(assignment.resident_bytes, resident);
+                }
+            }
+        }
     }
 }
 
@@ -651,13 +1074,19 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);
         let cp = Checkpoint::open(dir.path()).unwrap();
-        if kind == "fp8" {
+        if kind != "bf16" {
             for world in [4, 6] {
-                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe("step5:fp8", 1536, world).unwrap());
+                assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe(&format!("step5:{kind}"), 1536, world).unwrap());
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..88).collect::<Vec<_>>()).is_ok());
             }
-            for world in [1, 2, 3, 5, 7, 8] {
+            for world in [1, 2, 3, 7, 8] {
                 assert!(checkpoint_spark_recipe(&cp, world, &[3]).is_err(), "TP{world}");
+            }
+            if kind == "nvfp4" {
+                let error = checkpoint_spark_recipe(&cp, 5, &[3]).unwrap_err();
+                assert!(format!("{error:#}").contains("NVFP4 is deprecated"));
+            } else {
+                assert!(checkpoint_spark_recipe(&cp, 5, &[3]).is_ok());
             }
         } else {
             for world in [4, 6] {
@@ -669,7 +1098,7 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert_eq!(checkpoint_spark_recipe(&cp, world, &layers).unwrap(),
                     spark_recipe("step5:bf16", 1536, world).unwrap());
             }
-            if kind == "fp8" {
+            if kind != "bf16" {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_ok());
             } else {
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).is_err());
@@ -678,11 +1107,10 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert!(checkpoint_spark_recipe(&cp, world, &layers).is_err());
             }
         }
-        let r = report(dir.path(), 2, 96, 6, Some(262_144));
-        assert!(!r.executable() && !r.wip_launchable() && !r.native_serving_admitted);
-        for component in ["dense_ffn", "attention", "routed_expert"] {
-            assert!(r.hints.iter().any(|hint| hint.what.contains(component)), "{component}: {:?}", r.hints);
-        }
+        let r = report(dir.path(), 2, 96, 6, None);
+        assert_eq!(r.executable(), r.wip_launchable());
+        assert_eq!(r.wip_launchable(), kind == "fp8", "{:?}", r.hints);
+        assert_eq!(r.native_serving_admitted, kind == "fp8");
     }
 }
 
@@ -727,4 +1155,570 @@ fn routed_admission_rechecks_operand_shape_scale_and_role() {
         }
         assert!(model.accepts(&TensorRole::layer(Component::RoutedExpert, 3), &stem, &mut operand.clone()).is_err());
     }
+}
+
+#[test]
+fn nvfp4_routed_admission_rechecks_packing_scales_and_role() {
+    let dir = snapshot("nvfp4");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let model = Model::open(&cp).unwrap();
+    let groups = format::group_by_stem(&cp.tensors);
+    for projection in ["gate", "up", "down"] {
+        let stem = format!("model.layers.3.moe.{projection}_proj");
+        let operand = format::detect(&groups[&stem]).unwrap();
+        let role = TensorRole::layer(Component::RoutedExpert, 3);
+        assert!(model.accepts(&role, &stem, &mut operand.clone()).is_ok());
+        assert_eq!(model.experts(&operand).unwrap().package, "step5:nvfp4");
+        for mutation in 0..14 {
+            let mut wrong = operand.clone();
+            match mutation {
+                0 => wrong.logical[0] -= 1,
+                1 => wrong.logical[2] -= 1,
+                2 => wrong.stored[0] -= 1,
+                3 => wrong.encoding = format::Encoding::Int { bits: 8 },
+                4 => wrong.scale = None,
+                5 => wrong.scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                6 => wrong.scale.as_mut().unwrap().cols = 32,
+                7 => wrong.scale.as_mut().unwrap().rows = format::RowTiling::Uniform { rows: 2 },
+                8 => wrong.global_scale = None,
+                9 => wrong.global_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                10 => wrong.input_scale = None,
+                11 => wrong.input_scale.as_mut().unwrap().encoding = format::ScaleEncoding::Bf16,
+                12 => wrong.companions.push("bias".into()),
+                _ => { wrong.logical.pop(); }
+            }
+            assert!(model.accepts(&role, &stem, &mut wrong).is_err(), "{projection}: mutation {mutation}");
+        }
+        for role in [TensorRole::layer(Component::RoutedExpert, 4),
+            TensorRole::layer(Component::RoutedExpert, 88), TensorRole::layer(Component::DenseFfn, 3)] {
+            assert!(model.accepts(&role, &stem, &mut operand.clone()).is_err());
+        }
+    }
+}
+
+/// Startup validates that the peer's replicated routed reply never lands in
+/// storage a previous replication used without a head exchange in between.
+/// The shared FFN region must keep that true for every owner pattern the
+/// planner can produce (contiguous and alternating CSA owners).
+#[test]
+fn shared_ffn_region_keeps_replicated_replies_apart() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let csa: Vec<usize> = (0..cfg.layers).filter(|&l| cfg.full[l]).collect();
+    for contiguous in [true, false] {
+        let modes: Vec<_> = (0..cfg.layers).map(|layer| if !cfg.full[layer] { LayerMode::HeadSplit } else {
+            let ordinal = csa.iter().position(|&l| l == layer).unwrap();
+            let gpu = if contiguous { u8::from(ordinal >= csa.len() / 2) } else { (ordinal % 2) as u8 };
+            LayerMode::Whole { gpu, ffn: FfnMode::Owner }
+        }).collect();
+        let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+        for rows in [256, 2048] {
+            let mut copies = owners.routed_replications().unwrap();
+            for (layer, copy) in copies.iter_mut().enumerate() {
+                if let Some(copy) = copy {
+                    let destination = 1 - usize::from(copy.source);
+                    let base = native::rank_attention_bytes(&cfg, &owners, destination, rows).unwrap() as usize;
+                    // Live binding: the destination layer's ROUTED plane in its arena.
+                    copy.storage = 1 + base + native::routed_layout(rows, rows, cfg.full[layer]).unwrap()[9].0;
+                }
+            }
+            owners.execution().validate_routed_replications(&copies)
+                .unwrap_or_else(|error| panic!("contiguous={contiguous} rows={rows}: {error}"));
+            // A single reply plane would reuse storage across a CSA/SWA boundary.
+            let mut collapsed = copies.clone();
+            for copy in collapsed.iter_mut().flatten() { copy.storage = 1; }
+            assert!(owners.execution().validate_routed_replications(&collapsed).is_err());
+        }
+    }
+}
+
+
+#[test]
+fn native_prefill_refuses_every_unqualified_spark_count() {
+    for (kind, gpus) in [("nvfp4", 1), ("fp8", 2)] {
+        let dir = snapshot(kind);
+        // Boundaries plus a transport-valid count that lacks this native executor.
+        for ranks in [0, 1, 3, 8] {
+            let result = report(dir.path(), gpus, 96, ranks, None);
+            assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
+            assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
+                "{kind} ranks={ranks}: {:?}", result.hints);
+            assert!(result.memory_layout.unwrap().devices.is_empty());
+        }
+    }
+}
+
+#[test]
+fn step_runs_the_fixed_three_units_and_preserves_explicit_shapes() {
+    use crate::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, PrefillPlan};
+    let limits = crate::plan::Family::prefill_limits(&super::STEP5);
+    assert_eq!((limits.max_unit_rows, limits.max_waves, limits.max_span_rows), (4096, 4, 8256));
+    for ranks in [4, 6] {
+        assert_eq!(prefill_shape(ranks, limits, Default::default()).unwrap(),
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
+        for (unit, waves) in [(256, 3), (2752, 3), (4096, 2)] {
+            assert_eq!(prefill_shape(ranks, limits, PrefillOverrides {
+                unit_rows: Some(unit), waves: Some(waves), span_rows: None, reserve_rows: None,
+            }).unwrap(), PrefillPlan { unit_rows: unit, waves, span_rows: unit * waves });
+        }
+    }
+}
+
+#[test]
+fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
+    for (kind, gpus, sparks) in [("nvfp4", 1, 4), ("fp8", 2, 6)] {
+        let snapshot = snapshot(kind);
+        let manifest = native_manifest(snapshot.path());
+        for (unit, waves) in [(0, 0), (1024, 2), (2048, 4), (4096, 2)] {
+            let shape = crate::serving_capacity::prefill_waves::prefill_shape(sparks,
+                crate::plan::Family::prefill_limits(&super::STEP5),
+                crate::serving_capacity::prefill_waves::PrefillOverrides {
+                    unit_rows: (unit != 0).then_some(unit), waves: (waves != 0).then_some(waves), span_rows: None,
+                    reserve_rows: None,
+                }).unwrap();
+            let (expected_unit, expected_waves, expected_span) = (shape.unit_rows, shape.waves, shape.span_rows);
+            let report = plan::plan(snapshot.path(), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(spec::DraftOwnership::None),
+                layout: Some(layout::LayoutOptions {
+                    // The fixed shape must remain visible even when memory cannot admit it.
+                    rtx_bytes: vec![33 << 30; gpus], pool_tokens: Some(64 << 20),
+                    prefill_rows: unit, prefill_lanes: waves,
+                    host_memory: Some((128 << 30, 128 << 30)),
+                    workspace_manifest: Some(manifest.clone()),
+                    ..Default::default()
+                }), ..Default::default()
+            }).unwrap();
+            assert!(!report.wip_launchable(), "a 33 GiB coordinator cannot hold an explicit 64M-token pool");
+            assert_eq!(report.prefill_unit_rows, Some(expected_unit));
+            assert_eq!(report.prefill_waves, Some(expected_waves));
+            assert_eq!(report.prefill_span_rows, Some(expected_span));
+        }
+    }
+}
+
+/// The published K4 + Core-K6 recipe as a header-only snapshot
+/// (`quantization/step5/core_k6/recipe.py`): target attention/FFN/lm_head K6,
+/// routed experts per expert K4 (3-87) and K6 (88-90), MTP dense and stage
+/// heads K4, native tensors otherwise. One shard per layer, sparse payloads.
+pub(crate) fn exl3_snapshot() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_step5_exl3_snapshot(dir.path());
+    dir
+}
+
+#[test]
+fn exl3_recipe_headers_classify_core_routed_mtp_and_kept_tensors() -> anyhow::Result<()> {
+    let fixture = exl3_snapshot();
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let cp = Checkpoint::inventory(path)?;
+        let model = Model::open(&cp)?;
+        assert!(model.is_exl3());
+        // 92 target layers x 7 + lm_head = 645 K6; 3 stages x (7 + eh + head) = 27 K4.
+        let (k6, k4): (Vec<_>, Vec<_>) = model.core.projections.values().partition(|p| p.bits == 6);
+        assert_eq!((k6.len(), k4.len()), (645, 27));
+        assert!(k4.iter().all(|p| p.stem.starts_with("model.layers.9") && ["92", "93", "94"]
+            .contains(&p.stem.split('.').nth(2).unwrap())));
+        assert_eq!(model.core.get("model.layers.92.transformer.shared_head.output").unwrap().bits, 4);
+        assert_eq!(model.core.get("lm_head").unwrap().bits, 6);
+        assert_eq!(model.core.get("model.layers.91.mlp.down_proj").unwrap().bits, 6);
+        assert!(model.core.get("model.layers.7.self_attn.g_proj").is_none());
+        assert_eq!(model.expert_bits.len(), 88);
+        assert!(model.expert_bits.iter().all(|(&l, &b)| b == if l >= 88 { 6 } else { 4 }));
+        assert_eq!(model.exl3_tiers(), Some(vec![4, 6]));
+        assert_eq!(model.exl3_package().as_deref(), Some("exl3-k46"));
+        assert!(model.formats.iter().any(|f| f == "exl3-k4") && model.formats.iter().any(|f| f == "exl3-k6"));
+        // Native: indexer F32 W, head-wise gate BF16, router + bias, vision.
+        for (name, dtype) in [("model.layers.3.self_attn.sparse_indexer_w.weight", DType::F32),
+            ("model.layers.3.self_attn.g_proj.weight", DType::Bf16), ("model.layers.3.moe.gate.weight", DType::Bf16),
+            ("model.layers.3.moe.router_bias", DType::F32), ("vision_model.conv1.weight", DType::Bf16)] {
+            assert_eq!(model.tensors[name].dtype, dtype, "{name}");
+        }
+        eprintln!("Step-5 EXL3 inventory: {} ms", started.elapsed().as_millis());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exl3_spark_world_admission_follows_planner_fit() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let refused = super::spark_world_admitted(fixture.path(), &manifest, 2).unwrap_err().to_string();
+    assert!(refused.contains("does not admit 2 Spark ranks"), "{refused}");
+    // 4 and 6 are the card columns (exl3_card_columns_fit_from_headers).
+    super::spark_world_admitted(fixture.path(), &manifest, 3).unwrap();
+    assert!(super::spark_world_admitted(fixture.path(), &manifest, 0).is_err());
+}
+
+#[test]
+fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
+    let fixture = exl3_snapshot();
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
+    for component in &report.components {
+        assert!(matches!(component.status, Status::Ready | Status::Disabled | Status::Unused),
+            "{:?}: {:?} {:?}", component.component, component.status, component.rejections);
+    }
+    let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
+    assert_eq!(routed.formats.keys().cloned().collect::<Vec<_>>(), ["exl3-k4", "exl3-k6"]);
+    assert_eq!(routed.tensors, 88 * 352 * 3 * 4);
+    let cp = Checkpoint::open(fixture.path()).unwrap();
+    // Every shared width-class world; the evenly splitting ones are exact.
+    for world in cuteafd_core::tp_units::spark_package_worlds("step5", "exl3") {
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).unwrap();
+        let compact = if 12 % world == 0 {
+            assert_eq!(recipe.widths, vec![1536 / world; world]);
+            ""
+        } else { "-compact" };
+        assert_eq!(recipe.required_layouts, (0..world).map(|r| format!("tp{world}{compact}-rank{r}")).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
+    use crate::plan::checkpoint::CheckpointTensor;
+    let fixture = exl3_snapshot();
+    let mut cp = Checkpoint::inventory(fixture.path()).unwrap();
+    // A K5 core module disagrees with core_bits=6.
+    let stem = "model.layers.5.self_attn.q_proj";
+    let shard = cp.weight_map[&format!("{stem}.trellis")].clone();
+    let mut headers = crate::read_safetensors_metadata(&fixture.path().join(&shard)).unwrap();
+    let trellis = headers.iter_mut().find(|m| m.name == format!("{stem}.trellis")).unwrap();
+    trellis.shape[2] = 80;
+    trellis.byte_length = trellis.byte_length / 6 * 5;
+    cp.tensors.extend(headers.into_iter().filter(|m| m.name.starts_with(stem))
+        .map(|meta| CheckpointTensor { shard: shard.clone(), meta }));
+    cp.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    let error = format!("{:#}", Model::open(&cp).err().unwrap());
+    assert!(error.contains("core requires K6, found K5"), "{error}");
+    // A routed layer declared K6 but stored K4 fails against the declaration.
+    let mut config: Value = serde_json::from_slice(&std::fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
+    config["quantization_config"]["expert_bits_by_layer"]["87"] = serde_json::json!(6.0);
+    std::fs::write(fixture.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let error = format!("{:#}", Model::open(&Checkpoint::inventory(fixture.path()).unwrap()).err().unwrap());
+    assert!(error.contains("model.layers.87") && error.contains("K4"), "{error}");
+}
+
+#[test]
+fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<()> {
+    use crate::formats::dense_trellis::TrellisSide;
+    let fixture = exl3_snapshot();
+    let cp = Checkpoint::open(fixture.path())?;
+    let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
+    // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
+    assert_eq!(whole.core.len(), 645);
+    for name in whole.core.keys() {
+        assert!(!whole.operands.iter().any(|o| &o.name == name), "{name} resident twice");
+    }
+    assert!(!whole.operands.iter().any(|o| o.name.ends_with(".gate_up_proj.weight")));
+    // Head-wise gates, indexer, routers and norms stay native BF16/F32 operands.
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.g_proj.weight"));
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.sparse_indexer_q.weight"));
+    let core_bytes: u64 = whole.core.values().map(|c| c.bytes as u64).sum();
+    let bf16: u64 = whole.operands.iter().map(|o| o.allocation_bytes).sum();
+    assert_eq!(whole.resident_bytes, core_bytes + bf16);
+    // K6 core is ~8.9 GiB in the recipe table (scales included).
+    assert!((8 << 30..10 << 30).contains(&core_bytes), "{core_bytes}");
+    let split = coordinator::RankWeightLayout::from_checkpoint(&cp, 1, 2)?;
+    let q = &split.core["model.layers.4.self_attn.q_proj.weight"];
+    let o = &split.core["model.layers.4.self_attn.o_proj.weight"];
+    assert_eq!((q.side, q.shape, q.rank, q.ranks), (TrellisSide::Output, [6144, 4096], 1, 2));
+    assert_eq!((o.side, o.shape, o.rank, o.ranks), (TrellisSide::Input, [4096, 6144], 1, 2));
+    assert_eq!(split.core["model.layers.4.share_expert.gate_proj.weight"].shape, [1536, 4096]);
+    assert_eq!(split.core["model.layers.0.mlp.down_proj.weight"].shape, [4096, 13824]);
+    // Each MTP stage owns only its K4 operands and its own vocabulary head.
+    for stage in 0..3 {
+        let layout = coordinator::RankWeightLayout::for_mtp_stage(&cp, stage)?;
+        assert_eq!(layout.core.len(), 9);
+        assert!(layout.core.values().all(|c| c.bits == 4 && c.ranks == 1));
+        assert!(layout.core.contains_key(&format!("model.layers.{}.transformer.shared_head.output.weight", 92 + stage)));
+        assert!(!layout.core.contains_key("lm_head.weight"));
+    }
+    Ok(())
+}
+
+/// The installed `exl3-step5-k46/rtx-tp1` package metadata beside PROGRAMS.json.
+fn install_exl3_rtx_package(manifest: &std::path::Path) { testing::install_step5_exl3_rtx_package(manifest); }
+
+#[test]
+fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
+    use crate::placement::{ExpertHome, OnboardSetting};
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    let plan_with = |onboard: Option<OnboardSetting>| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
+        ..Default::default() }).unwrap();
+    let auto = plan_with(None);
+    assert!(auto.solver_placement.is_some(), "{:#?}", auto.hints);
+    let solved = auto.solver_placement.as_ref().unwrap();
+    let onboarded = solved.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count();
+    assert!(onboarded > 0, "auto should onboard on two 96 GiB RTX: {:?}", auto.hints);
+    assert!(solved.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })),
+        "two RTX split every onboarded layer TP2");
+    // A contiguous routed prefix from layer 3, both GPUs charged their halves
+    // and the exchange planes.
+    let tp2 = solved.tp2.as_ref().expect("TP2 range");
+    assert_eq!((tp2.first, tp2.layers), (3, onboarded));
+    let exchange = super::admission::tp2_exchange_bytes(auto.prefill_unit_rows.unwrap() as usize,
+        auto.prefill_waves.unwrap() as usize, super::admission::Tp2Exchange::Exl3).unwrap();
+    assert!(tp2.peak_bytes.iter().all(|&peak| peak > exchange));
+    assert_eq!(auto.onboard_layers, Some(onboarded));
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("split TP2 over both RTX")));
+    let none = plan_with(Some(OnboardSetting::Layers(0)));
+    assert_eq!(none.onboard_layers, Some(0));
+    assert!(none.solver_placement.unwrap().layers.iter().all(|l| l.experts == ExpertHome::Spark
+        || l.experts == ExpertHome::Dense));
+    let explicit = plan_with(Some(OnboardSetting::Layers(2)));
+    assert!(explicit.placement_supported, "{:#?}", explicit.hints);
+    assert_eq!(explicit.onboard_layers, Some(2));
+    let fixed = explicit.solver_placement.as_ref().unwrap();
+    assert_eq!(fixed.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count(), 2);
+    assert!(fixed.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })));
+    assert_eq!((fixed.tp2.as_ref().unwrap().first, fixed.tp2.as_ref().unwrap().layers), (3, 2));
+    assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
+    eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+}
+
+/// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
+/// an explicit layer count is refused.
+#[test]
+fn nvfp4_onboarding_is_refused_with_its_deprecation() {
+    let dir = snapshot("nvfp4");
+    let manifest = native_manifest(dir.path());
+    let plan_with = |onboard: Option<crate::placement::OnboardSetting>| plan::plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(4), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+            workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
+        ..Default::default() }).unwrap();
+    let auto = plan_with(None);
+    assert_eq!(auto.onboard_layers, Some(0), "{:#?}", auto.hints);
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|n| n == super::admission::NVFP4_ONBOARDING_DEPRECATED));
+    let explicit = plan_with(Some(crate::placement::OnboardSetting::Layers(2)));
+    assert!(explicit.hints.iter().any(|h| h.what.contains("Step-5 NVFP4 is deprecated")), "{:#?}", explicit.hints);
+}
+
+#[test]
+fn exl3_card_columns_fit_from_headers() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let fit = |gpus: usize, sparks: usize| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(sparks), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+            workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+        ..Default::default() }).unwrap();
+    for (gpus, sparks) in [(1, 2), (1, 3), (1, 4), (2, 4), (2, 6)] {
+        let report = fit(gpus, sparks);
+        let summary = report.memory_layout.as_ref().map(|m| {
+            let spark = m.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+                .map(|d| d.used_bytes() >> 30).max().unwrap_or(0);
+            format!("pool {} onboard {:?} spark_max {spark} GiB", m.pool_tokens, report.onboard_layers)
+        });
+        eprintln!("Step-5 EXL3 {gpus} RTX + {sparks} Sparks: launchable={} {summary:?} {:?}",
+            report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+    }
+    assert!(fit(2, 6).wip_launchable());
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
+        for (gpus, sparks) in [(1, 3), (2, 6)] {
+            let real = plan::plan(std::path::Path::new(&snapshot), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(spec::DraftOwnership::None),
+                layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+                    workspace_manifest: Some(manifest.clone()), ..Default::default()
+                }), ..Default::default()
+            }).unwrap();
+            let expected = fit(gpus, sparks);
+            let actual = real.memory_layout.as_ref().unwrap();
+            let fixture = expected.memory_layout.as_ref().unwrap();
+            assert!(real.wip_launchable(), "{:#?}", real.hints);
+            assert_eq!(real.onboard_layers, expected.onboard_layers);
+            assert_eq!(actual.pool_tokens, fixture.pool_tokens);
+            let spark_bytes = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices.iter()
+                .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+                .map(|d| d.used_bytes()).collect::<Vec<_>>();
+            assert_eq!(spark_bytes(actual), spark_bytes(fixture));
+            eprintln!("Step-5 EXL3 real {gpus}+{sparks}: pool {}, onboard {:?}, Spark bytes {:?}; fixture identical",
+                actual.pool_tokens, real.onboard_layers, spark_bytes(actual));
+        }
+    }
+}
+
+
+/// Host model of Step's target SWA order on one lane: each unit's K/V are
+/// staged into the ring (`AppendRing::proposal`), then every row at position p
+/// reads tokens p-511..=p through the ring page table (slot = token % rows),
+/// then the next unit stages. A ring of window + one unit returns exactly the
+/// staged keys for every read, at every unit size and split, across wraps, and
+/// a restore of the visible window into a fresh ring reads identically.
+#[test]
+fn swa_ring_of_one_unit_reads_every_window_exactly_and_restores_byte_identically() {
+    use crate::serving_capacity::step5::swa_ring;
+    let key = |token: u64| token.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for unit in [1u64, 63, 64, 65, 511, 512, 513, 2048, 2752, 4096] {
+        let ring = swa_ring(512, unit).unwrap();
+        assert_eq!(ring.rows, (512 + unit).next_multiple_of(64));
+        for total in [unit, 2 * unit + 17, 3 * unit, 5 * unit + 1] {
+            let mut slots = vec![0u64; ring.rows as usize];
+            let mut restored: Option<(u64, Vec<u64>)> = None;
+            let mut base = 0;
+            while base < total {
+                let rows = unit.min(total - base);
+                for run in ring.proposal(base, rows).unwrap() {
+                    for i in 0..run.rows { slots[(run.slot + i) as usize] = key(base + run.offset + i); }
+                }
+                for p in base..base + rows {
+                    for token in p.saturating_sub(511)..=p {
+                        assert_eq!(slots[(token % ring.rows) as usize], key(token),
+                            "unit {unit} total {total} row {p} token {token}");
+                    }
+                }
+                base += rows;
+                // A mark at this unit boundary: copy the visible window only.
+                if restored.is_none() && base < total {
+                    let mut fresh = vec![0u64; ring.rows as usize];
+                    for run in ring.visible(base) {
+                        for i in 0..run.rows { fresh[(run.slot + i) as usize] = slots[(run.slot + i) as usize]; }
+                    }
+                    restored = Some((base, fresh));
+                }
+            }
+            // Replay the rest from the restored mark: every read is identical.
+            if let Some((mark, mut fresh)) = restored {
+                let mut base = mark;
+                while base < total {
+                    let rows = unit.min(total - base);
+                    for run in ring.proposal(base, rows).unwrap() {
+                        for i in 0..run.rows { fresh[(run.slot + i) as usize] = key(base + run.offset + i); }
+                    }
+                    for p in base..base + rows {
+                        for token in p.saturating_sub(511)..=p {
+                            assert_eq!(fresh[(token % ring.rows) as usize], key(token));
+                        }
+                    }
+                    base += rows;
+                }
+                // Everything a later read can reach (the visible window) is
+                // identical; slots outside it are never read and may differ.
+                for run in ring.visible(total) {
+                    let range = run.slot as usize..(run.slot + run.rows) as usize;
+                    assert_eq!(fresh[range.clone()], slots[range], "restored replay differs at unit {unit} total {total}");
+                }
+            }
+        }
+        // One row more than a unit has no proposal: the ring fails closed.
+        assert!(ring.proposal(0, unit + 1).is_none());
+    }
+}
+
+/// The target SWA ring is one unit, whatever the prefill reserve; predictor
+/// rings, the hidden history and staging follow the step rows.
+#[test]
+fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
+    use crate::serving_capacity::step5::{swa_ring, Step5CacheLayout};
+    let fixture = exl3_snapshot();
+    let cfg = Config::parse(&Checkpoint::open(fixture.path()).unwrap()).unwrap();
+    let fp8 = crate::families::qwen4::Qwen4KvCache::Fp8;
+    let one = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 2752, fp8).unwrap();
+    let reserve = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 3 * 2752, fp8).unwrap();
+    assert_eq!(one.ring, swa_ring(512, 2752).unwrap());
+    assert_eq!(reserve.ring, one.ring);
+    assert_eq!((reserve.step_rows, reserve.mtp_ring.step), (3 * 2752, 3 * 2752));
+    assert!(reserve.mtp_hidden_rows > one.mtp_hidden_rows);
+    let target = |layout: &Step5CacheLayout| layout.ranks[0].sliding.iter().filter(|r| !r.mtp)
+        .map(|r| r.key.bytes + r.value.bytes).sum::<u64>();
+    assert_eq!(target(&reserve), target(&one));
+    assert!(Step5CacheLayout::new(&cfg, 1, 1 << 20, 0, 4096, 2048, fp8).is_err());
+}
+
+/// Two RTX: an onboarded layer's result is summed on its FFN ranks by the TP2
+/// pair, so it never replicates; a whole layer's owner is its routed source.
+#[test]
+fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let fixture = exl3_snapshot();
+    let cfg = Config::parse(&Checkpoint::open(fixture.path()).unwrap()).unwrap();
+    // CSA layers whole on GPU0 up to 47, then GPU1; SWA head split.
+    let modes = (0..92).map(|layer| if layer % 4 == 3 {
+        LayerMode::Whole { gpu: u8::from(layer > 47), ffn: FfnMode::Owner } } else { LayerMode::HeadSplit })
+        .collect::<Vec<_>>();
+    let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+    let before = owners.routed_replications().unwrap();
+    assert!(before[3].is_none() && before[4].is_some() && before[51].is_some(), "{before:?}");
+    let owners = owners.with_onboarded((3..60).collect()).unwrap();
+    let after = owners.routed_replications().unwrap();
+    assert!((3..60).all(|layer| after[layer].is_none()));
+    assert_eq!(after[60], before[60]);
+    assert_eq!(owners.routed_source(3).unwrap(), Some(0));
+    assert_eq!(owners.routed_source(51).unwrap(), Some(1));
+    assert_eq!(owners.routed_source(4).unwrap(), None);
+    // One unit, three lanes: three F32 partial planes plus routes and wire each.
+    let per_lane = 3 * 2752 * 4096 * 4 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * (4096 + 128);
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange};
+    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Exl3).unwrap(), 3 * per_lane as u64);
+    // FP8: BF16 partials and BF16 input rows.
+    let fp8 = 3 * 2752 * 4096 * 2 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * 4096 * 2;
+    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Fp8).unwrap(), 3 * fp8 as u64);
+    assert!(tp2_exchange_bytes(0, 1, Tp2Exchange::Exl3).is_err() && tp2_exchange_bytes(64, 5, Tp2Exchange::Exl3).is_err());
+}
+
+/// FP8 Step onboards TP2 on its qualified two-RTX card (fp8moe halves, BF16
+/// exchange); one RTX keeps it on the Sparks with a named reason.
+#[test]
+fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
+    use crate::placement::ExpertHome;
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange, FP8_ONBOARDING_TWO_RTX};
+    let dir = snapshot("fp8");
+    let report = report(dir.path(), 2, 96, 6, None);
+    assert!(report.wip_launchable(), "{:#?}", report.hints);
+    let solved = report.solver_placement.as_ref().unwrap();
+    let onboarded = solved.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count();
+    assert!(onboarded > 0 && solved.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })));
+    let exchange = tp2_exchange_bytes(report.prefill_unit_rows.unwrap() as usize,
+        report.prefill_waves.unwrap() as usize, Tp2Exchange::Fp8).unwrap();
+    assert!(solved.tp2.as_ref().unwrap().peak_bytes.iter().all(|&peak| peak > exchange));
+    eprintln!("Step-5 FP8 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+    let one = Checkpoint::open(dir.path()).unwrap();
+    let catalog = crate::read_expert_catalog(&one.snapshot).unwrap();
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(FP8_ONBOARDING_TWO_RTX));
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 2), None);
+}
+
+#[test]
+fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
+    let dir = snapshot("fp8");
+    let manifest = native_manifest(dir.path());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let options = |budget| PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(5),
+        spark_budget_bytes: Some(budget),
+        draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            pool_tokens: Some(262144), context_tokens: 262144, host_cache_bytes: Some(0),
+            spark_bytes: budget, spark_allocation_budget_bytes: Some(budget),
+            workspace_manifest: Some(manifest.clone()), ..Default::default()
+        }), ..Default::default()
+    };
+    let fit = input.plan(&options(192 << 30)).unwrap();
+    assert!(fit.fits && fit.placement_supported, "{:?}", fit.hints);
+    let small = input.plan(&options(64 << 30)).unwrap();
+    assert!(!small.fits, "{:?}", small.hints);
+    assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
+    assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
+        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
 }

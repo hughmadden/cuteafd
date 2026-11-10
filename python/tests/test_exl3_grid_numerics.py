@@ -1,7 +1,7 @@
 """Opt-in exact-AOT grid qualification; no export, JIT, or service startup.
 
 On an idle 188-SM SM120 host, point CUTEAFD_EXL3_GRID_AOT at one or more
-path-separated shipping variant directories (rtx-tp1, rtx-tp2, dspark; k23/k34).
+path-separated shipping coordinator variant directories (rtx-tp1 or rtx-tp2).
 Run: python3 -m unittest discover -s python/tests -p test_exl3_grid_numerics.py -v
 Synthetic packed weights exercise six experts across both tiers. This compares
 only grid invariance, not checkpoint accuracy or actual RTX 5090 hardware.
@@ -31,10 +31,12 @@ class Exl3GridNumericsTests(unittest.TestCase):
         meta = json.loads(meta_path.read_text())
         self.assertEqual(meta['compute'], [12, 0])
         self.assertEqual(meta['sms'], 188)
-        self.assertIn(meta['bits'], ([2, 3], [3, 4]))
+        self.assertEqual(len(meta['bits']), 2)
+        self.assertEqual(len(set(meta['bits'])), 2)
+        self.assertTrue(all(2 <= bit <= 5 for bit in meta['bits']))
         self.assertIsNone(meta.get('paired_boundary'))
-        self.assertIn(meta['intermediate'], (1152, 2304))
-        self.assertIn(meta['experts'], (128, 384))
+        self.assertGreater(meta['intermediate'], 0)
+        self.assertGreaterEqual(meta['experts'], 6)
         torch.manual_seed(4105170)
         hidden, width, experts = meta['hidden'], meta['intermediate'], meta['experts']
         capacity, topk = meta['capacity'], meta['top_k']

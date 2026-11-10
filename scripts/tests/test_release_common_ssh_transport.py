@@ -242,6 +242,9 @@ SPARK_EXPERT_DOCKER_INFERENCE=cuteafd-spark-expert:v10
 engine_commit=engine-revision
 sparkinfer_commit=sparkinfer-revision
 snapshot_rel=hub/models--x--M/snapshots/rev
+namespace_root=/mnt/sparknest
+hf_home=/custom/hf
+site_hub=1
 model_is_exl3=true
 exl3_family_tag=k34
 EXPERT_PORT=19441
@@ -401,18 +404,18 @@ class TestRunShLifecycle:
             "sparkinfer-revision",
             "hub/models--x--M/snapshots/rev",
             "seed0",
-            "true",
-            "k34",
             "__none__",
             "__none__",
             "__none__",
             "__default__",
             "__none__",
+            "/mnt/sparknest",
+            "/custom/hf",
         ], call
 
     def test_launch_passes_its_contract_positionally(self, tmp_path):
         """The worker argument contract is positional: an option set change must
-        not shift a single one of the sixteen values the remote script decodes."""
+        not shift a single one of the fifteen values the remote script decodes."""
         result, invocations = self._run(tmp_path, _slice("expert-launch"))
         assert result.returncode == 0, result.stderr
         call = invocations[0]
@@ -420,7 +423,7 @@ class TestRunShLifecycle:
         assert payload == [
             "cuteafd-spark-expert:v10", "cuteafd-spark-expert-seed0-19441", "0",
             "107374182400", "19441", "hub/models--x--M/snapshots/rev",
-            "fp", "2", "explicit", "2", "2", "", "", "", "info", "__none__",
+            "fp", "2", "explicit", "2", "2", "", "", "info", "__none__",
             # Docker options follow the positionals behind one sentinel.
             "--profile-args", "-e", "CUTEAFD_FP8_EXPERT_PREFILL=auto", "-e", "CUTEAFD_THERMAL=on",
         ], payload
@@ -433,9 +436,9 @@ class TestRunShLifecycle:
         )
         assert result.returncode == 0, result.stderr
         payload = _remote_payload(invocations[0])
-        assert payload[11:14] == ["/dev/infiniband", "", ""], payload
-        assert payload[14:16] == ["info", "__none__"], payload
-        assert payload.index("--profile-args") == 16, payload
+        assert payload[11:13] == ["/dev/infiniband", ""], payload
+        assert payload[13:15] == ["info", "__none__"], payload
+        assert payload.index("--profile-args") == 15, payload
 
 
 

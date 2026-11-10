@@ -8,23 +8,23 @@ fn k7_sparse_reservation_preserves_k5_accounting_and_stable_query_storage() -> R
         crate::shared::memory::device::Device { library: &lib, id: gpu }.run(|| {
             let budget = SparseAttentionWave::device_bytes(80)?;
             let mut wave = SparseAttentionWave::new(&lib, 80, budget)?;
-            let used = |wave: &SparseAttentionWave<'_>| wave.query.buffer.bytes + wave.output.buffer.bytes
-                + wave.metadata.buffer.bytes + wave.replay_begins.buffer.bytes
-                + wave.descriptors.buffer.bytes + wave.split_scratch.buffer.bytes;
+            let used = |wave: &SparseAttentionWave<'_>| wave.storage.query.buffer.bytes + wave.storage.output.buffer.bytes
+                + wave.storage.metadata.buffer.bytes + wave.storage.replay_begins.buffer.bytes
+                + wave.storage.descriptors.buffer.bytes + wave.storage.split_scratch.buffer.bytes;
             assert_eq!(used(&wave), budget);
-            let query = wave.query.buffer.ptr;
-            let output = wave.output.buffer.ptr;
-            let original_scratch = wave.split_scratch.buffer.ptr;
+            let query = wave.storage.query.buffer.ptr;
+            let output = wave.storage.output.buffer.ptr;
+            let original_scratch = wave.storage.split_scratch.buffer.ptr;
             wave.reserve_decode_rows(48)?;
-            assert_eq!(wave.split_scratch.buffer.ptr, original_scratch);
+            assert_eq!(wave.storage.split_scratch.buffer.ptr, original_scratch);
             assert_eq!(used(&wave), budget);
             wave.reserve_decode_rows(64)?;
             assert_eq!(used(&wave) - budget, 16 * (10 * 64 * 514 * 4 + 120));
-            assert_eq!(wave.query.buffer.ptr, query);
-            assert_eq!(wave.output.buffer.ptr, output);
-            let scratch = wave.split_scratch.buffer.ptr;
+            assert_eq!(wave.storage.query.buffer.ptr, query);
+            assert_eq!(wave.storage.output.buffer.ptr, output);
+            let scratch = wave.storage.split_scratch.buffer.ptr;
             wave.reserve_decode_rows(64)?;
-            assert_eq!(wave.split_scratch.buffer.ptr, scratch);
+            assert_eq!(wave.storage.split_scratch.buffer.ptr, scratch);
             assert!(wave.reserve_decode_rows(65).is_err());
             wave.enable_small_graph_shapes();
             assert_eq!(wave.graph_limit, 64);
@@ -214,7 +214,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             let input=wave.input().ptr;
             wave.reserve_decode_rows(64)?;
             assert_eq!(wave.input().ptr,input);
-            assert_eq!(wave.split_scratch.buffer.bytes,64*10*32*514*4);
+            assert_eq!(wave.storage.split_scratch.buffer.bytes,64*10*32*514*4);
             let allocate=|bytes,value|->Result<DeviceAllocation<'_>> {
                 let allocation=DeviceAllocation::new(&lib,bytes)?;
                 lib.copy_h2d(allocation.buffer,&vec![value;bytes])?;Ok(allocation)
@@ -223,21 +223,21 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             let scales=allocate(128*16,127)?;
             let end=allocate(8,0)?;
             let sink=allocate(32*4,0)?;
-            lib.copy_h2d(wave.query.buffer,&vec![0;wave.query.buffer.bytes])?;
-            lib.copy_h2d(wave.replay_begins.buffer,&vec![0;wave.replay_begins.buffer.bytes])?;
+            lib.copy_h2d(wave.storage.query.buffer,&vec![0;wave.storage.query.buffer.bytes])?;
+            lib.copy_h2d(wave.storage.replay_begins.buffer,&vec![0;wave.storage.replay_begins.buffer.bytes])?;
             let fields:Vec<u64>=[(1,0),(3,0),(3,1),(3,2)].into_iter()
                 .flat_map(|(count,pos)|[0,0,count,pos,0,0,0,0,0,0]).collect();
-            lib.copy_h2d(slice(wave.metadata.buffer,0,4*80),
+            lib.copy_h2d(slice(wave.storage.metadata.buffer,0,4*80),
                 &fields.iter().flat_map(|v|v.to_ne_bytes()).collect::<Vec<_>>())?;
             let window=||V41SparseWindow { values:values.buffer,scales:scales.buffer,
                 proposals:values.buffer,proposal_scales:scales.buffer,end:end.buffer,
-                proposal_capacity:128,replay_begins:Some(wave.replay_begins.buffer) };
+                proposal_capacity:128,replay_begins:Some(wave.storage.replay_begins.buffer) };
             let windows=[window(),window()];
-            let batch=wave.kernel.prepare_batch(wave.query.buffer,sink.buffer,wave.metadata.buffer,None,
-                &[(&windows[0],None,1),(&windows[1],None,3)],wave.output.buffer,
-                wave.descriptors.buffer,wave.replay_begins.buffer,wave.split_scratch.buffer)?;
+            let batch=wave.storage.kernel.prepare_batch(wave.storage.query.buffer,sink.buffer,wave.storage.metadata.buffer,None,
+                &[(&windows[0],None,1),(&windows[1],None,3)],wave.storage.output.buffer,
+                wave.storage.descriptors.buffer,wave.storage.replay_begins.buffer,wave.storage.split_scratch.buffer)?;
             assert_eq!(batch.backend_key(),2);
-            lib.copy_h2d(wave.descriptors.buffer,batch.bytes())?;
+            lib.copy_h2d(wave.storage.descriptors.buffer,batch.bytes())?;
             let plan=ColdSparse { layer:0,rows:4,sink:sink.buffer,launches:vec![],selected:None,
                 batch:Some(batch),fingerprint:vec![],needed:0,tail_identity:None };
             unsafe { wave.enqueue(plan.sink,&plan.launches,None,plan.batch.as_ref())?; }
@@ -246,10 +246,10 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
             wave.insert_graph(0,vec![],graph)?;
             for replay in 0..2 {
                 if replay==1 { lib.copy_h2d(values.buffer,&vec![0;values.buffer.bytes])?; }
-                unsafe { lib.cuda_graph_launch(graph,wave.stream.raw)?; }
+                unsafe { lib.cuda_graph_launch(graph,wave.storage.stream.raw)?; }
                 wave.synchronize()?;
                 let mut output=vec![0u8;4*32768];
-                lib.copy_d2h(&mut output,slice(wave.output.buffer,0,4*32768))?;
+                lib.copy_d2h(&mut output,slice(wave.storage.output.buffer,0,4*32768))?;
                 for (row,value) in [0.5f32,0.5,2.0/3.0,0.75].into_iter().enumerate() {
                     let bits=value.to_bits();
                     let expected=if replay==0 { ((bits+0x7fff+((bits>>16)&1))>>16) as u16 } else { 0 };

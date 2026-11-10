@@ -585,7 +585,7 @@ router ranks 17–32, then an explicitly recorded identity residual. Down
 projections are calibrated after gate/up EXL3 serialization and reload.
 
 The entire model does not fit on a single 96 GB GPU. Quantization ran one
-layer at a time on Oliver with a disk-backed rolling attention-residual bank.
+layer at a time on a 96 GB GPU with a disk-backed rolling attention-residual bank.
 The source license and custom tokenizer/processor files are included.
 Structural verification and per-projection error evidence accompany this
 artifact. Full-model generation/benchmark evaluation has not been performed.

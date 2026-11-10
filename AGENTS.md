@@ -6,6 +6,8 @@ model does what, how to brief, launch and review agents), one README
 and the `benchmarks/` index; measurements go in commit messages as short
 before → after tables with conditions.
 
+Porting a family or changing shared serve, prefill, exchange or admission code: read [docs/architecture/shared-engine.md](docs/architecture/shared-engine.md) first.
+
 ## Working method
 
 - Disk: builds live on raptor's root NVMe and fill it fast (1.4 TB of
@@ -19,13 +21,15 @@ before → after tables with conditions.
   `~/.cache/cuteafd/instances/<instance>/`; never delete the shared stores
   beside `builds/` (`bench`, `fidelity`, `console`, `instances`, caches):
   Docker recreates a missing bind source root-owned and breaks the server.
-- Profiling with root: run Nsight Compute directly as
-  `agent-sudo -n --agent-context "<why>" /usr/local/cuda/bin/ncu <args> <program>`
-  with the full command line visible. Never put ncu (or anything else) under
-  sudo inside a wrapper script or interpreter (`sudo python …`, `sudo bash …`):
-  the approver can't see what it runs and will flag or deny it.
+- Profiling: GPU performance counters are unlocked for users on every host
+  (`grep RmProfilingAdminOnly /proc/driver/nvidia/params` shows 0), so run
+  Nsight Compute as yourself, launching the program under it:
+  `ncu <args> <program>` on the host or in a dev container. No sudo. Never put
+  anything under sudo inside a wrapper script or interpreter (`sudo python …`,
+  `sudo bash …`): the approver can't see what it runs and will flag or deny it.
 - Canonical lock order: `sparks.lock` -> `gpu0.lock` -> `gpu1.lock` ->
-  `rhea.lock` -> `moa.lock` -> `kakapo.lock`. Never acquire an earlier lock
+  `rhea.lock` -> `moa.lock` -> `kakapo.lock` -> `cassowary.lock` ->
+  `kakapo-export.lock` -> `cassowary-export.lock`. Never acquire an earlier lock
   while holding a later one. Coordinator exports skip all GPU probes while
   a seed lease is live. Every lock wait and run has a timeout.
 - Waiting costs tokens, sleeping doesn't: start a long run as one background
@@ -125,13 +129,13 @@ before → after tables with conditions.
 - `./wip.sh --slot S --role both` for iteration, `./run.sh --wip S
   --restart` to launch; `./build.sh` and `./run.sh` for
   release images. Slots isolate artifacts, not GPUs or ports: CPU builds
-  use five counting slots; kakapo uses counting leases, serving-host seeds
-  remain exclusive. Serialize performance runs, one model per GPU.
+  use five counting slots; LAN-only seeds use counting leases plus one
+  GPU export at a time, serving-host seeds remain exclusive. Serialize performance runs, one model per GPU.
   `~/.cache/cuteafd/{gpu1,sparks}.lock` (flock) are the hardware mutexes;
   hold one only around the run that needs it and stop its containers before
   releasing it, so the next task finds a clean device.
 - Coordinator export placement: `auto` probes a free capped raptor GPU
-  without waiting, then oliver (config `CUTEAFD_EXPORT_HOST`, environment
+  without waiting, then maxq (config `CUTEAFD_EXPORT_HOST`, environment
   override wins), with bounded remote retry and no queued GPU-turn fallback.
   Independent EXL3 variants use bounded spawned workers; all exporters share
   host-wide CPU/context admission. Raptor Ninja CPU jobs are independent of
@@ -141,8 +145,8 @@ before → after tables with conditions.
   under-report usable unified memory. Remote exports reserve aggregate GPU
   and host RAM before container creation and release only after it stops.
 - Submodules are pinned with tree locks (`third_party/*.lock.json`).
-  Kernel changes go to `../sparkinfer-glmrt` master, quantizer changes to
-  `../GPTQModel` main; push there first, then bump pin and lock here.
+  Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
+  `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
@@ -153,17 +157,38 @@ before → after tables with conditions.
 - Host checks: `cargo check/test --workspace` from `rust/` with
   `CARGO_TARGET_DIR=~/.cache/cuteafd/builds/<task>/target` (no Python
   needed). Script tests: `.venv/bin/python -m pytest -q scripts/tests`
-  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers jsonschema pyyaml pillow matplotlib safetensors);
+  (`uv venv --python 3.12 .venv` + pytest pytest-xdist numpy tokenizers "huggingface-hub>=2.2" jsonschema pyyaml pillow matplotlib safetensors);
   `scripts/dev/cpu-gate --task NAME --jobs N` runs both suites concurrently
   (or set `CUTEAFD_TEST_JOBS`; default half the logical CPUs). The gate uses
   nextest when present on PATH or in the persistent architecture Cargo home,
   with cargo test as fallback. Install without root:
-  `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`. Release cuts also run `cpu-gate --slow` for the explicit slow CPU
-  tier, not arbitrary ignored GPU/network tests. Add no failing ids.
+  `CARGO_HOME="$HOME/.cache/cuteafd/cargo-home/$(uname -m)" cargo install --locked cargo-nextest`.
+  Default is for iteration and feature merges: it excludes the 15 measured
+  full-plan/cache IDs in `scripts/dev/cpu-gate`'s `FULL_TESTS`; receipts list
+  every exclusion. Use `cpu-gate --full` before merging into dev and for
+  releases to restore every nonignored test, including installed example
+  plans through the launcher's `release_prefill_shape`. That sweep uses
+  `HF_HOME` (or `~/.cache/huggingface`); override with
+  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
+  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports. Missing
+  checkpoints/revisions skip explicitly; installed planner failures still fail.
+  Release cuts also add `--slow`
+  for explicit ignored CPU soaks, not arbitrary ignored GPU/network tests.
+  Full-plan tests use `plan::testing::BudgetedPlanInput`'s strict 30 s per-plan
+  budget with phase diagnostics; multi-shape tests may take longer in total.
+  The nextest and cargo-test fallback selections agree. Add no failing ids.
 - Kernel/exporter pre-merge gate: CPU-only `scripts/build/compare-sm-exports.py --sms 188,170`; review object/cubin differences.
+  SM89 exporter changes add `--arch sm89` (offline SM89 target, 128 and 114 SMs); programs in
+  `scripts/build/sm89-export-variation.json` may differ in device code only, the toolchain's own run-to-run variation.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
-  (`cd /home/tj/Developer/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
+  (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
   relative submodule gitfiles resolve only from the real path.
+- Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
+  measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
+  using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.
+  Gate: no per-row collapse; >10% above neighbours or the curve's best, or an adjacent-size jump, needs an explanation,
+  a fix or a family descriptor preference avoiding that unit. Check internal route switches with `--compare-routes-exact`
+  and `--check-prefix-rows`; method: [#762](https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6413296191).
 - Release and WIP builds persist Cargo registry/git under
   `~/.cache/cuteafd/cargo-home/<arch>`, toolchain-keyed JIT caches under
   `~/.cache/cuteafd/jit/<dev-toolchain-hash>/<arch>`, and local compiler caches
@@ -258,7 +283,7 @@ before → after tables with conditions.
   counts), golden NLL/byte-exactness on one GPU or loopback, and the
   feature's own measurement. Changes to shared hot paths (transport, expert
   exchange, native lib, sampler, memory placement) add one quick A/B pair
-  on an affected model: candidate (WIP images) vs work/p0 measured the same
+  on an affected model: candidate (WIP images) vs dev measured the same
   day, C1 + C16 code decode, tools and memory headroom (~20 min). Correctness
   and memory safety gate; speed is reported, and only a clear drop (below
   ~0.95) earns more sessions (benches run one untimed batch per concurrency
@@ -319,9 +344,9 @@ before → after tables with conditions.
 
 ## Releases
 
-- Tag phase boundaries during development as `p0`, `p1`, …; an official
-  release is tagged `vN.N.N` once its basic benchmark profile has run
-  across the full family × quant × reference-config matrix.
+- An official release is tagged `vN.N.N` on `main` once its basic benchmark
+  profile has run across the full family × quant × reference-config matrix.
+  Every release build we make is tagged; no phase tags.
 - The README results table is generated by `cuteafd bench publish` from
   Release smoke exports, not hand-edited; re-run the smoke matrix before
   cutting a release if any family's rows are stale against the code being
@@ -333,9 +358,12 @@ before → after tables with conditions.
 
 ## Git
 
-- Feature work integrates on `work/p0`; `main` takes releases. Small commits,
-  push after every green step. Tag phase boundaries `p0`, `p1`, … Imperative
-  subjects; performance commits carry the measurement table. No attribution trailers.
+- `dev` is the integration branch: feature work merges there. `main` moves only
+  at a release, fast-forwarded to the release commit, which is tagged `vN.N.N`
+  (release candidates `vN.N.N-rcK`). Intermediate branches are free for
+  efficiency and tracking. Small commits, push after every green step.
+  Imperative subjects; performance commits carry the measurement table. No
+  attribution trailers.
 
 Branches, PRs and issues: any branch pushed but not merged by session end gets
 a draft PR (`scripts/dev/pr-sync init`). Its body is current state (aim for a few KB;
@@ -356,7 +384,14 @@ this repository is developed against; a different deployment will have
 different hosts, addresses and paths, but needs the same categories of
 facts recorded somewhere for agents working on it.
 
+Host policy and read-only inventory: [host tuning](docs/host-tuning.md).
+
 ### Hosts
+
+- `maxq`: WSL2 x86-64, RTX PRO 6000 Blackwell Max-Q 96 GB (SM120),
+  reached as `ssh maxq`. Builds, AOT exports, quants, CPU gates and
+  single-GPU correctness only; never perf A/B, cards or serving. Its
+  hardware lock is `~/.cache/cuteafd/maxq.lock` on raptor.
 
 - `raptor`: coordinator, x86-64, 2× RTX PRO 6000 Blackwell 96 GB (SM120),
   power-limited by the gpu-powerd daemon (900 W shared budget, thermal
@@ -367,14 +402,19 @@ facts recorded somewhere for agents working on it.
   limit they ran at. Fabric 10.55.0.22 / 10.55.1.22.
 - Sparks (GB10, SM121, ARM64, 121 GiB unified; `nvidia-smi` memory reads
   N/A, measure with CUDA): ostrich, dodo, emu, kiwi, rhea, moa at
-  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. TP4 on the
-  first four is the qualified V4.1 default until a six-rank layout wins.
-- `kakapo` (GB10, 172.22.2.7): build seed only, never serves; 10 GbE, no
-  RoCE. Its sealed slots reach the Sparks through sparknest. Three counting
-  build leases (20 threads / 121 GiB), shared `kakapo.lock` umbrella plus
-  exclusive `kakapo.build.N.lock`, exclude legacy exclusive users. Full or
-  unavailable kakapo may fall back to idle rhea/moa under their exclusive
-  hardware locks. Independent instances share host-wide exporter worker slots.
+  10.55.0.1–6. Ranks 0–5 in that order. All six are the pool. V4.1 max
+  uses all six (TJ 2026-10-22); TP4 is a reference layout.
+- LAN-only build seeds `kakapo` (GB10, 172.22.2.7) and `cassowary` (GB10,
+  172.22.2.8, ConnectX ports down): build only, never serve; 10 GbE, off the
+  RoCE fabric. Their sealed slots reach the Sparks through sparknest. Each has
+  three counting build leases (20 threads / ~120 GiB): shared `SEED.lock`
+  umbrella plus exclusive `SEED.build.N.lock`, excluding legacy exclusive
+  users. The leases cover Cargo and CPU phases; the GPU export takes the
+  seed's fair `SEED-export` turn (hwlock), one at a time; native-cache hits
+  skip it. An automatic seed is the less-loaded LAN seed (fewest held
+  slots), then idle rhea/moa under their exclusive hardware locks; `--seed`
+  is a placement request. Independent instances share host-wide exporter
+  worker slots. `build-dev-images.sh` gives both seeds the Spark dev image.
 - Fabric: Sparks have two RoCE ports at 200 Gb/s each on separate
   subnets (rail A 10.55.0.x, rail B 10.55.1.x); raptor has one 400 Gb/s
   port carrying both rail subnets. The switch is being raised from 100G to

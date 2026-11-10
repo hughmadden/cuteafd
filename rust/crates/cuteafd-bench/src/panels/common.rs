@@ -3,7 +3,7 @@
 use super::Ctx;
 use crate::client::{Chat, Client};
 use crate::report::ServerInfo;
-use crate::text::{filler, nonce};
+use crate::text::{corpus, nonce};
 use anyhow::Result;
 use cuteafd_api::openai::probe::ProbeSpec;
 use serde_json::{json, Value};
@@ -13,9 +13,17 @@ pub fn messages(text: &str) -> Value {
     json!([{"role": "user", "content": text}])
 }
 
-/// Greedy, thinking off.
-pub fn plain(text: &str, max_tokens: u64) -> Value {
-    json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}})
+/// Greedy, thinking off when the checkpoint renderer supports it.
+///
+/// `max_tokens: 0` sends no output budget at all, so the server applies its own
+/// output default: the request reserves the whole default lifetime, which is
+/// what a KV-reservation admission probe has to exercise.
+pub fn plain(client: &crate::client::Client, text: &str, max_tokens: u64) -> Value {
+    let mut body = json!({"messages": messages(text), "max_tokens": max_tokens, "temperature": 0, "thinking": {"type": "disabled"}});
+    if max_tokens == 0 {
+        body.as_object_mut().expect("benchmark request object").remove("max_tokens");
+    }
+    crate::request::thinking_off(&client.configuration, body)
 }
 
 /// The probe a request whose prompt re-renders model output carries: a
@@ -36,16 +44,16 @@ pub fn concurrency(info: &ServerInfo) -> usize {
     setting(info, &["concurrency", "max-sequences"]).and_then(|v| v.parse().ok()).unwrap_or(8)
 }
 
-/// Tokens per filler word, from the baseline's 8K prompt (about 1.3 otherwise).
-pub fn tokens_per_word(ctx: &Ctx<'_>) -> f64 {
-    ctx.baseline.and_then(|b| b.card.prefill.as_ref()).map(|p| p.prompt_tokens as f64 / 6200.0)
-        .filter(|r| r.is_finite() && *r > 0.5 && *r < 4.0).unwrap_or(1.33)
+/// Server tokens per corpus reference token, measured by the baseline fit.
+pub fn prompt_token_ratio(ctx: &Ctx<'_>) -> f64 {
+    ctx.baseline.and_then(|b| b.card.prompt_token_ratio)
+        .filter(|r| r.is_finite() && *r > 0.3 && *r < 4.0).unwrap_or(1.0)
 }
 
-/// A unique prompt of about `tokens` tokens: nonce, filler, then `question`.
+/// A unique prompt of about `tokens` tokens: nonce, corpus, then `question`.
 pub fn sized_prompt(ctx: &Ctx<'_>, seed: u64, tokens: u64, question: &str) -> String {
-    let words = ((tokens.saturating_sub(40)) as f64 / tokens_per_word(ctx)).max(8.0) as usize;
-    format!("[{}] Read the notes below.\n\n{}\n\n{question}", nonce(), filler(seed, words))
+    let words = ((tokens.saturating_sub(40)) as f64 / prompt_token_ratio(ctx)).max(8.0) as usize;
+    format!("[{}] Read the notes below.\n\n{}\n\n{question}", nonce(), corpus(seed, words))
 }
 
 /// One request of a concurrent wave, on the wave's clock.
@@ -229,6 +237,18 @@ pub fn doublings(from: u64, max: u64) -> Vec<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zero_tokens_omits_the_output_budget() {
+        use serde_json::json;
+        let client = crate::client::Client::new("http://127.0.0.1:1", None, std::sync::Arc::default());
+        let omitted = super::plain(&client, "test", 0);
+        assert_eq!(omitted.get("max_tokens"), None, "{omitted}");
+        assert_eq!(omitted, json!({"messages":[{"role":"user","content":"test"}], "temperature":0,
+            "thinking":{"type":"disabled"}}));
+        let explicit = super::plain(&client, "test", 192);
+        assert_eq!(explicit["max_tokens"], 192);
+    }
+
     #[test]
     fn counters_support_v41_totals_and_generic_verify_without_mixing_scopes() {
         use serde_json::json;

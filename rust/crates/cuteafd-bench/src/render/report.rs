@@ -68,7 +68,8 @@ pub fn report_svg(report: &Report) -> String {
     let banner = if t.scary || report.no_fit_reason().is_some() { 52.0 } else { 0.0 };
     let fabric_header = crate::fabric::header(&report.fabric);
     let header = if fabric_header.is_some() { 142.0 } else { 124.0 };
-    let caveats = crate::fabric::caveats(&report.fabric);
+    let mut caveats = crate::fabric::caveats(&report.fabric);
+    caveats.extend(crate::tables::report_findings(report).caveats);
     let fabric_chart = super::fabric::height(report, w - 48.0);
     let fabric_height = caveats.len() as f64 * 18.0 + if fabric_chart > 0.0 { fabric_chart + 12.0 } else { 0.0 };
     let footer = 64.0 + fabric_height;

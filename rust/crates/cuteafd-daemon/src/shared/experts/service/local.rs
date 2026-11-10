@@ -1,6 +1,8 @@
 //! The GPU owner polls admitted QPs and sends results without work queues.
 use super::*;
 use cuteafd_transport::{LocalVerbsExpertConnection, ProtocolV2ExecutorResponseRef};
+use super::backend::{Execution, Weights};
+use crate::shared::experts::exl3::execution::Exl3Epilogue;
 use std::{
     net::TcpListener,
     sync::{
@@ -19,11 +21,12 @@ fn apply_worker_selection(config: &mut NativeExpertServiceConfig,
     {
         let model = selection.model().context("worker selection requires typed model admission")?;
         model.validate(selection.geometry())?;
-        config.capacity = model.capacity;
+        config.capacity = model.capacity();
         config.max_frame_bytes = model.rings.max_frame_bytes;
         config.rdma_endpoints = model.endpoints.len();
         config.bf16_ingress = model.endpoints.iter().any(|endpoint|
             matches!(endpoint.ingress, cuteafd_core::SparkIngress::Bf16
+                | cuteafd_core::SparkIngress::Native
                 | cuteafd_core::SparkIngress::Bf16Decode { .. }));
         config.model_admission = Some(model.clone());
     }
@@ -43,6 +46,83 @@ pub(super) fn admit_worker_selection(config: &mut NativeExpertServiceConfig,
 mod selection_tests {
     use super::*;
     #[test]
+    fn received_only_intake_flushes_a_lone_unit_without_a_wait_path() {
+        assert!(continue_intake(true, true, 0, 4));
+        // The next nonblocking poll finds no peer: launch now, no deadline.
+        assert!(!continue_intake(false, true, 1, 4));
+        assert!(!continue_intake(true, false, 0, 4));
+        assert!(!continue_intake(true, true, 3, 4));
+        let source = include_str!("local.rs").rsplit_once("pub(super) fn run(").unwrap().1;
+        let receive = source.find("let launched = connections[index].begin_deferred").unwrap();
+        let direct = source[receive..].find("serve.launch(&mut executions[owner]").unwrap() + receive;
+        let sweep = source[direct..].find("index += 1;").unwrap() + direct;
+        let repeat = source[sweep..].find("continue_intake(received_this_sweep").unwrap() + sweep;
+        assert!(receive < direct && direct < sweep && sweep < repeat);
+        assert!(source.contains("let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)"));
+        // Negative control: repeating the first peer before advancing the normal
+        // sweep delays the decode on peer 1. Production advances first.
+        let normal = ["prefill peer 0", "decode peer 1", "extra intake"];
+        let delayed = ["prefill peer 0", "extra intake", "decode peer 1"];
+        assert!(normal.iter().position(|&e| e == "decode peer 1")
+            < delayed.iter().position(|&e| e == "decode peer 1"));
+    }
+
+    #[test]
+    fn full_response_ring_stops_staged_intake_before_any_send_wait() -> Result<()> {
+        assert!(intake_has_capacity(0, false, || panic!("ordinary decode must not preflight"))?);
+        for (sweep, staged) in [(0, true), (1, false), (1, true)] {
+            let mut checked = 0;
+            let mut launched = 0;
+            let mut send_waits = 0;
+            if intake_has_capacity(sweep, staged, || { checked += 1; Ok(false) })? {
+                send_waits += 1; // Negative control: begin_deferred on a full ring waits.
+            } else {
+                launched += usize::from(staged);
+            }
+            assert_eq!((checked, send_waits, launched), (1, 0, usize::from(staged)));
+        }
+        let source = include_str!("local.rs").rsplit_once("pub(super) fn run(").unwrap().1;
+        assert!(source.find("try_deferred_capacity").unwrap() < source.find(".begin_deferred(").unwrap());
+        let stop = source.find("if intake_blocked {\n                        sweep_blocked = true;\n                        break;").unwrap();
+        assert!(source[stop..].contains("flush_after_sweep(execution.has_staged(), sweep_blocked,"));
+        Ok(())
+    }
+
+    #[test]
+    fn staged_sweep_waits_for_idle_unless_intake_is_blocked() -> Result<()> {
+        assert!(!flush_after_sweep(true, false, || Ok(false))?);
+        assert!(flush_after_sweep(true, false, || Ok(true))?);
+        assert!(flush_after_sweep(true, true, || panic!("blocked intake must flush even while busy"))?);
+        assert!(!flush_after_sweep(false, false, || panic!("no staged work needs no stream query"))?);
+        assert!(flush_after_sweep(true, false, || anyhow::bail!("query failed")).is_err());
+        // A lone staged unit stays nonblocking until the next sweep sees idle.
+        for idle in [false, false, true] {
+            assert_eq!(flush_after_sweep(true, false, || Ok(idle))?, idle);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn staged_cancellation_neither_publishes_nor_strands_other_credits() -> Result<()> {
+        let owners = cuteafd_core::SparkExecutions::admit(&[64], 4096, 2752, 3, &cuteafd_core::EXL3_CAPACITIES)?;
+        let mut queues = OwnerQueues::new(&owners);
+        let first = queues.record_request(1, 0x1000)?;
+        let second = queues.record_request(1, 0x8000)?;
+        assert!(!queues.ready(first) && !queues.ready(second));
+        assert!(queues.release(first).is_err());
+        queues.cancel_staged(first)?;
+        assert_eq!(queues.retained[1], 1);
+        assert_eq!(queues.pending[1].front(), Some(&second));
+        assert!(queues.cancel_staged(first).is_err());
+        queues.publish_oldest(1, None)?;
+        assert!(queues.ready(second));
+        assert!(queues.cancel_staged(second).is_err());
+        queues.release(second)?;
+        assert_eq!(queues.retained[1], 0);
+        Ok(())
+    }
+
+    #[test]
     fn solved_worker_ids_control_loaded_and_admitted_set() {
         use cuteafd_transport::worker_selection::{WorkerIdentity, WorkerSelection};
         let dir = tempfile::tempdir().unwrap();
@@ -53,11 +133,12 @@ mod selection_tests {
         // Every backend consumes the same exact selected IDs within checkpoint bounds.
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
-            snapshot: dir.path().into(), exlr8_manifest: None, rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
-            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
-        let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
-            endpoints: vec![cuteafd_core::SparkEndpoint { capacity: 80,
-                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
+            snapshot: dir.path().into(), exlr8_manifest: None, exlr8_prefill_activations: Default::default(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
+            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: false, bf16_ingress: false };
+        let model = cuteafd_transport::worker_selection::ModelAdmission {
+            executions: cuteafd_core::SparkExecutions::admit(&[80], 80, 80, 1, &[80]).unwrap(),
+            endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
+                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 }, partial_reply_bytes: None }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };
         let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap()
@@ -80,8 +161,8 @@ mod selection_tests {
         assert!(config.bf16_ingress);
         assert_eq!(config.model_admission, Some(model.clone()));
         let mut covered = model.clone();
-        covered.capacity = 2048;
-        covered.compiled_capacity = 4096;
+        covered.executions.prefill = cuteafd_core::PrefillExecution { capacity: 2048,
+            compiled_capacity: 4096, unit_rows: 2048, buffered_units: 1 };
         covered.endpoints[0].capacity = 2048;
         let covered = sealed.clone().with_model(covered).unwrap();
         apply_worker_selection(&mut config, &covered, 1, 70).unwrap();
@@ -159,29 +240,26 @@ impl Drop for Admission {
 
 pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result<()> {
     ensure!(
-        config.rank < config.world && (1..=6).contains(&config.world),
+        config.rank < config.world && (1..=8).contains(&config.world),
         "native rank must be below the launched Spark world"
     );
     // The checkpoint fixes the process expert geometry before the native
     // library loads, so its helpers and every wire size agree with it.
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&config.snapshot)?;
     let v41 = cuteafd_loader::plan::family::detect(&inventory).is_some_and(|family| family.id() == "deepseek_v41");
-    let mut catalog = if v41 && inventory.quantization().is_none_or(|quant| quant["quant_method"] != "exl3") {
+    let mut catalog = if v41 {
         cuteafd_loader::read_official_v41_spark_catalog(&config.snapshot, config.rank, config.world)?
     } else {
         cuteafd_loader::read_expert_catalog(&config.snapshot)?
     };
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
-    let topology = crate::shared::spark_topology::for_checkpoint(
-        config.declared_world.ownership_topology(), config.world, v41 && catalog.exl3().is_some());
-    config.declared_world = crate::shared::spark_topology::world(topology, config.world)?;
     crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
-    config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
-        && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
+    config.native_spark_roles = catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;
+    drop(inventory);
     let mut census = super::census::Census::new();
     census.sample("before_native_library", None)?;
     // SAFETY: this owner outlives media, weights, retained modules and executions.
@@ -272,8 +350,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
     census.sample("before_expert_modules", Some(&library))?;
+    // Experts with a per-expert output norm reply per-expert partials through the
+    // shared epilogue programs, which the image's PROGRAMS.json carries. The same
+    // declaration sizes the worker: a partial-reply epilogue never allocates the
+    // weighted sum's token output owner.
+    let epilogue = Exl3Epilogue::for_catalog(&catalog);
+    let partial_replies = epilogue == Exl3Epilogue::PartialReplies;
     let programs = (|| -> Result<_> {
-        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies {
             let path = config.library.parent().context("native library directory")?
                 .join("../share/PROGRAMS.json");
             Ok(Some(library.programs()?.with_manifest(&path)?))
@@ -296,8 +380,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     census.sample("after_expert_modules_before_weights", Some(&library))?;
     let loaded = {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/weights");
-        load_weights(&library, &catalog, &config, &mut modules)
+        load_weights(&library, &catalog, &config, &mut modules,
+            selection.push_weights().then_some(&mut stream))
     };
+    catalog.finish_expert_reads();
     let (weights, remaining) = match loaded {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -312,20 +398,57 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let released = library.release_sync_h2d_staging()?;
     tracing::info!(released_bytes = released, "released load-time pinned upload staging");
     census.sample("before_retained_arenas", Some(&library))?;
-    let allocated = {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining, &mut modules)
-    };
-    let mut execution = match allocated {
-        Ok(execution) => execution,
+    let owners = config.model_admission.as_ref().context("Spark execution owners require model admission")?
+        .executions.clone();
+    owners.validate()?;
+    let mut queues = OwnerQueues::new(&owners);
+    let allocated = (|| -> Result<Vec<Execution<'_, '_>>> {
+        let device = library.cuda_get_device()?;
+        let mut executions: Vec<_> = std::iter::repeat_with(|| None).take(owners.decode.len() + 1).collect();
+        let mut budget = remaining;
+        // Consume the maximum-unit warmed exports before constructing narrower
+        // decode owners, whose module sets need not have the same capacities.
+        let mut extents: Vec<_> = owners.owners().collect();
+        extents.rotate_right(1);
+        for extent in extents {
+            let index = match extent.owner {
+                cuteafd_core::ExecutionOwner::Decode(lane) => lane,
+                cuteafd_core::ExecutionOwner::Prefill => owners.decode.len(),
+            };
+            let before = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
+            let mut owner_config = config.clone();
+            owner_config.capacity = extent.capacity;
+            let mut execution = {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope(
+                    if index < owners.decode.len() { "experts/workspace/decode" } else { "experts/workspace/prefill" });
+                weights.execution(&library, &owner_config, extent.compiled, extent, budget, &mut modules,
+                    epilogue)?
+            };
+            execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
+            if partial_replies {
+                let programs = programs.as_ref().context("partial replies need the image's PROGRAMS.json")?;
+                let super::backend::Execution::Exl3(worker) = &mut execution else {
+                    anyhow::bail!("partial replies are served by the EXL3 worker only");
+                };
+                worker.install_partial_epilogue(crate::shared::experts::exl3::partial::PartialEpilogue::load(
+                    &library, programs, extent.capacity as usize)?);
+            }
+            let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
+                .saturating_sub(before);
+            budget = budget.checked_sub(used).context("Spark execution owners exceed admitted workspace")?;
+            executions[index] = Some(execution);
+        }
+        executions.into_iter().map(|owner| owner.context("Spark execution owner was not constructed")).collect()
+    })();
+    let mut executions = match allocated {
+        Ok(executions) => executions,
         Err(error) => {
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
         }
     };
     census.sample("after_retained_arenas", Some(&library))?;
-    let mut exchange = HostExpertExchange::new(config.capacity)?;
-    let mut row_indices = vec![0; config.capacity as usize];
+    let (mut exchange, mut row_indices) = worker_host_exchange(&config)?;
     // Transport benchmarks only: answer each request with its response slot
     // as it is, without running the experts.
     let skip_compute = std::env::var("CUTEAFD_EXPERTD_SKIP_COMPUTE").is_ok_and(|v| v == "1");
@@ -397,7 +520,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     ensure!(resident == config.resident_layers(geometry.layers as usize)?, "loaded worker IDs differ from selected IDs");
     ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
     let loaded = worker_selection.selection().clone();
-    let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
+    let expert_grouping = executions[owners.decode.len()].installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
         .spawn(move || {
@@ -443,6 +566,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let spark_world = config.spark_world()?;
     let executor_id = spark_world.topology().executor_id(config.rank)?;
     let mut connections = Vec::<LocalVerbsExpertConnection>::with_capacity(16);
+    // Unique unit IDs survive swap-removal and preserve owner submission order
+    // independently of each connection's ordered request/reply ring storage.
+    let mut holding = Vec::<std::collections::VecDeque<HeldUnit>>::with_capacity(16);
+    let deferred_limit = usize::from(owners.prefill.buffered_units) + owners.decode.len();
     // Structured startup evidence: one line per rank naming the native role and
     // logical intermediate this worker actually loaded. A captured log can then
     // be hashed and checked against the declared topology, instead of trusting a
@@ -477,7 +604,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // connections). The wait must therefore end after `idle_wait`
     // (`LocalVerbsExpertConnection::poll`), not after an active exchange's
     // timeout. Any request or admission resets the idle timer.
-    let idle_spin = Duration::from_secs(30);
+    // Busy serving spins; after the shared idle-park time without a request
+    // (`--idle-park-seconds`, 30 s by default) the loop parks on completion
+    // events, so an idle worker uses no CPU.
+    let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;
     let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
     let mut idle_cursor = 0usize;
@@ -486,10 +616,16 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // sample. This is "first success after the admission event", not a proof
     // that the request arrived on the newly added connection.
     let mut pending_steady_log = false;
-    loop {
+    let profile_queue = std::env::var("CUTEAFD_EXPERT_TIMING").is_ok_and(|value| value == "1");
+    let mut prefill_overlap_high_water = 1usize;
+    let result = (|| -> Result<()> { loop {
         let mut progressed = false;
+        for (owner, execution) in executions.iter_mut().enumerate() {
+            progressed |= queues.complete_ready(owner, execution)?;
+        }
         if connections.is_empty() {
             connections.push(incoming.recv().context("native RoCE admission stopped")?);
+            holding.push(std::collections::VecDeque::new());
             progressed = true;
             pending_steady_log = true;
             log_spark_memory_if_enabled(
@@ -503,6 +639,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             progressed = true;
             if connections.len() < 16 {
                 connections.push(connection);
+                holding.push(std::collections::VecDeque::new());
                 pending_steady_log = true;
                 log_spark_memory_if_enabled(
                     &library,
@@ -520,85 +657,112 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             && last_activity.elapsed() >= idle_spin;
         let wait_index = waiting.then(|| idle_cursor % connections.len());
         let mut index = 0;
+        let mut intake = 0usize;
+        let mut intake_stats = IntakeStats::default();
+        let mut received_this_sweep = false;
+        let mut sweep_blocked = false;
         while index < connections.len() {
             let mut execution_failed = false;
             let mut executed = false;
-            let wait = (wait_index == Some(index)).then_some(idle_wait);
-            let result = connections[index].poll(wait, |view, mapped, emit| {
-                // The wire parser has validated framing and identities. Reject
-                // oversize work with a final response, not an unanswered peer drop.
-                if view.header.row_count > config.capacity {
-                    let response = cuteafd_transport::protocol_v2::ExpertProtocolV2ResponseRef::row_capacity_error(
-                        &view.header, config.capacity, executor_id)?;
-                    tracing::warn!(rows = view.header.row_count, capacity = config.capacity,
-                        request_id = view.header.request_id, "native expert request rejected");
-                    return emit(ProtocolV2ExecutorResponseRef::Host(response));
-                }
-                // A topology-bound worker admits only the ownership-aware
-                // request contract; every other family is a protocol mismatch,
-                // not a silent fallback.
-                let request = match spark_world.ownership_topology() {
-                    Some(topology) => BackboneRequest::parse_native_group(
-                        view.frame_bytes(),
-                        config.capacity,
-                        topology,
-                    )?,
-                    None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
+            let mut intake_blocked = false;
+            let mut received = false;
+            let wait = (intake == 0 && !executions.iter().any(Execution::has_staged)
+                && wait_index == Some(index)).then_some(idle_wait);
+            let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
+                weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
+                log_ingress: pending_steady_log };
+            let result = {
+                // Completion bookkeeping follows each owner's submission FIFO,
+                // independently of each connection's required reply order.
+                let finished = match holding[index].front().copied() {
+                    Some(unit) if queues.ready(unit) => connections[index].finish_deferred(|view, mapped, emit| {
+                        let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?
+                            .with_pace(queues.pace(unit));
+                        emit(ProtocolV2ExecutorResponseRef::Device(response))
+                    }).and_then(|()| {
+                        holding[index].pop_front();
+                        queues.release(unit)?;
+                        executed = true;
+                        Ok(true)
+                    }),
+                    _ => Ok(false),
                 };
-                if pending_steady_log {
-                    tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
-                        capacity = config.capacity, "Spark endpoint ingress geometry");
-                }
-                if skip_compute {
-                    if let Some(slot) = mapped.response_slot {
-                        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
-                        let bytes = request.plane_bytes()?;
-                        if request.permits_device_response() && slot.bytes >= prefix + bytes {
-                            let output = cuteafd_ffi::CuteafdDeviceBuffer {
-                                // SAFETY: the payload follows the header inside the mapped slot.
-                                ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
-                            };
-                            return emit(ProtocolV2ExecutorResponseRef::Device(
-                                request.response_device(executor_id, output)?));
+                finished.and_then(|finished| {
+                    if !intake_has_capacity(intake, executions.iter().any(Execution::has_staged),
+                        || connections[index].try_deferred_capacity(deferred_limit))? {
+                        intake_blocked = true;
+                        intake_stats.send_ring_full += 1;
+                        tracing::debug!(target: "cuteafd::spark_coalesce", peer = index, intake,
+                            send_ring_full = intake_stats.send_ring_full, reason = "send_or_ring_full",
+                            "Spark intake preflight refused");
+                        return Ok(finished);
+                    }
+                    let mut launch_failed = false;
+                    let mut input_address = 0;
+                    let launched = connections[index].begin_deferred(wait, deferred_limit, |view, mapped| {
+                        input_address = mapped.hidden_payload.ptr as usize;
+                        let owner = execution_owner(&owners, view, mapped.execution_lane)?;
+                        queues.admit(owner)?;
+                        serve.launch(&mut executions[owner], view, mapped).map(|launched| {
+                            (owner, launched)
+                        }).map_err(|failure| {
+                            launch_failed = failure.execution;
+                            failure.error
+                        })
+                    });
+                    match launched {
+                        Ok(Some((owner, true))) => {
+                            received = true;
+                            intake_stats.received += 1;
+                            holding[index].push_back(queues.record_request(owner, input_address)?);
+                            let queued = queues.pending[owner].len();
+                            // Count overlap only while the oldest GPU fence is
+                            // incomplete, not merely while replies retain storage.
+                            if profile_queue && owner == owners.decode.len()
+                                && queued > prefill_overlap_high_water
+                                && !executions[owner].unit_ready()? {
+                                prefill_overlap_high_water = queued;
+                                tracing::info!(target: "cuteafd::expert_timing", rank = config.rank, owner,
+                                    queued_units = queued, oldest_complete = false,
+                                    "Spark prefill owner overlap");
+                            }
+                            Ok(true)
                         }
+                        // The host-only path drains its owner before using blocking
+                        // uploads. Earlier replies still leave in connection order.
+                        Ok(Some((owner, false))) => (|| -> Result<bool> {
+                            received = true;
+                            intake_stats.received += 1;
+                            executions[owner].flush_staged()?;
+                            executions[owner].synchronize()?;
+                            queues.complete_ready(owner, &mut executions[owner])?;
+                            while let Some(earlier) = holding[index].front().copied() {
+                                executions[earlier.owner].flush_staged()?;
+                                executions[earlier.owner].synchronize()?;
+                                queues.complete_ready(earlier.owner, &mut executions[earlier.owner])?;
+                                connections[index].finish_deferred(|view, mapped, emit| {
+                                    let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
+                                    emit(ProtocolV2ExecutorResponseRef::Device(response))
+                                })?;
+                                holding[index].pop_front();
+                                queues.release(earlier)?;
+                            }
+                            connections[index].finish_deferred(|view, mapped, emit| {
+                                let served = serve.request(&mut executions[owner], view, mapped, emit);
+                                execution_failed = served.as_ref().is_err_and(|failure| failure.execution);
+                                executed = served.as_ref().is_ok_and(|served| served.executed);
+                                served.map(|_| ()).map_err(|failure| failure.error)
+                            })?;
+                            Ok(true)
+                        })(),
+                        Ok(None) => {
+                            if executions.iter().any(Execution::has_staged) { intake_stats.empty_second_receive += 1; }
+                            Ok(finished)
+                        },
+                        Err(error) => { execution_failed = launch_failed; Err(error) }
                     }
-                }
-                let layer = resident.binary_search(&(request.layer() as usize))
-                    .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
-                execution.bind_layer(&weights, layer)?;
-                if mapped.response_slot.is_some() {
-                    // The mapped frame's hidden rows are device-visible, so the
-                    // worker copies them on its stream instead of uploading.
-                    // SAFETY: the transport retains the mapped slots through execution and emission.
-                    let response = unsafe { execution.execute_mapped(&request,
-                        executor_id, &mut exchange, mapped) };
-                    let response = match response {
-                        Ok(response) => response,
-                        Err(error) => { execution_failed = true; return Err(error); }
-                    };
-                    if let Some(response) = response {
-                        emit(ProtocolV2ExecutorResponseRef::Device(response))?;
-                        executed = request.rows() > 0;
-                        return Ok(());
-                    }
-                }
-                let mut emit_failed = false;
-                let result = execution.execute_host_chunks(
-                    &request,
-                    executor_id,
-                    &mut exchange,
-                    &mut row_indices,
-                    config.max_frame_bytes,
-                    |response| {
-                        let result = emit(ProtocolV2ExecutorResponseRef::Host(response));
-                        emit_failed |= result.is_err();
-                        result
-                    },
-                );
-                execution_failed = result.is_err() && !emit_failed;
-                executed = result.is_ok() && request.rows() > 0;
-                result
-            });
+                })
+            };
             match result {
                 Ok(processed) => {
                     progressed |= processed;
@@ -620,15 +784,77 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                         );
                         pending_steady_log = false;
                     }
+                    // A full reply ring cannot delay the staged wave behind a
+                    // SEND wait. Launch it now, then resume the ordinary sweep.
+                    if intake_blocked {
+                        sweep_blocked = true;
+                        break;
+                    }
+                    received_this_sweep |= received;
                     index += 1;
+                    // Finish the original connection sweep before any extra
+                    // polling: a decode on another peer is never postponed.
+                    if index == connections.len() && continue_intake(received_this_sweep,
+                        executions.iter().any(Execution::has_staged), intake, deferred_limit) {
+                        intake += 1;
+                        index = 0;
+                        received_this_sweep = false;
+                    }
                 }
                 Err(error) => {
+                    // A failed launch can have queued copies before its error,
+                    // including a unit not yet recorded in the host FIFO. Drain
+                    // before any connection releases the borrowed mapped frames.
                     if execution_failed {
+                        for execution in &executions {
+                            crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark failed launch");
+                        }
                         return Err(error).context("native GPU execution failed");
                     }
+                    // Staged frames have only queued copies: retire them before
+                    // draining any launched members or releasing their peer rings.
+                    let mut retained = std::collections::VecDeque::new();
+                    for unit in holding[index].drain(..) {
+                        if executions[unit.owner].cancel_staged(unit.input_address)? {
+                            queues.cancel_staged(unit)?;
+                        } else { retained.push_back(unit); }
+                    }
+                    holding[index] = retained;
+                    for owner in 0..executions.len() {
+                        if holding[index].iter().any(|unit| unit.owner == owner) {
+                            executions[owner].flush_staged()?;
+                            crate::shared::decode_graph::fatal_drain(executions[owner].synchronize(), "Spark removed peer");
+                            queues.complete_ready(owner, &mut executions[owner])?;
+                        }
+                    }
+                    for unit in holding[index].drain(..) { queues.release(unit)?; }
                     tracing::warn!(%error, "native RoCE peer removed");
                     connections.swap_remove(index);
+                    holding.swap_remove(index);
+                    intake = 0;
                 }
+            }
+        }
+        if executions.iter().any(Execution::has_staged) {
+            tracing::debug!(target: "cuteafd::spark_coalesce", received = intake_stats.received,
+                send_ring_full = intake_stats.send_ring_full, empty_second_receive = intake_stats.empty_second_receive,
+                sweeps = intake + 1, "Spark intake flush decision");
+        }
+        for execution in &mut executions {
+            // Keep arrivals staged behind active compute, not in its CUDA queue.
+            // Staged work disables receive waits, so an empty intake keeps polling.
+            let flush = (|| -> Result<()> {
+                if flush_after_sweep(execution.has_staged(), sweep_blocked,
+                    || execution.stream_idle())? {
+                    execution.flush_staged()?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = flush {
+                for execution in &executions {
+                    crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark grouped launch");
+                }
+                return Err(error).context("native grouped execution failed");
             }
         }
         if progressed {
@@ -639,5 +865,409 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         } else {
             std::hint::spin_loop();
         }
+    } })();
+    for execution in &executions {
+        crate::shared::decode_graph::fatal_drain(execution.synchronize(), "Spark owner teardown");
+    }
+    result
+}
+
+#[derive(Default)]
+struct IntakeStats { received: u64, send_ring_full: u64, empty_second_receive: u64 }
+
+fn flush_after_sweep(staged: bool, blocked: bool, idle: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    Ok(staged && (blocked || idle()?))
+}
+
+fn intake_has_capacity(sweep: usize, staged: bool, check: impl FnOnce() -> Result<bool>) -> Result<bool> {
+    if sweep == 0 && !staged { return Ok(true); }
+    check()
+}
+
+/// Extra intake follows a full ordinary sweep and never waits for an arrival.
+pub(crate) fn continue_intake(received: bool, staged: bool, sweep: usize, bound: usize) -> bool {
+    received && staged && sweep + 1 < bound
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ExecutionProtocolError {
+    #[error("expert request has no source rows")]
+    Empty,
+    #[error("expert request mixes decode and prefill owners")]
+    MixedOwners,
+    #[error("Spark execution owner {owner} already retains its admitted {limit} units")]
+    Full { owner: usize, limit: usize },
+}
+
+fn execution_owner(owners: &cuteafd_transport::worker_selection::SparkExecutions,
+    view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>, lane: u32) -> Result<usize> {
+    let source = view.row(0).map_err(|_| ExecutionProtocolError::Empty)?.source_kind;
+    let owner = cuteafd_transport::worker_selection::execution_owner(owners, source, lane, view.header.row_count)?;
+    for row in 1..view.header.row_count as usize {
+        if cuteafd_transport::worker_selection::execution_owner(owners, view.row(row)?.source_kind, lane, view.header.row_count)? != owner {
+            return Err(ExecutionProtocolError::MixedOwners.into());
+        }
+    }
+    Ok(match owner {
+        cuteafd_transport::worker_selection::ExecutionOwner::Decode(lane) => lane,
+        cuteafd_transport::worker_selection::ExecutionOwner::Prefill => owners.decode.len(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct HeldUnit { owner: usize, id: u64, input_address: usize }
+
+/// GPU publication follows owner FIFO; transport emission follows connection
+/// FIFO. A completed unit still retains its own I/O and admission credit, and
+/// its measured pace until its reply carries it.
+struct OwnerQueues {
+    limits: Vec<usize>,
+    retained: Vec<usize>,
+    pending: Vec<std::collections::VecDeque<HeldUnit>>,
+    completed: std::collections::HashMap<HeldUnit, Option<crate::shared::experts::execution::timing::UnitPace>>,
+    next_id: u64,
+    /// The prefill owner's index: only its units report a pace (#762).
+    prefill: usize,
+}
+impl OwnerQueues {
+    fn new(owners: &cuteafd_transport::worker_selection::SparkExecutions) -> Self {
+        let limits: Vec<_> = owners.owners().map(|extent| usize::from(extent.buffered_units)).collect();
+        let capacity = limits.iter().sum();
+        Self { retained: vec![0; limits.len()],
+            pending: limits.iter().map(|&limit| std::collections::VecDeque::with_capacity(limit)).collect(),
+            limits, completed: std::collections::HashMap::with_capacity(capacity), next_id: 0,
+            prefill: owners.decode.len() }
+    }
+    fn admit(&self, owner: usize) -> Result<()> {
+        if self.retained[owner] >= self.limits[owner] {
+            return Err(ExecutionProtocolError::Full { owner, limit: self.limits[owner] }.into());
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    fn record(&mut self, owner: usize) -> Result<HeldUnit> { self.record_request(owner, self.next_id as usize) }
+    fn record_request(&mut self, owner: usize, input_address: usize) -> Result<HeldUnit> {
+        self.admit(owner)?;
+        let unit = HeldUnit { owner, id: self.next_id, input_address };
+        self.next_id = self.next_id.checked_add(1).context("expert unit identity exhausted")?;
+        self.retained[owner] += 1;
+        self.pending[owner].push_back(unit);
+        Ok(unit)
+    }
+    fn cancel_staged(&mut self, unit: HeldUnit) -> Result<()> {
+        ensure!(!self.ready(unit), "cannot cancel a published unit as staged");
+        let position = self.pending[unit.owner].iter().position(|&pending| pending == unit)
+            .context("staged unit missing from owner FIFO")?;
+        self.pending[unit.owner].remove(position);
+        self.retained[unit.owner] = self.retained[unit.owner].checked_sub(1).context("staged credit underflow")?;
+        Ok(())
+    }
+    fn ready(&self, unit: HeldUnit) -> bool { self.completed.contains_key(&unit) }
+    /// A completed unit's pace for its reply header: prefill owner units only.
+    fn pace(&self, unit: HeldUnit) -> Option<(u32, u32)> {
+        self.completed.get(&unit).copied().flatten().filter(|_| unit.owner == self.prefill)
+            .map(|pace| (pace.busy_us, pace.idle_us))
+    }
+    fn complete_ready(&mut self, owner: usize, execution: &mut Execution<'_, '_>) -> Result<bool> {
+        let mut progressed = false;
+        while !self.pending[owner].is_empty() && execution.unit_ready()? {
+            let pace = execution.complete()?;
+            self.publish_oldest(owner, pace)?;
+            progressed = true;
+        }
+        Ok(progressed)
+    }
+    fn publish_oldest(&mut self, owner: usize,
+        pace: Option<crate::shared::experts::execution::timing::UnitPace>) -> Result<()> {
+        let unit = self.pending[owner].pop_front().context("expert owner has no queued unit")?;
+        ensure!(self.completed.insert(unit, pace).is_none(), "expert unit published twice");
+        Ok(())
+    }
+    fn release(&mut self, unit: HeldUnit) -> Result<()> {
+        ensure!(self.completed.remove(&unit).is_some(), "expert I/O released before unit completion");
+        self.retained[unit.owner] = self.retained[unit.owner].checked_sub(1)
+            .context("expert unit credit underflow")?;
+        Ok(())
+    }
+}
+
+/// A request served synchronously: whether it ran the experts.
+struct Served { executed: bool }
+
+/// A failed request: whether the GPU execution itself failed (fatal) rather
+/// than the peer or the wire.
+struct ServeFailure { error: anyhow::Error, execution: bool }
+
+impl From<anyhow::Error> for ServeFailure {
+    fn from(error: anyhow::Error) -> Self { Self { error, execution: false } }
+}
+
+/// Everything one request needs from the GPU owner besides its execution slot.
+struct Serve<'s, 'w, 'a> {
+    config: &'s NativeExpertServiceConfig,
+    executor_id: u64,
+    spark_world: &'s SparkWorld,
+    resident: &'s [usize],
+    weights: &'w Weights<'a>,
+    exchange: &'s mut HostExpertExchange,
+    row_indices: &'s mut Vec<u32>,
+    skip_compute: bool,
+    log_ingress: bool,
+}
+
+impl<'w, 'a> Serve<'_, 'w, 'a> {
+    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig,
+        spark_world: &SparkWorld) -> Result<BackboneRequest<'v>> {
+        // A topology-bound worker admits only the ownership-aware request
+        // contract; every other family is a protocol mismatch, not a fallback.
+        match spark_world.ownership_topology() {
+            Some(topology) => BackboneRequest::parse_native_group(view.frame_bytes(), config.capacity, topology),
+            None => BackboneRequest::parse(view.frame_bytes(), config.capacity),
+        }
+    }
+
+    /// The device response a launched request writes into its send slot.
+    fn device_response(view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload, executor_id: u64,
+        config: &NativeExpertServiceConfig, spark_world: &SparkWorld)
+        -> Result<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>> {
+        let request = Self::parse(view, config, spark_world)?;
+        let slot = mapped.response_slot.context("deferred request lost its response slot")?;
+        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        ensure!(request.permits_device_response() && slot.bytes >= prefix + bytes,
+            "deferred request does not fit its response slot");
+        // SAFETY: the payload follows the header inside the mapped send slot.
+        let output = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(),
+            bytes, ..slot };
+        request.response_device(executor_id, output)
+    }
+
+    /// Queue a device-answerable request on `execution` without waiting
+    /// (`true`); `false` when it must be served synchronously instead.
+    fn launch(&mut self, execution: &mut Execution<'w, 'a>,
+        view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload) -> std::result::Result<bool, ServeFailure> {
+        if view.header.row_count > self.config.capacity || self.skip_compute || mapped.response_slot.is_none() {
+            return Ok(false);
+        }
+        let request = Self::parse(view, self.config, self.spark_world)?;
+        if !request.permits_device_response() { return Ok(false); }
+        let layer = self.resident.binary_search(&(request.layer() as usize))
+            .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
+        execution.bind_layer(self.weights, layer)?;
+        // SAFETY: the transport holds both slots through finish_deferred,
+        // which runs only after this unit's completion fence.
+        let response = unsafe { execution.execute_mapped(&request, self.executor_id, self.exchange, mapped) }
+            .map_err(|error| ServeFailure { error, execution: true })?;
+        Ok(response.is_some())
+    }
+
+    /// Serve one request to completion, emitting its response.
+    fn request(&mut self, execution: &mut Execution<'w, 'a>,
+        view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload,
+        emit: &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>)
+        -> std::result::Result<Served, ServeFailure> {
+        let (config, executor_id) = (self.config, self.executor_id);
+        // The wire parser has validated framing and identities. Reject
+        // oversize work with a final response, not an unanswered peer drop.
+        if view.header.row_count > config.capacity {
+            let response = cuteafd_transport::protocol_v2::ExpertProtocolV2ResponseRef::row_capacity_error(
+                &view.header, config.capacity, executor_id)?;
+            tracing::warn!(rows = view.header.row_count, capacity = config.capacity,
+                request_id = view.header.request_id, "native expert request rejected");
+            emit(ProtocolV2ExecutorResponseRef::Host(response))?;
+            return Ok(Served { executed: false });
+        }
+        let request = Self::parse(view, config, self.spark_world)?;
+        if self.log_ingress {
+            tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
+                capacity = config.capacity, "Spark endpoint ingress geometry");
+        }
+        if self.skip_compute {
+            if let Some(slot) = mapped.response_slot {
+                let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+                let bytes = request.plane_bytes()?;
+                if request.permits_device_response() && slot.bytes >= prefix + bytes {
+                    let output = cuteafd_ffi::CuteafdDeviceBuffer {
+                        // SAFETY: the payload follows the header inside the mapped slot.
+                        ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
+                    };
+                    emit(ProtocolV2ExecutorResponseRef::Device(request.response_device(executor_id, output)?))?;
+                    return Ok(Served { executed: false });
+                }
+            }
+        }
+        let layer = self.resident.binary_search(&(request.layer() as usize))
+            .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
+        execution.bind_layer(self.weights, layer)?;
+        if mapped.response_slot.is_some() {
+            // The mapped frame's hidden rows are device-visible, so the
+            // worker copies them on its stream instead of uploading.
+            // SAFETY: the transport retains the mapped slots through execution and emission.
+            let response = unsafe { execution.execute_mapped(&request, executor_id, self.exchange, mapped) }
+                .map_err(|error| ServeFailure { error, execution: true })?;
+            if let Some(response) = response {
+                execution.synchronize().and_then(|()| execution.complete().map(|_| ()))
+                    .map_err(|error| ServeFailure { error, execution: true })?;
+                emit(ProtocolV2ExecutorResponseRef::Device(response))?;
+                return Ok(Served { executed: request.rows() > 0 });
+            }
+        }
+        let mut emit_failed = false;
+        let result = execution.execute_host_chunks(&request, executor_id, self.exchange, self.row_indices,
+            config.max_frame_bytes, |response| {
+                let result = emit(ProtocolV2ExecutorResponseRef::Host(response));
+                emit_failed |= result.is_err();
+                result
+            });
+        match result {
+            Ok(()) => Ok(Served { executed: request.rows() > 0 }),
+            Err(error) => Err(ServeFailure { error, execution: !emit_failed }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    use cuteafd_transport::worker_selection::{DecodeExecution, PrefillExecution, SparkExecutions};
+
+    fn owners() -> SparkExecutions {
+        SparkExecutions { decode: vec![DecodeExecution { capacity: 80, compiled_capacity: 80 }; 2],
+            prefill: PrefillExecution { capacity: 4096, compiled_capacity: 4096, unit_rows: 2752, buffered_units: 3 } }
+    }
+
+    #[test]
+    fn request_sources_route_to_typed_owners_and_reject_mixed_or_oversize_units() -> Result<()> {
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RequestView,
+            ExpertProtocolV2RowDescriptor, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind};
+        use ExpertV2SourceKind::*;
+        let geometry = cuteafd_core::expert_geometry();
+        let frame = |sources: &[ExpertV2SourceKind]| -> Result<Vec<u8>> {
+            let rows = u32::try_from(sources.len())?;
+            let request = ExpertProtocolV2Request::new(91, 17, 3, geometry.hidden,
+                ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+                sources.iter().enumerate().map(|(row, &source_kind)| ExpertProtocolV2RowDescriptor {
+                    row_id: row as u64, source_kind, source_request_id: 1, token_position: row as u64,
+                    route_offset: row as u32 * geometry.topk, route_count: geometry.topk }).collect(),
+                (0..rows * geometry.topk).map(|route| ExpertProtocolV2RouteEntry {
+                    row_index: route / geometry.topk, expert_id: route % geometry.experts,
+                    gate_weight: 1.0 }).collect(),
+                vec![0; rows as usize * (geometry.hidden as usize + geometry.hidden as usize / 32)])?;
+            request.encode()
+        };
+        for (sources, lane, expected) in [(vec![Prefill; 2], 1, 2),
+            (vec![Benchmark; 2], 9, 2), (vec![Decode, MtpVerify], 1, 1)] {
+            let frame = frame(&sources)?;
+            let view = ExpertProtocolV2RequestView::parse(&frame)?;
+            assert_eq!(execution_owner(&owners(), &view, lane)?, expected);
+        }
+        let mixed = frame(&[Decode, Prefill])?;
+        let error = execution_owner(&owners(), &ExpertProtocolV2RequestView::parse(&mixed)?, 0).unwrap_err();
+        assert!(matches!(error.downcast_ref::<ExecutionProtocolError>(), Some(ExecutionProtocolError::MixedOwners)));
+        for (sources, lane) in [(vec![Decode; 81], 0), (vec![Decode], 2), (vec![Prefill; 2753], 0)] {
+            let frame = frame(&sources)?;
+            assert!(execution_owner(&owners(), &ExpertProtocolV2RequestView::parse(&frame)?, lane).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn owner_credit_remains_held_until_each_reply_is_released() -> Result<()> {
+        let mut queues = OwnerQueues::new(&owners());
+        let units = (0..3).map(|_| queues.record(2)).collect::<Result<Vec<_>>>()?;
+        let error = queues.admit(2).unwrap_err();
+        assert!(matches!(error.downcast_ref::<ExecutionProtocolError>(),
+            Some(ExecutionProtocolError::Full { owner: 2, limit: 3 })));
+        assert!(queues.release(units[0]).is_err());
+        queues.publish_oldest(2, None)?;
+        assert!(queues.ready(units[0]) && !queues.ready(units[1]));
+        assert!(queues.admit(2).is_err(), "completion alone cannot recycle retained I/O");
+        queues.release(units[0])?;
+        let replacement = queues.record(2)?;
+        assert_ne!(replacement, units[0]);
+        for unit in [units[1], units[2], replacement] {
+            queues.publish_oldest(2, None)?;
+            assert!(queues.ready(unit));
+            queues.release(unit)?;
+        }
+        assert_eq!(queues.retained, vec![0; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn lane_set_transports_use_distinct_decode_credits_and_one_prefill_owner() -> Result<()> {
+        use cuteafd_transport::expert::{SparkExperts, SparkWorld};
+        use cuteafd_transport::worker_selection::{execution_owner, ExecutionOwner};
+        use cuteafd_transport::{ExpertV2SourceKind, TcpTransportConfig};
+        let mut admitted = owners();
+        admitted.prefill.unit_rows = 2048;
+        admitted.prefill.buffered_units = 2;
+        let mut queues = OwnerQueues::new(&admitted);
+        let set = crate::shared::serve::lanes::LaneSet::default();
+        let peers = ["127.0.0.1:19455".parse()?];
+        let mut transports = set.try_map(|lane| SparkExperts::new_world(SparkWorld::canonical(1)?,
+            &peers, 2048, TcpTransportConfig::default(), u32::try_from(lane.index())?))?;
+        let mut units = Vec::new();
+        for (lane, transport) in transports.iter_mut().enumerate() {
+            assert_eq!(transport.execution_lane(), lane as u32);
+            for source in [ExpertV2SourceKind::Decode, ExpertV2SourceKind::MtpVerify] {
+                assert_eq!(execution_owner(&admitted, source, transport.execution_lane(), 62)?,
+                    ExecutionOwner::Decode(lane));
+            }
+            units.push(queues.record(lane)?);
+            assert!(queues.admit(lane).is_err());
+            assert_eq!(execution_owner(&admitted, ExpertV2SourceKind::Prefill,
+                transport.execution_lane(), 2048)?, ExecutionOwner::Prefill);
+            units.push(queues.record(admitted.decode.len())?);
+            transport.reset_connections();
+            assert_eq!(transport.execution_lane(), lane as u32);
+        }
+        assert_eq!(queues.retained, [1, 1, 2]);
+        assert!(queues.admit(admitted.decode.len()).is_err());
+        for unit in units {
+            queues.publish_oldest(unit.owner, None)?;
+            queues.release(unit)?;
+        }
+        assert_eq!(queues.retained, [0; 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn only_prefill_owner_units_carry_their_pace_until_release() -> Result<()> {
+        use crate::shared::experts::execution::timing::UnitPace;
+        let mut queues = OwnerQueues::new(&owners());
+        let (decode, prefill) = (queues.record(0)?, queues.record(2)?);
+        queues.publish_oldest(0, Some(UnitPace { busy_us: 5, idle_us: 6 }))?;
+        queues.publish_oldest(2, Some(UnitPace { busy_us: 700, idle_us: 30 }))?;
+        assert_eq!(queues.pace(decode), None, "decode owners never report a pace");
+        assert_eq!(queues.pace(prefill), Some((700, 30)));
+        queues.release(prefill)?;
+        assert_eq!(queues.pace(prefill), None);
+        queues.release(decode)?;
+        Ok(())
+    }
+
+    #[test]
+    fn decode_lanes_never_borrow_prefill_or_other_decode_credit() -> Result<()> {
+        let mut queues = OwnerQueues::new(&owners());
+        let first = queues.record(0)?;
+        assert!(queues.admit(0).is_err());
+        assert!(queues.admit(1).is_ok() && queues.admit(2).is_ok());
+        let second = queues.record(1)?;
+        queues.publish_oldest(1, None)?;
+        assert!(!queues.ready(first) && queues.ready(second));
+        queues.release(second)?;
+        queues.publish_oldest(0, None)?;
+        queues.release(first)?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_owner_loop_parks_after_the_shared_idle_time() {
+        let source = include_str!("local.rs");
+        assert!(source.contains("let idle_spin = cuteafd_transport::wait_policy::wait_policy().idle_park;"));
     }
 }
