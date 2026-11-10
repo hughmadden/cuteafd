@@ -2138,6 +2138,7 @@ def test_capture_ticket_native_failures_always_report_backoff():
         ("qwen3_5", "graphs.rs", "cache_ticket_failed"),
         ("muse_spark", "graphs.rs", "cache_ticket_failed"),
         ("kimi_k3", "graphs.rs", "cache_ticket_failed"),
+        ("step5", "graphs.rs", "cache_ticket_failed"),
         ("deepseek_v4", "engine.rs", "cache_capture_failed"),
         ("mimo_v2", "engine.rs", "cache_capture_failed"),
         ("glm5", "engine.rs", "cache_capture_failed"),
