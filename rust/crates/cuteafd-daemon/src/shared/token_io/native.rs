@@ -513,7 +513,7 @@ mod tests {
                 let mut cfg = GlmNextConfig::from_hf(&configs["flash"])?;
                 cfg.hidden = 128;
                 cfg.vocab_size = 256;
-                let mut all = records.clone();
+                let mut all = records.to_vec();
                 all.push(DenseRecord { tensor: selection.norm_name(), encoding: DenseEncoding::Bf16,
                     shape: vec![128], side: ShardSide::Output,
                     ownership: DenseOwnership::new(DenseExecution::RankZero), channels_per_shard: 128,
@@ -537,7 +537,7 @@ mod tests {
                 native_target(&facts, &dense, &cfg, embedding_rank)?
             } else {
                 use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership};
-                let mut all = records.clone();
+                let mut all = records.to_vec();
                 all.push(DenseRecord { tensor: "model.layers.0.input_layernorm.weight".into(),
                     encoding: DenseEncoding::Bf16, shape: vec![128], side: ShardSide::Output,
                     ownership: DenseOwnership::new(DenseExecution::Replicated), channels_per_shard: 128,
