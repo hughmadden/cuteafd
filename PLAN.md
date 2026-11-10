@@ -6567,3 +6567,221 @@ and the 30-minute progress timer is disabled. Do not replay the old checksum
 finisher against the intentionally retired local weights; final native command
 sources/results are retained in `muse-quant-work/native_finish.py` and
 `production-k128/native-cli-jobs/`.
+
+## SM89 2x RTX 4090 D 48 GB static optimization review (DSF 4.1, 2026-11-11)
+
+Reviewed cuteafd [`379b26792`](https://github.com/hughmadden/cuteafd/commit/379b26792)
+with SparkInfer pinned at
+[`ce9aec549307cf7736ea296b0e71d190923fc9c1`](https://github.com/hughmadden/sparkinfer-glmrt/commit/ce9aec549307cf7736ea296b0e71d190923fc9c1).
+Scope: inference-engine and kernel changes that improve performance, efficiency
+or KV-cache behavior without regressing accuracy. This was a static review: no
+engine launch, build, benchmark or hardware test ran, and no other agent's
+worktree or report was consulted.
+
+The useful baseline is already strong. SM89 decode experts reach about 95-97%
+of their measured streaming-read ceiling. The exact F16 expert MMA fixes the
+FP8 MMA's recipe mismatch for only 1.8-4.7% on memory-bound waves. Radix
+selection and shared-tile attention have removed large overheads, and copy-
+engine prefill staging improved measured 8K prefill from 4,315 to 4,853 tok/s
+(+12.5%), with 32K improving from 4,066 to 5,588 tok/s (+37.4%). Further
+generic decode-GEMV work is therefore low priority.
+
+### Findings, estimates and accuracy contracts
+
+These are estimates derived from the fork's measurements and traffic models,
+not new measurements on the review branch.
+
+| Priority | Improvement | Practical estimate | Accuracy contract |
+| --- | --- | --- | --- |
+| 1 | Capture the whole verify step | Existing documented ceiling: +10-15% C1, +8-12% C4; likely lower after recent SM89 fusions | Byte-identical graph replay and accepted tokens |
+| 2 | Pipeline FP4 gather with QK on SM89 | 10-25% attention; about 0.5-2% decode and 1-3% prefill | Same BF16 decode, QK order, 64-key softmax and PV |
+| 3 | Mirror Spark reply descriptors into device memory | 20-40% pinned landing; about 1-3% at C16/prefill and 0.5-1% C1 | Byte-identical copies and plane order |
+| 4 | Generate candidate positions inside scorer/top-k | 344 MiB freed per selection store (about 39 TP2 expert halves); 1-3% long-context prefill | Identical positions, scores, masks and tie order |
+| 5 | Session-aware prefix eviction | Avoid about 0.4 ms per 8K or 4.9 ms per 128K host restore; much larger when it prevents a cold prefill | Only victim order changes |
+| 6 | Ordered K64 split-K for wide routers | 20-40% router; about 0.5-1.5% C16 and below 0.5% prefill | Ordered second stage reproduces the existing K64 sum |
+| 7 | Fuse `q_a + wkv` activation production | 0.2-0.5% decode and 0.3-1% prefill; 26.9 MiB less scratch per 2752-row window store | Same activation codes and per-output GEMM order |
+| 8 | Census and bound V4.1 graph shapes | Unknown until measured; each 1 GiB freed buys about 118 TP2 halves or 2M KV tokens | Hot exact shapes stay; cold shapes run eagerly |
+
+#### 1. Whole verify-step capture
+
+V4.1 still captures per component/layer
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/graph_policy.rs`). The
+existing profiling records host launch gaps and projects +10-15% C1 and +8-12%
+C4 from whole-step capture (PLAN lines 459-475). That projection predates the
+latest mHC, dSpark and staging fusions, so it is a ceiling, not an expected
+result. It remains the largest documented decode opportunity.
+
+Capture target verification and its device-ordered Spark/TP2 exchanges as one
+graph per exact row shape, including the post-argmax host gap. Keep the current
+per-component graphs as the reference arm. Gate on byte-identical logits and
+accepted tokens, 10/10 lossless-speculation cases, exact prefix restores, zero
+steady-state captures and graph-memory accounting.
+
+#### 2. Asynchronous FP4 gather and QK overlap
+
+The native SM89 loop resolves references, gathers/decodes the complete KV tile
+into shared BF16, then runs QK, softmax and PV
+(`native/families/deepseek_v41/cuda/v41_sparse_attention.cu`, the tile loop and
+QK/PV sequence). Global gather and tensor-core work are serialized.
+
+Use one 32-key raw FP4 staging buffer: 8 KiB of values plus 1 KiB of scales (9
+KiB total). It fits the roughly 15 KiB left by the four-group prefill layout
+within SM89's approximately 99 KiB shared-memory budget.
+
+1. Load/decode the first 32 keys.
+2. Start asynchronous loading of the next 32.
+3. Compute QK for the first 32 while the second is in flight.
+4. Decode the second group and finish QK.
+5. Preserve the existing full 64-key softmax and PV.
+6. If another tile exists, prefetch its first group during PV.
+
+QK stays per-16-key WMMA tiles in the same column order; softmax and PV stay at
+64 keys. No numerical route change is required. This also helps a decode part
+with only one tile because the second half's load overlaps the first half's QK.
+
+Primary prior art: [TileLang's sparse-MLA
+kernels](https://github.com/tile-ai/tilelang/blob/1cf5a1f004a4a6175748b0316267e8b462e77e02/examples/deepseek_v32/README.md)
+use producer stages and overlap KV-layout work with QK;
+[FlashInfer PR #814](https://github.com/flashinfer-ai/flashinfer/pull/814)
+records SM89's shared-memory constraint; NVIDIA documents CC 8.0+ asynchronous
+global-to-shared copies in [LDGSTS](https://docs.nvidia.com/cuda/archive/13.4.1/cuda-programming-guide/04-special-topics/async-copies.html#using-ldgsts).
+Estimate 10-25% attention improvement, or about 0.5-2% decode and 1-3%
+prefill. Stop if profiling shows raw-gather waiting below 10% of attention
+time.
+
+#### 3. Device-side Spark reply descriptors
+
+Pinned landing lets every pull block read its rank descriptor over PCIe. The
+fork's by-value probe measures the available ceiling: 240 KiB 36.4 -> 26.8 us;
+960 KiB 91.7 -> 55.5 us; 10 MiB rank-by-rank 734.8 -> 438.9 us
+(`rust/crates/cuteafd-daemon/src/shared/spark_waves_tests.rs`,
+`device_ordered_landing_on_this_host`). Queued landing is in
+`rust/crates/cuteafd-daemon/src/shared/spark_waves.rs`.
+
+Changing descriptors cannot be graph-invariant kernel arguments. Mirror each
+rank's final descriptor once into a stable device-memory table instead. The
+pull then uses a device pointer and stops issuing duplicate host-descriptor
+reads. A tiny device-side staging kernel can preserve host-free sequencing.
+For host-ordered rounds, first evaluate the existing
+`CUTEAFD_SPARK_LANDING=auto`; the device table is for device-ordered and
+captured paths where copy-engine landing is currently disallowed. Estimate
+20-40% pinned-landing improvement, about 1-3% at C16/prefill and 0.5-1% C1.
+Reply bytes and reduction order do not change.
+
+#### 4. Eliminate the candidate-position plane
+
+Index selection reserves `WIDTH * 8` bytes per row for positions
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_index_selection.rs`,
+`IndexSelectionWave::sizes`). At 2752 rows this is 360,710,144 B = 344 MiB,
+enough for 39 TP2 expert halves at 9,131,264 B each.
+
+Positions are already derivable without storage:
+
+- contiguous tile: `begin + column`;
+- expanded candidate: `blocks[column / 8] * 8 + column % 8`.
+
+These are the formulas in
+`native/families/deepseek_v41/cuda/v41_candidate_blocks.cu`. Pass a tile-begin
+descriptor or the block-ID array to the scorer and radix selector instead of
+materializing positions. This removes one write and two reads (24 B per
+candidate) plus the generation launches.
+
+Across eight index producers at 2752 rows, that is 8.06 GiB per unit, or 24.2
+GiB across three units of an 8K prompt. At an effective 0.6-1 TB/s it is about
+24-40 ms, or 1-3% long-context prefill. Preserve exact U64 positions, `-inf`
+masking and ascending-position tie-breaking.
+
+#### 5. Session-aware prefix eviction
+
+Snapshots already carry `Entry.session`, but victim selection is global LRU
+(`rust/crates/cuteafd-engine/src/prefix/entry.rs` and `prefix/cache.rs`). Add a
+non-pinning session-aware rank: evict inactive or one-shot sessions before
+snapshots belonging to sessions with continuing turns. Fall back to current
+LRU when no session ID exists.
+
+At about 890 B/token, preventing a device eviction avoids approximately:
+
+- 8K: 7.3 MB plus mark, about 0.4 ms at 24 GB/s;
+- 128K: 114 MB plus mark, about 4.9 ms;
+- 1M: 890 MB plus mark, about 37 ms.
+
+If the host entry was also evicted, it avoids a complete prefill instead.
+[SGLang's session-aware unified radix
+cache](https://www.lmsys.org/blog/2026-08-11-unified-radix-cache/) reports
+2.9-16.6% lower TTFT on its SWE-bench configurations. Those results are
+directional evidence, not a forecast for cuteafd. Snapshot bytes and restore
+semantics do not change.
+
+#### 6. Ordered K64 split-K for wide routers
+
+The SM89 router retains K64 partials and adds them in K order
+(`b12x/moe/_shared/v41_router.py` at the pinned SparkInfer revision). Its own
+measurements show wide-row efficiency as low as 8-29% of roofline at 65-512
+rows. Ordinary split-K would alter the reduction order.
+
+Instead split only at existing K64 boundaries, run the same tile/MMA code on
+each contiguous chunk, write partials without atomics, and use a small ordered
+second stage that adds those partials in the original sequence. Include the
+second launch in the stop bar. Do not apply it to the already efficient skinny
+path. Estimate 20-40% router improvement at wide rows, about 0.5-1.5% at C16
+and below 0.5% prefill.
+
+#### 7. Share `q_a + wkv` activation production
+
+`q_a` and `wkv` have shapes 1280x5120 and 512x5120 and use the same K32/1e-4
+activation recipe (`python/tools/aot/export_b12x_v41_fp8_aot.py`). The window
+path copies `query.hidden` and launches a separate projection
+(`rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_window.rs`); dSpark
+also runs `q_a` and `wkv` over the same input.
+
+Quantize the activation once, then run the existing output-specific GEMM
+arithmetic into separate outputs. A jointly scheduled launch can also remove
+the small-projection launch floor. At 2752 rows the hidden-copy buffer alone is
+26.9 MiB; copy plus duplicate activation production is about 40 MiB per layer
+including the FP8 output. Estimate 0.2-0.5% decode and 0.3-1% prefill.
+
+#### 8. Census graph growth before assigning more tier/KV capacity
+
+Above 32 GiB, V4.1 has no fixed exact-shape set, while the planner reserves
+1472 MiB per GPU for graphs
+(`rust/crates/cuteafd-loader/src/placement/families/deepseek_v41.rs`,
+`graph_reserve`). The plan lists V4.1 graph memory as unmeasured.
+
+Collect a shape census and compare actual post-ready graph occupancy with the
+reserve. If it grows materially, retain hot exact shapes and run cold shapes
+eagerly using the existing small-card pattern; padding is optional. Each 1 GiB
+reclaimed buys about 118 TP2 expert halves or 2M additional logical KV tokens
+at the tighter 534 B/token owner.
+
+### Approaches rejected by this review
+
+- Revert to Ada FP8 MMA for experts: the final pin documents a quarter of route
+  outputs leaving the official recipe; exact F16 costs only 1.8-4.7% on
+  memory-bound waves.
+- FP8/NVFP4 decode replies: decode/verify deliberately stays BF16 for lossless
+  speculation.
+- Dynamic expert LRU eviction: GPU/Spark low-bit differences invalidate exact
+  prefixes, and the fork's synthetic replay shows large net losses after
+  re-prefill.
+- More generic decode-GEMV or split-K tuning: the kernels are near their
+  measured memory ceiling, and the existing decode split-K experiment was
+  slower.
+- Further KV quantization presented as a free capacity gain: it needs fresh
+  accuracy qualification and is unnecessary beside the structural wins above.
+
+### Implementation and validation order
+
+1. Position-array elimination: clear memory and traffic win, small correctness
+   surface.
+2. Device-side reply descriptors: directly supported by the fork's by-value
+   ceiling.
+3. FP4 gather/QK pipelining: kernel-local and bit-exact by construction.
+4. Session-aware eviction: small engine change, useful under mixed-session
+   pressure.
+5. Ordered router split-K and `q_a + wkv` fusion: useful but smaller.
+6. Whole verify-step capture: largest ceiling and largest engineering effort.
+
+For each change, run a component bit-exactness oracle first, then one warmed
+identical-config A/B with C1/C16, 8K/32K prefill, exact prefix checks, lossless
+speculation and thermal/power-cap telemetry. No such hardware validation was
+run as part of this review.
