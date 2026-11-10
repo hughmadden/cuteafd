@@ -604,11 +604,13 @@ def test_kimi_kda_exports_share_glmf_program_and_native_tp2_abi(exporter, decode
         if op == "kda":
             assert kwargs["output_kind"] == "norm"
             assert kwargs["decode"] == (kwargs["max_rows"] == decode_rows)
+            # The wide route is a prefill route; decode programs keep their shape.
+            assert kwargs["bf16_wide"] == (kwargs["max_rows"] != decode_rows)
     # KDA reuses the identical shared-FFN down projection, without a second export.
     output = [p for p in programs if p[0] == "ffn_down_i6144"]
     assert len(output) == 1
     _, op, params, thunk = output[0]
-    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168, "wide": True}
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
@@ -733,6 +735,8 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
                         if "gate_up" in stem else {"width": width, "outputs": 7168})
             if stem.endswith("_comp"):
                 expected["compensated"] = True
+            elif (expected["outputs"], expected["width"]) in ((6144, 7168), (7168, 3072), (7168, 6144)):
+                expected["wide"] = True
             assert params == expected
             continue
         assert module == "kimi_residual"
@@ -744,6 +748,9 @@ def test_kimi_w8_exports_every_residual_transition_and_situ_width(exporter):
             assert params["hidden"] == 7168
             assert params["has_mix"] == (params["candidates"] != 1)
             assert params["append"] == stem.endswith("_append")
+    # Only the owned Kimi BF16 shapes have a measured wide-route floor.
+    assert {stem for stem, (_, params, _) in calls.items() if params.get("wide")} == {
+        "ffn_gate_up_i3072", "ffn_down_i3072", "ffn_down_i6144"}
     for width in (3072, 6144, 16896, 33792):
         assert f"ffn_gate_up_i{width}" in calls
         assert f"ffn_gate_up_i{width}_comp" in calls
@@ -767,7 +774,7 @@ def test_kimi_routes_reuse_shared_kernels_at_hidden_and_latent_widths(exporter):
         assert len(args) == 1 and vars(args[0]) == geometry
     # KDA output already uses this canonical BF16 projection; no duplicate export.
     op, params, thunk = calls["ffn_down_i6144"]
-    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168}
+    assert op == "bf16_projection" and params == {"width": 6144, "outputs": 7168, "wide": True}
     assert thunk() == ("pointwise", "compile_bf16_projection_aot", (), params)
 
 
@@ -892,7 +899,7 @@ def test_kimi_latent_exports_native_norm_and_canonical_projections(exporter):
         assert calls[f"rmsnorm_h{hidden}"] == ("rmsnorm", {"hidden": hidden},
             ("kimi_residual", "compile_kimi_rmsnorm_aot", (), {"hidden": hidden}))
     for direction, width, outputs in (("down", 7168, 3584), ("up", 3584, 7168)):
-        params = dict(width=width, outputs=outputs)
+        params = dict(width=width, outputs=outputs, wide=True)
         assert calls[f"latent_{direction}"] == ("bf16_projection", params,
             ("pointwise", "compile_bf16_projection_aot", (), params))
 
