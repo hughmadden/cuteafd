@@ -41,3 +41,4 @@ refuse, and each mode has its own checkpoint fingerprint and memory charges.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-1rtx-6spark-kimi-k3-min/report.svg"><img src="../../benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-1rtx-6spark-kimi-k3-min/card.svg" width="360" alt="Kimi-K3-EXL3-K2-Core-K6 (exl3-k2) (1× RTX)"></a> <a href="../../benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg"><img src="../../benchmarks/kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/card.svg" width="360" alt="Kimi-K3-EXL3-K2-Core-K6 (exl3-k2) (2× RTX)"></a> |
