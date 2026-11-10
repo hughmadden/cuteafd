@@ -44,7 +44,7 @@ Pinned checkpoint revisions (original / matching `-HQA` repository):
 | Muse Spark K4/Core K6 | [`89998fb177ac`](https://huggingface.co/wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6/tree/89998fb177acd9a862ac8bd4fb79bfd50e940c97) | [`12065621f67b`](https://huggingface.co/wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6-HQA/tree/12065621f67bb2a8baa67af90877cc99e8bf81fc) |
 | Mistral Large 4 K4/Core K6 | [`03c80aebaa48`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6/tree/03c80aebaa483d55760703ae5bc0c9734c9d67d6) | [`080757045cd2`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6-HQA/tree/080757045cd2b9c0a65505c61a16aa90d118e35e) |
 
-Conditions: clean rc1 `de882488ac`, serial runs, one untimed warm batch per
+Conditions: v5.0.0, serial runs, one untimed warm batch per
 concurrency level, floating 900 W shared budget with per-card maxima 600 W.
 Thermal/power-cap times sum reported GPU-seconds across baseline/panel windows;
 busy clocks are baseline per-GPU means, temperatures/headroom are worst windows.

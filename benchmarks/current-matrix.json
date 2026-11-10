@@ -388,112 +388,112 @@
       "name": "qwen38-nvfp4-min",
       "config": "examples/configs/qwen38-nvfp4-min.config",
       "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
-      "release": "v3.0.0-rc5",
+      "release": "v3.0.0",
       "release_note": "Tagged build recorded by the report."
     },
     {
       "name": "qwen38-nvfp4-5090",
       "config": "examples/configs/qwen38-nvfp4-min.config",
       "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
-      "release": "v3.0.0-rc4",
+      "release": "v3.0.0",
       "release_note": "Tagged build recorded by the report."
     },
     {
       "name": "glm53f-exl3-v1",
       "config": "examples/configs/glm53-flash-exl3-min.config",
       "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
-      "release": "v3.0.0-rc5",
+      "release": "v3.0.0",
       "release_note": "Tagged build recorded by the report."
     },
     {
       "name": "glm53-nvfp4-min",
       "config": "examples/configs/glm53-nvfp4-min.config",
       "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-nvfp4-1rtx-4spark-glm53-nvfp4-min",
-      "release": "v4.0.0-rc1",
+      "release": "v4.0.0",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     },
     {
       "name": "glm53f-nvfp4-min",
       "config": "examples/configs/glm53-flash-nvfp4-min.config",
       "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-min",
-      "release": "v4.0.0-rc1",
+      "release": "v4.0.0",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     },
     {
       "name": "glm53f-nvfp4-5090",
       "config": "examples/configs/glm53-flash-nvfp4-min.config",
       "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-nvfp4-1rtx-2spark-glm53f-nvfp4-5090",
-      "release": "v4.0.0-rc1",
+      "release": "v4.0.0",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     },
     {
       "name": "glm53f-tr3-min",
       "config": "examples/configs/glm53-flash-exl3-min.config",
       "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-min",
-      "release": "v4.1.0-rc1",
+      "release": "v4.1.0",
       "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
     },
     {
       "name": "glm53f-tr3-5090",
       "config": "examples/configs/glm53-flash-exl3-min.config",
       "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-tr3-4bpw-1rtx-2spark-glm53f-tr3-5090",
-      "release": "v4.1.0-rc1",
+      "release": "v4.1.0",
       "release_note": "Release-candidate build recorded by the report. Retired in v5 (TJ 2026-11-02)."
     },
     {
       "name": "step5-fp8-max",
       "config": "examples/configs/step5-fp8-max.config",
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max",
-      "release": "v4.0.0-rc2",
+      "release": "v4.0.0",
       "release_note": "Step-5 FP8 retired in v5 (TJ 2026-10-31)"
     },
     {
       "name": "step5-nvfp4-min",
       "config": "examples/configs/step5-nvfp4-min.config",
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
-      "release": "v4.0.0-rc2",
+      "release": "v4.0.0",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
     },
     {
       "name": "v41-flash-reference-tp4",
       "config": "examples/configs/deepseek-v41-mxfp4-min.config",
       "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-reference-tp4",
-      "release": "v4.1.0-rc1",
+      "release": "v4.1.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     },
     {
       "name": "glm53f-exl3-5090",
       "config": "examples/configs/glm53-flash-exl3-min.config",
       "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090",
-      "release": "v4.1.0-rc1",
+      "release": "v4.1.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     },
     {
       "name": "v4-flash-reference-tp4",
       "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
       "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-4spark-v4-flash-reference-tp4",
-      "release": "v4.0.0-rc1",
+      "release": "v4.0.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     },
     {
       "name": "glm53-exlr8-a8-max",
       "config": "examples/configs/glm53-exlr8-max.config",
       "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-a8-max",
-      "release": "v4.0.0-rc2",
+      "release": "v4.0.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     },
     {
       "name": "qwen38-27b-bf16-min-nospec",
       "config": "examples/configs/qwen38-27b-bf16-min.config",
       "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min-nospec",
-      "release": "v4.0.0-rc2",
+      "release": "v4.0.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     },
     {
       "name": "qwen38-27b-fp8-min-nospec",
       "config": "examples/configs/qwen38-27b-fp8-min.config",
       "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min-nospec",
-      "release": "v4.0.0-rc2",
+      "release": "v4.0.0",
       "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     }
   ]

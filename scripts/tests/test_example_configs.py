@@ -492,10 +492,32 @@ def test_published_matrix_pins_current_reports() -> None:
         assert (ROOT / entry["config"]).is_file()
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report.get("baseline")
-        expected = report["server"]["build"]["release"] or f"v3 dev {report['created'][:10]}"
-        assert entry["release"] == expected and entry["release_note"].strip()
+        assert_retired_release(entry, report)
+        row = next(line for line in results.splitlines() if f'href="{entry["report"]}/card.svg"' in line)
+        assert f'>{entry["release"]}</td>' in row
+        build = report["server"]["build"]
+        label = build["release"] or build["commit"][:12] + ("+dirty" if build.get("dirty") else "")
+        assert f'build {label}; commit {build["commit"]};' in row
         assert f'href="{entry["report"]}/card.svg"' in results
     assert "simulated-5090" not in json.dumps(matrix)
+
+
+def assert_retired_release(entry: dict, report: dict) -> None:
+    label = entry["release"]
+    build = report["server"]["build"]
+    final = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", label)
+    if final:
+        tag = subprocess.run(
+            ["git", "-C", str(ROOT), "rev-parse", "--verify", f"refs/tags/{label}^{{commit}}"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        actual = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)(?:-rc\d+)?", build["release"])
+        assert actual and actual.group(1, 2) == final.group(1, 2)
+        assert tag == build["commit"] or re.fullmatch(re.escape(label) + r"-rc\d+", build["release"])
+    else:
+        assert re.fullmatch(r"v\d+ dev \d{4}-\d{2}-\d{2}", label)
+        assert not build["release"] and label.endswith(report["created"][:10])
+    assert entry["release_note"].strip()
 
 
 def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
@@ -892,7 +914,15 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
     published = {entry["name"]: entry for entry in
                  json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
-    assert all(published.get(entry["name"]) == entry for entry in retired)
+    assert all(published.get(entry["name"], {}).get("report") == entry["report"] for entry in retired)
+    v5 = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
+    assert {name: entry["report"] for name, entry in published.items()} == {
+        entry["name"]: entry["report"] for entry in v5["retired"]
+    }
+    assert set(published) - {entry["name"] for entry in retired} == {
+        "v41-flash-reference-tp4", "glm53f-exl3-5090", "v4-flash-reference-tp4",
+        "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec", "qwen38-27b-fp8-min-nospec",
+    }
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
         assert (ROOT / entry["config"]).is_file()

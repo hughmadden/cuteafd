@@ -337,7 +337,7 @@ restores the saved originals. Details: [Host tuning](docs/host-tuning.md).
 V4.1 defaults to `CUTEAFD_V41_FP8_HEAD=all`: one E4M3 vocabulary head
 (or one shard per GPU) shared by target and dSpark, with BF16 released after
 packing. `off` selects BF16; experimental `draft` retains BF16 for the target
-and adds FP8 for dSpark. The accepted target-head quality gate and matched RC2
+and adds FP8 for dSpark. The accepted target-head quality gate and matched
 controls support the release default.
 
 ## Working on it

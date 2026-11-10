@@ -1389,20 +1389,60 @@ mod tests {
         let current = rendered.split_once("\n### Retired").unwrap().0.trim();
         // Once the generated README carries Retired, compare the same main section.
         assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
-        assert_eq!(matrix.retired.len(), 21);
         let retired = rendered.split_once("\n### Retired").unwrap().1;
-        assert!(!retired.contains("nearest final release"));
+        assert_eq!(retired.matches("<tr><td>").count(), matrix.retired.len());
+        let digits = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+        let version = |s: &str| -> Option<Vec<String>> {
+            let parts = s.strip_prefix('v')?.split('.').collect::<Vec<_>>();
+            (parts.len() == 3 && parts.iter().all(|part| digits(part)))
+                .then(|| parts.into_iter().map(str::to_owned).collect())
+        };
         for entry in &matrix.retired {
             let report = &placed.iter().find(|p| p.dir == entry.report).unwrap().report;
-            let expected = report.server.build.release.clone()
-                .unwrap_or_else(|| format!("v3 dev {}", &report.created[..10]));
-            assert_eq!(entry.release, expected, "{} must name the actual build", entry.name);
-            assert!(retired.contains(&format!(">{}</td>", crate::render::svg::escape(&expected))));
-            assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
+            let row = retired.lines().find(|line| line.contains(&format!("href=\"{}\"", link(&entry.report, "card.svg")))).unwrap();
+            assert!(row.contains(&format!(">{}</td>", crate::render::svg::escape(&entry.release))));
+            let provenance = format!("build {}; commit {};", report.server.build.label(),
+                report.server.build.commit.as_deref().unwrap());
+            assert!(row.contains(&format!("title=\"{}", crate::render::svg::escape(&provenance))));
+            if let Some(final_version) = version(&entry.release) {
+                let build = report.server.build.release.as_deref().unwrap();
+                let build_version = version(build.split_once("-rc").map_or(build, |(base, _)| base)).unwrap();
+                assert_eq!(&final_version[..2], &build_version[..2]);
+                let tag = std::process::Command::new("git").arg("-C").arg(&root)
+                    .args(["rev-parse", "--verify", &format!("refs/tags/{}^{{commit}}", entry.release)])
+                    .output().unwrap();
+                assert!(tag.status.success(), "{} must be a shipped tag", entry.release);
+                let commit = String::from_utf8(tag.stdout).unwrap();
+                assert!(Some(commit.trim()) == report.server.build.commit.as_deref()
+                    || build.strip_prefix(&format!("{}-rc", entry.release))
+                        .is_some_and(|suffix| !suffix.is_empty() && suffix.bytes().all(|c| c.is_ascii_digit())),
+                    "{} must belong to {}", entry.name, entry.release);
+            } else {
+                let (major, date) = entry.release.split_once(" dev ").unwrap();
+                assert!(major.strip_prefix('v').is_some_and(digits));
+                let date_parts = date.split('-').collect::<Vec<_>>();
+                assert_eq!(date_parts.iter().map(|part| part.len()).collect::<Vec<_>>(), [4, 2, 2]);
+                assert!(date_parts.iter().all(|part| digits(part)));
+                assert!(report.server.build.release.is_none());
+                assert_eq!(date, &report.created[..10]);
+            }
         }
-        let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+        let old: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
             root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
-        assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());
+        let current: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
+            root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+        let pins = |entries: &[Retired]| entries.iter()
+            .map(|entry| (entry.name.clone(), entry.report.clone())).collect::<BTreeMap<_, _>>();
+        let old_pins = pins(&old.retired);
+        let current_pins = pins(&current.retired);
+        let published_pins = pins(&matrix.retired);
+        assert_eq!(published_pins, current_pins);
+        for (name, report) in &old_pins { assert_eq!(published_pins.get(name), Some(report)); }
+        let additions = published_pins.keys().filter(|name| !old_pins.contains_key(*name))
+            .map(String::as_str).collect::<BTreeSet<_>>();
+        assert_eq!(additions, BTreeSet::from(["v41-flash-reference-tp4", "glm53f-exl3-5090",
+            "v4-flash-reference-tp4", "glm53-exlr8-a8-max", "qwen38-27b-bf16-min-nospec",
+            "qwen38-27b-fp8-min-nospec"]));
     }
 
     /// Writes `benchmarks/current-matrix.json` from rows: the real file, re-parsed by the real loader.
