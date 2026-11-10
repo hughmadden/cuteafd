@@ -124,6 +124,15 @@ impl List { fn index(self) -> usize { self as usize } }
 #[derive(Default)]
 struct Queue { first: Option<u64>, last: Option<u64>, bytes: u64, len: usize }
 
+const OOM_RETRY_MISSES: u16 = 256;
+const OOM_LEVEL_DROP: u64 = 2 << 20;
+
+struct OomBackoff {
+    remaining: u16,
+    level: Option<u64>,
+    recovery_generation: u64,
+}
+
 struct Record {
     identity: Identity,
     cycle: Cycle,
@@ -140,6 +149,8 @@ struct Record {
     graph_rate: u64,
     parallel_width: usize,
     spans_devices: bool,
+    oom: Option<OomBackoff>,
+    oom_warned: bool,
     stats: Box<KeyStats>,
 }
 
@@ -475,6 +486,7 @@ pub(crate) struct DeviceCache {
     next_id: u64,
     next_bank: u64,
     identity_generation: u64,
+    recovery_generation: u64,
     recent_target: u64,
     records: HashMap<u64, Record>,
     identities: HashMap<Identity, u64>,
@@ -501,7 +513,7 @@ pub(crate) struct DeviceCache {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, reserve_policy: None, charged: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
@@ -660,8 +672,22 @@ impl DeviceCache {
             self.counters.entry(site.cycle).or_default().eager_runs += 1;
             return Miss::Eager;
         }
-        let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
         let old = self.identities.get(&identity).copied();
+        if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            if let Some(backoff) = &mut record.oom {
+                let level_recovered = backoff.level.zip(self.level)
+                    .is_some_and(|(before, now)| before.saturating_sub(now) >= OOM_LEVEL_DROP);
+                if backoff.remaining > 0 && backoff.recovery_generation == self.recovery_generation && !level_recovered {
+                    backoff.remaining -= 1;
+                    record.stats.event(site.cycle, 1);
+                    record.stats.misses += 1;
+                    self.counters.entry(site.cycle).or_default().eager_runs += 1;
+                    return Miss::Eager;
+                }
+                record.oom = None;
+            }
+        }
+        let (estimate, headroom) = self.estimate(site, node_estimate.as_ref().map(|e| e.bytes));
         let ghost = old.and_then(|id| self.records[&id].list)
             .filter(|list| matches!(list, List::RecentGhost | List::FrequentGhost));
         if let Some(list) = ghost {
@@ -714,7 +740,7 @@ impl DeviceCache {
                 let id = self.next_id;
                 self.identities.insert(identity.clone(), id);
                 self.records.insert(id, Record { identity, cycle: site.cycle, bytes: 0, list: None,
-                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, stats: KeyStats::new(now) });
+                    previous: None, next: None, pinned, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
                 id
             };
             let record = self.records.get_mut(&id).unwrap();
@@ -759,7 +785,7 @@ impl DeviceCache {
             let id = self.next_id;
             self.identities.insert(identity.clone(), id);
             self.records.insert(id, Record { identity: identity.clone(), cycle: site.cycle, bytes: estimate,
-                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, stats: KeyStats::new(now) });
+                list: None, previous: None, next: None, pinned: false, pending_destroy: false, pending_capture: false, frequent: false, nodes, node_rate: metadata.node_rate, graph_rate: metadata.graph_rate, parallel_width: metadata.parallel_width, spans_devices: site.spans_devices, oom: None, oom_warned: false, stats: KeyStats::new(now) });
             self.push(id, List::RecentGhost);
             self.trim_ghosts();
         }
@@ -771,6 +797,29 @@ impl DeviceCache {
         }
         self.counters.entry(site.cycle).or_default().eager_runs += 1;
         Miss::Eager
+    }
+
+    /// Retain the failed identity in ARC's bounded ghost history. No executable
+    /// survived, but driver growth still needs the ordinary completed sample.
+    /// Returns true only for the key's first OOM warning while it is retained.
+    pub fn capture_oom(&mut self, id: u64) -> bool {
+        let Some(record) = self.records.get_mut(&id) else { return false };
+        if !record.pending_capture { return false }
+        self.pending_bytes = self.pending_bytes.saturating_sub(record.bytes);
+        self.pools.live_nodes = self.pools.live_nodes.saturating_sub(record.nodes);
+        self.pools.live_execs = self.pools.live_execs.saturating_sub(1);
+        record.pending_capture = false;
+        record.pinned = false;
+        record.oom = Some(OomBackoff { remaining: OOM_RETRY_MISSES, level: self.level,
+            recovery_generation: self.recovery_generation });
+        let warn = !record.oom_warned;
+        record.oom_warned = true;
+        let ghost = if record.frequent || record.list == Some(List::Frequent) {
+            List::FrequentGhost
+        } else { List::RecentGhost };
+        self.push(id, ghost);
+        self.trim_ghosts();
+        warn
     }
 
     pub fn cancel_capture(&mut self, id: u64) {
@@ -860,6 +909,7 @@ impl DeviceCache {
         // Observed free deltas remain available to alternate accounting adapters;
         // the default driver-arena model never credits physical release.
         let _ = measurement.released;
+        if ids.iter().any(|id| self.records.contains_key(id)) { self.recovery_generation += 1; }
         for &id in ids {
             let Some(record) = self.records.get_mut(&id) else { continue };
             let evicted = record.pending_destroy;
@@ -901,6 +951,10 @@ impl DeviceCache {
 
     /// Forget destroyed owners, never crediting physical driver-arena release.
     pub fn remove_drained(&mut self, ids: &[u64]) {
+        if ids.iter().any(|id| self.records.get(id).is_some_and(|record|
+            record.pinned || record.pending_destroy || matches!(record.list, Some(List::Recent | List::Frequent)))) {
+            self.recovery_generation += 1;
+        }
         for &id in ids {
             let Some(record) = self.records.get(&id) else { continue };
             if record.pending_capture {
@@ -1130,6 +1184,96 @@ mod tests {
         cache.measured_capture(10);
         id
     }
+    #[test]
+    fn oom_backoff_skips_256_misses_preserves_accounting_and_warns_once() {
+        let mut cache = DeviceCache::new(-992, 1000);
+        cache.level = Some(100);
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, true) else { panic!() };
+        assert!(cache.capture_oom(id));
+        assert_eq!(cache.records[&id].list, Some(List::RecentGhost));
+        assert!(!cache.records[&id].pinned);
+        assert_eq!((cache.pending_bytes, cache.pools.live_nodes, cache.pools.live_execs), (0, 0, 0));
+        assert!(cache.needs_boundary(), "failed instantiation can still grow driver storage");
+        cache.measured_capture(10);
+        assert_eq!(cache.charged, 10);
+        assert!(!cache.needs_boundary());
+        for _ in 0..OOM_RETRY_MISSES {
+            assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Eager));
+            assert!(!cache.needs_boundary(), "suppressed misses must not request a device sample");
+        }
+        assert_eq!(cache.counters[&Cycle::Decode].eager_runs, u64::from(OOM_RETRY_MISSES));
+        let Miss::Capture(retry) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        assert_eq!(retry, id, "the retained exact key is reused");
+        assert!(!cache.capture_oom(retry), "repeated failures must not log again");
+        cache.measured_capture(0);
+        for _ in 0..OOM_RETRY_MISSES {
+            assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Eager));
+        }
+        let Miss::Capture(retry) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(0);
+        assert!(cache.records[&retry].oom.is_none());
+        assert_eq!(cache.records[&retry].stats.captures, 1);
+        assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn oom_backoff_retries_after_real_eviction_not_victim_selection_or_ghost_removal() {
+        for remove in [false, true] {
+            let mut cache = DeviceCache::new(-993, 1000);
+            let owner = capture(&mut cache, 1, false);
+            let Miss::Capture(id) = cache.miss(key(2), site(Preference::Capture), None, false) else { panic!() };
+            assert!(cache.capture_oom(id));
+            cache.measured_capture(0);
+            let Miss::Capture(ghost) = cache.miss(key(3), site(Preference::Capture), None, false) else { panic!() };
+            cache.capture_oom(ghost);
+            cache.measured_capture(0);
+            cache.remove_drained(&[ghost]);
+            assert_eq!(cache.mark_victim(false), Some(owner));
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            if remove { cache.remove_drained(&[owner]); }
+            else { cache.destroyed(&[owner], ReleaseMeasurement { released: 0 }); }
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Capture(retry) if retry == id));
+        }
+    }
+
+    #[test]
+    fn oom_backoff_retries_only_after_meaningful_observed_level_drop() {
+        let mut cache = DeviceCache::new(-994, 16 << 20);
+        cache.level = Some(4 << 20);
+        let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!() };
+        cache.capture_oom(id);
+        cache.measured_capture(0);
+        cache.level = Some((4 << 20) - OOM_LEVEL_DROP + 1);
+        assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Eager));
+        cache.level = Some((4 << 20) - OOM_LEVEL_DROP);
+        assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Capture(retry) if retry == id));
+        assert!(!cache.capture_oom(id));
+        cache.measured_capture(0);
+        assert!(matches!(cache.miss(key(1), site(Preference::Capture), None, false), Miss::Eager),
+            "a second OOM resets the level baseline and cooldown");
+    }
+
+    #[test]
+    fn oom_ghosts_obey_arc_byte_and_count_bounds_and_forget_warning_history() {
+        for (reserve, bootstrap, failures, retained) in [(100, 10, 11, 10), (1_000_000, 1, 65_537, 65_536)] {
+            let mut cache = DeviceCache::new(-995, reserve);
+            let site = Site { bootstrap, ..site(Preference::Capture) };
+            for n in 0..failures {
+                let Miss::Capture(id) = cache.miss(key(n), site, None, false) else { panic!() };
+                assert!(cache.capture_oom(id));
+            }
+            let ghosts = &cache.queues[List::RecentGhost.index()];
+            assert_eq!(ghosts.len, retained);
+            assert!(ghosts.bytes <= reserve);
+            assert_eq!(cache.records.len(), retained);
+            assert_eq!(cache.identities.len(), retained);
+            assert!(!cache.identities.contains_key(&key(0)));
+            let Miss::Capture(id) = cache.miss(key(0), site, None, false) else { panic!() };
+            assert!(cache.capture_oom(id), "forgotten bounded history may warn again");
+            assert_eq!(cache.records.len(), retained);
+        }
+    }
+
     #[test]
     fn stats_publish_cost_with_five_thousand_graph_records() {
         use std::hint::black_box;
@@ -1778,6 +1922,36 @@ mod observer_tests {
         assert_eq!(cache.charged, 75);
         assert_eq!(cache.counters[&Cycle::Decode].eager_runs, 1);
         Ok(())
+    }
+
+    #[test]
+    fn oom_backoff_uses_settled_level_refresh_without_resampling_suppressed_misses() {
+        let device = -99118;
+        let total = 64 << 20;
+        let cache = device_cache_sampled(device, 64 << 20, Basis::Bytes,
+            || Ok((total, total, 0, 0, 0))).unwrap();
+        pending(&cache);
+        observe_device_sampled(device, || Ok((total - (8 << 20), total, 0, 0, 0))).unwrap();
+        let site = Site { name: "observer-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 2, shape: "2".into() };
+        {
+            let mut cache = cache.lock().unwrap();
+            let Miss::Capture(id) = cache.miss(key.clone(), site, None, false) else { panic!() };
+            cache.capture_oom(id);
+        }
+        observe_device_sampled(device, || Ok((total - (8 << 20), total, 0, 0, 0))).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+            observe_device_sampled(device, || panic!("OOM cooldown must not add a device query")).unwrap();
+        }
+        let peak = 8 << 20;
+        let below_threshold = peak - OOM_LEVEL_DROP + 1;
+        assert_eq!(refreshed_arena_sampled(device, || Ok((total - below_threshold, total, 0, 0, 0))), Some((below_threshold, peak)));
+        assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+        let recovered = peak - OOM_LEVEL_DROP;
+        assert_eq!(refreshed_arena_sampled(device, || Ok((total - recovered, total, 0, 0, 0))), Some((recovered, peak)));
+        assert!(matches!(cache.lock().unwrap().miss(key, site, None, false), Miss::Capture(_)));
     }
 
     #[test]

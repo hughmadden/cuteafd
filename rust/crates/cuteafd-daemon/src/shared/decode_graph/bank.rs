@@ -238,6 +238,20 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         ticket.committed = true;
     }
 
+    /// Cancel a failed capture, backing off allocation failures by exact key.
+    /// Returns whether the caller should emit the failure warning.
+    pub fn cache_capture_failed(&mut self, id: u64, error: &anyhow::Error) -> bool {
+        let Some(binding) = &self.device else { return true };
+        let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if error.downcast_ref::<cuteafd_ffi::NativeStatusError>()
+            .is_some_and(|error| error.status == cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED) {
+            cache.capture_oom(id)
+        } else {
+            cache.cancel_capture(id);
+            true
+        }
+    }
+
     pub fn cache_cancel(&mut self, id: u64) {
         if let Some(binding) = &self.device { binding.cache.lock().unwrap_or_else(|p| p.into_inner()).cancel_capture(id); }
     }
@@ -949,6 +963,48 @@ mod device_tests {
         assert_eq!(bank.cache_keys.len(), 2);
         bank.cache_clear_drained();
         assert!(bank.cache_keys.is_empty());
+    }
+
+    #[test]
+    fn allocation_failure_backoff_keeps_exact_keys_and_uses_typed_native_status() {
+        #[derive(Clone, PartialEq, Eq, Hash)]
+        struct Key(u32);
+        impl std::fmt::Debug for Key {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("same display") }
+        }
+        let mut bank: GraphBank<Key, u32> = GraphBank::new(None);
+        bank.attach_device_for_test(-320, 1000, Site { spans_devices: true, ..site() }).unwrap();
+        let oom = anyhow::Error::new(cuteafd_ffi::NativeStatusError {
+            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED,
+            detail: "opaque diagnostic".into(),
+        }).context("peer graph capture");
+        let Miss::Capture(id) = bank.cache_miss(&Key(1), false, None) else { panic!() };
+        assert!(bank.cache_capture_failed(id, &oom));
+        bank.cache_measured(10);
+        bank.cache_tick();
+        assert_eq!(bank.cache_keys.len(), 1, "OOM ghosts retain the typed identity across boundaries");
+        for _ in 0..256 {
+            assert!(matches!(bank.cache_miss(&Key(1), false, None), Miss::Eager));
+        }
+        let Miss::Capture(other) = bank.cache_miss(&Key(2), false, None) else { panic!() };
+        assert_ne!(other, id, "identical display text must not share backoff");
+        bank.cache_cancel(other);
+        let Miss::Capture(retry) = bank.cache_miss(&Key(1), false, None) else { panic!() };
+        assert_eq!(retry, id);
+        assert!(!bank.cache_capture_failed(retry, &oom), "only one warning per retained key");
+        bank.cache_measured(0);
+        bank.cache_clear_drained();
+        // Neither a different native status nor matching text is an allocation failure.
+        for error in [anyhow::Error::new(cuteafd_ffi::NativeStatusError {
+            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+            detail: "cudaGraphInstantiate out of memory".into(),
+        }), anyhow::anyhow!("cudaGraphInstantiate out of memory")] {
+            let Miss::Capture(id) = bank.cache_miss(&Key(1), false, None) else { panic!() };
+            assert!(bank.cache_capture_failed(id, &error));
+            bank.cache_measured(0);
+            bank.cache_tick();
+            assert!(bank.cache_keys.is_empty(), "non-OOM cancellation does not retain a cooldown ghost");
+        }
     }
 
     #[test]
