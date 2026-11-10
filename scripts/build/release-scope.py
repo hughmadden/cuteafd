@@ -240,8 +240,16 @@ def requirements(repo, matrix, scope):
         spark_experts = sorted(tokens(scopes['CUTEAFD_WIP_EXPERT_FAMILIES']))
         spark_layouts = {item: [layout.removesuffix('/m1') for layout in scopes_module(repo).exl3_spark_layouts(item, tp)]
                          for item in spark_experts if ':exl3-' in item}
+        native_spark_symbols = {}
+        for item in spark_experts:
+            tag, kind = item.split(':')
+            if tag in ('dsv4f', 'dsv4p') and kind.startswith('spark'):
+                world = 4 if kind == 'spark' else int(kind.removeprefix('spark_tp'))
+                artifacts = spark_packages_module().native_spark_artifacts(tag)[world]
+                native_spark_symbols[item] = [artifact.prefix(tag) + 'launch' for artifact in artifacts]
         result.append(dict(name=entry['name'], family=family, programs=sorted(programs),
                            experts=sorted(experts), spark_experts=spark_experts, spark_layouts=spark_layouts,
+                           native_spark_symbols=native_spark_symbols,
                            spark_count=count, spark_tp=tp, dual=dual,
                            roles=sorted(tokens(scopes['CUTEAFD_WIP_SPARK_TP_ROLES'])),
                            nvfp4='nvfp4' in values.get('MODEL_ID', '').lower(),
@@ -406,9 +414,8 @@ def check_inventory(root, role, wanted, symbols=None):
                         check_package(root, 'fp8/fp8-qwen4', ['tp1'], role, verified)
                 elif (role == 'coordinator') == kind.startswith('rtx_'):
                     if role == 'expert':
-                        world = 4 if kind == 'spark' else int(kind.removeprefix('spark_tp'))
-                        artifacts = spark_packages_module().native_spark_artifacts(family)[world]
-                        required = [artifact.prefix(family) + 'launch' for artifact in artifacts]
+                        required = entry['native_spark_symbols'][item]
+                        require(bool(required), f'empty native expert symbol inventory {item}')
                     else:
                         tag = {'rtx_backbone': '_local', 'rtx_tp2': '_tp2'}[kind]
                         required = [f'cuteafd_{family}{tag}_expert_launch']

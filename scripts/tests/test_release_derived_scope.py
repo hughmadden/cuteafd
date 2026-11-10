@@ -227,11 +227,12 @@ def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, d
 ])
 def test_native_spark_inventory_requires_every_width_artifact(tmp_path, family, world):
     kind = 'spark' if world == 4 else f'spark_tp{world}'
-    wanted = [dict(name=f'{family}-tp{world}', family='deepseek_v4', programs=[],
-                   experts=[], spark_experts=[f'{family}:{kind}'], spark_count=world,
-                   context_split=False, audio=False)]
     artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)[world]
     symbols = {artifact.prefix(family) + 'launch' for artifact in artifacts}
+    wanted = [dict(name=f'{family}-tp{world}', family='deepseek_v4', programs=[],
+                   experts=[], spark_experts=[f'{family}:{kind}'], spark_count=world,
+                   native_spark_symbols={f'{family}:{kind}': sorted(symbols)},
+                   context_split=False, audio=False)]
     SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=symbols)
     for symbol in symbols:
         with pytest.raises(ValueError, match=f'missing native expert package.*{symbol}'):
@@ -239,7 +240,7 @@ def test_native_spark_inventory_requires_every_width_artifact(tmp_path, family, 
 
 
 @pytest.mark.parametrize('family', ['dsv4f', 'dsv4p'])
-def test_shipping_native_spark_scopes_pass_the_same_width_inventory(tmp_path, family):
+def test_shipping_native_spark_scopes_pass_the_same_width_inventory(tmp_path, monkeypatch, family):
     wanted = SCOPE.requirements(REPO, REPO / SCOPE.DEFAULT_MATRIX, 'all')
     selected = []
     for entry in wanted:
@@ -250,7 +251,10 @@ def test_shipping_native_spark_scopes_pass_the_same_width_inventory(tmp_path, fa
     artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)
     symbols = {artifact.prefix(family) + 'launch'
                for entry in selected for artifact in artifacts[entry['spark_tp']]}
-    SCOPE.check_inventory(tmp_path, 'expert', selected, symbols=symbols)
+    def no_checkout_policy():
+        raise AssertionError('remote inventory checks must use serialized requirements')
+    monkeypatch.setattr(SCOPE, 'spark_packages_module', no_checkout_policy)
+    SCOPE.check_inventory(tmp_path, 'expert', json.loads(json.dumps(selected)), symbols=symbols)
 
 
 def test_glm_context_program_must_not_be_satisfied_by_neutral_namespace(fixture_repo, tmp_path):
