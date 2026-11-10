@@ -740,7 +740,7 @@ fn retired_results(placed: &[Placed], entries: &[Retired]) -> Result<String> {
     if entries.is_empty() { return Ok(String::new()); }
     let escape = crate::render::svg::escape;
     let mut out = String::from("\n### Retired\n\nLast Release-smoke cards for retired configurations; no new measurements. \
-        Version labels identify the actual tagged or development build recorded by each report; hover for provenance.\n\n\
+        Version: the release whose card set includes this card; hover for the exact build.\n\n\
         <table>\n<tr><th>Model</th><th>Config</th><th>Version</th><th>Last card</th></tr>\n");
     for entry in entries {
         let p = placed.iter().find(|p| p.dir == entry.report)
@@ -1350,6 +1350,7 @@ mod tests {
         let matrix = Matrix::parse(&doc.to_string()).unwrap();
         let html = results(&[p.clone()], &matrix).unwrap();
         assert!(html.contains("### Retired"));
+        assert!(html.contains("Version: the release whose card set includes this card; hover for the exact build."));
         assert!(html.contains("old&lt;&amp;"));
         assert!(html.contains("abc123; actual &lt;build&gt;"));
         assert!(html.contains("v3 dev 2026-10-14 &lt;local&gt;</td>"));
