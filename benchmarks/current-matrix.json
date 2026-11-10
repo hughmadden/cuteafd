@@ -122,7 +122,7 @@
       },
       "1rtx": {
         "status": "current",
-        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min"
+        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min"
       },
       "2rtx": {
         "status": "current",
@@ -138,7 +138,7 @@
       },
       "1rtx": {
         "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min"
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-min"
       },
       "2rtx": {
         "status": "current",
@@ -154,7 +154,7 @@
       },
       "1rtx": {
         "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min"
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min"
       },
       "2rtx": {
         "status": "current",
