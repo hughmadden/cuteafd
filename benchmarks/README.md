@@ -20,25 +20,23 @@ does not establish a shipping attention default.
 These experiments are separate from the main three-column release table.
 Results are pending; no new speed or quality measurement is claimed here.
 
-| Max card | Modes | Quick fidelity / quality | Warmed speed |
+| Max card | Compact | HQA | FP8-compact |
 | --- | --- | --- | --- |
-| GLM 5.3 EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| GLM Flash EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| Kimi K3 EXL3 K2 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| Step-5 EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| Muse Spark EXL3 K4 + Core K6 | hqa, compact, fp8-compact | pending | pending |
-| Mistral Large 4 EXL3 K4 + Core K6 | hqa (= native FP8, fp8-compact equivalent), compact | pending | pending |
+| GLM 5.3 EXL3 K4 + Core K6 | pending | pending | pending |
+| GLM Flash EXL3 K4 + Core K6 | pending | pending | pending² |
+| Kimi K3 EXL3 K2 + Core K6 | pending | pending | pending |
+| Step-5 EXL3 K4 + Core K6 | pending | pending | pending |
+| Muse Spark EXL3 K4 + Core K6 | pending | pending | pending |
+| Mistral Large 4 EXL3 K4 + Core K6 | pending | - | pending¹ |
+
+¹ native FP8 attention ([#1750](https://github.com/tpurtell/cuteafd/issues/1750))
+
+² W8A8 prefill ([#1751](https://github.com/tpurtell/cuteafd/issues/1751))
 
 All modes retain the Release smoke baseline, including quick fidelity and
 quality. Publish those scores beside speed with equal prominence, the pinned
-original/HQA checkpoint revisions, and the report's thermal/power conditions; speed alone
-does not decide the attention mode. Mistral Large 4's `hqa` arm restores its
-original FP8 E4M3 wq/wo and is the native-FP8, fp8-compact-equivalent arm;
-its regular max card is the compact K6 view, so no extra arm is needed
-([#1750](https://github.com/tpurtell/cuteafd/issues/1750)).
-GLM Flash's `fp8-compact` uses FP8 weights + FP8 prefill activations (W8A8);
-it is not directly comparable to other families' W8A16 `fp8-compact`
-([#1751](https://github.com/tpurtell/cuteafd/issues/1751)).
+original/HQA checkpoint revisions, and the report's thermal/power conditions;
+speed alone does not decide the attention mode.
 Variant names append `-hqa` or
 `-fp8-compact` to the regular `-max` name; `compact` means that regular max
 card itself, not another launch. GLM Flash keeps its existing
