@@ -443,17 +443,58 @@ def test_glmf_exl3_smoke_and_gate_cards_use_the_published_core_checkpoint() -> N
 
 def test_published_matrix_pins_current_reports() -> None:
     matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
-    assert len(matrix["cells"]) == 17
+    readme = (ROOT / "README.md").read_text()
+    results = readme.split("<!-- results:begin -->", 1)[1].split("<!-- results:end -->", 1)[0]
+    identities = set()
+    assert matrix["cells"]
     for row in matrix["cells"]:
-        # The 5090 column carries our simulated card where the checkpoint fits 32 GB.
-        assert row["5090"]["status"] in ("current", "na")
-        if row["5090"]["status"] == "current":
-            assert row["5090"]["report"].endswith("-5090")
-        current = [row[c] for c in ("1rtx", "2rtx") if row[c]["status"] == "current"]
-        # Each published checkpoint has at least one PRO card; the other column says why not.
-        assert current and all(row[c]["status"] in ("current", "na") for c in ("1rtx", "2rtx"))
-        for cell in current:
-            assert (ROOT / cell["report"] / "report.json").is_file()
+        identity = row["family"], row["checkpoint"]
+        assert all(identity) and identity not in identities
+        identities.add(identity)
+        assert set(row) == {"family", "checkpoint", "5090", "1rtx", "2rtx"}
+        current = []
+        for column in ("5090", "1rtx", "2rtx"):
+            cell = row[column]
+            assert cell["status"] in {"current", "held", "pending", "na"}
+            if cell["status"] != "current":
+                assert cell.get("reason", "").strip() and "report" not in cell
+                continue
+            assert not cell.get("reason")
+            directory = Path(cell["report"])
+            assert not directory.is_absolute() and ".." not in directory.parts
+            assert len(directory.parts) == 3 and directory.parts[:2] == ("benchmarks", row["family"])
+            report = json.loads((ROOT / directory / "report.json").read_text())
+            server = report["server"]
+            snapshot = server.get("configuration", {}).get("snapshot") or ""
+            repo = next((part.removeprefix("models--").replace("--", "/")
+                         for part in Path(snapshot).parts if part.startswith("models--")), server["model"])
+            assert (server["family"], repo) == identity
+            assert report["profile"] in {"smoke", "share"}
+            settings = {s["name"]: s.get("value") for s in server["configuration"].get("settings", [])}
+            simulated = settings.get("simulated") == "5090"
+            small_column = simulated or settings.get("hardware.class") == "5090"
+            gpus = server["hardware"]["gpus"]
+            used = [gpu for gpu in gpus if gpu.get("used")] or gpus
+            if column == "5090":
+                assert small_column and len(used) == 1
+                assert simulated or all("RTX 5090" in gpu["name"] for gpu in used)
+            else:
+                assert not small_column and len(used) == int(column[0])
+            assert report.get("baseline") or column == "5090" and settings.get("qualification.no-fit")
+            assert f'href="{directory.as_posix()}/card.svg"' in results
+            assert (ROOT / directory / "card.svg").is_file()
+            current.append(cell)
+        assert current, "Every published checkpoint needs a measured card"
+    retired_names = set()
+    for entry in matrix["retired"]:
+        assert entry["name"] and entry["name"] not in retired_names
+        retired_names.add(entry["name"])
+        assert (ROOT / entry["config"]).is_file()
+        report = json.loads((ROOT / entry["report"] / "report.json").read_text())
+        assert report["profile"] == "smoke" and report.get("baseline")
+        expected = report["server"]["build"]["release"] or f"v3 dev {report['created'][:10]}"
+        assert entry["release"] == expected and entry["release_note"].strip()
+        assert f'href="{entry["report"]}/card.svg"' in results
     assert "simulated-5090" not in json.dumps(matrix)
 
 
@@ -849,7 +890,9 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert len(retired) == 21
     assert "glm53-exl3-max" not in {entry["name"] for entry in retired}
     assert {"qwen38-nvfp4-" + size for size in ("min", "max", "5090")} <= {e["name"] for e in retired}
-    assert retired == json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]
+    published = {entry["name"]: entry for entry in
+                 json.loads((ROOT / "benchmarks/current-matrix.json").read_text())["retired"]}
+    assert all(published.get(entry["name"]) == entry for entry in retired)
     reports = [(path, json.loads(path.read_text())) for path in (ROOT / "benchmarks").glob("*/*/report.json")]
     for entry in retired:
         assert (ROOT / entry["config"]).is_file()
