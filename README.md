@@ -166,31 +166,31 @@ concurrency point is that limit.
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen4.md"><b>Qwen 3.8</b></a><br><sub>wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1</sub><br><sub>exl3-k4+exl3-k5</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-31-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090/card.svg"><img src="benchmarks/qwen4/2026-10-31-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-1spark-qwen38-exl3-5090/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 1 Spark"></a><br><sub>simulated 5090 + 1× Spark</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/qwen4/2026-10-31-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg"><img src="benchmarks/qwen4/2026-10-31-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ gpu-powerd 470 W (310–600)"></a><br><sub>1× RTX</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen4/2026-11-10-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg"><img src="benchmarks/qwen4/2026-11-10-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-1rtx-qwen38-exl3-min/card.svg" alt="wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1 on 1× RTX PRO 6000 @ gpu-powerd 505 W (450–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen3_5.md"><b>Qwen 3.5 / 3.8 dense</b></a><br><sub>Qwen/Qwen3.5-9B</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg"><img src="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg" alt="Qwen/Qwen3.5-9B on 1× RTX PRO 6000 @ gpu-powerd 415/475 W (300–600)"></a><br><sub>1× RTX</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg"><img src="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-5-9b-1rtx-qwen35-9b-bf16-min/card.svg" alt="Qwen/Qwen3.5-9B on 1× RTX PRO 6000 @ gpu-powerd 480 W (450–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen3_5.md"><b>Qwen 3.5 / 3.8 dense</b></a><br><sub>Qwen/Qwen3.8-27B</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg"><img src="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg" alt="Qwen/Qwen3.8-27B on 1× RTX PRO 6000 @ gpu-powerd 385/505 W (300–600)"></a><br><sub>1× RTX</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg"><img src="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min/card.svg" alt="Qwen/Qwen3.8-27B on 1× RTX PRO 6000 @ gpu-powerd 505 W (450–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/qwen3_5.md"><b>Qwen 3.5 / 3.8 dense</b></a><br><sub>Qwen/Qwen3.8-27B-FP8</sub><br><sub></sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg"><img src="benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg" alt="Qwen/Qwen3.8-27B-FP8 on 1× RTX PRO 6000 @ gpu-powerd 390/500 W (300–600)"></a><br><sub>1× RTX</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg"><img src="benchmarks/qwen3_5/2026-11-10-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min/card.svg" alt="Qwen/Qwen3.8-27B-FP8 on 1× RTX PRO 6000 @ gpu-powerd 500 W (450–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/mistral_large4.md"><b>Mistral Large 4</b></a><br><sub>wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top">n/a<br><sub>doesn&#39;t fit</sub></td>
-<td width="27%" valign="top">pending<br><sub>v5 rc1 smoke not yet measured</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg"><img src="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg" alt="wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 on 1× RTX PRO 6000 @ gpu-powerd 465 W (450–600) + 5× DGX Spark"></a><br><sub>1× RTX + 5× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg"><img src="benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" alt="wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 450/450 W (350–545) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>

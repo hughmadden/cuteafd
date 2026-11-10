@@ -96,4 +96,4 @@ names.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
-| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg"><img src="../../benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/card.svg" width="360" alt="Mistral-Large-4-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |
