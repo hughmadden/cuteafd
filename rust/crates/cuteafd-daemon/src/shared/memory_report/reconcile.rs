@@ -152,8 +152,8 @@ fn spark_row(id: &str, stage: &str, worker: Option<&Value>,
 }
 
 /// The per-rank device inventory admission registered, or `None` when the
-/// family publishes no `memory_reconciliation_provenance` (Step-5 and Muse do
-/// not). A family without it keeps both `/v1/stats` rows null instead of
+/// family publishes no `memory_reconciliation_provenance`. A family without
+/// it keeps both `/v1/stats` rows null instead of
 /// reporting an empty or partial reconciliation.
 fn admitted_devices(inputs: &Value) -> Option<&Vec<Value>> {
     inputs.get("memory_reconciliation_provenance")?.get("devices")?.as_array()
@@ -170,10 +170,25 @@ fn admitted_devices(inputs: &Value) -> Option<&Vec<Value>> {
 /// scheduler loop, guards its own call).
 pub(crate) fn capture(stage: &str) {
     let inputs = memory_ledger::fault::inputs();
-    let Some(devices) = admitted_devices(&inputs) else { return };
-    let provenance = &inputs["memory_reconciliation_provenance"];
+    if admitted_devices(&inputs).is_none() { return; }
     let worker_samples = workers().lock().unwrap_or_else(|e| e.into_inner()).clone();
     let graph_samples = crate::shared::decode_graph::device::snapshots();
+    let Some(value) = capture_with(stage, &inputs, &worker_samples,
+        &memory_ledger::fault::device_memory_observer,
+        &|device, sample| sample.and_then(|(free, total, _)| {
+            crate::shared::decode_graph::device::refreshed_arena(device, free as u64, total as u64)
+        }).or_else(|| graph_samples.iter().find(|sample| sample.device == device)
+            .map(|sample| (sample.level.unwrap_or(sample.charged), sample.charged))))
+        else { return };
+    tracing::info!(target: "cuteafd::memory", record = %value, "memory admission reconciliation");
+    records().lock().unwrap_or_else(|e| e.into_inner())[stage] = value;
+}
+
+fn capture_with(stage: &str, inputs: &Value, worker_samples: &BTreeMap<u32, Value>,
+    sample_device: &impl Fn(i32) -> anyhow::Result<Option<(usize, usize, usize)>>,
+    graph_charge: &impl Fn(i32, Option<(usize, usize, usize)>) -> Option<(u64, u64)>) -> Option<Value> {
+    let devices = admitted_devices(inputs)?;
+    let provenance = &inputs["memory_reconciliation_provenance"];
     let mut rows = Vec::new();
     for (key, value) in inputs.as_object().into_iter().flatten().filter(|(key, _)| key.starts_with("device.")) {
         let Ok(owners) = serde_json::from_value::<cuteafd_core::memory_policy::DeviceBreakdown>(value.clone()) else { continue };
@@ -181,23 +196,13 @@ pub(crate) fn capture(stage: &str) {
         if let Some(index) = id.strip_prefix("rtx").and_then(|n| n.parse::<usize>().ok()) {
             let physical = devices.get(index).and_then(|value| value["device"].as_i64());
             let sample = physical.and_then(|device| i32::try_from(device).ok())
-                .map(memory_ledger::fault::device_memory_observer).transpose();
+                .map(sample_device).transpose();
             let sample_error = sample.as_ref().err().map(|error| format!("observer-aware CUDA sample unavailable: {error:#}"));
             let sample = sample.ok().flatten().flatten();
             let mut identity = provenance.clone();
             identity["device_sample"] = devices.get(index).cloned().unwrap_or(Value::Null);
-            // Refresh the level from this stage's settled sample: a capture
-            // boundary can catch a transient peak that has already reversed by
-            // the time the stage runs. A device without a live graph controller
-            // keeps the cached snapshot's figure.
             let graph_arena = physical.and_then(|device| i32::try_from(device).ok())
-                .and_then(|device| sample.and_then(|(free, total, _)| {
-                    crate::shared::decode_graph::device::refreshed_arena(
-                        device, free as u64, total as u64)
-                }))
-                .or_else(|| physical.and_then(|device| graph_samples.iter()
-                    .find(|sample| i64::from(sample.device) == device))
-                    .map(|sample| (sample.level.unwrap_or(sample.charged), sample.charged)));
+                .and_then(|device| graph_charge(device, sample));
             rows.push(observed_row(id, sample, &owners, graph_arena, identity,
                 sample_error.as_deref().or_else(|| sample.is_none().then_some("no active CUDA primary context sample"))));
         } else if let Some(rank) = id.strip_prefix("spark").and_then(|n| n.trim_start_matches('.').parse::<u32>().ok()) {
@@ -206,24 +211,53 @@ pub(crate) fn capture(stage: &str) {
             rows.push(record);
         }
     }
-    let value = json!({"stage": stage, "devices": rows});
-    tracing::info!(target: "cuteafd::memory", record = %value, "memory admission reconciliation");
-    records().lock().unwrap_or_else(|e| e.into_inner())[stage] = value;
+    Some(json!({"stage": stage, "devices": rows}))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Step-5 and Muse run the shared Qwen scheduler and register no
-    /// `memory_reconciliation_provenance`, so its first-request hook must find
-    /// no device inventory and leave both `/v1/stats` rows null. Admission
-    /// values belong to families that publish the identity (Qwen4, Kimi, GLM).
+    /// No registered device identity means there is no physical sample to take.
     #[test]
     fn a_family_that_publishes_no_provenance_has_no_sample() {
         assert!(admitted_devices(&json!({"device.rtx0": {"device": "rtx0"}})).is_none());
         assert!(admitted_devices(&json!({"memory_reconciliation_provenance": {"family": "step5"}})).is_none());
         assert_eq!(admitted_devices(&json!({"memory_reconciliation_provenance": {"devices": [{"device": 0}]}}))
             .map(|devices| devices.len()), Some(1));
+    }
+
+    #[test]
+    fn muse_ready_and_first_request_resolve_physical_device_samples() {
+        let device = cuteafd_core::RuntimeSample { device: 3, total_bytes: 1000,
+            free_bytes: 250, context_bytes: 100, module_bytes: 0, sms: 96,
+            arch: "sm_120".into(), driver: "test".into() };
+        let owners = cuteafd_core::memory_policy::DeviceBreakdown { device: "rtx0".into(),
+            cap_bytes: 1000, weights_bytes: 600, workspace_bytes: 100, kv_bytes: 0,
+            other_bytes: 0, reserve_overridden: false,
+            reserve: vec![cuteafd_core::memory_policy::ReserveComponent {
+                name: "graph reserve".into(), bytes: 100 }] };
+        let mut inputs = json!({"memory_reconciliation_provenance": {
+            "family": "muse_spark", "devices": [device]}, "device.rtx0": owners});
+        for stage in ["ready", "first_request"] {
+            let result = capture_with(stage, &inputs, &BTreeMap::new(), &|physical| {
+                assert_eq!(physical, 3);
+                Ok(Some((150, 1000, 100)))
+            }, &|physical, sample| { assert_eq!(physical, 3); assert!(sample.is_some()); Some((50, 50)) }).unwrap();
+            assert_eq!(result["stage"], stage);
+            let row = &result["devices"][0];
+            assert_eq!(row["measured_bytes"], 750);
+            assert_eq!(row["graph_arena_high_water_bytes"], 50);
+            assert_eq!(row["graph_reserve_slack"], 50);
+            assert_eq!(row["delta_vs_measured"], 0);
+            assert_eq!(row["beyond_half_padding"], false);
+            assert!(row["unavailable_reason"].is_null());
+        }
+        // The old bare integer inventory must not fabricate a physical sample.
+        inputs["memory_reconciliation_provenance"]["devices"] = json!([3]);
+        let missing = capture_with("ready", &inputs, &BTreeMap::new(),
+            &|_| panic!("malformed identity cannot sample CUDA"), &|_, _| None).unwrap();
+        assert!(missing["devices"][0]["measured_bytes"].is_null());
+        assert!(missing["devices"][0]["delta_vs_measured"].is_null());
     }
 
     #[test]

@@ -51,6 +51,23 @@ impl StepMetadata {
     /// SWA layers write each row's record into the step's own `kv_step` row.
     pub(crate) fn step_slots(&self) -> Vec<i64> { (0..self.positions.len() as i64).collect() }
 
+    /// Give decode tables a stable admitted row pitch. Positions still bound
+    /// attention on-device; sentinel padding is never a visible key.
+    pub(crate) fn with_stride(mut self, stride: usize) -> Result<Self> {
+        ensure!(self.table_stride > 0 && stride >= self.table_stride,
+            "Muse decode table stride {} exceeds admitted {stride}", self.table_stride);
+        if stride != self.table_stride {
+            let mut table = Vec::with_capacity(self.positions.len() * stride);
+            for row in self.page_table.chunks_exact(self.table_stride) {
+                table.extend_from_slice(row);
+                table.resize(table.len() + stride - self.table_stride, -1);
+            }
+            self.page_table = table;
+            self.table_stride = stride;
+        }
+        Ok(self)
+    }
+
     /// `ring_rows`: rows of one sequence's ring; `slots`: rings admitted.
     /// `shared_table`: the prefill route reads one table row for its one sequence.
     pub(crate) fn build(sequences: &[StepSequence<'_>], ring_rows: usize, slots: usize, step_capacity: usize,
@@ -218,6 +235,24 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fixed_decode_pitch_preserves_every_visible_key_and_address() -> Result<()> {
+        let pages = [7, 2, 9];
+        let original = StepMetadata::build(&[StepSequence { slot: 1, start: 127, rows: 2, pages: &pages }],
+            2112, 4, 64, false)?;
+        let padded = original.clone().with_stride(8)?;
+        assert_eq!(padded.positions, original.positions);
+        assert_eq!(padded.page_slots, original.page_slots);
+        assert_eq!(padded.ring_slots, original.ring_slots);
+        assert_eq!(padded.seq_first, original.seq_first);
+        for row in 0..2 {
+            assert_eq!(&padded.page_table[row * 8..row * 8 + 3], &original.page_table[row * 3..row * 3 + 3]);
+            assert!(padded.page_table[row * 8 + 3..(row + 1) * 8].iter().all(|&p| p == -1));
+        }
+        assert!(original.with_stride(2).is_err());
         Ok(())
     }
 

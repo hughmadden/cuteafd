@@ -11,6 +11,7 @@ pub(crate) mod device;
 pub(crate) mod engine;
 pub(crate) mod experts;
 pub(crate) mod forward;
+pub(crate) mod graphs;
 pub(crate) mod lane;
 pub(crate) mod media;
 pub(crate) mod onboard;

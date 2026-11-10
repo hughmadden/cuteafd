@@ -1892,3 +1892,100 @@ def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
     assert "(true, scheduler::UngraphedKind::Decode)" in serve
     assert "(false, scheduler::UngraphedKind::Scoring)" in serve
     assert "check_diagnostic_graph_bypass(&tokens)?" in golden
+
+
+
+def muse_trace(device=0):
+    def graph(rows, layer, hits, cost):
+        return {"site": "muse_spark.segment", "bank": 1, "key_id": f"{rows}-{layer}",
+                "shape": f"Key {{ layer: {layer}, rows: {rows}, stride: 2048, section: Attention }}",
+                "hits": hits, "count": hits + 1, "misses": 1, "capture_bytes": cost}
+    return {"schema_version": 2, "cache": {"device": device, "sampled_at_ms": 10},
+            "graphs": [graph(1, 0, 20, 100), graph(1, 1, 0, 50),
+                       graph(4, 0, 10, 200), graph(8, 0, 0, 300)]}
+
+
+def test_muse_prices_capture_only_siblings_but_not_zero_replay_geometries():
+    result = MODULE.generate_muse([muse_trace()], 1, 2)
+    assert result["reserve_base_bytes"] == [2 << 20]
+    assert result["reserve_extra_bytes"] == [2 << 20]
+    assert result["entries"] == [
+        {"rows": 1, "pin": False, "capture_bytes": [150]},
+        {"rows": 4, "pin": False, "capture_bytes": [200]}]
+    assert "1 zero-replay siblings included" in result["provenance"]
+    assert "1 zero-replay identities stay lazy" in result["provenance"]
+    assert result == MODULE.generate_muse([muse_trace(), muse_trace()], 1, 2)
+
+
+def test_muse_latest_snapshot_and_physical_rank_costs_are_not_borrowed():
+    old = muse_trace()
+    old["cache"]["sampled_at_ms"] = 1
+    old["graphs"][0]["capture_bytes"] = 9999999
+    other = muse_trace(1)
+    other["graphs"][0]["capture_bytes"] = 300
+    result = MODULE.generate_muse([old, muse_trace(), other], 2, 2)
+    assert result["entries"][0]["capture_bytes"] == [150, 350]
+    assert result == MODULE.generate_muse([other, muse_trace(), old], 2, 2)
+    with pytest.raises(ValueError, match="needs 2 device traces"):
+        MODULE.generate_muse([muse_trace()], 2, 2)
+    missing = muse_trace()
+    missing["graphs"][1].pop("capture_bytes")
+    with pytest.raises(ValueError, match="lacks measured capture share"):
+        MODULE.generate_muse([missing], 1, 2)
+
+
+def test_muse_measured_min_inventory_prices_its_selected_rows():
+    checked = json.loads((SCRIPT.parents[2] /
+        "rust/crates/cuteafd-loader/src/serving_capacity/muse_prewarm.json").read_text())
+    assert {(row["ranks"], row["onboard_layers"]) for row in checked["layouts"]} == {(1, 2), (2, 0)}
+    layout = checked["layouts"][0]
+    assert len(layout["entries"]) == 55
+    assert [entry["rows"] for entry in layout["entries"] if entry["pin"]] == [56]
+    assert len({entry["rows"] for entry in layout["entries"]}) == 55
+    assert 1 in {entry["rows"] for entry in layout["entries"]}
+    assert layout["reserve_base_bytes"] == [1056964608]
+    assert layout["reserve_extra_bytes"] == [2 << 20]
+    assert MODULE.packed(sum(entry["capture_bytes"][0] for entry in layout["entries"])) == 1056964608
+
+
+def test_muse_trimmed_source_traces_reproduce_both_layouts_byte_for_byte():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/muse-prewarm-traces.json.gz"
+    traces = json.loads(gzip.decompress(fixture.read_bytes()))
+    generated = {"schema_version": 1, "family": "muse_spark", "layouts": [
+        MODULE.generate_muse(traces["min"], 1, 2),
+        MODULE.generate_muse(traces["max"], 2, 0)]}
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/muse_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    maximum = generated["layouts"][1]
+    assert len(maximum["entries"]) == 53
+    assert not any(entry["pin"] for entry in maximum["entries"])
+    assert maximum["reserve_base_bytes"] == [1287651328, 1302331392]
+    assert maximum["reserve_extra_bytes"] == [MODULE.CHUNK] * 2
+    assert "2984 zero-replay identities stay lazy" in maximum["provenance"]
+    for snapshots in traces.values():
+        for trace in snapshots:
+            assert all(graph["nodes"] >= 2 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
+
+
+def test_muse_synthetic_trace_regeneration_is_byte_stable():
+    expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n"
+    assert json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n" == expected
+
+
+def test_muse_cli_reports_onboard_geometry_and_reproduces_output(tmp_path):
+    import subprocess
+    import sys
+
+    trace_path = tmp_path / "trace.json"
+    output = tmp_path / "prewarm.json"
+    trace_path.write_text(json.dumps(muse_trace()))
+    expected = json.dumps(MODULE.generate_muse([muse_trace()], 1, 2), indent=2) + "\n"
+    result = subprocess.run([sys.executable, str(SCRIPT), "--family", "muse_spark",
+                             "--trace", str(trace_path), "--ranks", "1", "--onboard-layers", "2",
+                             "--output", str(output)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "Muse 1 ranks onboard_layers=2: 2 geometries" in result.stdout
+    assert output.read_text() == expected

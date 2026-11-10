@@ -428,7 +428,7 @@ if [[ "$family" == qwen3_5 ]]; then
     *) release_die "DECODE_GRAPHS must be on or off" ;;
   esac
 fi
-if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 ]]; then
+if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
     [[ -z "$(get "$key")" ]] || graph_census_args+=(-e "CUTEAFD_$key=$(get "$key")")
@@ -1885,6 +1885,12 @@ fi
 # the partial-reply cutoff and wide format (the prefill unit shape comes from the
 # deployment plan, as for every units family).
 if [[ $family == muse_spark ]]; then
+  muse_decode_graphs="$(get DECODE_GRAPHS on)"
+  case "$muse_decode_graphs" in
+    on) family_args+=(--decode-graphs true) ;;
+    off) family_args+=(--decode-graphs false) ;;
+    *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
+  esac
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers")
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")

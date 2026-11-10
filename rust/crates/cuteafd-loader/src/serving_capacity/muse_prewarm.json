@@ -1,0 +1,843 @@
+{
+  "schema_version": 1,
+  "family": "muse_spark",
+  "layouts": [
+    {
+      "ranks": 1,
+      "onboard_layers": 2,
+      "provenance": "GRAPH_TRACE latest inventories on devices [0]; every replayed row geometry; 0 zero-replay siblings included; 615 zero-replay identities stay lazy",
+      "reserve_base_bytes": [
+        1056964608
+      ],
+      "reserve_extra_bytes": [
+        2097152
+      ],
+      "entries": [
+        {
+          "rows": 56,
+          "pin": true,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 3,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 64,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 9,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 5,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 4,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 17,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 11,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 10,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 8,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 13,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 7,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 32,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 18,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 20,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 49,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 12,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 25,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 19,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 21,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 6,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 47,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 2,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 15,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 16,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 23,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 44,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 46,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 40,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 43,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 45,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 14,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 31,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 41,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 48,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 39,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 22,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 27,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 29,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 42,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 1,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 34,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 26,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 33,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 24,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 28,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 30,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 38,
+          "pin": false,
+          "capture_bytes": [
+            14680064
+          ]
+        },
+        {
+          "rows": 57,
+          "pin": false,
+          "capture_bytes": [
+            16777216
+          ]
+        },
+        {
+          "rows": 62,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 36,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 50,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 51,
+          "pin": false,
+          "capture_bytes": [
+            20971520
+          ]
+        },
+        {
+          "rows": 53,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        },
+        {
+          "rows": 63,
+          "pin": false,
+          "capture_bytes": [
+            18874368
+          ]
+        }
+      ]
+    },
+    {
+      "ranks": 2,
+      "onboard_layers": 0,
+      "provenance": "GRAPH_TRACE latest inventories on devices [0, 1]; every replayed row geometry; 0 zero-replay siblings included; 2984 zero-replay identities stay lazy",
+      "reserve_base_bytes": [
+        1287651328,
+        1302331392
+      ],
+      "reserve_extra_bytes": [
+        2097152,
+        2097152
+      ],
+      "entries": [
+        {
+          "rows": 3,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 64,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            23068672
+          ]
+        },
+        {
+          "rows": 8,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            27262976
+          ]
+        },
+        {
+          "rows": 9,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 4,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 5,
+          "pin": false,
+          "capture_bytes": [
+            20971520,
+            20971520
+          ]
+        },
+        {
+          "rows": 7,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 2,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            23068672
+          ]
+        },
+        {
+          "rows": 6,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            20971520
+          ]
+        },
+        {
+          "rows": 13,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 25,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            27262976
+          ]
+        },
+        {
+          "rows": 49,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            25165824
+          ]
+        },
+        {
+          "rows": 17,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 20,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 21,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            23068672
+          ]
+        },
+        {
+          "rows": 11,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 22,
+          "pin": false,
+          "capture_bytes": [
+            20971520,
+            27262976
+          ]
+        },
+        {
+          "rows": 32,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 23,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 47,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            23068672
+          ]
+        },
+        {
+          "rows": 10,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 48,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 24,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 12,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 46,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 14,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 19,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 31,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            27262976
+          ]
+        },
+        {
+          "rows": 43,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            23068672
+          ]
+        },
+        {
+          "rows": 44,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 15,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 45,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 18,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            20971520
+          ]
+        },
+        {
+          "rows": 26,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 1,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 16,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 29,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 41,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 34,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            25165824
+          ]
+        },
+        {
+          "rows": 63,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 42,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            27262976
+          ]
+        },
+        {
+          "rows": 57,
+          "pin": false,
+          "capture_bytes": [
+            20971520,
+            23068672
+          ]
+        },
+        {
+          "rows": 30,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 39,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            23068672
+          ]
+        },
+        {
+          "rows": 55,
+          "pin": false,
+          "capture_bytes": [
+            27262976,
+            25165824
+          ]
+        },
+        {
+          "rows": 28,
+          "pin": false,
+          "capture_bytes": [
+            20971520,
+            27262976
+          ]
+        },
+        {
+          "rows": 33,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 36,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 38,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            23068672
+          ]
+        },
+        {
+          "rows": 51,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            23068672
+          ]
+        },
+        {
+          "rows": 52,
+          "pin": false,
+          "capture_bytes": [
+            25165824,
+            25165824
+          ]
+        },
+        {
+          "rows": 58,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            25165824
+          ]
+        },
+        {
+          "rows": 61,
+          "pin": false,
+          "capture_bytes": [
+            23068672,
+            27262976
+          ]
+        }
+      ]
+    }
+  ]
+}

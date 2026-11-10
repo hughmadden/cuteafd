@@ -109,6 +109,18 @@ mod tests {
     use super::*;
     use cuteafd_loader::plan::{layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
+    fn without_sampled_baseline(mut placement: cuteafd_loader::placement::Placement,
+        occupied: u64) -> cuteafd_loader::placement::Placement {
+        for items in &mut placement.items {
+            let owners = items.iter().filter(|item|
+                cuteafd_loader::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
+            assert_eq!(owners.len(), usize::from(occupied > 0));
+            assert_eq!(owners.iter().map(|item| item.bytes).sum::<u64>(), occupied);
+            items.retain(|item| !cuteafd_loader::placement::sampled_baseline::is_source(&item.group));
+        }
+        placement
+    }
+
     fn manifest(gpus: usize) -> serde_json::Value {
         let programs = programs::required(gpus).unwrap().into_iter().map(|(name, _)| name)
             .chain([programs::ROPE_TABLES.to_string()])
@@ -228,6 +240,7 @@ mod tests {
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: served_drafter, media: None })
             })?.placement;
+            let live = without_sampled_baseline(live, arch.context_bytes);
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
@@ -310,6 +323,7 @@ mod tests {
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
                     vision, cuteafd_loader::plan::MediaMode::Off, 1)?) })?.placement;
+            let live = without_sampled_baseline(live, arch.context_bytes);
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
             for gpu in 0..gpus {
                 let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
@@ -433,18 +447,23 @@ mod tests {
             partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
             local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
             drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
-        let live = &built.placement;
-        assert_eq!(live, planned);
+        let live = without_sampled_baseline(built.placement.clone(), arch.context_bytes);
+        assert_eq!(&live, planned);
         let planned_phases = report.phase_ledger.as_ref().context("admitted phase ledger")?;
         assert_eq!(planned_phases.budgets.len(), built.solved.budgets.len());
         for (planned, live) in planned_phases.budgets.iter().zip(&built.solved.budgets) {
-            // Forecast and sampled baselines differ in provenance, not capacity.
             assert_eq!((&planned.id, &planned.locations, planned.physical_bytes,
-                planned.logical_bytes, planned.headroom, planned.available()?),
+                planned.logical_bytes, planned.headroom),
                 (&live.id, &live.locations, live.physical_bytes,
-                    live.logical_bytes, live.headroom, live.available()?));
+                    live.logical_bytes, live.headroom));
         }
-        assert_eq!(planned_phases.phases, built.solved.phases);
+        for (planned, live) in planned_phases.phases.iter().zip(&built.solved.phases) {
+            assert_eq!((&planned.budget, planned.phase, planned.owned),
+                (&live.budget, live.phase, live.owned));
+            // Sampled context moves from unavailable capacity to a named opaque owner.
+            assert_eq!(planned.available - planned.owned - planned.opaque,
+                live.available - live.owned - live.opaque);
+        }
         assert_eq!(report.host_budget_bytes, built.host.prefix_bytes);
         for device in report.memory_layout.as_ref().context("admitted devices")?.devices.iter()
             .filter(|device| device.kind == DeviceKind::Spark) {

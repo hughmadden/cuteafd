@@ -1319,6 +1319,71 @@ def generate_glm5_flash(traces, coverage=0.999, pin_frequency=0.9):
             "reserve_extra_bytes": extra, "entries": entries}
 
 
+MUSE_GEOMETRY = re.compile(r"Key \{ layer: \d+, rows: (\d+), stride: \d+, section: (\w+) \}")
+
+
+def generate_muse(traces, ranks, onboard_layers):
+    """Select every replayed row geometry and price all its captured siblings."""
+    if ranks not in (1, 2) or type(onboard_layers) is not int or not 0 <= onboard_layers <= 62:
+        raise ValueError("Muse needs --ranks 1|2 and --onboard-layers 0..62")
+    latest = {}
+    for trace in traces:
+        if trace.get("schema_version") not in (1, 2):
+            raise ValueError("expected GRAPH_TRACE schema_version=1 or 2")
+        device = int(trace["cache"]["device"])
+        timestamp = int(trace["cache"].get("sampled_at_ms", 0))
+        if device not in latest or timestamp >= latest[device][0]:
+            latest[device] = (timestamp, trace)
+    devices = sorted(latest)
+    if len(devices) != ranks:
+        raise ValueError(f"Muse {ranks} ranks needs {ranks} device traces, found {devices}")
+    identities = {}
+    counts = {}
+    pins = set()
+    for device, (_, trace) in latest.items():
+        for graph in trace["graphs"]:
+            if graph["site"] != "muse_spark.segment":
+                continue
+            match = MUSE_GEOMETRY.fullmatch(graph["shape"])
+            if match is None or not 1 <= int(match[1]) <= 64:
+                raise ValueError(f"cannot parse Muse identity: {graph['shape']!r}")
+            rows = int(match[1])
+            identity = (device, graph.get("bank", 0), graph.get("key_id", graph["shape"]))
+            if identity in identities:
+                continue
+            identities[identity] = (rows, graph)
+            replay = qwen_replay(graph)
+            if replay > 0:
+                counts[rows] = max(counts.get(rows, 0), replay)
+                if sustained(graph):
+                    pins.add(rows)
+    if not counts:
+        raise ValueError("trace records no replayed Muse graph identities")
+    selected = set(counts)
+    costs = {rows: [0] * ranks for rows in selected}
+    zero_siblings = zero_lazy = 0
+    for (device, _, _), (rows, graph) in identities.items():
+        if rows not in selected:
+            zero_lazy += 1
+            continue
+        share = graph.get("capture_bytes")
+        if share is None or int(share) < 0:
+            raise ValueError(f"Muse selected identity lacks measured capture share: {graph['shape']!r}")
+        costs[rows][devices.index(device)] += int(share)
+        zero_siblings += qwen_replay(graph) == 0
+    # The emitted startup step captures all layer/head siblings at this row count.
+    # Missing rank costs indicate an incomplete trace, not free graphs.
+    if any(cost <= 0 for costs_by_rank in costs.values() for cost in costs_by_rank):
+        raise ValueError("Muse selected geometry has no measured capture cost on a rank")
+    entries = [{"rows": rows, "pin": rows in pins, "capture_bytes": costs[rows]}
+               for rows in sorted(selected, key=lambda rows: (rows not in pins, -counts[rows], rows))]
+    return {"ranks": ranks, "onboard_layers": onboard_layers,
+            "provenance": f"GRAPH_TRACE latest inventories on devices {devices}; every replayed row geometry; "
+                          f"{zero_siblings} zero-replay siblings included; {zero_lazy} zero-replay identities stay lazy",
+            "reserve_base_bytes": [packed(sum(cost[rank] for cost in costs.values())) for rank in range(ranks)],
+            "reserve_extra_bytes": [CHUNK] * ranks, "entries": entries}
+
+
 def qwen_geometry(graph):
     match = QWEN_GEOMETRY.search(graph["shape"])
     if match is None:
@@ -1663,7 +1728,7 @@ def generate_qwen35(traces, variant, summary=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--family", required=True,
-                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5")))
+                        choices=sorted((*SITE_PREFIX, "glm5_flash", "qwen4", "deepseek_v41", "mimo_v2", "kimi_k3", "qwen3_5", "muse_spark")))
     parser.add_argument("--layout",
                         help="coordinator layout the trace was recorded on (glm5, mistral_large4, deepseek_v41), "
                              "or the deepseek_v4 layout key to replace in --list")
@@ -1682,6 +1747,7 @@ def main():
     parser.add_argument("--pin-frequency", type=float, default=0.9, help="schema 1 legacy frequency threshold")
     parser.add_argument("--ranks", type=int, help="MiMo/Kimi physical coordinator ranks")
     parser.add_argument("--variant", help="MiMo checkpoint program and layers, e.g. mimof-48")
+    parser.add_argument("--onboard-layers", type=int, help="Muse resolved onboarded layer prefix")
     parser.add_argument("--sparks", choices=("yes", "no"), help="MiMo Spark attachment")
     args = parser.parse_args()
     report = []
@@ -1712,6 +1778,9 @@ def main():
     try:
         if args.family == "qwen3_5":
             result = generate_qwen35([json.loads(Path(path).read_text()) for path in args.trace], args.variant, summary)
+        elif args.family == "muse_spark":
+            result = generate_muse([json.loads(Path(path).read_text()) for path in args.trace],
+                                   args.ranks, args.onboard_layers)
         elif args.family == "mimo_v2":
             result = generate([json.loads(Path(path).read_text()) for path in args.trace],
                               args.family, args.coverage, args.pin_frequency, pin_report=report,
@@ -1745,6 +1814,10 @@ def main():
         args.merge.write_text(json.dumps(document, indent=2) + "\n")
     else:
         args.output.write_text(json.dumps(result, indent=2) + "\n")
+    if args.family == "muse_spark":
+        print(f"Muse {result['ranks']} ranks onboard_layers={result['onboard_layers']}: {len(result['entries'])} geometries; "
+              f"base={result['reserve_base_bytes']} extra={result['reserve_extra_bytes']}")
+        return
     if args.family == "deepseek_v4":
         entry = result["layouts"][layout]
         verify = sum(1 for row in entry["entries"] if row["table_width"] > 0)

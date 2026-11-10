@@ -170,7 +170,7 @@ impl<'a> RankResources<'a> {
         -> RankDevice<'a, 'w> {
         RankDevice { library: self.device.library, cfg, programs: &self.programs, core: &self.core,
             layers: &self.layers, lane, rope: self.rope.buffers(), kv: &self.kv.layers,
-            ranks: self.ranks, rank: self.rank, tp2: self.tp2.as_ref(), wire_grid: self.wire_grid, stream }
+            ranks: self.ranks, rank: self.rank, tp2: self.tp2.as_ref(), wire_grid: self.wire_grid, stream, graphs: None }
     }
 }
 

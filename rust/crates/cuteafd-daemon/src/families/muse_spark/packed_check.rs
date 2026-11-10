@@ -44,8 +44,9 @@ fn qualify(mut args: GoldenArgs) -> Result<()> {
         ensure!(slots > 2 * members, "Muse packing check needs a spare restore slot");
         let (family, mut cache) = backend.prefix_cache(&args.engine.prefix, slots)?;
         let prompts = packed_check::prompts(&selected[0].tokens, members)?;
+        let continuation_capacity = CONTINUATION_ROWS.max(backend.diagnostic_graph_width().unwrap_or(0) + 1);
         let mut allocate = |lengths: Vec<usize>, first_slot: usize| -> Result<Vec<Placement>> {
-            lengths.into_iter().enumerate().map(|(i, len)| Ok(cache.admit_cold(&family, len, len + CONTINUATION_ROWS + 1,
+            lengths.into_iter().enumerate().map(|(i, len)| Ok(cache.admit_cold(&family, len, len + continuation_capacity + 1,
                 |pages| Placement { pages, slot: first_slot + i, ..Default::default() })?.placement)).collect()
         };
         let packed = allocate(prompts.iter().map(Vec::len).collect(), 0)?;
@@ -196,6 +197,32 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
         placement.slot, restore_slot, placement.len, continuation.len());
     println!("Muse prompt-end restore: slot {} -> {}, {} rows, visible SWA marks and {}-token continuation logits byte-identical",
         placement.slot, restore_slot, placement.len, continuation.len());
+    if let Some(max_width) = backend.diagnostic_graph_width() {
+        for (rows, speculative) in graph_oracle_cases(max_width) {
+            let tokens = continuation.iter().copied().cycle().take(rows).collect::<Vec<_>>();
+            let mut outputs = Vec::new();
+            // Repeat the graph arm from exactly the same slot/frontier to test
+            // replay as well as first capture, then bypass capture for the control.
+            for eager in [false, false, true] {
+                backend.diagnostic_sync()?;
+                restored.len = 0;
+                family.restore(Some(MarkSlot(0)), &mut restored, placement.len).map_err(boxed)?;
+                family.drain().map_err(boxed)?;
+                let sequences = &mut [(&mut restored, tokens.as_slice())];
+                let logits = if eager {
+                    backend.verify_device_ungraphed(sequences, speculative,
+                        crate::shared::qwen::scheduler::UngraphedKind::Decode, pool)?
+                } else {
+                    backend.verify_device(sequences, speculative, pool)?
+                }.context("Muse graph oracle produced no logits")?;
+                outputs.push(logits.to_host(backend.library())?.iter().map(|value| value.to_bits()).collect::<Vec<_>>());
+                if !eager { backend.diagnostic_require_graph_rows(rows)?; }
+            }
+            ensure!(same_logit_bits(&outputs[0], &outputs[1]) && same_logit_bits(&outputs[1], &outputs[2]),
+                "Muse graph capture/replay/eager logits differ: {rows} rows, speculative={speculative}");
+            println!("Muse graph capture/replay/eager: {rows} rows, speculative={speculative}, every logit bit identical");
+        }
+    }
     Ok(snapshot)
 }
 
@@ -210,13 +237,31 @@ fn continuation_bits(backend: &MuseBackend<'_, '_>, placement: &mut Placement, t
     Ok(bits)
 }
 
+fn graph_oracle_cases(max_width: usize) -> Vec<(usize, bool)> {
+    let mut cases = vec![(1, false)];
+    let mut widths = [2, 4, max_width].into_iter().filter(|&width| width > 0 && width <= max_width)
+        .collect::<Vec<_>>();
+    widths.sort_unstable();
+    widths.dedup();
+    cases.extend(widths.into_iter().map(|width| (width + 1, true)));
+    cases
+}
+
 fn same_logit_bits(live: &[u32], restored: &[u32]) -> bool {
     !live.is_empty() && live == restored
 }
 
 #[cfg(test)]
 mod tests {
-    use super::same_logit_bits;
+    use super::{graph_oracle_cases, same_logit_bits};
+
+    #[test]
+    fn graph_oracle_covers_decode_and_anchor_plus_draft_widths() {
+        assert_eq!(graph_oracle_cases(15), [(1, false), (3, true), (5, true), (16, true)]);
+        assert_eq!(graph_oracle_cases(4), [(1, false), (3, true), (5, true)]);
+        assert_eq!(graph_oracle_cases(1), [(1, false), (2, true)]);
+        assert_eq!(graph_oracle_cases(0), [(1, false)]);
+    }
 
     #[test]
     fn cache_continuation_checks_every_float_bit_and_row() {
