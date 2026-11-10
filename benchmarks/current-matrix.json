@@ -30,7 +30,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-stridedple-2rtx-6spark-v41-flash-strided-max"
+        "report": "benchmarks/deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-stridedple-2rtx-6spark-v41-flash-strided-max"
       }
     },
     {
@@ -62,7 +62,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/deepseek_v4/2026-10-31-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max"
+        "report": "benchmarks/deepseek_v4/2026-11-10-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-2rtx-6spark-v4-pro-exl3-max"
       }
     },
     {
