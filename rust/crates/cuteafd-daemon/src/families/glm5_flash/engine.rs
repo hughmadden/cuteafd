@@ -5765,7 +5765,10 @@ mod prefill_lane_tests {
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
             // Fork c81a39a2/0b9292f1 add a separate prefill-router exporter; decode projection
             // dispatch, shapes, arithmetic and capacity thresholds are unchanged.
-            ("integration/cuteafd/glmf.py", 0x9384fb38251982be_u64),
+            // Fork #269 makes Kimi BF16 wide prefill opt-in; GLM leaves bf16_wide off
+            // and bf16_wide_min_rows None, preserving its routes. The pin-bump CHANGES
+            // receipt changes only kimik3_* / draft_bf16_*: all GLM objects are identical.
+            ("integration/cuteafd/glmf.py", 0xe9850fac36cb38d5_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
@@ -5774,7 +5777,9 @@ mod prefill_lane_tests {
             // True); projection routes and thresholds untouched. SM188/170 vs the master-pinned
             // baseline: glm, glm2, glmf, glm-stage programs byte-identical including SASS.
             // Re-audit shared with Mistral commit a14370e52.
-            ("integration/cuteafd/_glm_kernels.py", 0x481c_c910_48bc_d648),
+            // Fork #269 forwards optional wide_min_rows, default None; GLM retains
+            // its existing wide floor and byte-identical exported objects.
+            ("integration/cuteafd/_glm_kernels.py", 0xea3a_e723_ea70_f710),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
@@ -5823,7 +5828,10 @@ mod prefill_lane_tests {
             // Fork #189 adds route metadata only; launch keys, arithmetic and thresholds stay unchanged.
             // Fork #257/#258 add ordered-K16 native HQA tiles at non-Flash shapes;
             // no existing Flash tile, threshold or accumulation order changes.
-            ("gemm/bf16_gemv/_skinny.py", 0x09c1666707b3a730_u64),
+            // Fork #269 adds Kimi-only decode bands and optional tile_k; existing
+            // entries retain tile_k=64. Optional wide_min_rows defaults to the old
+            // WIDE_PREFILL_MIN_ROWS, preserving GLM keys, floors and exported objects.
+            ("gemm/bf16_gemv/_skinny.py", 0xd0e1685b6faa91ea_u64),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,
