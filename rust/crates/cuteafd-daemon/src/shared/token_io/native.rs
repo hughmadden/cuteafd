@@ -398,9 +398,10 @@ fn load_rows_with<'a>(library: &'a NativeLibrary, slice: &DenseSlice, staging: &
         ensure!(std::ptr::eq(owner.device.library, library), "native vocabulary library mismatch");
         Ok(DeviceAllocation::from_allocation(owner))
     };
+    // Arena keys follow the component recipe, not the kernel's pointer names.
     let weights = RowFp8Weights {
-        payload: plane("payload", requests[0].1)?,
-        scales: plane("scales", requests[1].1)?,
+        payload: plane(&requests[0].0, requests[0].1)?,
+        scales: plane(&requests[1].0, requests[1].1)?,
         source: [slice.components[0].source.clone(), slice.components[1].source.clone()],
     };
     for ((name, bytes), buffer) in requests.iter().zip([weights.payload(), weights.scales()]) {
@@ -460,7 +461,7 @@ mod tests {
     fn vocabulary_and_placeholder_hooks_preserve_bytes_and_backing_receipts() -> Result<()> {
         use crate::shared::{memory::{device::Device, weight_arena::DeviceWeightArena, receipts::Census},
             token_io::{EmbedSource, TokenEmbedding}};
-        use cuteafd_loader::{serving_capacity::WeightArenaLayout, placement::planner::{CoordinatorDevices, PhaseOrder}};
+        use cuteafd_loader::placement::planner::{CoordinatorDevices, PhaseOrder};
         use serde_json::json;
         let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
         let library = fixture.load()?;
@@ -496,35 +497,96 @@ mod tests {
         let manifest = dir.path().join("PROGRAMS.json");
         std::fs::write(&manifest, serde_json::to_vec(&json!({"programs":entries}))?)?;
         let programs = library.programs()?.with_manifest(&manifest)?;
-        let plan = || VocabularyPlan::new(&records, &selection(false), 1, 0, 128, 256);
-        let plain = NativeVocabulary::load_prepared(&library, &programs, plan()?, plan()?.staging_bytes() as u64, 0)?
-            .context("standalone vocabulary")?;
-        let arena = DeviceWeightArena::new(Device { library: &library, id: 0 }, WeightArenaLayout::new("test/vocabulary",
-            [("embedding.payload".into(), 32768), ("embedding.scales".into(), 1024),
-                ("head.payload".into(), 32768), ("head.scales".into(), 1024), ("embedding.table".into(), 256)])?, crate::shared::memory::TEST_ARENA)?;
-        let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(&library, &programs, plan()?,
-            plan()?.staging_bytes() as u64, 0, |name, bytes| arena.view(name, bytes))?.context("packed vocabulary")?);
-        let embedding = TokenEmbedding::row_fp8_with(&library, EmbedSource {
-            path: records[0].components[0].source.path.clone(), offset: 0, vocab: 256, hidden: 128,
-            snapshot: None, tensor_name: EMBEDDING.into(),
-        }, vocabulary.clone(), |name, bytes| arena.view(name, bytes))?;
-        drop(arena);
-        for (one, two) in [(&plain.embedding, &vocabulary.embedding), (&plain.head, &vocabulary.head)] {
-            for (a, b) in [(one.payload(), two.payload()), (one.scales(), two.scales())] {
-                let (mut left, mut right) = (vec![0; a.bytes], vec![0; b.bytes]);
-                library.copy_d2h(&mut left, a)?;
-                library.copy_d2h(&mut right, b)?;
-                assert_eq!(left, right);
-                assert!(left.iter().any(|&v| v != 0));
+        fixture.configure_memory(&library, 1, 1 << 30)?;
+        for flash in [false, true] { for world in [1, 2] { for embedding_rank in 0..if flash { world } else { 1 } {
+            library.cuda_set_device(0)?;
+            let selection = selection(flash);
+            let mut records = records.clone();
+            for (record, name) in records.iter_mut().zip(selection.vocabulary_names()) { record.tensor = name; }
+            let plan = |rank| VocabularyPlan::new(&records, &selection, world, rank, 128, 256);
+            let layouts = if flash {
+                use cuteafd_loader::{families::glm5_flash::{GlmNextConfig, weight_layout::native_target},
+                    plan::exlr8::{native::DenseFacts, dense::{DenseExecution, DenseOwnership,
+                        requests::NativeDenseRecords}}};
+                let configs: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../../cuteafd-loader/tests/fixtures/exlr8-dense-configs.json"))?;
+                let mut cfg = GlmNextConfig::from_hf(&configs["flash"])?;
+                cfg.hidden = 128;
+                cfg.vocab_size = 256;
+                let mut all = records.to_vec();
+                all.push(DenseRecord { tensor: selection.norm_name(), encoding: DenseEncoding::Bf16,
+                    shape: vec![128], side: ShardSide::Output,
+                    ownership: DenseOwnership::new(DenseExecution::RankZero), channels_per_shard: 128,
+                    rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+                    components: vec![DenseComponent { suffix: "bf16".into(), dtype: "BF16".into(),
+                        shape: vec![128], source: DenseRange { path: "not-read".into(), offset: 0, bytes: 256 }, window: None }] });
+                let mla = cfg.attention.iter().position(|kind| *kind ==
+                    cuteafd_loader::families::glm5_flash::GlmNextAttention::Mla).context("fixture MLA")?;
+                let mut body = all.last().unwrap().clone();
+                body.tensor = format!("{}.input_layernorm.weight", selection.layer_prefix(mla)?);
+                body.ownership = DenseOwnership::new(DenseExecution::Replicated);
+                all.push(body);
+                let facts = DenseFacts::new(all, selection.clone(), cfg.layers, vec![0; world])?;
+                let dense = (0..world).map(|rank| {
+                    let mut dense = NativeDenseRecords::from_records(&facts.records, &selection,
+                        cfg.layers, world, rank, &Default::default())?;
+                    // Keep one replicated MLA operand so peer scopes are nonempty.
+                    dense.layers.retain(|layer| layer.layer == mla);
+                    Ok(dense)
+                }).collect::<Result<Vec<_>>>()?;
+                native_target(&facts, &dense, &cfg, embedding_rank)?
+            } else {
+                use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership};
+                let mut all = records.to_vec();
+                all.push(DenseRecord { tensor: "model.layers.0.input_layernorm.weight".into(),
+                    encoding: DenseEncoding::Bf16, shape: vec![128], side: ShardSide::Output,
+                    ownership: DenseOwnership::new(DenseExecution::Replicated), channels_per_shard: 128,
+                    rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+                    components: vec![DenseComponent { suffix: "bf16".into(), dtype: "BF16".into(),
+                        shape: vec![128], source: DenseRange { path: "not-read".into(), offset: 0, bytes: 256 }, window: None }] });
+                let plans = (0..world).map(|rank| DensePlan::for_rank(&all, world, rank)
+                    .map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?;
+                cuteafd_loader::placement::families::glm5::weights::WeightInventory::from_native(
+                    &selection, 1, &plans)?.coordinator_arenas()?
+            };
+            let backing = layouts[0].id().to_owned();
+            let arenas = layouts.into_iter().enumerate().map(|(rank, layout)| DeviceWeightArena::new(
+                Device { library: &library, id: rank as i32 }, layout, crate::shared::memory::TEST_ARENA))
+                .collect::<Result<Vec<_>>>()?;
+            let key = |name: &str, rank: usize| if flash { name.to_owned() }
+                else { format!("glm.weights.gpu.{rank}.vocabulary.{name}") };
+            let plain = NativeVocabulary::load_prepared(&library, &programs, plan(0)?, plan(0)?.staging_bytes() as u64,
+                embedding_rank as i32)?.context("standalone vocabulary")?;
+            let vocabulary = std::rc::Rc::new(NativeVocabulary::load_prepared_with(&library, &programs, plan(0)?,
+                plan(0)?.staging_bytes() as u64, embedding_rank as i32, |name, bytes| {
+                    let rank = library.cuda_get_device()? as usize;
+                    arenas[rank].view(&key(name, rank), bytes)
+                })?.context("packed vocabulary")?);
+            let embedding = TokenEmbedding::row_fp8_with(&library, EmbedSource {
+                path: records[0].components[0].source.path.clone(), offset: 0, vocab: 256, hidden: 128,
+                snapshot: None, tensor_name: records[0].tensor.clone(),
+            }, vocabulary.clone(), |name, bytes| arenas[0].view(
+                if flash { name } else { "glm.weights.embedding" }, bytes))?;
+            drop(arenas);
+            for (one, two) in [(&plain.embedding, &vocabulary.embedding), (&plain.head, &vocabulary.head)] {
+                for (a, b) in [(one.payload(), two.payload()), (one.scales(), two.scales())] {
+                    let (mut left, mut right) = (vec![0; a.bytes], vec![0; b.bytes]);
+                    Device { library: &library, id: a.device_id }.run(|| library.copy_d2h(&mut left, a))?;
+                    Device { library: &library, id: b.device_id }.run(|| library.copy_d2h(&mut right, b))?;
+                    assert_eq!(left, right, "flash={flash} world={world} embedding_rank={embedding_rank}");
+                    assert!(left.iter().any(|&v| v != 0));
+                }
             }
-        }
-        let physical = [0];
-        let mut census = Census::default();
-        census.owners(embedding.allocation_receipts(CoordinatorDevices::new(&physical)?, "embedding")?);
-        census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
-        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
-        assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 3);
-        assert!(census.receipts.iter().filter_map(|r| r.allocation.view.as_ref()).all(|v| v.backing == "test/vocabulary"));
+            let physical = (0..world as i32).collect::<Vec<_>>();
+            let mut census = Census::default();
+            census.owners(embedding.allocation_receipts(CoordinatorDevices::new(&physical)?, "embedding")?);
+            census.normalize(PhaseOrder::DRAFT_THEN_TARGET)?;
+            let roots = if embedding_rank == 0 { 1 } else { 2 };
+            assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), roots);
+            assert_eq!(census.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 3);
+            assert!(census.receipts.iter().filter_map(|r| r.allocation.view.as_ref()).any(|v| v.backing == backing));
+        }}}
+        library.cuda_set_device(0)?;
         Ok(())
     }
 
