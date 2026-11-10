@@ -1885,7 +1885,7 @@ fi
 # the partial-reply cutoff and wide format (the prefill unit shape comes from the
 # deployment plan, as for every units family).
 if [[ $family == muse_spark ]]; then
-  muse_decode_graphs="$(get DECODE_GRAPHS off)"
+  muse_decode_graphs="$(get DECODE_GRAPHS on)"
   case "$muse_decode_graphs" in
     on) family_args+=(--decode-graphs true) ;;
     off) family_args+=(--decode-graphs false) ;;

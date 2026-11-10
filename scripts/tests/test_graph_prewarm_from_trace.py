@@ -1937,7 +1937,7 @@ def test_muse_latest_snapshot_and_physical_rank_costs_are_not_borrowed():
 def test_muse_measured_min_inventory_prices_its_selected_rows():
     checked = json.loads((SCRIPT.parents[2] /
         "rust/crates/cuteafd-loader/src/serving_capacity/muse_prewarm.json").read_text())
-    assert {(row["ranks"], row["onboard_layers"]) for row in checked["layouts"]} == {(1, 2)}
+    assert {(row["ranks"], row["onboard_layers"]) for row in checked["layouts"]} == {(1, 2), (2, 0)}
     layout = checked["layouts"][0]
     assert len(layout["entries"]) == 55
     assert [entry["rows"] for entry in layout["entries"] if entry["pin"]] == [56]
@@ -1946,6 +1946,28 @@ def test_muse_measured_min_inventory_prices_its_selected_rows():
     assert layout["reserve_base_bytes"] == [1056964608]
     assert layout["reserve_extra_bytes"] == [2 << 20]
     assert MODULE.packed(sum(entry["capture_bytes"][0] for entry in layout["entries"])) == 1056964608
+
+
+def test_muse_trimmed_source_traces_reproduce_both_layouts_byte_for_byte():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/muse-prewarm-traces.json.gz"
+    traces = json.loads(gzip.decompress(fixture.read_bytes()))
+    generated = {"schema_version": 1, "family": "muse_spark", "layouts": [
+        MODULE.generate_muse(traces["min"], 1, 2),
+        MODULE.generate_muse(traces["max"], 2, 0)]}
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/muse_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    maximum = generated["layouts"][1]
+    assert len(maximum["entries"]) == 53
+    assert not any(entry["pin"] for entry in maximum["entries"])
+    assert maximum["reserve_base_bytes"] == [1287651328, 1302331392]
+    assert maximum["reserve_extra_bytes"] == [MODULE.CHUNK] * 2
+    assert "2984 zero-replay identities stay lazy" in maximum["provenance"]
+    for snapshots in traces.values():
+        for trace in snapshots:
+            assert all(graph["nodes"] >= 2 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
 
 
 def test_muse_synthetic_trace_regeneration_is_byte_stable():

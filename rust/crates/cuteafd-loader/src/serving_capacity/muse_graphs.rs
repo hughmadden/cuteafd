@@ -102,6 +102,21 @@ mod tests {
     }
 
     #[test]
+    fn measured_max_inventory_is_rank_local_and_does_not_seed_onboarded_layouts() {
+        let list = layout(2, 0).expect("measured 2 RTX/onboard 0 inventory");
+        assert_eq!(list.entries.len(), 53);
+        assert!(list.entries.iter().all(|entry| !entry.pin));
+        assert_eq!(list.reserve_base_bytes, [1_287_651_328, 1_302_331_392]);
+        for rank in 0..2 {
+            let sum = list.entries.iter().map(|entry| entry.capture_bytes[rank]).sum::<u64>();
+            assert_eq!(sum.next_multiple_of(2 << 20), list.reserve_base_bytes[rank]);
+        }
+        assert_eq!(selected(list, &list.reserve_base_bytes).len(), list.entries.len());
+        assert!(list.entries.iter().any(|entry| entry.rows == 1));
+        assert!(layout(2, 2).is_none());
+    }
+
+    #[test]
     fn smaller_base_fits_pins_as_a_set_then_a_heat_ordered_prefix() {
         let list = Layout { ranks: 1, onboard_layers: 2, provenance: "fixture".into(),
             reserve_base_bytes: vec![8 << 20], reserve_extra_bytes: vec![2 << 20],

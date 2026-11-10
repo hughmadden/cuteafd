@@ -24,7 +24,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 0)] pub device: i32,
     #[arg(long)] pub split_device: Option<i32>,
     /// Bounded decode/verify graph replay; prefill and diagnostics stay eager.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub decode_graphs: bool,
     /// Spark expert ranks: every expert's intermediate is sliced across them (TP),
     /// each replying per-expert partials the coordinator combines.
@@ -767,8 +767,8 @@ mod tests {
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
-        assert!(!defaults.decode_graphs);
-        assert!(args(&["--peers", PEERS, "--decode-graphs", "true"])?.decode_graphs);
+        assert!(defaults.decode_graphs);
+        assert!(!args(&["--peers", PEERS, "--decode-graphs", "false"])?.decode_graphs);
         assert_eq!(defaults.vision, cuteafd_loader::plan::MediaMode::Auto);
         assert_eq!(defaults.audio, cuteafd_loader::plan::MediaMode::Auto);
         assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());
