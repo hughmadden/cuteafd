@@ -1854,7 +1854,7 @@ def main():
         if layout not in STEP5_LAYOUTS:
             parser.error("Step-5 requires its exact --layout")
     elif layout is not None and args.family not in ("deepseek_v4", "kimi_k3"):
-        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41 kimi_k3 and step5 only")
+        parser.error("--layout applies to glm5, mistral_large4, deepseek_v4, deepseek_v41, kimi_k3 and step5 only")
     if (args.output is None) == (args.merge is None):
         parser.error("exactly one of --output or --merge is required")
     try:
