@@ -2123,14 +2123,16 @@ def test_capture_ticket_native_failures_always_report_backoff():
     families = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families"
     checked = 0
     for path in (families / "deepseek_v41").rglob("*.rs"):
-        source = re.split(r"#\[cfg\(test\)\]\s*mod ", path.read_text(), maxsplit=1)[0]
+        # Test modules may precede production impls (notably the router).
+        source = re.sub(r"^#\[cfg\(test\)\]\s*mod \w+\s*\{.*?^\}", "",
+                        path.read_text(), flags=re.MULTILINE | re.DOTALL)
         if ".cache_ticket(" not in source and path.name != "dual.rs":
             continue
         for native in re.finditer(r"\.cuda_graph_(?:begin_capture|end_capture_topology)\(", source):
             prefix = source[max(0, native.start() - 180):native.start()]
             assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
             checked += 1
-    assert checked >= 52, "the V4.1 capture inventory must not disappear"
+    assert checked >= 54, "the V4.1 capture inventory must not disappear"
     for family, file, api in [
         ("qwen4", "engine.rs", "cache_ticket_failed"),
         ("qwen3_5", "graphs.rs", "cache_ticket_failed"),
