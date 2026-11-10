@@ -145,6 +145,7 @@ def _recorded_dirs(
         HARNESS._write_stub(shims / name, body)
 
     env = dict(os.environ)
+    env["CUTEAFD_EXPORT_IMAGE_ID"] = "sha256:" + "0" * 64
     env["PATH"] = f"{shims}:{env['PATH']}"
     env.pop("CARGO_TARGET_DIR", None)
     env.pop("CUTEAFD_RELEASE_SPARK_TP_ROLES", None)
@@ -206,6 +207,7 @@ def test_a_requested_root_the_container_cannot_write_reports_the_cause(tmp_path)
     for name, body in _recording_shims(log, tmp_path / "guard.jsonl").items():
         HARNESS._write_stub(shims / name, body)
     env = dict(os.environ)
+    env["CUTEAFD_EXPORT_IMAGE_ID"] = "sha256:" + "0" * 64
     env["PATH"] = f"{shims}:{env['PATH']}"
     env["CUTEAFD_RELEASE_BUILD_ROOT"] = str(missing)
     result = subprocess.run(
