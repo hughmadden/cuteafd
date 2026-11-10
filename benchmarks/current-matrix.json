@@ -14,7 +14,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-2rtx-6spark-v41-flash-max"
+        "report": "benchmarks/deepseek_v41/2026-11-10-smoke-deepseek-v4-1-flash-1017-2rtx-6spark-v41-flash-max"
       }
     },
     {
