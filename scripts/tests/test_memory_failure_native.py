@@ -238,7 +238,8 @@ int main() {
       assert(status == CUTEAFD_STATUS_OK);
       cudaGraphDestroy(info.graph); cudaGraphExecDestroy(info.graph_exec); cudaGetLastError();
     } else {
-      assert(status == CUTEAFD_STATUS_INTERNAL_ERROR && exec == nullptr && info.graph == nullptr);
+      const auto expected = failure == 3 ? CUTEAFD_STATUS_ALLOCATION_FAILED : CUTEAFD_STATUS_INTERNAL_ERROR;
+      assert(status == expected && exec == nullptr && info.graph == nullptr);
     }
     assert(!active && live_graphs == 0 && live_execs == 0 && peer_wait_abortable() == 0);
   }

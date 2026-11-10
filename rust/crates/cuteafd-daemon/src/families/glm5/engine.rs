@@ -2342,8 +2342,9 @@ impl<'a> GlmEngine<'a> {
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                graphs.borrow_mut().cache_cancel(ticket);
-                tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                    tracing::warn!(%error, rank, ?key, "graph instantiation unavailable; running eagerly");
+                }
                 return segment();
             }
         };
