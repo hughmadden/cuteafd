@@ -105,7 +105,7 @@ concurrency point is that limit.
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/deepseek_v4.md"><b>DeepSeek V4</b></a><br><sub>deepseek-ai/DeepSeek-V4-Flash-0731</sub><br><sub>mxfp4-g32</sub></td>
-<td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090/card.svg"><img src="benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4-Flash-0731 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark"></a><br><sub>simulated 5090 + 2× Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-11-10-smoke-deepseek-v4-flash-0731-1rtx-4spark-v4-flash-5090/card.svg"><img src="benchmarks/deepseek_v4/2026-11-10-smoke-deepseek-v4-flash-0731-1rtx-4spark-v4-flash-5090/card.svg" alt="deepseek-ai/DeepSeek-V4-Flash-0731 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark"></a><br><sub>simulated 5090 + 4× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/deepseek_v4/2026-11-10-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/card.svg"><img src="benchmarks/deepseek_v4/2026-11-10-smoke-deepseek-v4-flash-0731-1rtx-2spark-v4-flash-min/card.svg" alt="deepseek-ai/DeepSeek-V4-Flash-0731 on 1× RTX PRO 6000 @ gpu-powerd 455 W (450–550) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top">n/a<br><sub>—</sub></td>
 </tr>
