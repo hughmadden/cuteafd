@@ -921,7 +921,8 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g))]
     for rows in sorted({decode_rows, prefill_rows}):
         decode = rows == decode_rows
-        params = {"max_rows": rows, "output_kind": "norm", "decode": decode}
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode,
+                  "bf16_wide": not decode}
         out.append((f"kda_m{rows}", "kda", params,
                     lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
     for heads in (48, 96):
@@ -1037,13 +1038,13 @@ def kimi_latent_programs():
 
     def projection(width, outputs):
         from b12x.integration.cuteafd import pointwise
-        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs)
+        return pointwise.compile_bf16_projection_aot(width=width, outputs=outputs, wide=True)
 
     return [(f"rmsnorm_h{width}", "rmsnorm", {"hidden": width},
              lambda w=width: norm(w)) for width in (3584, 7168)] + [
-        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584},
+        ("latent_down", "bf16_projection", {"width": 7168, "outputs": 3584, "wide": True},
          lambda: projection(7168, 3584)),
-        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168},
+        ("latent_up", "bf16_projection", {"width": 3584, "outputs": 7168, "wide": True},
          lambda: projection(3584, 7168)),
     ]
 
@@ -1078,6 +1079,9 @@ def kimi_w8_programs():
                     lambda w=width: build_situ(w)))
         for op, params in (("gate_up", {"width": 7168, "outputs": 2 * width}),
                            ("down", {"width": width, "outputs": 7168})):
+            # The wide route's floors were measured on these Kimi BF16 shapes only.
+            if (params["outputs"], params["width"]) in ((6144, 7168), (7168, 3072), (7168, 6144)):
+                params = {**params, "wide": True}
             out.append((f"ffn_{op}_i{width}", "bf16_projection", params,
                         lambda kw=params: build_projection(kw)))
         # Speed-first default; compensation is for informational F32 comparisons.
