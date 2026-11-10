@@ -154,6 +154,9 @@ def test_unrecordable_exports_are_never_stored(tree, tmp_path, mode, reason):
     foreign = tmp_path / "foreign.txt"
     foreign.write_text("outside every root")
     event, detail = run(tree, env={"FOREIGN": str(foreign)}, mode=mode)
+    # pytest's scratch may be on NVMe rather than beneath the system temp root.
+    if mode == "foreign" and "read-temporary:" not in detail:
+        reason = "read:"
     assert event == "uncacheable" and reason in detail, detail
     assert run(tree, env={"FOREIGN": str(foreign)}, mode=mode)[0] == "uncacheable"
 
@@ -232,9 +235,9 @@ def test_known_compilers_and_shells_with_unknown_programs_fail_closed(tree):
 
 def test_without_a_store_or_image_the_command_just_runs(tree):
     _, build = tree
-    assert run(tree, env={"CUTEAFD_EXPORT_CACHE": "off"})[0] == "none"
+    assert run(tree, env={"CUTEAFD_EXPORT_CACHE": "off"})[0] == "bypassed"
     assert (build / "out/kernel.o").read_text() == "3"
-    assert run(tree, env={"CUTEAFD_EXPORT_IMAGE_ID": ""})[0] == "none"
+    assert run(tree, env={"CUTEAFD_EXPORT_IMAGE_ID": ""})[0] == "bypassed"
 
 
 def test_required_hit_fails_before_the_exporter_starts(tree):
@@ -304,3 +307,41 @@ def test_launcher_variables_stay_out_of_the_republish_identity(monkeypatch):
                  "CUTEAFD_EXPORT_CACHE_STATS", "CUTEAFD_EXPORT_CACHE_SOURCE_ROOT", "CUTEAFD_EXPORT_CACHE_TRACE"):
         monkeypatch.setenv(name, "/run/" + name)
     assert records.export_environment() == before
+
+
+@pytest.mark.parametrize("image", ["", "mutable-tag"])
+def test_missing_image_warns_and_records_bypass(tree, image):
+    assert run(tree, env={"CUTEAFD_EXPORT_IMAGE_ID": image})[0] == "bypassed"
+    _, build = tree
+    events = [json.loads(line) for line in (build.parent / "stats.jsonl").read_text().splitlines()]
+    assert events == [{"event": "bypassed", "layer": "invocation",
+                       "reason": "missing or invalid CUTEAFD_EXPORT_IMAGE_ID"}]
+    assert (build / "out/kernel.o").read_text() == "3"
+
+
+def test_bypass_warning_and_summary(tmp_path):
+    stats = tmp_path / "stats.jsonl"
+    result = subprocess.run([sys.executable, str(LAUNCHER), "run", "--build-dir", str(tmp_path),
+                             "--", sys.executable, "-c", "print('ran')"],
+                            env={**os.environ, "CUTEAFD_EXPORT_CACHE": str(tmp_path / "store"),
+                                 "CUTEAFD_EXPORT_IMAGE_ID": "", "CUTEAFD_EXPORT_CACHE_STATS": str(stats)},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert "WARNING: AOT EXPORT CACHE BYPASSED" in result.stderr
+    assert "ran" in result.stdout
+    summary = subprocess.run([sys.executable, str(LAUNCHER), "stats", str(stats)],
+                             capture_output=True, text=True, check=True, timeout=10)
+    assert "invocation\tbypassed\t1\t" in summary.stdout
+    assert "invocation\thit\t0\t" in summary.stdout
+    assert "invocation\tmiss\t0\t" in summary.stdout
+
+
+def test_summary_counts_program_hits_and_misses_not_summary_events(tmp_path):
+    stats = tmp_path / "stats.jsonl"
+    stats.write_text(json.dumps({"event": "programs", "layer": "program", "hits": 63,
+                                 "misses": 1447, "uncacheable": 0, "unidentified": 0}) + "\n")
+    result = subprocess.run([sys.executable, str(LAUNCHER), "stats", str(stats)],
+                            capture_output=True, text=True, check=True, timeout=10)
+    assert "program\thit\t63\t" in result.stdout
+    assert "program\tmiss\t1447\t" in result.stdout
+    assert "program\tprograms" not in result.stdout

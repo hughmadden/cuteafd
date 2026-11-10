@@ -20,6 +20,11 @@ cuteafd_build_cache_docker_args() {
     --toolchain "$tc_hash" --mode "$mode" --arch "${5:-$(uname -m)}"
 }
 
+# The caller supplies the immutable ID admitted on the host that runs the export.
+cuteafd_export_cache_docker_args() {
+  printf '%s\n' -e "CUTEAFD_EXPORT_IMAGE_ID=$1" -e "CUTEAFD_EXPORT_CACHE_STATS=$2"
+}
+
 # Cargo's offline resolution is probed without changing the caller's --locked policy.
 # A first build may populate missing crates; a complete cache never refreshes the index.
 cuteafd_build_cache_cargo_offline() {

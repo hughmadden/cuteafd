@@ -173,6 +173,12 @@ def test_dry_run_prints_registry_plan_without_docker_or_ssh(tmp_path):
     assert result.returncode == 0, result.stderr
     assert f'pull {MOD.REGISTRY}:tc-{MOD._toolchain.identity(ROOT)}-arm64 on ostrich' in result.stdout
     assert not (tmp_path/'calls').exists()
+    default = subprocess.check_output(['python3', str(ROOT/'scripts/build/release-scope.py'),
+                                       'default-matrix'], text=True).strip()
+    assert f'release matrix: {ROOT/default}' in result.stdout
+    assert 'CUTEAFD_EXPORT_IMAGE_ID=${COORDINATOR_DOCKER_DEV}' in result.stdout
+    assert 'CUTEAFD_EXPORT_IMAGE_ID=${dev_image}' in result.stdout
+    assert result.stdout.count('CUTEAFD_EXPORT_CACHE_STATS=/output/EXPORT_CACHE_STATS.jsonl') == 2
 
 
 @pytest.mark.parametrize('mode', ['registry', 'build'])
@@ -256,3 +262,71 @@ def test_wip_cancel_stops_remote_session_that_survives_ssh_client(tmp_path):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+
+
+@pytest.mark.parametrize('role,image_variable', [('coordinator', 'COORDINATOR_DOCKER_DEV'),
+                                               ('expert', 'dev_image')])
+def test_release_container_uses_admitted_image_for_cache(tmp_path, role, image_variable):
+    text = (ROOT/'build.sh').read_text()
+    command = text.split(f'/source/scripts/build/build-release-artifacts.sh /source {role}', 1)[0]
+    command = command[command.rfind('mapfile -t export_cache_args'):]
+    assert f'cuteafd_export_cache_docker_args "${image_variable}" /output/EXPORT_CACHE_STATS.jsonl' in command
+    assert '"${export_cache_args[@]}"' in command
+    assert f'"${image_variable}"' in command.split('docker run', 1)[1]
+    result = subprocess.run(['bash', '-c', f'source "{ROOT}/scripts/build/build-caches.sh"; '
+                             'cuteafd_export_cache_docker_args "$1" /output/EXPORT_CACHE_STATS.jsonl',
+                             'test', IMAGE], capture_output=True, text=True, check=True, timeout=10)
+    assert result.stdout.splitlines() == ['-e', f'CUTEAFD_EXPORT_IMAGE_ID={IMAGE}',
+                                          '-e', 'CUTEAFD_EXPORT_CACHE_STATS=/output/EXPORT_CACHE_STATS.jsonl']
+
+
+def test_release_artifacts_refuse_missing_image_before_compilation(tmp_path):
+    output = tmp_path/'output'
+    result = subprocess.run(['bash', str(ROOT/'scripts/build/build-release-artifacts.sh'),
+                             str(ROOT), 'coordinator', '120', str(output)],
+                            env={**os.environ, 'CUTEAFD_EXPORT_IMAGE_ID': '', 'CUTEAFD_EXPORT_CACHE': str(tmp_path/'store'),
+                                 'CUTEAFD_EXPORT_CACHE_STATS': str(output/'EXPORT_CACHE_STATS.jsonl')},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 2
+    assert 'requires the admitted compiler image ID' in result.stderr
+    assert json.loads((output/'EXPORT_CACHE_STATS.jsonl').read_text())['event'] == 'bypassed'
+
+
+def test_release_cache_receipts_survive_staging_and_are_checksummed():
+    text = (ROOT/'build.sh').read_text()
+    assert '"$artifact_dir/EXPORT_CACHE_STATS.jsonl" "$repo_root/dist/EXPORT_CACHE_STATS.coordinator.jsonl"' in text
+    assert '$seed_host:$remote_dir/.cuteafd-release-image/EXPORT_CACHE_STATS.jsonl' in text
+    for leg in ('coordinator', 'spark'):
+        assert f'dist_source_manifest+=(EXPORT_CACHE_STATS.{leg}.jsonl)' in text
+    assert 'stats "$repo_root/dist/EXPORT_CACHE_STATS.$leg.jsonl"' in text
+
+
+@pytest.mark.parametrize('store', ['', 'off'])
+def test_release_cache_disabled_does_not_require_image(tmp_path, store):
+    text = (ROOT/'scripts/build/build-release-artifacts.sh').read_text()
+    admission = text[text.index('mkdir -p "$output_dir"'):text.index('# Where the writable build root')]
+    output = tmp_path/'output'
+    result = subprocess.run(['bash', '-euc', 'output_dir="$1"; ' + admission, 'test', str(output)],
+                            env={**os.environ, 'CUTEAFD_EXPORT_CACHE': store, 'CUTEAFD_EXPORT_IMAGE_ID': '',
+                                 'CUTEAFD_EXPORT_CACHE_STATS': str(output/'EXPORT_CACHE_STATS.jsonl')},
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((output/'EXPORT_CACHE_STATS.jsonl').read_text())['reason'] == 'cache disabled'
+
+
+def test_missing_release_cache_receipts_warn_without_failing(tmp_path):
+    text = (ROOT/'build.sh').read_text()
+    collection = text[text.index('# Receipts are informational:'):text.index('if [[ -n "$source_manifest" ]]; then',
+                                                                          text.index('# Receipts are informational:'))]
+    (tmp_path/'dist').mkdir()
+    for leg in ('coordinator', 'spark'):
+        (tmp_path/f'dist/EXPORT_CACHE_STATS.{leg}.jsonl').write_text('stale')
+    result = subprocess.run(['bash', '-euc', 'repo_root="$1"; artifact_dir="$1/missing"; '
+                             'seed_host=seed; remote_dir=/missing; dist_source_manifest=(); '
+                             'release_sync() { return 1; }; ' + collection +
+                             '\n[[ ${#dist_source_manifest[@]} == 0 ]]', 'test', str(tmp_path)],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'WARNING: coordinator export cache receipt unavailable' in result.stderr
+    assert 'WARNING: Spark export cache receipt unavailable' in result.stderr
+    assert not list((tmp_path/'dist').iterdir())

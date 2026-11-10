@@ -11,6 +11,16 @@ source_dir="$(realpath "$1")"
 role="$2"
 cuda_arch="$3"
 output_dir="$(realpath -m "$4")"
+mkdir -p "$output_dir"
+export CUTEAFD_EXPORT_CACHE_STATS="${CUTEAFD_EXPORT_CACHE_STATS:-$output_dir/EXPORT_CACHE_STATS.jsonl}"
+: >"$CUTEAFD_EXPORT_CACHE_STATS"
+if [[ -z "${CUTEAFD_EXPORT_CACHE:-}" || "$CUTEAFD_EXPORT_CACHE" == off ]]; then
+  printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"cache disabled"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
+elif [[ "${CUTEAFD_EXPORT_IMAGE_ID:-}" != sha256:* ]]; then
+  printf '%s\n' '{"event":"bypassed","layer":"invocation","reason":"missing or invalid CUTEAFD_EXPORT_IMAGE_ID"}' >>"$CUTEAFD_EXPORT_CACHE_STATS"
+  echo "release export cache requires the admitted compiler image ID (CUTEAFD_EXPORT_IMAGE_ID)" >&2
+  exit 2
+fi
 # Where the writable build root is created. Unset keeps the historical in-container
 # /tmp scratch; build.sh relocates it to a unique per-task path on the host, mounted
 # at the identical path in the container, so a release build never depends on how
@@ -445,3 +455,4 @@ test -s "$output_dir/SPARKINFER_SHA256SUMS"
 test -s "$output_dir/XGRAMMAR_PROVENANCE.json"
 test -s "$output_dir/XGRAMMAR_LICENSE"
 test -s "$output_dir/XGRAMMAR_SHA256SUMS"
+python3 "$source_dir/scripts/build/export-cache.py" stats "$CUTEAFD_EXPORT_CACHE_STATS"

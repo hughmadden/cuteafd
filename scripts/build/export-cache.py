@@ -106,6 +106,11 @@ def run(args) -> int:
     store = cache.store_from_environment()
     toolchain = cache.toolchain_identity() if store else None
     if store is None or toolchain is None:
+        reason = "cache disabled" if store is None else "missing or invalid CUTEAFD_EXPORT_IMAGE_ID"
+        cache.stats("bypassed", layer="invocation", reason=reason)
+        if store is not None:
+            print(f"WARNING: AOT EXPORT CACHE BYPASSED: {reason}; mounted store will not be used",
+                  file=sys.stderr, flush=True)
         os.execvp(command[0], command)
     roots = cache.Roots(ROOT, Path(args.build_dir))
     identity = {"schema": cache.SCHEMA, "layer": "invocation", "toolchain": toolchain,
@@ -204,11 +209,18 @@ def restore(store, entry, roots: cache.Roots) -> bool:
 
 def summarise(path: Path) -> int:
     events = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    rows = {}
+    rows = {("invocation", kind): (0, 0.0) for kind in ("hit", "miss", "bypassed")}
     for event in events:
-        key = (event.get("layer"), event["event"])
-        count, seconds = rows.get(key, (0, 0.0))
-        rows[key] = (count + 1, seconds + float(event.get("seconds", 0)))
+        if event["event"] == "programs":
+            for field, kind in (("hits", "hit"), ("misses", "miss"),
+                                ("uncacheable", "uncacheable"), ("unidentified", "unidentified")):
+                key = ("program", kind)
+                count, seconds = rows.get(key, (0, 0.0))
+                rows[key] = (count + int(event.get(field, 0)), seconds)
+        else:
+            key = (event.get("layer"), event["event"])
+            count, seconds = rows.get(key, (0, 0.0))
+            rows[key] = (count + 1, seconds + float(event.get("seconds", 0)))
     for (layer, kind), (count, seconds) in sorted(rows.items()):
         print(f"{layer}\t{kind}\t{count}\t{seconds:.1f}s")
     return 0
