@@ -335,10 +335,22 @@ pub fn one_row(family: &str, checkpoint: &str, cells: [Cell; 3]) -> Matrix {
 /// A re-render that fails is the publisher's error, not a run without that
 /// export: publishing stops rather than leave the stale image in place.
 /// The committed copy of a placed `report.json` keeps rendered measurements and
-/// audit summaries, not request payloads, pool snapshots or raw NIC counters.
+/// audit summaries, not request payloads, pool snapshots, expert histograms or
+/// raw NIC counters.
 /// The verdict is set once from the full rows (`slim_placed`); a slimmed report
 /// keeps it (`quality::bar_met`). Run directories retain the full report.
 pub fn slim(report: &mut Value) {
+    fn expert_usage(value: &mut Value) {
+        match value {
+            Value::Array(values) => values.iter_mut().for_each(expert_usage),
+            Value::Object(object) => {
+                object.remove("expert_usage");
+                object.remove("expert_usage_scope");
+                object.values_mut().for_each(expert_usage);
+            }
+            _ => {}
+        }
+    }
     fn fabric(phase: &mut Value) {
         if let Some(ports) = phase.get_mut("ports").and_then(Value::as_array_mut) {
             for port in ports {
@@ -356,7 +368,7 @@ pub fn slim(report: &mut Value) {
             Value::Object(object) => {
                 for key in ["requests", "warm_requests", "cold_response", "completed_response",
                     "retained_prewarm", "attempted_assistant", "assistant_replay",
-                    "pool_before", "pool_samples", "pool_after"] {
+                    "pool_before", "pool_samples", "pool_after", "expert_usage", "expert_usage_scope"] {
                     object.remove(key);
                 }
                 if let Some(phase) = object.get_mut("fabric") {
@@ -392,6 +404,10 @@ pub fn slim(report: &mut Value) {
                 }
             }
         }
+    }
+    if let Some(baseline) = report.get_mut("baseline") {
+        // Baseline measurements are retained, but not nested sweep histograms.
+        expert_usage(baseline);
     }
     if let Some(baseline) = report.get_mut("baseline").and_then(Value::as_object_mut) {
         baseline.remove("fabric");
@@ -1875,15 +1891,17 @@ mod tests {
         let mut slimmed = full;
         slim(&mut slimmed);
         let after: Report = serde_json::from_value(slimmed.clone()).unwrap();
-        let placed = |report| vec![Placed { dir: PathBuf::from("benchmarks/deepseek_v41/rc1"), report }];
+        let family = before.server.family.as_deref().unwrap_or("unknown");
+        let placed = |report| vec![Placed { dir: PathBuf::from(format!("benchmarks/{family}/rc1")), report }];
         let full = placed(before.clone());
         let slimmed_placed = placed(after.clone());
         let matrix = one_row_of(&full[0]);
         assert_eq!(results(&full, &matrix).unwrap(), results(&slimmed_placed, &matrix).unwrap());
         assert_eq!(index(&full), index(&slimmed_placed));
         let published = BTreeSet::from([full[0].dir.clone()]);
-        assert_eq!(family_cards(&select(&full, &matrix).unwrap(), &published, "deepseek_v41"),
-            family_cards(&select(&slimmed_placed, &matrix).unwrap(), &published, "deepseek_v41"));
+        let full_family = family_cards(&select(&full, &matrix).unwrap(), &published, family);
+        assert!(!full_family.is_empty(), "oracle must compare the report's family cards");
+        assert_eq!(full_family, family_cards(&select(&slimmed_placed, &matrix).unwrap(), &published, family));
         let mut exports = vec!["card.svg".to_string(), "report.svg".to_string()];
         exports.extend(crate::render::report::shown(&before).iter().map(|id| format!("panel-{id}.svg")));
         for name in exports {
@@ -1941,11 +1959,13 @@ mod tests {
             "pool_before": {}, "pool_samples": [{}], "pool_after": {},
             "aggregate_tok_s": 123.0, "thermal": {"seconds": 10},
             "cache_exact": {"status": "pass"}, "expert_usage": {"rows": [1]},
+            "expert_usage_scope": "whole panel pass",
             "mapped_tables": {"bytes": 12},
             "fabric": {"ports": [{"counters": {"port_xmit_data": 99}, "sent_bytes": 99,
                 "peers": [{"peer": "spark", "sent_bytes": 90}], "health": {"verdict": "ok"}}]}
         });
         report["fabric"][0]["ports"] = scratch["fabric"]["ports"].clone();
+        report["baseline"]["card"] = serde_json::json!({"points": [scratch.clone()]});
         report["panels"] = serde_json::json!([
             {"id": "shared_prefix", "passes": [{"points": [scratch.clone()],
                 "retained": {"points": [scratch.clone()]}}], "partial": scratch.clone(), "history": [scratch.clone()]},
@@ -1956,7 +1976,8 @@ mod tests {
         super::slim(&mut report);
         let mut expected = scratch;
         for key in ["requests", "warm_requests", "cold_response", "completed_response", "retained_prewarm",
-            "attempted_assistant", "assistant_replay", "pool_before", "pool_samples", "pool_after"] {
+            "attempted_assistant", "assistant_replay", "pool_before", "pool_samples", "pool_after",
+            "expert_usage", "expert_usage_scope"] {
             expected.as_object_mut().unwrap().remove(key);
         }
         expected["fabric"]["ports"][0]["counters"] = serde_json::json!({});
@@ -1965,6 +1986,11 @@ mod tests {
             assert_eq!(report.pointer(path).unwrap(), &expected, "{path}");
         }
         assert_eq!(report["fabric"][0]["ports"], expected["fabric"]["ports"]);
+        let baseline_point = &report["baseline"]["card"]["points"][0];
+        assert!(baseline_point.get("expert_usage").is_none());
+        assert!(baseline_point.get("expert_usage_scope").is_none());
+        assert_eq!(baseline_point["aggregate_tok_s"], 123.0);
+        assert_eq!(baseline_point["thermal"], expected["thermal"]);
         assert_eq!(report["panels"][1]["passes"][0], serde_json::json!({"thermal": {"seconds": 10}}));
         assert_eq!(report["panels"][2]["passes"][0], serde_json::json!({"readiness_s": 5}));
         let before = report.clone();
