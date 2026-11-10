@@ -1297,7 +1297,7 @@ impl<'a> ProductionInput<'a> {
                 .ok_or_else(|| invalid("context sample exceeds physical capacity"))?;
             if bytes > 0 {
                 self.allowances.push(Opaque { location: budget.locations[0], bytes,
-                    basis: Basis::Calibrated, lifetime: Lifetime::RESIDENT,
+                    basis: Basis::Exact, lifetime: Lifetime::RESIDENT,
                     source: crate::placement::sampled_baseline::source(&format!(
                         "V4.1 context and selected modules: {source}")) });
             }

@@ -1316,7 +1316,7 @@ mod admission_tests {
                             && cuteafd_loader::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
                     assert_eq!(owners.len(), 1);
                     assert_eq!(owners[0].bytes, occupied[gpu]);
-                    assert_eq!(admission::runtime_base_components(facts, gpu as u8).total(), occupied[gpu]);
+                    assert_eq!(families::deepseek_v41::admission::runtime_base_components(facts, gpu as u8).total(), occupied[gpu]);
                 }
                 Ok(())
             })?;

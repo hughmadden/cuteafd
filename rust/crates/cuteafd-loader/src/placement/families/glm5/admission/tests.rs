@@ -2273,7 +2273,7 @@ fn expert_usage_recipe_is_canonical_fixed_and_off_or_skip_has_no_owners() {
 #[test]
 fn sampled_preweight_replaces_census_context_once_and_preserves_capacity() {
     use cuteafd_core::memory_policy::MemoryPolicy;
-    let cfg = cfg();
+    for cfg in [cfg(), GlmDsaConfig::from_hf(&crate::plan::testing::mistral_large4_config()).unwrap()] {
     let samples = [682_885_120, 691_273_728];
     for gpus in [1, 2] {
         for reserve in [None, Some(0), Some(200 << 20)] {
@@ -2319,6 +2319,7 @@ fn sampled_preweight_replaces_census_context_once_and_preserves_capacity() {
         let offline = make_offline_figures(gpus);
         assert_eq!(offline, if gpus == 1 { vec![GLM_MIN_CONTEXT.bytes] }
             else { GLM_MAX_CONTEXT.iter().map(|figure| figure.bytes).collect() });
+    }
     }
     fn make_offline_figures(gpus: usize) -> Vec<u64> {
         let figures = DeviceFigures::new(gpus, true, false).unwrap();
