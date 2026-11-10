@@ -1928,7 +1928,7 @@ mod observer_tests {
     fn oom_backoff_uses_settled_level_refresh_without_resampling_suppressed_misses() {
         let device = -99118;
         let total = 64 << 20;
-        let cache = device_cache_sampled(device, 16 << 20, Basis::Bytes,
+        let cache = device_cache_sampled(device, 64 << 20, Basis::Bytes,
             || Ok((total, total, 0, 0, 0))).unwrap();
         pending(&cache);
         observe_device_sampled(device, || Ok((total - (8 << 20), total, 0, 0, 0))).unwrap();
