@@ -220,6 +220,39 @@ def test_glm_inventory_requires_full_static_namespaces(fixture_repo, tmp_path, d
         SCOPE.check_inventory(root, 'coordinator', wanted, symbols=set())
 
 
+@pytest.mark.parametrize('family,world', [
+    (family, world)
+    for family in ('dsv4f', 'dsv4p')
+    for world in SCOPE.spark_packages_module().package_worlds(family, 'mxfp4')
+])
+def test_native_spark_inventory_requires_every_width_artifact(tmp_path, family, world):
+    kind = 'spark' if world == 4 else f'spark_tp{world}'
+    wanted = [dict(name=f'{family}-tp{world}', family='deepseek_v4', programs=[],
+                   experts=[], spark_experts=[f'{family}:{kind}'], spark_count=world,
+                   context_split=False, audio=False)]
+    artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)[world]
+    symbols = {artifact.prefix(family) + 'launch' for artifact in artifacts}
+    SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=symbols)
+    for symbol in symbols:
+        with pytest.raises(ValueError, match=f'missing native expert package.*{symbol}'):
+            SCOPE.check_inventory(tmp_path, 'expert', wanted, symbols=symbols - {symbol})
+
+
+@pytest.mark.parametrize('family', ['dsv4f', 'dsv4p'])
+def test_shipping_native_spark_scopes_pass_the_same_width_inventory(tmp_path, family):
+    wanted = SCOPE.requirements(REPO, REPO / SCOPE.DEFAULT_MATRIX, 'all')
+    selected = []
+    for entry in wanted:
+        scopes = [item for item in entry['spark_experts'] if item.startswith(f'{family}:spark')]
+        if scopes:
+            selected.append({**entry, 'spark_experts': scopes, 'programs': [], 'audio': False})
+    assert selected
+    artifacts = SCOPE.spark_packages_module().native_spark_artifacts(family)
+    symbols = {artifact.prefix(family) + 'launch'
+               for entry in selected for artifact in artifacts[entry['spark_tp']]}
+    SCOPE.check_inventory(tmp_path, 'expert', selected, symbols=symbols)
+
+
 def test_glm_context_program_must_not_be_satisfied_by_neutral_namespace(fixture_repo, tmp_path):
     repo, matrix = fixture_repo
     data = json.loads(matrix.read_text())
