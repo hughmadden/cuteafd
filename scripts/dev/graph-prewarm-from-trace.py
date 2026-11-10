@@ -1941,7 +1941,8 @@ def main():
         for pin in report:
             print("pin " + json.dumps(pin, sort_keys=True))
         return
-    values = result["layouts"].values() if "layouts" in result else result.get("ranks", [result])
+    values = (result["layouts"].values() if "layouts" in result else
+              [result] if args.family == "kimi_k3" else result.get("ranks", [result]))
     for values in values:
         pinned = sum(entry["pin"] for entry in values["entries"])
         if "measured_bytes" in values:

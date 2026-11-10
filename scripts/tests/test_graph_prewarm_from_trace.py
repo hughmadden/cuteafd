@@ -1569,6 +1569,21 @@ def test_kimi_layout_row_keeps_replay_widths_and_skips_prefill():
     assert row["reserve_extra_bytes"] == 2 << 20
 
 
+@pytest.mark.parametrize("core", ["bf16", "k6"])
+def test_kimi_cli_merges_core_key_and_prints_summary(tmp_path, core):
+    import subprocess
+    import sys
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps(kimi_trace()))
+    output = tmp_path / "kimi_prewarm.json"
+    result = subprocess.run([sys.executable, str(SCRIPT), "--family", "kimi_k3",
+        "--variant", core, "--ranks", "1", "--layout", "cli", "--coverage", "1",
+        "--trace", str(trace), "--output", str(output)], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "1 shapes; layout=cli;" in result.stdout
+    assert json.loads(output.read_text())["layouts"][0]["core"] == core
+
+
 def test_kimi_verify_width_is_its_own_pin(tmp_path):
     trace = kimi_trace(rows=4, speculative=True)
     row = MODULE.generate_kimi([trace, kimi_trace(device=1, rows=4, speculative=True)], 2, "kimi-k3-exl3-k6-max", core="k6")
@@ -1857,8 +1872,10 @@ def test_kimi_seeded_grouped_trace_reproduces_checked_in_layouts():
                         hits=hits, cycles=cycles, first_seen_ms=first_seen,
                         capture_bytes=share + (sibling < tail), hit_histogram=histogram))
             traces.append(data)
-        result = MODULE.generate_kimi(traces, layout["ranks"], layout["layout"], coverage=fixture["coverage"], core="k6")
-        expected = next(row for row in checked["layouts"] if row["ranks"] == layout["ranks"])
+        core = layout.get("core", "k6")
+        result = MODULE.generate_kimi(traces, layout["ranks"], layout["layout"], coverage=fixture["coverage"], core=core)
+        expected = next(row for row in checked["layouts"]
+                        if row["core"] == core and row["ranks"] == layout["ranks"])
         assert result == expected
         for rank in range(layout["ranks"]):
             assert MODULE.packed(sum(entry["capture_bytes"][rank] or 0
@@ -1869,7 +1886,7 @@ def test_kimi_seeded_grouped_trace_reproduces_checked_in_layouts():
 def test_kimi_cleaned_fixture_prewarms_replayed_late_widths_without_pinning():
     checked = json.loads((SCRIPT.parents[2] /
         "rust/crates/cuteafd-loader/src/serving_capacity/kimi_prewarm.json").read_text())
-    minimum, maximum = checked["layouts"]
+    minimum, maximum = [row for row in checked["layouts"] if row["core"] == "k6"]
     entries = {(entry["rows"], entry["op"], entry["speculative"]): entry
                for entry in minimum["entries"]}
     for rows, op in [(50, "attention"), (56, "attention"),

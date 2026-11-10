@@ -831,13 +831,13 @@ impl<'a> LocalLane<'a> {
         self.kda.zero_startup_state()
     }
 
-    /// Attach this lane to its device's bounded cache and prewarm the pinned
-    /// geometry. Returns how many executables were captured; a refusal only
-    /// leaves that geometry lazy.
     pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
         self.programs.graph_core()
     }
 
+    /// Attach this lane to its device's bounded cache and prewarm the pinned
+    /// geometry. Returns how many executables were captured; a refusal only
+    /// leaves that geometry lazy.
     pub(crate) fn warm_graphs(&mut self, keys: &[super::graphs::Key], rank: usize,
         reserve: u64) -> Result<usize> {
         self.check_startup_keys(keys, rank)?;

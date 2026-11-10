@@ -682,6 +682,10 @@ mod tests {
             let inventory = Checkpoint::inventory_view(&view)?;
             let eager = CoreInventory::from_checkpoint(&cfg, &inventory, &expected)?;
             assert!(!eager.projections.is_empty());
+            use crate::serving_capacity::kimi_prewarm::KimiCoreFormat;
+            assert_eq!(KimiCoreFormat::from_inventory(&core), KimiCoreFormat::K6,
+                "attention view retains the checkpoint's parent graph inventory key");
+            assert_eq!(KimiCoreFormat::from_inventory(&eager), KimiCoreFormat::K6);
             assert_eq!(eager.projections.keys().collect::<Vec<_>>(), core.projections.keys().collect::<Vec<_>>());
             assert_eq!(eager.native, core.native);
             for role in [crate::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false },
