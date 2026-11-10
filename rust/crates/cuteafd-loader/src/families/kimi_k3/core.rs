@@ -315,9 +315,10 @@ pub fn projection_scratch_for_ranks(cfg: &KimiK3Config, core: &CoreInventory, ro
                 crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
             };
             let matching = policies.iter().filter(|p| p["input_features"] == k && p["output_features"] == n
-                && p["sharded_side"] == side && p["codebook"] == book).collect::<Vec<_>>();
-            ensure!(matching.len() == 1, "{}: expected one K6 row policy for K{k}/N{n}/side{side}/{book}, found {}",
-                projection.stem, matching.len());
+                && p["sharded_side"] == side && p["codebook"] == book
+                && p.get("bits").and_then(serde_json::Value::as_u64).unwrap_or(6) == projection.bits as u64).collect::<Vec<_>>();
+            ensure!(matching.len() == 1, "{}: expected one K{} row policy for K{k}/N{n}/side{side}/{book}, found {}",
+                projection.stem, projection.bits, matching.len());
             let policy = matching[0];
             let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
             if let Some(grouped) = policy.get("grouped") {
@@ -355,8 +356,9 @@ pub fn draft_head_scratch(core: &CoreInventory, rows: usize, metadata: &serde_js
     };
     let policies = metadata["row_policies"].as_array().context("Kimi K6 row-policy list")?;
     let matching = policies.iter().filter(|p| p["input_features"] == k && p["output_features"] == n
-        && p["sharded_side"] == 1 && p["codebook"] == book).collect::<Vec<_>>();
-    ensure!(matching.len() == 1, "lm_head: expected one K6 row policy for K{k}/N{n}/{book}, found {}", matching.len());
+        && p["sharded_side"] == 1 && p["codebook"] == book
+        && p.get("bits").and_then(serde_json::Value::as_u64).unwrap_or(6) == head.bits as u64).collect::<Vec<_>>();
+    ensure!(matching.len() == 1, "lm_head: expected one K{} row policy for K{k}/N{n}/{book}, found {}", head.bits, matching.len());
     Ok(Some(ProjectionScratchLayout::new(k, n, rows)?))
 }
 
@@ -385,7 +387,7 @@ impl CoreInventory {
             |name| !name.contains(".experts.")
                 && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head.")),
             |stem| split(stem).map(|split| crate::formats::trellis_core::CoreContract {
-                split, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                family: "Kimi", widths: &[4, 6, 8], split, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
                     && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
                         shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
             }))?;

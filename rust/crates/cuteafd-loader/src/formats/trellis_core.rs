@@ -178,8 +178,19 @@ impl ProjectionScratchLayout {
 
 /// A family's explicit geometry and TP split, never inferred from a side map.
 pub struct CoreContract {
+    pub family: &'static str,
+    pub widths: &'static [usize],
     pub split: CoreSplit,
     pub padded_outputs: bool,
+}
+
+impl CoreContract {
+    pub fn validate_width(&self, stem: &str, bits: usize) -> Result<()> {
+        ensure!(self.widths.contains(&bits),
+            "{} {stem}: unsupported dense core width K{bits}; shipping widths {:?}; add a native trellis_linear exporter program and family dispatch before loading this width",
+            self.family, self.widths);
+        validate_core_width(stem, bits)
+    }
 }
 
 /// Dense core rates are independent of the routed-expert kernel inventory.
@@ -228,7 +239,7 @@ pub fn read_projections(
         ensure!(shape.len() == 2, "{stem}: core projection must be a matrix");
         let suffixes = members.keys().map(String::as_str).collect::<Vec<_>>();
         let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|t| &t.meta))?;
-        validate_core_width(&stem, module.bits)?;
+        contract.validate_width(&stem, module.bits)?;
         let padded = contract.padded_outputs && module.output_features == shape[0].next_multiple_of(128);
         ensure!(module.input_features == shape[1] && (module.output_features == shape[0] || padded),
             "{stem}: core header shape [{},{}], expected {shape:?} (only explicit N128 padding is allowed)",
@@ -292,6 +303,20 @@ mod tests {
                 let error = validate_core_width("model.projection", bits).unwrap_err().to_string();
                 assert!(error.contains(&format!("unsupported dense core width K{bits}")), "{error}");
                 assert!(error.contains("model.projection") && error.contains("trellis_linear") && error.contains("export_b12x_dense_trellis_k6_aot.py"), "{error}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn family_shipping_contracts_refuse_nonshipping_widths() -> Result<()> {
+        for family in ["GLM 5.3", "GLM Flash", "Muse", "Mistral Large 4", "Step-5"] {
+            let contract = CoreContract { family, widths: &[6], split: CoreSplit::Whole, padded_outputs: false };
+            contract.validate_width("model.q_proj", 6)?;
+            for bits in [4, 5, 8] {
+                let error = contract.validate_width("model.q_proj", bits).unwrap_err().to_string();
+                assert!(error.contains(family) && error.contains(&format!("unsupported dense core width K{bits}"))
+                    && error.contains("trellis_linear"), "{error}");
             }
         }
         Ok(())

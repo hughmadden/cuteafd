@@ -1523,11 +1523,11 @@ fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
 }
 
 #[test]
-fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
+fn exl3_contract_refuses_nonshipping_core_widths() {
     use crate::plan::checkpoint::CheckpointTensor;
     let fixture = exl3_snapshot();
     let mut cp = Checkpoint::inventory(fixture.path()).unwrap();
-    // A K5 core module disagrees with core_bits=6.
+    // A header-native K5 core is not in the shipping K6 target inventory.
     let stem = "model.layers.5.self_attn.q_proj";
     let shard = cp.weight_map[&format!("{stem}.trellis")].clone();
     let mut headers = crate::read_safetensors_metadata(&fixture.path().join(&shard)).unwrap();

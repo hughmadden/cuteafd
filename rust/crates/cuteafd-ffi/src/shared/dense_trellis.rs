@@ -661,14 +661,19 @@ impl GroupedPolicy {
     /// The grouped launch of the single policy matching this exact geometry, if any.
     pub fn from_package_geometry(programs: &Programs<'_>, input: usize, output: usize, side: usize,
         codebook: &str) -> Result<Option<Self>> {
+        Self::from_package_geometry_bits(programs, input, output, side, 6, codebook)
+    }
+
+    pub fn from_package_geometry_bits(programs: &Programs<'_>, input: usize, output: usize, side: usize,
+        bits: usize, codebook: &str) -> Result<Option<Self>> {
         let family = programs.family_metadata("dense_trellis_k6")?;
         let entries = family["row_policies"].as_array().ok_or(DenseTrellisError::Invalid("row-policy list"))?;
         let mut matches = entries.iter().filter(|p| p["input_features"].as_u64() == Some(input as u64)
             && p["output_features"].as_u64() == Some(output as u64)
             && p["sharded_side"].as_u64() == Some(side as u64) && p["codebook"].as_str() == Some(codebook)
-            && p.get("bits").is_none_or(|bits| bits == 6));
+            && p.get("bits").and_then(serde_json::Value::as_u64).unwrap_or(6) == bits as u64);
         let selected = matches.next().ok_or_else(|| DenseTrellisError::MissingGeometry {
-            input, output, side, codebook: codebook.to_owned(), bits: 6,
+            input, output, side, codebook: codebook.to_owned(), bits,
         })?;
         if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate row policy")); }
         Self::parse(selected)
@@ -725,7 +730,7 @@ pub struct GroupedMember { pub payload: Buffer, pub suh: Buffer, pub svh: Buffer
 
 pub struct GroupedTrellis<'a> {
     input: Program<'a>, core: Program<'a>, output: Program<'a>,
-    k: usize, n: usize, ctas: i32,
+    k: usize, n: usize, bits: usize, ctas: i32,
 }
 impl<'a> GroupedTrellis<'a> {
     /// Resolved before capture beside the member's standalone dispatch.
@@ -745,7 +750,7 @@ impl<'a> GroupedTrellis<'a> {
             || !matching_rotated_dtype(&input.geometry, &core.geometry)
             || output.geometry["features"].as_u64() != Some(n as u64) || output.geometry["output_dtype"].as_str() != Some("bf16")
             || core.geometry["codebook"].as_str() != Some(base.codebook.as_str())
-            || [("abi_version", 1), ("input_features", k), ("output_features", n), ("bits", 6), ("sharded_side", 1),
+            || [("abi_version", 1), ("input_features", k), ("output_features", n), ("bits", base.bits), ("sharded_side", 1),
                 ("rotation_count", GROUPS), ("split_k_blocks", 8), ("splits", splits), ("ctas_per_sm", 4)]
                 .iter().any(|&(key, value)| core.geometry[key].as_u64() != Some(value as u64))
             || core.scratch.get("partial").copied() != Some((GROUPS * grouped.max_rows * splits * n * 4) as u64) {
@@ -756,8 +761,10 @@ impl<'a> GroupedTrellis<'a> {
             .ok_or(DenseTrellisError::Invalid("runtime SM count"))?;
         Ok(Self { input: programs.program(&grouped.native_input, GROUPED_INPUT)?,
             core: programs.program(&grouped.native, GROUPED_CORE)?,
-            output: programs.program(&grouped.output_program, GROUPED_OUTPUT)?, k, n, ctas })
+            output: programs.program(&grouped.output_program, GROUPED_OUTPUT)?, k, n, bits: base.bits, ctas })
     }
+
+    pub fn bits(&self) -> usize { self.bits }
 
     pub fn geometry(&self) -> (usize, usize) { (self.k, self.n) }
 
@@ -855,16 +862,19 @@ mod bits_tests {
             if let Some(bits) = bits { p["bits"] = serde_json::json!(bits); }
             p
         };
-        let family = serde_json::json!({"abi_version":1,"row_policies":[entry(None,"q"), entry(Some(4),"mtp_q")]});
+        let family = serde_json::json!({"abi_version":1,"row_policies":[entry(None,"q"), entry(Some(4),"mtp_q"), entry(Some(8),"q_k8")]});
         let k6 = DenseTrellisPolicy::from_geometry_metadata(&family,4096,12288,1,6,"mcg").unwrap();
         let k4 = DenseTrellisPolicy::from_geometry_metadata(&family,4096,12288,1,4,"mcg").unwrap();
         assert_eq!((k6.bits, k6.shape.as_str(), k4.bits, k4.shape.as_str()), (6, "q", 4, "mtp_q"));
+        let k8 = DenseTrellisPolicy::from_geometry_metadata(&family,4096,12288,1,8,"mcg").unwrap();
+        assert_eq!((k8.bits, k8.shape.as_str()), (8, "q_k8"));
         let error = DenseTrellisPolicy::from_geometry_metadata(&family,4096,12288,1,5,"mcg").unwrap_err();
         assert!(error.to_string().contains("K5"), "{error}");
         let k4_geometry = DenseTrellisGeometry { input: 4096, output: 12288, bits: 4, side: 1, rows: 64,
             input_dtype: TrellisDType::Bf16, output_dtype: TrellisDType::Bf16 };
         // Workspace depends only on K/N/rows; payload extents scale with width.
         assert_eq!(k4_geometry.workspace().unwrap(), DenseTrellisGeometry { bits: 6, ..k4_geometry }.workspace().unwrap());
+        assert_eq!(k4_geometry.workspace().unwrap(), DenseTrellisGeometry { bits: 8, ..k4_geometry }.workspace().unwrap());
         assert!(DenseTrellisGeometry { bits: 7, ..k4_geometry }.workspace().is_err());
     }
 }

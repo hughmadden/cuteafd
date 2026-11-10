@@ -990,7 +990,9 @@ fn check_checkpoint_target_head(checkpoint: &cuteafd_loader::plan::Checkpoint, h
     let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
     let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
         |stem| (stem == head_stem).then_some(CoreContract {
-            split: CoreSplit::Whole, bits: 6, padded_outputs: false,
+            family: if head_stem.starts_with("language_model.") { "Kimi" } else { "DFlash target" },
+            widths: if head_stem.starts_with("language_model.") { &[4, 6, 8] } else { &[6] },
+            split: CoreSplit::Whole, padded_outputs: false,
         }))?;
     if native.contains_key(head_stem) {
         ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native K6 target head");

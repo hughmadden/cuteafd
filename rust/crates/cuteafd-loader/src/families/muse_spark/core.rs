@@ -61,7 +61,7 @@ impl CoreInventory {
         // The K6 head is stored at whole 128-row output blocks (202,112 for the
         // logical 202,048 vocabulary); the engine trims logits before the softcap.
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { split, padded_outputs: stem == HEAD }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "Muse", widths: &[6], split, padded_outputs: stem == HEAD }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         for (name, shape) in expected(cfg) {
             let stem = name.strip_suffix(".weight").unwrap();

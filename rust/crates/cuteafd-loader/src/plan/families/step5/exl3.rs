@@ -8,16 +8,6 @@ use crate::plan::checkpoint::Checkpoint;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
-/// The checkpoint's declared EXL3 widths, cross-checked against every header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Widths {
-    /// Target attention q/k/v/o, shared and dense FFNs.
-    pub core: usize,
-    pub head: usize,
-    /// Every MTP-stage projection, including each stage's own vocabulary head.
-    pub mtp: usize,
-}
-
 /// `config.json` declares the publication; tensors carry the actual widths.
 pub fn is_exl3(checkpoint: &Checkpoint) -> bool {
     quantization(checkpoint).is_some_and(|q| q["quant_method"] == "exl3")
@@ -26,22 +16,6 @@ pub fn is_exl3(checkpoint: &Checkpoint) -> bool {
 fn quantization(checkpoint: &Checkpoint) -> Option<&serde_json::Value> {
     checkpoint.config.get("quantization_config")
         .or_else(|| checkpoint.config.get("text_config").and_then(|t| t.get("quantization_config")))
-}
-
-pub fn widths(checkpoint: &Checkpoint) -> Result<Widths> {
-    let q = quantization(checkpoint).context("Step-5 EXL3 requires quantization_config")?;
-    let int = |key: &str, default: Option<usize>| -> Result<usize> {
-        match q.get(key) {
-            None => default.with_context(|| format!("Step-5 EXL3 requires quantization_config.{key}")),
-            Some(v) => {
-                let bits = v.as_f64().filter(|b| b.fract() == 0.0 && (1.0..=8.0).contains(b))
-                    .with_context(|| format!("Step-5 EXL3 {key} must be an integer K1..K8, found {v}"))?;
-                Ok(bits as usize)
-            }
-        }
-    };
-    let core = int("core_bits", None)?;
-    Ok(Widths { core, head: int("head_bits", Some(core))?, mtp: int("mtp_bits", Some(core))? })
 }
 
 /// Stem and [N,K] of every quantizable dense projection the recipe may store
@@ -112,7 +86,9 @@ impl CoreInventory {
             || name.starts_with("model.layers."));
         let projections = read_projections(checkpoint, &shapes, selected, |stem| {
             let split = split(cfg, stem)?;
-            Some(CoreContract { split, padded_outputs: false })
+            let mtp = stem.strip_prefix("model.layers.").and_then(|s| s.split('.').next())
+                .and_then(|s| s.parse::<usize>().ok()).is_some_and(|layer| layer >= cfg.layers);
+            Some(CoreContract { family: "Step-5", widths: if mtp { &[4] } else { &[6] }, split, padded_outputs: false })
         })?;
         let inventory = Self { projections };
         inventory.validate_groups(cfg)?;
