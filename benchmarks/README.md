@@ -22,7 +22,7 @@ Release smoke run; use the linked report for coverage and capacity details.
 
 | Max card | Compact | HQA | FP8-compact |
 | --- | --- | --- | --- |
-| GLM 5.3 K4/Core K6 | [pass; KL 0.0208, top-1 96.99%; 61.9 / 143.8 / 3380](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg) | [pass; KL 0.0201, top-1 97.38%; 52.0 / 135.2 / 3265](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-hqa/report.svg) | pending |
+| GLM 5.3 K4/Core K6 | [pass; KL 0.0208, top-1 96.99%; 61.9 / 143.8 / 3380](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg) | [pass; KL 0.0201, top-1 97.38%; 52.0 / 135.2 / 3265](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-hqa/report.svg) | [pass; KL 0.0241, top-1 96.84%; 52.9 / 141.6 / 3282](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-fp8-compact/report.svg) |
 | GLM Flash K4/Core K6 | [pass; KL 0.0201, top-1 96.52%; 174.8 / 563.9 / 6805](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg) | pending | pending² |
 | Kimi K3 K2/Core K6 | [pass; KL 0.0655, top-1 92.27%; 50.2 / 102.1 / 1819](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg) | pending | pending |
 | Step-5 K4/Core K6 | [pass; KL 0.0173, top-1 95.99%; 71.7 / 203.8 / 2709](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg) | pending | pending |
@@ -54,6 +54,7 @@ Power-cap slowdown is budget allocation, distinct from thermal slowdown.
 | --- | --- | --- | --- |
 | [GLM 5.3 K4/Core K6, compact](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg) | 0.000 / 31.958 | 2547/2791 | 74 / 23 |
 | [GLM 5.3 K4/Core K6, hqa](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-hqa/report.svg) | 0.000 / 18.976 | 2638/2816 | 70 / 23 |
+| [GLM 5.3 K4/Core K6, fp8-compact](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-fp8-compact/report.svg) | 0.000 / 21.003 | 2608/2817 | 73 / 24 |
 | [GLM Flash K4/Core K6, compact](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg) | 0.000 / 74.973 | 2296/2516 | 81 / 13 |
 | [Kimi K3 K2/Core K6, compact](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg) | 0.000 / 297.977 | 2595/2502 | 82 / 9 |
 | [Step-5 K4/Core K6, compact](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg) | 0.000 / 19.987 | 2689/2800 | 72 / 22 |
@@ -185,6 +186,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## GLM 5.3
 
+- 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (380–515) + 6× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-fp8-compact/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-hqa-2rtx-6spark-glm53-exl3-k6core-max-hqa/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-exlr8-k2-k3-k4 · 1× RTX PRO 6000 @ gpu-powerd 470 W (450–600) + 4× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-1rtx-4spark-glm53-exlr8-min/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 460 W (450–600) + 4× DGX Spark · build v5.0.0-rc1 · [report](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-1rtx-4spark-glm53-exl3-k6core-min/report.svg)
