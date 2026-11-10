@@ -147,7 +147,7 @@ concurrency point is that limit.
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">n/a<br><sub>—</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-4spark-glm53f-exl3-k6-5090/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-4spark-glm53f-exl3-k6-5090/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6 on simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark"></a><br><sub>simulated 5090 + 4× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6 on 1× RTX PRO 6000 @ gpu-powerd 460 W (450–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6 on 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550)"></a><br><sub>2× RTX</sub></td>
 </tr>
