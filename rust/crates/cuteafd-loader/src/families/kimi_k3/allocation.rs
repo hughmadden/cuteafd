@@ -368,9 +368,9 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
 /// The configured graph arena, one Demand per physical rank. Admission owns
 /// the whole reserve before KV sizing; the bounded device cache grows into it
 /// lazily and evicts, rather than re-planning memory, when it is full.
-pub fn graph_reserve_demands(ranks: usize) -> anyhow::Result<Vec<Demand>> {
+pub fn graph_reserve_demands(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize) -> anyhow::Result<Vec<Demand>> {
     (0..ranks).map(|rank| {
-        let (base, extra) = crate::placement::graph_reserve::kimi_default(ranks, rank);
+        let (base, extra) = crate::placement::graph_reserve::kimi_default(core, ranks, rank);
         let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)?;
         tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,
             "Kimi GPU_GRAPH_RESERVE");
@@ -528,7 +528,7 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         |rank, layer| physical_ranks == 1 || cfg.attention[layer] == KimiAttention::Kda
             || heads || rank == usize::from(owners[layer]))?;
     let mut demands = vec![spark_demand_on(shape, 0, spark_ranks, (physical_ranks - 1) as u8, format)?];
-    demands.extend(graph_reserve_demands(physical_ranks)?);
+    demands.extend(graph_reserve_demands(crate::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(core), physical_ranks)?);
     for rank in 0..physical_ranks {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));

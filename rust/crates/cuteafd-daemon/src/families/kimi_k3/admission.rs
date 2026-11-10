@@ -1294,7 +1294,7 @@ pub(super) mod tests {
             automatic.requested_pool = None; automatic.prefix_marks = 2;
             automatic.spark_budget = Some(spark.clone());
             automatic.rtx = Some(plan_rtx(&cfg, &catalog, package.clone(), 4096, 5)?);
-            automatic.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+            automatic.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?;
             match admit(automatic) {
                 Ok(admitted) => println!("automatic context={context} draft={enabled} pool={} owners={}/{} marks={}",
                     admitted.placement.pool_tokens,
@@ -1809,7 +1809,7 @@ pub(super) mod tests {
         let cfg = cfg();
         let mut i = inputs(&cfg);
         // The configured arena is independent of the winning key inventory.
-        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?;
         i.startup = reserve.clone();
         i.draft = Some(draft_layout(i.state_slots, i.state_slots, 1048576));
         let admitted = admit(i)?;
@@ -1997,7 +1997,7 @@ pub(super) mod tests {
                 allocation::NativeScratch::from_manifest_for_ranks(&manifest, 1)?, 1)?]];
             i.fixed = vec![allocation::code_demand(0,
                 code.pending(arch.context_bytes + resident, arch.context_bytes), 1)?];
-            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(1)?;
+            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 1)?;
             i.gpus[0] = GpuBudget { capacity_bytes: capacity, reserve_bytes: cuteafd_loader::placement::reserve::gpu("kimi_k3"),
                 baseline: Baseline::Measured { free_bytes: capacity - arch.context_bytes - resident } };
             Ok(i)
@@ -2222,7 +2222,7 @@ pub(super) mod tests {
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
             i.fixed = super::super::startup::exchange_demands(unit, false)?;
-            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+            i.startup = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?;
             for rank in 0..2 {
                 let code = cuteafd_loader::placement::inventory::loaded_code_allowance(
                     "kimik3", "exl3", true, rank as u8, arch, Some(&programs));
@@ -2288,7 +2288,7 @@ pub(super) mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let mut i = inputs(&cfg);
         i.attention = Some(AttentionPlacement::Layers);
-        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?;
+        let reserve = cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?;
         i.startup = reserve.clone();
         // A fixed asymmetric owner makes equal layer counts the wrong balance.
         let whole = LayerLayout::pair(&cfg, 3,

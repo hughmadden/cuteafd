@@ -12,7 +12,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::{families::kimi_k3::config::{KimiAttention, KimiK3Config},
     placement::inventory::StartupGraphs,
-    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, kimi_selected, KimiPrewarmLayout, KimiPrewarmOp}};
+    serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, kimi_selected, KimiCoreFormat, KimiPrewarmLayout, KimiPrewarmOp}};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Op {
@@ -74,8 +74,8 @@ pub(crate) fn prewarm_selected(layout: &KimiPrewarmLayout, key: Key, pinned: boo
     kimi_selected(layout, key.rows, key.op.speculative(), geometry(key.op), pinned)
 }
 
-pub(crate) fn pinned(ranks: usize, key: Key) -> bool {
-    prewarm_selected(kimi_layout(ranks), key, true)
+pub(crate) fn pinned(core: KimiCoreFormat, ranks: usize, key: Key) -> bool {
+    prewarm_selected(kimi_layout(core, ranks), key, true)
 }
 
 /// Project observed trace geometries onto the placement's actual sites. No new
@@ -115,7 +115,7 @@ pub(crate) fn fit_prewarm(keys: Vec<Key>, layout: &KimiPrewarmLayout,
     bases: &[u64], bootstraps: &[u64]) -> Vec<Key> {
     let pins = layout.entries.iter().map(|entry| entry.pin).collect::<Vec<_>>();
     let geometries = layout.entries.iter().map(|entry| KimiPrewarmLayout {
-        ranks: layout.ranks, layout: layout.layout.clone(), reserve_base_bytes: Vec::new(),
+        core: layout.core, ranks: layout.ranks, layout: layout.layout.clone(), reserve_base_bytes: Vec::new(),
         reserve_extra_bytes: 0, entries: vec![entry.clone()],
     }).collect::<Vec<_>>();
     let matches = |index: usize, key: Key| prewarm_selected(&geometries[index], key, false);
@@ -330,12 +330,12 @@ impl<'a> Graphs<'a> {
     /// Best-effort startup prewarm of the checked-in pinned geometry. A geometry
     /// that can never replay inside a lane window is skipped, and a controller
     /// refusal only leaves that geometry lazy.
-    pub(crate) fn prewarm(&mut self, stream: &Stream<'a>, ranks: usize, keys: &[Key],
+    pub(crate) fn prewarm(&mut self, stream: &Stream<'a>, core: KimiCoreFormat, ranks: usize, keys: &[Key],
         mut body: impl FnMut(Key) -> Result<()>) -> Result<usize> {
         let mut captured = 0;
         for &key in keys {
-            if !prewarm_selected(kimi_layout(ranks), key, false) || self.cached(&key) { continue }
-            let pinned = pinned(ranks, key);
+            if !prewarm_selected(kimi_layout(core, ranks), key, false) || self.cached(&key) { continue }
+            let pinned = pinned(core, ranks, key);
             let Some(ticket) = self.bank.cache_ticket(&key, pinned, None) else { continue };
             if self.capture(stream, key, ticket, &mut || body(key))? { captured += 1; }
         }
@@ -473,7 +473,7 @@ mod tests {
     fn every_observed_geometry_expands_to_reachable_keys_and_nothing_else() -> Result<()> {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
-        let layout = KimiPrewarmLayout { ranks: 1, layout: "trace".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "trace".into(),
             reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
             entries: vec![
                 KimiPrewarmEntry { rows: 20, speculative: true, pin: true,
@@ -509,7 +509,7 @@ mod tests {
             Op::Ffn(layer)].map(|op|
                 Key { lane: 0, rank: 0, rows: 1, op });
         for kind in [KimiPrewarmOp::Context, KimiPrewarmOp::Ffn] {
-            let layout = KimiPrewarmLayout { ranks: 2, layout: "trace".into(),
+            let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 2, layout: "trace".into(),
                 reserve_base_bytes: vec![1], reserve_extra_bytes: 2 << 20,
                 entries: vec![KimiPrewarmEntry { rows: 4, speculative: false, pin: true,
                     op: Some(kind), capture_bytes: vec![] }] };
@@ -526,7 +526,7 @@ mod tests {
     fn prewarm_base_keeps_pins_indivisible_then_takes_a_prefix() {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
         let keys = [1, 2, 4].map(|rows| Key { lane: 0, rank: 0, rows, op: Op::Ffn(0) });
-        let layout = KimiPrewarmLayout { ranks: 1, layout: "base-test".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "base-test".into(),
             reserve_base_bytes: vec![20], reserve_extra_bytes: 2 << 20,
             entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
                 pin: rows == 1, op: Some(KimiPrewarmOp::Ffn), capture_bytes: vec![] }).into() };
@@ -542,7 +542,7 @@ mod tests {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
         let keys = (0..2).flat_map(|rank| [1, 2, 4].map(|rows|
             Key { lane: 0, rank, rows, op: Op::Ffn(0) })).collect::<Vec<_>>();
-        let mut layout = KimiPrewarmLayout { ranks: 2, layout: "measured".into(),
+        let mut layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 2, layout: "measured".into(),
             reserve_base_bytes: vec![5, 9], reserve_extra_bytes: 2 << 20,
             entries: [1, 2, 4].map(|rows| KimiPrewarmEntry { rows, speculative: false,
                 pin: rows == 1, op: Some(KimiPrewarmOp::Ffn),
@@ -564,7 +564,7 @@ mod tests {
     fn prewarm_base_deduplicates_overlapping_unmeasured_bootstrap_entries() {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiPrewarmEntry;
         let keys = vec![Key { lane: 0, rank: 0, rows: 4, op: Op::Ffn(0) }];
-        let layout = KimiPrewarmLayout { ranks: 1, layout: "bootstrap".into(),
+        let layout = KimiPrewarmLayout { core: KimiCoreFormat::K6, ranks: 1, layout: "bootstrap".into(),
             reserve_base_bytes: vec![10], reserve_extra_bytes: 2 << 20,
             entries: [false, true].map(|speculative| KimiPrewarmEntry { rows: 4,
                 speculative, pin: false, op: None, capture_bytes: vec![] }).into() };

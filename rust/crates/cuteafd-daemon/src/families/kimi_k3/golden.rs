@@ -1162,7 +1162,7 @@ mod tests {
             requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None, full_prefill_logits: false,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
-            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(2)?,
+            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?,
             pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0, prefix: None })?;
         let onboard = admitted.placement.onboard_layers;
         assert!(onboard >= spark.minimum_rtx_layers()?);
