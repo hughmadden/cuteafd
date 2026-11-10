@@ -94,3 +94,4 @@ automatic, and admission refuses configurations below the 256K context floor.
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg"><img src="../../benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/card.svg" width="360" alt="Step-5-Preview-EXL3-K4-Core-K6 (exl3-k4+exl3-k6) (2× RTX)"></a> |

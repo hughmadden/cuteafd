@@ -110,7 +110,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/glm5/2026-10-31-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max"
+        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max"
       }
     },
     {
@@ -126,15 +126,15 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max"
+        "report": "benchmarks/glm5/2026-11-10-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-max"
       }
     },
     {
       "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
       "5090": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090"
+        "status": "na",
+        "reason": "K3.25 small-card layout retired in v5; use K4/Core K6"
       },
       "1rtx": {
         "status": "current",
@@ -142,7 +142,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max"
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-2rtx-glm53f-exl3-max"
       }
     },
     {
@@ -158,7 +158,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/glm5_flash/2026-10-30-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max"
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max"
       }
     },
     {
@@ -190,23 +190,7 @@
       },
       "2rtx": {
         "status": "current",
-        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max"
-      }
-    },
-    {
-      "family": "step5",
-      "checkpoint": "stepfun-ai/Step-5-Preview",
-      "5090": {
-        "status": "na",
-        "reason": "doesn't fit"
-      },
-      "1rtx": {
-        "status": "na",
-        "reason": "\u2014"
-      },
-      "2rtx": {
-        "status": "current",
-        "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-2rtx-6spark-step5-fp8-max"
+        "report": "benchmarks/mimo_v2/2026-11-10-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max"
       }
     },
     {
@@ -271,6 +255,54 @@
       "2rtx": {
         "status": "na",
         "reason": "\u2014"
+      }
+    },
+    {
+      "family": "mistral_large4",
+      "checkpoint": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
+      "5090": {
+        "status": "na",
+        "reason": "doesn't fit"
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "v5 rc1 smoke not yet measured"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max"
+      }
+    },
+    {
+      "family": "muse_spark",
+      "checkpoint": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+      "5090": {
+        "status": "na",
+        "reason": "doesn't fit"
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "v5 rc1 smoke not yet measured"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max"
+      }
+    },
+    {
+      "family": "step5",
+      "checkpoint": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+      "5090": {
+        "status": "na",
+        "reason": "doesn't fit"
+      },
+      "1rtx": {
+        "status": "pending",
+        "reason": "v5 rc1 smoke not yet measured"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max"
       }
     }
   ],
@@ -421,6 +453,48 @@
       "report": "benchmarks/step5/2026-10-30-smoke-step-5-preview-nvfp4-1rtx-4spark-step5-nvfp4-min",
       "release": "v4.0.0-rc2",
       "release_note": "Release-candidate build recorded by the report. NVFP4 cards retired in v5 (TJ 2026-10-31)."
+    },
+    {
+      "name": "v41-flash-reference-tp4",
+      "config": "examples/configs/deepseek-v41-mxfp4-min.config",
+      "report": "benchmarks/deepseek_v41/2026-10-31-smoke-deepseek-v4-1-flash-1017-1rtx-4spark-v41-flash-reference-tp4",
+      "release": "v4.1.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "glm53f-exl3-5090",
+      "config": "examples/configs/glm53-flash-exl3-min.config",
+      "report": "benchmarks/glm5_flash/2026-10-31-smoke-glm-5-3-flash-exl3-k3-25-core-fp8-1rtx-2spark-glm53f-exl3-5090",
+      "release": "v4.1.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "v4-flash-reference-tp4",
+      "config": "examples/configs/deepseek-v4-flash-mxfp4-min.config",
+      "report": "benchmarks/deepseek_v4/2026-10-30-smoke-deepseek-v4-flash-0731-1rtx-4spark-v4-flash-reference-tp4",
+      "release": "v4.0.0-rc1",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "glm53-exlr8-a8-max",
+      "config": "examples/configs/glm53-exlr8-max.config",
+      "report": "benchmarks/glm5/2026-10-30-smoke-glm-5-3-exlr8-k2-k3-k4-2rtx-6spark-glm53-exlr8-a8-max",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "qwen38-27b-bf16-min-nospec",
+      "config": "examples/configs/qwen38-27b-bf16-min.config",
+      "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-1rtx-qwen38-27b-bf16-min-nospec",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
+    },
+    {
+      "name": "qwen38-27b-fp8-min-nospec",
+      "config": "examples/configs/qwen38-27b-fp8-min.config",
+      "report": "benchmarks/qwen3_5/2026-10-30-smoke-qwen3-8-27b-fp8-1rtx-qwen38-27b-fp8-min-nospec",
+      "release": "v4.0.0-rc2",
+      "release_note": "Build recorded by the last published Release-smoke report. Retired from the approved v5 card set (2026-11-10)."
     }
   ]
 }

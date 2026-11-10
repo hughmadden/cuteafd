@@ -196,3 +196,4 @@ or `--audio rtx` requests coordinator placement directly. Qualification is on #9
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg"><img src="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/card.svg" width="360" alt="Muse-Spark-Open-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |
