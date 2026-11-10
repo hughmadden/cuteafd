@@ -166,7 +166,7 @@
       "checkpoint": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
       "5090": {
         "status": "current",
-        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090"
+        "report": "benchmarks/mimo_v2/2026-11-10-smoke-mimo-v2-6-flash-mopd-1rtx-4spark-mimo26-flash-5090"
       },
       "1rtx": {
         "status": "current",

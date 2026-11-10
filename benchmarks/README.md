@@ -10,37 +10,57 @@ workloads are unchanged.
 
 ## v5 HQA Comparison
 
-The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) schedules 11
-additional max-only attention comparisons. Regular min/max cards retain the
-original checkpoint repositories and their default attention, with no mode
-flag. The regular max card is each comparison's compact arm. Separate `hqa`
-and `fp8-compact` arms pin the matching dual-view `-HQA` repository revision
-(Mistral Large 4: `hqa` only). Users choose the checkpoint; this comparison
-does not establish a shipping attention default.
-These experiments are separate from the main three-column release table.
-Results are pending; no new speed or quality measurement is claimed here.
+The [v5 smoke matrix](../scripts/bench/release-smoke-v5.json) adds 11 max-only
+attention arms. Compact is the regular max card; HQA/FP8-compact use the
+pinned dual-view checkpoint. Mistral Large 4 runs only its `hqa` arm,
+shown in FP8-compact. No run settings change for this display.
+These comparisons are separate from the release table and do not select a default.
+
+Each measured cell shows **quality; KL, top-1; C1 / C16 / 8K tok/s**.
+Pending means unmeasured, not zero. Quality and speed come from the same warmed
+Release smoke run; use the linked report for coverage and capacity details.
 
 | Max card | Compact | HQA | FP8-compact |
 | --- | --- | --- | --- |
-| GLM 5.3 EXL3 K4 + Core K6 | pending | pending | pending |
-| GLM Flash EXL3 K4 + Core K6 | pending | pending | pending² |
-| Kimi K3 EXL3 K2 + Core K6 | pending | pending | pending |
-| Step-5 EXL3 K4 + Core K6 | pending | pending | pending |
-| Muse Spark EXL3 K4 + Core K6 | pending | pending | pending |
-| Mistral Large 4 EXL3 K4 + Core K6 | pending | - | pending¹ |
+| GLM 5.3 K4/Core K6 | [pass; KL 0.0208, top-1 96.99%; 61.9 / 143.8 / 3380](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg) | pending | pending |
+| GLM Flash K4/Core K6 | [pass; KL 0.0201, top-1 96.52%; 174.8 / 563.9 / 6805](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg) | pending | pending² |
+| Kimi K3 K2/Core K6 | [pass; KL 0.0655, top-1 92.27%; 50.2 / 102.1 / 1819](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg) | pending | pending |
+| Step-5 K4/Core K6 | [pass; KL 0.0173, top-1 95.99%; 71.7 / 203.8 / 2709](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg) | pending | pending |
+| Muse Spark K4/Core K6 | [pass; KL 0.0069, top-1 97.76%; 80.4 / 123.2 / 3289](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg) | pending | pending |
+| Mistral Large 4 K4/Core K6 | [pass; KL 0.0097, top-1 97.16%; 49.8 / 141.3 / 3292](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg) | - | pending¹ |
 
 ¹ native FP8 attention ([#1750](https://github.com/tpurtell/cuteafd/issues/1750))
 
 ² W8A8 prefill ([#1751](https://github.com/tpurtell/cuteafd/issues/1751))
 
-All modes retain the Release smoke baseline, including quick fidelity and
-quality. Publish those scores beside speed with equal prominence, the pinned
-original/HQA checkpoint revisions, and the report's thermal/power conditions;
-speed alone does not decide the attention mode.
-Variant names append `-hqa` or
-`-fp8-compact` to the regular `-max` name; `compact` means that regular max
-card itself, not another launch. GLM Flash keeps its existing
-`glm53f-exl3-k6-*` card/config names for the K4 + Core K6 checkpoint.
+Pinned checkpoint revisions (original / matching `-HQA` repository):
+
+| Max card | Original revision | HQA revision |
+| --- | --- | --- |
+| GLM 5.3 K4/Core K6 | [`5a4e83a09a11`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6/tree/5a4e83a09a11f3145332ed632d28a9894ea88225) | [`354226e187c9`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6-HQA/tree/354226e187c9f6c318a633aeee3a1bb327ae11f7) |
+| GLM Flash K4/Core K6 | [`5d3fffe1df9c`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6/tree/5d3fffe1df9c4a109bbbdafb60dc19df9fac019d) | [`e0ecc3d55d11`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6-HQA/tree/e0ecc3d55d117e656a03d5790521cad0c4fcb624) |
+| Kimi K3 K2/Core K6 | [`1a28050d2954`](https://huggingface.co/wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6/tree/1a28050d2954426a43a3db705e53ca120e5f2b47) | [`46b802d31c73`](https://huggingface.co/wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6-HQA/tree/46b802d31c737bc64b4251ad158b9b3ffc4e04f6) |
+| Step-5 K4/Core K6 | [`83d47a384eab`](https://huggingface.co/wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6/tree/83d47a384eabc07ea6fcfaac4779b0e5f013ce89) | [`61f9275e7f60`](https://huggingface.co/wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA/tree/61f9275e7f604cb11a5ae9a64a07ff1c600174b7) |
+| Muse Spark K4/Core K6 | [`89998fb177ac`](https://huggingface.co/wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6/tree/89998fb177acd9a862ac8bd4fb79bfd50e940c97) | [`12065621f67b`](https://huggingface.co/wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6-HQA/tree/12065621f67bb2a8baa67af90877cc99e8bf81fc) |
+| Mistral Large 4 K4/Core K6 | [`03c80aebaa48`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6/tree/03c80aebaa483d55760703ae5bc0c9734c9d67d6) | [`080757045cd2`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6-HQA/tree/080757045cd2b9c0a65505c61a16aa90d118e35e) |
+
+Conditions: clean rc1 `de882488ac`, serial runs, one untimed warm batch per
+concurrency level, floating 900 W shared budget with per-card maxima 600 W.
+Thermal/power-cap times sum reported GPU-seconds across baseline/panel windows;
+busy clocks are baseline per-GPU means, temperatures/headroom are worst windows.
+Power-cap slowdown is budget allocation, distinct from thermal slowdown.
+
+| Card, mode | Thermal / power-cap GPU-s | Busy SM MHz | Max °C / min T.Limit °C |
+| --- | --- | --- | --- |
+| [GLM 5.3 K4/Core K6, compact](glm5/2026-11-10-smoke-glm-5-3-exl3-k4-core-k6-2rtx-6spark-glm53-exl3-k6core-max/report.svg) | 0.000 / 31.958 | 2547/2791 | 74 / 23 |
+| [GLM Flash K4/Core K6, compact](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max/report.svg) | 0.000 / 74.973 | 2296/2516 | 81 / 13 |
+| [Kimi K3 K2/Core K6, compact](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg) | 0.000 / 297.977 | 2595/2502 | 82 / 9 |
+| [Step-5 K4/Core K6, compact](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg) | 0.000 / 19.987 | 2689/2800 | 72 / 22 |
+| [Muse Spark K4/Core K6, compact](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg) | 0.000 / 26.000 | 2661/2820 | 76 / 19 |
+| [Mistral Large 4 K4/Core K6, compact](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg) | 0.000 / 53.948 | 2517/2788 | 77 / 20 |
+
+Cache endpoint byte identity and quick fidelity are required for each passing
+published arm. A report may still mark short-fresh continuation uncovered.
 
 ### v5 Retirements
 
@@ -313,6 +333,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## MiMo V2
 
+- 2026-11-10 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark · build v5.0.0-rc1 · [report](mimo_v2/2026-11-10-smoke-mimo-v2-6-flash-mopd-1rtx-4spark-mimo26-flash-5090/report.svg)
 - 2026-11-10 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 2× DGX Spark · build v5.0.0-rc1 · [report](mimo_v2/2026-11-10-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min/report.svg)
 - 2026-11-10 · Release smoke · XiaomiMiMo/MiMo-V2.6-Pro-MOPD · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](mimo_v2/2026-11-10-smoke-mimo-v2-6-pro-mopd-2rtx-6spark-mimo-pro-max/report.svg)
 - 2026-10-30 · Release smoke · XiaomiMiMo/MiMo-V2.6-Flash-MOPD · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.8 GiB + 2 Spark · build v4.0.0-rc1 · [report](mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-5090/report.svg)
