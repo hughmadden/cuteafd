@@ -185,7 +185,7 @@ impl<'a> DualAttentionWave<'a> {
         if graph.is_some() || self.window.is_windowed() || crate::shared::decode_graph::census::eager("layer_row") {
             return Ok(());
         }
-        let Some(ticket) = self.tails.cache_ticket(&(layer, key.clone()),
+        let Some(mut ticket) = self.tails.cache_ticket(&(layer, key.clone()),
             crate::families::deepseek_v41::graph_policy::pinned_shape(self.halves[0].device.id, rows as u32), None) else {
             // The completed eager continuation already produced the result.
             return Ok(());
@@ -197,9 +197,9 @@ impl<'a> DualAttentionWave<'a> {
         let owner=wave.halves[0].device;
         owner.run(||unsafe {
             tail.restore_warmup()?;
-            library.cuda_graph_begin_capture(stream)?;
+            ticket.capture_result(library.cuda_graph_begin_capture(stream))?;
             let queued=tail.enqueue(&attention,stream);
-            let captured=library.cuda_graph_end_capture_topology(stream);
+            let captured=ticket.capture_result(library.cuda_graph_end_capture_topology(stream));
             let (graph,nodes,width,_spans,inspection)=match (queued,captured) {
                 (Ok(()),Ok(graph))=>graph,
                 (Err(error),Ok((graph,_,_,_,_)))=> { library.cuda_graph_exec_destroy(graph)?;return Err(error); },

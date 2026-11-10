@@ -148,14 +148,14 @@ impl<'w,'a> Rank<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.graphs.get_shape(layer,weights,rows).is_some() { return Ok(()); }
         let device=self.storage.stream.device;
-        let Some(ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&(layer,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
             super::graph_policy::note_miss(format!("projection_rank rows={rows}"), || "graph cache selected eager".into());
             return Ok(());
         };
         device.run(||unsafe {
-            device.library.cuda_graph_begin_capture(self.storage.stream.raw)?;
+            ticket.capture_result(device.library.cuda_graph_begin_capture(self.storage.stream.raw))?;
             let queued=self.enqueue(weights,rows);
-            let captured=device.library.cuda_graph_end_capture_topology(self.storage.stream.raw);
+            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(self.storage.stream.raw));
             match (queued,captured) {
                 (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
                     if let Err(error)=self.graphs.cache_insert(layer,weights,rows,graph,ticket,nodes as u64,width,true) {
@@ -302,14 +302,14 @@ impl<'w,'a> Wave<'w,'a> {
         if !super::graph_policy::captures_shape(rows) || crate::shared::decode_graph::census::eager("layer_row")
             || self.gather_graphs.get_shape(0,weights,rows).is_some() { return Ok(()); }
         let stream=self.ranks[self.owner].storage.stream.raw;let device=self.storage.output.device;
-        let Some(ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
+        let Some(mut ticket) = self.gather_graphs.cache_ticket(&(0,rows), super::graph_policy::pinned_shape(device.id, rows), None) else {
             super::graph_policy::note_miss(format!("projection_gather rows={rows}"), || "graph cache selected eager".into());
             return Ok(());
         };
         device.run(||unsafe {
-            device.library.cuda_graph_begin_capture(stream)?;
+            ticket.capture_result(device.library.cuda_graph_begin_capture(stream))?;
             let queued=self.enqueue_gather(rows);
-            let captured=device.library.cuda_graph_end_capture_topology(stream);
+            let captured=ticket.capture_result(device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {
                 (Ok(()),Ok((graph, nodes, width, _spans, _))) => {
                     if let Err(error)=self.gather_graphs.cache_insert(0,weights,rows,graph,ticket,nodes as u64,width,true) {

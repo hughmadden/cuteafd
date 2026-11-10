@@ -1000,11 +1000,11 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             let stream = self.stream().raw;
             // SAFETY: the real admitted state pins ratio-two pending buffers.
             // Capture records proposal kernels only, without execution/commit.
-            let Some(ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
+            let Some(mut ticket) = self.retained_graphs.cache_ticket(&(row, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, row as u32), None) else { continue };
-            unsafe { library.cuda_graph_begin_capture(stream)?; }
+            unsafe { ticket.capture_result(library.cuda_graph_begin_capture(stream))?; }
             let queued = unsafe { self.enqueue(state, row) };
-            let captured = unsafe { library.cuda_graph_end_capture_topology(stream) };
+            let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(stream)) };
             match (queued, captured) {
                 (Ok(()), Ok((graph, nodes, width, spans, _))) => self.insert_graph(graph, row, state.owner, ticket, nodes as u64, width, spans)?,
                 (Err(error), Ok((graph, ..))) => {
@@ -1060,10 +1060,10 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
             if !chained && !unsafe { self.stream().library.cuda_stream_query(self.stream().raw)? } { return Ok(false); }
             let ticket = if *capture { self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
                 super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) } else { None };
-            if let Some(ticket) = ticket {
-                unsafe { self.stream().library.cuda_graph_begin_capture(self.stream().raw)?; }
+            if let Some(mut ticket) = ticket {
+                unsafe { ticket.capture_result(self.stream().library.cuda_graph_begin_capture(self.stream().raw))?; }
                 let queued = unsafe { self.enqueue(state, prepared.rows) };
-                let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
+                let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
                 let (graph, nodes, width, spans, _) = match (queued, captured) {
                     (Ok(()), Ok(topology)) => topology,
                     (Err(error), Ok((graph, ..))) => {
@@ -1179,18 +1179,18 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         // Preserve the completed proposal identity; preparing again would
         // invalidate the eager result without running any replacement work.
         let prepared = self.ready.take().context("compressor capture eager output missing")?;
-        let Some(ticket) = self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
+        let Some(mut ticket) = self.retained_graphs.cache_ticket(&(prepared.rows, state.owner),
             super::graph_policy::pinned_shape(self.storage.input.buffer.device_id, prepared.rows as u32), None) else {
                 self.ready = Some(prepared);
                 return Ok(());
             };
         unsafe {
-            self.stream()
+            ticket.capture_result(self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream().raw)?;
+                .cuda_graph_begin_capture(self.stream().raw))?;
         }
         let launched = unsafe { self.enqueue(state, prepared.rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
+        let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;

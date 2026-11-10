@@ -379,20 +379,20 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         Ok(())
     }
     unsafe fn capture_ready(&mut self, rows: usize) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.storage.output.buffer.device_id, rows as u32), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.storage.output.buffer.device_id, rows as u32), None) else {
             crate::families::deepseek_v41::graph_policy::note_miss(format!("engram_gate rows={rows} layer={}", self.layer()), || "graph cache selected eager".into());
             return Ok(());
         };
         self.ready_rows = None;
         ensure!(!self.window.is_windowed(), "windowed gate cannot capture");
         unsafe {
-            self.weights
+            ticket.capture_result(self.weights
                 .library
-                .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
         // End on both paths so a failed enqueue cannot leave the stream capturing.
-        let captured = unsafe { self.weights.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.weights.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: this executable has not launched; the containing gate

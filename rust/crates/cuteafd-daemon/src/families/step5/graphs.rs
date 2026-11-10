@@ -85,14 +85,16 @@ impl<'a> Graphs<'a> {
             let library = stream.device.library;
             // SAFETY: sections contain only ordered launches on this stream, with persistent storage.
             if let Err(error) = unsafe { library.cuda_graph_begin_capture(stream.raw) } {
-                drop(ticket);
-                tracing::warn!(%error, ?key, "Step-5 capture unavailable; running eagerly");
+                if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, ?key, "Step-5 capture unavailable; running eagerly");
+                }
                 return work();
             }
             let result = work();
             // SAFETY: always end this stream's capture, including a failed section.
             let captured = unsafe { library.cuda_graph_end_capture_topology(stream.raw) };
             if let Err(error) = result {
+                self.bank.borrow_mut().cache_ticket_failed(ticket, captured.as_ref().err().unwrap_or(&error));
                 if let Ok((raw, ..)) = captured {
                     // SAFETY: failed capture has never launched.
                     unsafe { library.cuda_graph_exec_destroy(raw)?; }
@@ -102,8 +104,9 @@ impl<'a> Graphs<'a> {
             let (raw, nodes, width, spans_devices, inspection_error) = match captured {
                 Ok(topology) => topology,
                 Err(error) => {
-                    drop(ticket);
-                    tracing::warn!(%error, ?key, "Step-5 instantiate unavailable; running eagerly");
+                    if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                        tracing::warn!(%error, ?key, "Step-5 instantiate unavailable; running eagerly");
+                    }
                     return work();
                 }
             };

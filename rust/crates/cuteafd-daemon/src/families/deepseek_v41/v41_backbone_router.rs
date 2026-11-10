@@ -656,18 +656,18 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     // Warmup has completed. Capture never yields with the stream in capture mode.
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&(self.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
             super::graph_policy::note_miss(format!("backbone_router rows={rows} layer={}", self.layer), || "graph cache selected eager".into());
             return Ok(());
         };
         self.invalidate();
         unsafe {
-            self.stream()
+            ticket.capture_result(self.stream()
                 .library
-                .cuda_graph_begin_capture(self.stream().raw)?;
+                .cuda_graph_begin_capture(self.stream().raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream().library.cuda_graph_end_capture_topology(self.stream().raw) };
+        let captured = unsafe { ticket.capture_result(self.stream().library.cuda_graph_end_capture_topology(self.stream().raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) =

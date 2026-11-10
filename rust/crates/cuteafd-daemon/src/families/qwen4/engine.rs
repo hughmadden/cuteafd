@@ -3718,8 +3718,9 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: capture records this stream's launches; nothing in a segment
         // synchronizes the host or allocates.
         if let Err(error) = unsafe { self.library.cuda_graph_begin_capture(self.execution_stream()) } {
-            drop(ticket);
-            tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
+            if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
+            }
             segment()?;
             return self.ple_consumed(&key);
         }
@@ -3727,6 +3728,7 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: ends the capture begun above on the same stream.
         let exec = unsafe { self.library.cuda_graph_end_capture_topology(self.execution_stream()) };
         if let Err(error) = captured {
+            self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {
                 // SAFETY: the unlaunched executable owns no queued work.
                 unsafe { let _ = self.library.cuda_graph_exec_destroy(raw); }
@@ -3736,8 +3738,9 @@ impl<'a> Qwen4Engine<'a> {
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                drop(ticket);
-                tracing::warn!(%error, "Qwen graph instantiation unavailable; running eagerly");
+                if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, "Qwen graph instantiation unavailable; running eagerly");
+                }
                 segment()?;
                 return self.ple_consumed(&key);
             }

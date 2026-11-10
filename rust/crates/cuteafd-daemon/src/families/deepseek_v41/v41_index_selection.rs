@@ -386,12 +386,12 @@ impl<'a> IndexSelectionWave<'a> {
         self.storage.stream.require_complete()?;
         let mut groups = Vec::new();
         extend_score_groups(&mut groups, 0, rows, source.binding());
-        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.buffers[0].buffer.device_id, rows as u32), None)
+        let Some(mut ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.buffers[0].buffer.device_id, rows as u32), None)
             else { return Ok(()) };
         // SAFETY: only commands are recorded; real metadata is uploaded before replay.
-        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+        unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
         let recorded = unsafe { self.enqueue(query, &[source], &groups, shared, rows, 1, DECODE_WIDTH_BUCKET, false) };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (recorded, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = self.insert_graph(graph, key, ticket, nodes as u64, width, spans) {
@@ -732,18 +732,19 @@ impl<'a> IndexSelectionWave<'a> {
             self.storage.stream.library.copy_h2d(lengths, &staged[rows * 48..rows * 56])?;
         }
         if capture && self.graph.is_none() {
+            let mut ticket = ticket.context("index capture ticket missing")?;
             unsafe {
-                self.storage.stream
+                ticket.capture_result(self.storage.stream
                     .library
-                    .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                    .cuda_graph_begin_capture(self.storage.stream.raw))?;
             }
             let launched = unsafe {
                 self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates)
             };
-            let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+            let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
             match (launched, captured) {
                 (Ok(()), Ok((g, nodes, parallel_width, spans, _))) => {
-                    if let Err(error) = self.insert_graph(g, fingerprint, ticket.context("index capture ticket missing")?, nodes as u64, parallel_width, spans) {
+                    if let Err(error) = self.insert_graph(g, fingerprint, ticket, nodes as u64, parallel_width, spans) {
                         // SAFETY: insertion failed before taking executable ownership.
                         unsafe { self.storage.stream.library.cuda_graph_exec_destroy(g)?; }
                         return Err(error);

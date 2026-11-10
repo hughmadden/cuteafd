@@ -124,14 +124,16 @@ impl DenseEngine<'_> {
         };
         // SAFETY: blocks only enqueue launches over persistent engine storage.
         if let Err(error) = unsafe { library.cuda_graph_begin_capture(self.stream.raw) } {
-            drop(ticket);
-            tracing::warn!(%error, "Dense Qwen capture unavailable; eager fallback");
+            if self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, "Dense Qwen capture unavailable; eager fallback");
+            }
             return segment();
         }
         let captured = segment();
         // SAFETY: ends capture on the same stream even when enqueue failed.
         let ended = unsafe { library.cuda_graph_end_capture_topology(self.stream.raw) };
         if let Err(error) = captured {
+            self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, ended.as_ref().err().unwrap_or(&error));
             if let Ok((raw, ..)) = ended {
                 // SAFETY: this executable has never been launched.
                 unsafe { let _ = library.cuda_graph_exec_destroy(raw); }
@@ -141,8 +143,9 @@ impl DenseEngine<'_> {
         let (raw, nodes, width, spans, inspection) = match ended {
             Ok(info) => info,
             Err(error) => {
-                drop(ticket);
-                tracing::warn!(%error, "Dense Qwen instantiate unavailable; eager fallback");
+                if self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, "Dense Qwen instantiate unavailable; eager fallback");
+                }
                 return segment();
             }
         };

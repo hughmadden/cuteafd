@@ -202,12 +202,12 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
         } else {
             let warmup = unsafe { self.enqueue(rows) };
             warmup.and(self.synchronize())?;
-            if let Some(ticket) = self.graphs.cache_ticket(&rows,
+            if let Some(mut ticket) = self.graphs.cache_ticket(&rows,
                 super::graph_policy::pinned_shape(self.storage.ids.buffer.device_id, rows as u32), None) {
                 // SAFETY: warmup completed and the wave pins all recorded storage.
-                unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+                unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
                 let launched = unsafe { self.enqueue(rows) };
-                let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+                let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
                 match (launched, captured) {
                     (Ok(()), Ok((raw, nodes, width, spans, _))) => {
                         // SAFETY: this owner retains the executable before any replay.

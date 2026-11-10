@@ -178,12 +178,12 @@ impl<'w,'a> Tp2FfnGraphs<'w,'a> {
         weights:&'w BackboneHcWeights<'a>,binding:QueryBinding,rows:usize,
         projected:CuteafdDeviceBuffer,stream:*mut std::ffi::c_void)->Result<()> {
         self.device.run(||unsafe {
-            let Some(ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
+            let Some(mut ticket)=self.bank.cache_ticket(&(binding.layer(),rows as u32),
                 super::graph_policy::pinned_shape(self.device.id, rows as u32),None) else {return Ok(())};
             block.restore_ffn_graph_warmup(binding,rows)?;
-            self.device.library.cuda_graph_begin_capture(stream)?;
+            ticket.capture_result(self.device.library.cuda_graph_begin_capture(stream))?;
             let queued=block.enqueue_ffn(binding,rows,projected,stream);
-            let captured=self.device.library.cuda_graph_end_capture_topology(stream);
+            let captured=ticket.capture_result(self.device.library.cuda_graph_end_capture_topology(stream));
             match (queued,captured) {
                 (Ok(_),Ok((graph,nodes,width,spans,_)))=> {
                     if let Err(error)=self.bank.cache_insert(binding.layer(),weights,rows as u32,graph,ticket,nodes as u64,width,spans) {

@@ -451,17 +451,17 @@ impl AttentionQueryWave<'_, '_> {
     }
     unsafe fn capture_ready_kind(&mut self, rows: u32, prefix: bool) -> Result<()> {
         let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };
-        let Some(ticket) = graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.buffers[0].as_ref().unwrap().buffer.device_id, rows), None) else {
+        let Some(mut ticket) = graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.buffers[0].as_ref().unwrap().buffer.device_id, rows), None) else {
             super::graph_policy::note_miss(format!("attention_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };
         unsafe {
-            self.storage.stream
+            ticket.capture_result(self.storage.stream
                 .library
-                .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw))?;
         }
         let launched = unsafe { if prefix { self.enqueue_rank(rows) } else { self.enqueue(rows) } };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 let graphs = if prefix { &mut self.tp2_prefix_graphs } else { &mut self.graphs };

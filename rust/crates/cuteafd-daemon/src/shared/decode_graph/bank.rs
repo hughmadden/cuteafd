@@ -105,6 +105,33 @@ pub(crate) struct CaptureTicket {
     committed: bool,
 }
 
+fn capture_failed(cache: &super::device::SharedCache, id: u64, error: &anyhow::Error) -> bool {
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if error.downcast_ref::<cuteafd_ffi::NativeStatusError>()
+        .is_some_and(|error| error.status == cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED) {
+        cache.capture_oom(id)
+    } else {
+        cache.cancel_capture(id);
+        true
+    }
+}
+
+impl CaptureTicket {
+    /// Keep native results and error precedence; settle failure before Drop can
+    /// discard an OOM ghost. `committed` also prevents reporting twice.
+    pub fn capture_result<T>(&mut self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        if let Err(error) = &result {
+            if !self.committed {
+                if capture_failed(&self.cache, self.id, error) {
+                    tracing::warn!(%error, "graph capture unavailable");
+                }
+                self.committed = true;
+            }
+        }
+        result
+    }
+}
+
 impl Drop for CaptureTicket {
     fn drop(&mut self) {
         if !self.committed {
@@ -242,14 +269,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     /// Returns whether the caller should emit the failure warning.
     pub fn cache_capture_failed(&mut self, id: u64, error: &anyhow::Error) -> bool {
         let Some(binding) = &self.device else { return true };
-        let mut cache = binding.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if error.downcast_ref::<cuteafd_ffi::NativeStatusError>()
-            .is_some_and(|error| error.status == cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED) {
-            cache.capture_oom(id)
-        } else {
-            cache.cancel_capture(id);
-            true
-        }
+        capture_failed(&binding.cache, id, error)
+    }
+
+    /// Consume a failed reservation without cancelling its retained OOM ghost.
+    pub fn cache_ticket_failed(&mut self, mut ticket: CaptureTicket, error: &anyhow::Error) -> bool {
+        let warn = if ticket.committed { false } else { self.cache_capture_failed(ticket.id, error) };
+        ticket.committed = true;
+        warn
     }
 
     pub fn cache_cancel(&mut self, id: u64) {
@@ -1005,6 +1032,55 @@ mod device_tests {
             bank.cache_tick();
             assert!(bank.cache_keys.is_empty(), "non-OOM cancellation does not retain a cooldown ghost");
         }
+    }
+
+    #[test]
+    fn raii_allocation_failure_retains_ghost_but_other_errors_cancel() {
+        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        bank.attach_device_for_test(-321, 1000, Site { spans_devices: true, ..site() }).unwrap();
+        let oom = anyhow::Error::new(cuteafd_ffi::NativeStatusError {
+            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED,
+            detail: "opaque diagnostic".into(),
+        }).context("peer graph capture");
+        let ticket = bank.cache_ticket(&1, false, None).unwrap();
+        assert!(bank.cache_ticket_failed(ticket, &oom));
+        bank.cache_tick();
+        assert_eq!(bank.cache_keys.len(), 1);
+        for _ in 0..256 { assert!(bank.cache_ticket(&1, false, None).is_none()); }
+        let ticket = bank.cache_ticket(&1, false, None).expect("cooldown expires");
+        assert!(!bank.cache_ticket_failed(ticket, &oom), "retained key warns once");
+        let ticket = bank.cache_ticket(&2, false, None).unwrap();
+        assert!(bank.cache_ticket_failed(ticket, &anyhow::anyhow!("ordinary capture failure")));
+        bank.cache_tick();
+        assert!(!bank.cache_keys.contains_key(&2));
+        assert!(bank.cache_ticket(&2, false, None).is_some(), "non-OOM has no cooldown");
+    }
+
+    #[test]
+    fn successful_begin_then_oom_end_reports_ticket_once() {
+        let mut bank: GraphBank<u32, u32> = GraphBank::new(None);
+        bank.attach_device_for_test(-322, 1000, Site { spans_devices: true, ..site() }).unwrap();
+        let mut ticket = bank.cache_ticket(&1, false, None).unwrap();
+        ticket.capture_result(Ok(())).unwrap();
+        assert!(!ticket.committed, "successful begin does not settle admission");
+        let oom = anyhow::Error::new(cuteafd_ffi::NativeStatusError {
+            context: "end capture".into(), status: cuteafd_ffi::CUTEAFD_STATUS_ALLOCATION_FAILED,
+            detail: "opaque diagnostic".into(),
+        });
+        assert!(ticket.capture_result::<()>(Err(oom)).is_err());
+        assert!(ticket.committed, "failed end settles before Drop");
+        assert!(bank.cache_ticket(&1, false, None).is_none());
+        // A second report must neither cancel the ghost nor reset its timer.
+        assert!(ticket.capture_result::<()>(Err(anyhow::anyhow!("later cleanup error"))).is_err());
+        assert!(!bank.cache_ticket_failed(ticket, &anyhow::anyhow!("duplicate report")));
+        bank.cache_tick();
+        for _ in 1..256 { assert!(bank.cache_ticket(&1, false, None).is_none()); }
+        assert!(bank.cache_ticket(&1, false, None).is_some());
+        let mut ticket = bank.cache_ticket(&2, false, None).unwrap();
+        assert!(ticket.capture_result::<()>(Err(anyhow::anyhow!("not OOM"))).is_err());
+        drop(ticket);
+        bank.cache_tick();
+        assert!(!bank.cache_keys.contains_key(&2));
     }
 
     #[test]

@@ -2328,14 +2328,15 @@ impl<'a> GlmEngine<'a> {
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            graphs.borrow_mut().cache_cancel(ticket);
-            tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            }
             return segment();
         }
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_cancel(ticket);
+            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
             return Err(error);
         }
