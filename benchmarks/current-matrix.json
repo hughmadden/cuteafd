@@ -170,7 +170,7 @@
       },
       "1rtx": {
         "status": "current",
-        "report": "benchmarks/mimo_v2/2026-10-30-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min"
+        "report": "benchmarks/mimo_v2/2026-11-10-smoke-mimo-v2-6-flash-mopd-1rtx-2spark-mimo26-flash-min"
       },
       "2rtx": {
         "status": "na",
@@ -281,8 +281,8 @@
         "reason": "doesn't fit"
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "v5 rc1 smoke not yet measured"
+        "status": "current",
+        "report": "benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min"
       },
       "2rtx": {
         "status": "current",
@@ -297,8 +297,8 @@
         "reason": "doesn't fit"
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "v5 rc1 smoke not yet measured"
+        "status": "current",
+        "report": "benchmarks/step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-1rtx-3spark-step5-exl3-k6core-min"
       },
       "2rtx": {
         "status": "current",
