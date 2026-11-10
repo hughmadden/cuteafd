@@ -519,17 +519,32 @@ mod tests {
                     rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
                     components: vec![DenseComponent { suffix: "bf16".into(), dtype: "BF16".into(),
                         shape: vec![128], source: DenseRange { path: "not-read".into(), offset: 0, bytes: 256 }, window: None }] });
+                let mla = cfg.attention.iter().position(|kind| *kind ==
+                    cuteafd_loader::families::glm5_flash::GlmNextAttention::Mla).context("fixture MLA")?;
+                let mut body = all.last().unwrap().clone();
+                body.tensor = format!("{}.input_layernorm.weight", selection.layer_prefix(mla)?);
+                body.ownership = DenseOwnership::new(DenseExecution::Replicated);
+                all.push(body);
                 let facts = DenseFacts::new(all, selection.clone(), cfg.layers, vec![0; world])?;
                 let dense = (0..world).map(|rank| {
                     let mut dense = NativeDenseRecords::from_records(&facts.records, &selection,
                         cfg.layers, world, rank, &Default::default())?;
-                    // This fixture exercises globals without unrelated layer operands.
-                    dense.layers.clear();
+                    // Keep one replicated MLA operand so peer scopes are nonempty.
+                    dense.layers.retain(|layer| layer.layer == mla);
                     Ok(dense)
                 }).collect::<Result<Vec<_>>>()?;
                 native_target(&facts, &dense, &cfg, embedding_rank)?
             } else {
-                let plans = (0..world).map(|rank| Ok(plan(rank)?.dense)).collect::<Result<Vec<_>>>()?;
+                use cuteafd_loader::plan::exlr8::dense::{DenseExecution, DenseOwnership};
+                let mut all = records.clone();
+                all.push(DenseRecord { tensor: "model.layers.0.input_layernorm.weight".into(),
+                    encoding: DenseEncoding::Bf16, shape: vec![128], side: ShardSide::Output,
+                    ownership: DenseOwnership::new(DenseExecution::Replicated), channels_per_shard: 128,
+                    rotation_id: 0, rotation: None, hessian_solved: false, native_blocks: 0,
+                    components: vec![DenseComponent { suffix: "bf16".into(), dtype: "BF16".into(),
+                        shape: vec![128], source: DenseRange { path: "not-read".into(), offset: 0, bytes: 256 }, window: None }] });
+                let plans = (0..world).map(|rank| DensePlan::for_rank(&all, world, rank)
+                    .map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?;
                 cuteafd_loader::placement::families::glm5::weights::WeightInventory::from_native(
                     &selection, 1, &plans)?.coordinator_arenas()?
             };
