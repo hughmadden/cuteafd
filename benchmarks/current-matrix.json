@@ -313,8 +313,8 @@
         "reason": "Release smoke measurement pending"
       },
       "1rtx": {
-        "status": "pending",
-        "reason": "Release smoke measurement pending"
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min"
       },
       "2rtx": {
         "status": "current",

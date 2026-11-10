@@ -208,7 +208,7 @@ concurrency point is that limit.
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>kindlingai/glm-5.3-flash-exlr8-k2-k3-k4</sub><br><sub></sub></td>
 <td width="27%" valign="top">pending<br><sub>Release smoke measurement pending</sub></td>
-<td width="27%" valign="top">pending<br><sub>Release smoke measurement pending</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/card.svg" alt="kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 on 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 1× DGX Spark"></a><br><sub>1× RTX + 1× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg" alt="kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 on 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550)"></a><br><sub>2× RTX</sub></td>
 </tr>
 </table>
