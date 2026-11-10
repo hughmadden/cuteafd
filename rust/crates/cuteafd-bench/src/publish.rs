@@ -34,6 +34,7 @@ pub fn family_title(family: &str) -> &str {
         "mistral_large4" => "Mistral Large 4",
         "glm5_flash" => "GLM 5.3 Flash",
         "mimo_v2" => "MiMo V2",
+        "muse_spark" => "Muse Spark",
         "qwen4" => "Qwen 3.8",
         "qwen3_5" => "Qwen 3.5 / 3.8 dense",
         "kimi_k3" => "Kimi K3",
@@ -491,7 +492,8 @@ fn link(dir: &Path, file: &str) -> String {
 }
 
 /// Family display order.
-const FAMILIES: [&str; 7] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4", "mimo_v2", "qwen4"];
+const FAMILIES: [&str; 11] = ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mistral_large4",
+    "mimo_v2", "qwen4", "kimi_k3", "step5", "muse_spark", "qwen3_5"];
 
 fn without_release_candidate(name: &str) -> &str {
     name.rsplit_once("-rc").filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
@@ -957,6 +959,23 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn release_smoke_families_have_named_publication_pages() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let smoke: Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("scripts/bench/release-smoke-v5.json")).unwrap()).unwrap();
+        let families: BTreeSet<_> = smoke["entries"].as_array().unwrap().iter()
+            .map(|entry| entry["family"].as_str().unwrap()).collect();
+        assert!(!families.is_empty());
+        for family in families {
+            assert!(FAMILIES.contains(&family), "{family} is missing from FAMILIES");
+            assert_ne!(family_title(family), family, "{family} needs a display title");
+            assert!(root.join("docs/models").join(format!("{family}.md")).is_file(),
+                "{family} needs its publication page");
+        }
+        assert_eq!(family_title("muse_spark"), "Muse Spark");
+    }
 
     /// A publication marker: cell selection reads report data, never a directory name.
     fn marker(p: &mut Placed, name: &str, value: &str) {
