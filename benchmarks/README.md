@@ -250,6 +250,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## GLM 5.3 Flash
 
+- 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · simulated 5090: RTX PRO 6000 (188 SMs) capped at 31.799999999813735 GiB + 4 Spark · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-4spark-glmf-exlr8-k4-5090/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 1× DGX Spark · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/report.svg)
 - 2026-11-10 · Release smoke · kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 · 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550) · build v5.0.0-rc2 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) · build v5.0.0-rc1 · [report](glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-hqa-2rtx-glm53f-exl3-k6-max-fp8-compact/report.svg)
