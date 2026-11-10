@@ -469,7 +469,17 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
         assert (ROOT / entry["config"]).is_file()
         values = {**keys(ROOT / entry["config"]), **smoke["defaults"]["set"], **entry["set"]}
         assert re.fullmatch(r"[a-f0-9]{40}", values["MODEL_REVISION"])
-        for port in (values["ADDR"].rsplit(":", 1)[1], values["EXPERT_PORT"]):
+        family = entry["family"]
+        if family == "deepseek_v41":
+            assert "EXPERT_BACKEND" not in values
+        else:
+            assert not any(re.fullmatch(r"SPARK_\d+_LANE_B", key) for key in values)
+        if family == "qwen3_5":
+            assert "EXPERT_PORT" not in values
+        card_ports = [values["ADDR"].rsplit(":", 1)[1]]
+        if "EXPERT_PORT" in values:
+            card_ports.append(values["EXPERT_PORT"])
+        for port in card_ports:
             assert port not in ports
             ports.add(port)
         assert len(entry["gpus"]) == int(values["RTX_GPUS"])
