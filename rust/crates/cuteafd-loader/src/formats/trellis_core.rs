@@ -92,8 +92,8 @@ impl CoreWeightLayout {
             crate::formats::dense_trellis::TrellisSide::Output=>(n/ranks,k),
             crate::formats::dense_trellis::TrellisSide::Input=>(n,k/ranks),
         };
-        ensure!(matches!(projection.bits,2..=6) && n>0 && k>0 && n%128==0 && k%128==0,
-            "dense trellis K2-K6 local H128 geometry");
+        ensure!(matches!(projection.bits,4 | 6 | 8) && n>0 && k>0 && n%128==0 && k%128==0,
+            "dense trellis K4/K6/K8 local H128 geometry");
         let payload=n.checked_mul(k).and_then(|v|v.checked_mul(projection.bits))
             .context("dense trellis payload extent overflow")?/8;
         let vectors=n.checked_add(k).and_then(|v|v.checked_mul(2))
@@ -179,8 +179,14 @@ impl ProjectionScratchLayout {
 /// A family's explicit geometry and TP split, never inferred from a side map.
 pub struct CoreContract {
     pub split: CoreSplit,
-    pub bits: usize,
     pub padded_outputs: bool,
+}
+
+/// Dense core rates are independent of the routed-expert kernel inventory.
+pub fn validate_core_width(stem: &str, bits: usize) -> Result<()> {
+    ensure!(matches!(bits, 4 | 6 | 8),
+        "{stem}: unsupported dense core width K{bits}; add dense_trellis_k6 trellis_linear K{bits} program in python/tools/aot/export_b12x_dense_trellis_k6_aot.py (supported: K4/K6/K8)");
+    Ok(())
 }
 
 /// Read each missing selected shard header once, including index-only role
@@ -222,7 +228,7 @@ pub fn read_projections(
         ensure!(shape.len() == 2, "{stem}: core projection must be a matrix");
         let suffixes = members.keys().map(String::as_str).collect::<Vec<_>>();
         let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|t| &t.meta))?;
-        ensure!(module.bits == contract.bits, "{stem}: core requires K{}, found K{}", contract.bits, module.bits);
+        validate_core_width(&stem, module.bits)?;
         let padded = contract.padded_outputs && module.output_features == shape[0].next_multiple_of(128);
         ensure!(module.input_features == shape[1] && (module.output_features == shape[0] || padded),
             "{stem}: core header shape [{},{}], expected {shape:?} (only explicit N128 padding is allowed)",
@@ -270,6 +276,28 @@ mod tests {
     }
 
     #[test]
+    fn header_widths_have_exact_residency_and_actionable_rejection() -> Result<()> {
+        for bits in 1..=8 {
+            if matches!(bits, 4 | 6 | 8) {
+                validate_core_width("model.projection", bits)?;
+                let mut p = projection(256, 512, CoreSplit::Output);
+                p.bits = bits;
+                for ranks in [1, 2] {
+                    let layout = CoreWeightLayout::new(&p, TrellisSide::Output, 0, ranks)?;
+                    assert_eq!(layout.bytes, 512 * 256 * bits / 8 / ranks + 2 * (512 + 256 / ranks));
+                    assert_eq!(layout.bytes as u64, p.resident_bytes(ranks)?);
+                    assert_eq!(layout.arena_tensors("projection")?.iter().map(|(_, b)| b).sum::<usize>(), layout.bytes);
+                }
+            } else {
+                let error = validate_core_width("model.projection", bits).unwrap_err().to_string();
+                assert!(error.contains(&format!("unsupported dense core width K{bits}")), "{error}");
+                assert!(error.contains("model.projection") && error.contains("trellis_linear") && error.contains("export_b12x_dense_trellis_k6_aot.py"), "{error}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn padded_kv_a_layout_keeps_full_transform_extent() -> Result<()> {
         let mut p = projection(576, 6144, CoreSplit::Whole);
         p.stored_outputs = 640;
@@ -288,7 +316,7 @@ mod tests {
         }
         assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 2).is_err());
         let mut p = projection(128, 128, CoreSplit::Whole);
-        for bits in [1, 7] {
+        for bits in [1, 2, 3, 5, 7] {
             p.bits = bits;
             assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).is_err());
         }

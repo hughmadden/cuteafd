@@ -34,8 +34,8 @@ pub fn widths(checkpoint: &Checkpoint) -> Result<Widths> {
         match q.get(key) {
             None => default.with_context(|| format!("Step-5 EXL3 requires quantization_config.{key}")),
             Some(v) => {
-                let bits = v.as_f64().filter(|b| b.fract() == 0.0 && (2.0..=6.0).contains(b))
-                    .with_context(|| format!("Step-5 EXL3 {key} must be an integer K2..K6, found {v}"))?;
+                let bits = v.as_f64().filter(|b| b.fract() == 0.0 && (1.0..=8.0).contains(b))
+                    .with_context(|| format!("Step-5 EXL3 {key} must be an integer K1..K8, found {v}"))?;
                 Ok(bits as usize)
             }
         }
@@ -107,16 +107,12 @@ impl CoreInventory {
     /// width. Index-only role inventories read the needed headers once.
     pub fn from_checkpoint(cfg: &Config, checkpoint: &Checkpoint) -> Result<Self> {
         if !is_exl3(checkpoint) { return Ok(Self::default()); }
-        let widths = widths(checkpoint)?;
         let shapes = expected(cfg);
         let selected = |name: &str| !name.contains(".experts.") && (name.starts_with("lm_head.")
             || name.starts_with("model.layers."));
         let projections = read_projections(checkpoint, &shapes, selected, |stem| {
             let split = split(cfg, stem)?;
-            let mtp = stem.strip_prefix("model.layers.").and_then(|r| r.split('.').next())
-                .and_then(|l| l.parse::<usize>().ok()).is_some_and(|l| l >= cfg.layers);
-            let bits = if mtp { widths.mtp } else if stem == "lm_head" { widths.head } else { widths.core };
-            Some(CoreContract { split, bits, padded_outputs: false })
+            Some(CoreContract { split, padded_outputs: false })
         })?;
         let inventory = Self { projections };
         inventory.validate_groups(cfg)?;

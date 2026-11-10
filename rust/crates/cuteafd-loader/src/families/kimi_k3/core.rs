@@ -385,7 +385,7 @@ impl CoreInventory {
             |name| !name.contains(".experts.")
                 && (name.starts_with("language_model.model.") || name.starts_with("language_model.lm_head.")),
             |stem| split(stem).map(|split| crate::formats::trellis_core::CoreContract {
-                split, bits: 6, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                split, padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa")
                     && expected.get(&format!("{stem}.weight")).is_some_and(|shape|
                         shape.first() == Some(&(cfg.kv_lora_rank + cfg.qk_rope_dim))),
             }))?;

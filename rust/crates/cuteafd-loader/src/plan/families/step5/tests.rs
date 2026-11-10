@@ -1538,7 +1538,7 @@ fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
         .map(|meta| CheckpointTensor { shard: shard.clone(), meta }));
     cp.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
     let error = format!("{:#}", Model::open(&cp).err().unwrap());
-    assert!(error.contains("core requires K6, found K5"), "{error}");
+    assert!(error.contains("unsupported dense core width K5"), "{error}");
     // A routed layer declared K6 but stored K4 fails against the declaration.
     let mut config: Value = serde_json::from_slice(&std::fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
     config["quantization_config"]["expert_bits_by_layer"]["87"] = serde_json::json!(6.0);

@@ -50,10 +50,10 @@ pub struct DenseTrellisWorkspace {
 impl DenseTrellisGeometry {
     pub fn workspace(self) -> Result<DenseTrellisWorkspace> {
         let Self { input: k, output: n, bits, side, rows, .. } = self;
-        if !matches!(bits, 2..=6) || !matches!(side, 1 | 2) || k == 0 || n == 0
+        if !matches!(bits, 4 | 6 | 8) || !matches!(side, 1 | 2) || k == 0 || n == 0
             || k % 128 != 0 || n % 128 != 0 || rows == 0
             || [k, n, rows].iter().any(|&v| v > i32::MAX as usize) {
-            return Err(DenseTrellisError::Invalid("K2-K6/H128/side/row geometry"));
+            return Err(DenseTrellisError::Invalid("K4/K6/K8/H128/side/row geometry"));
         }
         let product = |values: &[usize]| values.iter().try_fold(1usize, |a, &b| a.checked_mul(b))
             .ok_or(DenseTrellisError::Invalid("workspace size overflow"));
@@ -416,7 +416,7 @@ impl DenseTrellisPolicy {
     }
     fn validate(&self) -> Result<()> {
         if self.input==0 || self.input%128!=0 || self.output==0 || self.output%128!=0 || !matches!(self.side,1|2)
-            || !matches!(self.bits,2..=6)
+            || !matches!(self.bits,4 | 6 | 8)
             || !matches!(self.codebook.as_str(),"mcg"|"mul1")
             || [&self.shape,&self.native,&self.native_input,&self.output_program].iter().any(|name|name.is_empty()) {
             return Err(DenseTrellisError::Invalid("row-policy geometry/route/scratch"));
