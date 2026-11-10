@@ -6567,3 +6567,315 @@ and the 30-minute progress timer is disabled. Do not replay the old checksum
 finisher against the intentionally retired local weights; final native command
 sources/results are retained in `muse-quant-work/native_finish.py` and
 `production-k128/native-cli-jobs/`.
+
+## Static review: dual 48 GB RTX 4090 D, V4.1 (2026-11-11 Sydney)
+
+Scope: cuteafd **379b267921fa983035107c6c01d800fd27294075** and SparkInfer
+**ce9aec549307cf7736ea296b0e71d190923fc9c1**, on local branch
+**codex/dsf41-4090d-static-review**. Source inspection and primary online
+research only: no engine, GPU probes, builds, model downloads or benchmarks.
+No other agents' working files, reports, sessions or worktrees were consulted.
+The kernel pin was fetched from Hugh's remote into this review's own checkout.
+No implementation or launch configuration was changed.
+
+The target is Ada SM89, 114 SMs per 4090 D; the extra VRAM does not add SMs
+or Blackwell block-scaled instructions. The committed measurements below used
+a two-card coordinator with four Sparks. Their topology and checkpoint revision
+are historical evidence, not a claim about the current deployment. In
+particular, the checked-in default checkpoint revision and the 1017 checkpoint
+used by some commit measurements must not be mixed in a future A/B.
+
+**Recommendation:** address the forced approximate partial-prefix path below
+to establish an exact-cache baseline. For performance, first remove redundant
+attention-merge work and empty expert compute blocks; pursue exact intermediate
+prefix snapshots for repeated long prompts. Do not trade away the newly
+repaired expert accumulation.
+Memory arithmetic is firmer than timing estimates. All prospective speedups
+below are hypotheses or conditional examples, not measured results, and must
+not be added together.
+
+### What is already present
+
+- Native source KV is already FP4 E2M1/group-16 with E4M3 scales; local SWA
+  remains FP8. Four shared sources at layers 2, 8, 14 and 20 consume
+  2.5 * (288 + 68) = **890 bytes/token** across the coordinator pair in the
+  default nonreplicated layout. One 1,048,576-token history is **0.869 GiB**
+  of source storage, before rings, page tables, marks and workspaces. Sources
+  are not duplicated on both cards unless optional TP2 attention is enabled.
+- Radix top-k, SM89 grouped sparse attention/vectorized gathers, two decode
+  lanes, GPU sampling, COW source pages, exact prompt/turn marks, host paging,
+  Engram row caching/lookahead, TP2 dSpark and a static GPU expert tier exist.
+- Decode reservations already grow by chunks. The lifetime-reservation comment
+  atop V4.1's prefix adapter is stale; scheduler admission and reserve_round
+  implement the newer policy. Recommending paged KV or chunked reservation as
+  a missing feature would be incorrect.
+- Commit [643b6aa09](https://github.com/hughmadden/cuteafd/commit/643b6aa09)
+  already fixes slow SM-to-host prefill staging on the EPYC/4090 D setup.
+  Commit [982d068c7](https://github.com/hughmadden/cuteafd/commit/982d068c7)
+  supplies the grouped attention changes, enabled by 8f9453a81.
+- Commit [379b26792](https://github.com/hughmadden/cuteafd/commit/379b26792)
+  records 99.973% expert BF16 agreement with the recipe after replacing Ada
+  FP8 MMA with two FP16 MMAs, versus 75% before. These are recorded component
+  results, not whole-model accuracy measurements from this review.
+
+### Accuracy finding: V4.1 forces approximate partial-prefix reuse on
+
+**Confirmed control flow; task-level accuracy impact unmeasured.**
+[prepare_prefix_cache](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs#L205)
+passes true to both layout(..., partial) and PrefixCache::new(..., partial).
+For a matching prefix inside a longer saved snapshot,
+[plan](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/prefix.rs#L151)
+returns ApproximateReplay. The restore discards the saved encoder windows and
+[restarts them empty 128 tokens earlier](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_backbone_cache/prefix.rs#L87).
+The shared cache accepts this fidelity; it is not merely an unused enum.
+V4.1's dedicated NativeServeArgs has no prefix_partial switch, so the generic
+shared argument's default-off setting does not protect this serving path.
+
+This changes reconstructed state based on the cache-hit position and does
+not satisfy the repository's byte-exact prefix-restore requirement. It is
+not evidence of a measured task-score regression. DeepSeek's own report
+describes bounded encoder replay as approximate with small observed quality
+impact; that does not establish zero regression on this fork or workload.
+
+Expose an exact-only policy and apply it consistently to device/host lookup
+and restore: reuse the deepest retained complete ancestor, otherwise prefill
+fresh. Preserve the current exact full-mark path. Partial matches may become
+slower; this is an accuracy prerequisite, not a speed claim. Intermediate
+exact marks in item 3 recover much of that performance without empty-window
+reconstruction. Any approximate mode should be an explicit quality tradeoff.
+
+### 1. Share the attention merge's scalar softmax work
+
+**High confidence in redundant source work; medium confidence in payoff.**
+[merge](native/families/deepseek_v41/cuda/v41_sparse_attention.cu#L439)
+launches 256 threads per row/head. Every thread independently computes the
+same maximum, ten exponential scale factors, normalizer and sink exponential;
+only the two output dimensions differ. A ten-part, 64-head row therefore
+expresses **180,224 scalar exponential evaluations** for just **704 distinct
+values**. These are source-level counts, not a claim about emitted SASS.
+
+Compute factors once per head CTA, or once per warp if synchronization is
+cheaper, and broadcast them. Preserve the ordered FP32 fmaf chain per output
+column, the normalizer's exact summation order, invalid-row sentinel, expf
+semantics, sink and final BF16 rounding. Keep the existing ten/two-part recipe;
+changing split count is a different numerical experiment.
+
+Planning target: **1.2-2x faster merge**, conditional on scalar work dominating
+this kernel. If merge is 10-20% of attention time, that means approximately
+**2-11% faster attention**, not a comparable whole-engine gain. Inspect SASS
+first; reject if broadcasts/barriers consume the savings. Amdahl's law applies
+again to attention's share of token latency. No KV precision/storage changes.
+
+### 2. Stop scheduling an output-tile grid for every possible expert group
+
+**High confidence in excess compute scheduling; medium confidence in payoff.**
+[V41SlicePipeline](third_party/sparkinfer/b12x/moe/_shared/kernels/v41_slice_pipeline.py#L130)
+launches an upper bound on group count from rows/top-k, although
+[V41RoutePlan](third_party/sparkinfer/b12x/moe/_shared/kernels/v41_route_plan.py#L60)
+has already constructed the compact, live groups. Both SM89 FC kernels launch
+an output-tile grid across that upper bound and test metadata[group,1].
+The GPU tier makes this particularly wasteful: nonresident routes are -1.
+
+For six target rows, the bound is 36 groups. At TP2 I=1152/H=5120, defaults
+launch 36 FC1 plus 80 FC2 output CTAs per group. If eight groups actually run,
+this schedules **4,176 CTAs instead of 928 useful expert-compute CTAs** per
+GPU/layer. The 3,248 others do no expert matrix work. FC2 also zeros invalid
+route outputs, so they cannot simply be deleted without replacing that work.
+
+Have the planner publish the actual group count in device memory. Use a
+bounded persistent grid with deterministic task assignment over live groups,
+retaining each output's K ordering and the invalid-route zeroing contract.
+Do not download the count to the CPU or introduce graph recapture/dynamic
+allocation. Preserve parallelism for small group counts and avoid a contended
+global work queue when static striding suffices. Fuse the one-integer publish
+kernel into planning if the ABI permits it.
+
+The example removes **78% of scheduled expert-compute tile slots**, not 78% of runtime.
+A useful target is **5-15% less local expert-call time on sparse tier hits**;
+if removable scheduling is only 2% of the call, the ceiling is only 2%.
+Whole-engine gain can be zero when Sparks remain the critical path. This also
+applies to dSpark's three-route expert calls, with their own geometry.
+
+### 3. Add CED-aware exact intermediate prefix checkpoints
+
+**High confidence that this integration is missing; workload-dependent gain.**
+[PrefixArgs](rust/crates/cuteafd-daemon/src/shared/prefix.rs#L47) exposes gap
+and message-boundary checkpoint controls for other families. V4.1's dedicated
+arguments and scheduling do not wire these controls in. Its captures are
+[prompt completion](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler.rs#L726)
+and [turn completion](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_native_serve/scheduler/independent.rs#L427).
+Turning on the generic point knobs alone will not add V4.1 checkpoints.
+
+Example against an **exact-only cold baseline**: two 32K prompts share their
+first 24K tokens, but neither full prompt is a prefix of the other and there
+is no shorter retained ancestor. An exact 24K checkpoint can skip 75% of the
+second prompt's encoder tokens. Using only
+the historical 4.9-5.6K tok/s figures from 643b6aa09 as an illustrative rate,
+that is about **4.4-5.0 seconds** of prefill work avoided, less checkpoint,
+restore and remaining decoder costs. This is not a forecast for the supplied
+commit or every prompt. Existing exact ancestor hits gain nothing. The current
+approximate partial-hit path already skips almost all this work: against that
+path, the benefit is exact state plus avoiding 128 replay tokens (roughly
+23-26 ms at those illustrative rates), not a 4-5 second additional saving.
+Extra capture/restore cost may outweigh that small timing benefit.
+
+This requires a new snapshot capability, not a call inserted mid-prefill:
+[copy_mark](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_backbone_cache/prefix.rs#L171)
+requires CachePhase::Full. At an encoder unit frontier, retain the exact
+20 encoder rings, compressor carry, Engram lookback, and all four published
+source frontiers/pages, including layer 20's global source. Tag the mark as
+encoder-only. Initially admit it only for continuations with at least 128 new
+tokens: the existing final decoder replay then lies entirely in the suffix.
+Shorter suffixes and exact-end hits need complete decoder/dSpark state and
+logits, or must fall back to an older complete snapshot. Do not advertise
+encoder marks as full marks. Drain unit publication before copying.
+
+Full target+dSpark marks currently cost **2.787 MiB each**, plus up to one
+455,680-byte private tail unit and retained score/metadata storage. An
+encoder-only ring/carry mark needs about **1.30 MiB** before metadata. Capture
+a small number of useful message boundaries, not every 512-token page.
+Global pages should remain shared; a 32K source history is already 27.8125 MiB.
+Cache gains require users to repeat stable prefixes before the marks are evicted.
+
+### 4. Batch exact snapshot capture and restore copies
+
+**High confidence in call count; timing needs measurement.**
+[WindowState::retain_prefix](rust/crates/cuteafd-daemon/src/families/deepseek_v41/v41_window/prefix.rs#L31)
+issues two copies per ring span plus one 8-byte end copy. Across 40 full rings,
+that is **120 copies at a ring-aligned frontier or 200 at a wrapped frontier**,
+before compressor carry, draft rings and tail pages. Restore has the same
+pattern. Each reaches cudaMemcpyAsync through
+[cuteafd_copy_d2d_async](native/shared/src/cuteafd_native.cc#L2046).
+
+Batch the initialized spans with a stable descriptor list, grouped by device
+and dependency, using a gather/scatter kernel or a supported batched-copy API.
+Keep independent capture lanes, source lifetimes, cross-device fences and
+partial-failure drains. Never copy uninitialized ring padding. Benchmark SM
+copies against DMA on this EPYC topology: the already-fixed prefill staging
+problem is a warning against assuming the former is always faster.
+
+Illustrative ceiling: at 1-3 microseconds of host submission/queue overhead per
+small copy, replacing 120-200 submissions saves roughly **0.12-0.60 ms per
+capture/restore**, before batching overhead. The actual per-call cost is
+unknown. This improves short-turn latency and CPU efficiency; it does not
+increase long-generation steady-state tok/s or shrink the stored KV itself.
+
+### 5. Optimize exact FP16 expert execution, within its bandwidth ceiling
+
+**Medium confidence in opportunity; low confidence without compiler inspection.**
+[promoted_mma_f16](third_party/sparkinfer/b12x/moe/_shared/kernels/w4a8_v41_sm89.py#L217)
+widens four weight words and two activation words per MMA wrapper call.
+FC1 calls it for four output fragments and optionally two row tiles; FC2 for
+two output fragments and optionally two row tiles. Activations can be reused
+across fragments and weights across row tiles. Hoist widening only where the
+compiler has not already done so: the conversion inline asm is explicitly
+side-effect-free, so source repetition alone does not prove repeated SASS.
+
+Next inspect direct lossless E2M1-to-FP16 expansion and a short software
+pipeline overlapping the next compressed load batch with current MMAs.
+Current code batches loads before compute; it is not a weight prefetch-free
+baseline. Retain two m16n8k16 operations per K32 block, zero initialization,
+UE8M0 scale promotion, ascending K/warp folds, BF16 intermediate rounding and
+MXFP8 requantization. Do not change warp/K partition just to reduce instruction
+count without separately qualifying the numerical result.
+
+The [tier cost model](rust/crates/cuteafd-loader/src/placement/expert_tier.rs#L217)
+records a prior 24-expert wave at 94% of the stated 1008 GB/s card bandwidth.
+The exact-MMA pin costs 1.8-4.7% on 8-48-expert waves and 14-22% on a lone
+expert call. A sensible planning range is **0-7% faster wide local expert
+waves**, with more opportunity in the small-call overhead and no expectation
+of a large bandwidth gain. If local experts occupy 30% of step time, a 3-7%
+kernel speedup gives only **0.9-2.0% end-to-end** before overlap. Stop if SASS
+already reuses conversions, or additional registers reduce occupancy.
+
+### 6. Use a smaller existing decode-reservation chunk when the pool is tight
+
+**Exact capacity arithmetic; configuration experiment, not a missing feature.**
+The default is 16,384 tokens. At 16 active requests with enough remaining
+output allowance, choosing 2,048 instead releases up to
+16 * (16,384 - 2,048) * 890 = **194.6875 MiB of reservation headroom** across
+the default coordinator layout. This is more usable space inside an already
+allocated pool, not 195 MiB returned to CUDA or a reduction in live KV bytes.
+The maximum reduction is 87.5% of the speculative reservation chunk, not of
+total KV. For smaller output limits the saving is smaller or zero.
+
+The code already tops up reservations at drained boundaries. Smaller chunks
+cause up to eight times as many top-ups and can pause both lanes more often;
+no throughput benefit is promised. Preserve the drain guarantee and leave
+early termination disabled, so this changes resource scheduling rather than
+truncating responses. First test only if pool-pressure/admission counters
+justify it; the normal 2M-token source pool itself is just 1.738 GiB.
+
+### Lower-priority research candidate: reuse decoded selected KV across layers
+
+There are 38 indexed attention layers but only eight index-producing layers.
+Within a reuse group, selected global KV records are unchanged, whereas the
+native attention kernel gathers/decodes them again for every layer. A
+lane-local cache of the exact BF16 decoded records could remove up to
+**30/38 = 79%** of those repeated source-gather/dequantization operations.
+SWA remains layer-specific. Keys must include selection/source version,
+position, overlay and lane; publish only after source production completes.
+
+This is not a 79% attention speedup. The expanded cache costs 512 KiB per
+query row (20 MiB for 40 rows per lane), versus 144 KiB of packed source
+records. Extra writes and 3.56x wider reads can lose on bandwidth/L2 pressure;
+prefill-sized expansion is especially unattractive. Restrict an initial
+experiment to decode and retain it only if conversion/irregular-gather stalls
+dominate. If those costs are 20% of attention time, even perfect removal of
+79% gives only a 1.19x attention ceiling before the new traffic. Zero or
+negative gain is plausible. Persistent KV stays in its native FP4 format.
+
+### Accuracy boundary and primary research
+
+The proposed mechanical optimizations should preserve the current execution's
+bits, but no accuracy result was established here. Keep the exact-MMA default,
+all six target expert routes, 512 selected keys, quantization scales and
+ordered reductions. Do not shrink top-k, quantize SWA further, switch the wire
+to lossy FP8/NVFP4, or use atomic accumulation to obtain an easy speed number.
+Dynamic expert migration is also not a free cache optimization: the existing
+tier_cache module correctly prices prefix invalidation when GPU/Spark low-bit
+arithmetic changes. Keep residency stable during a cache epoch.
+
+- [DeepSeek V4.1 report, sections 2.3/2.4/3.2](https://arxiv.org/html/2609.19969v1):
+  supports the existing shared-source/FP4 design. Its encoder SWA bounded
+  replay explicitly reconstructs approximate state, so it is excluded from
+  the exact-cache recommendation. Exact continuation above is relative to
+  this fork's existing CED prefill semantics; it does not claim those semantics
+  equal a full 40-layer decoder prefill.
+- [FlashAttention-2](https://arxiv.org/abs/2307.08691): motivates reducing
+  scalar softmax work and warp communication. Its published A100 speedups
+  are not estimates for this fork's already optimized SM89 attention.
+- [FlashInfer](https://arxiv.org/abs/2501.01005): useful precedent for balancing
+  runtime work while retaining CUDA-graph-compatible storage and scheduling.
+  Borrow the mechanism, not its reported speedup or its serving dependency.
+- [SGLang/RadixAttention](https://arxiv.org/abs/2312.07104) and
+  [PagedAttention](https://arxiv.org/abs/2309.06180): support exact prefix
+  sharing and avoiding unnecessary reservation/duplication. The fork already
+  has the fundamental cache mechanisms; V4.1 intermediate marks are the gap.
+- [Marlin's implementation notes](https://github.com/IST-DASLab/marlin#techniques):
+  relevant load/dequantization overlap and register reuse on Ampere/Ada.
+  Its FP16xINT4 kernel is not a drop-in for V4.1's calibrated MXFP4/MXFP8 path.
+- [NVIDIA Ada tuning guide](https://docs.nvidia.com/cuda/ada-tuning-guide/index.html):
+  check 64K registers/SM and 100 KiB shared-memory limits when attempting
+  these changes. Query actual SM/L2 properties; the full AD102 cache figure
+  is not a guarantee for this modified 4090 D configuration.
+
+### Future acceptance bars; no hardware work performed for this review
+
+Inspect generated code before spending GPU time. Then qualify one change at
+a time: byte-exact attention/expert outputs against this pin; live-row,
+capacity, graph-replay, invalid-route and page-boundary cases; prefix restores
+against fresh execution including odd compressor carry, suffixes of 127/128/129
+tokens, media and two-lane cancellation. Encoder-only marks must reproduce
+every initialized encoder/source byte and the final continued request state.
+Run the existing golden/logprob checks on the identical checkpoint and recipe
+before accepting any non-bitwise arithmetic change.
+
+Use one warmed baseline/candidate pair on this two-card topology for a first
+decision, C1 plus C16 if the path is shared. Report emitted tok/s, prefill/TTFT,
+memory headroom, and power/thermal windows; acceptance rate is not speed.
+For merge/grid changes, seek at least 5% component improvement without a
+clear whole-engine regression. For prefix marks, measure saved prefill minus
+capture/restore/eviction cost on actually branching prompts. Stop on an
+unexplained numerical mismatch or exhausted theoretical ceiling. None of
+these future checks was run in this static review.
