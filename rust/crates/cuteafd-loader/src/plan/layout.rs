@@ -319,7 +319,7 @@ impl Default for LayoutOptions {
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_slots: None,
             mimo_decode_graphs: true,
-            step5_decode_graphs: false,
+            step5_decode_graphs: true,
             physical_sms: None,
             mimo_draft_bf16: false,
             mimo_drafter_disabled: false,

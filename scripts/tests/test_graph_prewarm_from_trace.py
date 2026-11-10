@@ -1929,6 +1929,15 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
         MODULE.generate_qwen35([data], layout["variant"])
 
 
+def test_step5_launcher_defaults_graphs_on_for_plan_and_serve():
+    launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
+    assert 'step5_decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
+    assert '--step5-decode-graphs "$step5_decode_graphs"' in launcher
+    step5 = launcher.split('step5_decode_graphs="$(get DECODE_GRAPHS on)"', 1)[1].split("esac", 1)[0]
+    assert 'on) family_args+=(--decode-graphs true)' in step5
+    assert 'off) family_args+=(--decode-graphs false)' in step5
+
+
 def test_dense_qwen_launcher_defaults_graphs_on_for_plan_and_serve():
     launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
     for section in ("shared_graph_census_args()", "plan_profile_env=()"):

@@ -635,8 +635,8 @@ pub(crate) struct PlanArgs {
     /// MiMo segmented decode graph storage (matches serving; on by default).
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     pub(crate) mimo_decode_graphs: String,
-    /// Step-5 decode/verify layer sections; eager until card qualification.
-    #[arg(long, default_value = "off", value_parser = ["on", "off"])]
+    /// Step-5 decode/verify layer sections (matches serving; on by default).
+    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
     pub(crate) step5_decode_graphs: String,
     /// Physical coordinator SM count for memory-budget simulations.
     #[arg(long)]

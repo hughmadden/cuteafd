@@ -1392,7 +1392,7 @@ mod tests {
             draft_sequences: None,
             draft_context_slots: None,
             mimo_decode_graphs: "on".into(),
-            step5_decode_graphs: "off".into(),
+            step5_decode_graphs: "on".into(),
             physical_sms: None,
             mimo_draft_bf16: false,
             glm5_draft_bf16: false,

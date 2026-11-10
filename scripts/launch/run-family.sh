@@ -1868,7 +1868,7 @@ fi
 # is auto (default: the planner picks the RTX-onboarded routed layers and marks)
 # or a fixed count, which admission must then fit.
 if [[ "$family" == step5 ]]; then
-  step5_decode_graphs="$(get DECODE_GRAPHS off)"
+  step5_decode_graphs="$(get DECODE_GRAPHS on)"
   case "$step5_decode_graphs" in
     on) family_args+=(--decode-graphs true) ;;
     off) family_args+=(--decode-graphs false) ;;

@@ -67,7 +67,7 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     /// Replay bounded persistent decode/verify sections (prefill remains eager).
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     decode_graphs: bool,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
@@ -684,6 +684,22 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn decode_graphs_default_on_and_allow_explicit_off() {
+        assert!(args().decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1", "--decode-graphs", "false"]).unwrap();
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert!(!args.decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "on");
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m", "--step5-decode-graphs", "off"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "off");
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_decode_graphs);
     }
 
     #[test]
