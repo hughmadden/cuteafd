@@ -398,6 +398,7 @@ fn load_rows_with<'a>(library: &'a NativeLibrary, slice: &DenseSlice, staging: &
         ensure!(std::ptr::eq(owner.device.library, library), "native vocabulary library mismatch");
         Ok(DeviceAllocation::from_allocation(owner))
     };
+    // Arena keys follow the component recipe, not the kernel's pointer names.
     let weights = RowFp8Weights {
         payload: plane(&requests[0].0, requests[0].1)?,
         scales: plane(&requests[1].0, requests[1].1)?,
