@@ -383,16 +383,16 @@ async fn run() -> Result<()> {
                     cuteafd_transport::wait_policy::WaitPolicy { wait: cli.host_wait,
                         idle_park: std::time::Duration::from_secs_f64(cli.idle_park_seconds) }, cuteafd_core::spark_reply::SparkReplyFormats {
                             prefill: cli.spark_prefill_reply_format, decode: cli.spark_decode_reply_format },
-                    cli.coordinator_weight_budget_gib)
+                    cli.coordinator_weight_budget_gib, cli.graph_disable_low_mem)
             },
             Err(error) => error.exit(),
         }
     };
-    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget) =
+    let (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch, initial_wait, initial_reply, initial_weight_budget, initial_graph_floor) =
         parse(Cli::command().get_matches());
     let mut selected_view = None;
     // `serve` and `golden` pick the family and stand for its own command.
-    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget) = match command {
+    let (mut command, matches, family_budget, family_vision, family_audio, family_image_cap, family_fetch, wait_policy, family_reply, family_weight_budget, family_graph_floor) = match command {
         Commands::Serve(args) => match commands::family::resolve(commands::family::Kind::Serve, args)? {
             Some(resolved) => { selected_view = resolved.view; parse(Cli::command().get_matches_from(resolved.argv)) },
             None => return Ok(()),
@@ -402,7 +402,7 @@ async fn run() -> Result<()> {
             None => return Ok(()),
         },
         command => (command, matches, initial_budget, initial_vision, initial_audio, initial_image_cap, initial_fetch,
-            initial_wait, initial_reply, initial_weight_budget),
+            initial_wait, initial_reply, initial_weight_budget, initial_graph_floor.clone()),
     };
     if let Some((role, directory)) = shared::memory_report::dump_location(&matches) {
         let host = std::env::var("CUTEAFD_PROFILE_HOST").unwrap_or_else(|_| {
@@ -479,9 +479,11 @@ async fn run() -> Result<()> {
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
     policy.install().map_err(anyhow::Error::msg)?;
+    let graph_floor = family_graph_floor.or(initial_graph_floor);
+    shared::decode_graph::device::set_physical_floor(graph_floor.clone())?;
     shared::memory_report::register_inputs(&matches, &policy, weight_budget_gib);
     // A serve command's resolved options, for the server's benchmark reports.
-    commands::bench::capture(&matches, memory)?;
+    commands::bench::capture(&matches, memory, graph_floor.as_deref())?;
     // Memory ledger reports for the long-running roles (device use by category).
     match &command {
         Commands::Expertd(_) => {

@@ -33,6 +33,8 @@ size_t fixture_device_free_mismatch(int *owner, int *current) {
 static int bind_after = -1, bind_calls;
 void fixture_configure_bind_after(int after) { bind_after = after; bind_calls = 0; }
 static size_t memory_total[8], memory_used[8], graph_bytes;
+static size_t memory_queries;
+size_t fixture_memory_queries(void) { return memory_queries; }
 static int immediate_copies;
 /* Untouched, per-owner virtual extents: allocation tests never launch math. */
 static int extent_only;
@@ -148,6 +150,7 @@ int cuteafd_cuda_device_info(int device, struct device_info *info) {
 
 int cuteafd_cuda_get_device(int *device) { *device = current_device; return 0; }
 int cuteafd_cuda_memory_info(size_t *free_bytes, size_t *total) {
+    ++memory_queries;
     *total = memory_total[current_device];
     *free_bytes = *total - memory_used[current_device];
     return 0;

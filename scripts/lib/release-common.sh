@@ -108,13 +108,13 @@ PYPROFILE
 
 # The one device memory policy (rust/crates/cuteafd-core/src/memory_policy.rs):
 # launch keys and the global cuteafd flags they become, in one order.
-RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE MEMORY_PADDING GRAPH_NODE_PADDING
+RELEASE_MEMORY_KEYS=(GPU_MEMORY_CAP SPARK_MEMORY_CAP GPU_RESERVE SPARK_RESERVE FAMILY_RESERVE MEMORY_PADDING GRAPH_DISABLE_LOW_MEM GRAPH_NODE_PADDING
   KV_TARGET_TOKENS KV_MIN_TOKENS KV_MAX_TOKENS)
 release_memory_flag() {
   case "$1" in
     GPU_MEMORY_CAP) printf -- --gpu-memory-cap ;; SPARK_MEMORY_CAP) printf -- --spark-memory-cap ;;
     GPU_RESERVE) printf -- --gpu-reserve ;; SPARK_RESERVE) printf -- --spark-reserve ;;
-    FAMILY_RESERVE) printf -- --family-reserve ;; MEMORY_PADDING) printf -- --memory-padding ;; GRAPH_NODE_PADDING) printf -- --graph-node-padding ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
+    FAMILY_RESERVE) printf -- --family-reserve ;; MEMORY_PADDING) printf -- --memory-padding ;; GRAPH_DISABLE_LOW_MEM) printf -- --graph-disable-low-mem ;; GRAPH_NODE_PADDING) printf -- --graph-node-padding ;; KV_TARGET_TOKENS) printf -- --kv-target-tokens ;;
     KV_MIN_TOKENS) printf -- --kv-min-tokens ;; KV_MAX_TOKENS) printf -- --kv-max-tokens ;;
     *) return 1 ;;
   esac
@@ -130,6 +130,10 @@ release_validate_memory_value() {
     GPU_MEMORY_CAP|SPARK_MEMORY_CAP)
       [[ "$value" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ && "$value" =~ [1-9] ]] ||
         release_die "$key must be a positive size in B, MB, GB, MiB or GiB" ;;
+    GRAPH_DISABLE_LOW_MEM)
+      local size='[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?'
+      [[ "$value" =~ ^($size)$ || "$value" =~ ^gpu[0-9]+=($size)(,gpu[0-9]+=($size))*$ ]] ||
+        release_die "$key must be a size or gpuN=size list" ;;
     GRAPH_NODE_PADDING)
       [[ "$value" =~ ^($graph_value)$ || "$value" =~ ^rtx=($graph_value),spark=($graph_value)$ || "$value" =~ ^spark=($graph_value),rtx=($graph_value)$ ]] ||
         release_die "$key must be a percentage, integer bytes/node or rtx=VALUE,spark=VALUE" ;;
@@ -967,7 +971,7 @@ release_known_key() {
     MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     GPU_GRAPH_RESERVE|GPU_GRAPH_RESERVE_EXTRA|GPU_GRAPH_RESERVE_EXTRA_CAP|SPARK_GRAPH_RESERVE|GRAPH_TRACE) return 0 ;; # Bounded graph cache.
-    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
+    GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
     EXPERT_PARTIAL_BF16_MAX_ROWS|SPARK_PREFILL_REPLY_FORMAT|SPARK_DECODE_REPLY_FORMAT) return 0 ;; # Partial-reply cutoff and shared Spark reply format.
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS|TP2_DFLASH) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;

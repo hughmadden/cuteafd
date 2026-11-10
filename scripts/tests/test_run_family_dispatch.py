@@ -2885,6 +2885,8 @@ def test_glmf_resolved_units_and_memory_policy_are_forwarded(tmp_path, keys, exp
     ("FAMILY_RESERVE", "10%", "FAMILY_RESERVE must be a size"),
     ("MEMORY_PADDING", "10%", "MEMORY_PADDING must be a size"),
     ("MEMORY_PADDING", "-1", "MEMORY_PADDING must be a size"),
+    ("GRAPH_DISABLE_LOW_MEM", "10%", "GRAPH_DISABLE_LOW_MEM must be a size"),
+    ("GRAPH_DISABLE_LOW_MEM", "spark=50MiB", "GRAPH_DISABLE_LOW_MEM must be a size"),
     ("GRAPH_NODE_PADDING", "rtx=1", "GRAPH_NODE_PADDING must be a percentage"),
     ("GRAPH_NODE_PADDING", "-1", "GRAPH_NODE_PADDING must be a percentage"),
     ("GRAPH_NODE_PADDING", "rtx=1,rtx=2", "GRAPH_NODE_PADDING must be a percentage"),
@@ -2903,6 +2905,7 @@ MEMORY_POLICY_KEYS = {
     "GPU_MEMORY_CAP": ("--gpu-memory-cap", "80GiB"), "SPARK_MEMORY_CAP": ("--spark-memory-cap", "100GiB"),
     "GPU_RESERVE": ("--gpu-reserve", "3GiB"), "SPARK_RESERVE": ("--spark-reserve", "2.5GiB"),
     "FAMILY_RESERVE": ("--family-reserve", "512MiB"), "MEMORY_PADDING": ("--memory-padding", "100MiB"), "KV_TARGET_TOKENS": ("--kv-target-tokens", "1048576"),
+    "GRAPH_DISABLE_LOW_MEM": ("--graph-disable-low-mem", "gpu0=50MiB,gpu1=0"),
     "GRAPH_NODE_PADDING": ("--graph-node-padding", "rtx=2.5%,spark=20"),
     "KV_MIN_TOKENS": ("--kv-min-tokens", "131072"), "KV_MAX_TOKENS": ("--kv-max-tokens", "4194304"),
 }
@@ -2940,7 +2943,7 @@ def test_every_memory_policy_key_reaches_the_plan_and_the_serve_argv(tmp_path, f
         assert worker[worker.index("--spark-memory-cap") + 1] == "100GiB"
         assert worker[worker.index("--spark-reserve") + 1] == "2.5GiB"
         assert worker[worker.index("--graph-node-padding") + 1] == "rtx=2.5%,spark=20"
-        assert "--gpu-memory-cap" not in worker and "--family-reserve" not in worker and "--memory-padding" not in worker
+        assert "--gpu-memory-cap" not in worker and "--family-reserve" not in worker and "--memory-padding" not in worker and "--graph-disable-low-mem" not in worker
 
 
 @pytest.mark.parametrize("key,value", [("GPU_MEMORY_CAP", "90%"), ("SPARK_MEMORY_CAP", "50%"),

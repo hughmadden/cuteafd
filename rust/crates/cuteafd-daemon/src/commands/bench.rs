@@ -203,8 +203,11 @@ fn family_of(command: &str) -> Option<&'static str> {
 
 /// Records a serve command's resolved options (value, default, source) for
 /// the benchmark; other commands record nothing.
-pub(crate) fn capture(matches: &ArgMatches, memory: crate::cli::MemoryArgs) -> Result<()> {
+pub(crate) fn capture(matches: &ArgMatches, memory: crate::cli::MemoryArgs, graph_floor: Option<&str>) -> Result<()> {
     if let Some(mut context) = serve_context(matches, Some(memory))? {
+        if let Some(value) = graph_floor {
+            context.settings.push(Setting { name: "graph-disable-low-mem".into(), value: Some(value.into()), default: None, source: "cli/env".into() });
+        }
         let formats = cuteafd_core::spark_reply::requested();
         let (prefill, decode) = reply_settings(&mut context, formats);
         tracing::info!(%prefill, %decode, prefill_explicit = formats.prefill.is_some(),
@@ -532,7 +535,7 @@ mod tests {
             "/opt/lib.so", "--max-sequences", "2"];
         let matches = crate::cli::Cli::command().try_get_matches_from(argv).unwrap();
         let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap();
-        capture(&matches, cli.memory).unwrap();
+        capture(&matches, cli.memory, cli.graph_disable_low_mem.as_deref()).unwrap();
         let context = cuteafd_bench::context::get();
         assert_eq!(context.family, None);
         assert_eq!(context.snapshot.as_deref(), Some(std::path::Path::new("/hub/models--Qwen--Q/snapshots/abc")));

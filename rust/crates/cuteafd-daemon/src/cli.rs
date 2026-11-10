@@ -121,6 +121,9 @@ fn parse_idle_park(text: &str) -> std::result::Result<f64, String> {
 #[derive(Debug, Parser)]
 #[command(name = "cuteafd", about = "CUTEAFD phase0 runtime CLI")]
 pub(crate) struct Cli {
+    /// Minimum physical GPU free bytes after graph capture (default MEMORY_PADDING/2); size or gpuN=size, 0 disables.
+    #[arg(long, global = true, env = "CUTEAFD_GRAPH_DISABLE_LOW_MEM")]
+    pub(crate) graph_disable_low_mem: Option<String>,
     /// Spark prefill expert replies. Explicit selections apply even to small units.
     /// Omission keeps BF16 combined replies and Muse's split NVFP4 partial replies.
     #[arg(long, global = true, env = "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT")]
