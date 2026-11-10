@@ -892,7 +892,7 @@ fn production_counts(routed: usize, local: bool, waves: u64, skip: bool) -> Vec<
 }
 
 impl<'a> ProductionInput<'a> {
-    pub fn prepare(self) -> Result<PreparedGlm<'a>, Refusal> {
+    pub fn prepare(mut self) -> Result<PreparedGlm<'a>, Refusal> {
         use super::local_physical::LocalPhysicalInventory;
         use crate::placement::{FfnMode, SparkIntakeMode, SparkIntakeOwners};
         if self.maximum_pool_tokens < self.context {
@@ -953,7 +953,8 @@ impl<'a> ProductionInput<'a> {
         // Source-reference bytes are fixed before admission. Classification
         // against the canonical resolved layout happens after the single solve.
         let reference = if self.gpus == 1 { MIN_LAYOUT } else { MAX_LAYOUT };
-        let runtime = DeviceFigures::new(self.gpus, self.spark_ranks > 0, self.prefix_host)?;
+        let mut runtime = DeviceFigures::new(self.gpus, self.spark_ranks > 0, self.prefix_host)?;
+        runtime.sample_baselines(&mut self.budgets)?;
         let host = HostFigures::for_layout(self.gpus, reference)?;
         let expert_usage = (self.expert_usage && !self.skip_routed_experts && routed > 0)
             .then(|| cuteafd_core::expert_usage::Geometry { layers: self.layers,
@@ -1558,6 +1559,7 @@ pub struct DeviceFigures {
     /// removed from the context row that absorbed them, with the peak live
     /// stream count that produced each.
     slabs: Vec<(u64, u64)>,
+    sampled: Vec<Option<(u64, String)>>,
 }
 
 impl DeviceFigures {
@@ -1571,7 +1573,23 @@ impl DeviceFigures {
             crate::placement::planner::cuda_stream_slab_bytes(peak).map(|bytes| (peak, bytes))
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(Self { context, stages: MEASURED_DEVICE_STAGES.iter().filter(|row| row.ranks == gpus).collect(),
-            slabs })
+            slabs, sampled: vec![None; gpus] })
+    }
+
+    fn sample_baselines(&mut self, budgets: &mut [Budget]) -> Result<(), Refusal> {
+        for budget in budgets {
+            let [Location { device: Device::Coordinator(rank), .. }] = budget.locations.as_slice() else { continue; };
+            let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
+            let bytes = budget.physical_bytes.checked_sub(*free)
+                .ok_or_else(|| invalid("context sample exceeds physical capacity"))?;
+            let slot = self.sampled.get_mut(usize::from(*rank))
+                .ok_or_else(|| invalid("context sample rank absent"))?;
+            if slot.is_some() { return Err(invalid("duplicate context sample rank")); }
+            *slot = Some((bytes, source.clone()));
+            budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
+                source: "physical capacity; sampled GLM context and selected modules charged once in recipe".into() };
+        }
+        Ok(())
     }
 
     pub fn context(&self) -> &[MemoryFigure] { &self.context }
@@ -1588,21 +1606,28 @@ impl DeviceFigures {
 
     pub fn components(&self, maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
         if maximum_pages == 0 { return Err(invalid("zero device figure pool extent")); }
-        // The preweight context figure normalizes context + streams + selected
-        // modules, so the slab owner takes its bytes from that row rather than
-        // charging the same driver residency twice.
+        // Offline census context includes the startup stream slabs, extracted
+        // below. Live preload has only one compute stream per rank (zero slabs):
+        // its sample replaces the census context while later slab growth stays
+        // separately charged. Module bytes are already inside that sample.
         let mut components = self.context.iter().zip(&self.slabs).enumerate().map(|(rank, (figure, &(_, slab)))| {
-            let bytes = figure.bytes.checked_sub(slab)
-                .ok_or_else(|| invalid("GLM stream slabs exceed the measured context figure"))?;
+            let (bytes, source, assumed) = if let Some((bytes, source)) = &self.sampled[rank] {
+                (*bytes, crate::placement::sampled_baseline::source(&format!(
+                    "GLM context and selected modules: {source}")), false)
+            } else {
+                (figure.bytes.checked_sub(slab)
+                    .ok_or_else(|| invalid("GLM stream slabs exceed the measured context figure"))?,
+                    format!("GLM context and selected modules: {:?}; {}; producer {}; less the \
+                        {slab} B stream-slot slabs charged by glm/driver-stream-slabs/gpu{rank}",
+                        figure.attribution, figure.evidence, figure.producing_commit),
+                    matches!(figure.attribution, FigureAttribution::Estimated { .. }))
+            };
             Ok(Component {
                 activation: Activation::always(),
                 bytes: ByteCurve::fixed(bytes, maximum_pages),
                 kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
                     bytes, lifetime: Lifetime::RESIDENT,
-                    source: format!("GLM context and selected modules: {:?}; {}; producer {}; less the \
-                        {slab} B stream-slot slabs charged by glm/driver-stream-slabs/gpu{rank}",
-                        figure.attribution, figure.evidence, figure.producing_commit),
-                    assumed: matches!(figure.attribution, FigureAttribution::Estimated { .. }),
+                    source, assumed,
                 }),
             })
         }).collect::<Result<Vec<_>, Refusal>>()?;

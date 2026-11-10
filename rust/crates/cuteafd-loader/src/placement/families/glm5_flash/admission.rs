@@ -790,25 +790,29 @@ fn prepare_fixed<'a>(i: &'a GlmfInputs<'a>, sms: usize, rtx_experts: bool, proce
         }
     }
     let mut budgets = Vec::new();
-    let overridden = cuteafd_core::memory_policy::MemoryPolicy::current().gpu_reserve.is_some();
     for (gpu, &(total, baseline)) in i.gpus.iter().enumerate() {
-        // One context+modules owner on both sides (plan == runtime). Under a
-        // GPU_RESERVE override, which replaces runtime components, a live
-        // sample is already-held occupancy and moves into the baseline instead.
-        let forecast = || p::Baseline::Forecast { occupied: 0,
-            source: "GLM Flash physical capacity; runtime owner charged in recipe".into(), assumed: false };
-        let (occupied, baseline) = match baseline {
-            Baseline::Planned { context_bytes, loaded_bytes } => (context_bytes.checked_add(loaded_bytes)
-                .ok_or(p::Refusal::Overflow("GLM Flash runtime baseline"))?, forecast()),
-            Baseline::Measured { free_bytes } if overridden => (0, p::Baseline::Sampled { free: free_bytes.min(total),
-                phase: p::Phase::Load, source: "GLM Flash measured free bytes after context and modules".into() }),
-            Baseline::Measured { free_bytes } => (total.saturating_sub(free_bytes), forecast()),
+        let occupied = match baseline {
+            Baseline::Planned { context_bytes, loaded_bytes } => context_bytes.checked_add(loaded_bytes)
+                .ok_or(p::Refusal::Overflow("GLM Flash runtime baseline"))?,
+            Baseline::Measured { free_bytes } => total.saturating_sub(free_bytes),
         };
         budgets.push(p::Budget { id: format!("rtx{gpu}"), locations: vec![p::Location::coordinator(gpu as u8)],
-            physical_bytes: total, logical_bytes: total, headroom: i.headroom_bytes, baseline });
+            physical_bytes: total, logical_bytes: total, headroom: i.headroom_bytes,
+            baseline: p::Baseline::Forecast { occupied: 0,
+                source: "GLM Flash physical capacity; runtime owner charged in recipe".into(), assumed: false } });
         if occupied > 0 {
-            add_demand(&mut contract, &Demand::new(gpu as u8, Category::Runtime, "context+modules", occupied,
-                Basis::Calibrated), &[], format!("glmf.runtime.{gpu}"), p::Activation::always())?;
+            if matches!(baseline, Baseline::Measured { .. }) {
+                contract.components.push(p::Component { activation: p::Activation::always(),
+                    bytes: p::ByteCurve::fixed(occupied, maximum),
+                    kind: p::ComponentKind::Allowance(p::Allowance {
+                        location: p::Location::coordinator(gpu as u8), bytes: occupied,
+                        lifetime: p::Lifetime::RESIDENT, assumed: false,
+                        source: crate::placement::sampled_baseline::source("GLM Flash context and selected modules"),
+                    }) });
+            } else {
+                add_demand(&mut contract, &Demand::new(gpu as u8, Category::Runtime, "context+modules", occupied,
+                    Basis::Calibrated), &[], format!("glmf.runtime.{gpu}"), p::Activation::always())?;
+            }
         }
     }
     // HOST and PINNED share one physical capacity; external occupancy is sampled
@@ -1204,6 +1208,48 @@ impl PreparedGlmf<'_> {
 mod tests {
     use super::*;
     use crate::plan::exlr8::residency::{ExpertSet, Residency};
+
+    #[test]
+    fn sampled_preweight_is_one_protected_capacity_neutral_owner_per_rank() {
+        use cuteafd_core::memory_policy::MemoryPolicy;
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(4)).unwrap();
+        for gpus in [1, 2] {
+            let mut input = crate::placement::families::glm5_flash::tests::inputs(&cfg, gpus,
+                crate::placement::inventory::PRO_TOTAL_BYTES);
+            let samples = [682_885_120, 691_273_728];
+            for (rank, (total, baseline)) in input.gpus.iter_mut().enumerate() {
+                *baseline = Baseline::Measured { free_bytes: *total - samples[rank] };
+            }
+            for reserve in [None, Some(0), Some(200 << 20)] {
+                MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| {
+                    let mut reference = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30)).unwrap();
+                    reference.recipe.contract.components.retain(|component| !matches!(&component.kind,
+                        p::ComponentKind::Allowance(owner) if crate::placement::sampled_baseline::is_source(&owner.source)));
+                    for rank in 0..gpus {
+                        reference.budgets[rank].baseline = p::Baseline::Sampled {
+                            free: input.gpus[rank].0 - samples[rank], phase: p::Phase::Load, source: "reference".into() };
+                    }
+                    let before = reference.admit().unwrap().solved;
+                    let plan = prepare(&input, 188, true, ProcessOwners::new((512 << 30, 512 << 30), 8 << 30))
+                        .unwrap().admit().unwrap().solved;
+                    assert_eq!(plan.pool_tokens, before.pool_tokens);
+                    assert_eq!(plan.decisions, before.decisions);
+                    for rank in 0..gpus {
+                        let owners = plan.facts.allowances.iter().filter(|owner|
+                            owner.location == p::Location::coordinator(rank as u8)
+                                && crate::placement::sampled_baseline::is_source(&owner.source)).collect::<Vec<_>>();
+                        assert_eq!(owners.len(), 1);
+                        assert_eq!(owners[0].bytes, samples[rank]);
+                        for phase in [p::Phase::Load, p::Phase::Ready, p::Phase::Growth] {
+                            let now = plan.phases.iter().find(|row| row.budget == format!("rtx{rank}") && row.phase == phase).unwrap();
+                            let old = before.phases.iter().find(|row| row.budget == format!("rtx{rank}") && row.phase == phase).unwrap();
+                            assert_eq!(now.available - now.owned - now.opaque, old.available - old.owned - old.opaque);
+                        }
+                    }
+                });
+            }
+        }
+    }
 
     /// SM120 retains a 2 MiB driver slab per four peak live streams (#1511);
     /// the charge is one named resident allowance per coordinator GPU.

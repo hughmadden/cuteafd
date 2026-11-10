@@ -1280,9 +1280,18 @@ impl Opened {
             if !native && spark_bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 },
             cuteafd_core::SparkRings { max_frame_bytes: frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
             cuteafd_core::spark_reply::requested())?;
-        let budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
+        let mut budgets = production_budgets(&cards, cuteafd_loader::placement::reserve::gpu("glm5"), host,
             serving.map_or(8 << 30, |(prefix, _)| prefix.host_cache_headroom_bytes).max(host.0 / 10),
             &vec![cuteafd_loader::placement::reserve::spark_cap(); spark_ranks])?;
+        for (budget, sample) in budgets.iter_mut().zip(&inventory.gpus) {
+            // PreWeight context_bytes already includes selected module residency;
+            // ledger-tracked owners remain separately charged by the recipe.
+            budget.baseline = Baseline::Sampled {
+                free: budget.physical_bytes.checked_sub(sample.context_bytes)
+                    .context("GLM sampled context exceeds physical capacity")?,
+                phase: Phase::Load, source: "GLM pre-weight context and selected modules".into(),
+            };
+        }
         let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());

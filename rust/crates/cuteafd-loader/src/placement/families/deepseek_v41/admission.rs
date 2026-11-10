@@ -216,6 +216,11 @@ pub fn runtime_base_check(facts: &Facts, gpu: u8, used: u64)
         let bucket = if RUNTIME_OWNERS.contains(&allocation.group.as_str()) { &mut predicted } else { &mut others };
         *bucket = bucket.checked_add(allocation.bytes).ok_or(Refusal::Overflow("V4.1 runtime base check"))?;
     }
+    for owner in facts.allowances.iter().filter(|owner| owner.location == location
+        && owner.lifetime.contains(Phase::Ready, facts.phase_order)
+        && crate::placement::sampled_baseline::is_source(&owner.source)) {
+        predicted = predicted.checked_add(owner.bytes).ok_or(Refusal::Overflow("V4.1 sampled base check"))?;
+    }
     for mapping in facts.driver_page_tables.iter().filter(|mapping| mapping.location == location) {
         others = others.checked_add(mapping.bytes()).ok_or(Refusal::Overflow("V4.1 page-table check"))?;
     }
@@ -251,6 +256,11 @@ pub fn untracked_ready_owners(facts: &Facts, gpu: u8) -> Result<u64, Refusal> {
         }
         total = total.checked_add(allocation.bytes).ok_or(Refusal::Overflow("V4.1 untracked owners"))?;
     }
+    for owner in facts.allowances.iter().filter(|owner| owner.location == location
+        && owner.lifetime.contains(Phase::Ready, facts.phase_order)
+        && crate::placement::sampled_baseline::is_source(&owner.source)) {
+        total = total.checked_add(owner.bytes).ok_or(Refusal::Overflow("V4.1 sampled untracked owners"))?;
+    }
     for mapping in facts.driver_page_tables.iter().filter(|mapping| mapping.location == location) {
         total = total.checked_add(mapping.bytes()).ok_or(Refusal::Overflow("V4.1 untracked page tables"))?;
     }
@@ -280,10 +290,15 @@ pub fn runtime_base_components(facts: &Facts, gpu: u8) -> RuntimeBaseComponents 
         };
         *slot = slot.saturating_add(allocation.bytes);
     }
+    components.context_bytes = components.context_bytes.saturating_add(facts.allowances.iter()
+        .filter(|owner| owner.location == location
+            && owner.lifetime.contains(Phase::Ready, facts.phase_order)
+            && crate::placement::sampled_baseline::is_source(&owner.source))
+        .map(|owner| owner.bytes).sum::<u64>());
     components
 }
 
-/// One GPU's predicted runtime base, component by component.
+/// One GPU's runtime base; live context_bytes includes its selected modules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeBaseComponents {
     pub context_bytes: u64,
@@ -1275,6 +1290,20 @@ impl<'a> ProductionInput<'a> {
     pub fn prepare(mut self) -> Result<PreparedV41<'a>, Refusal> {
         self.owners.extend(super::owners::packed_head_load_owners(&self.weight_arenas)
             .map_err(|error| invalid(&error.to_string()))?);
+        for budget in &mut self.budgets {
+            let [Location { device: Device::Coordinator(_), .. }] = budget.locations.as_slice() else { continue; };
+            let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
+            let bytes = budget.physical_bytes.checked_sub(*free)
+                .ok_or_else(|| invalid("context sample exceeds physical capacity"))?;
+            if bytes > 0 {
+                self.allowances.push(Opaque { location: budget.locations[0], bytes,
+                    basis: Basis::Calibrated, lifetime: Lifetime::RESIDENT,
+                    source: crate::placement::sampled_baseline::source(&format!(
+                        "V4.1 context and selected modules: {source}")) });
+            }
+            budget.baseline = Baseline::Forecast { occupied: 0, assumed: false,
+                source: "physical capacity; sampled V4.1 context and selected modules charged once in recipe".into() };
+        }
         let routed = self.experts.len();
         if !(1..=2).contains(&self.gpus)
             || routed != 40
