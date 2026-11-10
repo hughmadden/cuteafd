@@ -2455,8 +2455,8 @@ impl<'a> MimoEngine<'a> {
         // yet. SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
             if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
-                tracing::warn!(%error, "graph capture unavailable;
-            } running eagerly");
+                tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            }
             return segment();
         }
         let captured = segment();
@@ -2470,8 +2470,8 @@ impl<'a> MimoEngine<'a> {
             Ok(info) => info,
             Err(error) => {
                 if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
-                    tracing::warn!(%error, "graph instantiation unavailable;
-                } running eagerly");
+                    tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                }
                 return segment();
             }
         };

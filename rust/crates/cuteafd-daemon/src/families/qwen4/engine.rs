@@ -3719,8 +3719,8 @@ impl<'a> Qwen4Engine<'a> {
         // synchronizes the host or allocates.
         if let Err(error) = unsafe { self.library.cuda_graph_begin_capture(self.execution_stream()) } {
             if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
-                tracing::warn!(%error, "Qwen graph capture unavailable;
-            } running eagerly");
+                tracing::warn!(%error, "Qwen graph capture unavailable; running eagerly");
+            }
             segment()?;
             return self.ple_consumed(&key);
         }
@@ -3739,8 +3739,8 @@ impl<'a> Qwen4Engine<'a> {
             Ok(info) => info,
             Err(error) => {
                 if self.graphs.borrow_mut()[owner].cache_ticket_failed(ticket, &error) {
-                    tracing::warn!(%error, "Qwen graph instantiation unavailable;
-                } running eagerly");
+                    tracing::warn!(%error, "Qwen graph instantiation unavailable; running eagerly");
+                }
                 segment()?;
                 return self.ple_consumed(&key);
             }

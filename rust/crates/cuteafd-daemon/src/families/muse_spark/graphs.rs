@@ -50,8 +50,8 @@ impl<'a> Graphs<'a> {
         // SAFETY: callers submit only device work on this stream, using persistent storage.
         if let Err(error) = unsafe { self.device.library.cuda_graph_begin_capture(stream) } {
             if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
-                tracing::warn!(%error, "Muse graph capture unavailable;
-            } running eagerly");
+                tracing::warn!(%error, "Muse graph capture unavailable; running eagerly");
+            }
             return segment();
         }
         let captured = segment();
@@ -70,8 +70,8 @@ impl<'a> Graphs<'a> {
             Ok(info) => info,
             Err(error) => {
                 if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
-                    tracing::warn!(%error, "Muse graph instantiation unavailable;
-                } running eagerly");
+                    tracing::warn!(%error, "Muse graph instantiation unavailable; running eagerly");
+                }
                 return segment();
             }
         };
