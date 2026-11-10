@@ -4578,14 +4578,15 @@ impl<'a> GlmfEngine<'a> {
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { self.library.cuda_graph_begin_capture(stream) }) {
-            graphs.borrow_mut().cache_cancel(ticket);
-            tracing::warn!(%error, "graph capture unavailable; running eagerly");
+            if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                tracing::warn!(%error, "graph capture unavailable;
+            } running eagerly");
             return self.eager_segment(segment);
         }
         let captured = segment();
         let exec = self.on(rank, || unsafe { self.library.cuda_graph_end_capture_topology(stream) });
         if let Err(error) = captured {
-            graphs.borrow_mut().cache_cancel(ticket);
+            graphs.borrow_mut().cache_capture_failed(ticket, exec.as_ref().err().unwrap_or(&error));
             if let Ok((raw, _, _, _, _)) = exec {
                 // SAFETY: the capture failed; this executable owns no live launch.
                 let _ = self.on(rank, || unsafe { self.library.cuda_graph_exec_destroy(raw) });
@@ -4595,8 +4596,9 @@ impl<'a> GlmfEngine<'a> {
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
             Ok(info) => info,
             Err(error) => {
-                graphs.borrow_mut().cache_cancel(ticket);
-                tracing::warn!(%error, "graph instantiation unavailable; running eagerly");
+                if graphs.borrow_mut().cache_capture_failed(ticket, &error) {
+                    tracing::warn!(%error, "graph instantiation unavailable;
+                } running eagerly");
                 return self.eager_segment(segment);
             }
         };

@@ -413,19 +413,19 @@ impl AttentionOutputWave<'_, '_> {
         unsafe { self.capture_ready_on(rows, self.storage.stream.raw) }
     }
     unsafe fn capture_ready_on(&mut self, rows: u32, stream: *mut std::ffi::c_void) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.b(0).device_id, rows), None) else {
             super::graph_policy::note_miss(format!("attention_output rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };
         self.ready = None;
         self.origin = None;
         unsafe {
-            self.storage.stream
+            ticket.capture_result(self.storage.stream
                 .library
-                .cuda_graph_begin_capture(stream)?;
+                .cuda_graph_begin_capture(stream))?;
         }
         let launched = unsafe { self.enqueue_on(rows, stream) };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(stream) };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(stream)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = unsafe {

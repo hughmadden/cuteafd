@@ -388,17 +388,17 @@ impl IndexQueryWave<'_, '_> {
         unsafe { self.capture_ready(rows) }
     }
     unsafe fn capture_ready(&mut self, rows: u32) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.hidden.buffer.device_id, rows), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&(self.weights.layer, rows), super::graph_policy::pinned_shape(self.storage.hidden.buffer.device_id, rows), None) else {
             super::graph_policy::note_miss(format!("index_query rows={rows} layer={}", self.weights.layer), || "graph cache selected eager".into());
             return Ok(());
         };
         unsafe {
-            self.storage.stream
+            ticket.capture_result(self.storage.stream
                 .library
-                .cuda_graph_begin_capture(self.storage.stream.raw)?;
+                .cuda_graph_begin_capture(self.storage.stream.raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 if let Err(error) = unsafe {

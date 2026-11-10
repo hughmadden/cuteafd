@@ -288,13 +288,13 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         let key = self.startup_key(layer, rows, sink, selected, aligned,
             tail.as_ref().map(|tail| &**tail as &dyn AttentionGraphTail))?;
         if self.graphs.contains(&key) { return Ok(()); }
-        let Some(ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None) else {
+        let Some(mut ticket) = self.graphs.cache_ticket(&key, super::graph_policy::pinned_shape(self.storage.query.buffer.device_id, rows as u32), None) else {
             return Ok(());
         };
         let plan = self.attention_plan.context("sparse startup reduction plan absent")?;
         let recipe = self.storage.kernel.startup_batch_recipe(plan, rows, layer >= 2, aligned)?;
         // SAFETY: this owner is drained and the caller retains every bound plane.
-        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+        unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
         let queued = (|| unsafe {
             self.storage.kernel.record_startup_batch(&recipe, self.storage.query.buffer, sink,
                 self.storage.metadata.buffer, selected, self.storage.output.buffer, self.storage.descriptors.buffer,
@@ -306,7 +306,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             Ok(())
         })();
         // End capture even if a tail failed, so the owner is not left capturing.
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (queued, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }
@@ -486,14 +486,14 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     /// The caller retains the external inputs represented by the owned cold plan.
     /// Returned attention is queued, ready for consumers on chain_stream().
     pub async unsafe fn finish_prepare(&mut self, mut tail: Option<&mut dyn AttentionGraphTail>) -> Result<QueuedSparseAttention> {
-        let plan = self.cold.take().context("cold attention preparation absent")?;
+        let mut plan = self.cold.take().context("cold attention preparation absent")?;
         #[cfg(test)]
         eprintln!("queued sparse warmup layer={} rows={} batched={}", plan.layer, plan.rows, plan.batch.is_some());
         self.storage.stream.wait().await?;
         ensure!(plan.tail_identity == tail.as_ref().map(|t| t.identity()), "cold attention tail identity changed");
         if let Some(tail) = tail.as_deref_mut() { unsafe { tail.restore_warmup()?; } }
         self.warmed_kernels |= plan.needed;
-        let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
+        let graph = unsafe { self.capture_plan(&mut plan, &mut tail)? };
         self.insert_graph((plan.layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
         let graph = graph.0;
         let launched = unsafe { self.storage.stream.library.cuda_graph_launch(graph, self.storage.stream.raw) };
@@ -501,15 +501,15 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
             layer: plan.layer, rows: plan.rows })
     }
-    unsafe fn capture_plan(&self, plan: &ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
-        unsafe { self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw)?; }
+    unsafe fn capture_plan(&self, plan: &mut ColdSparse, tail: &mut Option<&mut dyn AttentionGraphTail>) -> Result<(*mut c_void, usize, usize, bool)> {
+        unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_begin_capture(self.storage.stream.raw))?; }
         let launched = (|| unsafe {
             self.enqueue(plan.sink, &plan.launches, plan.selected, plan.batch.as_ref())?;
             if let Some(tail) = tail.as_deref_mut() { tail.enqueue(&QueuedSparseAttention {
                 values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)), layer: plan.layer, rows: plan.rows }, self.storage.stream.raw)?; }
             Ok(())
         })();
-        let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw) };
+        let captured = unsafe { plan.ticket.capture_result(self.storage.stream.library.cuda_graph_end_capture_topology(self.storage.stream.raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {
                 if let Some(error) = inspection { tracing::warn!(%error, "sparse graph topology inspection failed"); }
@@ -839,7 +839,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
                 mask | (1 << (recipe + 4 * usize::from(launch.source.is_some())))
             }) };
             let needs_warmup = tail.is_some() || self.warmed_kernels & needed != needed;
-            let plan = ColdSparse { layer, rows, sink, launches, selected, batch, fingerprint, needed, tail_identity,
+            let mut plan = ColdSparse { layer, rows, sink, launches, selected, batch, fingerprint, needed, tail_identity,
                 ticket: ticket.expect("capture miss reserved a ticket") };
             if needs_warmup {
                 let launched = (|| unsafe {
@@ -858,7 +858,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             }
             // Metadata uploads remain ordered on this stream; capture itself
             // contains no await. Evictions are drained at the enclosing completed-step boundary.
-            let graph = unsafe { self.capture_plan(&plan, &mut tail)? };
+            let graph = unsafe { self.capture_plan(&mut plan, &mut tail)? };
             self.insert_graph((layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
             graph.0
         };

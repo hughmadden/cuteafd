@@ -90,13 +90,13 @@ impl<'w, 'a> Rank<'w, 'a> {
         if self.graphs[mode].get(rows).is_none() && self.graphs[mode].capture_allowed(rows)
             && !crate::shared::decode_graph::census::eager("head") {
             let lib = self.stream.library;
-            let Some(ticket) = self.graphs[mode].cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.input.buffer.device_id, rows as u32), None) else {
+            let Some(mut ticket) = self.graphs[mode].cache_ticket(&rows, crate::families::deepseek_v41::graph_policy::pinned_shape(self.input.buffer.device_id, rows as u32), None) else {
                 crate::shared::decode_graph::note_eager("deepseek_v41", &format!("head rows={rows}"), || "cache admission".into());
                 return Ok(());
             };
-            unsafe { lib.cuda_graph_begin_capture(self.stream.raw)?; }
+            unsafe { ticket.capture_result(lib.cuda_graph_begin_capture(self.stream.raw))?; }
             let queued = unsafe { self.enqueue(rows, greedy) };
-            let captured = unsafe { lib.cuda_graph_end_capture_topology(self.stream.raw) };
+            let captured = unsafe { ticket.capture_result(lib.cuda_graph_end_capture_topology(self.stream.raw)) };
             match (queued, captured) {
                 (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                     // SAFETY: rank storage is stable and the eager projection drained.

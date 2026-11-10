@@ -485,14 +485,14 @@ impl DsparkChain<'_, '_> {
         let key = (count, self.width);
         if self.graphs.contains(&key) { return Ok(()); }
         let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, count, self.width);
-        let Some(ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
+        let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
-            self.stream
+            ticket.capture_result(self.stream
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream.raw))?;
         }
         let launched = unsafe { self.enqueue_geometry(reads, count) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
         self.invalidate();
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, inspection))) => {

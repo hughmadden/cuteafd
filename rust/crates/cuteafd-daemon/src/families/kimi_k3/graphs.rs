@@ -379,7 +379,9 @@ impl<'a> Graphs<'a> {
         // duration of the step body; every captured pointer is pinned by LocalLane.
         if let Err(error) = stream.device.run(|| unsafe {
             stream.device.library.cuda_graph_begin_capture(stream.raw) }) {
-            tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
+            if self.bank.cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, ?key, "Kimi graph capture unavailable; running eagerly");
+            }
             return Ok(false);
         }
         let submitted = body();
@@ -416,13 +418,19 @@ impl<'a> Graphs<'a> {
                 Ok(true)
             }
             (Err(error), Ok((raw, ..))) => {
+                self.bank.cache_ticket_failed(ticket, &error);
                 // SAFETY: the failed capture's executable has never launched.
                 unsafe { stream.device.library.cuda_graph_exec_destroy(raw)?; }
                 Err(error)
             }
-            (Err(error), Err(ended)) => Err(error.context(format!("ending failed Kimi capture: {ended:#}"))),
+            (Err(error), Err(ended)) => {
+                self.bank.cache_ticket_failed(ticket, &ended);
+                Err(error.context(format!("ending failed Kimi capture: {ended:#}")))
+            }
             (Ok(()), Err(error)) => {
-                tracing::warn!(%error, ?key, "Kimi graph instantiation unavailable; running eagerly");
+                if self.bank.cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, ?key, "Kimi graph instantiation unavailable; running eagerly");
+                }
                 Ok(false)
             }
         }

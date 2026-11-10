@@ -253,15 +253,15 @@ impl<'a> TargetHeadWave<'a, '_> {
         self.invalidate();
         ensure!((1..=self.capacity).contains(&rows) && self.graph(rows).is_none(),
             "target head graph for {rows} rows already captured or out of range");
-        let Some(ticket) = self.graphs.cache_ticket(&rows,
+        let Some(mut ticket) = self.graphs.cache_ticket(&rows,
             super::graph_policy::pinned_shape(self.b(0).device_id, rows as u32), None) else { return Ok(()) };
         unsafe {
-            self.stream
+            ticket.capture_result(self.stream
                 .library
-                .cuda_graph_begin_capture(self.stream.raw)?;
+                .cuda_graph_begin_capture(self.stream.raw))?;
         }
         let launched = unsafe { self.enqueue(rows) };
-        let captured = unsafe { self.stream.library.cuda_graph_end_capture_topology(self.stream.raw) };
+        let captured = unsafe { ticket.capture_result(self.stream.library.cuda_graph_end_capture_topology(self.stream.raw)) };
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 // SAFETY: warmup drained and the wave owns every captured pointer.

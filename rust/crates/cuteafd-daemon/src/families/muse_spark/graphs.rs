@@ -49,8 +49,9 @@ impl<'a> Graphs<'a> {
         let Some(ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.borrow().contains(&key.rows), None) else { return segment() };
         // SAFETY: callers submit only device work on this stream, using persistent storage.
         if let Err(error) = unsafe { self.device.library.cuda_graph_begin_capture(stream) } {
-            drop(ticket);
-            tracing::warn!(%error, "Muse graph capture unavailable; running eagerly");
+            if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                tracing::warn!(%error, "Muse graph capture unavailable;
+            } running eagerly");
             return segment();
         }
         let captured = segment();
@@ -58,6 +59,7 @@ impl<'a> Graphs<'a> {
         // SAFETY: this is the stream whose capture began above.
         let executable = unsafe { self.device.library.cuda_graph_end_capture_topology(stream) };
         if let Err(error) = captured {
+            self.bank.borrow_mut().cache_ticket_failed(ticket, executable.as_ref().err().unwrap_or(&error));
             if let Ok((raw, ..)) = executable {
                 // SAFETY: this executable has never been launched.
                 unsafe { self.device.library.cuda_graph_exec_destroy(raw)?; }
@@ -67,8 +69,9 @@ impl<'a> Graphs<'a> {
         let (raw, nodes, width, spans_devices, inspection_error) = match executable {
             Ok(info) => info,
             Err(error) => {
-                drop(ticket);
-                tracing::warn!(%error, "Muse graph instantiation unavailable; running eagerly");
+                if self.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                    tracing::warn!(%error, "Muse graph instantiation unavailable;
+                } running eagerly");
                 return segment();
             }
         };

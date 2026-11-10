@@ -193,12 +193,12 @@ impl<'a> DsparkWindow<'a> {
         f(self.ring.buffer.device_id, "dspark_cache", false, &mut self.graphs)
     }
     fn capture_ready(&mut self) -> Result<()> {
-        let Some(ticket) = self.graphs.cache_ticket(&(), true, None) else { return Ok(()) };
+        let Some(mut ticket) = self.graphs.cache_ticket(&(), true, None) else { return Ok(()) };
         let library = self.stream.library;
         // SAFETY: all earlier writes completed and this window pins every buffer.
-        unsafe { library.cuda_graph_begin_capture(self.stream.raw)?; }
+        unsafe { ticket.capture_result(library.cuda_graph_begin_capture(self.stream.raw))?; }
         let queued = unsafe { self.enqueue() };
-        let captured = unsafe { library.cuda_graph_end_capture_topology(self.stream.raw) };
+        let captured = unsafe { ticket.capture_result(library.cuda_graph_end_capture_topology(self.stream.raw)) };
         match (queued, captured) {
             (Ok(()), Ok((raw, nodes, width, spans, _))) => {
                 // SAFETY: Drop drains before clearing this owner and its allocations.

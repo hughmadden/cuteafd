@@ -2114,3 +2114,34 @@ def test_muse_cli_reports_onboard_geometry_and_reproduces_output(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "Muse 1 ranks onboard_layers=2: 2 geometries" in result.stdout
     assert output.read_text() == expected
+
+
+def test_capture_ticket_native_failures_always_report_backoff():
+    """New V4.1 capture sites must not silently cancel OOM ghosts by Drop."""
+    import re
+
+    families = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families"
+    checked = 0
+    for path in (families / "deepseek_v41").rglob("*.rs"):
+        source = re.split(r"#\[cfg\(test\)\]\s*mod ", path.read_text(), maxsplit=1)[0]
+        if ".cache_ticket(" not in source and path.name != "dual.rs":
+            continue
+        for native in re.finditer(r"\.cuda_graph_(?:begin_capture|end_capture_topology)\(", source):
+            prefix = source[max(0, native.start() - 180):native.start()]
+            assert re.search(r"(?:plan\.)?ticket\.capture_result\([^;{}]*$", prefix), path
+            checked += 1
+    assert checked >= 52, "the V4.1 capture inventory must not disappear"
+    for family, file, api in [
+        ("qwen4", "engine.rs", "cache_ticket_failed"),
+        ("qwen3_5", "graphs.rs", "cache_ticket_failed"),
+        ("muse_spark", "graphs.rs", "cache_ticket_failed"),
+        ("kimi_k3", "graphs.rs", "cache_ticket_failed"),
+        ("deepseek_v4", "engine.rs", "cache_capture_failed"),
+        ("mimo_v2", "engine.rs", "cache_capture_failed"),
+        ("glm5", "engine.rs", "cache_capture_failed"),
+        ("glm5_flash", "engine.rs", "cache_capture_failed"),
+    ]:
+        source = (families / family / file).read_text()
+        for warning in re.finditer(r'tracing::warn!\([^;]*"[^";]*(?:capture|instantiat)[^";]*(?:eager|fallback)[^";]*"', source):
+            prefix = source[max(0, warning.start() - 180):warning.start()]
+            assert api + "(ticket, &error)" in prefix, (family, warning.group())
