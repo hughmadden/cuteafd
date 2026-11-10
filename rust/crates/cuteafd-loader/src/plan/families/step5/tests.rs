@@ -743,7 +743,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let r = report(dir.path(), 2, 96, 6, None);
     let memory = r.memory_layout.unwrap();
     assert!(memory.pool_tokens >= 262_144);
-    assert!(memory.notes.iter().any(|n| n.contains("decode graphs false")));
+    assert!(memory.notes.iter().any(|n| n.contains("decode graphs true")));
     assert!(memory.notes.iter().any(|n| n.contains("compiled extent 1048576")));
 
 }
