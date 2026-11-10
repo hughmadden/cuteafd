@@ -149,7 +149,10 @@ pub fn staging_layout(layout: &Step5CacheLayout, rank: usize, sequences: usize)
         .max(256);
     let mut sizes = vec![step.checked_mul(8).context("Step-5 positions overflow")?.max(256),
         step.checked_mul(4).context("Step-5 requests overflow")?.max(256), table,
-        table.checked_mul(sequences).context("Step-5 page tables overflow")?];
+        table.checked_mul(sequences).context("Step-5 page tables overflow")?,
+        step.checked_mul(4).context("Step-5 graph requests overflow")?.max(256),
+        table.checked_mul(sequences).context("Step-5 graph ring tables overflow")?,
+        table.checked_mul(sequences).context("Step-5 graph page tables overflow")?];
     if layers > 0 { sizes.extend([metadata, metadata, scratch]); }
     let raw = rows.checked_mul(256 * 2).context("Step-5 raw staging overflow")?;
     for _ in 0..layers { sizes.extend([raw, raw]); }
@@ -173,6 +176,8 @@ const EXECUTOR: ExecutorModes = crate::placement::families::STEP5;
 /// absolute additional peaks above that same sample, not steady-state deltas.
 #[derive(Clone)]
 pub struct RuntimeInputs {
+    pub graph_layout: Option<crate::serving_capacity::step5_graphs::Step5GraphLayout>,
+    pub decode_graphs: bool,
     pub host: HostInputs,
     pub bf16_target_head: crate::placement::planner::serving::BlasHead,
     pub resident_weight_limit: Option<ResidentWeights>,
@@ -588,7 +593,7 @@ mod tests {
         }
     }
     fn inputs(ranks: usize) -> RuntimeInputs {
-        RuntimeInputs { bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: crate::families::qwen4::Qwen4KvCache::Bf16,
             full_prefill_logits: false, waves: 1, unit: 0,
@@ -637,6 +642,134 @@ mod tests {
                 o.ranks()
             ])
         })
+    }
+
+    #[test]
+    fn sampled_preweight_occupancy_is_capacity_neutral_and_named_once_per_rank() -> Result<()> {
+        use crate::placement::{families::step5 as family, planner::*};
+        struct Prepared(Contract);
+        impl Recipe for Prepared {
+            fn prepare(&self, _: &Request) -> std::result::Result<Contract, Refusal> { Ok(self.0.clone()) }
+        }
+        for reserve in [None, Some(0), Some(200 << 20)] {
+            cuteafd_core::memory_policy::MemoryPolicy { gpu_reserve: reserve, ..Default::default() }.scoped(|| -> Result<()> {
+        for occupied in [[0, 0], [682_885_120, 711_196_672]] {
+            let mut input = inputs(2);
+            for gpu in &mut input.inventory.gpus {
+                gpu.reserve_bytes = crate::placement::reserve::gpu("step5");
+            }
+            for (gpu, bytes) in input.inventory.gpus.iter_mut().zip(occupied) {
+                gpu.baseline = crate::placement::Baseline::Measured { free_bytes: gpu.capacity_bytes - bytes };
+            }
+            let cfg = config();
+            let recipe = family::Step5Recipe::new(&cfg, &input, 0, |ownership| Ok(vec![RankAdmission {
+                resident_weights: ResidentWeights(0), weight_arenas: vec![], immutable: 1 << 30,
+                private_requests: vec![1 << 30], drafter_requests: vec![], vocabulary_heads: vec![],
+                projection_bytes: 0, workspace: 1 << 20 }; ownership.ranks()]))?;
+            let request = recipe.request();
+            let mut contract = recipe.prepare(&request)?;
+            contract.components.retain(|component| !matches!(&component.kind,
+                ComponentKind::Allowance(owner) if crate::placement::sampled_baseline::is_source(&owner.source)));
+            let mut old_budgets = family::budgets(&input)?;
+            for (budget, bytes) in old_budgets.iter_mut().take(2).zip(occupied) {
+                budget.baseline = planner::Baseline::Sampled { free: budget.physical_bytes - bytes,
+                    phase: Phase::Load, source: "pre-weight CUDA free memory".into() };
+            }
+            let before = solve(request, old_budgets, &Prepared(contract))?;
+            let now = run(&input)?.solved;
+            assert_eq!(now.pool_tokens, before.pool_tokens);
+            assert_eq!(now.decisions, before.decisions);
+            assert_eq!(&now.budgets[2..], &before.budgets[2..], "Spark/host budgets unchanged");
+            for (rank, bytes) in occupied.into_iter().enumerate() {
+                assert!(matches!(now.budgets[rank].baseline, planner::Baseline::Forecast { occupied: 0, .. }));
+                for phase in [Phase::Load, Phase::Ready, Phase::Growth] {
+                    let items = now.items_at(Location::coordinator(rank as u8), phase)?;
+                    let owners = items.iter().filter(|item| crate::placement::sampled_baseline::is_source(&item.group)).collect::<Vec<_>>();
+                    assert_eq!(owners.len(), usize::from(bytes > 0));
+                    assert_eq!(owners.iter().map(|owner| owner.bytes).sum::<u64>(), bytes);
+                    let row = |plan: &ResolvedPlan| plan.phases.iter().find(|row|
+                        row.budget == format!("rtx{rank}") && row.phase == phase).unwrap().clone();
+                    let a = row(&now); let b = row(&before);
+                    assert_eq!(a.available - a.owned - a.opaque, b.available - b.owned - b.opaque);
+                    let breakdown = crate::placement::reserve::breakdown(format!("rtx{rank}"),
+                        cuteafd_core::memory_policy::DeviceKind::Gpu, now.budgets[rank].physical_bytes,
+                        now.budgets[rank].headroom, &items);
+                    assert_eq!(breakdown.reserve.iter().filter(|owner|
+                        owner.name == "sampled baseline").map(|owner| owner.bytes).sum::<u64>(), bytes);
+                }
+            }
+        }
+                Ok(())
+            })?;
+        }
+        let mut offline = inputs(2);
+        for gpu in &mut offline.inventory.gpus {
+            gpu.baseline = crate::placement::Baseline::Planned { context_bytes: 600 << 20, loaded_bytes: 40 << 20 };
+        }
+        let planned = run(&offline)?.solved;
+        assert!(!planned.facts.allowances.iter().any(|owner|
+            crate::placement::sampled_baseline::is_source(&owner.source)));
+        assert!(matches!(planned.budgets[0].baseline, planner::Baseline::Forecast { occupied, .. }
+            if occupied == 640 << 20));
+        let mut invalid = inputs(2);
+        invalid.inventory.gpus[1].baseline = crate::placement::Baseline::Measured {
+            free_bytes: invalid.inventory.gpus[1].capacity_bytes + 1 };
+        assert!(run(&invalid).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank() -> Result<()> {
+        const CHILD: &str = "CUTEAFD_TEST_STEP5_GRAPH_RESERVE";
+        let Ok(value) = std::env::var(CHILD) else {
+            // Isolate reserve policy from the parent environment without mutating
+            // process-wide variables while other Rust tests are running.
+            let name = format!("{}::graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank",
+                module_path!().split_once("::").unwrap().1);
+            for value in ["untraced", "gpu0=64MiB,gpu1=96MiB"] {
+                let mut child = std::process::Command::new(std::env::current_exe()?);
+                child.args(["--exact", &name, "--nocapture"]).env(CHILD, value)
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+                    .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+                if value != "untraced" { child.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+                ensure!(child.status()?.success(), "Step-5 graph reserve child failed: {value}");
+            }
+            return Ok(());
+        };
+        for ranks in [1, 2] {
+            let mut policy = inputs(ranks);
+            let eager = run(&policy)?;
+            policy.decode_graphs = true;
+            let graphs = run(&policy)?;
+            // An asymmetric nonzero reserve can legitimately change the selected
+            // CSA boundary; only zero reserve promises eager-equivalent placement.
+            if value == "untraced" {
+                assert_eq!(graphs.placement.pool_tokens, eager.placement.pool_tokens);
+                assert_eq!(graphs.placement.layers, eager.placement.layers);
+            }
+            for rank in 0..ranks {
+                let expected = if value == "untraced" { 0 } else { [64 << 20, 96 << 20][rank] };
+                let owners = graphs.solved.facts.allowances.iter().filter(|owner|
+                    owner.location == crate::placement::planner::Location::coordinator(rank as u8)
+                        && crate::placement::graph_reserve::is_source(&owner.source)).collect::<Vec<_>>();
+                // The shared physical ledger omits zero-byte allowances.
+                assert_eq!(owners.len(), usize::from(expected != 0));
+                if let Some(owner) = owners.first() {
+                    assert_eq!(owner.bytes, expected);
+                    assert_eq!(owner.source, crate::placement::graph_reserve::source(&format!("step5.graphs.{rank}")));
+                    assert!(!owner.assumed);
+                }
+                for phase in [crate::placement::planner::Phase::Ready, crate::placement::planner::Phase::Growth] {
+                    let total = |admission: &Admission| admission.solved.facts.allowances.iter()
+                        .filter(|owner| owner.location == crate::placement::planner::Location::coordinator(rank as u8)
+                            && owner.lifetime.contains(phase, admission.solved.facts.phase_order))
+                        .map(|owner| owner.bytes).sum::<u64>();
+                    assert_eq!(total(&graphs), total(&eager) + expected);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]

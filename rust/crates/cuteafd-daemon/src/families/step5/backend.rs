@@ -241,6 +241,50 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         self
     }
 
+    /// Startup owns slot zero and disposable pages before the scheduler exists.
+    /// Run the real joins, but never publish a scratch proposal or prefix mark.
+    pub(super) fn warm_decode_graphs(&self,
+        layout: Option<cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout>) -> Result<()> {
+        let selected = cuteafd_loader::serving_capacity::step5_graphs::selected_rows(
+            layout, self.prefill.0.min(self.rows).min(self.context))?;
+        if selected.is_empty() { return Ok(()); }
+        self.state.retire();
+        let page_count = usize::try_from(self.ranks[0].borrow().page_count())?;
+        let mut pool = RefPagePool::new(page_count, 64);
+        let reset = || -> Result<()> {
+            for rank in &self.ranks { rank.borrow().reset_sequence(0)?; }
+            Ok(())
+        };
+        let result = self.execution.warming_graphs(|| -> Result<()> {
+            for &(rows, _) in &selected {
+                let pages = pool.alloc(rows.div_ceil(64)).context("Step-5 graph prewarm scratch pages")?;
+                let mut placement = Placement { pages, sequence: 0, committed: 0 };
+                let tokens = vec![0u32; rows];
+                // First-touch eagerly, seed after lazy module/workspace setup,
+                // then capture the same persistent geometry on the next pass.
+                let warmed = (|| -> Result<()> {
+                    for pass in 0..2 {
+                        reset()?;
+                        let (step, _) = self.execute_inner(&[(&mut placement, &tokens)], &pool,
+                            cuteafd_transport::ExpertV2SourceKind::MtpVerify, Some(0))?;
+                        drop(step);
+                        if pass == 0 { self.execution.observe_graph_startup()?; }
+                    }
+                    Ok(())
+                })();
+                pool.release(&placement.pages);
+                reset()?;
+                warmed?;
+            }
+            Ok(())
+        });
+        let cleaned = reset();
+        result?;
+        cleaned?;
+        tracing::info!(?layout, rows = ?selected, "Step-5 graph prewarm completed on scratch state");
+        Ok(())
+    }
+
     /// Score retained packed target rows before another target pass replaces them.
     #[cfg(test)]
     pub(super) fn diagnostic_packed_logits(&self, rows: &[usize]) -> Result<Vec<Vec<f32>>> {
@@ -556,8 +600,10 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.retire();
         let source = ungraphed_kind(speculative, kind);
-        if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
-        else { self.immediate(sequences, pool, source, None).map(Some) }
+        self.execution.without_graphs(|| {
+            if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
+            else { self.immediate(sequences, pool, source, None).map(Some) }
+        })
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {

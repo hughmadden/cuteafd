@@ -1,6 +1,7 @@
 """Trace-derived startup lists preserve hot shapes and per-device ownership."""
 import copy
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 
@@ -36,6 +37,121 @@ def test_non_glm_generators_keep_existing_fixture_outputs(family):
     else:
         result = MODULE.generate_kimi([kimi_trace()], 1, "kimi-k3-exl3-k6-min")
     assert result == expected[family]
+
+
+def test_step5_real_hqa_traces_reproduce_installed_inventories_byte_for_byte():
+    import gzip
+
+    fixture = SCRIPT.parents[1] / "tests/fixtures/step5-prewarm-trace.json.gz"
+    evidence = json.loads(gzip.decompress(fixture.read_bytes()))
+    assert evidence["checkpoint"] == "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6-HQA"
+    assert evidence["revision"] == "61f9275e7f604cb11a5ae9a64a07ff1c600174b7"
+    generated = {"layouts": [MODULE.generate_step5(layout["traces"], layout["layout"])
+                             for layout in evidence["layouts"]]}
+    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/step5_prewarm.json"
+    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
+    expected = [(58, [3_407_872_000], [46]), (59, [2_835_349_504, 2_629_828_608], [])]
+    for layout, (rows, bases, pins) in zip(generated["layouts"], expected, strict=True):
+        assert [rank["reserve_base_bytes"] for rank in layout["ranks"]] == bases
+        for rank in layout["ranks"]:
+            assert len(rank["entries"]) == rows
+            assert [entry["rows"] for entry in rank["entries"] if entry["pin"]] == pins
+            assert rank["reserve_extra_bytes"] == MODULE.CHUNK
+            assert rank["zero_replay_sibling_bytes"] == 0
+            assert rank["lazy_zero_replay_bytes"] > 0
+    for layout in evidence["layouts"]:
+        for trace in layout["traces"]:
+            assert all(graph["nodes"] > 2 and not graph["spans_devices"]
+                       and graph["recaptures"] == 0 for graph in trace["graphs"])
+    assert fixture.stat().st_size < 1_000_000
+
+
+def step5_trace(device=0):
+    def graph(layer, rows, section, hits, capture, pin=False):
+        return {"site": "step5.section", "bank": 1,
+                "shape": f"Key {{ layer: {layer}, rows: {rows}, section: {section} }}",
+                "nodes": 4, "spans_devices": False, "hits": hits, "capture_bytes": capture,
+                "hit_histogram": {"counts": [1, 1, 1, 1] if pin else [hits], "interval_ms": 10000}}
+    return {"schema_version": 2, "cache": {"device": device, "sampled_at_ms": 40000},
+            "graphs": [graph(0, 1, "Projection", 100, 1000),
+                       graph(0, 4, "Attention", 2, 2000, True),
+                       graph(1, 16, "Finish", 1, 0),
+                       graph(2, 64, "Shared", 0, 999999)]}
+
+
+@pytest.mark.parametrize("layout", ["fp8-2rtx-6spark", "exl3-k4-core-k6-2rtx-6spark"])
+def test_step5_selects_every_replayed_section_and_heat_orders_each_rank(layout):
+    result = MODULE.generate_step5([step5_trace(1), step5_trace(0)], layout)
+    assert [rank["rank"] for rank in result["ranks"]] == [0, 1]
+    for rank in result["ranks"]:
+        assert [entry["rows"] for entry in rank["entries"]] == [4, 1, 16]
+        assert [entry["pin"] for entry in rank["entries"]] == [True, False, False]
+        assert rank["entries"][-1]["capture_bytes"] == 1500
+        assert rank["reserve_base_bytes"] == 2 << 20
+        assert rank["reserve_extra_bytes"] == 2 << 20
+    assert result == MODULE.generate_step5([step5_trace(0), step5_trace(1), step5_trace(0)],
+                                           layout)
+
+
+def test_step5_exl3_min_and_max_have_independent_rank_identities():
+    layout = "exl3-k4-core-k6-1rtx-3spark"
+    result = MODULE.generate_step5([step5_trace()], layout)
+    assert result["layout"] == layout
+    assert len(result["ranks"]) == 1
+    with pytest.raises(ValueError, match="requires 2 device traces"):
+        MODULE.generate_step5([step5_trace()], "exl3-k4-core-k6-2rtx-6spark")
+
+
+@pytest.mark.parametrize("change", [lambda t: t["graphs"][0].update(nodes=1),
+    lambda t: t["graphs"][0].update(spans_devices=True),
+    lambda t: t["graphs"][0].update(capture_bytes=None),
+    lambda t: t["graphs"][0].update(shape="Key { layer: 0, rows: 1, sequence: 2 }"),
+    lambda t: t["graphs"].append(copy.deepcopy(t["graphs"][0]))])
+def test_step5_rejects_unmeasured_or_unsafe_section_inventory(change):
+    data = step5_trace()
+    change(data)
+    with pytest.raises(ValueError):
+        MODULE.generate_step5([data], "nvfp4-1rtx-4spark")
+
+
+def test_step5_row_selection_prices_zero_replay_siblings_on_every_rank():
+    data = step5_trace()
+    sibling = copy.deepcopy(data["graphs"][0])
+    sibling.update(shape="Key { layer: 1, rows: 1, section: Attention }", hits=0, capture_bytes=3000)
+    data["graphs"].append(sibling)
+    result = MODULE.generate_step5([data], "nvfp4-1rtx-4spark")["ranks"][0]
+    row = next(entry for entry in result["entries"] if entry["rows"] == 1)
+    assert row["capture_bytes"] == 4000
+    assert len(row["sections"]) == 2
+    assert result["zero_replay_sibling_bytes"] == 3000
+    assert result["lazy_zero_replay_bytes"] == 999999
+
+
+def test_step5_never_borrows_another_layout_or_selects_capture_only():
+    with pytest.raises(ValueError):
+        MODULE.generate_step5([step5_trace()], "fp8-2rtx-6spark")
+    data = step5_trace()
+    for graph in data["graphs"]:
+        graph["hits"] = 0
+    with pytest.raises(ValueError, match="no replayed"):
+        MODULE.generate_step5([data], "nvfp4-1rtx-4spark")
+
+
+def test_step5_extension_preserves_every_existing_family_output_byte_for_byte():
+    # Hashes from the generator at 2cdcc757a3, before Step-5 dispatch was added.
+    cases = [
+        (MODULE.generate([trace()], "glm5"), "3081a5619f1997899f40c27fc72a392f0a0a7c6219f52dc360e41671b0cb5cc8"),
+        (MODULE.generate([flash_trace()], "glm5_flash"), "135dc28da122a25b94de1cc0e525d571f006ae1ad2eee33fe55fff7984b0823a"),
+        (MODULE.generate([context_trace()], "mistral_large4", layout=2), "5b9886faf0eeea59230dc82c7f60229feae0b90479576ec9438767479206bf73"),
+        (MODULE.generate_qwen([qwen_trace()], "single_sparks"), "4c18df79e34426c11074a1f9f82785f916f2cccf73475d8d2f476bc811e45735"),
+        (MODULE.generate([v4_trace(0, 5 << 20)], "deepseek_v4", layout="rtx1-local", existing=v4_list()),
+         "fc9483c5180001c782b40e200cb5138fc3d03c7ecf71b85af34b1d77c4a71032"),
+        (MODULE.generate([v41_trace()], "deepseek_v41", layout=1), "8e9f32b829849a0f3fc4a2a01c595346c80606c7ee866e50cc5b2601982df754"),
+        (MODULE.generate([mimo_trace()], "mimo_v2", ranks=1, variant="mimof-48", sparks=True),
+         "51a36a9ea8fe52f6b62bd8a7de62c7ff5e984cae8b499e5f3c37088d72576ce2"),
+    ]
+    for result, expected in cases:
+        assert hashlib.sha256((json.dumps(result, indent=2) + "\n").encode()).hexdigest() == expected
 
 
 def test_frequency_and_low_parameter_pin_candidate():
@@ -1811,6 +1927,15 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
     data["graphs"][0]["nodes"] = 1
     with pytest.raises(ValueError, match="singleton"):
         MODULE.generate_qwen35([data], layout["variant"])
+
+
+def test_step5_launcher_defaults_graphs_on_for_plan_and_serve():
+    launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
+    assert 'step5_decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
+    assert '--step5-decode-graphs "$step5_decode_graphs"' in launcher
+    step5 = launcher.split('step5_decode_graphs="$(get DECODE_GRAPHS on)"', 1)[1].split("esac", 1)[0]
+    assert 'on) family_args+=(--decode-graphs true)' in step5
+    assert 'off) family_args+=(--decode-graphs false)' in step5
 
 
 def test_dense_qwen_launcher_defaults_graphs_on_for_plan_and_serve():

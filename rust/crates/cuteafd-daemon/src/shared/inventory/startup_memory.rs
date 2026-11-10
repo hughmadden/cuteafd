@@ -357,7 +357,7 @@ mod tests {
         let snapshot = root.path().join("snapshot");
         cuteafd_loader::plan::testing::write_step5_exl3_snapshot(&snapshot);
         let checkpoint = Checkpoint::open(&snapshot)?;
-        let inputs = RuntimeInputs {
+        let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false,
             bf16_target_head: cuteafd_loader::placement::planner::serving::BlasHead::TensorLt,
             host: HostInputs::default(), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,

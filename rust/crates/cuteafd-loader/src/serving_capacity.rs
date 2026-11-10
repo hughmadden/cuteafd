@@ -13,6 +13,7 @@ use thiserror::Error;
 
 mod deepseek;
 pub mod step5;
+pub mod step5_graphs;
 mod spark_intake;
 pub mod prefill_waves;
 mod fp8moe_workspace;

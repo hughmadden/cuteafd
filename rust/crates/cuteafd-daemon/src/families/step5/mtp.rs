@@ -547,7 +547,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
                 requests: owner.metadata[2].buffer, rows, base: self.coordinates.base as usize,
                 extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64, kv_format: owner.kv_format },
             start: 0, key: self.components[0], value: self.components[1], summaries: None,
-            table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
+            table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(), table_batch: 1,
             pages: self.cache.layout().mtp_ring.rows as usize / 64,
         })?;
         let history_ring = self.cache.layout().mtp_history.context("Step-5 MTP hidden history ring")?;

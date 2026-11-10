@@ -1,4 +1,4 @@
-//! Eager native target and default-on MTP over the shared scheduler.
+//! Native target, bounded decode sections and default-on MTP over the shared scheduler.
 use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, cache::CacheRank,
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
@@ -66,6 +66,9 @@ fn resident_budget(peak: usize, workspace: usize) -> Result<usize> {
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Replay bounded persistent decode/verify sections (prefill remains eager).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    decode_graphs: bool,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
     #[command(flatten)]
@@ -321,7 +324,9 @@ fn with_backend<T>(args: &ServeArgs,
         &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let reserve = cuteafd_loader::placement::reserve::gpu("step5");
-    let mut inputs = RuntimeInputs { bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+    let graph_layout = cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
+        &catalog, &contract, ids.len(), args.peers.len());
+    let mut inputs = RuntimeInputs { graph_layout, decode_graphs: args.decode_graphs, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         host: Default::default(), resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, reserve_bytes: reserve }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: usize::try_from(shape.span_rows)?,
@@ -345,6 +350,7 @@ fn with_backend<T>(args: &ServeArgs,
     // One admission: the contract prices every retained owner, and native ABIs
     // are validated against the ownership it selected.
     let (admission, native_plan) = admission::admit_mtp_with_contract(&programs, &checkpoint, &inputs, usize::from(args.mtp), contract, native_selection)?;
+    publish_reconciliation(args, &ids, &admission.solved)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admission.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admission.solved.served_context().to_string());
     tracing::info!(elapsed_s = planning.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
@@ -373,8 +379,7 @@ fn with_backend<T>(args: &ServeArgs,
                 cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(args.mtp), inputs.kv_format)?);
         }
         let native = native.check(u64::MAX, &[])?;
-        let total = admission.placement.items[rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved allocation overflow")?;
+        let total = future_allocation_bytes(&admission.placement.items[rank], &inputs.inventory.gpus[rank])?;
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
@@ -388,8 +393,7 @@ fn with_backend<T>(args: &ServeArgs,
     let predictor_budget = if args.mtp > 0 {
         let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::mtp_weight_charge(
             &checkpoint, &native_plan.contract, usize::from(args.mtp))?;
-        let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
-            .context("Step-5 solved predictor allocation overflow")?;
+        let total = future_allocation_bytes(&admission.placement.items[head_rank], &inputs.inventory.gpus[head_rank])?;
         Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
     } else { None };
     crate::shared::inventory::startup_probe(&library, &ids, "step5/pre-weight", Default::default())?;
@@ -537,8 +541,9 @@ fn with_backend<T>(args: &ServeArgs,
         Ok(link)
     })?) };
     library.cuda_set_device(args.device)?;
-    let execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
+    let mut execution = Execution::bind_native(&checkpoint, ownership, native, caches_ref, stages_ref, inputs.rows,
         transport, 92, 1)?;
+    execution.configure_graphs(args.decode_graphs, graph_layout)?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, &target_input)?
         .with_served_context(usize::try_from(admission.solved.served_context())?)?
         .with_admitted_host(admission.host_cache_bytes, admission.host_geometry)
@@ -547,13 +552,62 @@ fn with_backend<T>(args: &ServeArgs,
             args.prefill_rows as usize)?)?
         .configure_packing(args.prefill_packing, coordinator_cap)?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
+    if args.decode_graphs { backend.warm_decode_graphs(graph_layout)?; }
     library.cuda_set_device(args.device)?;
     tracing::info!(elapsed_s = bind_start.elapsed().as_secs_f64(), total_s = startup.elapsed().as_secs_f64(),
         "Step-5 startup native binding complete");
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
-        "Step-5 admitted eager target and native predictor depth");
+        "Step-5 admitted target and native predictor depth");
     run(&backend, inputs.sequences)
+}
+
+pub(super) fn future_allocation_bytes(items: &[cuteafd_core::memory_layout::Item], gpu: &GpuBudget) -> Result<u64> {
+    let total = items.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 solved allocation overflow")?;
+    // CUDA free already excludes this occupancy; only future owners belong in
+    // native/predictor checks against GpuBudget::available().
+    let sampled = match gpu.baseline {
+        cuteafd_loader::placement::Baseline::Measured { free_bytes } => gpu.capacity_bytes
+            .checked_sub(free_bytes).context("Step-5 sample exceeds physical capacity")?,
+        cuteafd_loader::placement::Baseline::Planned { .. } => 0,
+    };
+    let owners = items.iter().filter(|item| cuteafd_loader::placement::sampled_baseline::is_source(&item.group))
+        .collect::<Vec<_>>();
+    ensure!(owners.len() == usize::from(sampled > 0), "Step-5 sampled owner must appear exactly once");
+    let published = owners.iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+        .context("Step-5 sampled owner overflow")?;
+    ensure!(published == sampled, "Step-5 sampled owner differs from measured occupancy");
+    total.checked_sub(published).context("Step-5 sampled owner missing from solved ledger")
+}
+
+fn reconciliation_devices(ids: &[i32]) -> Vec<serde_json::Value> {
+    ids.iter().map(|id| serde_json::json!({"device": id})).collect()
+}
+
+pub(super) fn publish_reconciliation(args: &ServeArgs, ids: &[i32],
+    solved: &cuteafd_loader::placement::planner::ResolvedPlan) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    cuteafd_loader::placement::reserve::log_plan(solved, "step5");
+    let hash = |path: &std::path::Path| -> Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut digest = Sha256::new();
+        std::io::copy(&mut file, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
+    };
+    cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
+        "memory_reconciliation_provenance": {
+            "schema_version": 1, "family": "step5", "source_commit": env!("CUTEAFD_BUILD_COMMIT"),
+            "source_dirty": env!("CUTEAFD_BUILD_DIRTY"), "toolchain": env!("CUTEAFD_BUILD_TOOLCHAIN"),
+            "native_sha256": hash(&args.native_lib)?, "programs_sha256": hash(&args.manifest)?,
+            "devices": reconciliation_devices(ids),
+            "spark_world": args.peers.len(), "onboard_layers": solved.decisions.onboard_layers,
+            "prefill": solved.decisions.prefill, "context": solved.served_context(),
+            "kv_cache": format!("{:?}", args.kv_cache), "decode_graphs": args.decode_graphs,
+            "graph_basis": "per-device bounded byte basis; layout-specific traced rows, or zero untraced base without pins"
+        }
+    }));
+    Ok(())
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
@@ -630,6 +684,89 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn decode_graphs_default_on_and_allow_explicit_off() {
+        assert!(args().decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1", "--decode-graphs", "false"]).unwrap();
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert!(!args.decode_graphs);
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "on");
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m", "--step5-decode-graphs", "off"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
+        assert_eq!(args.step5_decode_graphs, "off");
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_decode_graphs);
+    }
+
+    #[test]
+    fn future_allocation_excludes_only_the_exact_published_sample() -> Result<()> {
+        use cuteafd_core::memory_layout::{Basis, Category, Item};
+        use cuteafd_loader::placement::Baseline;
+        let gpu = GpuBudget { capacity_bytes: 1000, reserve_bytes: 50,
+            baseline: Baseline::Measured { free_bytes: 800 } };
+        let owner = |bytes| Item::new(Category::Runtime,
+            cuteafd_loader::placement::sampled_baseline::source("Step-5 context and selected modules; pre-weight sample"), "", bytes, Basis::Formula);
+        let future = Item::new(Category::Workspace, "native", "", 600, Basis::Formula);
+        let available = gpu.available();
+        assert_eq!(future_allocation_bytes(&[owner(200), future.clone()], &gpu)?, 600);
+        assert_eq!(gpu.available(), available);
+        assert!(future_allocation_bytes(&[future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(201), future.clone()], &gpu).is_err());
+        assert!(future_allocation_bytes(&[owner(100), owner(100), future.clone()], &gpu).is_err());
+        let invalid = GpuBudget { baseline: Baseline::Measured { free_bytes: 1001 }, ..gpu };
+        assert!(future_allocation_bytes(&[future.clone()], &invalid).is_err());
+        let planned = GpuBudget { baseline: Baseline::Planned { context_bytes: 200, loaded_bytes: 0 }, ..gpu };
+        assert_eq!(future_allocation_bytes(&[future], &planned)?, 600);
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_devices_preserve_tp2_physical_ids_in_rank_order() {
+        let devices = reconciliation_devices(&[1, 3]);
+        assert_eq!(devices, vec![serde_json::json!({"device": 1}), serde_json::json!({"device": 3})]);
+        for (rank, physical) in [1, 3].into_iter().enumerate() {
+            assert_eq!(devices[rank]["device"].as_i64(), Some(physical));
+        }
+        assert_eq!(reconciliation_devices(&[1]), vec![serde_json::json!({"device": 1})]);
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("\"devices\": reconciliation_devices(ids)"));
+        assert!(source.contains("\"spark_world\": args.peers.len()"));
+    }
+
+    #[test]
+    fn reconciliation_is_registered_and_shared_scheduler_samples_after_join() {
+        let serve = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(serve.contains("publish_reconciliation(args, &ids, &admission.solved)?"));
+        assert!(serve.contains("\"memory_reconciliation_provenance\""));
+        let scheduler = include_str!("../../shared/qwen/scheduler.rs");
+        assert!(scheduler.contains("crate::shared::probe::first_request(&FIRST"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))"));
+        assert!(execution.contains("self.graph_completed()"));
+        assert!(!serve.contains("graph_capture_stats"));
+    }
+
+    #[test]
+    fn graph_prewarm_uses_disposable_state_and_the_joined_execution_path() {
+        let backend = include_str!("backend.rs");
+        let start = backend.find("pub(super) fn warm_decode_graphs(").unwrap();
+        let end = start + backend[start..].find("/// Score retained packed").unwrap();
+        let warm = &backend[start..end];
+        assert!(warm.contains("RefPagePool::new(page_count, 64)"));
+        assert!(warm.contains("reset_sequence(0)?"));
+        assert!(warm.contains("self.execute_inner("));
+        assert!(warm.contains("drop(step)"));
+        assert!(warm.contains("pool.release(&placement.pages)"));
+        assert!(warm.contains("observe_graph_startup()?"));
+        assert!(!warm.contains("publish_wave"));
+        let execution = include_str!("execution.rs");
+        assert!(execution.contains("bank.warming(true)"));
+        assert!(execution.contains("bank.warming(false)"));
+        assert!(include_str!("graphs.rs").contains("Cycle::Other } else { cycle"));
     }
 
     #[test]
@@ -795,7 +932,7 @@ mod tests {
         let capacity = placement::inventory::PRO_TOTAL_BYTES;
         let arch = placement::inventory::ArchContext::coordinator(capacity, None);
         let selected = ProgramSet::from_names(&["step5", "step52"], programs.names());
-        let mut inputs = RuntimeInputs { bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
+        let mut inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
                 kv_format: args.kv_cache,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
@@ -830,7 +967,7 @@ mod tests {
                         plan::families::step5::native::mtp_forecast_workspace(inputs.unit_rows(), usize::from(depth), inputs.kv_format)?);
                 }
                 let native = native.check(u64::MAX, &[])?;
-                let total = admitted.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();
+                let total = future_allocation_bytes(&admitted.placement.items[rank], &inputs.inventory.gpus[rank])?;
                 ensure!(native <= total && total <= inputs.inventory.gpus[rank].available(),
                     "native allocation exceeds solved startup budget at rank {rank}");
             }

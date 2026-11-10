@@ -144,7 +144,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
     let arch = ArchContext::coordinator(capacity, None);
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16,
         crate::families::qwen4::Qwen4KvCache::Fp8] {
-        let inputs = RuntimeInputs { bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
+        let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false, bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             kv_format,
             inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
@@ -743,7 +743,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     let r = report(dir.path(), 2, 96, 6, None);
     let memory = r.memory_layout.unwrap();
     assert!(memory.pool_tokens >= 262_144);
-    assert!(memory.notes.iter().any(|n| n.contains("zero graphs")));
+    assert!(memory.notes.iter().any(|n| n.contains("decode graphs true")));
     assert!(memory.notes.iter().any(|n| n.contains("compiled extent 1048576")));
 
 }
@@ -2113,7 +2113,7 @@ fn hqa_selected_mode_recipe_charges_exact_target_and_mtp_owners() -> anyhow::Res
         let checkpoint = Checkpoint::open_view(&view)?;
         let cfg = Config::parse(&checkpoint)?;
         let contract = coordinator::CoordinatorContract::from_checkpoint(&checkpoint)?;
-        let inputs = RuntimeInputs {
+        let inputs = RuntimeInputs { graph_layout: None, decode_graphs: false,
             bf16_target_head: crate::placement::planner::serving::BlasHead::TensorLt,
             host: Default::default(), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
