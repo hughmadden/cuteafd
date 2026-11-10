@@ -1277,9 +1277,8 @@ mod tests {
     /// First-use module load is post-baseline growth if it happens after the
     /// admission sample. The shared measured window loads every
     /// runtime-registered native module itself (#1600), so the family must not
-    /// also load modules by hand inside it, and the predicted runtime base's
-    /// module half is that window's measured free-memory drop — never the
-    /// offline program-count estimate.
+    /// also load modules by hand inside it. Admission uses the full measured
+    /// context including those modules, never the offline program-count estimate.
     #[test]
     fn native_modules_load_once_inside_the_measured_window() {
         // Anchors are assembled so this test's own text cannot satisfy them.
@@ -1289,8 +1288,8 @@ mod tests {
             let measured = source.split(start).nth(1).unwrap().split(end).next().unwrap();
             assert!(measured.contains("admission::preload("),
                 "the selected V4.1 programs still warm before admission");
-            assert!(measured.contains("gpu.module_bytes"),
-                "admission charges the measured pre-weight module window");
+            assert!(measured.contains(concat!("gpu.", "context_bytes")),
+                "admission charges the full pre-weight sample including selected modules");
             assert!(!source.contains(concat!("tp2_native", "_initialize")),
                 "module loading belongs to the shared measured window, not the family");
             assert!(!source.contains(concat!("ProgramSet::", "module_bytes")),

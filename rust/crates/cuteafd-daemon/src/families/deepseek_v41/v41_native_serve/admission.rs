@@ -834,11 +834,9 @@ pub(super) fn expert_demands(
 /// within this of the device at Ready needs no further attribution.
 const RUNTIME_BASE_RESIDUAL_BAR: u64 = 50 << 20;
 
-/// Report the predicted runtime base against the device at Ready, component by
-/// component: the calibrated CUDA context and the measured module-image extent,
-/// read back from the owners admission charged. Verification only: the pool
-/// already exists, so a residual never changes placement; it reports the part
-/// of the device's runtime base the two predicted owners do not name.
+/// Compare the admitted pre-weight sample (including selected modules) with
+/// the device at Ready. Verification only: the pool already exists, so a
+/// residual reports later runtime growth without changing placement.
 pub(super) fn log_runtime_base(lib: &cuteafd_ffi::NativeLibrary, admitted: &Admitted) -> Result<()> {
     use families::deepseek_v41::admission::{runtime_base_check, runtime_base_components};
     let ranks = admitted.placement.items.len();

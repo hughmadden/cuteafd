@@ -676,7 +676,7 @@ pub(crate) mod tests {
             assert_eq!(offline.movables, [(MovableId::Drafter, 0)]);
             assert_eq!(offline.movables, serving.movables);
             assert_eq!(offline.pool_tokens, serving.pool_tokens);
-            assert_eq!(offline.items, serving.items);
+            assert_sampled_parity(&offline, &serving);
         }
     }
 
@@ -1025,7 +1025,27 @@ pub(crate) mod tests {
             let r = contract(&sampled(&planned)).unwrap();
             assert_eq!(p.solved.pool_tokens, r.solved.pool_tokens);
             assert_eq!(p.solved.decisions, r.solved.decisions);
-            assert_eq!(p.solved.facts.allocations, r.solved.facts.allocations);
+            assert_sampled_parity(&p.placement, &r.placement);
+            let mut offline = p.solved.facts.clone();
+            let mut live = r.solved.facts.clone();
+            for rank in 0..ranks {
+                let location = planner::Location::coordinator(rank as u8);
+                let base = offline.allocations.iter().filter(|owner|
+                    owner.location == location && owner.group == "context+modules").collect::<Vec<_>>();
+                let measured = live.allowances.iter().filter(|owner|
+                    owner.location == location && crate::placement::sampled_baseline::is_source(&owner.source))
+                    .collect::<Vec<_>>();
+                assert_eq!(base.len(), 1);
+                assert_eq!(measured.len(), 1);
+                assert_eq!(base[0].bytes, measured[0].bytes);
+                assert_eq!(base[0].lifetime, measured[0].lifetime);
+                assert!(!measured[0].assumed);
+                offline.allocations.retain(|owner|
+                    owner.location != location || owner.group != "context+modules");
+                live.allowances.retain(|owner|
+                    owner.location != location || !crate::placement::sampled_baseline::is_source(&owner.source));
+            }
+            assert_eq!(offline, live);
             assert_eq!(p.graphs, r.graphs);
             assert_eq!(p.working, r.working);
         }
@@ -1935,7 +1955,7 @@ pub(crate) mod tests {
                     "routers are part of target weights, never an extra demand");
             }
             let admitted = contract(&sampled(&input)).unwrap().placement;
-            assert_eq!(placed.items, admitted.items);
+            assert_sampled_parity(&placed, &admitted);
             assert_eq!(placed.layers, admitted.layers);
             assert_eq!(placed.pool_tokens, admitted.pool_tokens);
             // Removing only router headers from the inventory changes each rank's
