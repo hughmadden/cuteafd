@@ -220,7 +220,18 @@ pub(crate) fn monitor(stage: &'static str, period: Duration) {
         let mut last: Option<Vec<i64>> = None;
         let mut sequence = 0u64;
         loop {
-            let value = report(stage);
+            // Timestamp before the ledger/query so an overlapping completed
+            // boundary always wins over this asynchronous physical sample.
+            let sampled_at = std::time::Instant::now();
+            let ledger = memory_ledger::snapshot();
+            let value = report_snapshot(stage, &ledger, &|device| {
+                let sample = memory_ledger::fault::device_memory(device);
+                if let Some((free, _)) = sample {
+                    crate::shared::decode_graph::device::monitor_physical(device, sampled_at,
+                        free as u64, ledger.total(Space::Device, device) as u64);
+                }
+                sample
+            });
             publish_dashboard(&value);
             if value["devices"].as_array().is_none_or(Vec::is_empty) && value["pinned"]["tracked"] == 0 {
                 std::thread::sleep(period);

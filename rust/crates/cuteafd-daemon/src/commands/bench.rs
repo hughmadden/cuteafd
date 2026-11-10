@@ -206,7 +206,7 @@ fn family_of(command: &str) -> Option<&'static str> {
 pub(crate) fn capture(matches: &ArgMatches, memory: crate::cli::MemoryArgs, graph_floor: Option<&str>) -> Result<()> {
     if let Some(mut context) = serve_context(matches, Some(memory))? {
         if let Some(value) = graph_floor {
-            context.settings.push(Setting { name: "graph-disable-low-mem".into(), value: Some(value.into()), default: None, source: "cli/env".into() });
+            context.settings.push(Setting { name: "graph-disable-low-mem".into(), value: Some(value.into()), default: None, source: "resolved".into() });
         }
         let formats = cuteafd_core::spark_reply::requested();
         let (prefill, decode) = reply_settings(&mut context, formats);

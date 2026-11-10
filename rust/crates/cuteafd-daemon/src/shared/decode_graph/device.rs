@@ -291,7 +291,13 @@ static PHYSICAL_FLOOR: OnceLock<Option<String>> = OnceLock::new();
 
 pub(crate) fn set_physical_floor(text: Option<String>) -> anyhow::Result<()> {
     cuteafd_loader::placement::graph_reserve::physical_floor(text.as_deref(), 0, 0)?;
-    PHYSICAL_FLOOR.set(text).map_err(|_| anyhow::anyhow!("graph physical floor was already installed"))
+    install_physical_floor(&PHYSICAL_FLOOR, text)
+}
+
+fn install_physical_floor(policy: &OnceLock<Option<String>>, text: Option<String>) -> anyhow::Result<()> {
+    let installed = policy.get_or_init(|| text.clone());
+    anyhow::ensure!(*installed == text, "graph physical floor was already installed with a different value");
+    Ok(())
 }
 
 pub(crate) fn device_cache(library: &cuteafd_ffi::NativeLibrary, device: i32,
@@ -426,6 +432,14 @@ fn existing_cache(device: i32) -> Option<SharedCache> {
         .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
+/// Reuse a periodic report's physical sample; older asynchronous reports may
+/// not replace a newer boundary sample. No CUDA query or graph-level mutation.
+pub(crate) fn monitor_physical(device: i32, sampled_at: Instant, free: u64, tracked: u64) {
+    if let Some(cache) = existing_cache(device) {
+        cache.lock().unwrap_or_else(|p| p.into_inner()).monitor_physical(sampled_at, free, tracked);
+    }
+}
+
 /// Observe once per physical device, even when several banks or lanes completed.
 /// Call only at a completed submission boundary, never within a peer segment.
 pub(crate) fn observe_device(library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
@@ -501,7 +515,7 @@ pub(crate) struct DeviceCache {
     charged: u64,
     level: Option<u64>,
     physical_floor: u64,
-    physical_sample: Option<(u64, u64)>,
+    physical_sample: Option<(Instant, u64, u64)>,
     physical_floor_warned: bool,
     floor_resample_pending: bool,
     floor_resample_used: bool,
@@ -563,13 +577,32 @@ impl DeviceCache {
     pub fn pending(&self, id: u64) -> bool { self.records.get(&id).is_some_and(|r| r.pending_destroy) }
 
     fn sample_physical(&mut self, free: u64, tracked: u64) {
-        self.physical_sample = Some((free, tracked));
+        self.physical_sample = Some((Instant::now(), free, tracked));
         self.floor_resample_pending = false;
+    }
+
+    fn monitor_physical(&mut self, sampled_at: Instant, free: u64, tracked: u64) {
+        if self.physical_sample.is_none_or(|(previous, _, _)| sampled_at > previous) {
+            // An asynchronous report updates physical admission only, never the
+            // graph observer, charge, pending tickets or retry state.
+            self.physical_sample = Some((sampled_at, free, tracked));
+        }
+    }
+
+    fn floor_skip(&mut self, old: Option<u64>, cycle: Cycle) -> Miss {
+        if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
+            record.stats.event(cycle, 1);
+            record.stats.misses += 1;
+        }
+        let counters = self.counters.entry(cycle).or_default();
+        counters.eager_runs += 1;
+        counters.physical_floor_skips += 1;
+        Miss::Eager
     }
 
     fn physical_room(&mut self, estimate: u64, headroom: u64) -> bool {
         if self.physical_floor == 0 { return true }
-        let Some((free, tracked)) = self.physical_sample else { return true };
+        let Some((_, free, tracked)) = self.physical_sample else { return true };
         let current = cuteafd_ffi::memory_ledger::current_bytes(
             cuteafd_ffi::memory_ledger::Space::Device, self.device) as u64;
         let free = free.saturating_sub(current.saturating_sub(tracked))
@@ -777,14 +810,7 @@ impl DeviceCache {
         if allowed && room && old.is_none_or(|id| !self.records[&id].pending_destroy && !self.records[&id].pending_capture) {
             // No CUDA query or ticket for a planned physical-headroom miss.
             if !self.physical_room(estimate, headroom) {
-                if let Some(record) = old.and_then(|id| self.records.get_mut(&id)) {
-                    record.stats.event(site.cycle, 1);
-                    record.stats.misses += 1;
-                }
-                let counters = self.counters.entry(site.cycle).or_default();
-                counters.eager_runs += 1;
-                counters.physical_floor_skips += 1;
-                return Miss::Eager;
+                return self.floor_skip(old, site.cycle);
             }
             if !self.captured_since_observation {
                 if let Some(query) = &self.memory_query {
@@ -798,6 +824,12 @@ impl DeviceCache {
                         return Miss::Eager;
                     }
                 }
+            }
+            // The existing baseline query can reveal lower free memory than
+            // the boundary precheck. Honor that sample without another query.
+            if !self.physical_room(estimate, headroom) {
+                if !self.unmeasured { self.captured_since_observation = false; }
+                return self.floor_skip(old, site.cycle);
             }
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
@@ -1956,6 +1988,58 @@ mod observer_tests {
         pending(&cache);
         observe_device_sampled(-99109, || Ok((675, 1000, 0, 0, 0))).unwrap();
         assert_eq!(cache.lock().unwrap().snapshot().charged, 50);
+    }
+
+    #[test]
+    fn physical_floor_policy_reinstall_is_idempotent() {
+        let policy = OnceLock::new();
+        install_physical_floor(&policy, Some("50MiB".into())).unwrap();
+        install_physical_floor(&policy, Some("50MiB".into())).unwrap();
+        assert!(install_physical_floor(&policy, Some("0".into())).is_err());
+    }
+
+    #[test]
+    fn monitor_sample_recovers_stuck_floor_and_ignores_older_reports() {
+        let device = -99125;
+        let cache = device_cache_sampled(device, 1000, Basis::Bytes,
+            || Ok((5, 1000, 0, 0, 0))).unwrap();
+        cache.lock().unwrap().physical_floor = 50;
+        let site = Site { name: "floor-monitor-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+        let stale = Instant::now();
+        observe_device_sampled(device, || Ok((5, 1000, 0, 0, 0))).unwrap();
+        monitor_physical(device, stale, 1000, 0);
+        assert!(matches!(cache.lock().unwrap().miss(key.clone(), site, None, false), Miss::Eager));
+        assert!(!cache.lock().unwrap().needs_boundary());
+        let (level, charged) = { let cache = cache.lock().unwrap(); (cache.level, cache.charged) };
+        monitor_physical(device, Instant::now(), 1000, 0);
+        let mut cache = cache.lock().unwrap();
+        assert_eq!((cache.level, cache.charged), (level, charged));
+        assert!(cache.floor_resample_used, "monitor must not reset bounded refresh or OOM state");
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Capture(_)));
+    }
+
+    #[test]
+    fn refreshed_capture_baseline_must_also_honor_the_floor() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory_usage(&library, 6, 1000, 995)?;
+        let mut cache = DeviceCache::new(6, 1000);
+        cache.physical_floor = 50;
+        cache.sample_physical(1000, 0);
+        cache.memory_query = Some(library.physical_memory_query()?);
+        let site = Site { name: "floor-refresh-fixture", cycle: Cycle::Decode,
+            preference: Preference::Capture, bootstrap: 10, basis: Basis::Bytes, spans_devices: false };
+        let key = Identity { bank: 1, site: site.name, key: 1, shape: "1".into() };
+        let before = fixture.memory_queries(&library)?;
+        assert!(matches!(cache.miss(key, site, None, false), Miss::Eager));
+        assert_eq!(fixture.memory_queries(&library)?, before + 1);
+        assert_eq!((cache.next_id, cache.pending_bytes, cache.pending_growth), (0, 0, 0));
+        assert!(!cache.unmeasured);
+        assert!(!cache.captured_since_observation);
+        Ok(())
     }
 
     #[test]

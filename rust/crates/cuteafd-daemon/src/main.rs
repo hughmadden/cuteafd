@@ -479,7 +479,13 @@ async fn run() -> Result<()> {
         tracing::info!(bytes = cap, "installed per-GPU memory cap; SM count and L2 unchanged");
     }
     policy.install().map_err(anyhow::Error::msg)?;
-    let graph_floor = family_graph_floor.or(initial_graph_floor);
+    // Resolve the environment only after generic serve/golden's family reparse:
+    // an environment fallback must not overwrite an explicit outer CLI value.
+    let graph_floor = family_graph_floor.or(initial_graph_floor).or(
+        std::env::var("CUTEAFD_GRAPH_DISABLE_LOW_MEM").map(Some).or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            error => Err(error),
+        })?);
     shared::decode_graph::device::set_physical_floor(graph_floor.clone())?;
     shared::memory_report::register_inputs(&matches, &policy, weight_budget_gib);
     // A serve command's resolved options, for the server's benchmark reports.
