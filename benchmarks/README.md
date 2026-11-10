@@ -27,7 +27,7 @@ Release smoke run; use the linked report for coverage and capacity details.
 | Kimi K3 K2/Core K6 | [pass; KL 0.0655, top-1 92.27%; 50.2 / 102.1 / 1819](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg) | [pass; KL 0.0654, top-1 92.73%; 43.5 / 103.5 / 1792](kimi_k3/2026-11-10-smoke-kimi-k3-exl3-k2-core-k6-hqa-2rtx-6spark-kimi-k3-max-hqa/report.svg) | pending |
 | Step-5 K4/Core K6 | [pass; KL 0.0173, top-1 95.99%; 71.7 / 203.8 / 2709](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-2rtx-6spark-step5-exl3-k6core-max/report.svg) | [pass; KL 0.0145, top-1 95.92%; 65.1 / 183.8 / 2692](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-hqa-2rtx-6spark-step5-exl3-k6core-max-hqa/report.svg) | [pass; KL 0.0166, top-1 95.69%; 68.5 / 207.3 / 2672](step5/2026-11-10-smoke-step-5-preview-exl3-k4-core-k6-hqa-2rtx-6spark-step5-exl3-k6core-max-fp8-compact/report.svg) |
 | Muse Spark K4/Core K6 | [pass; KL 0.0069, top-1 97.76%; 80.4 / 123.2 / 3289](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg) | [pass; KL 0.0077, top-1 98.03%; 77.1 / 120.5 / 3285](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-hqa-2rtx-6spark-muse-spark-exl3-max-hqa/report.svg) | [pass; KL 0.0081, top-1 97.76%; 74.2 / 125.6 / 3279](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-hqa-2rtx-6spark-muse-spark-exl3-max-fp8-compact/report.svg) |
-| Mistral Large 4 K4/Core K6 | [pass; KL 0.0097, top-1 97.16%; 49.8 / 141.3 / 3292](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg) | - | pending¹ |
+| Mistral Large 4 K4/Core K6 | [pass; KL 0.0097, top-1 97.16%; 49.8 / 141.3 / 3292](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg) | - | [pass; KL 0.0094, top-1 97.71%; 46.9 / 140.5 / 3309](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-hqa-2rtx-6spark-ml4-exl3-max-hqa/report.svg)¹ |
 
 ¹ native FP8 attention ([#1750](https://github.com/tpurtell/cuteafd/issues/1750))
 
@@ -67,6 +67,7 @@ Power-cap slowdown is budget allocation, distinct from thermal slowdown.
 | [Muse Spark K4/Core K6, hqa](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-hqa-2rtx-6spark-muse-spark-exl3-max-hqa/report.svg) | 0.000 / 21.998 | 2676/2821 | 75 / 20 |
 | [Muse Spark K4/Core K6, fp8-compact](muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-hqa-2rtx-6spark-muse-spark-exl3-max-fp8-compact/report.svg) | 0.000 / 24.004 | 2682/2824 | 75 / 22 |
 | [Mistral Large 4 K4/Core K6, compact](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg) | 0.000 / 53.948 | 2517/2788 | 77 / 20 |
+| [Mistral Large 4 K4/Core K6, fp8-compact](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-hqa-2rtx-6spark-ml4-exl3-max-hqa/report.svg) | 0.000 / 45.015 | 2574/2798 | 75 / 19 |
 
 Cache endpoint byte identity and quick fidelity are required for each passing
 published arm. A report may still mark short-fresh continuation uncovered.
@@ -390,6 +391,7 @@ historical recipe; new release launches use the v5 matrix.
 
 ## Mistral Large 4
 
+- 2026-11-10 · Release smoke · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-hqa-2rtx-6spark-ml4-exl3-max-hqa/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 1× RTX PRO 6000 @ gpu-powerd 465 W (450–600) + 5× DGX Spark · build v5.0.0-rc1 · [report](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-1rtx-5spark-ml4-exl3-min/report.svg)
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (350–545) + 6× DGX Spark · build v5.0.0-rc1 · [report](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max/report.svg)
 - 2026-11-02 · Custom · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6 · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (310–550) + 6× DGX Spark · build ed34ed61ebdd · [report](mistral_large4/2026-11-02-custom-mistral-large-4-exl3-k4-core-k6-2rtx-6spark-ml4-exl3-max-candidate-r1/report.svg)
