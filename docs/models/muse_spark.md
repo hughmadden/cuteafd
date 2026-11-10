@@ -194,5 +194,5 @@ or `--audio rtx` requests coordinator placement directly. Qualification is on #9
 
 ## Changelog
 
-| Date | Release | Change | Quality / performance |
-|---|---|---|---|
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |

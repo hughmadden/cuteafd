@@ -36,3 +36,8 @@ refuse, and each mode has its own checkpoint fingerprint and memory charges.
 ## Release card
 
 [<img src="../../benchmarks/kimi_k3/2026-10-31-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/card.svg" width="360" alt="Kimi K3 (2× RTX)">](../../benchmarks/kimi_k3/2026-10-31-smoke-kimi-k3-exl3-k2-core-k6-2rtx-6spark-kimi-k3-max/report.svg)
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |

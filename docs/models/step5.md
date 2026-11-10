@@ -89,3 +89,8 @@ Start with `examples/configs/step5-fp8-max.config` or
 and select a sealed WIP slot containing `serve-step5`. Keep media disabled;
 Step-5's bundled vision execution is not yet qualified. Pool sizing remains
 automatic, and admission refuses configurations below the 256K context floor.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |

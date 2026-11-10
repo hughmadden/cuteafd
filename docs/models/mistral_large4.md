@@ -91,3 +91,8 @@ names.
   The fidelity goldens use it (`golden.py`).
 - `ops.py`: op-level references, bit-exact against the official modules.
 - `trace.py`: the per-layer engine golden that `cuteafd glm-golden` compares.
+
+## Changelog
+
+| Version | Date | Change | Basic eval |
+| --- | --- | --- | --- |
