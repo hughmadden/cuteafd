@@ -161,6 +161,84 @@ impl<'a> KimiMla<'a> {
     }
 }
 
+const INDEX_PRODUCER: &[&str] = &["x", "q_resid", "positions", "index_slots", "cos_sin",
+    "w_iq", "w_ik", "k_norm_w", "k_norm_b", "index_cache", "q_fp8", "head_weights", "scratch"];
+
+/// Native BF16 index projections. Key/head rows share one packed arena view;
+/// neither projection participates in the selected dense-core conversion.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexWeights {
+    pub query: Buffer, pub key_heads: Buffer, pub norm: Buffer, pub bias: Buffer,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexBatch {
+    pub rows: usize, pub cache_pages: usize,
+    pub x: Buffer, pub q_resid: Buffer, pub positions: Buffer, pub slots: Buffer,
+    /// NoPE ignores this retained placeholder, matching the shared producer ABI.
+    pub cos_sin: Buffer,
+    pub cache: Buffer, pub query_fp8: Buffer, pub head_weights: Buffer, pub scratch: Buffer,
+}
+
+pub struct KimiIndexProducer<'a> {
+    program: Program<'a>, rows: usize, scratch: usize,
+}
+impl<'a> KimiIndexProducer<'a> {
+    pub fn load(programs: &'a Programs<'a>, rows: usize) -> Result<Self> {
+        let name = format!("kimik31_index_producer_m{rows}");
+        let scratch = validate_index_manifest(programs.spec(&name)?, rows)?;
+        Ok(Self { program: programs.program(&name, INDEX_PRODUCER)?, rows, scratch })
+    }
+
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// The caller orders normalized q-LoRA and hidden inputs before this stage,
+    /// and retains native weights/cache/outputs through stream and graph use.
+    pub fn launch(&self, weights: KimiIndexWeights, b: KimiIndexBatch, stream: *mut c_void) -> Result<()> {
+        validate_index_batch(weights, b, self.rows, self.scratch)?;
+        // SAFETY: extents, devices and write aliases checked. The owning lane
+        // supplies valid physical slots and retains the stream and storage.
+        unsafe { self.program.launch(&[b.x.ptr, b.q_resid.ptr, b.positions.ptr, b.slots.ptr,
+            b.cos_sin.ptr, weights.query.ptr, weights.key_heads.ptr, weights.norm.ptr,
+            weights.bias.ptr, b.cache.ptr, b.query_fp8.ptr, b.head_weights.ptr, b.scratch.ptr],
+            &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_index_manifest(spec: &ProgramSpec, rows: usize) -> Result<usize> {
+    let g = &spec.geometry;
+    if !(1..=4096).contains(&rows) || spec.capacity_rows as usize != rows
+        || spec.scalar_kinds != b"i" || spec.pointers.iter().map(String::as_str).ne(INDEX_PRODUCER.iter().copied())
+        || [("hidden", 7168), ("q_lora_rank", 1536), ("index_heads", 32),
+            ("index_head_dim", 128), ("index_topk", 2048), ("page_rows", 64), ("max_rows", rows)]
+            .iter().any(|&(key, value)| g[key].as_u64() != Some(value as u64))
+        || g["index_norm_eps"].as_f64() != Some(1e-5) || g["rope"].as_bool() != Some(false)
+        || g["scale_format"].as_str() != Some("ue8m0") || g["scale_storage"].as_str() != Some("float32")
+        || g["query_amax_floor"].as_f64() != Some(1e-10) || g["key_amax_floor"].as_f64() != Some(1e-4) {
+        return Err(KimiMlaError::Invalid("K3.1 index manifest arithmetic/geometry/ABI"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let scratch = align(rows * 4096 * 2) + align(rows * 160 * 2);
+    if spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
+        return Err(KimiMlaError::Invalid("K3.1 index manifest scratch"));
+    }
+    Ok(scratch)
+}
+
+fn validate_index_batch(w: KimiIndexWeights, b: KimiIndexBatch, rows: usize, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("K3.1 index batch/cache geometry"));
+    }
+    let cache = b.cache_pages.checked_mul(8448).ok_or(KimiMlaError::Invalid("index cache overflow"))?;
+    validate_phase(&[(b.x, b.rows * 7168 * 2), (b.q_resid, b.rows * 1536 * 2),
+        (b.positions, b.rows * 8), (b.slots, b.rows * 8), (b.cos_sin, 64 * 4),
+        (w.query, 4096 * 1536 * 2), (w.key_heads, 160 * 7168 * 2),
+        (w.norm, 128 * 2), (w.bias, 128 * 2), (b.cache, cache),
+        (b.query_fp8, b.rows * 4096), (b.head_weights, b.rows * 32 * 4),
+        (b.scratch, scratch)], 9..13, b.x.device_id)
+}
+
 fn validate_phase(operands: &[(Buffer, usize)], writers: std::ops::Range<usize>, device: i32) -> Result<()> {
     validate_buffers(operands, device)?;
     for &(buffer, bytes) in operands {
@@ -1129,6 +1207,57 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn k31_index_manifest_requires_exact_native_qdq_and_cache_layout() {
+        let rows = 64;
+        let scratch = rows * (4096 + 160) * 2;
+        let spec = ProgramSpec { name: "kimik31_index_producer_m64".into(),
+            pointers: INDEX_PRODUCER.iter().map(|name| (*name).into()).collect(),
+            scalar_kinds: b"i".to_vec(), capacity_rows: rows as u32,
+            scratch: [("scratch".into(), scratch as u64)].into_iter().collect(),
+            geometry: serde_json::json!({"hidden":7168,"q_lora_rank":1536,"index_heads":32,
+                "index_head_dim":128,"index_topk":2048,"page_rows":64,"max_rows":64,
+                "index_norm_eps":1e-5,"rope":false,"scale_format":"ue8m0","scale_storage":"float32",
+                "query_amax_floor":1e-10,"key_amax_floor":1e-4}) };
+        assert_eq!(validate_index_manifest(&spec, rows).unwrap(), scratch);
+        for (key, value) in [("index_norm_eps", serde_json::json!(1e-6)),
+            ("rope", serde_json::json!(true)), ("scale_format", serde_json::json!("fp32")),
+            ("scale_storage", serde_json::json!("uint8")), ("query_amax_floor", serde_json::json!(0)),
+            ("key_amax_floor", serde_json::json!(1e-10)), ("index_topk", serde_json::json!(1024))] {
+            let mut wrong = spec.clone();
+            wrong.geometry[key] = value;
+            assert!(validate_index_manifest(&wrong, rows).is_err(), "{key}");
+        }
+        let mut wrong = spec.clone(); wrong.scratch.insert("scratch".into(), 1);
+        assert!(validate_index_manifest(&wrong, rows).is_err());
+        let mut wrong = spec.clone(); wrong.pointers.swap(1, 2);
+        assert!(validate_index_manifest(&wrong, rows).is_err());
+        assert!(validate_index_manifest(&spec, rows + 1).is_err());
+    }
+
+    #[test]
+    fn k31_index_batch_rejects_writer_aliases_and_undercharged_cache() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let weights = KimiIndexWeights { query: buffer(1), key_heads: buffer(2), norm: buffer(3), bias: buffer(4) };
+        let b = KimiIndexBatch { rows: 17, cache_pages: 3, x: buffer(5), q_resid: buffer(6),
+            positions: buffer(7), slots: buffer(8), cos_sin: buffer(9), cache: buffer(10),
+            query_fp8: buffer(11), head_weights: buffer(12), scratch: buffer(13) };
+        let check = |b| validate_index_batch(weights, b, 64, 4096);
+        check(b).unwrap();
+        assert!(check(KimiIndexBatch { rows: 0, ..b }).is_err());
+        assert!(check(KimiIndexBatch { rows: 65, ..b }).is_err());
+        assert!(check(KimiIndexBatch { cache_pages: usize::MAX, ..b }).is_err());
+        assert!(check(KimiIndexBatch { cache: Buffer { bytes: 3 * 8448 - 1, ..b.cache }, ..b }).is_err());
+        for reader in [b.x, b.q_resid, b.positions, b.slots, b.cos_sin,
+            weights.query, weights.key_heads, weights.norm, weights.bias] {
+            assert!(check(KimiIndexBatch { cache: Buffer { ptr: reader.ptr, ..b.cache }, ..b }).is_err());
+            assert!(check(KimiIndexBatch { query_fp8: Buffer { ptr: reader.ptr, ..b.query_fp8 }, ..b }).is_err());
+        }
+        assert!(check(KimiIndexBatch { head_weights: b.query_fp8, ..b }).is_err());
+        assert!(check(KimiIndexBatch { scratch: b.cache, ..b }).is_err());
     }
 
     #[test]
