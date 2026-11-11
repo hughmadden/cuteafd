@@ -123,15 +123,36 @@ fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
                 assert_eq!(tail.requests(), [backing.bytes]);
             }
         }
+        let input = weights.dense_input(rows).unwrap();
+        assert_eq!((input.width, input.bytes), (12288, u64::from(rows) * 12288 * 2));
+        let input_components = input.components("minimax.dense", 0, Lifetime::TARGET, 1024).unwrap();
+        let owner = input.allocation("minimax.dense", 0, Lifetime::TARGET);
+        let input_allocations = input_components.iter().filter_map(|c| match &c.kind {
+            ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
+        assert_eq!(input_allocations, [&owner]);
+        assert!(!owners.iter().any(|a| a.id == owner.id));
+        for component in &input_components {
+            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
+                assert_eq!(tail.backings.len(), 1);
+                assert_eq!(tail.backings[0].backing, owner.id);
+                assert_eq!(tail.requests(), [owner.bytes]);
+            }
+        }
+        assert!(input.components("", 0, Lifetime::TARGET, 1024).is_err());
+        assert!(input.components("dense", 2, Lifetime::TARGET, 1024).is_err());
+        assert!(input.components("dense", 0, Lifetime::TARGET, 0).is_err());
         assert!(layout.components("", 0, Lifetime::TARGET, 1024).is_err());
         assert!(layout.components("dense", 2, Lifetime::TARGET, 1024).is_err());
         assert!(layout.components("dense", 0, Lifetime::TARGET, 0).is_err());
     }
     assert!(weights.dense_workspace(0).is_err());
     assert!(weights.dense_workspace(4097).is_err());
+    assert!(weights.dense_input(0).is_err());
+    assert!(weights.dense_input(4097).is_err());
     let mut empty = weights;
     empty.projections.clear();
     assert!(empty.dense_workspace(1).is_err());
+    assert!(empty.dense_input(1).is_err());
 }
 
 #[test]

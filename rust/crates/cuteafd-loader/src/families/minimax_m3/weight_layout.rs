@@ -72,7 +72,48 @@ impl DenseWorkspace {
     }
 }
 
+/// Stable BF16 producer destination addressed by the owner's one-entry input
+/// table. Producers write packed [live_rows, projection_K] rows here directly;
+/// this is not a staging copy or another charge for retained branch outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseInput {
+    pub rows: u32,
+    pub width: u64,
+    pub bytes: u64,
+}
+
+impl DenseInput {
+    pub fn allocation(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime)
+        -> crate::placement::planner::Allocation {
+        crate::placement::planner::Allocation::buffer(format!("{prefix}.activation"),
+            crate::placement::planner::Location::coordinator(rank), self.bytes, lifetime,
+            cuteafd_core::memory_layout::Category::Workspace, "native serial dense projection")
+    }
+
+    pub fn components(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime,
+        maximum_pages: u64) -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
+        use crate::placement::planner::{ByteCurve, Component, Refusal, fixed_request_tails};
+        if prefix.is_empty() || rank > 1 || maximum_pages == 0 || self.rows == 0 || self.rows > 4096
+            || self.width == 0 || u64::from(self.rows).checked_mul(self.width).and_then(|n| n.checked_mul(2)) != Some(self.bytes) {
+            return Err(Refusal::InvalidFact("invalid MiniMax dense BF16 producer destination".into()));
+        }
+        let mut components = vec![Component::allocation(self.allocation(prefix, rank, lifetime),
+            ByteCurve::fixed(self.bytes, maximum_pages), false, maximum_pages)];
+        fixed_request_tails(&mut components, maximum_pages, &[])?;
+        Ok(components)
+    }
+}
+
 impl CoordinatorWeights {
+    pub fn dense_input(&self, rows: u32) -> Result<DenseInput> {
+        ensure!((1..=4096).contains(&rows), "MiniMax dense rows outside native capacity");
+        let width = self.projections.iter().map(|p| p.input as u64).max()
+            .filter(|width| *width > 0).context("MiniMax dense input owner has no projections")?;
+        let bytes = u64::from(rows).checked_mul(width).and_then(|n| n.checked_mul(2))
+            .context("MiniMax dense input extent overflow")?;
+        Ok(DenseInput { rows, width, bytes })
+    }
+
     /// Each decode lane or concurrently live prefill unit needs its own owner.
     /// The F32 output is temporary; callers retain live gate/up/Q/K/V separately.
     pub fn dense_workspace(&self, rows: u32) -> Result<DenseWorkspace> {

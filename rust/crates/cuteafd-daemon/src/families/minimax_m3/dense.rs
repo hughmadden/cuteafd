@@ -4,7 +4,7 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::{native_dense::DenseLinear, native_dense_glue::{Companion, Op}, programs::Programs};
 use std::collections::BTreeMap;
 use cuteafd_core::memory_layout::Tag;
-use cuteafd_loader::families::minimax_m3::weight_layout::{CoordinatorWeights, DenseWorkspace};
+use cuteafd_loader::families::minimax_m3::weight_layout::{CoordinatorWeights, DenseInput, DenseWorkspace};
 
 /// Loaded handles borrow the installed program table; no weights or writable
 /// workspaces are allocated here. Each physical device binds its own handles.
@@ -78,6 +78,34 @@ impl<'a> Workspace<'a> {
     }
 }
 
+/// One independently live lane/unit: admit both input and workspace requests
+/// first. All producers and consumers use this same device and ordered stream.
+pub(crate) struct ExecutionOwner<'a> {
+    pub workspace: Workspace<'a>,
+    pub input_layout: DenseInput,
+    pub activation: Allocation<'a>,
+}
+
+impl<'a> ExecutionOwner<'a> {
+    pub fn new(device: Device<'a>, weights: &CoordinatorWeights, rows: u32) -> Result<Self> {
+        let input_layout = weights.dense_input(rows)?;
+        weights.dense_workspace(rows)?;
+        let activation = Allocation::new(device, usize::try_from(input_layout.bytes)?,
+            Tag::workspace("minimax/dense/activation"))?;
+        let workspace = Workspace::new(device, weights, rows)?;
+        // Fresh storage only, before capture or enqueue: no per-call host table
+        // uploads, nor copies from a second producer destination, are required.
+        device.run(|| device.library.copy_h2d(workspace.inputs.buffer,
+            &(activation.buffer.ptr as u64).to_le_bytes()))?;
+        Ok(Self { workspace, input_layout, activation })
+    }
+
+    pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
+        self.workspace.inventory(inventory, prefix)?;
+        self.activation.inventory(inventory, &format!("{prefix}.activation"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +156,41 @@ mod tests {
         let wide = weights.dense_workspace(4096)?;
         let components = wide.components("dense", 0, Lifetime::TARGET, 32)?;
         assert_eq!(components.iter().filter(|c| matches!(c.kind, ComponentKind::Allocation { .. })).count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn stable_input_table_names_one_direct_producer_destination_and_one_charge() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        fixture.configure_memory(&library, 1, 1 << 20)?;
+        let device = Device { library: &library, id: 1 };
+        let weights = weights()?;
+        let owner = ExecutionOwner::new(device, &weights, 17)?;
+        assert_eq!(owner.input_layout, DenseInput { rows: 17, width: 128, bytes: 17 * 128 * 2 });
+        let mut table = [0; 8];
+        device.run(|| library.copy_d2h(&mut table, owner.workspace.inputs.buffer))?;
+        assert_eq!(u64::from_le_bytes(table), owner.activation.buffer.ptr as u64);
+        let devices = [1];
+        let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax", Lifetime::TARGET,
+            Category::Workspace, "native serial dense projection");
+        owner.inventory(&mut inventory, "dense")?;
+        assert_eq!(inventory.receipts.len(), 4);
+        let activation = inventory.receipts.last().unwrap();
+        let expected = owner.input_layout.allocation("minimax.dense", 0, Lifetime::TARGET);
+        assert_eq!(activation.allocation, expected);
+        assert_eq!(fixture.events()?.matches('D').count(), 4);
+        let other = ExecutionOwner::new(device, &weights, 17)?;
+        assert_ne!(owner.activation.buffer.ptr, other.activation.buffer.ptr);
+        assert_ne!(owner.workspace.inputs.buffer.ptr, other.workspace.inputs.buffer.ptr);
+        assert_eq!(library.cuda_get_device()?, 0);
+        drop(other);
+        drop(owner);
+        assert_eq!(device.run(|| library.cuda_physical_memory_info())?.0, 1 << 20);
+        assert_eq!(fixture.events()?.matches('d').count(), 8);
+        assert_eq!(fixture.device_free_mismatch(&library)?, (0, -1, -1));
         Ok(())
     }
 
