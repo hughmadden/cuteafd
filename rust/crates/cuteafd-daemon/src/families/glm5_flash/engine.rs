@@ -5782,7 +5782,8 @@ mod prefill_lane_tests {
             // Re-audit shared with Mistral commit a14370e52.
             // Fork #269 forwards optional wide_min_rows, default None; GLM retains
             // its existing wide floor and byte-identical exported objects.
-            ("integration/cuteafd/_glm_kernels.py", 0xea3a_e723_ea70_f710),
+            // Fork #278 adds an opt-in UE8M0 index-scale route for K3.1; the default FP32 route and GLM/GLM Flash exports are unchanged (678/678 objects identical).
+            ("integration/cuteafd/_glm_kernels.py", 0x2087_8fca_2f4a_b67c),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
