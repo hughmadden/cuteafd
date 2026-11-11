@@ -279,3 +279,40 @@ def test_ml4_shared_score_reduction_preserves_math():
     expected = torch.einsum("qh,qhk->qk", w.float() * 3 ** -.5,
         torch.relu(torch.einsum("qhd,kd->qhk", q.float(), k.float()) * 4 ** -.5))
     assert torch.equal(indexer_score_reduction(q, k, w), expected)
+
+
+def test_rust_golden_vectors_match_pinned_python_reference():
+    import hashlib
+    import json
+    import math
+    torch = pytest.importorskip("torch")
+    from shape_invariant import fixed_index_topk
+    from families.mistral_large4.ops import indexer_score_reduction
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/kimi-k31-dsa.json").read_text())
+    assert fixture["reference_sha256"] == hashlib.sha256(Path(k31.__file__).read_bytes()).hexdigest()
+    tensor = lambda key, *shape: torch.tensor(fixture[key], dtype=torch.float32).reshape(*shape)
+    c = config()
+    a = k31.extend_reference(tiny_reference(torch), c).KimiDSAAttention(c, 1).eval().float()
+    index = a.indexer
+    with torch.no_grad():
+        for parameter, key in ((index.wq_b.weight, "wq"), (index.wk.weight, "wk"),
+                (index.weights_proj.weight, "wh"), (index.k_norm.weight, "norm"),
+                (index.k_norm.bias, "bias")):
+            parameter.copy_(tensor(key, *parameter.shape))
+        iq, ik, iw = index(tensor("hidden", 5, 4), tensor("latent", 5, 4))
+        torch.testing.assert_close(iq, tensor("index_queries", 5, 2, 4), rtol=0, atol=0)
+        torch.testing.assert_close(ik, tensor("index_keys", 5, 4), rtol=0, atol=0)
+        scores = indexer_score_reduction(iq, ik, iw)
+        q, k, v, gate = (tensor("mla_query", 5, 4), tensor("mla_keys", 5, 4),
+            tensor("mla_values", 5, 2), tensor("gate", 5, 2))
+        outputs = []
+        for position in range(5):
+            chosen = fixed_index_topk(scores[position:position+1, :position+1], 2)
+            ids = sorted(chosen.indices[0, torch.isfinite(chosen.values[0])].tolist())
+            assert ids + [-1] * (2 - len(ids)) == fixture["selected"][position]
+            # Evaluate the selected attention directly, independent of the Rust oracle.
+            probabilities = ((q[position] @ k[ids].T) / math.sqrt(4)).softmax(-1)
+            outputs.append((probabilities @ v[ids]) * gate[position].sigmoid())
+        torch.testing.assert_close(torch.stack(outputs), tensor("gated_values", 5, 2),
+            rtol=3e-5, atol=3e-6)

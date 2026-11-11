@@ -70,6 +70,23 @@ pub struct GlmDsaConfig {
 }
 
 impl GlmDsaConfig {
+    /// Mathematical post-transform score/selection contract. Projection, RoPE,
+    /// E4M3 scales and cross-layer selection reuse remain GLM's device hooks.
+    pub fn sparse_indexer_geometry(&self) -> Result<crate::shared::sparse_indexer::IndexerGeometry> {
+        use crate::shared::sparse_indexer::*;
+        ensure!(self.variant.is_glm(), "ML4 index transforms require their own descriptor");
+        let geometry = IndexerGeometry {
+            query_heads: self.index_heads, key_heads: 1, head_dim: self.index_head_dim,
+            rope: Some(Rope { dim: self.qk_rope_head_dim, style: RopeStyle::Interleaved }),
+            query_norm: Norm::None, key_norm: Norm::LayerNorm, activation: Activation::Relu,
+            head_reduction: HeadReduction::WeightedSum { learned: true }, selection_heads: 1,
+            granularity: Granularity::Token, topk: self.index_topk,
+            initial_blocks: 0, local_blocks: 0, forced_windows: ForcedWindows::WithinTopK, index_values: false,
+        };
+        geometry.validate()?;
+        Ok(geometry)
+    }
+
     pub fn read(snapshot: &Path) -> Result<Self> {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
     }
@@ -298,6 +315,20 @@ mod tests {
         });
         let cfg = GlmDsaConfig::from_hf(&v)?;
         assert_eq!((cfg.first_moe_layer, cfg.topk, cfg.eos_tokens.len()), (3, 8, 3));
+        let index = cfg.sparse_indexer_geometry()?;
+        assert_eq!((index.query_heads, index.key_heads, index.head_dim, index.topk), (32,1,128,2048));
+        assert_eq!(index.rope, Some(crate::shared::sparse_indexer::Rope {
+            dim: 64, style: crate::shared::sparse_indexer::RopeStyle::Interleaved }));
+        assert_eq!(index.query_norm, crate::shared::sparse_indexer::Norm::None);
+        assert_eq!(index.key_norm, crate::shared::sparse_indexer::Norm::LayerNorm);
+        assert!(!index.index_values);
+        assert_eq!(index.key_cache_bytes(64, 1)?, 8192); // E4M3 payload, excludes FP32 scales.
+        let scores = index.scores(&vec![1.; 32*128], &vec![1.; 3*128], Some(&[0.25;32]))?;
+        assert_eq!(scores, vec![vec![1024.;3]]);
+        let selected = index.select(&scores, 1)?;
+        assert_eq!(&selected[0][..3], &[0,1,-1]);
+        assert_eq!(selected[0].len(), 2048);
+
         assert_eq!(cfg.index_source(5), 2);
         assert_eq!(cfg.index_source(6), 6);
         for layer in 0..cfg.layers {

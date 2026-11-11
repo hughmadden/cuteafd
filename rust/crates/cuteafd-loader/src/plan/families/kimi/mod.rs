@@ -194,7 +194,7 @@ impl Model {
                         let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
                         model.frontends[ordinal % 2] += tensor.meta.byte_length;
                     }
-                    let residency = if role.component == Component::Attention && model.cfg.attention[layer] == KimiAttention::Mla {
+                    let residency = if matches!(role.component, Component::Attention | Component::Indexer) && model.cfg.attention[layer] == KimiAttention::Mla {
                         &mut model.mla[layer]
                     } else { &mut model.coordinator };
                     let bucket = if replicated(rest) { &mut residency.replicated } else { &mut residency.split };
@@ -235,6 +235,7 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
     let layers = (0..cfg.layers).map(|layer| LayerSpec {
         attention: match cfg.attention[layer] {
             KimiAttention::Kda => AttentionKind::Kda,
+            KimiAttention::Mla if cfg.dsa.is_some() => AttentionKind::MlaDsa { indexer: true },
             KimiAttention::Mla => AttentionKind::Mla { rope: false, output_gate: true },
         },
         ffn: if cfg.dense[layer] { FfnKind::Dense { intermediate: cfg.dense_intermediate } } else { FfnKind::Moe },
@@ -266,7 +267,9 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
                 cfg.residual_block, cfg.max_residual_blocks()),
             format!("Situ FFNs (beta {}, linear beta {}); MLA without RoPE plus sigmoid output gate; KDA full-rank output gate",
                 cfg.situ_beta, cfg.situ_linear_beta),
-            "no native MTP; external K3 DFlash/dSpark drafters exist".into(),
+            if cfg.dsa.is_some() {
+                "Gated DSA: native BF16 NoPE indexer; device execution and K3 drafter compatibility unqualified (#1777)".into()
+            } else { "no native MTP; external K3 DFlash/dSpark drafters exist".into() },
         ],
     }
 }
@@ -308,6 +311,7 @@ impl Family for KimiK3 {
             else if rest.starts_with("block_sparse_moe.shared_experts.") { Component::SharedExpert }
             else if rest.starts_with("block_sparse_moe.routed_expert_") { Component::LatentProjection }
             else if rest.starts_with("mlp.") { Component::DenseFfn }
+            else if rest.starts_with("self_attn.indexer.") { Component::Indexer }
             else if rest.starts_with("self_attn.") { Component::Attention }
             else if rest.starts_with("self_attention_res_") || rest.starts_with("mlp_res_") { Component::ResidualMix }
             else if rest.starts_with("input_layernorm.") || rest.starts_with("post_attention_layernorm.") { Component::Norm }

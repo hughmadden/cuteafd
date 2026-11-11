@@ -38,7 +38,7 @@ impl KimiDsaConfig {
             rope: None, query_norm: Norm::None, key_norm: Norm::LayerNorm,
             activation: Activation::Relu, head_reduction: HeadReduction::WeightedSum { learned: true },
             selection_heads: 1, granularity: Granularity::Token, topk: self.topk,
-            initial_blocks: 0, local_blocks: 0, index_values: false }
+            initial_blocks: 0, local_blocks: 0, forced_windows: ForcedWindows::WithinTopK, index_values: false }
     }
 }
 

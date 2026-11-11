@@ -3,6 +3,7 @@ pub mod allocation;
 pub mod config;
 pub mod context;
 pub mod core;
+pub mod dsa;
 pub mod kda;
 pub mod mla;
 pub mod reference;

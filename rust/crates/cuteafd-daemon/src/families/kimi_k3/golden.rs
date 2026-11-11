@@ -372,6 +372,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         .context("Kimi golden requires the immutable selected checkpoint view")?));
     let full = KimiK3Config::from_hf(&checkpoint.config)?;
     full.release_geometry()?;
+    full.validate_attention_runtime()?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
     check_hosted_hint(args.rtx_expert_layers, &cfg, &hosted)?;
@@ -414,6 +415,7 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
+    cfg.validate_attention_runtime()?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
     check_hosted_hint(args.rtx_expert_layers, &cfg, &hosted)?;
     ensure!((1..=8).contains(&args.peers.len()),

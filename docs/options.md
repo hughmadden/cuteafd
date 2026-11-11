@@ -247,7 +247,7 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
-| `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable dense-core view. MC metadata advertises K8/K6; plain checkpoints refuse these. Original is the complete checkpoint-native core. `fp8-compact` refuses for Kimi K3.1 MC and GLM Flash MC (whole-core FP8 pending). Muse MC supports **attention-only FP8** (q/k/v/o), not whole-core FP8. Other qualified plain families retain their current conversion scope, including Step-5 MTP O. No conversion of an FP8-origin core. |
+| `CORE_VIEW` | unset (= `original`) | `original`, `k8-compact`, `k6-compact`, `fp8-compact` | Immutable dense-core view. MC metadata advertises K8/K6; plain checkpoints refuse these. Original is the complete checkpoint-native core. `fp8-compact` refuses for Kimi K3.1 (plain or MC) and GLM Flash MC (whole-core FP8 pending). Muse MC supports **attention-only FP8** (q/k/v/o), not whole-core FP8. Other qualified plain families retain their current conversion scope, including Step-5 MTP O. No conversion of an FP8-origin core. |
 | `ATTENTION_PLACEMENT` | `auto` | `auto`, `context`, `layers`, `heads` | Per-family defaults and refusals are in the table below. |
 | `ATTENTION_PLAN_ROWS` | `auto` | `auto`, positive int | Decode/verify reduction plan rows. |
 | `MAX_CONTEXT_TOKENS` | `auto` | `auto`, 1–1048576 | `auto`: serve min(model maximum context, admitted pool). A number pins context and requires the pool to cover it. Plan and every serve command use `--max-context-tokens` with `auto` or a number; explicit CLI overrides the config. Compiled workspace/table extent is internal, not a user context setting. |
@@ -321,6 +321,14 @@ Each key is also a global `cuteafd` flag (`--gpu-memory-cap`, `--kv-max-tokens`,
 | `MEDIA_CACHE_BYTES` | engine | byte size | Media cache. |
 | `MEDIA_FEATURES_DIR`, `AUDIO_FEATURES_DIR` | unset | absolute dir | Encoder feature caches. |
 | `CHAT_TEMPLATE_FROM` | checkpoint | snapshot dir | GLM Flash template source when the checkpoint's template cannot mark images. |
+
+Kimi K3.1 (`kimi_k31`) is recognized by the shared Kimi family for CPU header
+and core-view inspection. Its Gated DSA device path and index-cache prefix
+restore are not installed yet, so plan/serve refuse execution (#1777); dense
+MLA is not a fallback. K3 DFlash2 hidden-state compatibility is unqualified,
+and requesting a drafter for K3.1 refuses explicitly. MC `original`,
+`k8-compact` and `k6-compact` retain native BF16 indexer weights;
+`fp8-compact` refuses until whole-core conversion is implemented.
 
 Kimi K3 and Step-5 are text-only; dense Qwen has media off. GLM 5.3 / ML4,
 GLM Flash, MiMo, Qwen4 and Muse carry their own towers. Native GLM Flash EXLR8

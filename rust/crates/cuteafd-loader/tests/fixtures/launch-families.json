@@ -3761,5 +3761,21 @@
    }
   },
   "line": "muse_spark muse_spark 0 61"
+ },
+ {
+  "name": "Kimi K3.1, shared Kimi execution family",
+  "config": {
+   "model_type": "kimi_k31",
+   "text_config": {
+    "model_type": "kimi_linear",
+    "num_hidden_layers": 93,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1
+   },
+   "architectures": [
+    "KimiK31ForConditionalGeneration"
+   ]
+  },
+  "line": "kimi_k3 kimi_k31 1 92"
  }
 ]

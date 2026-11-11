@@ -895,7 +895,12 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     assert!(KIMI_K3.detect(&checkpoint));
     let model = Model::open(&checkpoint)?;
     assert!(!model.native_serving_admission());
+    assert_eq!(model.spec.layers.iter().filter(|layer| matches!(layer.attention, AttentionKind::MlaDsa { indexer: true })).count(), 24);
     assert!(model.core.projections.is_empty());
+    let index_bytes = 24 * (4096*1536 + 128*7168 + 32*7168 + 2*128) * 2;
+    assert_eq!(model.bytes.get(&Component::Indexer), Some(&(index_bytes as u64)));
+    assert_eq!(model.mla[3].replicated - 30_281_728, (index_bytes / 24) as u64);
+
     let base = KimiK3Config::from_hf(&config())?;
     for mode in [crate::placement::LayerMode::HeadSplit, crate::placement::LayerMode::ContextSplit] {
         let layouts = LayerLayout::pair(&parsed, 3, mode)?;
@@ -910,7 +915,7 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
     }
     let options = crate::serving_capacity::CacheOptions {
         coordinator_ranks: 2, attention_placement: Some(crate::placement::AttentionPlacement::Context),
-        ..Default::default() };
+        mla_kv: cuteafd_core::MlaCacheFormat::Bf16, ..Default::default() };
     let cache = model.cache_geometry(options)?.unwrap();
     for rank in cache.ranks { assert_eq!(rank.persistent_unit_bytes, (24*64*(576*2/2+128*2)) as u64); }
     headers.pop();

@@ -276,6 +276,54 @@ mod family_tests {
     }
 
     #[test]
+    fn k31_views_preserve_native_indexer_and_charge_selected_core() -> Result<()> {
+        use crate::families::kimi_k3::{config::{tests::k31_config, KimiK3Config},
+            core::CoreInventory, weight_layout::LayerLayout};
+        let dir = tempfile::tempdir()?;
+        let config = k31_config();
+        let cfg = KimiK3Config::from_hf(&config)?;
+        let mut tensors = testing::kimi_k3_tensors(false);
+        for (layer, kind) in cfg.attention.iter().enumerate() {
+            if *kind != crate::families::kimi_k3::config::KimiAttention::Mla { continue; }
+            let root = format!("language_model.model.layers.{layer}.self_attn.indexer");
+            for (leaf, shape) in [("wq_b.weight", vec![4096,1536]), ("wk.weight", vec![128,7168]),
+                ("weights_proj.weight", vec![32,7168]), ("k_norm.weight", vec![128]), ("k_norm.bias", vec![128])] {
+                tensors.push(testing::t(format!("{root}.{leaf}"), "BF16", &shape));
+            }
+        }
+        let shapes = tensors.iter().filter(|(n, ..)| n.strip_suffix(".weight")
+            .is_some_and(|s| crate::families::kimi_k3::core::split(s).is_some()))
+            .map(|(n, _, s)| (n.clone(), s.clone())).collect();
+        testing::write_mc_snapshot(dir.path(), &config, &tensors, &shapes);
+        let mut bytes = Vec::new();
+        let mut identities = std::collections::BTreeSet::new();
+        for (view, bits) in [(CoreView::Original, 16), (CoreView::K8Compact, 8), (CoreView::K6Compact, 6)] {
+            let selected = CheckpointView::select(dir.path(), view)?;
+            identities.insert(selected.fingerprint().to_owned());
+            let checkpoint = Checkpoint::open_view(&selected)?;
+            let expected = tensors.iter().map(|(n, _, s)| (n.clone(), s.clone())).collect();
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
+            if bits == 16 { assert!(core.projections.is_empty() && core.native.is_empty()); }
+            else { assert!(!core.projections.is_empty() && core.projections.values().all(|p| p.bits == bits)); }
+            let index: Vec<_> = checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".indexer.")).collect();
+            assert_eq!(index.len(), 24*5);
+            assert!(index.iter().all(|t| t.meta.dtype == cuteafd_core::DType::Bf16));
+            let layouts = LayerLayout::pair_with_core(&cfg, 3, crate::placement::LayerMode::ContextSplit, &core)?;
+            bytes.push(layouts.iter().map(|l| l.bytes()).collect::<Result<Vec<_>>>()?.iter().sum::<usize>());
+        }
+        assert_eq!(identities.len(), 3);
+        assert!(bytes[0] > bytes[1] && bytes[1] > bytes[2], "{bytes:?}");
+        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string()
+            .contains("whole-core FP8 pending"));
+        let plain = tempfile::tempdir()?;
+        testing::write_snapshot(plain.path(), &config, &tensors, None);
+        assert!(CheckpointView::select(plain.path(), CoreView::Fp8Compact).unwrap_err().to_string()
+            .contains("whole-core FP8 pending"));
+        assert!(CheckpointView::select(plain.path(), CoreView::K8Compact).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn muse_original_k6_k8_admit_distinct_exact_core_bytes() -> Result<()> {
         use crate::families::muse_spark::{config::MuseSparkConfig, core::CoreInventory, weight_layout::LayerLayout};
         let dir = tempfile::tempdir()?;
