@@ -1,5 +1,5 @@
 {
-  "baseline": "630e15e8254f3844b6447a2805b6f10f5e2b2842",
+  "baseline": "d6aecfcb7229f592318bc8bce96929e356ce805e",
   "results": [
     {
       "model": "Qwen/Qwen3.5-9B",
@@ -102,6 +102,11 @@
       "family": "glm5_flash"
     },
     {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+      "revision": "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d",
+      "family": "glm5_flash"
+    },
+    {
       "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2",
       "revision": "acba35b61a672561652b16a96fca1be85c1bd875",
       "family": "kimi_k3"
@@ -110,6 +115,11 @@
       "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
       "revision": "1a28050d2954426a43a3db705e53ca120e5f2b47",
       "family": "kimi_k3"
+    },
+    {
+      "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4",
+      "revision": "9c354cee78cd6feddb057549b8edde6e3b319822",
+      "family": "mistral_large4"
     },
     {
       "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",

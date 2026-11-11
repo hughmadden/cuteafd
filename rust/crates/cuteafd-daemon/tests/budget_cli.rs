@@ -963,7 +963,7 @@ fn installed_example_deployments_publish_executable_prefill_shapes() {
 }
 
 #[test]
-fn installed_release_and_example_families_match_dev_630e15e82() {
+fn installed_release_and_example_families_match_dev_d6aecfcb7() {
     use cuteafd_loader::plan::{family, Checkpoint};
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let hf_home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME")
@@ -972,9 +972,9 @@ fn installed_release_and_example_families_match_dev_630e15e82() {
     let matrix: serde_json::Value = serde_json::from_slice(
         &std::fs::read(root.join("benchmarks/current-matrix.json")).unwrap()).unwrap();
     let retired = retired_configs(&matrix);
-    // Captured by running this detector test on the actual dev630e15e82 tree.
+    // Captured by running this detector test on the actual devd6aecfcb7 tree.
     let baseline: serde_json::Value = serde_json::from_str(include_str!(
-        "fixtures/family-detection-dev630e15e82.json")).unwrap();
+        "fixtures/family-detection-devd6aecfcb7.json")).unwrap();
     let expected = baseline["results"].as_array().unwrap().iter().map(|entry|
         ((entry["model"].as_str().unwrap(), entry["revision"].as_str().unwrap()),
          entry["family"].as_str().unwrap())).collect::<std::collections::BTreeMap<_, _>>();
@@ -1009,13 +1009,13 @@ fn installed_release_and_example_families_match_dev_630e15e82() {
         let detected = family::detect(&checkpoint).expect("installed checkpoint family").id();
         let pinned = expected.get(&(model.as_str(), revision.as_str()))
             .unwrap_or_else(|| panic!("add verified baseline family for {model}@{revision}"));
-        assert_eq!(detected, *pinned, "{model}@{revision}: changed from dev630e15e82");
+        assert_eq!(detected, *pinned, "{model}@{revision}: changed from devd6aecfcb7");
         assert_ne!(detected, "minimax_m3");
         eprintln!("{model}@{revision}: {detected}");
         tested += 1;
     }
-    assert!(tested >= 27, "installed checkpoint coverage shrank: {tested}");
-    eprintln!("family detection baseline630e15e82: {tested} installed checkpoint revisions unchanged");
+    assert!(tested >= 29, "installed checkpoint coverage shrank: {tested}");
+    eprintln!("family detection baselined6aecfcb7: {tested} installed checkpoint revisions unchanged");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
