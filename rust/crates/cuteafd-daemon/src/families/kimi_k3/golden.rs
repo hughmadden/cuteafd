@@ -878,7 +878,7 @@ mod tests {
     #[test]
     fn golden_provenance_binds_selected_mode_bundle_and_fp8_recipe() -> Result<()> {
         use clap::Parser;
-        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView, CheckpointView};
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let dir = tempfile::tempdir()?;
         let config = cuteafd_loader::plan::testing::kimi_k3_config();
         cuteafd_loader::plan::testing::write_mc_snapshot(dir.path(), &config, &[],
@@ -888,16 +888,16 @@ mod tests {
             "--golden", "/reference", "--save-logits", "/output"])?.command
             else { panic!("Kimi command"); };
         let mut fingerprints = std::collections::BTreeSet::new();
-        for mode in [CoreView::Original, CoreView::K6Compact, CoreView::Fp8Compact] {
+        for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
             let provenance = args.selected_provenance(&view);
             assert_eq!(provenance["core_view"], serde_json::to_value(mode)?);
             assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
-            assert_eq!(provenance["core_fp8_recipe"],
-                if mode == CoreView::Fp8Compact { FP8_RECIPE } else { "none" });
+            assert_eq!(provenance["core_fp8_recipe"], "none");
             fingerprints.insert(view.fingerprint().to_owned());
         }
         assert_eq!(fingerprints.len(), 3);
+        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string().contains("whole-core FP8 pending"));
         Ok(())
     }
 

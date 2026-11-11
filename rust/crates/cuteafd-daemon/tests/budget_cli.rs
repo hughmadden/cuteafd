@@ -36,7 +36,13 @@ fn direct_family_concurrency_matches_logical_capacity_and_explicit_launcher_inpu
         } else {
             serde_json::json!({"model_type": "glm5_next"})
         };
-        std::fs::write(snapshot.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        if family == "serve-glm" {
+            cuteafd_loader::plan::testing::write_snapshot(snapshot.path(), &config,
+                &cuteafd_loader::plan::testing::glm5_tensors(|name, n, k|
+                    cuteafd_loader::plan::testing::fp8(name, n, k, None)), None);
+        } else {
+            std::fs::write(snapshot.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        }
         for gib in [30u64, 32, 96] {
             let expected = cuteafd_core::serving_capacity::default_concurrency(gib << 30);
             for explicit in [None, Some(expected), Some(4)] {

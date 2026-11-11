@@ -232,19 +232,21 @@ impl Checkpoint {
                 required.entry(shard.clone()).or_default().insert(name.clone());
             }
         }
-        // Hydrate declared native operands for eager family inventories, sharing
-        // each header read with anomalous unscaled A4 declarations on that shard.
-        for (shard, mut names) in required {
-            for meta in read_safetensors_metadata(&snapshot.join(&shard))? {
-                if names.remove(&meta.name) {
-                    checkpoint.tensors.push(CheckpointTensor { shard:shard.clone(), meta });
+        let mut classification = Vec::new();
+        for (shard, names) in required {
+            let headers = read_safetensors_metadata(&snapshot.join(&shard))?;
+            validate_index_headers(&shard, &names.iter().map(String::as_str).collect(), &headers)?;
+            for meta in headers {
+                if names.contains(&meta.name) {
+                    let tensor = CheckpointTensor { shard: shard.clone(), meta };
+                    if native.contains(tensor.meta.name.as_str()) { classification.push(tensor); }
+                    else { checkpoint.tensors.push(tensor); }
                 }
             }
-            ensure!(!names.iter().any(|name| native.contains(name.as_str())),
-                "declared native attention header missing in shard {shard}: {}", names.into_iter().collect::<Vec<_>>().join(", "));
         }
         checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
-        debug_assert!(checkpoint.tensors.windows(2).all(|pair| pair[0].meta.name <= pair[1].meta.name));
+        classification.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+        checkpoint.view.as_mut().unwrap().classification_headers = std::sync::Arc::new(classification);
         Ok(checkpoint)
     }
 

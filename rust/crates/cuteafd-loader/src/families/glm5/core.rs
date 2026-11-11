@@ -56,8 +56,7 @@ pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &C
 pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<()> {
     use crate::plan::checkpoint::{CoreView, ProjectionStorage};
     use cuteafd_core::DType;
-    if !cfg.variant.is_glm() || checkpoint.core_view().compact()
-        || checkpoint.contains_tensor("model.layers.0.self_attn.q_b_proj.trellis") { return Ok(()); }
+    if !cfg.variant.is_glm() { return Ok(()); }
     let layers = cfg.layers.checked_add(cfg.mtp_layers).context("GLM publication layer overflow")?;
     for layer in 0..layers {
         for (leaf, expected) in [
@@ -65,6 +64,7 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
             ("o_proj", vec![cfg.hidden, cfg.heads * cfg.v_head_dim]),
         ] {
             let stem = format!("model.layers.{layer}.self_attn.{leaf}");
+            if checkpoint.contains_tensor(&format!("{stem}.trellis")) { continue; }
             let projection = checkpoint.projection(&stem)?;
             let ProjectionStorage::Native { dtype, shape } = &projection.storage else {
                 return Err(UnsupportedAttentionFormat { tensors: vec![stem], found: format!("{:?}", projection.storage),
@@ -73,7 +73,19 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
             ensure!(shape == &expected && matches!(dtype, DType::Bf16 | DType::F8E4M3),
                 "{stem}: expected native BF16/E4M3 {expected:?}, found {dtype:?} {shape:?}");
             if *dtype == DType::F8E4M3 {
-                crate::formats::native_attention::fp8_scale(&projection, &stem)?;
+                if projection.tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.weight_scale"))
+                    && !projection.tensors.iter().any(|tensor| tensor.meta.name.ends_with(".weight_scale_inv")
+                        || tensor.meta.name.ends_with(".qscale_weight")) {
+                    // Ordinary GLM landing expands ModelOpt's scalar without changing E4M3 bytes.
+                    // Mixed trellis/native stages validate their stricter block-grid contract below.
+                    let scale = projection.tensors.iter().find(|tensor|
+                        tensor.meta.name == format!("{stem}.weight_scale")).unwrap();
+                    ensure!(scale.meta.dtype == DType::F32 && scale.meta.byte_length == 4
+                        && scale.meta.shape.iter().all(|&extent| extent == 1),
+                        "{stem}.weight_scale: expected one FP32 value");
+                } else {
+                    crate::formats::native_attention::fp8_scale(&projection, &stem)?;
+                }
                 if checkpoint.core_view() == CoreView::Fp8Compact {
                     return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
                         tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
@@ -628,7 +640,6 @@ mod tests {
         let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
         cfg.mtp_layers = 1;
         let mut checkpoint = checkpoint(&cfg);
-        checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
         for layer in 0..cfg.layers + cfg.mtp_layers {
             for (leaf, shape) in [
                 ("q_b_proj", vec![cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank]),
@@ -730,7 +741,6 @@ mod tests {
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
         checkpoint.view = Some(CheckpointView::select(dir.path(), CoreView::Original)?);
-        checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
         for layer in 0..cfg.layers {
             for op in [Op::QB, Op::O] {
                 let stem = cfg.stem(layer, op).unwrap();
@@ -765,10 +775,9 @@ mod tests {
         let original = checkpoint.tensors.clone();
         let weight = cfg.weight(0, Op::QB).unwrap();
         let scale = format!("{}.qscale_weight", cfg.stem(0, Op::QB).unwrap());
-        for failure in ["missing", "shape", "scale_dtype", "weight_dtype", "undeclared", "conversion"] {
+        for failure in ["missing", "shape", "scale_dtype", "weight_dtype"] {
             checkpoint.tensors = original.clone();
-            checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
-            checkpoint.view = Some(CheckpointView::select(dir.path(), if failure == "conversion" {
+                checkpoint.view = Some(CheckpointView::select(dir.path(), if failure == "conversion" {
                 CoreView::Fp8Compact
             } else { CoreView::Original })?);
             match failure {
@@ -776,7 +785,6 @@ mod tests {
                 "shape" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.shape[0] += 1,
                 "scale_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.dtype = DType::Bf16,
                 "weight_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == weight).unwrap().meta.dtype = DType::Bf16,
-                "undeclared" => { checkpoint.config["quantization_config"].as_object_mut().unwrap().remove("attention_view"); },
                 "conversion" => (),
                 _ => unreachable!(),
             }

@@ -529,13 +529,12 @@ mod tests {
     }
     #[test]
     fn snapshot_identity_binds_selected_metadata_and_live_media_files() {
-        const COMPACT_CONFIG: &str = "config.compact-attention.json";
-        const COMPACT_INDEX: &str = "model.compact-attention.safetensors.index.json";
-        const COMPACT_QUANT: &str = "quantize_config.compact-attention.json";
+        const COMPACT_CONFIG: &str = "config.k6.json";
+        const COMPACT_INDEX: &str = "model.k6.safetensors.index.json";
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(COMPACT_CONFIG), "{}").unwrap();
-        std::fs::write(root.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#).unwrap();
-        std::fs::write(root.path().join(COMPACT_QUANT), "{}").unwrap();
+        cuteafd_loader::plan::testing::write_mc_snapshot(root.path(),
+            &cuteafd_loader::plan::testing::glm5_flash_config(2), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128, 128])]));
         for file in ["tokenizer.json", "processor_config.json"] {
             std::fs::write(root.path().join(file), file).unwrap();
         }

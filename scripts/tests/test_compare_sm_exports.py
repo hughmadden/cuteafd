@@ -63,9 +63,12 @@ def test_two_target_counts():
 
 def test_draft_bf16_group_matches_exported_shapes():
     exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
-    assert exporter.hqa_bf16_shapes() == {(1536,16384),(1536,8192),
-                                          (16384,4096),(8192,4096),(4096,4096)}
-    assert exporter.hqa_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
+    assert exporter.flash_native_bf16_shapes() == {(1536,16384),(1536,8192),
+                                          (16384,4096),(8192,4096),(4096,4096),
+                                          (4096,1536),(4096,512),(4096,12288),(4096,6144),
+                                          (12288,4096),(6144,4096),(4096,2048),(4096,1024),
+                                          (2048,4096),(1024,4096)}
+    assert exporter.flash_native_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
     expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
     for scope in ("all", "suspects"):
         job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")

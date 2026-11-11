@@ -1479,14 +1479,15 @@ fn selected_view_group_rejects_cross_mode_expert_catalog() -> Result<()> {
     use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
     let root = tempfile::tempdir()?;
     let (tensors, _) = qwen4_exl3(1, 4);
-    write_snapshot(root.path(), &qwen4_config(1), &tensors, Some(4));
-    let hqa = CheckpointView::select(root.path(), CoreView::Original)?;
-    let converted = CheckpointView::select(root.path(), CoreView::Fp8Compact)?;
-    let selected = cuteafd_loader::read_expert_catalog_view(&hqa)?;
-    validate_selected_catalog(&hqa, Some(&selected))?;
-    assert!(validate_selected_catalog(&converted, Some(&selected)).is_err());
+    cuteafd_loader::plan::testing::write_mc_snapshot(root.path(), &qwen4_config(1), &tensors,
+        &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128, 128])]));
+    let original = CheckpointView::select(root.path(), CoreView::Original)?;
+    let compact = CheckpointView::select(root.path(), CoreView::K8Compact)?;
+    let selected = cuteafd_loader::read_expert_catalog_view(&original)?;
+    validate_selected_catalog(&original, Some(&selected))?;
+    assert!(validate_selected_catalog(&compact, Some(&selected)).is_err());
     let legacy = cuteafd_loader::read_expert_catalog(root.path())?;
-    assert!(validate_selected_catalog(&hqa, Some(&legacy)).is_err());
-    validate_selected_catalog(&converted, None)?;
+    assert!(validate_selected_catalog(&original, Some(&legacy)).is_err());
+    validate_selected_catalog(&compact, None)?;
     Ok(())
 }

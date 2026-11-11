@@ -2174,7 +2174,7 @@ mod tests {
         use crate::families::glm5_flash::head::GlmfHeadFormat;
         let defaults = parse(&[]);
         assert_eq!((defaults.kda_fp8, defaults.kda_state, defaults.head_format),
-            (KdaFp8::Row128, KdaState::F32, GlmfHeadFormat::Auto));
+            (KdaFp8::Off, KdaState::F32, GlmfHeadFormat::Auto));
         for state in ["f32", "bf16", "bf16-tile"] {
             for kda in ["off", "row128", "channel"] {
                 for (head, format) in [("true", GlmfHeadFormat::Fp8), ("false", GlmfHeadFormat::Bf16),

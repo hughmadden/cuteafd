@@ -1245,6 +1245,11 @@ esac
 detected_family="$(release_config_family "$config" "$core_view")"
 [[ -n "$family" ]] || family="$detected_family"
 core_view_args=(--core-view "$core_view")
+serve_core_view_args=()
+case "$family" in
+  glm5|glm5_flash|kimi_k3|step5|muse_spark) serve_core_view_args=("${core_view_args[@]}") ;;
+  *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
+esac
 
 [[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
   release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
@@ -1612,7 +1617,7 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${core_view_args[@]}")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${serve_core_view_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;

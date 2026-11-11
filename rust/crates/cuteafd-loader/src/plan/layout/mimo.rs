@@ -669,13 +669,13 @@ mod tests {
                             additional.extend(graph.reservations(rank).unwrap());
                             MimoRankRuntime { weight_arenas: vec![], resident_weights: Default::default(), device: rank as u32, loading_additional: vec![], additional,
                                 workspaces: workspace_options(&cfg, ranks, rank, 4096, 32768, lanes, true,
-                                    opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, pro, |_| Ok(0)).unwrap() }
+                                    opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow, false, |_| Ok(0)).unwrap() }
                         }).collect();
                         let admitted = mimo_capacity_profiles(&checkpoint, &cfg, MimoResidentOptions {
                             layers: cfg.layers, coordinator_ranks: ranks, checkpoint_tp: if pro { 8 } else { 4 },
-                            native_mtp_layers: 0, gpu_embedding: true, head_format: if pro { R::Fp8 } else { R::Bf16 },
+                            native_mtp_layers: 0, gpu_embedding: true, head_format: R::Bf16,
                             output_formats: (0..cfg.layers).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"),
-                                if pro { R::Fp8 } else { R::Bf16 })).collect(),
+                                R::Bf16)).collect(),
                         }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
                             rings: opts.mimo_rings(), mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
                         let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
@@ -710,8 +710,7 @@ mod tests {
                             opts.host_memory.unwrap(), opts.spark_bytes, 4).unwrap();
                         let runtime = production::ProductionInput {
                             startup_probe_bytes: probe,
-                            blas_head: if pro { crate::placement::planner::serving::BlasHead::Native }
-                                else { opts.bf16_target_head }, draft_head: false,
+                            blas_head: opts.bf16_target_head, draft_head: false,
                             expert_usage: opts.expert_usage, cfg: &cfg, layers: cfg.layers, kv,
                             mtp_stages: 0, context: 32768, maximum_pool_tokens: 32768, prefill,
                             lanes: lanes as u64, embedding: EmbeddingHome::Device(0), gpus: ranks, spark_ranks: 4,

@@ -79,7 +79,7 @@ impl CheckpointView {
             let model_type = config.get("model_type").and_then(Value::as_str).unwrap_or("");
             if mc.is_some() {
                 let family = match model_type {
-                    "kimi_k3" | "kimi_k3_1" | "kimi_k31" => Some("Kimi K3.1"),
+                    "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "kimi_linear" => Some("Kimi K3.1"),
                     "glm_next" | "glm5_flash" | "glm5_next" | "glm5_next_text" => Some("GLM Flash"),
                     _ => None,
                 };
@@ -152,9 +152,14 @@ impl CheckpointView {
     pub(super) fn quantize_config(&self) -> Option<Value> { self.quantize_config.as_deref().cloned() }
     pub(super) fn weight_map(&self) -> Option<&BTreeMap<String, String>> { self.weight_map.as_deref() }
     pub(super) fn native_core_names(&self) -> impl Iterator<Item = &str> {
+        let model_type = self.config.get("model_type").and_then(Value::as_str).unwrap_or("");
+        let eager_core = matches!(model_type, "glm_moe_dsa" | "glm5_moe" | "glm5" | "glm_next"
+            | "glm5_flash" | "glm5_next" | "glm5_next_text" | "mistral4" | "mistral_large4" | "mistral3"
+            | "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "kimi_linear");
         self.weight_map.iter().flat_map(|weights| weights.keys()).map(String::as_str)
-            .filter(|name| !name.contains(".experts.") && !name.contains(".mtp.")
-                && (name.ends_with(".weight") || name.ends_with(".weight_scale_inv") || name.ends_with(".qscale_weight"))
+            .filter(move |name| eager_core && !name.contains(".experts.") && !name.contains(".mtp.")
+                && (name.ends_with(".weight") || name.ends_with(".weight_scale_inv") || name.ends_with(".qscale_weight")
+                    || name.ends_with(".weight_scale") || name.ends_with(".input_scale"))
                 && (name.contains(".self_attn.") || name.contains(".attention.") || name.contains(".mlp.") || name.starts_with("lm_head.")
                     || name.starts_with("language_model.lm_head.")))
     }

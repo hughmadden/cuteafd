@@ -562,7 +562,7 @@ mod source_format_tests {
         }
         args.draft = Some(external.path().into());
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
-        assert_eq!(selected.head, MimoProjectionRepresentation::Fp8);
+        assert_eq!(selected.head, MimoProjectionRepresentation::Bf16);
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
     }
 
@@ -586,8 +586,8 @@ mod source_format_tests {
         checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.draft, MimoDraftRepresentation::Fp8Only);
-        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Fp8);
-        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 71);
+        assert_eq!(selected.output["model.mtp.layers.0.self_attn.o_proj.weight"], MimoProjectionRepresentation::Bf16);
+        assert_eq!(selected.output.values().filter(|&&format| format == MimoProjectionRepresentation::Fp8).count(), 0);
     }
 
     #[test]
@@ -597,7 +597,7 @@ mod source_format_tests {
         checkpoint.tensors[at].meta.shape[1] = 6100;
         let selected = resolve_weight_formats(&args, &checkpoint, &cfg).unwrap();
         assert_eq!(selected.default_policy, MimoDefaultPolicy::Checkpoint);
-        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Bf16Only));
+        assert_eq!((selected.head, selected.draft), (MimoProjectionRepresentation::Bf16, MimoDraftRepresentation::Fp8Only));
         assert!(selected.output.values().all(|&format| format == MimoProjectionRepresentation::Bf16));
     }
 

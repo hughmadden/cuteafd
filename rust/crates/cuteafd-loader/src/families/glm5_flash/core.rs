@@ -99,7 +99,7 @@ impl CoreInventory {
                     && layer.parse::<usize>().is_ok_and(|l| cfg.attention[l] == GlmNextAttention::Mla));
             let preserve = (mla || stem.contains(".mlp."))
                 && expected.keys().any(|name| name.starts_with(&format!("{group}."))
-                    && checkpoint.tensors.iter().any(|t| t.meta.name == *name && t.meta.dtype == cuteafd_core::DType::Bf16));
+                    && checkpoint.header(name).is_some_and(|t| t.dtype == cuteafd_core::DType::Bf16));
             if !mixed && !preserve { continue; }
             ensure!(&actual == shape, "{stem}: native core shape {actual:?}, expected {shape:?}");
             ensure!(matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
@@ -526,7 +526,7 @@ mod tests {
                     weight_budget_bytes: 80 << 30, ..Default::default() }), ..Default::default() })?;
             assert!(report.executable(), "{}", crate::plan::render(&report));
             let layout = report.memory_layout.as_ref().unwrap();
-            assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
+            assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "selected native core")));
             let representation = crate::families::glm5_flash::resident::GlmfRepresentation {
                 kda_fp8: false, output_shard: false, head: crate::families::glm5_flash::resident::GlmfHeadFormat::Bf16,
             };
@@ -583,6 +583,7 @@ mod tests {
                 byte_length: 2 * shape.iter().product::<usize>() as u64, shape,
             },
         }).collect();
+        checkpoint.weight_map = checkpoint.tensors.iter().map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
         assert!(core.projections.is_empty());
         assert!(!core.native.is_empty() && core.native.values().all(|w| !w.fp8));
@@ -862,6 +863,7 @@ mod tests {
                 let source = format!("{PREFIX}0.self_attn.q_proj");
                 let extra = changed.tensors.iter().filter(|t| t.meta.name.starts_with(&source)).cloned()
                     .map(|mut t| { t.meta.name = t.meta.name.replacen(&source, &stem, 1); t }).collect::<Vec<_>>();
+                changed.weight_map.extend(extra.iter().map(|t| (t.meta.name.clone(), t.shard.clone())));
                 changed.tensors.extend(extra);
             }
             assert!(CoreInventory::from_checkpoint(&cfg, &changed).is_err());

@@ -883,7 +883,7 @@ def test_glm_official_catalog_stays_fused(exporter):
     geometry = types.SimpleNamespace(moe_inter=2048, dense_inter=12288)
     entries = exporter.glm_programs(geometry, 64, 4096, 1048576)
     names = {name for name, _, _, _ in entries}
-    assert len(names) == len(entries) == 27
+    assert len(names) == len(entries) == 29
     for rows in (64, 4096):
         for stem in ("producer", "index_producer", "o"):
             assert f"{stem}_m{rows}" in names
