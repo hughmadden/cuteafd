@@ -350,11 +350,16 @@ impl PackedLayer {
                     .map(|(rank, _)| rank).collect();
                 if cfg.dsa.is_some() {
                     use cuteafd_loader::families::kimi_k3::dsa::{load_native, IndexerOperand};
-                    for operand in IndexerOperand::ALL {
+                    for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
                         let tensor = load_native(cfg, layer, operand, &mut read)?;
                         for &owner in &owners {
                             pair[owner].operands.insert(operand.arena_name(), tensor.bytes.clone());
                         }
+                    }
+                    let mut kw = load_native(cfg, layer, IndexerOperand::Key, &mut read)?.bytes;
+                    kw.extend_from_slice(&load_native(cfg, layer, IndexerOperand::Heads, &mut read)?.bytes);
+                    for &owner in &owners {
+                        pair[owner].operands.insert("mla.indexer.kw", kw.clone());
                     }
                 }
                 for (operand, name) in [(MlaOperand::QkvA, "mla.qkv_a"), (MlaOperand::QNorm, "mla.q_norm"),
@@ -671,13 +676,25 @@ mod tests {
                 } else { tensor(name) }
             })?;
             for rank in &packed {
-                for operand in IndexerOperand::ALL {
+                for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
                     assert_eq!(rank.operands.contains_key(operand.arena_name()), rank.attention.present());
                     if rank.attention.present() {
                         let (_, shape) = operand.specification(&cfg, 3)?;
                         let expected: Vec<u8> = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
                         assert_eq!(rank.operands[operand.arena_name()], expected);
                     }
+                }
+                assert!(!rank.operands.contains_key("mla.indexer.k"));
+                assert!(!rank.operands.contains_key("mla.indexer.weights"));
+                assert_eq!(rank.operands.contains_key("mla.indexer.kw"), rank.attention.present());
+                if rank.attention.present() {
+                    let mut expected = Vec::new();
+                    for operand in [IndexerOperand::Key, IndexerOperand::Heads] {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        expected.extend((0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes));
+                    }
+                    assert_eq!(rank.operands["mla.indexer.kw"], expected);
+                    assert_eq!(expected.len(), (cfg.dsa.unwrap().head_dim + cfg.dsa.unwrap().heads) * cfg.hidden * 2);
                 }
             }
         }

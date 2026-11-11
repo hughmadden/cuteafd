@@ -439,12 +439,24 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
         let local = heads / owners.len();
         if cfg.dsa.is_some() {
             use cuteafd_loader::families::kimi_k3::dsa::IndexerOperand;
-            for operand in IndexerOperand::ALL {
+            for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
                 let (name, shape) = operand.specification(cfg, layer)?;
                 for &owner in &owners {
                     ops[owner].insert(operand.arena_name(), self.whole(devices[owner],
                         operand.arena_name(), &name, DType::Bf16, &shape)?);
                 }
+            }
+            let (key, key_shape) = IndexerOperand::Key.specification(cfg, layer)?;
+            let (heads, head_shape) = IndexerOperand::Heads.specification(cfg, layer)?;
+            expect(self.checkpoint, &key, DType::Bf16, &key_shape)?;
+            expect(self.checkpoint, &heads, DType::Bf16, &head_shape)?;
+            for &owner in &owners {
+                let key_rows = rect(self.checkpoint, &key, None, None)?;
+                let head_rows = rect(self.checkpoint, &heads, None, None)?;
+                let at = key_rows.bytes();
+                let bytes = at.checked_add(head_rows.bytes()).context("Kimi index projection extent overflow")?;
+                ops[owner].insert("mla.indexer.kw", self.landed(devices[owner], "mla.indexer.kw",
+                    vec![(key_rows, 0), (head_rows, at)], bytes)?);
             }
         }
         let kv_b = format!("{root}.kv_b_proj.weight");
