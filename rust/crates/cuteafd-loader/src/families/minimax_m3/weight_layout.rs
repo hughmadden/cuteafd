@@ -78,6 +78,54 @@ impl CoordinatorWeights {
         self.projections.iter().map(Mxfp8Projection::program_name).collect()
     }
 
+    pub fn quantizer_programs(&self) -> BTreeSet<String> {
+        self.projections.iter().map(|projection|
+            format!("exlr8_dense_quant_k{}_bf16_a8", projection.input)).collect()
+    }
+
+    /// Resolve only exports this rank binds. Validate the full manifest ABI,
+    /// including pointer dtypes and shapes, before admission or kernel loading.
+    pub fn resolve_dense_programs(&self, manifest: &serde_json::Value, rows: u32)
+        -> std::result::Result<Vec<cuteafd_ffi::programs::ProgramSpec>, crate::placement::planner::Refusal> {
+        use crate::placement::{inventory::ProgramEntry, planner::Refusal};
+        let records = self.records_bytes(rows).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+        let names = self.dense_programs().union(&self.quantizer_programs()).cloned().collect::<BTreeSet<_>>();
+        let entries = manifest["programs"].as_array().ok_or_else(||
+            Refusal::InvalidFact("MiniMax native PROGRAMS.json has no program list".into()))?;
+        let mut resolved = Vec::new();
+        for name in names {
+            let refusal = |detail| Refusal::MissingExport { export: name.clone(),
+                geometry: "MiniMax BF16 ingress, native MXFP8 W8A8, rotation_count=1".into(),
+                context: u64::from(rows), detail };
+            let mut matches = entries.iter().filter(|entry| entry["name"].as_str() == Some(name.as_str()));
+            let entry = matches.next().ok_or_else(|| refusal("absent from PROGRAMS.json".into()))?;
+            if matches.next().is_some() { return Err(refusal("duplicate program in PROGRAMS.json".into())); }
+            let parsed = ProgramEntry::from_manifest(entry).map_err(|error| refusal(error.to_string()))?;
+            if name.starts_with("exlr8_dense_quant_k") {
+                let expected = self.projections.iter().find_map(|projection|
+                    (name == format!("exlr8_dense_quant_k{}_bf16_a8", projection.input))
+                        .then_some(cuteafd_ffi::native_dense_glue::Op::Mx8QuantBf16 { features: projection.input as u32 }))
+                    .expect("quantizer name derived from projections");
+                let actual = cuteafd_ffi::native_dense_glue::validate_entry(&parsed.spec, entry)
+                    .map_err(|error| refusal(error.to_string()))?;
+                if actual != expected { return Err(refusal("quantizer geometry differs from checkpoint".into())); }
+            } else {
+                if entry["op"].as_str() != Some("dense_mxfp8") {
+                    return Err(refusal("native MXFP8 GEMM operation differs".into()));
+                }
+                let expected = self.projections.iter().find(|projection| projection.program_name() == name)
+                    .expect("GEMM name derived from projections").geometry();
+                let actual = cuteafd_ffi::native_dense::validate_entry(&parsed.spec, entry)
+                    .map_err(|error| refusal(error.to_string()))?;
+                if actual != expected || actual.scratch_bytes(rows).map_err(|error| refusal(error.to_string()))? > records {
+                    return Err(refusal("GEMM geometry or record owner differs from checkpoint".into()));
+                }
+            }
+            resolved.push(parsed.spec);
+        }
+        Ok(resolved)
+    }
+
     /// Charge one arena backing and its one driver-allocation tail. Tensor
     /// views are aliases, not additional resident-weight charges.
     pub fn weight_components(&self, maximum_pages: u64)

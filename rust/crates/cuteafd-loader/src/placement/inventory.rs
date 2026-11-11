@@ -275,7 +275,7 @@ impl ProgramsManifest {
 }
 
 impl ProgramEntry {
-    fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
+    pub(crate) fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
         use anyhow::Context;
         #[derive(Deserialize)]
         struct Pointer { name: String }

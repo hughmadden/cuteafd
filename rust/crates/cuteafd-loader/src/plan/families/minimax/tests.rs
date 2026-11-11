@@ -152,6 +152,72 @@ fn coordinator_native_arena_preserves_checkpoint_bytes_and_explicit_owners() {
     assert!(CoordinatorWeights::plan(&checkpoint, &wrong, 1, &[0; 4]).is_err());
 }
 
+fn dense_manifest(weights: &crate::families::minimax_m3::weight_layout::CoordinatorWeights) -> serde_json::Value {
+    use serde_json::json;
+    let scalars = json!([{"name":"rows","type":"int32"},
+        {"name":"rotation_id","type":"int32"}, {"name":"cta_limit","type":"int32"}]);
+    let mut entries = std::collections::BTreeMap::new();
+    for projection in &weights.projections {
+        let (k, n) = (projection.input, projection.output);
+        let quant = format!("exlr8_dense_quant_k{k}_bf16_a8");
+        entries.insert(quant.clone(), json!({"name":quant,"op":"dense_mxfp8_quant",
+            "capacity_rows":4096,"scratch_bytes_at_capacity":{},"scalars":scalars,
+            "geometry":{"input_features":k,"input_dtype":"bf16","rotation_count":1,"max_rows":4096,"abi_version":2},
+            "pointers":[{"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+                {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]}));
+        entries.insert(projection.program_name(), json!({"name":projection.program_name(),"op":"dense_mxfp8",
+            "capacity_rows":4096,"scratch_bytes_at_capacity":{},"scalars":scalars,
+            "geometry":{"input_features":k,"output_features":n,"sharded_side":1,"encoding":"mxfp8",
+                "input_dtype":"bf16","rotation_count":1,"max_rows":4096,"abi_version":2},
+            "pointers":[{"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+                {"name":"payload","dtype":"uint8","shape":format!("[{}]", k*n),"role":"in"},
+                {"name":"scales","dtype":"uint8","shape":format!("[{}]", n*k/32),"role":"in"},
+                {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"in"},
+                {"name":"output","dtype":"float32","shape":format!("[rows,{n}]"),"role":"out"}]}));
+    }
+    json!({"programs":entries.into_values().collect::<Vec<_>>()})
+}
+
+#[test]
+fn coordinator_native_program_inventory_validates_full_abi_and_quantizers() {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    use serde_json::json;
+    let (dir, _, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap().remove(0);
+    let manifest = dense_manifest(&weights);
+    assert_eq!(weights.dense_programs().len(), 8);
+    assert_eq!(weights.quantizer_programs().len(), 4);
+    let programs = weights.resolve_dense_programs(&manifest, 2752).unwrap();
+    assert_eq!(programs.len(), 12);
+    assert!(programs.windows(2).all(|p| p[0].name < p[1].name));
+    for rows in [0, 4097] { assert!(weights.resolve_dense_programs(&manifest, rows).is_err()); }
+    assert!(weights.resolve_dense_programs(&json!({}), 1).is_err());
+    let mut missing = manifest.clone();
+    missing["programs"].as_array_mut().unwrap().pop();
+    assert!(weights.resolve_dense_programs(&missing, 1).is_err());
+    let mut duplicate = manifest.clone();
+    duplicate["programs"].as_array_mut().unwrap().push(manifest["programs"][0].clone());
+    assert!(weights.resolve_dense_programs(&duplicate, 1).is_err());
+    for index in 0..12 {
+        for (field, value) in [("input_dtype", json!("f16")), ("abi_version", json!(null)),
+            ("rotation_count", json!(4)), ("input_features", json!(512)), ("max_rows", json!(64))] {
+            let mut bad = manifest.clone();
+            bad["programs"][index]["geometry"][field] = value;
+            assert!(weights.resolve_dense_programs(&bad, 1).is_err(), "{index} {field}");
+        }
+        for (field, value) in [("dtype", "float16"), ("shape", "[4]"), ("role", "out")] {
+            let mut bad = manifest.clone();
+            bad["programs"][index]["pointers"][0][field] = json!(value);
+            assert!(weights.resolve_dense_programs(&bad, 1).is_err(), "{index} {field}");
+        }
+        let mut bad = manifest.clone();
+        bad["programs"][index]["scalars"][0]["name"] = json!("count");
+        assert!(weights.resolve_dense_programs(&bad, 1).is_err());
+    }
+}
+
 #[test]
 fn coordinator_native_arena_refuses_missing_scale_header() {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
