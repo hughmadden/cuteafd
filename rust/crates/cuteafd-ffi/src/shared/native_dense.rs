@@ -17,6 +17,7 @@ fn invalid(message: impl Into<String>) -> DenseError {
 pub enum Encoding {
     Trellis,
     TrellisA8,
+    Mxfp8A8,
     Int4G32,
     Mxfp8,
     RowFp8,
@@ -94,8 +95,12 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
     if bf16_input && encoding != Encoding::Trellis {
         return Err(invalid("BF16 core suffix requires trellis encoding"));
     }
-    let encoding = if a8 && encoding == Encoding::Trellis { Encoding::TrellisA8 }
-        else if a8 { return Err(invalid("A8 core suffix requires trellis encoding")); } else { encoding };
+    let encoding = match (a8, encoding) {
+        (true, Encoding::Trellis) => Encoding::TrellisA8,
+        (true, Encoding::Mxfp8) => Encoding::Mxfp8A8,
+        (true, _) => return Err(invalid("A8 suffix requires trellis or MXFP8 encoding")),
+        (false, encoding) => encoding,
+    };
     let g = &spec.geometry;
     let field = |key: &str, expected| -> Result<()> {
         if g[key].as_u64() != Some(expected) {
@@ -136,6 +141,14 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
             if g["codebook"].as_str() != Some("e4m3") {
                 return Err(invalid("native trellis requires checkpoint E4M3 codebook"));
             }
+        } else if encoding == Encoding::Mxfp8A8 {
+            if (k / 32) * 256 > (i32::MAX as u64) / 8 {
+                return Err(invalid("native MXFP8 A8 record indexing extent"));
+            }
+            if g["encoding"].as_str() != Some("mxfp8") || g["input_dtype"].as_str() != Some("bf16") {
+                return Err(invalid("native MXFP8 A8 requires BF16 ingress and MXFP8 weights"));
+            }
+            field("rotation_count", 1)?;
         } else {
             let expected = match encoding {
                 Encoding::Int4G32 => "int4_g32",
@@ -175,7 +188,7 @@ impl DenseGeometry {
         if rows == 0 || rows > self.max_rows {
             return Err(invalid("rows outside compiled native dense capacity"));
         }
-        Ok(if self.encoding == Encoding::TrellisA8 {
+        Ok(if matches!(self.encoding, Encoding::TrellisA8 | Encoding::Mxfp8A8) {
             u64::from(rows).div_ceil(16) * (self.input_features / 32) * 528
         } else if self.encoding == Encoding::Trellis {
             u64::from(rows) * self.input_features.div_ceil(1024) * self.output_features * 4
@@ -200,7 +213,7 @@ impl DenseGeometry {
                 "partial",
                 "output",
             ],
-            Encoding::TrellisA8 => &["rotated_inputs", "payload", "scales", "records", "output"],
+            Encoding::TrellisA8 | Encoding::Mxfp8A8 => &["rotated_inputs", "payload", "scales", "records", "output"],
             Encoding::Embedding => &["ids", "payload", "scales", "output"],
             _ => &["x", "payload", "scales", "partial", "output"],
         }
@@ -209,12 +222,12 @@ impl DenseGeometry {
 
 pub fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
     let g = geometry(spec)?;
-    let kinds: &[u8] = if matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8) {
+    let kinds: &[u8] = if matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8 | Encoding::Mxfp8A8) {
         b"iii"
     } else {
         b"ii"
     };
-    let scratch = if matches!(g.encoding, Encoding::Embedding | Encoding::TrellisA8) {
+    let scratch = if matches!(g.encoding, Encoding::Embedding | Encoding::TrellisA8 | Encoding::Mxfp8A8) {
         std::collections::HashMap::new()
     } else {
         std::collections::HashMap::from([("partial".to_string(), g.scratch_bytes(g.max_rows)?)])
@@ -237,10 +250,10 @@ pub fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
 /// Validate the exported contract without loading kernels or allocating GPU storage.
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<DenseGeometry> {
     let g = validate_spec(spec)?;
-    let a8 = g.encoding == Encoding::TrellisA8;
+    let a8 = matches!(g.encoding, Encoding::TrellisA8 | Encoding::Mxfp8A8);
     let trellis = matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8);
     let embedding = g.encoding == Encoding::Embedding;
-    let scalar_names: &[&str] = if trellis {
+    let scalar_names: &[&str] = if trellis || a8 {
         &["rows", "rotation_id", "cta_limit"]
     } else {
         &["rows", "cta_limit"]
@@ -260,7 +273,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
     let n = g.output_features;
     let scale_type = match g.encoding {
         Encoding::Trellis | Encoding::TrellisA8 | Encoding::Int4G32 => "float16",
-        Encoding::Mxfp8 => "uint8",
+        Encoding::Mxfp8 | Encoding::Mxfp8A8 => "uint8",
         _ => "float32",
     };
     let (dtypes, shapes, roles): (Vec<&str>, Vec<String>, Vec<&str>) = if embedding {
@@ -290,7 +303,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
         };
         (
             vec![
-                if trellis { "int64" } else { "bfloat16" },
+                if trellis || a8 { "int64" } else { "bfloat16" },
                 "uint8",
                 scale_type,
                 if a8 { "uint8" } else { "float32" },
@@ -299,6 +312,8 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
             vec![
                 if trellis {
                     "[4]".into()
+                } else if a8 {
+                    "[1]".into()
                 } else {
                     format!("[rows,{k}]")
                 },
@@ -371,7 +386,8 @@ impl<'a> DenseLinear<'a> {
     /// # Safety
     /// All pointers must be device storage for the validated manifest geometry,
     /// on the bound device, and survive until the stream completes. For trellis,
-    /// `input` is the I64 table of four F16 rotated inputs; otherwise BF16 rows.
+    /// `input` is an I64 table of four rotated inputs. MXFP8 A8 takes an I64
+    /// table of one BF16 input; other scaled encodings take BF16 rows directly.
     /// Caller owns every rotation/output transform and admits per-lane scratch.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn launch(
@@ -386,21 +402,11 @@ impl<'a> DenseLinear<'a> {
         rotation: u32,
         stream: *mut c_void,
     ) -> Result<()> {
-        let required = self.geometry.launch_scratch_bytes(rows)?;
+        validate_linear_launch(self.geometry, [input, payload, scales, partial, output],
+            partial_bytes, rows, rotation)?;
         let trellis = matches!(self.geometry.encoding, Encoding::Trellis | Encoding::TrellisA8);
-        if partial_bytes < required
-            || (required > 0 && partial.is_null())
-            || input.is_null()
-            || payload.is_null()
-            || scales.is_null()
-            || output.is_null()
-            || (trellis && rotation >= 4)
-            || (!trellis && rotation != 0)
-        {
-            return Err(invalid("native dense launch storage or rotation"));
-        }
         let mut scalars = vec![Scalar::I32(rows as i32)];
-        if trellis {
+        if trellis || self.geometry.encoding == Encoding::Mxfp8A8 {
             scalars.push(Scalar::I32(rotation as i32));
         }
         scalars.push(Scalar::I32(self.cta_limit));
@@ -412,6 +418,18 @@ impl<'a> DenseLinear<'a> {
         }
         .map_err(|e| invalid(e.to_string()))
     }
+}
+
+fn validate_linear_launch(g: DenseGeometry, pointers: [*mut c_void; 5],
+    partial_bytes: u64, rows: u32, rotation: u32) -> Result<()> {
+    let required = g.launch_scratch_bytes(rows)?;
+    let trellis = matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8);
+    if partial_bytes < required || (required > 0 && pointers[3].is_null())
+        || [pointers[0], pointers[1], pointers[2], pointers[4]].iter().any(|p| p.is_null())
+        || (trellis && rotation >= 4) || (!trellis && rotation != 0) {
+        return Err(invalid("native dense launch storage or rotation"));
+    }
+    Ok(())
 }
 
 /// Row-FP8 vocabulary gather. `ids` contains arbitrary vocabulary IDs, not row offsets.
@@ -593,6 +611,56 @@ mod tests {
         }
         entry["pointers"][3]["role"] = json!("scratch");
         assert!(validate_entry(&spec, &entry).is_err());
+    }
+
+    #[test]
+    fn native_mxfp8_a8_manifest_keeps_native_weights_and_bf16_ingress() {
+        let (mut spec, mut entry) = trellis();
+        spec.name = "exlr8_dense_mxfp8_k6144_n8192_s1_a8".into();
+        spec.geometry = json!({"input_features":6144,"output_features":8192,
+            "encoding":"mxfp8","sharded_side":1,"input_dtype":"bf16",
+            "rotation_count":1,"max_rows":4096,"abi_version":2});
+        spec.scratch.clear();
+        spec.pointers[2] = "scales".into();
+        spec.pointers[3] = "records".into();
+        entry["pointers"] = json!([
+            {"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+            {"name":"payload","dtype":"uint8","shape":"[50331648]","role":"in"},
+            {"name":"scales","dtype":"uint8","shape":"[1572864]","role":"in"},
+            {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"in"},
+            {"name":"output","dtype":"float32","shape":"[rows,8192]","role":"out"}]);
+        let g = validate_entry(&spec, &entry).unwrap();
+        assert_eq!(g.encoding, Encoding::Mxfp8A8);
+        for (rows, tiles) in [(1, 1), (16, 1), (17, 2), (4096, 256)] {
+            assert_eq!(g.launch_scratch_bytes(rows).unwrap(), tiles * 192 * 528);
+        }
+        let pointer = std::ptr::NonNull::<u32>::dangling().as_ptr().cast();
+        let records = g.scratch_bytes(17).unwrap();
+        validate_linear_launch(g, [pointer; 5], records, 17, 0).unwrap();
+        assert!(validate_linear_launch(g, [pointer; 5], records - 1, 17, 0).is_err());
+        for rows in [0, 4097, u32::MAX] {
+            assert!(validate_linear_launch(g, [pointer; 5], records, rows, 0).is_err());
+        }
+        for rotation in [1, 4, u32::MAX] {
+            assert!(validate_linear_launch(g, [pointer; 5], records, 17, rotation).is_err());
+        }
+        for missing in 0..5 {
+            let mut pointers = [pointer; 5];
+            pointers[missing] = std::ptr::null_mut();
+            assert!(validate_linear_launch(g, pointers, records, 17, 0).is_err());
+        }
+        for (field, value) in [("input_dtype", json!("f16")), ("encoding", json!("trellis")),
+            ("rotation_count", json!(4)), ("abi_version", json!(1)), ("max_rows", json!(64))] {
+            let mut bad = spec.clone();
+            bad.geometry[field] = value;
+            assert!(validate_entry(&bad, &entry).is_err(), "{field}");
+        }
+        for (pointer, field, value) in [(0, "shape", "[4]"), (2, "dtype", "float16"),
+            (3, "role", "scratch")] {
+            let mut bad = entry.clone();
+            bad["pointers"][pointer][field] = json!(value);
+            assert!(validate_entry(&spec, &bad).is_err(), "{pointer}/{field}");
+        }
     }
 
     #[test]
