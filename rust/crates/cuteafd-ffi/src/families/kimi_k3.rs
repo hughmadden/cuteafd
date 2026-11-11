@@ -448,7 +448,7 @@ fn validate_candidate_batch(b: KimiCandidateBatch) -> Result<()> {
     validate_phase(&operands, 3..7, b.scores.device_id)
 }
 
-const SPARSE_ATTENTION: &[&str] = &["query", "kv_cache", "indices", "lengths", "query_offsets", "out", "lse", "scratch"];
+const SPARSE_ATTENTION: &[&str] = ATTENTION;
 
 #[derive(Clone, Copy, Debug)]
 pub struct KimiSparseBatch {
@@ -1679,6 +1679,47 @@ mod tests {
                     assert!(validate_sparse_manifest(&spec, 48, rows, format, begin).is_err());
                     assert!(validate_sparse_manifest(&spec, heads, rows, format, Some(24)).is_err());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn k31_selected_mla_accepts_sealed_export_manifest() {
+        // Unmodified entries from the f44d9776 SM120 export, not synthesized
+        // from the consumer's pointer-name constants.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/kimi_k31_sparse_mla_sm120.json")).unwrap();
+        assert_eq!(manifest["sparkinfer_revision"], "f44d97769fd540fafd7ed341ae6966554fa80ea7");
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 16);
+        for entry in entries {
+            let pointers = entry["pointers"].as_array().unwrap().iter()
+                .map(|p| p["name"].as_str().unwrap().to_owned()).collect();
+            let scalar_kinds = entry["scalars"].as_array().unwrap().iter().map(|scalar| {
+                match scalar["type"].as_str().unwrap() {
+                    "int32" => b'i', "int64" => b'l', other => panic!("unexpected scalar {other}"),
+                }
+            }).collect();
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().to_owned(), pointers, scalar_kinds,
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                geometry: entry["geometry"].clone(),
+            };
+            let heads = spec.geometry["heads"].as_u64().unwrap() as usize;
+            let rows = spec.capacity_rows as usize;
+            let begin = spec.geometry.get("head_begin").map(|value| value.as_u64().unwrap() as usize);
+            let format = match spec.geometry["kv_cache"].as_str().unwrap() {
+                "bf16" => MlaCacheFormat::Bf16, "fp8" => MlaCacheFormat::Fp8,
+                other => panic!("unexpected cache format {other}"),
+            };
+            validate_sparse_manifest(&spec, heads, rows, format, begin).unwrap();
+            for (index, alias) in [(2, "indices"), (3, "lengths"), (4, "query_offsets"), (5, "out")] {
+                let mut wrong = spec.clone();
+                wrong.pointers[index] = alias.into();
+                assert!(validate_sparse_manifest(&wrong, heads, rows, format, begin).is_err(),
+                    "{} accepted stale alias {alias}", spec.name);
             }
         }
     }
