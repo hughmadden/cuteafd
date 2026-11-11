@@ -137,7 +137,10 @@ fn glm_flash_native_core_plan(bits: usize) {
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
     let shapes = crate::families::glm5_flash::core::expected(&cfg);
     let mut tensors = glm5_flash_tensors(&config);
-    tensors.retain(|(name, _, _)| !shapes.contains_key(name));
+    tensors.retain(|(name, _, _)| {
+        let (stem, _) = format::split_stem(name);
+        !shapes.contains_key(&format!("{stem}.weight"))
+    });
     for (name, shape) in &shapes {
         tensors.extend(exl3(name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits));
     }
@@ -183,10 +186,12 @@ fn glm_flash_unsupported_native_core_width_is_actionable() {
 #[test]
 fn glm_and_ml4_planner_native_core_widths_equal_loader_contracts() {
     let flash = glm5_flash_config(2);
+    let ml4 = tempfile::tempdir().unwrap();
+    write_mistral_large4_snapshot(ml4.path(), Some(&[1]), false);
     let dirs = [
         snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None))),
         snapshot(flash.clone(), &glm5_flash_tensors(&flash)),
-        snapshot(mistral_large4_config(), &mistral_large4_tensors(Some(&[1]), false)),
+        ml4,
     ];
     let cases: [(&dyn family::Family, &str, Vec<usize>, &[usize]); 3] = [
         (&families::glm::GLM5, "lm_head", vec![64, 6144], crate::families::glm5::core::NATIVE_CORE_WIDTHS),
