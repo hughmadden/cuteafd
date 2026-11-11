@@ -143,8 +143,9 @@ def test_original_core_view_is_not_forwarded_to_unsupported_workers(tmp_path, fa
     result = _family_launch_result(tmp_path, config, model,
         selector + "SPARK_COUNT=4\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode == 0, result.stderr
-    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
-    assert workers, result.stderr
+    worker_marker = "--profile-args" if family == "deepseek_v41" else "cuteafd expertd-native"
+    workers = [line for line in result.stderr.splitlines() if worker_marker in line]
+    assert len(workers) == 4, result.stderr
     assert all("--core-view" not in line for line in workers), result.stderr
 
 
