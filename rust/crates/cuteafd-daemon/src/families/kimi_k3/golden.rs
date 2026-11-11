@@ -115,6 +115,15 @@ fn router_top17(scores: &[f32], bias: &[f32], selected: &[u32]) -> Result<Value>
 }
 
 impl Capture {
+    pub(super) fn after_ffn(capture: Option<&Self>, layer: usize,
+        work: impl FnOnce(&Self) -> Result<()>) -> Result<()> {
+        if let Some(capture) = capture.filter(|capture|
+            capture.call.get().is_some() && capture.layers.contains(&layer)) {
+            work(capture)?;
+        }
+        Ok(())
+    }
+
     fn new(args: &GoldenArgs, windows: &[cuteafd_bench::reference::Window], capacity: usize,
         unit_rows: usize, provenance: Value) -> Result<Option<std::rc::Rc<Self>>> {
         let Some(rows) = args.capture_rows.clone() else { return Ok(None); };
@@ -412,12 +421,7 @@ fn run(args: GoldenArgs) -> Result<()> {
     native(&args, &checkpoint, &full, &cfg, reference, None)
 }
 
-fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
-    -> Result<cuteafd_bench::reference::Reference> {
-    ensure!(manifest["schema"] == "cuteafd.kimi.skipped-routed/1"
-        && manifest["diagnostic_only"] == true && manifest["tier"] == "quick"
-        && manifest["treatment"] == "router+shared-experts; routed contribution zero",
-        "Kimi skipped-routed golden requires a matching diagnostic reference, not a full-model reference");
+fn diagnostic_source(root: &Path, manifest: &Value, cfg: &KimiK3Config) -> Result<()> {
     ensure!(KimiK3Config::from_hf(&manifest["checkpoint_config"])? == *cfg
         && manifest["vocab"].as_u64() == Some(cfg.vocab_size as u64),
         "Kimi diagnostic checkpoint config/vocabulary differs");
@@ -458,6 +462,16 @@ fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
     ensure!(manifest["checkpoint_config_sha256"] == digest(&config_bytes)
         && serde_json::from_slice::<Value>(&config_bytes)? == manifest["checkpoint_config"],
         "Kimi diagnostic raw checkpoint config differs");
+    Ok(())
+}
+
+fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
+    -> Result<cuteafd_bench::reference::Reference> {
+    ensure!(manifest["schema"] == "cuteafd.kimi.skipped-routed/1"
+        && manifest["diagnostic_only"] == true && manifest["tier"] == "quick"
+        && manifest["treatment"] == "router+shared-experts; routed contribution zero",
+        "Kimi skipped-routed golden requires a matching diagnostic reference, not a full-model reference");
+    diagnostic_source(root, manifest, cfg)?;
     let proof = &manifest["prefix_qualification"];
     ensure!(proof["schema"] == "cuteafd.fidelity.prefix/1" && proof["passed"] == true
         && proof["finite"] == true && proof["different_rows"] == serde_json::json!([])
@@ -477,12 +491,56 @@ fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
     Ok(reference)
 }
 
+fn arithmetic_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config,
+    args: &GoldenArgs) -> Result<cuteafd_bench::reference::Reference> {
+    ensure!(args.skip_routed_experts && !args.capture_layers.is_empty() && args.capture_rows.is_some()
+        && args.window.is_some() && args.verify_rows.is_none()
+        && manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1"
+        && manifest["diagnostic_only"] == true && manifest["qualification_reference"] == false
+        && manifest["diagnostic"]["arithmetic"] == "f32"
+        && manifest["diagnostic"]["window"].as_str() == args.window.as_deref()
+        && manifest["treatment"] == "router+shared-experts; routed contribution zero",
+        "Kimi arithmetic diagnostic is capture-only, never an NLL qualification reference");
+    diagnostic_source(root, manifest, cfg)?;
+    let binding = &manifest["binding"];
+    ensure!(binding["source_pin"] == manifest["source_pin"]
+        && binding["snapshot_identity"] == manifest["snapshot_identity"]
+        && binding["set_sha256"] == manifest["set_sha256"]
+        && binding["skip_routed_experts"] == true && binding["state_dtype"] == "float32",
+        "Kimi arithmetic diagnostic binding differs");
+    let platform_bytes = std::fs::read(root.join("platform.json"))?;
+    let platform: Value = serde_json::from_slice(&platform_bytes)?;
+    ensure!(manifest["platform_sha256"] == digest(&platform_bytes) && manifest["platform"] == platform
+        && sha(&platform["image_sha256"])
+        && binding["image_sha256"].as_str() == platform["image_sha256"].as_str()
+            .map(|hash| format!("sha256:{hash}")).as_deref(),
+        "Kimi arithmetic diagnostic image/platform binding differs");
+    let bytes = std::fs::read(root.join("reference.json"))?;
+    ensure!(manifest["reference_sha256"] == digest(&bytes), "Kimi arithmetic reference checksum differs");
+    let reference: cuteafd_bench::reference::Reference = serde_json::from_slice(&bytes)?;
+    reference.validate()?;
+    ensure!(reference.windows.len() == 1 && reference.windows[0].id == *args.window.as_ref().unwrap()
+        && Some(reference.set_sha256.as_str()) == manifest["set_sha256"].as_str()
+        && Some(reference.checkpoint.as_str()) == manifest["checkpoint"].as_str()
+        && reference.vocab == cfg.vocab_size, "Kimi arithmetic reference window/identity differs");
+    let window = &reference.windows[0];
+    ensure!(binding["windows"][&window.id] == digest(&serde_json::to_vec(&window.tokens)?),
+        "Kimi arithmetic window tokens differ");
+    let logits = root.join("windows").join(&window.id).join("logits.bin");
+    ensure!(logits.metadata()?.len() == (window.positions.len() * cfg.vocab_size * 4) as u64
+        && manifest["logits_sha256"][&window.id] == digest(&std::fs::read(logits)?),
+        "Kimi arithmetic logits checksum/shape differs");
+    Ok(reference)
+}
+
 fn full_reference(args: &GoldenArgs, cfg: &KimiK3Config) -> Result<Vec<cuteafd_bench::reference::Window>> {
     use cuteafd_bench::fidelity_dataset;
     let root = args.golden.as_deref().context("--nll requires --golden")?;
     let bytes = std::fs::read(root.join("manifest.json"))?;
     let manifest: Value = serde_json::from_slice(&bytes)?;
-    let reference = if args.skip_routed_experts {
+    let reference = if manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1" {
+        arithmetic_reference(root, &manifest, cfg, args)?
+    } else if args.skip_routed_experts {
         skipped_reference(root, &manifest, cfg)?
     } else {
         let (hash, config) = if cfg.dsa.is_some() {
@@ -893,6 +951,21 @@ mod tests {
     }
 
     #[test]
+    fn post_ffn_capture_is_inert_without_an_armed_selected_layer() -> Result<()> {
+        let calls = std::cell::Cell::new(0);
+        Capture::after_ffn(None, 0, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        let capture = Capture { root: PathBuf::new(), layers: vec![3], rows: 1..2,
+            call: std::cell::Cell::new(None), provenance: Value::Null };
+        Capture::after_ffn(Some(&capture), 3, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        capture.call.set(Some(0));
+        Capture::after_ffn(Some(&capture), 2, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        assert_eq!(calls.get(), 0);
+        Capture::after_ffn(Some(&capture), 3, |_| { calls.set(calls.get() + 1); Ok(()) })?;
+        assert_eq!(calls.get(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn capture_is_bounded_prefill_only_and_checks_actual_router_ids() -> Result<()> {
         use clap::Parser;
         let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
@@ -1011,6 +1084,47 @@ mod tests {
             let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
             std::fs::write(tmp.path().join("reference.json"), b"{}")?;
             assert!(skipped_reference(tmp.path(), &manifest, &cfg).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn arithmetic_reference_requires_capture_and_rejects_nll_qualification() -> Result<()> {
+        use clap::Parser;
+        let tmp = tempfile::tempdir()?;
+        let (cfg, mut manifest) = skipped_fixture(tmp.path(), true)?;
+        manifest["schema"] = json!("cuteafd.kimi.arithmetic-diagnostic/1");
+        manifest["qualification_reference"] = json!(false);
+        manifest["diagnostic"] = json!({"arithmetic":"f32","window":"w"});
+        let platform = json!({"image_sha256":"d".repeat(64)});
+        let bytes = serde_json::to_vec(&platform)?;
+        std::fs::write(tmp.path().join("platform.json"), &bytes)?;
+        manifest["platform_sha256"] = json!(digest(&bytes));
+        manifest["platform"] = platform;
+        manifest["binding"] = json!({"source_pin":manifest["source_pin"],
+            "snapshot_identity":manifest["snapshot_identity"],"set_sha256":manifest["set_sha256"],
+            "skip_routed_experts":true,"state_dtype":"float32","image_sha256":format!("sha256:{}","d".repeat(64)),
+            "windows":{"w":digest(&serde_json::to_vec(&vec![1u32,2])?)}});
+        let folder = tmp.path().join("windows/w");
+        std::fs::create_dir_all(&folder)?;
+        let logits = vec![0u8; cfg.vocab_size * 4];
+        std::fs::write(folder.join("logits.bin"), &logits)?;
+        manifest["logits_sha256"] = json!({"w":digest(&logits)});
+        let base = ["cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
+            "--golden", "/reference", "--save-logits", "/output", "--skip-routed-experts"];
+        let crate::cli::Commands::KimiGolden(mut args) = crate::cli::Cli::try_parse_from(base)?.command
+            else { panic!("Kimi golden"); };
+        assert!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args).is_err());
+        args.window = Some("w".into());
+        assert!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args).is_err());
+        args.capture_layers = vec![0];
+        args.capture_rows = Some(0..1);
+        assert_eq!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args)?.windows.len(), 1);
+        for path in ["/qualification_reference", "/diagnostic/arithmetic", "/binding/source_pin",
+            "/platform_sha256", "/source_pin/reference_runner_sha256", "/logits_sha256/w"] {
+            let mut changed = manifest.clone();
+            *changed.pointer_mut(path).context("arithmetic fixture path")? = Value::Null;
+            assert!(arithmetic_reference(tmp.path(), &changed, &cfg, &args).is_err(), "{path}");
         }
         Ok(())
     }

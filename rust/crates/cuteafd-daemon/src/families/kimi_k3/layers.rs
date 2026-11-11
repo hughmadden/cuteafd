@@ -691,6 +691,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         } else {
             self.local[0].adopt("delta", shared, self.rows, 7168)?;
         }
+        self.local[0].capture_post_ffn(layer, self.rows)?;
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }
         self.with_probe(|probe| {
             // SAFETY: this mark follows all FFN consumers on the only physical lane stream.
@@ -1059,6 +1060,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             if self.local[0].native_ffn(layer)? {self.meet_core(layer,true,"delta")?;}
             else {self.meet("ffn output", "delta")?;}
         }
+        self.local[0].capture_post_ffn(layer, self.rows)?;
         // Checkpoint taps are the completed decoder prefix plus final FFN
         // delta, before the following residual mixer or final output norm.
         if let Some(draft) = self.draft { draft.tap_at(layer, &mut self.local[0], self.rows, self.tap_first)?; }

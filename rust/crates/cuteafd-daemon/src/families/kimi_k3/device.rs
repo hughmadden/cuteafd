@@ -1704,6 +1704,15 @@ impl<'a> LocalLane<'a> {
         Ok(output)
     }
 
+    pub(crate) fn capture_post_ffn(&mut self, layer: usize, rows: usize) -> Result<()> {
+        let capture = self.capture.clone();
+        super::golden::Capture::after_ffn(capture.as_deref(), layer, |capture| {
+            let output = self.terminal_residual(rows)?;
+            capture.record(self.stream(), self.capture_site(layer, "post-ffn", rows)?,
+                &[("residual", output, 7168, "BF16")], None)
+        })
+    }
+
     pub(crate) fn residual(&mut self, site: MixSite, rows: usize) -> Result<CuteafdDeviceBuffer> {
         self.residual_body(site, rows)?;
         self.plane("normalized", rows, 7168)

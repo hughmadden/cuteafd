@@ -573,11 +573,15 @@ def execute(a):
                 total_rows += len(logits)
             del hidden, blocks, selected, logits
         if diagnostic:
+            write_arithmetic_reference(a.out, manifest, config, windows, entries)
+            shutil.copyfile(a.snapshot / "config.json", a.out / "checkpoint-config.json")
             from fidelity_windows import collect_runtime_platform
             platform = collect_runtime_platform()
             atomic_json(a.out / "platform.json", platform)
             atomic_json(a.out / "manifest.json", {
                 "schema": "cuteafd.kimi.arithmetic-diagnostic/1", "diagnostic_only": True,
+                "revision": a.snapshot.name, "checkpoint": manifest["checkpoint"],
+                "set_sha256": manifest["set_sha256"], "source_pin": pins, "snapshot_identity": snapshot,
                 "qualification_reference": False, "diagnostic": diagnostic,
                 "treatment": "router+shared-experts; routed contribution zero",
                 "checkpoint_config": json.loads((a.snapshot / "config.json").read_bytes()),
@@ -585,6 +589,7 @@ def execute(a):
                 "binding": binding, "platform": platform, "platform_sha256": digest(a.out / "platform.json"),
                 "vocab": config.vocab_size, "windows": entries,
                 "nll": total_nll / total_rows, "scored_tokens": total_rows,
+                "reference_sha256": digest(a.out / "reference.json"),
                 "logits_sha256": {entry["id"]: digest(a.out / entry["path"] / "logits.bin") for entry in entries},
                 "captures": {str(path.relative_to(a.out)): digest(path)
                              for path in sorted((a.out / "capture").glob("*/meta.json"))}})
@@ -631,6 +636,33 @@ def execute(a):
     if skip_routed and not checking:
         write_skipped_reference(a.out, manifest, a.snapshot, config, pins, proof)
     print(f"reference NLL {total_nll / total_rows:.12f}; {total_rows} scored rows", flush=True)
+
+
+def write_arithmetic_reference(out, panel, config, windows, entries):
+    """Compact comparison operands; only the capture-specific consumer accepts these."""
+    import numpy as np
+    packed = []
+    for raw in windows:
+        entry = next(row for row in entries if row["id"] == raw["id"])
+        rows = np.memmap(out / entry["path"] / "logits.bin", dtype="<f4", mode="r",
+                         shape=(len(entry["positions"]), config.vocab_size))
+        positions = []
+        topk = min(1024, config.vocab_size - 1)
+        for pos, row in zip(entry["positions"], rows):
+            logits = np.asarray(row, dtype=np.float64)
+            lp = logits - np.logaddexp.reduce(logits)
+            ids = np.argsort(-lp, kind="stable")[:topk]
+            rest = np.ones(config.vocab_size, dtype=bool)
+            rest[ids] = False
+            positions.append(dict(pos=pos, next=raw["tokens"][pos], next_lp=float(lp[raw["tokens"][pos]]),
+                top=[dict(id=int(i), lp=float(lp[i])) for i in ids],
+                tail_lp=float(np.logaddexp.reduce(lp[rest]))))
+        packed.append({**raw, "top_k": topk, "positions": positions})
+    atomic_json(out / "reference.json", dict(name="Kimi arithmetic diagnostic ONLY",
+        schema="cuteafd.fidelity.reference/2", checkpoint=panel["checkpoint"],
+        models=[panel["checkpoint"]], vocab=config.vocab_size, set_sha256=panel["set_sha256"],
+        expect=dict(kl_max=0.03, top1_min=0.95),
+        quick_windows=[window["id"] for window in windows], windows=packed))
 
 
 def write_skipped_reference(out, panel, snapshot, config, pins, proof):
