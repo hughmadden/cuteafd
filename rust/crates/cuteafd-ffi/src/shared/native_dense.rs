@@ -862,19 +862,22 @@ mod tests {
             buffers.push(library.alloc_device_buffer(bytes, crate::memory_ledger::Tag::workspace("fixture/mxfp8"))?);
         }
         library.copy_h2d(buffers[0], &(buffers[1].ptr as u64).to_le_bytes())?;
+        // The CPU allocator marks host fallback for correct release accounting.
+        // Only dispatch views simulate CUDA flags; keep the originals for free.
+        let views = buffers.iter().map(|b| crate::CuteafdDeviceBuffer { flags: 0, ..*b }).collect::<Vec<_>>();
         // The no-math fixture observes dispatch only; it never emulates MXFP8.
         let ready = buffers[1].ptr as usize as u32;
         fixture.register_reply(&library, 0, ready, b'P')?;
         fixture.register_reply(&library, 1, ready, b'Q')?;
         let stream = std::ptr::null_mut();
-        op.quantize(17, buffers[0], buffers[1], buffers[2], stream)?;
-        for _ in 0..2 { op.project(17, buffers[0], buffers[3], buffers[4], buffers[2], buffers[5], stream)?; }
+        op.quantize(17, views[0], views[1], views[2], stream)?;
+        for _ in 0..2 { op.project(17, views[0], views[3], views[4], views[2], views[5], stream)?; }
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
         assert_eq!(fixture.events()?.matches('P').count(), 2);
         assert_eq!(fixture.events()?.matches('D').count(), 6);
         library.cuda_set_device(1)?;
-        assert!(op.quantize(17, buffers[0], buffers[1], buffers[2], stream).is_err());
-        assert!(op.project(17, buffers[0], buffers[3], buffers[4], buffers[2], buffers[5], stream).is_err());
+        assert!(op.quantize(17, views[0], views[1], views[2], stream).is_err());
+        assert!(op.project(17, views[0], views[3], views[4], views[2], views[5], stream).is_err());
         library.cuda_set_device(0)?;
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
         assert_eq!(fixture.events()?.matches('P').count(), 2);
