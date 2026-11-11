@@ -551,7 +551,12 @@ fn full_reference(args: &GoldenArgs, cfg: &KimiK3Config) -> Result<Vec<cuteafd_b
             "Kimi F32 reference config/vocabulary differs");
         fidelity_dataset::load(root, &manifest)?
     };
-    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    let mut windows = if manifest["schema"] == "cuteafd.kimi.arithmetic-diagnostic/1" {
+        // The strict capture-only envelope already selected its one explicit window.
+        reference.windows
+    } else {
+        fidelity_dataset::quick_windows(&reference)?
+    };
     if let Some(id) = &args.window {
         windows.retain(|window| &window.id == id);
         ensure!(windows.len() == 1, "Kimi smoke window must belong to the sealed quick subset");
@@ -1120,6 +1125,12 @@ mod tests {
         args.capture_layers = vec![0];
         args.capture_rows = Some(0..1);
         assert_eq!(arithmetic_reference(tmp.path(), &manifest, &cfg, &args)?.windows.len(), 1);
+        std::fs::write(tmp.path().join("manifest.json"), serde_json::to_vec(&manifest)?)?;
+        args.golden = Some(tmp.path().to_path_buf());
+        assert_eq!(full_reference(&args, &cfg)?[0].id, "w");
+        let selected = std::mem::take(&mut args.capture_layers);
+        assert!(full_reference(&args, &cfg).is_err());
+        args.capture_layers = selected;
         for path in ["/qualification_reference", "/diagnostic/arithmetic", "/binding/source_pin",
             "/platform_sha256", "/source_pin/reference_runner_sha256", "/logits_sha256/w"] {
             let mut changed = manifest.clone();
