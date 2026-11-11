@@ -205,7 +205,7 @@ mod tests {
             let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
                 serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
             std::fs::write(root.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
-                "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}}))?)?;
+                "tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(65536)}, "tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(32768)}}}))?)?;
         }
         let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
         let prefixes: &[&str] = if ranks == 2 { &["step5", "step52"] } else { &["step5"] };

@@ -2530,7 +2530,7 @@ fn glm5_flash_native_block_projection_rejects_wrong_scale_dtype_grid_or_missing_
 #[test]
 fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let dense = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(dense.path(), json!({"layouts": {"tp1": {"capacities": [{"capacity":4096,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+    std::fs::write(dense.path(), json!({"layouts": {"tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": [{"capacity":4096,"scratch_bytes":1024}]}}}).to_string()).unwrap();
     let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, glmf_dense_manifest: Some(dense.path().to_path_buf()), ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));
     tensors.retain(|(name, ..)| !name.contains(".mlp.experts.") && !name.starts_with("model.language_model.layers.0.mlp."));
@@ -3772,7 +3772,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp2":{
-        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
@@ -5744,7 +5744,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":{
-        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
@@ -6662,7 +6662,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
     std::fs::write(&mimo_manifest, serde_json::to_vec(&json!({"layouts": {"tp1": {
         "input": "bf16", "tp": 1, "hidden": 4096, "experts": 256, "top_k": 8,
         "intermediate": 2048, "slice": 2048, "weights": "mxfp4",
-        "capacities": [{"capacity": 4096, "scratch_bytes": 671_354_880}]
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [{"capacity": 4096, "scratch_bytes": 671_354_880}]
     }}})).unwrap()).unwrap();
     let mimo_base = PlanOptions {
         vision: MediaMode::Spark(Some(0)),

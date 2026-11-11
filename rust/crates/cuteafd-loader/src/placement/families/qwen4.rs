@@ -582,7 +582,7 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
             && info["top_k"].as_u64() == Some(shape.topk as u64)
             && info["input"].as_str() == Some("bf16") && weights,
             "Qwen MTP package must be native full-width BF16-input TP1: {}", root.display());
-        let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", rows)
+        let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", rows)?
             .ok_or_else(|| anyhow::anyhow!("Qwen MTP package has no capacity for {rows} rows"))?.max(256);
         (resident, scratch)
     };
@@ -644,7 +644,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
                 && info["top_k"].as_u64() == Some(shape.topk as u64)
                 && info["input"].as_str() == Some("bf16") && weights,
                 "Qwen FP8/NVFP4 TP2 rank {rank} package geometry mismatch: {}", package.display());
-            crate::placement::inventory::fp8moe_scratch_bytes(&manifest, name, rows)
+            crate::placement::inventory::fp8moe_scratch_bytes(&manifest, name, rows)?
                 .ok_or_else(|| anyhow::anyhow!("Qwen TP2 rank {rank} has no capacity for {rows} rows"))?
         };
         let output_element = if catalog.exl3().is_some() { 4 } else { 2 };
@@ -1425,7 +1425,7 @@ mod tests {
         assert_eq!(cost.whole.resident, 512 * (3 * 640 * 2560 * 9 / 16 + 3 * 8));
         let package = |width, scratch| serde_json::json!({"tp": 2, "hidden": 2560, "slice": width,
             "intermediate": 640, "experts": 512, "top_k": 10, "input": "bf16", "weights": "nvfp4a4",
-            "capacities": [{"capacity": 1, "scratch_bytes": 128}, {"capacity": 16, "scratch_bytes": scratch}]});
+            "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [{"capacity": 1, "scratch_bytes": 128}, {"capacity": 16, "scratch_bytes": scratch}]});
         let mut manifest = serde_json::json!({"layouts": {"tp2-w384": package(384, 1000),
             "tp2-w256": package(256, 2000)}});
         let save = |value: &serde_json::Value| std::fs::write(dir.path().join("manifest.json"),

@@ -413,9 +413,9 @@ mod tests {
         let retained = [(1024, 163_779_584), (4096, 734_346_240)];
         let capacities: Vec<_> = retained.iter().map(|&(capacity, scratch)|
             serde_json::json!({"capacity": capacity, "scratch_bytes": scratch})).collect();
-        let manifest = serde_json::json!({"layouts": {"tp2": {"capacities": capacities}}});
+        let manifest = serde_json::json!({"layouts": {"tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities}}});
         for (rows, abi_scratch) in retained {
-            let scratch = fp8moe_scratch_bytes(&manifest, "tp2", rows as u64)
+            let scratch = fp8moe_scratch_bytes(&manifest, "tp2", rows as u64)?
                 .context("planner retained-form scratch inventory")?;
             let (_, output, runtime) = workspace(abi_scratch, 4096, rows)?;
             let planned = scratch + output as u64;
@@ -426,9 +426,9 @@ mod tests {
             }
         }
         // Admission uses the smallest sufficient bucket, not the request rows.
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1023), Some(163_779_584));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1025), Some(734_346_240));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 4097), None);
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1023).unwrap(), Some(163_779_584));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1025).unwrap(), Some(734_346_240));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 4097).unwrap(), None);
         Ok(())
     }
 

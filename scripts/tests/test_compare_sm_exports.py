@@ -1198,7 +1198,8 @@ def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
+    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -1227,6 +1228,7 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
         __file__=str(tmp_path / "baseline-package.py"),
         layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        ABI_VERSION=6, activation_params=lambda *args: (1.0, 0.0),
         input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
     ))
     (tmp_path / "baseline-package.py").write_text("# baseline without core variants\n")
@@ -1238,7 +1240,9 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     assert len(records) == 1
     assert json.loads((tmp_path / "routed.json").read_text())["layouts"]["tp1"] == {
         "tp": 1, "hidden": 4096, "slice": 2048, "experts": 256, "top_k": 8,
-        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16"}
+        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16",
+        "abi_version": 6, "activation": "silu_bf16_product", "projection": "bf16",
+        "swiglu_limit": 0.0, "swiglu_alpha": 1.0, "swiglu_beta": 0.0}
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
@@ -1267,7 +1271,8 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
     calls = []
     def compile_program(g, **kwargs):
         calls.append(kwargs)

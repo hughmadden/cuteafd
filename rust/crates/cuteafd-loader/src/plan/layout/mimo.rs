@@ -466,7 +466,7 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
                 && info["slice"].as_u64() == Some(tensors.rank_width(ranks, rank, slicing)? as u64)
                 && info["weights"].as_str().is_some_and(|weights| weights.starts_with(expected_weights)),
                 "MiMo expert manifest does not serve the checkpoint BF16-input geometry: {layout}");
-            let scratch = crate::placement::inventory::fp8moe_scratch_bytes(metadata, layout, rows.max(64))
+            let scratch = crate::placement::inventory::fp8moe_scratch_bytes(metadata, layout, rows.max(64))?
                 .context("MiMo expert manifest lacks selected capacity")?;
             if ranks == 2 {
                 let output = rows.max(64).checked_mul(cfg.hidden as u64).and_then(|bytes| bytes.checked_mul(2))
@@ -1014,7 +1014,7 @@ mod tests {
                     "input": "bf16", "tp": ranks, "hidden": cfg.hidden, "experts": cfg.experts,
                     "top_k": cfg.topk, "intermediate": cfg.moe_intermediate,
                     "slice": cfg.moe_intermediate / ranks, "weights": "mxfp4",
-                    "capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
+                    "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [{"capacity": 4096, "scratch_bytes": scratch}]
                 }}})).unwrap()).unwrap();
                 let mut admitted = devices();
                 let placement = apply(&input, &options, &mut admitted, 0, 4096, 4, 256 << 10, None).unwrap();

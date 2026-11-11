@@ -60,7 +60,7 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
     let metadata = metadata.context("MiMo local experts need a generated BF16-input package manifest")?;
     let scratch = |path: &std::path::Path| -> Result<u64> {
         let layout = path.file_name().and_then(|name| name.to_str()).context("MiMo package layout")?;
-        cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)
+        cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&metadata, layout, rows as u64)?
             .context("MiMo expert manifest lacks selected capacity")
     };
     let (workspace, tp2_workspace) = if ranks == 2 {
@@ -799,7 +799,7 @@ fn local_expert_reservations(
             bytes: {
                 let manifest = local_package_manifest(&directory)?;
                 let capacity = super::engine::expert_capacity(args.prefill_rows);
-                let bytes = cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", capacity as u64)
+                let bytes = cuteafd_loader::placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", capacity as u64)?
                     .context("MiMo local package lacks tp1 scratch at selected capacity")?;
                 ensure!(bytes == metadata.scratch_for(capacity)?.max(256) as u64,
                     "MiMo local package JSON/native scratch contracts disagree");

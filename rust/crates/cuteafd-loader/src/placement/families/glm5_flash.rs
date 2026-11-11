@@ -1643,14 +1643,14 @@ pub(crate) mod tests {
         let path = share.join("PROGRAMS.json");
         assert!(expert_workspace(&catalog, Some(&path), 4096, 2).is_err());
         std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
-            "tp1": {"capacities":[{"capacity":4096,"scratch_bytes":12345}]},
-            "tp2": {"capacities":[{"capacity":4096,"scratch_bytes":67890}]}}}).to_string()).unwrap();
+            "tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":12345}]},
+            "tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":67890}]}}}).to_string()).unwrap();
         assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 1).unwrap(), 12345);
         assert_eq!(expert_workspace(&catalog, Some(&path), 4096, 2).unwrap(), 67890 + 4096 * 4096 * 2);
         assert!(expert_workspace(&catalog, Some(&path), 4097, 2).is_err());
         // Measured GLMf TP2 package ABI maxima, plus its owned BF16 output.
         std::fs::write(package.join("manifest.json"), serde_json::json!({"layouts": {
-            "tp2": {"capacities":[{"capacity":1024,"scratch_bytes":163779584},
+            "tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":1024,"scratch_bytes":163779584},
                 {"capacity":4096,"scratch_bytes":734346240}]}}}).to_string()).unwrap();
         for (rows, scratch) in [(1024, 163779584), (4096, 734346240)] {
             assert_eq!(expert_workspace(&catalog, Some(&path), rows, 2).unwrap(), scratch + rows * 4096 * 2);
@@ -1685,7 +1685,7 @@ pub(crate) mod tests {
             let root = dir.path().join("lib/fp8").join(name);
             std::fs::create_dir_all(root.join("tp2")).unwrap();
             std::fs::write(root.join("manifest.json"), serde_json::json!({"layouts":{
-                "tp2":{"capacities":[{"capacity":4096,"scratch_bytes":scratch}]}}}).to_string()).unwrap();
+                "tp2":{"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":scratch}]}}}).to_string()).unwrap();
             root
         };
         package("fp8-glmf-nvfp4", 12345);
