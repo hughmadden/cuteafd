@@ -190,7 +190,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     memory.sample("modules-rtx-experts")?;
     let context_programs = devices.iter().map(|device|
         (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
-            .then(|| device.run(|| super::context::Programs::load(programs, options.cache_format).map(Rc::new)))
+            .then(|| device.run(|| super::context::Programs::load_for_config(programs, options.cache_format, full).map(Rc::new)))
             .transpose()).collect::<Result<Vec<_>>>()?;
     let context_programs = context_programs.try_into()
         .map_err(|_| anyhow::anyhow!("Kimi context program rank inventory"))?;
@@ -211,7 +211,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         .try_into().map_err(|_| anyhow::anyhow!("Kimi lane physical rank inventory"))?;
     let context_layout = (options.attention == Some(cuteafd_loader::placement::AttentionPlacement::Context))
         .then(|| super::context::Programs::layout(programs, options.cache_format,
-            options.max_context, unit, lane_layouts[0].metadata_banks())).transpose()?;
+            options.max_context, unit, lane_layouts[0].metadata_banks(), full)).transpose()?;
     let lane_layouts = vec![lane_layouts];
     let verify_rows = match options.verify_rows {
         0 => options.draft.as_ref().map(super::draft::Options::verify_rows).transpose()?.unwrap_or(0),

@@ -1270,10 +1270,11 @@ impl<'a> LocalLane<'a> {
                     rank * owner.compact_width() * 4, pages * 4)?;
                 let pool = self.context.cache(rank, self.layer)?;
                 let stream = self.local.stream();
+                let gather = self.programs.gather.as_ref().context("Kimi DSA context requires selected-token prefill")?;
                 stream.device.run(|| {
                     // SAFETY: both banks and the exact remote reader streams are
                     // retained by ContextOwner; prior owner commits were joined.
-                    unsafe { self.programs.gather.launch(&[pool.ptr, table.ptr, self.batch.cache.ptr],
+                    unsafe { gather.launch(&[pool.ptr, table.ptr, self.batch.cache.ptr],
                         &[cuteafd_ffi::programs::Scalar::I32((pages * 64) as i32),
                             cuteafd_ffi::programs::Scalar::I32(2), cuteafd_ffi::programs::Scalar::I32(rank as i32)], stream.raw) }
                 })
