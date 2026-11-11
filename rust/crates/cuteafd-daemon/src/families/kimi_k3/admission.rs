@@ -2924,6 +2924,24 @@ pub(super) mod tests {
         let demand = request(i)?;
         assert!(demand.layers.iter().all(|layer| layer.experts.is_none()));
         assert!(!demand.fixed.iter().any(|d| d.group.contains("Spark")));
+        fn check<const RANKS: usize>(cfg: &KimiK3Config) -> Result<()> {
+            let mut i = inputs_for_ranks::<RANKS>(cfg);
+            i.skip_routed_experts = true;
+            i.spark_ranks = 0;
+            i.spark_budget = None;
+            let admitted = admit(i)?;
+            assert!(admitted.skip_routed_experts);
+            assert_eq!(admitted.spark_ranks, 0);
+            assert!(admitted.spark_links.is_empty());
+            assert!(admitted.rtx.is_none() && admitted.expert_usage.is_none() && admitted.draft.is_none());
+            assert!(admitted.placement.layers.iter().all(|layer| layer.experts == ExpertHome::Dense));
+            assert!(admitted.working_set().spark_layers.is_empty());
+            assert!(admitted.placement.items.iter().flatten().all(|item|
+                !item.group.contains("Spark") && !item.group.contains("push host")));
+            Ok(())
+        }
+        check::<1>(&cfg)?;
+        check::<2>(&cfg)?;
         for case in 0..3 {
             let mut i = inputs(&cfg);
             i.skip_routed_experts = true;

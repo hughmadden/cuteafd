@@ -482,7 +482,7 @@ def execute(a):
                       official_forward=comparison, arithmetic=arithmetic,
                       expert_storage=binding["expert_storage"],
                       root_arithmetic={"source": ("hash-checked official K3 decoder plus isolated K3.1 DSA adapter, cross-checked against pinned vLLM and SGLang; F32 indexer does not emulate serving E4M3/UE8M0 QDQ; original/fixed-row comparison shares the DSA adapter" if is_k31 else "official checkpoint Python decoder; exact E2M1/E8M0 group-32 MXFP4 decoded directly to F32"),
-                          "arithmetic": "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note: the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
+                          "arithmetic": ("Diagnostic computed entirely in F32 from shipped BF16/F32 dense tensors; router and shared experts run, routed contribution is zero, and no routed payload is loaded; F32 activations, block history, norms, KDA recurrence and eager attention; TF32 disabled, fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note:" if skip_routed else "Reference computed entirely in F32 from the native checkpoint: exact group-32 MXFP4 to F32; shipped BF16/F32 dense tensors upcast to F32; F32 activations, block history, router, norms, KDA recurrence and eager attention; TF32 disabled in Torch and Triton, highest matmul precision; one expert matrix dequantized at a time from a per-layer packed GPU cache; fixed-M128 linears; MTP/cache off.\n\nCheckpoint-format note:") + " the release zero-pads native KDA A_log from 96 active heads to 128. Each affected tensor is narrowed to the first 96 only after all 32 unused F32 values are verified bit-exact positive zero. Per-layer shapes and tail SHA256 checks are recorded in reference_provenance.gates.kda_a_log_zero_padding; all other tensor shapes remain strict."},
                       platform={"capability": list(torch.cuda.get_device_capability()),
                                 "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda})
     if skip_routed and not checking:
@@ -522,6 +522,13 @@ def write_skipped_reference(out, panel, snapshot, config, pins, proof):
         set_sha256=panel["set_sha256"], quick_windows=panel["quick_windows"], windows=windows)
     atomic_json(out / "reference.json", reference)
     config_bytes = (snapshot / "config.json").read_bytes()
+    config_copy = out / "checkpoint-config.pending"
+    with config_copy.open("wb") as stream:
+        stream.write(config_bytes)
+        stream.flush()
+        os.fsync(stream.fileno())
+    config_copy.replace(out / "checkpoint-config.json")
+    sync_directory(out)
     atomic_json(out / "manifest.json", dict(schema="cuteafd.kimi.skipped-routed/1",
         config=panel["family"] + "-dense-attention-dsa-skipped-routed", revision=snapshot.name,
         checkpoint=panel["checkpoint"], vocab=config.vocab_size, treatment=SKIPPED_ROUTED_TREATMENT,

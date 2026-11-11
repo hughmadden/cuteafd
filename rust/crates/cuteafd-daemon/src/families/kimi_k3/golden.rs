@@ -432,14 +432,38 @@ fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
     ] {
         ensure!(manifest["source_pin"][key] == digest(bytes), "Kimi diagnostic source pin differs: {key}");
     }
-    if cfg.dsa.is_some() {
-        ensure!(manifest["source_pin"]["dsa_adapter_sha256"] == digest(include_bytes!(
-            "../../../../../../python/reference/families/kimi_k3/k31.py")), "Kimi diagnostic DSA adapter differs");
+    let pins = &manifest["source_pin"];
+    let base = if cfg.dsa.is_some() { &pins["base_decoder"] } else { pins };
+    ensure!(base["revision"] == REVISION, "Kimi diagnostic base decoder revision differs");
+    for (key, expected) in SOURCE {
+        ensure!(base[key] == expected, "Kimi diagnostic base decoder source differs: {key}");
     }
+    for key in ["fla_source_sha256", "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+        ensure!(sha(&pins[key]), "Kimi diagnostic runtime source digest missing: {key}");
+    }
+    ensure!(sha(&manifest["set_sha256"]) && sha(&manifest["checkpoint_config_sha256"])
+        && manifest["checkpoint_config_sha256"] == manifest["snapshot_identity"]["config_sha256"]
+        && sha(&manifest["snapshot_identity"]["tokenizer_sha256"]),
+        "Kimi diagnostic config/tokenizer/set binding differs");
+    if cfg.dsa.is_some() {
+        for (key, bytes) in [
+            ("dsa_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/k31.py").as_slice()),
+            ("indexer_ops_sha256", include_bytes!("../../../../../../python/reference/families/mistral_large4/ops.py").as_slice()),
+            ("shape_invariant_sha256", include_bytes!("../../../../../../python/reference/shape_invariant.py").as_slice()),
+        ] {
+            ensure!(pins[key] == digest(bytes), "Kimi diagnostic DSA source differs: {key}");
+        }
+    }
+    let config_bytes = std::fs::read(root.join("checkpoint-config.json"))?;
+    ensure!(manifest["checkpoint_config_sha256"] == digest(&config_bytes)
+        && serde_json::from_slice::<Value>(&config_bytes)? == manifest["checkpoint_config"],
+        "Kimi diagnostic raw checkpoint config differs");
     let proof = &manifest["prefix_qualification"];
     ensure!(proof["schema"] == "cuteafd.fidelity.prefix/1" && proof["passed"] == true
         && proof["finite"] == true && proof["different_rows"] == serde_json::json!([])
         && proof["argmax_disagreements"] == 0 && proof["rows"] == 512
+        && proof["score_from"] == 64 && proof["lengths"] == serde_json::json!([576, 640])
+        && proof["fixed_rows"] == 128 && proof["family"] == if cfg.dsa.is_some() { "kimi_k31" } else { "kimi_k3" }
         && proof["set_sha256"] == manifest["set_sha256"]
         && proof["snapshot_identity"] == manifest["snapshot_identity"],
         "Kimi diagnostic reference prefix qualification differs");
@@ -910,6 +934,87 @@ mod tests {
         Ok(())
     }
 
+    fn skipped_fixture(root: &Path, k31: bool) -> Result<(KimiK3Config, Value)> {
+        let mut config = cuteafd_loader::plan::testing::kimi_k3_config();
+        if k31 {
+            config["model_type"] = json!("kimi_k31");
+            config["architectures"] = json!(["KimiK31ForConditionalGeneration"]);
+            config["text_config"]["dsa_config"] = json!({
+                "dsa_layers":config["text_config"]["linear_attn_config"]["full_attn_layers"],
+                "index_num_heads":32,"index_head_dim":128,"index_topk":2048,
+                "index_rope_dim":0,"index_k_norm_type":"layernorm","index_topk_freq":1,
+                "index_skip_topk_offset":1});
+        }
+        let cfg = KimiK3Config::from_hf(&config)?;
+        let config_bytes = serde_json::to_vec(&config)?;
+        std::fs::write(root.join("checkpoint-config.json"), &config_bytes)?;
+        let revision = if k31 { "6d0a0202956796543364d666ab19c6ad1a494ee1" } else { REVISION };
+        let mut base = json!({"revision":REVISION});
+        for (key, value) in SOURCE { base[key] = json!(value); }
+        let mut pins = if k31 { json!({"revision":revision,"base_decoder":base}) } else { base };
+        for (key, bytes) in [
+            ("reference_runner_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/golden.py").as_slice()),
+            ("reference_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/model.py").as_slice()),
+            ("dsa_adapter_sha256", include_bytes!("../../../../../../python/reference/families/kimi_k3/k31.py").as_slice()),
+            ("indexer_ops_sha256", include_bytes!("../../../../../../python/reference/families/mistral_large4/ops.py").as_slice()),
+            ("shape_invariant_sha256", include_bytes!("../../../../../../python/reference/shape_invariant.py").as_slice()),
+        ] { pins[key] = json!(digest(bytes)); }
+        for key in ["fla_source_sha256", "transformers_source_sha256", "compressed_tensors_source_sha256"] {
+            pins[key] = json!("a".repeat(64));
+        }
+        let identity = json!({"snapshot_revision":revision,"config_sha256":digest(&config_bytes),
+            "tokenizer_sha256":"b".repeat(64)});
+        let reference = json!({"name":"skipped diagnostic","models":["fixture"],"vocab":cfg.vocab_size,
+            "expect":{"kl_max":0.03,"top1_min":0.95},"schema":"cuteafd.fidelity.reference/2",
+            "checkpoint":"fixture","set_sha256":"c".repeat(64),"quick_windows":["w"],
+            "windows":[{"id":"w","block":"a","bucket":"0-2K","tokens":[1,2],
+                "roles":["ctx","gen"],"score_from":1,"top_k":1,"positions":[{
+                    "pos":1,"next":2,"next_lp":-1.0,"top":[{"id":2,"lp":-1.0}],"tail_lp":-0.5}]}]});
+        let bytes = serde_json::to_vec(&reference)?;
+        std::fs::write(root.join("reference.json"), &bytes)?;
+        let manifest = json!({"schema":"cuteafd.kimi.skipped-routed/1","diagnostic_only":true,
+            "treatment":"router+shared-experts; routed contribution zero","checkpoint_config":config,
+            "checkpoint_config_sha256":digest(&config_bytes),"vocab":cfg.vocab_size,"revision":revision,
+            "source_pin":pins,"snapshot_identity":identity,"set_sha256":"c".repeat(64),
+            "checkpoint":"fixture","reference_sha256":digest(&bytes),"prefix_qualification":{
+                "schema":"cuteafd.fidelity.prefix/1","passed":true,"finite":true,"different_rows":[],
+                "argmax_disagreements":0,"rows":512,"score_from":64,"lengths":[576,640],"fixed_rows":128,
+                "family":if k31 { "kimi_k31" } else { "kimi_k3" },"set_sha256":"c".repeat(64),
+                "snapshot_identity":identity}});
+        Ok((cfg, manifest))
+    }
+
+    #[test]
+    fn skipped_reference_binds_treatment_config_sources_proof_and_logits() -> Result<()> {
+        for k31 in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
+            assert_eq!(skipped_reference(tmp.path(), &manifest, &cfg)?.windows.len(), 1);
+            let mut paths = vec!["/schema", "/diagnostic_only", "/treatment", "/vocab", "/revision",
+                "/checkpoint_config/text_config/hidden_size", "/checkpoint_config_sha256",
+                "/source_pin/reference_runner_sha256", "/source_pin/reference_adapter_sha256",
+                "/source_pin/fla_source_sha256", "/snapshot_identity/config_sha256",
+                "/snapshot_identity/tokenizer_sha256", "/prefix_qualification/fixed_rows",
+                "/prefix_qualification/lengths", "/prefix_qualification/score_from",
+                "/prefix_qualification/family", "/prefix_qualification/passed",
+                "/prefix_qualification/snapshot_identity", "/set_sha256", "/reference_sha256"];
+            if k31 { paths.extend(["/source_pin/dsa_adapter_sha256", "/source_pin/indexer_ops_sha256",
+                "/source_pin/shape_invariant_sha256", "/source_pin/base_decoder/modeling_kimi_linear_sha256"]); }
+            else { paths.push("/source_pin/modeling_kimi_linear_sha256"); }
+            for path in paths {
+                let mut changed = manifest.clone();
+                *changed.pointer_mut(path).with_context(|| format!("fixture path missing: {path}"))? = Value::Null;
+                assert!(skipped_reference(tmp.path(), &changed, &cfg).is_err(), "k31={k31} {path}");
+            }
+            std::fs::write(tmp.path().join("checkpoint-config.json"), b"{}")?;
+            assert!(skipped_reference(tmp.path(), &manifest, &cfg).is_err());
+            let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
+            std::fs::write(tmp.path().join("reference.json"), b"{}")?;
+            assert!(skipped_reference(tmp.path(), &manifest, &cfg).is_err());
+        }
+        Ok(())
+    }
+
     #[test]
     fn skipped_routed_flag_is_golden_only_and_conflicts_with_peers() -> Result<()> {
         use clap::Parser;
@@ -921,7 +1026,10 @@ mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         assert!(args.hosted(&cfg)?.is_none());
         assert!(crate::cli::Cli::try_parse_from(base.into_iter().chain(["--peers", "127.0.0.1:1234"])).is_err());
-        assert!(crate::cli::Cli::try_parse_from(["cuteafd", "kimi-serve", "--skip-routed-experts"]).is_err());
+        let serve = ["cuteafd", "serve-kimi", "--snapshot", "/checkpoint", "--native-lib", "/native",
+            "--peers", "127.0.0.1:1234"];
+        assert!(crate::cli::Cli::try_parse_from(serve).is_ok());
+        assert!(crate::cli::Cli::try_parse_from(serve.into_iter().chain(["--skip-routed-experts"])).is_err());
         assert_eq!(args.provenance()["diagnostic_only"], true);
         Ok(())
     }
