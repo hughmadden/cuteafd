@@ -734,13 +734,21 @@ fn core_header_validation_rejects_wrong_bits_keep_list_and_duplicate_bf16() {
 }
 
 #[test]
-fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
+fn header_native_k4_k6_k8_core_is_admitted_by_default() -> Result<()> {
     let dir=tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(dir.path(),false);
-    let checkpoint=Checkpoint::open(dir.path())?;
+    for bits in [4, 6, 8] {
+    let mut checkpoint=Checkpoint::open(dir.path())?;
+    for tensor in &mut checkpoint.tensors {
+        if tensor.meta.name.ends_with(".trellis") && !tensor.meta.name.contains(".experts.") {
+            tensor.meta.shape[2] = 16 * bits;
+            tensor.meta.byte_length = tensor.meta.byte_length / 6 * bits as u64;
+        }
+    }
     let mut model=Model::open(&checkpoint)?;
     model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
+    assert!(model.core.projections.values().all(|p| p.bits == bits));
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
             .cloned().collect::<Vec<_>>();
@@ -749,6 +757,7 @@ fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
         let role=KIMI_K3.classify(&model.spec,&format!("{stem}.trellis")).unwrap();
         model.accepts(&role,stem,&mut operand).map_err(anyhow::Error::msg)?;
         assert_eq!(operand.logical,[projection.stored_outputs,projection.shape[1]]);
+    }
     }
     Ok(())
 }

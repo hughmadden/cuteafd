@@ -246,7 +246,7 @@ pub(crate) struct NativePrograms<'a> {
 impl NativePrograms<'_> {
     pub(crate) fn graph_core(&self) -> cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat {
         use cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat;
-        if self.core.is_some() { KimiCoreFormat::K6 } else { KimiCoreFormat::Bf16 }
+        self.core.as_ref().map_or(KimiCoreFormat::Bf16, |core| KimiCoreFormat::from_inventory(&core.native_inventory))
     }
 }
 

@@ -81,7 +81,7 @@ impl CoreInventory {
             .is_some_and(|(layer, leaf)| layer.parse::<usize>().is_ok_and(|layer| layer < cfg.layers)
                 && !leaf.contains(".experts."));
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6, padded_outputs: false }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { family: "GLM Flash", widths: &[6], split, padded_outputs: false }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         // A selected view can replace individual attention operands. Legacy
         // checkpoints retain their existing fused conversion policy.

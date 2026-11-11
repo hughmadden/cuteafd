@@ -180,7 +180,7 @@ impl CoreInventory {
         // kv_a may store N128 padding (RoPE latent N576 -> N640).
         let kv_a: std::collections::BTreeSet<String> = (0..cfg.layers).filter_map(|l| cfg.stem(l, Op::KvA)).collect();
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6,
+            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: &[6], split,
                 padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         if checkpoint.view.is_some() {

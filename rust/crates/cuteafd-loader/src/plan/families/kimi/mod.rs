@@ -359,9 +359,9 @@ impl FamilyModel for Model {
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if let Some(projection) = self.core.projections.get(stem) {
-            return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+            return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits } if bits == projection.bits)
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
-                || format!("{stem}: expected header-native K6 {:?}", projection.shape));
+                || format!("{stem}: expected header-native K{} {:?}", projection.bits, projection.shape));
         }
         if role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2) {
             let expected = match stem.rsplit_once('.').map(|(_, name)| name) {

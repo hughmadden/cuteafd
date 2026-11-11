@@ -20,12 +20,14 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum KimiCoreFormat { Bf16, K6 }
+pub enum KimiCoreFormat { Bf16, K6, Trellis }
 
 impl KimiCoreFormat {
     /// Header-native trellis inventory, not a repository name or HQA mode.
     pub fn from_inventory(core: &crate::families::kimi_k3::core::CoreInventory) -> Self {
-        if core.projections.is_empty() { Self::Bf16 } else { Self::K6 }
+        if core.projections.is_empty() { Self::Bf16 }
+        else if core.projections.values().all(|p| p.bits == 6) { Self::K6 }
+        else { Self::Trellis }
     }
 }
 
@@ -96,7 +98,8 @@ pub fn kimi_layout(core: KimiCoreFormat, ranks: usize) -> &'static KimiPrewarmLa
 fn kimi_bootstrap_layout(core: KimiCoreFormat) -> &'static KimiPrewarmLayout {
     static BF16: OnceLock<KimiPrewarmLayout> = OnceLock::new();
     static K6: OnceLock<KimiPrewarmLayout> = OnceLock::new();
-    let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6 };
+    static TRELLIS: OnceLock<KimiPrewarmLayout> = OnceLock::new();
+    let bootstrap = match core { KimiCoreFormat::Bf16 => &BF16, KimiCoreFormat::K6 => &K6, KimiCoreFormat::Trellis => &TRELLIS };
     bootstrap.get_or_init(|| KimiPrewarmLayout {
         core,
         ranks: 0,

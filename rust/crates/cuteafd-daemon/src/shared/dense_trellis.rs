@@ -89,7 +89,7 @@ impl CoreWeightLayout {
         let metadata = suffixes.iter().map(|&s| Ok((s, metadata(&format!("{stem}.{s}"))?.clone())))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let module = exl3_module(stem, &suffixes, |s| metadata.get(s))?;
-        ensure!(module.codebook == self.codebook && module.bits == 6, "{stem}: K6 codebook/bits differ from admission");
+        ensure!(module.codebook == self.codebook && module.bits == self.bits, "{stem}: trellis codebook/bits differ from admission");
         // The marker is four bytes: checked on the host while planning.
         let marker = crate::shared::checkpoint_read::read_tensor(checkpoint, &format!("{stem}.{}", self.codebook.marker()))?;
         ensure!(marker.bytes.as_slice() == self.codebook.multiplier().to_le_bytes(),
@@ -577,7 +577,7 @@ mod upload_tests {
         fixture.configure_memory(&library,1,1<<30)?;
         fixture.immediate_copies(&library)?;
         let device = Device { library: &library,id:1 };
-        for bits in [4,6] {
+        for bits in [4,6,8] {
             let layout = CoreWeightLayout { stem: format!("model.k{bits}"), side: TrellisSide::Output,
                 rank:0,ranks:1,shape:[256,128],bytes:256*128*bits/8+2*(256+128),bits,codebook:Exl3Codebook::Mcg };
             let requests = layout.shared_layout().arena_tensors(&layout.stem)?;

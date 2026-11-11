@@ -990,7 +990,9 @@ fn check_checkpoint_target_head(checkpoint: &cuteafd_loader::plan::Checkpoint, h
     let expected = BTreeMap::from([(weight.clone(), vec![vocab, hidden])]);
     let native = read_projections(&checkpoint, &expected, |name| name.starts_with(&prefix),
         |stem| (stem == head_stem).then_some(CoreContract {
-            split: CoreSplit::Whole, bits: 6, padded_outputs: false,
+            family: if head_stem.starts_with("language_model.") { "Kimi" } else { "DFlash target" },
+            widths: if head_stem.starts_with("language_model.") { &[4, 6, 8] } else { &[6] },
+            split: CoreSplit::Whole, padded_outputs: false,
         }))?;
     if native.contains_key(head_stem) {
         ensure!(!explicit_fp8_head, "{head_stem}: --fp8-head cannot replace the shared native K6 target head");
@@ -3303,7 +3305,7 @@ mod checkpoint_header_tests {
         assert!(check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).is_err());
         let fixture = native_head_snapshot(4);
         let error = check_snapshot_target_head(&fixture.0, "lm_head", 128, 256, false).unwrap_err().to_string();
-        assert!(error.contains("requires K6") && error.contains("found K4"), "{error}");
+        assert!(error.contains("unsupported dense core width K4") && error.contains("shipping widths [6]"), "{error}");
     }
 
     #[test]
