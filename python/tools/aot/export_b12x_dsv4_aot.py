@@ -1015,6 +1015,13 @@ def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                                     {**params, "head_begin": begin, "head_count": 48},
                                     lambda r=rows, g=mla, b=begin: kimi_dsa.compile_kimi_sparse_mla_partial_aot(
                                         g, max_rows=r, head_begin=b)))
+    for cache in ("bf16", "fp8"):
+        record_bytes = 1152 if cache == "bf16" else 656
+        suffix = "" if cache == "bf16" else "_fp8"
+        out.append((f"paged_staging_gather{suffix}", "paged_staging_gather",
+                    {"row_bytes": record_bytes, "page_rows": PAGE_ROWS},
+                    lambda rb=record_bytes: context_split.compile_paged_staging_gather_aot(
+                        row_bytes=rb, page_rows=PAGE_ROWS)))
     out.extend(kimi_w8_programs())
     out.extend(kimi_latent_programs())
     out.extend(kimi_route_programs())

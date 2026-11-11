@@ -136,7 +136,8 @@ pub fn program_names_for_config(format: MlaCacheFormat, cfg: &super::config::Kim
 fn variant_program_names(format: MlaCacheFormat, dsa: bool) -> Vec<String> {
     if !dsa { return program_names(format); }
     let tag = format.program_suffix();
-    let mut names = vec!["kimik31_lse_combine2".into(), "kimik31_dsa_candidate_merge".into()];
+    let mut names = vec!["kimik31_lse_combine2".into(), "kimik31_dsa_candidate_merge".into(),
+        format!("kimik31_paged_staging_gather{tag}")];
     for begin in [0, HEADS] {
         names.push(format!("kimik31_sparse_mla_partial{tag}_h{begin}_m64"));
     }
@@ -174,6 +175,12 @@ impl ContextLayout {
             if dsa && name.ends_with("dsa_candidate_merge") {
                 ensure!(entries[0]["geometry"]["topk"] == 2048
                     && entries[0]["geometry"]["unit_rows"] == ROWS, "Kimi DSA context merge geometry differs");
+            }
+            if dsa && name.contains("paged_staging_gather") {
+                let geometry = &entries[0]["geometry"];
+                ensure!(geometry["row_bytes"] == format.record_bytes() && geometry["page_rows"] == ROWS
+                    && geometry["page_bytes"] == ROWS * format.record_bytes(),
+                    "Kimi DSA context gather geometry differs");
             }
             if name.contains("_partial") {
                 let bytes = entries[0]["scratch_bytes_at_capacity"]["scratch"].as_u64()
@@ -421,6 +428,8 @@ mod tests {
             }).collect::<Vec<_>>();
             let mut manifest = serde_json::json!({"programs":entries});
             manifest["programs"][0]["geometry"] = serde_json::json!({"heads":HEADS,"has_sink":false});
+            manifest["programs"][2]["geometry"] = serde_json::json!({"row_bytes":format.record_bytes(),
+                "page_rows":ROWS,"page_bytes":ROWS * format.record_bytes()});
             let layout = ContextLayout::from_variant(&manifest, format, 8192, 2752, 3, true)?;
             assert!(layout.dsa() && layout.tiles().is_none());
             assert_eq!(layout.decode().plain(), (1..=ROWS).collect::<Vec<_>>());
@@ -435,7 +444,7 @@ mod tests {
             assert!(ContextLayout::from_manifest(&manifest, format, 8192, 2752, 3).is_err());
             for field in ["norm_eps", "lse_base", "topk", "head_begin", "page_size", "kv_cache"] {
                 let mut broken = manifest.clone();
-                broken["programs"][2]["geometry"][field] = serde_json::Value::Null;
+                broken["programs"][3]["geometry"][field] = serde_json::Value::Null;
                 assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true).is_err(), "{field}");
             }
             for name in variant_program_names(format, true) {

@@ -655,6 +655,10 @@ def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(e
     assert len(catalog) == len(programs)
     assert not any("draft" in stem or "dense_mla" in stem for stem in catalog)
     assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
+    for suffix, row_bytes in [("", 1152), ("_fp8", 656)]:
+        module, function, args, kwargs = catalog[f"paged_staging_gather{suffix}"][2]()
+        assert (module, function, args) == ("context_split", "compile_paged_staging_gather_aot", ())
+        assert kwargs == {"row_bytes": row_bytes, "page_rows": 64}
     for rows, mode in [(decode_rows, "decode"), (prefill_rows, "prefill")]:
         module, function, args, kwargs = catalog[f"index_producer_m{rows}"][2]()
         assert (module, function, kwargs) == ("kimi_dsa", "compile_kimi_index_producer_aot", {"max_rows": rows})

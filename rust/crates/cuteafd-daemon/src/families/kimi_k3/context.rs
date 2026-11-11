@@ -32,9 +32,15 @@ impl<'a> Programs<'a> {
             let combine = programs.spec("kimik31_lse_combine2")?;
             ensure!(combine.scalar_kinds == b"i" && combine.geometry["heads"] == 48
                 && combine.geometry["has_sink"] == false, "Kimi DSA context combine ABI differs");
+            let name = format!("kimik31_paged_staging_gather{}", format.program_suffix());
+            let gather = programs.spec(&name)?;
+            ensure!(gather.scalar_kinds == b"iii" && gather.geometry["row_bytes"] == format.record_bytes()
+                && gather.geometry["page_rows"] == 64 && gather.geometry["page_bytes"] == 64 * format.record_bytes(),
+                "Kimi DSA context gather ABI differs");
             return Ok(Self { partial: None,
                 combine: programs.bound("kimik31_lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"] )?,
-                gather: None, sms: programs.library().sm_count()? });
+                gather: Some(programs.bound(&name, &["pool", "table", "staging"] )?),
+                sms: programs.library().sm_count()? });
         }
         let tag = format.program_suffix();
         let combine = programs.spec("kimik3_lse_combine2")?;

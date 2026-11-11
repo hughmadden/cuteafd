@@ -174,6 +174,9 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
             add(format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{capacity}"), SequenceLocal)?;
         }}
     }
+    for cache in ["", "_fp8"] {
+        add(format!("kimik31_paged_staging_gather{cache}"), SequenceLocal)?;
+    }
     add("kimik3_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
@@ -1347,6 +1350,9 @@ impl<'a> LocalLane<'a> {
             }
             fn produce(&mut self) -> Result<()> { self.local.mla_produce(self.layer, self.batch) }
             fn attention(&mut self) -> Result<()> {
+                if self.local.programs.dsa.is_some() {
+                    return self.local.dsa_selected(self.layer, self.batch, true);
+                }
                 let stream = self.local.stream();
                 stream.device.run(|| self.local.programs.mla[0].extend.attention(self.layer, self.batch, stream.raw))
             }
@@ -1413,7 +1419,11 @@ impl<'a> LocalLane<'a> {
     /// Ordinary placement shares physical page IDs between index and MLA.
     /// Context must instead merge global candidates into its independent local table.
     fn dsa_attention(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
-        ensure!(!self.mla.parity(), "Kimi Context DSA requires global candidates before parity mapping");
+        self.dsa_selected(layer, batch, false)
+    }
+
+    fn dsa_selected(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch, staging: bool) -> Result<()> {
+        ensure!(staging == self.mla.parity(), "Kimi Context DSA requires logical slots in gathered staging");
         let programs = self.programs.dsa.as_ref().context("Kimi DSA programs not resolved")?;
         let unit = usize::from(batch.rows > 64);
         let cache = self.mla.index(layer)?;
@@ -1430,16 +1440,20 @@ impl<'a> LocalLane<'a> {
                 cos_sin: weights.norm, cache, query_fp8: query, head_weights,
                 scratch: self.lane.buffer("DSA producer scratch")?,
             }, stream.raw)?;
-            programs.selector[unit].launch(cuteafd_ffi::KimiIndexSelection {
+            // Gathered MLA is ordered by logical token, not index physical slot.
+            // The scored selector already returns logical IDs and valid -1 tails.
+            let selector = if staging { &programs.scored[unit] } else { &programs.selector[unit] };
+            selector.launch(cuteafd_ffi::KimiIndexSelection {
                 rows: batch.rows, cache_pages: self.mla.pages(),
                 table_width: self.lane.layout.max_context.div_ceil(64),
                 table_stride: self.lane.layout.max_context.div_ceil(64),
                 query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
                 lengths: self.lane.buffer("DSA lengths")?, indices,
-                scores: indices, scratch: self.lane.buffer("DSA selector scratch")?,
+                scores: if staging { self.lane.buffer("DSA scores")? } else { indices },
+                scratch: self.lane.buffer("DSA selector scratch")?,
             }, stream.raw)?;
             self.mla_program(layer, batch.rows, false)?.selected(layer, cuteafd_ffi::KimiSparseBatch {
-                rows: batch.rows, cache_tokens: self.mla.pages() * 64,
+                rows: batch.rows, cache_tokens: batch.cache_pages * 64,
                 query: batch.query, cache: batch.cache, indices,
                 lengths: self.lane.buffer("DSA selected lengths")?,
                 query_offsets: self.lane.buffer("DSA query offsets")?, output: batch.attention,

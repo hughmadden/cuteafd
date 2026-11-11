@@ -83,7 +83,7 @@ pub const DSA_METADATA: [&str; 6] = ["DSA positions", "DSA slots", "DSA page tab
     "DSA lengths", "DSA query offsets", "DSA selected lengths"];
 /// Unit-local index temporaries are not lane row planes. Keep their backing
 /// distinct from projected-core scratch until all index and attention readers end.
-pub const DSA_SCRATCH: [&str; 5] = ["DSA query", "DSA head weights", "DSA indices",
+pub const DSA_SCRATCH: [&str; 6] = ["DSA query", "DSA head weights", "DSA indices", "DSA scores",
     "DSA producer scratch", "DSA selector scratch"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,7 +227,8 @@ impl NativeLaneLayout {
         let rows = self.unit;
         let requests = rows.min(64);
         for (name, bytes) in [("DSA query", rows * 4096), ("DSA head weights", rows * 32 * 4),
-            ("DSA indices", rows * 2048 * 4), ("DSA producer scratch", scratch.producer),
+            ("DSA indices", rows * 2048 * 4), ("DSA scores", rows * 2048 * 4),
+            ("DSA producer scratch", scratch.producer),
             ("DSA selector scratch", scratch.selector)] {
             ensure!(self.operands.insert(name, bytes).is_none(), "duplicate Kimi DSA scratch owner {name}");
         }
