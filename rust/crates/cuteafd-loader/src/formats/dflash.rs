@@ -903,7 +903,7 @@ struct Raw {
 
 #[derive(Deserialize)]
 struct Draft {
-    core_view: String,
+    attention_mode: String,
     block_size: usize,
     conv_kernel_size: usize,
     conv_group_size: usize,
@@ -927,7 +927,7 @@ impl MlaDflashConfig {
         validate_topk_vocab(raw.vocab_size as u64)?;
         let d = raw.dflash_config;
         if !raw.architectures.iter().any(|a| a == "DFlash2DraftModel")
-            || d.core_view != "mla" || raw.is_causal || raw.mla_use_output_gate
+            || d.attention_mode != "mla" || raw.is_causal || raw.mla_use_output_gate
             || raw.attention_bias || raw.hidden_act != "silu" || raw.fc_norm {
             return Err(unsupported("MLA DFlash2 requires noncausal, ungated, bias-free SiLU and fc_norm=false"));
         }
@@ -1549,7 +1549,7 @@ mod tests {
             "rope_parameters":{"rope_type":"yarn", "rope_theta":50000.0, "factor":32.0,
                 "original_max_position_embeddings":32768, "beta_fast":32, "beta_slow":1,
                 "mscale":1.0, "mscale_all_dim":1.0},
-            "dflash_config":{"core_view":"mla", "block_size":8,
+            "dflash_config":{"attention_mode":"mla", "block_size":8,
                 "conv_kernel_size":2, "conv_group_size":16, "selector_rank":256,
                 "selector_top_k":16, "target_layer_ids":[19,37,66,78,90], "mask_token_id":163592}})
     }
@@ -2432,7 +2432,7 @@ mod tests {
         for (field, value) in [("target_layer_ids", json!([19,19])),
             ("target_layer_ids", json!([37,19])), ("target_layer_ids", json!([93])),
             ("mask_token_id", json!(163840)), ("conv_group_size", json!(0)),
-            ("block_size", json!(64)), ("core_view", json!("gqa"))] {
+            ("block_size", json!(64)), ("attention_mode", json!("gqa"))] {
             let mut raw = config(); raw["dflash_config"][field] = value;
             assert!(MlaDflashConfig::from_json(&raw).is_err(), "{field}");
         }
