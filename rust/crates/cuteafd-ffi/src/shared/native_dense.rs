@@ -420,6 +420,107 @@ impl<'a> DenseLinear<'a> {
     }
 }
 
+/// Checked native MXFP8 W8A8 execution. Quantize once per distinct BF16 input;
+/// sibling projections may reuse its records without another activation read.
+/// The caller initializes `inputs[0]` to the stable activation address before
+/// enqueue/capture, orders producers and consumers on `stream`, and retains all
+/// buffers and the stream through completion and graph replay.
+pub struct Mxfp8A8<'a> {
+    linear: DenseLinear<'a>,
+    quantizer: super::native_dense_glue::Companion<'a>,
+    library: &'a crate::NativeLibrary,
+    device: i32,
+}
+
+impl<'a> Mxfp8A8<'a> {
+    pub fn bind(programs: &'a Programs<'a>, linear: &str, quantizer: &str) -> Result<Self> {
+        use super::native_dense_glue::{op_of, Companion, Op};
+        let geometry = validate_spec(programs.spec(linear).map_err(|e| invalid(e.to_string()))?)?;
+        if geometry.encoding != Encoding::Mxfp8A8 {
+            return Err(invalid("checked MXFP8 execution requires native BF16 A8 geometry"));
+        }
+        let expected = Op::Mx8QuantBf16 { features: u32::try_from(geometry.input_features)
+            .map_err(|_| invalid("MXFP8 input width"))? };
+        let spec = programs.spec(quantizer).map_err(|e| invalid(e.to_string()))?;
+        let entry = serde_json::json!({"op":"dense_mxfp8_quant", "geometry":spec.geometry});
+        if op_of(&entry).map_err(|e| invalid(e.to_string()))? != Some(expected)
+            || spec.scalar_kinds != b"iii" || spec.capacity_rows != 4096 || !spec.scratch.is_empty() {
+            return Err(invalid("MXFP8 quantizer differs from native linear geometry"));
+        }
+        let library = programs.library();
+        let device = library.cuda_get_device().map_err(|e| invalid(e.to_string()))?;
+        let linear = DenseLinear::bind(programs, linear)?;
+        let quantizer = Companion::bind(programs, quantizer, expected).map_err(|e| invalid(e.to_string()))?;
+        Ok(Self { linear, quantizer, library, device })
+    }
+
+    pub fn geometry(&self) -> DenseGeometry { self.linear.geometry() }
+
+    /// `activation` is the packed BF16 destination named by the stable table.
+    /// No table transfer, workspace allocation or synchronization occurs here.
+    pub fn quantize(&self, rows: u32, inputs: crate::CuteafdDeviceBuffer,
+        activation: crate::CuteafdDeviceBuffer, records: crate::CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<()> {
+        validate_mxfp8_quantize(self.geometry(), rows, [inputs, activation, records], self.device)?;
+        self.current_device()?;
+        // SAFETY: the BF16 table/activation/record extents, alignment, device and
+        // writable nonaliasing were checked. The owner initializes the table and
+        // retains all storage and the ordered stream through completion/replay.
+        unsafe { self.quantizer.launch(&[inputs.ptr, records.ptr], rows, 0, stream) }
+            .map_err(|e| invalid(e.to_string()))
+    }
+
+    /// Consume prepared records; this does not requantize the shared input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn project(&self, rows: u32, inputs: crate::CuteafdDeviceBuffer,
+        payload: crate::CuteafdDeviceBuffer, scales: crate::CuteafdDeviceBuffer,
+        records: crate::CuteafdDeviceBuffer, output: crate::CuteafdDeviceBuffer,
+        stream: *mut c_void) -> Result<()> {
+        validate_mxfp8_project(self.geometry(), rows, [inputs, payload, scales, records, output], self.device)?;
+        self.current_device()?;
+        // SAFETY: native operand extents, alignment, device and writable
+        // nonaliasing checked; the caller retains storage and the ordered stream.
+        unsafe { self.linear.launch(inputs.ptr, payload.ptr, scales.ptr, records.ptr,
+            records.bytes as u64, output.ptr, rows, 0, stream) }
+    }
+
+    fn current_device(&self) -> Result<()> {
+        if self.library.cuda_get_device().map_err(|e| invalid(e.to_string()))? != self.device {
+            return Err(invalid("MXFP8 launch is not on its bound device"));
+        }
+        Ok(())
+    }
+}
+
+fn mxfp8_extent(values: &[u64]) -> Result<usize> {
+    values.iter().try_fold(1u64, |a, b| a.checked_mul(*b))
+        .and_then(|bytes| usize::try_from(bytes).ok()).ok_or_else(|| invalid("MXFP8 operand extent overflow"))
+}
+
+fn validate_mxfp8_quantize(g: DenseGeometry, rows: u32,
+    buffers: [crate::CuteafdDeviceBuffer; 3], device: i32) -> Result<()> {
+    if g.encoding != Encoding::Mxfp8A8 || buffers[0].device_id != device {
+        return Err(invalid("MXFP8 encoding or bound device"));
+    }
+    let records = usize::try_from(g.scratch_bytes(rows)?).map_err(|_| invalid("MXFP8 records extent"))?;
+    let activation = mxfp8_extent(&[u64::from(rows), g.input_features, 2])?;
+    super::projected_buffers::validate_buffers(&[(buffers[0], 8), (buffers[1], activation),
+        (buffers[2], records)], &[8, 8, 16], &[2]).map_err(invalid)
+}
+
+fn validate_mxfp8_project(g: DenseGeometry, rows: u32,
+    buffers: [crate::CuteafdDeviceBuffer; 5], device: i32) -> Result<()> {
+    if g.encoding != Encoding::Mxfp8A8 || buffers[0].device_id != device {
+        return Err(invalid("MXFP8 encoding or bound device"));
+    }
+    let records = usize::try_from(g.scratch_bytes(rows)?).map_err(|_| invalid("MXFP8 records extent"))?;
+    let payload = mxfp8_extent(&[g.input_features, g.output_features])?;
+    let output = mxfp8_extent(&[u64::from(rows), g.output_features, 4])?;
+    super::projected_buffers::validate_buffers(&[(buffers[0], 8), (buffers[1], payload),
+        (buffers[2], payload / 32), (buffers[3], records), (buffers[4], output)],
+        &[8, 8, 1, 16, 8], &[4]).map_err(invalid)
+}
+
 fn validate_linear_launch(g: DenseGeometry, pointers: [*mut c_void; 5],
     partial_bytes: u64, rows: u32, rotation: u32) -> Result<()> {
     let required = g.launch_scratch_bytes(rows)?;
@@ -661,6 +762,125 @@ mod tests {
             bad["pointers"][pointer][field] = json!(value);
             assert!(validate_entry(&spec, &bad).is_err(), "{pointer}/{field}");
         }
+    }
+
+    #[test]
+    fn checked_mxfp8_operands_reject_extent_alignment_device_flags_and_aliasing() {
+        use crate::CuteafdDeviceBuffer as Buffer;
+        let g = DenseGeometry { encoding: Encoding::Mxfp8A8, input_features: 128,
+            output_features: 32, side: 1, max_rows: 4096 };
+        let buffer = |address, bytes| Buffer { ptr: address as *mut c_void, bytes, device_id: 1, flags: 0 };
+        for rows in [1, 16, 17, 2752, 4096] {
+            let records = g.scratch_bytes(rows).unwrap() as usize;
+            let quant = [buffer(0x1000usize, 8), buffer(0x100000, rows as usize * 128 * 2),
+                buffer(0x10000000, records)];
+            let project = [quant[0], buffer(0x20000000, 4096), buffer(0x30000000, 128),
+                quant[2], buffer(0x40000000, rows as usize * 32 * 4)];
+            validate_mxfp8_quantize(g, rows, quant, 1).unwrap();
+            validate_mxfp8_project(g, rows, project, 1).unwrap();
+            for index in 0..quant.len() {
+                for mutation in 0..6 {
+                    let mut bad = quant;
+                    match mutation {
+                        0 => bad[index].bytes -= 1,
+                        1 => bad[index].ptr = std::ptr::null_mut(),
+                        2 => bad[index].device_id = 0,
+                        3 => bad[index].flags = 1,
+                        4 => bad[index].ptr = ((bad[index].ptr as usize) + 1) as *mut c_void,
+                        _ => bad[index].ptr = (usize::MAX - 7) as *mut c_void,
+                    }
+                    assert!(validate_mxfp8_quantize(g, rows, bad, 1).is_err(), "quant {index}/{mutation}");
+                }
+            }
+            for index in 0..project.len() {
+                for mutation in 0..6 {
+                    if index == 2 && mutation == 4 { continue; } // Byte scales have no stronger alignment.
+                    let mut bad = project;
+                    match mutation {
+                        0 => bad[index].bytes -= 1,
+                        1 => bad[index].ptr = std::ptr::null_mut(),
+                        2 => bad[index].device_id = 0,
+                        3 => bad[index].flags = 1,
+                        4 => bad[index].ptr = ((bad[index].ptr as usize) + 1) as *mut c_void,
+                        _ => bad[index].ptr = (usize::MAX - 7) as *mut c_void,
+                    }
+                    assert!(validate_mxfp8_project(g, rows, bad, 1).is_err(), "project {index}/{mutation}");
+                }
+            }
+            for source in 0..2 {
+                let mut bad = quant;
+                bad[2].ptr = bad[source].ptr;
+                assert!(validate_mxfp8_quantize(g, rows, bad, 1).is_err());
+            }
+            for source in 0..4 {
+                let mut bad = project;
+                bad[4].ptr = bad[source].ptr;
+                assert!(validate_mxfp8_project(g, rows, bad, 1).is_err());
+            }
+            for invalid in [0, 4097, u32::MAX] {
+                assert!(validate_mxfp8_quantize(g, invalid, quant, 1).is_err());
+                assert!(validate_mxfp8_project(g, invalid, project, 1).is_err());
+            }
+            assert!(validate_mxfp8_quantize(g, rows, quant, 0).is_err());
+            assert!(validate_mxfp8_project(g, rows, project, 0).is_err());
+        }
+    }
+
+    #[test]
+    fn checked_mxfp8_dispatch_separates_quantization_from_sibling_projections() -> anyhow::Result<()> {
+        use crate::native_library_lifetime_fixture::Fixture;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let scalars = json!([{"name":"rows","type":"int32"},
+            {"name":"rotation_id","type":"int32"},{"name":"cta_limit","type":"int32"}]);
+        let manifest = json!({"programs":[
+            {"name":"exlr8_dense_mxfp8_k128_n32_s1_a8","op":"dense_mxfp8",
+                "capacity_rows":4096,"scratch_bytes_at_capacity":{},"scalars":scalars,
+                "geometry":{"input_features":128,"output_features":32,"sharded_side":1,"encoding":"mxfp8",
+                    "input_dtype":"bf16","rotation_count":1,"max_rows":4096,"abi_version":2},
+                "pointers":[{"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+                    {"name":"payload","dtype":"uint8","shape":"[4096]","role":"in"},
+                    {"name":"scales","dtype":"uint8","shape":"[128]","role":"in"},
+                    {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"in"},
+                    {"name":"output","dtype":"float32","shape":"[rows,32]","role":"out"}]},
+            {"name":"exlr8_dense_quant_k128_bf16_a8","op":"dense_mxfp8_quant",
+                "capacity_rows":4096,"scratch_bytes_at_capacity":{},"scalars":scalars,
+                "geometry":{"input_features":128,"input_dtype":"bf16","rotation_count":1,"max_rows":4096,"abi_version":2},
+                "pointers":[{"name":"rotated_inputs","dtype":"int64","shape":"[1]","role":"in"},
+                    {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]}
+        ]});
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let names = manifest["programs"].as_array().unwrap();
+        let op = Mxfp8A8::bind(&programs, names[0]["name"].as_str().unwrap(), names[1]["name"].as_str().unwrap())?;
+        assert_eq!(fixture.events()?.matches('D').count(), 0);
+        let mut buffers = Vec::new();
+        for bytes in [8, 17 * 128 * 2, 2 * 4 * 528, 4096, 128, 17 * 32 * 4] {
+            buffers.push(library.alloc_device_buffer(bytes, crate::memory_ledger::Tag::workspace("fixture/mxfp8"))?);
+        }
+        library.copy_h2d(buffers[0], &(buffers[1].ptr as u64).to_le_bytes())?;
+        // The no-math fixture observes dispatch only; it never emulates MXFP8.
+        let ready = buffers[1].ptr as usize as u32;
+        fixture.register_reply(&library, 0, ready, b'P')?;
+        fixture.register_reply(&library, 1, ready, b'Q')?;
+        let stream = std::ptr::null_mut();
+        op.quantize(17, buffers[0], buffers[1], buffers[2], stream)?;
+        for _ in 0..2 { op.project(17, buffers[0], buffers[3], buffers[4], buffers[2], buffers[5], stream)?; }
+        assert_eq!(fixture.events()?.matches('Q').count(), 1);
+        assert_eq!(fixture.events()?.matches('P').count(), 2);
+        assert_eq!(fixture.events()?.matches('D').count(), 6);
+        library.cuda_set_device(1)?;
+        assert!(op.quantize(17, buffers[0], buffers[1], buffers[2], stream).is_err());
+        assert!(op.project(17, buffers[0], buffers[3], buffers[4], buffers[2], buffers[5], stream).is_err());
+        library.cuda_set_device(0)?;
+        assert_eq!(fixture.events()?.matches('Q').count(), 1);
+        assert_eq!(fixture.events()?.matches('P').count(), 2);
+        for buffer in &mut buffers { library.free_device_buffer(buffer)?; }
+        Ok(())
     }
 
     #[test]
