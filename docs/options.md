@@ -9,6 +9,23 @@ by `scripts/build/release-scope.py default-matrix`. `CUTEAFD_RELEASE_MATRIX`
 overrides that default; `--scope` selects families or cards for development builds,
 while publication requires `all` and complete image inventories.
 
+## Optional performance levers
+
+Optional levers that are off by default and trade precision or host resources
+for speed or memory at serve time. Every entry starts from the checkpoint's
+native format or the most conservative behaviour; the effect is measured on the
+stated hardware or marked unmeasured. Debug, profiling and capacity knobs are
+documented in their own sections, not here. A PR that adds an optional,
+default-off performance lever adds its row here in the same PR (AGENTS.md).
+
+| Lever | Families | Enable | Effect | Cost |
+| --- | --- | --- | --- | --- |
+| `L2_PREFETCH` | V4.1, MiMo, Qwen4 | `L2_PREFETCH=auto` or a MiB count (unset = off; GLM 5.3 and GLM Flash already default it to `auto`) | Pulls the next layer's weights into L2 while a one-lane decode step waits on its Spark exchange. V4.1 1× RTX 5090 + 4 Sparks: every C1 cell +1.7–3.9%, C4/C8 and 8K prefill unchanged (#623); GLM 5.3 weighted +4.4%, GLM Flash C1 +6–15% (2026-09-30). | None in values (outputs byte-identical); only extra L2 traffic. |
+| `QWEN_FP8_DECODE` | Qwen4 | `QWEN_FP8_DECODE=on` (unset = checkpoint BF16) | Holds the GDN/attention projections as one resident E4M3 copy; with `QWEN_FP8_HEAD=on`, 1× RTX code C1 222→247 tok/s, C4 441→489, 8K prefill 6100→6177 (2026-10-03). | Converts target projections to FP8 at load: golden KL 0.036→0.046, top-1 88.5%→86.7%; fails the KL gate, so opt-in only. |
+| `SPARK_PREFILL_REPLY_FORMAT` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Kimi K3, Step-5, Muse | `SPARK_PREFILL_REPLY_FORMAT=fp8` or `nvfp4` (unset = BF16; release builds only) | Spark expert partials return compressed instead of BF16: fewer exchange bytes per prefill wave. Unmeasured. | Reply values at FP8/NVFP4 precision instead of BF16. |
+| `SPARK_DECODE_REPLY_FORMAT` | V4.1, V4, GLM 5.3 / ML4, GLM Flash, MiMo, Qwen4, Kimi K3, Step-5, Muse | `SPARK_DECODE_REPLY_FORMAT=fp8` or `nvfp4` (unset = BF16; release builds only) | Spark expert partials return compressed instead of BF16: fewer exchange bytes per decode wave. Unmeasured. | Reply values at FP8/NVFP4 precision instead of BF16. |
+| `ENGRAM_WARM` | V4.1 | `ENGRAM_WARM=on` (unset = off) | After readiness, reads both Engram tables into page cache on a background thread so per-token table reads hit RAM on stores with slow random reads. Unmeasured. | Host page cache equal to the table bytes (about 203 GB for the official checkpoint), reclaimable; skipped when free memory is below the tables plus 16 GiB. |
+
 ## How options are set
 
 A launch reads one plain `KEY=VALUE` config file (`cuteafd.config` by default):
@@ -294,6 +311,9 @@ K4 min/max examples use automatic bundled vision; the planner admits its residen
 weights and scratch alongside the KV pool and routed experts.
 
 ## Precision
+
+Keys here that are optional and off by default are also listed under
+[Optional performance levers](#optional-performance-levers).
 
 | Key | Default | Values | Notes |
 | --- | --- | --- | --- |
