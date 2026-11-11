@@ -227,7 +227,8 @@ mod tests {
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::F16;
         let error = check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap_err();
         assert!(matches!(error, ProjectionInputError::Native(_)), "{error}");
-        assert!(error.to_string().contains(name) && error.to_string().contains("F16"), "{error}");
+        assert!(error.to_string().contains(name.strip_suffix(".weight").unwrap())
+            && error.to_string().contains("F16"), "{error}");
         let (mut checkpoint, mut cfg) = fixture();
         widen_sources(&mut checkpoint);
         cfg.moe_intermediate = 2000;

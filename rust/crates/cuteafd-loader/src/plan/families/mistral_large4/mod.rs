@@ -6,9 +6,10 @@
 //! (`layers.N.attention.wq`, `layers.N.experts.E.w1`, `output`), read from
 //! `config.json:transformers_weights` (`consolidated.safetensors.index.json`).
 //!
-//! Two storage forms pass the tensor contract: the official FP8 block-128
-//! release (the quantization source and fidelity root, inventory only) and
-//! the EXL3 K4 experts + K6 core publication the engine serves. The contract
+//! The official FP8 block-128 release is the quantization source and fidelity
+//! root; its routed experts still need a supported Spark package. Serving accepts
+//! EXL3 experts with the original mixed E4M3/BF16 core, or a stored trellis core.
+//! The original mixed core is not an MC publication. The contract
 //! is exact: every text tensor's name, shape and form comes from the
 //! checkpoint's own config, so a quant that drifts from the recipe is named.
 use std::collections::BTreeMap;

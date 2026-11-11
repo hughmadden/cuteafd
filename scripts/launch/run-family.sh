@@ -1465,7 +1465,7 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
-spark_worker_args+=" ${core_view_args[*]}"
+spark_worker_args+=" ${serve_core_view_args[*]}"
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then

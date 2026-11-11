@@ -634,7 +634,8 @@ pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&package).unwrap();
     let layout = json!({"capacities":[{"capacity":4096,"scratch_bytes":4096}]});
     fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":layout,"tp2":layout}}).to_string()).unwrap();
-    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_s16", "kda_s16t", "kda_w8",
+        "kda_w8_s16", "kda_w8_s16t", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
         .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",

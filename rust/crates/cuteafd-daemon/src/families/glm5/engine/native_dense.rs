@@ -271,8 +271,8 @@ impl<'a> GlmEngine<'a> {
         let local = retained[usize::from(key == "down")].buffer;
         let native = layer.attention_native.contains_key(key);
         let peer = self.core_received(rank, slot(index, key == "down", lane), rows, if native { 4 } else { 2 })?;
-        // Widen retained BF16 cores for rank-ordered F32 addition, then run
-        // the one complete H128/svh egress.
+        // Native projections retain F32 partials; trellis projections widen
+        // retained BF16 cores before the complete H128/svh egress.
         let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
         if native {
             // SAFETY: both rank-ordered F32 partials have completed their exchange;
@@ -332,8 +332,8 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// Input-side projections narrow F32 cores to retained BF16 before any
-    /// following projection reuses the accumulator. Their caller owns the meet.
+    /// Input-side native projections retain F32 partials, while trellis cores
+    /// retain BF16. Their caller owns the meet before either storage is reused.
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
         if let Some(weights) = layer.attention_native.get(key) {

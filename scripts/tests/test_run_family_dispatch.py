@@ -133,6 +133,19 @@ def test_core_view_refuses_unknown_value(tmp_path):
     assert "CORE_VIEW" in result.stderr
 
 
+@pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "mimo_v2"])
+def test_original_core_view_is_not_forwarded_to_unsupported_workers(tmp_path, family):
+    config = ({"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+               "moe_layer_freq": [0, 1]} if family == "mimo_v2" else {"model_type": family})
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    result = _family_launch_result(tmp_path, config, model,
+        "CORE_VIEW=original\nSPARK_COUNT=4\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert workers, result.stderr
+    assert all("--core-view" not in line for line in workers), result.stderr
+
+
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
 @pytest.mark.parametrize("wip", [False, True])
 def test_exlr8_prefill_activations_reach_plan_coordinator_and_workers(tmp_path, activations, wip):
@@ -954,6 +967,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    # Launcher tests model an idle host, independent of real API listeners.
+    (bin_dir / "ss").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "ss").chmod(0o755)
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
                      "mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32)
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):

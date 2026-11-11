@@ -189,7 +189,7 @@ def parse_defaults() -> dict[str, str]:
             continue
         for row in rows:
             for key in re.findall(r"`([A-Z_0-9]+)`", row[0]):
-                value = label(row[1])
+                value = "unset" if row[1].startswith("unset") else label(row[1])
                 assert defaults.setdefault(key, value) == value, \
                     f"{key} has two documented defaults"
     return defaults
@@ -197,6 +197,21 @@ def parse_defaults() -> dict[str, str]:
 
 LEVERS = parse_levers()
 DEFAULTS = parse_defaults()
+
+
+def test_unset_defaults_preserve_resolved_value_annotations(monkeypatch, tmp_path):
+    doc = tmp_path / "options.md"
+    doc.write_text(
+        "## Test\n| Key | Default |\n| --- | --- |\n"
+        "| `CORE_VIEW` | unset (= `original`) |\n"
+        "| `GLM5_FLASH_FP8_PREFILL` | unset (engine `mla,ffn`) |\n"
+        "| `GLM5_FLASH_KDA_FP8` | unset (`auto` = `off`) |\n"
+        "| `EXPERT_USAGE` | `on` |\n")
+    monkeypatch.setitem(globals(), "DOC", doc)
+    assert parse_defaults() == {
+        "CORE_VIEW": "unset", "GLM5_FLASH_FP8_PREFILL": "unset",
+        "GLM5_FLASH_KDA_FP8": "unset", "EXPERT_USAGE": "on",
+    }
 
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():

@@ -892,7 +892,7 @@ mod tests {
         }
         let mut changed = checkpoint;
         let tensor = changed.tensors.iter_mut().find(|t| t.meta.name.ends_with("q_proj.trellis")).unwrap();
-        tensor.meta.shape[2] = 64;
+        tensor.meta.shape[2] = 80; // K5 is unsupported; K4/K6/K8 are valid.
         tensor.meta.byte_length = tensor.meta.shape.iter().product::<usize>() as u64 * 2;
         assert!(CoreInventory::from_checkpoint(&cfg, &changed).is_err());
     }

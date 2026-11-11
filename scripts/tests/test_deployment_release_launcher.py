@@ -242,7 +242,8 @@ def test_deployment_preserves_release_container_commands(
             before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
         # The new default is an explicit checkpoint-native view, not an implicit
         # target-weight conversion. Historical captures predate this selector.
-        if old["host"] != "coordinator" or entry["family"] in {"glm5", "glm5_flash"}:
+        if (entry["family"] in {"glm5", "glm5_flash", "kimi_k3", "step5", "muse_spark"}
+                and (old["host"] != "coordinator" or entry["family"] in {"glm5", "glm5_flash"})):
             anchor = "--device-budget-bytes" if old["host"] != "coordinator" else "--embedding-placement"
             position = before["command"].index(anchor) + 2
             before["command"][position:position] = ["--core-view", "original"]

@@ -730,7 +730,7 @@ mod tests {
                             let blas = devices[rank].items.iter().filter(|item|
                                 item.group.starts_with("cuBLAS handles:") || item.group.starts_with("BLAS device initialization"))
                                 .map(|item| item.bytes).sum::<u64>();
-                            assert_eq!(blas, u64::from(!pro && rank == 0) * (2 << 20));
+                            assert_eq!(blas, u64::from(rank == 0) * (2 << 20));
                             assert_eq!(devices[rank].items, runtime.placement.items[rank],
                                 "all physical owners, pro={pro}, ranks={ranks}, graphs={graphs}, rank={rank}");
                             let total = runtime.placement.items[rank].iter().map(|item| item.bytes).sum::<u64>();

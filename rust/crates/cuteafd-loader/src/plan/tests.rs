@@ -2539,7 +2539,8 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
             ("mimof:fp8 (MXFP4)", 32, &[2, 3, 4, 5, 6, 7, 8][..]));
         assert_eq!(component(&report, Component::Vision).status, Status::Unused);
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("family mimof")));
-        assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("follow checkpoint tensors")));
+        assert!(report.spec.as_ref().unwrap().notes.iter().any(|note|
+            note.contains("default target weights preserve checkpoint precision")));
     }
     let mut wrong = mimo_flash_mopd_tensors();
     wrong.iter_mut().find(|(name, ..)| name == "model.layers.1.mlp.gate.weight").unwrap().1 = "F32";
@@ -3591,14 +3592,18 @@ fn glm5_flash_layout_charges_the_packed_head_on_one_gpu() {
     assert_eq!(weights(&bf16) - weights(&fp8), 524_288 - 270_336);
     assert_eq!(weights(&packed) - weights(&fp8), 395_776 - 270_336);
     assert_eq!([draft_scratch(&bf16), draft_scratch(&fp8), draft_scratch(&packed)], [0, 0, 1 << 20]);
-    for (ranks, resolved) in [(1, GlmfHeadFormat::Packed), (2, GlmfHeadFormat::Fp8)] {
+    for ranks in [1, 2] {
         let report = planned(GlmfHeadFormat::Auto, ranks);
         assert!(report.placement_supported, "auto TP{ranks}: {:?}", report.hints);
         let memory = report.memory_layout.unwrap();
         assert!(memory.notes.iter().any(|note|
-            note.contains(&format!("shared target/draft head: {}", resolved.name()))));
-        assert!(memory.devices.iter().flat_map(|device| &device.items).all(|item|
-            !item.group.starts_with("cuBLAS handles:") && !item.group.starts_with("BLAS device initialization")));
+            note.contains(&format!("shared target/draft head: {}", GlmfHeadFormat::Bf16.name()))));
+        assert!(memory.devices.iter().flat_map(|device| &device.items)
+            .all(|item| !item.group.starts_with("cuBLAS handles:")));
+        let initialization: u64 = memory.devices.iter().flat_map(|device| &device.items)
+            .filter(|item| item.group.starts_with("BLAS device initialization"))
+            .map(|item| item.bytes).sum();
+        assert_eq!(initialization, 2 << 20);
     }
     let split = planned(GlmfHeadFormat::Packed, 2);
     assert!(!split.placement_supported);
@@ -4631,7 +4636,14 @@ fn mimo_draft_prefix_ledger_is_opt_in_and_checked() {
         std::fs::write(draft.join("config.json"), json!({"num_hidden_layers": 5,
             "num_key_value_heads": 8, "head_dim": 128}).to_string()).unwrap();
         let disabled = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
-        assert_eq!(disabled.devices[0].used_bytes(), base.devices[0].used_bytes());
+        assert!(!disabled.devices[0].items.iter().any(|i| i.group == "DFlash context marks"));
+        // A present DFlash borrows the BF16 head through GEMM, independently of prefix marks.
+        let handles = |memory: &cuteafd_core::memory_layout::MemoryLayout| memory.devices[0].items.iter()
+            .filter(|item| item.group.starts_with("cuBLAS handles: mimo/blas/serve"))
+            .map(|item| item.bytes).sum::<u64>();
+        assert_eq!(handles(&base), 0);
+        assert_eq!(handles(&disabled), 64 << 20);
+        assert_eq!(disabled.devices[0].used_bytes() - base.devices[0].used_bytes(), handles(&disabled));
         options.layout.as_mut().unwrap().mimo_prefix_draft = true;
         let marked = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let bytes = marked.devices[0].items.iter().find(|i| i.group == "DFlash context marks").unwrap().bytes;
@@ -5511,17 +5523,17 @@ fn qwen_native_resident_admission_includes_padding_not_source_inventory() {
         .map(|c| c.bytes).sum::<u64>();
     // Source inventory over the fixture's complete coordinator headers.
     assert_eq!(source, 1_436_704_192);
-    // The TP1 target arena's backing B (target 168,080,128 + head 168,960 +
+    // The TP1 target arena's backing B (target 168,080,128 + BF16 head 327,680 +
     // device embedding 327,680, inter-view padding 0 at these shapes) plus the
     // native expert arenas (1,279,262,720): `layout.bytes()`, not a payload sum.
     let arena = crate::families::qwen4::weight_layout::single_arena_bytes(&checkpoint, &cfg, cfg.layers, false,
         layout::LayoutOptions::default().qwen_representation,
         crate::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint).unwrap()).unwrap();
-    assert_eq!(arena, 168_576_768);
-    assert_eq!(required, 1_447_839_488);
+    assert_eq!(arena, 168_735_488);
+    assert_eq!(required, 1_447_998_208);
     assert_eq!(required - arena, 1_279_262_720);
     assert!(report.executable(), "{}", render(&report));
-    // Expert arena padding outweighs this fixture's small FP8-head saving.
+    // Expert arena padding makes the resident backing larger than the source inventory.
     // A budget that fits the source inventory must still refuse native owners.
     for limit in [source, required - 1] {
         let refused = plan(dir.path(), &PlanOptions { coordinator_budget_bytes: limit, ..options.clone() }).unwrap();
