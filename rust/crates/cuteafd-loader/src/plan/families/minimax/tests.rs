@@ -330,8 +330,13 @@ fn installed_minimax_headers_match_native_contract() {
     let report = plan::plan(path, &PlanOptions::default()).unwrap();
     eprintln!("MiniMax installed plan: min_spark_ranks={:?}, spark_budget_bytes={}",
         report.min_spark_ranks, report.spark_budget_bytes);
-    assert_eq!(report.min_spark_ranks, Some(3));
-    // The export range starts at the physical two-GB10 lower bound. The
-    // planner's default 100-GiB expert budget requires a third Spark.
+    // Runtime placement remains gated, so this is not a serving-fit witness.
+    assert_eq!(report.min_spark_ranks, None);
+    let routed_bytes = checkpoint.tensors.iter()
+        .filter(|tensor| tensor.meta.name.contains(".block_sparse_moe.experts."))
+        .map(|tensor| tensor.meta.byte_length).sum::<u64>();
+    assert_eq!(routed_bytes, 232_381_393_920);
+    assert!(routed_bytes > 121 << 30, "one GB10 cannot hold the native experts");
+    eprintln!("MiniMax installed routed expert bytes={routed_bytes}; one GB10 is physically insufficient");
     assert_eq!(report.spark_budget_bytes, 100 << 30);
 }
