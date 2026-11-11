@@ -267,6 +267,17 @@ def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
                        ["--geometry", "ml4", "--only", "draft_context_fc"])
 
 
+def test_ml4_index_has_a_scoped_listed_cross_sm_gate():
+    for scope in ("suspects", "all"):
+        job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-index")
+        assert job == ("ml4-index", "export_b12x_dsv4_aot.py",
+                       ["--geometry", "ml4", "--only",
+                        "index_post_m64,index_post_nope_m64,index_post_m4096,index_post_nope_m4096"])
+    result = subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--list"],
+                            check=True, capture_output=True, text=True)
+    assert result.stdout.splitlines().count("ml4-index") == 1
+
+
 def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
     names = ["mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",
              "mla_draft_attention_full_m64", "mla_draft_attention_w4096_m64",
