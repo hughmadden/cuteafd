@@ -160,6 +160,44 @@ def test_dev_shell_execs_docker_with_the_group(tmp_path):
         assert f"{common_dir}:{common_dir}:ro" in tokens
 
 
+def _alternate_stores(git_dir: str) -> list[str]:
+    stores: list[str] = []
+    for path in Path(git_dir).rglob("objects/info/alternates"):
+        for line in path.read_text().splitlines():
+            if line.startswith("/") and Path(line).is_dir() and line not in stores:
+                stores.append(line)
+    return stores
+
+
+def test_dev_shell_mounts_submodule_alternate_object_stores(tmp_path):
+    """submodule-init-local submodules borrow objects from the mirror store via
+    objects/info/alternates; the container must see each store read-only or git
+    (and the pinned-source verifier) fails on a missing object."""
+    common_dir = subprocess.check_output(
+        ["git", "-C", str(REPO), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        text=True,
+    ).strip()
+    stores = [s for s in _alternate_stores(common_dir)
+              if not s.startswith(f"{REPO}/") and not s.startswith(f"{common_dir}/")]
+    if not stores:
+        pytest.skip("checkout has no external alternate object stores")
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    log = tmp_path / "docker.log"
+    stub = binary / "docker"
+    stub.write_text(DOCKER_STUB)
+    stub.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CUTEAFD_KACHE")}
+    env.update(PATH=f"{binary}{os.pathsep}{os.environ['PATH']}", HOME=str(tmp_path / "home"),
+               MOCK_DOCKER_LOG=str(log), HF_HOME=str(tmp_path / "hf"))
+    result = subprocess.run(["bash", str(DEV_SHELL), "expert", "--", "true"], cwd=REPO, env=env,
+                            capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stderr
+    tokens = [line[2:] for line in log.read_text().splitlines() if line.startswith("A\t")]
+    for store in stores:
+        assert tokens.count(f"{store}:{store}:ro") == 1, store  # once, read-only
+
+
 def test_nvfp4_verifier_writes_the_reference_as_the_calling_user():
     text = NVFP4_VERIFIER.read_text(encoding="utf-8")
     assert '--user "$(id -u):$(id -g)"' in text

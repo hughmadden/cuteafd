@@ -170,6 +170,19 @@ if git_common_dir="$(git -C "$repo_root" rev-parse --path-format=absolute --git-
     && [[ "$git_common_dir" != "$repo_root/.git" ]]; then
   docker_args+=(-v "$git_common_dir:$git_common_dir:ro")
 fi
+# scripts/dev/submodule-init-local backs submodules with the local mirror store
+# through objects/info/alternates; mount each alternate object store read-only
+# at its own path so git (and the pinned-source verifier) can read those objects.
+mounted_alternates=()
+while IFS= read -r alternates_file; do
+  while IFS= read -r store; do
+    [[ "$store" == /* && -d "$store" ]] || continue
+    [[ " ${mounted_alternates[*]} " == *" $store "* ]] && continue
+    case "$store" in "$repo_root"/*|"${git_common_dir:-/nonexistent}"/*) continue ;; esac
+    mounted_alternates+=("$store")
+    docker_args+=(-v "$store:$store:ro")
+  done < "$alternates_file"
+done < <(find "${git_common_dir:-$repo_root/.git}" -path '*/objects/info/alternates' -type f 2>/dev/null)
 # Relative gitfiles (worktrees, submodules) resolve only from the checkout's real
 # path, not the /workspace/cuteafd alias: point the pinned SparkInfer tools at the
 # real-path copy (mounted above), still verified against the lock file.
