@@ -448,6 +448,13 @@ fn original_ml4_native_inventory_equals_routes_and_single_arena_charges() -> Res
     config["quantization_config"] = quant;
     fixture::write_snapshot(root.path(), &config, &tensors, None);
     fixture::write_quantize_config(root.path(), &manifest);
+    // The native contract validates bundled drafter headers against Mistral's params.
+    std::fs::write(root.path().join("params.json"), serde_json::to_vec(&serde_json::json!({
+        "softmax_tanh_gating": 30.0,
+        "mtp": {"n_layers": 3, "depth": 3, "ragged_attention": "2048,2048,2048",
+            "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+            "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}}
+    }))?)?;
     let cfg = GlmDsaConfig::from_hf(&config)?;
     let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
