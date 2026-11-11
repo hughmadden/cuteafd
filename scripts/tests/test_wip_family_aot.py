@@ -452,7 +452,7 @@ def test_glm_context_only_passes_only_supported_base_geometries(tmp_path, mode, 
     else:
         expected = ['glm', 'glm2']
         if kimi:
-            expected += ['kimik3', 'dense_trellis_k6', 'kimi_split']
+            expected += ['kimik3', 'kimik31', 'dense_trellis_k6', 'kimi_split']
         else:
             expected += ['dense_trellis_k6']
         expected += ['glm_stage', 'glm2_stage']
@@ -531,7 +531,7 @@ def test_kimi_builds_always_package_k6_programs(tmp_path):
                  'native/CMakeLists.txt', 'native/cmake/shared/dsv4_programs.cmake'):
         assert 'KIMIK6' not in (ROOT / name).read_text(), name
     table = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
-    assert '"kimik3,dense_trellis_k6,kimi_split"' in table
+    assert '"kimik3,kimik31,dense_trellis_k6,kimi_split"' in table
     for exporter in ['export_b12x_dense_trellis_k6_aot.py', 'export_b12x_kimi_split_aot.py']:
         assert exporter in table
 

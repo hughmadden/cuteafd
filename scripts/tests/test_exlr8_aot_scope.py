@@ -238,7 +238,7 @@ def test_spark_and_coordinator_program_geometry_by_scope(tmp_path):
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_GLM_AOT='ON')
     assert fields['GEOMETRY'] == 'glm,glm2,dense_trellis_k6,glm_stage,glm2_stage,expert_reply'
     fields, _ = _program_geometry(tmp_path, CUTEAFD_ENABLE_KIMIK3_AOT='ON', CUTEAFD_ENABLE_GLM_AOT='ON')
-    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
+    assert fields['GEOMETRY'] == 'glm,glm2,kimik3,kimik31,dense_trellis_k6,kimi_split,glm_stage,glm2_stage,expert_reply'
 
 
 def test_exporter_forwards_role_to_the_fork_and_appends_last():
@@ -339,8 +339,8 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     assert '${CUTEAFD_WIP_KIMIK3_AOT:-OFF}' in dispatch
     cmake = (ROOT / 'native/cmake/shared/dsv4_programs.cmake').read_text()
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")' in block
-    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimik31,dense_trellis_k6,kimi_split")' in block
+    assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimik31,dense_trellis_k6,kimi_split")' in block
 
 
 def test_ml4_switch_is_keyed_only_when_on_and_forwarded():
