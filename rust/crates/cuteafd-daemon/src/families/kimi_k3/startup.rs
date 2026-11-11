@@ -102,6 +102,8 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     checkpoint: &cuteafd_loader::plan::Checkpoint, full: &KimiK3Config,
     cfg: &KimiK3Config, mut options: Options<'_, RANKS>) -> Result<Loaded<'a>> {
     ensure!(matches!(RANKS, 1 | 2), "Kimi startup requires one or two physical devices");
+    full.validate_speculation(options.draft.is_some())?;
+    full.validate_attention_runtime()?;
     let mut memory = memory_phases(library, &options.devices)?;
     memory.sample("context-before-family-modules")?;
     if RANKS == 2 { options.attention = Some(cuteafd_loader::families::kimi_k3::resolve_attention(options.attention, RANKS)); }

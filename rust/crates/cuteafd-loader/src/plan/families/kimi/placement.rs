@@ -28,6 +28,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
+    if let Err(error) = cfg.validate_attention_runtime() {
+        report.refuse_placement(error.to_string(),
+            "Complete the Gated DSA kernel and prefix-cache qualification tracked in #1777; dense MLA is not an equivalent fallback.");
+        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(),
+            notes: vec!["Kimi K3.1 headers and core views are recognized; sparse execution is not qualified".into()] };
+    }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![

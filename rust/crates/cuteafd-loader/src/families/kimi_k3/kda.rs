@@ -28,7 +28,8 @@ pub fn cache_geometry_for_ranks(cfg: &KimiK3Config, mla_layers: &[usize], cache_
     }
     let mark = (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / mla_layers.len() as u64 * cfg.kda_layers() as u64;
     let ranks = mla_layers.iter().map(|&layers| RankCacheGeometry {
-        persistent_unit_bytes: layers as u64 * 64 * cache_format.record_bytes() as u64,
+        persistent_unit_bytes: layers as u64 * 64 * (cache_format.record_bytes()
+            + cfg.dsa.map_or(0, |index| index.head_dim * 2)) as u64,
         active_state_per_sequence_bytes: mark, retained_mark_bytes: mark, ..Default::default()
     }).collect();
     Ok(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::PartitionedLayers, ranks })

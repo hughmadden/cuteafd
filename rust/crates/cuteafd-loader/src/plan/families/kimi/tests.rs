@@ -868,3 +868,53 @@ fn k6_max_context_plan_charges_parity_pool_and_each_shared_allocation() -> Resul
         && n.contains("compiled cap 1048576 tokens = 1375731712 B")), "{:?}", memory.notes);
     Ok(())
 }
+
+#[test]
+fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<()> {
+    use crate::families::kimi_k3::{config::{tests::k31_config, KimiK3Config}, weight_layout::LayerLayout};
+    let dir = snapshot(false);
+    let cfg = k31_config();
+    std::fs::write(dir.path().join("config.json"), cfg.to_string())?;
+    let path = dir.path().join("model.safetensors.index.json");
+    let mut index: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let parsed = KimiK3Config::from_hf(&cfg)?;
+    let mut headers = Vec::new();
+    for (layer, kind) in parsed.attention.iter().enumerate() {
+        if *kind != KimiAttention::Mla { continue; }
+        let root = format!("language_model.model.layers.{layer}.self_attn.indexer");
+        for (leaf,shape) in [("wq_b.weight",vec![4096,1536]),("wk.weight",vec![128,7168]),
+            ("weights_proj.weight",vec![32,7168]),("k_norm.weight",vec![128]),("k_norm.bias",vec![128])] {
+            let name = format!("{root}.{leaf}");
+            index["weight_map"][&name] = serde_json::json!("indexers.safetensors");
+            headers.push(t(name, "BF16", &shape));
+        }
+    }
+    testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
+    std::fs::write(&path,index.to_string())?;
+    let checkpoint = Checkpoint::open(dir.path())?;
+    assert!(KIMI_K3.detect(&checkpoint));
+    let model = Model::open(&checkpoint)?;
+    assert!(!model.native_serving_admission());
+    assert!(model.core.projections.is_empty());
+    let base = KimiK3Config::from_hf(&config())?;
+    for mode in [crate::placement::LayerMode::HeadSplit, crate::placement::LayerMode::ContextSplit] {
+        let layouts = LayerLayout::pair(&parsed, 3, mode)?;
+        let original = LayerLayout::pair(&base, 3, mode)?;
+        let bytes = (4096*1536 + 128*7168 + 32*7168 + 2*128)*2;
+        for rank in 0..2 {
+            assert_eq!(layouts[rank].bytes()? - original[rank].bytes()?, bytes);
+            let arena = crate::serving_capacity::WeightArenaLayout::new("indexer fixture",
+                layouts[rank].arena_tensors("layers.3")?)?;
+            assert!(arena.view("layers.3.mla.indexer.q").is_some());
+        }
+    }
+    let options = crate::serving_capacity::CacheOptions {
+        coordinator_ranks: 2, attention_placement: Some(crate::placement::AttentionPlacement::Context),
+        ..Default::default() };
+    let cache = model.cache_geometry(options)?.unwrap();
+    for rank in cache.ranks { assert_eq!(rank.persistent_unit_bytes, (24*64*(576*2/2+128*2)) as u64); }
+    headers.pop();
+    testing::write_safetensors(&dir.path().join("indexers.safetensors"), &headers);
+    assert!(Checkpoint::open(dir.path()).is_err());
+    Ok(())
+}
