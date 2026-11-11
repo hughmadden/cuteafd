@@ -238,7 +238,7 @@ impl GoldenArgs {
     fn reference_receipt(&self) -> Result<Value> {
         let bytes = std::fs::read(self.golden.as_ref().context("golden reference missing")?.join("manifest.json"))?;
         let manifest: Value = serde_json::from_slice(&bytes)?;
-        Ok(serde_json::json!({"config":manifest["config"], "revision":manifest["revision"],
+        Ok(serde_json::json!({"config":manifest["config"], "revision":manifest["revision"], "tier":"quick",
             "manifest_sha256":digest(&bytes), "treatment":if self.skip_routed_experts {
                 "dense/attention/DSA golden with routed experts skipped; not a full-model golden"
             } else { "full-model" }}))
@@ -415,7 +415,7 @@ fn run(args: GoldenArgs) -> Result<()> {
 fn skipped_reference(root: &Path, manifest: &Value, cfg: &KimiK3Config)
     -> Result<cuteafd_bench::reference::Reference> {
     ensure!(manifest["schema"] == "cuteafd.kimi.skipped-routed/1"
-        && manifest["diagnostic_only"] == true
+        && manifest["diagnostic_only"] == true && manifest["tier"] == "quick"
         && manifest["treatment"] == "router+shared-experts; routed contribution zero",
         "Kimi skipped-routed golden requires a matching diagnostic reference, not a full-model reference");
     ensure!(KimiK3Config::from_hf(&manifest["checkpoint_config"])? == *cfg
@@ -972,7 +972,7 @@ mod tests {
                     "pos":1,"next":2,"next_lp":-1.0,"top":[{"id":2,"lp":-1.0}],"tail_lp":-0.5}]}]});
         let bytes = serde_json::to_vec(&reference)?;
         std::fs::write(root.join("reference.json"), &bytes)?;
-        let manifest = json!({"schema":"cuteafd.kimi.skipped-routed/1","diagnostic_only":true,
+        let manifest = json!({"schema":"cuteafd.kimi.skipped-routed/1","diagnostic_only":true,"tier":"quick",
             "treatment":"router+shared-experts; routed contribution zero","checkpoint_config":config,
             "checkpoint_config_sha256":digest(&config_bytes),"vocab":cfg.vocab_size,"revision":revision,
             "source_pin":pins,"snapshot_identity":identity,"set_sha256":"c".repeat(64),
@@ -990,7 +990,7 @@ mod tests {
             let tmp = tempfile::tempdir()?;
             let (cfg, manifest) = skipped_fixture(tmp.path(), k31)?;
             assert_eq!(skipped_reference(tmp.path(), &manifest, &cfg)?.windows.len(), 1);
-            let mut paths = vec!["/schema", "/diagnostic_only", "/treatment", "/vocab", "/revision",
+            let mut paths = vec!["/schema", "/diagnostic_only", "/tier", "/treatment", "/vocab", "/revision",
                 "/checkpoint_config/text_config/hidden_size", "/checkpoint_config_sha256",
                 "/source_pin/reference_runner_sha256", "/source_pin/reference_adapter_sha256",
                 "/source_pin/fla_source_sha256", "/snapshot_identity/config_sha256",
@@ -1069,13 +1069,17 @@ mod tests {
     }
 
     #[test]
-    fn golden_provenance_binds_selected_mode_bundle_and_fp8_recipe() -> Result<()> {
+    fn golden_provenance_binds_selected_mode_bundle_and_fp8_refusal() -> Result<()> {
         use clap::Parser;
         use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let dir = tempfile::tempdir()?;
         let config = cuteafd_loader::plan::testing::kimi_k3_config();
-        cuteafd_loader::plan::testing::write_mc_snapshot(dir.path(), &config, &[],
-            &std::collections::BTreeMap::from([("language_model.lm_head.weight".into(), vec![128, 128])]));
+        let tensors = cuteafd_loader::plan::testing::kimi_k3_tensors(false);
+        let expected = tensors.iter().map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        let shapes = tensors.iter().filter(|(name, ..)| name.strip_suffix(".weight")
+            .is_some_and(|stem| cuteafd_loader::families::kimi_k3::core::split(stem).is_some()))
+            .map(|(name, _, shape)| (name.clone(), shape.clone())).collect();
+        cuteafd_loader::plan::testing::write_mc_snapshot(dir.path(), &config, &tensors, &shapes);
         let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from([
             "cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
             "--golden", "/reference", "--save-logits", "/output"])?.command
@@ -1087,10 +1091,18 @@ mod tests {
             assert_eq!(provenance["core_view"], serde_json::to_value(mode)?);
             assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
             assert_eq!(provenance["core_fp8_recipe"], "none");
+            if mode == CoreView::Original {
+                let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+                let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
+                let core = cuteafd_loader::families::kimi_k3::core::CoreInventory::from_checkpoint(
+                    &cfg, &checkpoint, &expected)?;
+                assert!(core.native.is_empty(), "original view must schedule zero FP8 conversions");
+            }
             fingerprints.insert(view.fingerprint().to_owned());
         }
         assert_eq!(fingerprints.len(), 3);
-        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string().contains("whole-core FP8 pending"));
+        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err()
+            .to_string().contains("whole-core FP8 pending"));
         Ok(())
     }
 

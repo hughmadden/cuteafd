@@ -318,6 +318,35 @@ def test_rust_golden_vectors_match_pinned_python_reference():
             rtol=3e-5, atol=3e-6)
 
 
+def test_skipped_quick_windows_preserve_full_and_prefix_defaults():
+    import copy
+    import re
+    from families.kimi_k3.golden import QUICK_WINDOWS, execution_windows
+    rust = (Path(__file__).resolve().parents[2] /
+        "rust/crates/cuteafd-bench/src/fidelity_dataset.rs").read_text()
+    sealed = re.search(r"pub const QUICK_WINDOWS:.*?= \[(.*?)\];", rust).group(1)
+    assert tuple(re.findall(r'"([^"]+)"', sealed)) == QUICK_WINDOWS
+    panel = {"windows": [dict(id=wid, tokens=[1] * (9000 if wid == "a20" else 520),
+        score_from=8488 if wid == "a20" else 8) for wid in (*QUICK_WINDOWS, "extra")]}
+    original = copy.deepcopy(panel)
+    selected = execution_windows(panel, skip_routed=True)
+    assert tuple(w["id"] for w in selected) == QUICK_WINDOWS
+    assert max(w["score_from"] for w in selected) > 8192
+    assert len(execution_windows(panel)) == 9
+    probe = {"windows": [dict(id="short", tokens=[1] * 640, score_from=64)]}
+    assert execution_windows(probe, skip_routed=True, prefix_probe=True) == probe["windows"]
+    selected[0]["tokens"][0] = 2
+    assert panel == original
+    for change, message in ((lambda p: p["windows"].pop(0), "sealed eight"),
+            (lambda p: p["windows"].append(copy.deepcopy(p["windows"][0])), "sealed eight"),
+            (lambda p: p["windows"][0].update(score_from=1), "512 scored"),
+            (lambda p: p["windows"][4].update(tokens=[1] * 520, score_from=8), "8K history")):
+        changed = copy.deepcopy(panel)
+        change(changed)
+        with pytest.raises(ValueError, match=message):
+            execution_windows(changed, skip_routed=True)
+
+
 def test_skipped_routed_diagnostic_keeps_router_and_shared_only():
     torch = pytest.importorskip("torch")
     calls = []

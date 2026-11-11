@@ -283,6 +283,6 @@
       2
     ]
   ],
-  "reference_sha256": "c4758b0b95c6aeb4312ebbb9486225ebdc60746601d2f840ececc27b2a36cc36",
+  "reference_sha256": "1f335098eded76f00c8b393a0f2bb076453b70326c1a60847dd34b0e32ebdd37",
   "source": "python/reference/families/kimi_k3/k31.py, F32 mathematical oracle, torch seed 73, 5 tokens, topk 2"
 }

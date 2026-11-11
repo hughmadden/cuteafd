@@ -25,6 +25,23 @@ from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_
                                     package_source_identity, source_identity)
 
 
+QUICK_WINDOWS = ("legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00")
+
+
+def execution_windows(panel, *, skip_routed=False, prefix_probe=False):
+    windows = copy.deepcopy(panel["windows"])
+    if not skip_routed or prefix_probe:
+        return windows
+    selected = [window for window in windows if window["id"] in QUICK_WINDOWS]
+    if len(selected) != 8 or {w["id"] for w in selected} != set(QUICK_WINDOWS):
+        raise ValueError("skipped-routed quick diagnostic requires the sealed eight windows")
+    if any(len(w["tokens"]) - w["score_from"] != 512 for w in selected):
+        raise ValueError("skipped-routed quick diagnostic requires 512 scored rows per window")
+    if not any(w["score_from"] >= 8192 for w in selected):
+        raise ValueError("skipped-routed quick diagnostic requires sparse DSA beyond 8K history")
+    return selected
+
+
 def digest(path):
     value = hashlib.sha256()
     with Path(path).open("rb") as stream:
@@ -317,7 +334,7 @@ def execute(a):
     # A diagnostic prefix is never passed to qualification or output scoring.
     proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None else None
     forced_routes = checking and getattr(a, "_route_forced_qualification", False)
-    windows = copy.deepcopy(manifest["windows"])
+    windows = execution_windows(manifest, skip_routed=skip_routed, prefix_probe=checking)
     if checking:
         for name in ("official_short", "adapted_short"):
             source = copy.deepcopy(windows[0])
@@ -468,6 +485,8 @@ def execute(a):
         finish_golden(a.out, manifest, entries, snapshot_identity=snapshot, source_pin=pins,
                       skip_routed_experts=skip_routed,
                       diagnostic_only=skip_routed,
+                      **({"diagnostic_tier": "quick", "diagnostic_windows": list(QUICK_WINDOWS)}
+                         if skip_routed and not checking else {}),
                       treatment=("router+shared-experts; routed contribution zero" if skip_routed else "full-model"),
                       **({"source_identity_provider": "families.kimi_k3.k31"} if is_k31 else {}),
                       nll=total_nll / total_rows, scored_tokens=total_rows, seconds=time.monotonic() - started,
@@ -498,7 +517,7 @@ def write_skipped_reference(out, panel, snapshot, config, pins, proof):
     meta = json.loads((out / "meta.json").read_bytes())
     validate_qualification(proof, panel, meta["snapshot_identity"])
     windows = []
-    for raw in panel["windows"]:
+    for raw in execution_windows(panel, skip_routed=True):
         entry = next(row for row in meta["windows"] if row["id"] == raw["id"])
         rows = np.memmap(out / entry["path"] / "logits.bin", dtype="<f4", mode="r",
                          shape=(len(entry["positions"]), config.vocab_size))
@@ -516,10 +535,10 @@ def write_skipped_reference(out, panel, snapshot, config, pins, proof):
                 top=[dict(id=int(i), lp=float(lp[i])) for i in ids],
                 tail_lp=float(tmax + np.log(np.exp(tail - tmax).sum()))))
         windows.append({**raw, "top_k": 1024, "positions": positions})
-    reference = dict(name="Kimi dense/attention/DSA diagnostic; routed experts skipped",
+    reference = dict(name="Kimi quick dense/attention/DSA diagnostic; routed experts skipped",
         models=[panel["checkpoint"]], vocab=config.vocab_size, expect=dict(kl_max=0.03, top1_min=0.95),
         schema="cuteafd.fidelity.reference/2", checkpoint=panel["checkpoint"],
-        set_sha256=panel["set_sha256"], quick_windows=panel["quick_windows"], windows=windows)
+        set_sha256=panel["set_sha256"], quick_windows=list(QUICK_WINDOWS), windows=windows)
     atomic_json(out / "reference.json", reference)
     config_bytes = (snapshot / "config.json").read_bytes()
     config_copy = out / "checkpoint-config.pending"
@@ -532,7 +551,8 @@ def write_skipped_reference(out, panel, snapshot, config, pins, proof):
     atomic_json(out / "manifest.json", dict(schema="cuteafd.kimi.skipped-routed/1",
         config=panel["family"] + "-dense-attention-dsa-skipped-routed", revision=snapshot.name,
         checkpoint=panel["checkpoint"], vocab=config.vocab_size, treatment=SKIPPED_ROUTED_TREATMENT,
-        diagnostic_only=True, checkpoint_config=json.loads(config_bytes),
+        diagnostic_only=True, tier="quick", windows=list(QUICK_WINDOWS),
+        checkpoint_config=json.loads(config_bytes),
         checkpoint_config_sha256=hashlib.sha256(config_bytes).hexdigest(),
         snapshot_identity=meta["snapshot_identity"], source_pin=pins, prefix_qualification=proof,
         set_sha256=panel["set_sha256"], reference_sha256=digest(out / "reference.json")))
@@ -543,7 +563,7 @@ def main():
     for name in ("snapshot", "windows", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--skip-routed-experts", action="store_true",
-                        help="diagnostic only: router and shared expert, zero routed contribution; not full-model fidelity")
+                        help="quick sealed-eight diagnostic: router and shared expert, zero routed contribution; not full-model fidelity")
     parser.add_argument("--check-only", action="store_true", help="CPU checkpoint source/header/shape validation; no golden or device allocation")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--stop-after-layer", type=int, default=None,

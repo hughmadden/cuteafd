@@ -2836,7 +2836,7 @@ mod tests {
         layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes, crate::shared::memory::TEST)?))).collect::<Result<BTreeMap<_, _>>>())?;
-        let lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands, arena: None, layout,
+        let lane = Lane { stream: Rc::new(Stream::new(device)?), operands, arena: None, layout,
             window: None, metadata_bank: 0, core: None };
         lane.prime_attention()?;
         let primed = fixture.events()?;
@@ -2896,7 +2896,7 @@ mod tests {
         layout.arena_bytes = 0;
         let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes, crate::shared::memory::TEST)?))).collect::<Result<BTreeMap<_, _>>>())?;
-        let mut lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands,
+        let mut lane = Lane { stream: Rc::new(Stream::new(device)?), operands,
             arena: None, layout, window: None, metadata_bank: 0, core: None };
         lane.prime_attention()?;
         let mut pool = cuteafd_engine::prefix::RefPagePool::parity(8, 64, 0);
@@ -2958,7 +2958,7 @@ mod tests {
         let fixture = Fixture::build()?;
         let library = fixture.load()?;
         let device = Device { library: &library, id: 1 };
-        let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
+        let stream = Rc::new(Stream::new(device)?);
         let lane = Lane { stream: stream.clone(),
             operands: BTreeMap::from([("delta", Allocation::new(device, 16, crate::shared::memory::TEST)?)]),
             arena: Some(Allocation::new(device, 32, crate::shared::memory::TEST)?),
@@ -2999,7 +2999,7 @@ mod tests {
         let weights = Rc::new(super::super::weights::coordinator_golden_tests::baseline_global(
             device, &layout[0], packed)?);
         let weak = Rc::downgrade(&weights);
-        let stream = Rc::new(Stream { device, raw: std::ptr::null_mut() });
+        let stream = Rc::new(Stream::new(device)?);
         let io = IoLayout { rank: 0, ranks: 2, rows: 16, hidden: 4, vocab: 8, core_head:false, full_prefill_logits: false }
             .allocate(device, stream.clone(), weights.clone())?;
         drop(weights);
