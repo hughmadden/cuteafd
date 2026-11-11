@@ -46,6 +46,19 @@ def programs():
             for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
                                    ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
                 result.append((f"{name}_h{heads}_m{rows}", partial(compiler, mg, max_rows=rows), rows))
+    # K3.1 shares projected math but has a distinct rank-norm epsilon. Append
+    # variant seams so the existing K3 objects and their table indices stay put.
+    for heads in (48, 96):
+        mg = KimiMlaGeometry(heads=heads, norm_eps=1e-5)
+        for rows in (64, 4096):
+            for cache, suffix in (("bf16", ""), ("fp8", "_fp8")):
+                cg = KimiMlaGeometry(heads=heads, kv_cache=cache, norm_eps=1e-5)
+                for stride in (576, 640):
+                    result.append((f"kimik31_mla_rank_norm_h{heads}_kv{stride}{suffix}_m{rows}",
+                        partial(compile_kimi_mla_rank_norm_aot, cg, max_rows=rows, kv_stride=stride), rows))
+            for name, compiler in (("mla_query", compile_kimi_mla_query_aot),
+                                   ("mla_gate_output", compile_kimi_mla_gate_output_aot)):
+                result.append((f"kimik31_{name}_h{heads}_m{rows}", partial(compiler, mg, max_rows=rows), rows))
     return result
 
 
