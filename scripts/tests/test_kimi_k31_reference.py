@@ -393,6 +393,16 @@ def test_arithmetic_diagnostic_is_explicit_single_window_and_cannot_qualify():
             execution_windows(panel, diagnostic_window="a00", **kwargs)
     with pytest.raises(ValueError, match="absent or duplicated"):
         execution_windows(panel, skip_routed=True, diagnostic_window="missing")
+    multiple = {"windows": [*panel["windows"], dict(id="a04", tokens=[2] * 1822, score_from=1310)]}
+    assert execution_windows(multiple, skip_routed=True, diagnostic_window="a04,a00") == multiple["windows"]
+    listed = diagnostic_options(types.SimpleNamespace(**(args | {"diagnostic_window": "a00,a04"})))
+    assert listed["window"] == "a00,a04"
+    for invalid in ("a00,a00", "a00,missing", "a00,", "", "a04,a04"):
+        with pytest.raises(ValueError, match="absent or duplicated"):
+            execution_windows(multiple, skip_routed=True, diagnostic_window=invalid)
+    duplicated = {"windows": [*multiple["windows"], multiple["windows"][0]]}
+    with pytest.raises(ValueError, match="absent or duplicated"):
+        execution_windows(duplicated, skip_routed=True, diagnostic_window="a00,a04")
     assert diagnostic_rows("1757:1821") == (1757, 1821)
     import argparse
     for value in ("0:65", "-1:1", "1:1", "1", "x:2"):

@@ -33,8 +33,10 @@ def execution_windows(panel, *, skip_routed=False, prefix_probe=False, diagnosti
     if diagnostic_window is not None:
         if not skip_routed or prefix_probe:
             raise ValueError("arithmetic diagnostic requires skipped experts and no prefix probe")
-        selected = [window for window in windows if window["id"] == diagnostic_window]
-        if len(selected) != 1:
+        ids = diagnostic_window.split(",")
+        selected = [window for window in windows if window["id"] in ids]
+        if (any(not wid for wid in ids) or len(set(ids)) != len(ids)
+                or len(selected) != len(ids) or {window["id"] for window in selected} != set(ids)):
             raise ValueError("diagnostic window absent or duplicated")
         return selected
     if not skip_routed or prefix_probe:
@@ -426,8 +428,11 @@ def execute(a):
     forced_routes = checking and getattr(a, "_route_forced_qualification", False)
     windows = execution_windows(manifest, skip_routed=skip_routed, prefix_probe=checking,
                                 diagnostic_window=diagnostic["window"] if diagnostic else None)
-    if diagnostic and diagnostic["capture_rows"] and diagnostic["capture_rows"][1] > len(windows[0]["tokens"]) - 1:
-        raise ValueError("diagnostic capture rows exceed prediction inputs")
+    if diagnostic and diagnostic["capture_rows"]:
+        if len(windows) != 1:
+            raise ValueError("diagnostic capture requires exactly one explicit window")
+        if diagnostic["capture_rows"][1] > len(windows[0]["tokens"]) - 1:
+            raise ValueError("diagnostic capture rows exceed prediction inputs")
     if checking:
         for name in ("official_short", "adapted_short"):
             source = copy.deepcopy(windows[0])
@@ -720,7 +725,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--skip-routed-experts", action="store_true",
                         help="quick sealed-eight diagnostic: router and shared expert, zero routed contribution; not full-model fidelity")
-    parser.add_argument("--diagnostic-window", help="skipped-only single-window arithmetic diagnosis; never qualification")
+    parser.add_argument("--diagnostic-window", help="skipped-only explicit window ID or comma-separated IDs; never qualification")
     parser.add_argument("--diagnostic-arithmetic", choices=("f32", "bf16"),
                         help="diagnostic decoder arithmetic; identical fixed-M128 geometry and F32 head")
     parser.add_argument("--diagnostic-capture-rows", type=diagnostic_rows,
