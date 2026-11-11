@@ -108,7 +108,7 @@ impl ProducerLayout {
         if rows == 0 || rows > self.rows as usize { return Err(invalid("producer live row capacity")); }
         let operands = self.operands();
         if operands.len() != N { return Err(invalid("producer operand count")); }
-        let align = std::array::from_fn(|i| match operands[i].dtype {
+        let align: [usize; N] = std::array::from_fn(|i| match operands[i].dtype {
             "int64" => 8, "float32" => 4, _ => 16,
         });
         let writable = operands.iter().enumerate().filter_map(|(i, o)| (o.role != "in").then_some(i)).collect::<Vec<_>>();
@@ -239,7 +239,7 @@ mod tests {
     }
     #[test]
     fn producers_match_all_pinned_export_contracts() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../../tests/fixtures/minimax_producer_programs.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../tests/fixtures/minimax_producer_programs.json")).unwrap();
         for (kind, entry) in Kind::ALL.into_iter().zip(fixture["programs"].as_array().unwrap()) {
             let spec = ProgramSpec {
                 name: entry["name"].as_str().unwrap().into(),
