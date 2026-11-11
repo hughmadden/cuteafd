@@ -111,6 +111,17 @@ core tensors. Unindexed bytes from other views may remain in shared shards. The 
 checks only the selected view's manifest/index contract during discovery;
 normal inventory validates selected shard headers afterward.
 
-Publish only after this format specification has been reviewed. The intended
-MC repositories are Kimi-K3.1-Pro-EXL3-K2-MC, Muse-Spark-Open-EXL3-K4-MC and
-GLM-5.3-Flash-EXL3-K4-MC under `wrldsuksgo2mars`.
+Publish only after this format specification has been reviewed.
+[`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
+is published at `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with BF16
+`original` (default), `k8-compact` and `k6-compact`; `fp8-compact` still refuses.
+See its [min](../examples/configs/glm53-flash-exl3-k4-mc-min.config) and
+[max](../examples/configs/glm53-flash-exl3-k4-mc-max.config) configs.
+The other intended MC repositories are Kimi-K3.1-Pro-EXL3-K2-MC and
+Muse-Spark-Open-EXL3-K4-MC under `wrldsuksgo2mars`.
+
+The non-MC Mistral publication is pinned at
+`9c354cee78cd6feddb057549b8edde6e3b319822`; its
+[min](../examples/configs/mistral-large4-exl3-k4-min.config) and
+[max](../examples/configs/mistral-large4-exl3-k4-max.config) configs select
+only `original`.

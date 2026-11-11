@@ -1,19 +1,26 @@
 # Mistral Large 4
 
-`mistralai/Mistral-Large-4-1T-A52B` (official FP8 block-128) is served as an
-EXL3 quant, `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`: K4 routed experts
-on five or six Sparks (with RTX onboarding) and a native K6 dense core
-(attention, dense and shared FFN, vocabulary head) on the RTX cards. The
-published revision is `03c80aebaa483d55760703ae5bc0c9734c9d67d6`;
-qualification continues, with no release card yet. WIP examples:
+[`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4`](https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4)
+serves `mistralai/Mistral-Large-4-1T-A52B` with EXL3 K4 routed experts and
+the original mixed FP8/BF16 vendor core. Revision
+`9c354cee78cd6feddb057549b8edde6e3b319822` is a plain checkpoint, not MC;
+only `CORE_VIEW=original` is supported. New WIP examples:
+[min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-min.config)
+and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-max.config).
+These preserve the earlier layouts and bundled dSpark; the new checkpoint
+has no benchmark cards yet.
+
+Previously served as `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`
+at revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with a native K6
+dense core. Its historical examples remain available:
 [min, 1 RTX + 5 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-min.config)
 and [max, 2 RTX + 6 Sparks](../../examples/configs/mistral-large4-exl3-k4-core-k6-max.config).
-Gate cards `ml4-exl3-min` and `ml4-exl3-max` in
-`scripts/bench/kits/gate/matrix-ml4.json` use these recipes. TP2 expert
-onboarding, official-reference image fidelity, exact prefix restores and
-lossless speculation have passed on hardware. On two GPUs, `auto` selects
-`context` after correctness and interleaved throughput qualification;
-explicit `layers` remains available.
+The v5 cards in the changelog and gate cards `ml4-exl3-min` / `ml4-exl3-max`
+in `scripts/bench/kits/gate/matrix-ml4.json` still describe that Core-K6
+checkpoint, not the restored original core. TP2 expert onboarding,
+official-reference image fidelity, exact prefix restores and lossless
+speculation passed on that checkpoint. On two GPUs, `auto` selects
+`context`; explicit `layers` remains available.
 
 ## Original mixed-precision core
 

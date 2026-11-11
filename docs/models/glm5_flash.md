@@ -1,7 +1,14 @@
 # GLM 5.3 Flash
 
 A hybrid-attention sibling of GLM 5.3: most layers run linear Kimi Delta
-Attention (KDA), a minority run MLA + DSA.
+Attention (KDA), a minority run MLA + DSA. Alongside the existing checkpoints,
+[`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC`](https://huggingface.co/wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC)
+is published at revision `91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d`, with
+a BF16 original core (default), `k8-compact` and `k6-compact` views. New WIP
+configs preserve the existing layouts:
+[min, 1 RTX + 2 Sparks](../../examples/configs/glm53-flash-exl3-k4-mc-min.config)
+and [max, 2 RTX, no Sparks](../../examples/configs/glm53-flash-exl3-k4-mc-max.config).
+They explicitly select `CORE_VIEW=original`; no benchmark cards exist yet.
 
 ## Supported checkpoints / quants
 

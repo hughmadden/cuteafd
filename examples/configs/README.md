@@ -60,6 +60,19 @@ release loader leaves the key empty when absent (the launch then resolves
 auto). V4.1 launches through `run-family.sh` like every family (#82); roadmap
 step S5 unifies this default with the other families'.
 
+## Newly published checkpoints
+
+These pinned recipes need a matching WIP build and have no benchmark cards yet.
+Layouts, speculators and image keys match their earlier Core-K6 examples; this
+is not a claim that the restored original core has the same memory or speed.
+`CORE_VIEW=original` is explicit in each config. Mistral is a plain checkpoint;
+GLM Flash MC also offers `k8-compact` and `k6-compact`, but not `fp8-compact`.
+
+| Model | Config | Layout |
+| --- | --- | --- |
+| [Mistral Large 4, EXL3 K4 + original mixed FP8/BF16 core](../../docs/models/mistral_large4.md) | [min](mistral-large4-exl3-k4-min.config) · [max](mistral-large4-exl3-k4-max.config) | 1 RTX + 5 Spark / 2 RTX + 6 Spark; bundled dSpark |
+| [GLM 5.3 Flash, EXL3 K4 MC](../../docs/models/glm5_flash.md) | [min](glm53-flash-exl3-k4-mc-min.config) · [max](glm53-flash-exl3-k4-mc-max.config) | 1 RTX + 2 Spark / 2 RTX, no Sparks; DFlash2 |
+
 ## Families under qualification
 
 These have no release card yet. Use a `./wip.sh` slot containing the path
