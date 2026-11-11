@@ -656,6 +656,42 @@ mod tests {
     }
 
     #[test]
+    fn mixed_dense_edges_preserve_existing_graph_count_and_trace_selected_variants() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::context::DecodeBuckets;
+        let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        let manifest = |edges: &[usize]| serde_json::json!({"programs":[{
+            "name":"dense_trellis_k6_trellis_mla_q_a_mcg",
+            "geometry":{"bits":6,"decode_route_thresholds":edges}}]});
+        let existing = DecodeBuckets::from_manifest(&manifest(&[8,16,32,48]))?;
+        let mut mixed = manifest(&[8,16,32,48]);
+        mixed["programs"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":"dense_trellis_k6_trellis_mla_gate_mcg_k8",
+            "geometry":{"bits":8,"decode_route_thresholds":[8,32,48]}}));
+        let union = DecodeBuckets::from_manifest(&mixed)?;
+        let old = DecodeBuckets::from_manifest(&manifest(&[16,32,48]))?;
+        let inventory = |decode: &DecodeBuckets| inventory_with_context(&cfg, 1, 2752, 16, 8, 2,
+            |_, _| true, |layer| cfg.attention[layer] == KimiAttention::Mla, Some(decode));
+        let before = inventory(&existing)?;
+        let after = inventory(&union)?;
+        assert_eq!(before.keys.len(), after.keys.len());
+        let old_set = inventory(&old)?;
+        let context_layers = cfg.attention.iter().filter(|&&kind| kind == KimiAttention::Mla).count();
+        assert_eq!(after.keys.len() - old_set.keys.len(), context_layers * 2);
+        let layer = cfg.attention.iter().position(|kind| *kind == KimiAttention::Mla).unwrap();
+        let ordinary = Key { lane:0, rank:0, rows:8, op:Op::Context { layer, speculative:false } };
+        let speculative = Key { op:Op::Context { layer, speculative:true }, ..ordinary };
+        assert!(after.keys.contains(&ordinary) && after.keys.contains(&speculative));
+        assert!(!old_set.keys.contains(&ordinary) && old_set.keys.contains(&speculative));
+        let layout = kimi_layout(KimiCoreFormat::K6, 2);
+        let warmed = prewarm_keys(&cfg, &after.keys, layout, 16, 2752);
+        assert!(!warmed.contains(&ordinary));
+        assert!(warmed.contains(&speculative));
+        assert!(!pinned(KimiCoreFormat::K6, 2, ordinary));
+        assert_eq!(union.graph_rows(8,16,64), (1..=64).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[test]
     fn context_startup_covers_every_c1_to_c16_mixed_verify_batch() -> Result<()> {
         let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         // One MLA layer is sufficient for the exhaustive row/slot geometry;

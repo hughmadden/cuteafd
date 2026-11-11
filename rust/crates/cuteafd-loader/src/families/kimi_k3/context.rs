@@ -7,7 +7,7 @@ use crate::placement::ContextBuffers;
 pub const SPLIT_BUCKETS: [usize; 4] = [2, 4, 8, 16];
 
 /// Context-only padding inventory. Native route edges come from the package,
-/// which exports the very constants used by the K6 dispatcher.
+/// which exports each dense trellis program's actual arithmetic boundaries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodeBuckets {
     thresholds: Vec<usize>,
@@ -17,24 +17,24 @@ pub struct DecodeBuckets {
 impl DecodeBuckets {
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
-        let mut thresholds: Option<Vec<usize>> = None;
+        let mut thresholds = Vec::new();
         for program in programs.iter().filter(|p| p["name"].as_str().is_some_and(|name|
-            name.starts_with("dense_trellis_k6_trellis_")) && p["geometry"]["bits"] == 6) {
+            name.starts_with("dense_trellis_") && name.contains("_trellis_"))
+            && matches!(p["geometry"]["bits"].as_u64(), Some(4 | 6 | 8))) {
             let geometry = &program["geometry"];
             let routes = geometry["decode_route_thresholds"].as_array()
-                .context("Kimi context native K6 decode route thresholds missing")?;
+                .context("Kimi context native decode route thresholds missing")?;
             let routes = routes.iter().map(|v| -> Result<usize> {
                 usize::try_from(v.as_u64().context("Kimi context invalid native decode route threshold")?)
                     .context("Kimi context decode route threshold overflow")
             }).collect::<Result<Vec<_>>>()?;
-            ensure!(!routes.is_empty() && routes.iter().all(|&edge| (1..64).contains(&edge))
+            ensure!(routes.iter().all(|&edge| (1..64).contains(&edge))
                 && routes.windows(2).all(|pair| pair[0] < pair[1]),
                 "Kimi context native decode routes must be sorted unique edges below 64");
-            ensure!(thresholds.as_ref().is_none_or(|expected| *expected == routes),
-                "Kimi context native decode routes differ between programs");
-            thresholds = Some(routes);
+            thresholds.extend(routes);
         }
-        let thresholds = thresholds.unwrap_or_default();
+        thresholds.sort_unstable();
+        thresholds.dedup();
         let mut plain = if thresholds.is_empty() { vec![1, 4, 16, 64] } else { vec![1, 4, 64] };
         plain.extend(&thresholds);
         plain.sort_unstable();
@@ -242,16 +242,43 @@ mod tests {
         assert_eq!(decode.dispatch_rows(13, true)?, 13);
         assert_eq!(decode.dispatch_rows(13, false)?, 16);
         assert!(decode.dispatch_rows(1, true).is_err());
-        for routes in [serde_json::Value::Null, serde_json::json!([]), serde_json::json!([8, 8]),
+        for routes in [serde_json::Value::Null, serde_json::json!([8, 8]),
             serde_json::json!([16, 8]), serde_json::json!([0]), serde_json::json!([64]), serde_json::json!(["8"])] {
             assert!(DecodeBuckets::from_manifest(&native_manifest(routes)).is_err());
         }
-        let mut inconsistent = native_manifest(serde_json::json!([8, 16, 32, 48]));
-        let mut second = inconsistent["programs"][0].clone();
-        second["name"] = "dense_trellis_k6_trellis_mla_kv_a_mul1".into();
-        second["geometry"]["decode_route_thresholds"] = serde_json::json!([8, 16, 32]);
-        inconsistent["programs"].as_array_mut().unwrap().push(second);
-        assert!(DecodeBuckets::from_manifest(&inconsistent).is_err());
+        let empty = DecodeBuckets::from_manifest(&native_manifest(serde_json::json!([])))?;
+        assert_eq!(empty.plain(), [1, 4, 16, 64]);
+        Ok(())
+    }
+
+    #[test]
+    fn context_buckets_union_each_native_width_and_group_without_crossing_edges() -> Result<()> {
+        let baseline = DecodeBuckets::from_manifest(&native_manifest(serde_json::json!([8, 16, 32, 48])))?;
+        let mut mixed = native_manifest(serde_json::json!([8, 16, 32, 48]));
+        for (name, bits, edges) in [
+            ("dense_trellis_k6_trellis_mla_q_b_mcg_k8", 8, vec![8, 32, 48]),
+            ("dense_trellis_k6_trellis_kda_grouped_mcg_k8", 8, vec![16, 32, 48]),
+            ("dense_trellis_k4_trellis_mtp_mcg", 4, vec![]),
+        ] {
+            mixed["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                "name":name,"geometry":{"bits":bits,"decode_route_thresholds":edges}}));
+        }
+        let union = DecodeBuckets::from_manifest(&mixed)?;
+        assert_eq!(union, baseline);
+        assert!(union.plain().contains(&8) && union.plain().contains(&16));
+        assert_eq!(union.graph_rows(8, 16, 64), baseline.graph_rows(8, 16, 64));
+        for rows in 1..=64 {
+            let bucket = union.bucket(rows)?;
+            for edges in [[8, 16, 32, 48].as_slice(), &[8, 32, 48], &[16, 32, 48]] {
+                assert!(edges.iter().all(|&edge| (rows <= edge) == (bucket <= edge)));
+            }
+        }
+        // A genuinely new edge changes ordinary padding, even when verify rows already include it.
+        let old = DecodeBuckets::from_manifest(&native_manifest(serde_json::json!([16, 32, 48])))?;
+        assert_eq!(old.bucket(5)?, 16);
+        assert_eq!(union.bucket(5)?, 8);
+        assert_eq!(union.bucket(9)?, 16);
+        assert_eq!(union.graph_rows(8, 16, 64), old.graph_rows(8, 16, 64));
         Ok(())
     }
 
