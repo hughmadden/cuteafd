@@ -2,6 +2,10 @@
 //! disabled native MTP stage are outside the coordinator core inventory.
 use super::GlmDsaConfig;
 use crate::{formats::trellis_core::{CoreContract, read_projections}, plan::Checkpoint};
+
+// GLM 5.3 still binds K6-only programs. ML4 ships its original FP8 core or K6,
+// not K8; both need exporter and runtime dispatch changes before widening.
+pub(crate) const NATIVE_CORE_WIDTHS: &[usize] = &[6];
 pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScratchLayout};
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
@@ -192,7 +196,7 @@ impl CoreInventory {
         // kv_a may store N128 padding (RoPE latent N576 -> N640).
         let kv_a: std::collections::BTreeSet<String> = (0..cfg.layers).filter_map(|l| cfg.stem(l, Op::KvA)).collect();
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: &[6], split,
+            |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: NATIVE_CORE_WIDTHS, split,
                 padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
         let shapes = expected(cfg);

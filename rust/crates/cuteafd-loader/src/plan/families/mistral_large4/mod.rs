@@ -387,7 +387,7 @@ impl FamilyModel for Model {
         let e = self.expected.get(stem)
             .ok_or_else(|| format!("{stem}: outside the Mistral Large 4 text tensor contract ({})", describe(operand)))?;
         if let Encoding::Exl3 { bits } = operand.encoding {
-            require(bits == 6, || format!("Mistral Large 4 {stem}: unsupported dense core width K{bits}; shipping width K6; add trellis_linear exporter program and family dispatch"))?;
+            require(crate::families::glm5::core::NATIVE_CORE_WIDTHS.contains(&bits), || format!("Mistral Large 4 {stem}: unsupported dense core width K{bits}; shipping width K6; add trellis_linear exporter program and family dispatch"))?;
         }
         let core = |operand: &mut QuantOperand, pad: bool| -> Option<Result<(), String>> {
             (operand.encoding == (Encoding::Exl3 { bits: 6 })).then(|| {
