@@ -765,7 +765,7 @@ impl<'a> LocalLane<'a> {
             let owner = &self.context.as_ref().context("Kimi parity metadata without context")?.0.ranks[self.rank];
             if let Some(decode) = &metadata.decode {
                 let mut decode = decode[self.rank].clone();
-                decode.pad(owner.decode().bucket(decode.rows)?)?;
+                if self.programs.dsa.is_none() { decode.pad(owner.decode().bucket(decode.rows)?)?; }
                 for (name, bytes) in decode.uploads() { owner.upload(name, bank, bytes, self.stream())?; }
                 self.context_pages[bank] = decode.owned_pages;
             }
@@ -1123,6 +1123,57 @@ impl<'a> LocalLane<'a> {
             attention_scratch: self.lane.buffer("MLA attention scratch")?, output_scratch: self.lane.buffer("MLA output scratch")? })
     }
 
+    fn context_dsa_score(&self, layer: usize, rows: usize, speculative: bool)
+        -> Result<crate::shared::peer_split::attention::Candidates> {
+        let dsa = self.programs.dsa.as_ref().context("Kimi Context index programs missing")?;
+        let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
+        let batch = self.context_batch(layer, rows, speculative)?;
+        let weights = self.layer(layer)?.indexer()?;
+        let cache = self.mla.index(layer)?;
+        let query = self.lane.buffer("DSA query")?;
+        let head_weights = self.lane.buffer("DSA head weights")?;
+        let scores = owner.buffer("DSA global scores")?;
+        let indices = owner.buffer("DSA global indices")?;
+        let stream = self.stream();
+        stream.device.run(|| {
+            // Both ranks retain the full index history, independent of MLA parity.
+            dsa.producer[0].launch(weights, cuteafd_ffi::KimiIndexBatch {
+                rows, cache_pages: self.mla.pages(), x: batch.x, q_resid: batch.q_resid,
+                positions: self.lane.buffer("DSA positions")?, slots: self.lane.buffer("DSA slots")?,
+                cos_sin: weights.norm, cache, query_fp8: query, head_weights,
+                scratch: self.lane.buffer("DSA producer scratch")?,
+            }, stream.raw)?;
+            if self.rank == 0 {
+                dsa.scored[0].launch(cuteafd_ffi::KimiIndexSelection {
+                    rows, cache_pages: self.mla.pages(),
+                    table_width: self.lane.layout.max_context.div_ceil(64),
+                    table_stride: self.lane.layout.max_context.div_ceil(64),
+                    query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
+                    lengths: self.lane.buffer("DSA lengths")?, indices, scores,
+                    scratch: self.lane.buffer("DSA selector scratch")?,
+                }, stream.raw)?;
+            }
+            Ok(())
+        })?;
+        Ok(crate::shared::peer_split::attention::Candidates { scores: scores.ptr, indices: indices.ptr })
+    }
+
+    fn context_dsa_merge(&self, rows: usize, scores: *mut std::ffi::c_void,
+        indices: *mut std::ffi::c_void) -> Result<()> {
+        let dsa = self.programs.dsa.as_ref().context("Kimi MLA has no indexer candidates")?;
+        let owner = &self.context.as_ref().context("Kimi context not bound")?.0.ranks[self.rank];
+        let stream = self.stream();
+        let buffer = |ptr| CuteafdDeviceBuffer { ptr, bytes: rows * 4096 * 4,
+            device_id: stream.device.id, flags: 0 };
+        stream.device.run(|| Ok(dsa.merge.launch(cuteafd_ffi::KimiCandidateBatch {
+            rows, table_stride: owner.compact_width(), rank: self.rank,
+            scores: buffer(scores), indices: buffer(indices),
+            output_scores: owner.buffer("DSA merged scores")?, output_indices: owner.buffer("DSA merged indices")?,
+            table: owner.metadata("compact page tables", self.lane.metadata_bank)?,
+            local_slots: owner.buffer("DSA local slots")?, local_lengths: owner.buffer("DSA local lengths")?,
+        }, stream.raw)?))
+    }
+
     fn context_partial(&self, layer: usize, rows: usize, speculative: bool, heads_rank: usize) -> Result<()> {
         ensure!(heads_rank < 2, "Kimi context partial head rank");
         let batch = self.context_batch(layer, rows, speculative)?;
@@ -1132,6 +1183,16 @@ impl<'a> LocalLane<'a> {
         let stream = self.stream();
         let partial = owner.partial(heads_rank != self.rank, rows)?;
         let buffer = |ptr, bytes| CuteafdDeviceBuffer { ptr, bytes, device_id: stream.device.id, flags: 0 };
+        if let Some(dsa) = &self.programs.dsa {
+            return stream.device.run(|| Ok(dsa.partial[0][heads_rank].launch(cuteafd_ffi::KimiSparseBatch {
+                rows, cache_tokens: self.mla.local_pages() * 64,
+                query: buffer(slot.query, rows * 96 * 576 * 2), cache: batch.cache,
+                indices: owner.buffer("DSA local slots")?, lengths: owner.buffer("DSA local lengths")?,
+                query_offsets: self.lane.buffer("DSA query offsets")?,
+                output: buffer(partial.values, rows * 48 * 512 * 2), lse: buffer(partial.lse, rows * 48 * 4),
+                scratch: owner.buffer("partial scratch")?,
+            }, stream.raw)?));
+        }
         stream.device.run(|| Ok(programs.partial(rows, heads_rank)?.launch(cuteafd_ffi::KimiMlaPartialBatch {
             rows, active_splits: owner.metadata("active splits", self.lane.metadata_bank)?,
             cache_pages: batch.cache_pages, page_table_width: batch.page_table_width,
@@ -1170,9 +1231,12 @@ impl<'a> LocalLane<'a> {
                 self.local.mla_produce(self.layer, batch)?;
                 Ok(Query { values: self.local.lane.buffer("MLA query")?.ptr, row_pitch: 48 * 576 * 2, width: None })
             }
-            fn score(&mut self) -> Result<Option<Candidates>> { Ok(None) }
-            fn merge(&mut self, _: *mut std::ffi::c_void, _: *mut std::ffi::c_void) -> Result<()> {
-                bail!("Kimi MLA has no indexer candidates")
+            fn score(&mut self) -> Result<Option<Candidates>> {
+                if self.local.programs.dsa.is_none() { return Ok(None); }
+                self.local.context_dsa_score(self.layer, self.rows, self.speculative).map(Some)
+            }
+            fn merge(&mut self, scores: *mut std::ffi::c_void, indices: *mut std::ffi::c_void) -> Result<()> {
+                self.local.context_dsa_merge(self.rows, scores, indices)
             }
             fn partial(&mut self, query: *mut std::ffi::c_void, heads_rank: usize) -> Result<Partial> {
                 ensure!(query == self.local.context_slot(self.layer)?.query, "Kimi context query pointer changed");
@@ -1202,7 +1266,9 @@ impl<'a> LocalLane<'a> {
             "Kimi context decode needs its fixed metadata bank");
         ensure!(self.graphs.is_some(), "Kimi context decode requires the graph cache");
         let context = self.context.as_ref().context("Kimi context not bound")?.0.clone();
-        let bucket = context.ranks[self.rank].decode().dispatch_rows(rows, speculative)?;
+        // DSA metadata describes live rows only: padding could append to slot zero.
+        let bucket = if self.programs.dsa.is_some() { rows }
+            else { context.ranks[self.rank].decode().dispatch_rows(rows, speculative)? };
         let input = context.ranks[self.rank].buffer("decode input")?;
         let source = self.plane("normalized", rows, 7168)?;
         let stream = self.stream().clone();

@@ -132,6 +132,23 @@ impl<'a> Rank<'a> {
                 }
             }
         }
+        if layout.dsa() {
+            // Rank one publishes this empty run; rank zero overwrites its run
+            // with global selection. Never merge two duplicate global runs.
+            for (name, bits) in [("DSA global scores", f32::NEG_INFINITY.to_bits()),
+                ("DSA global indices", u32::MAX)] {
+                let buffer = owner.buffer(name)?;
+                let bytes = bits.to_le_bytes().repeat(buffer.bytes / 4);
+                for stream in &owner.streams {
+                    stream.device.run(|| {
+                        // SAFETY: startup owns this fixed destination and ordered
+                        // staging retains the host bytes until the upload lands.
+                        unsafe { stream.device.library.copy_h2d_ordered(buffer, &bytes, stream.raw) }
+                    })?;
+                }
+            }
+            for stream in &owner.streams { stream.drain()?; }
+        }
         Ok(owner)
     }
 
