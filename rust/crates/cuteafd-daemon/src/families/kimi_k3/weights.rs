@@ -4,7 +4,7 @@
 use crate::shared::{memory::device::{Allocation, Device}, placement::layers::AttentionShare};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, memory_layout::{Basis, Category}};
-use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
+use cuteafd_ffi::{CuteafdDeviceBuffer, KimiIndexWeights, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::collections::BTreeMap;
@@ -348,6 +348,20 @@ impl PackedLayer {
             KimiAttention::Mla => {
                 let owners: Vec<_> = shares.iter().enumerate().filter(|(_, share)| share.present())
                     .map(|(rank, _)| rank).collect();
+                if cfg.dsa.is_some() {
+                    use cuteafd_loader::families::kimi_k3::dsa::{load_native, IndexerOperand};
+                    for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
+                        let tensor = load_native(cfg, layer, operand, &mut read)?;
+                        for &owner in &owners {
+                            pair[owner].operands.insert(operand.arena_name(), tensor.bytes.clone());
+                        }
+                    }
+                    let mut kw = load_native(cfg, layer, IndexerOperand::Key, &mut read)?.bytes;
+                    kw.extend_from_slice(&load_native(cfg, layer, IndexerOperand::Heads, &mut read)?.bytes);
+                    for &owner in &owners {
+                        pair[owner].operands.insert("mla.indexer.kw", kw.clone());
+                    }
+                }
                 for (operand, name) in [(MlaOperand::QkvA, "mla.qkv_a"), (MlaOperand::QNorm, "mla.q_norm"),
                     (MlaOperand::KvNorm, "mla.kv_norm"), (MlaOperand::QB, "mla.q_b"), (MlaOperand::Uk, "mla.uk"),
                     (MlaOperand::Uv, "mla.uv"), (MlaOperand::Gate, "mla.gate"), (MlaOperand::Output, "mla.output")] {
@@ -464,6 +478,13 @@ impl<'a> LayerWeights<'a> {
         Ok(KimiKdaWeights { input: self.buffer("kda.input")?, forget: self.buffer("kda.forget")?,
             convolution: self.buffer("kda.conv")?, a_log: self.buffer("kda.a_log")?,
             dt_bias: self.buffer("kda.dt_bias")?, norm: self.buffer("kda.norm")?, output: self.buffer("kda.output")? })
+    }
+
+    pub(crate) fn indexer(&self) -> Result<KimiIndexWeights> {
+        ensure!(self.attention.present(), "Kimi indexer weights absent on this nonowner");
+        Ok(KimiIndexWeights { query: self.buffer("mla.indexer.q")?,
+            key_heads: self.buffer("mla.indexer.kw")?, norm: self.buffer("mla.indexer.norm")?,
+            bias: self.buffer("mla.indexer.bias")? })
     }
 
     pub(crate) fn mla(&self) -> Result<KimiMlaWeights> {
@@ -639,6 +660,51 @@ mod tests {
             }
         }
         for layer in [0, 2, 5, 7, usize::MAX] { assert!(routed_owner(&cfg, layer).is_err()); }
+        Ok(())
+    }
+
+    #[test]
+    fn k31_indexer_native_bytes_follow_every_attention_owner() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{config::KimiDsaConfig, dsa::IndexerOperand};
+        let mut cfg = cfg();
+        cfg.dsa = Some(KimiDsaConfig { heads: 2, head_dim: 4, topk: 2 });
+        for mode in [LayerMode::HeadSplit, LayerMode::ContextSplit,
+            LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }] {
+            let packed = PackedLayer::pair(&cfg, 3, mode, |name| {
+                if name.contains(".indexer.") {
+                    let (_, shape) = IndexerOperand::ALL.into_iter().map(|op| op.specification(&cfg, 3).unwrap())
+                        .find(|(key, _)| key == name).unwrap();
+                    let mut value = tensor("test.weight")?;
+                    value.info.name = name.into();
+                    value.info.shape = shape.clone();
+                    value.bytes = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                    value.info.byte_length = value.bytes.len() as u64;
+                    Ok(value)
+                } else { tensor(name) }
+            })?;
+            for rank in &packed {
+                for operand in [IndexerOperand::Query, IndexerOperand::Norm, IndexerOperand::Bias] {
+                    assert_eq!(rank.operands.contains_key(operand.arena_name()), rank.attention.present());
+                    if rank.attention.present() {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        let expected: Vec<u8> = (0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes).collect();
+                        assert_eq!(rank.operands[operand.arena_name()], expected);
+                    }
+                }
+                assert!(!rank.operands.contains_key("mla.indexer.k"));
+                assert!(!rank.operands.contains_key("mla.indexer.weights"));
+                assert_eq!(rank.operands.contains_key("mla.indexer.kw"), rank.attention.present());
+                if rank.attention.present() {
+                    let mut expected = Vec::new();
+                    for operand in [IndexerOperand::Key, IndexerOperand::Heads] {
+                        let (_, shape) = operand.specification(&cfg, 3)?;
+                        expected.extend((0..shape.iter().product::<usize>() as u16).flat_map(u16::to_le_bytes));
+                    }
+                    assert_eq!(rank.operands["mla.indexer.kw"], expected);
+                    assert_eq!(expected.len(), (cfg.dsa.unwrap().head_dim + cfg.dsa.unwrap().heads) * cfg.hidden * 2);
+                }
+            }
+        }
         Ok(())
     }
 

@@ -1147,6 +1147,38 @@ def row_dump_dirs(directory):
                    if p.is_file() and ROW_FILE.fullmatch(p.name)})
 
 
+def bin_token_args(a_path, b_path, vocab):
+    """Align scored-only logits rows with their next-token positions."""
+    tokens = a_path.parent / 'tokens.bin'
+    if a_path.name != 'logits.bin' or not tokens.is_file():
+        return []
+    rows, remainder = divmod(a_path.stat().st_size, 4 * vocab)
+    token_count, token_remainder = divmod(tokens.stat().st_size, 4)
+    if remainder or token_remainder or not rows:
+        raise ValueError('invalid logits or token byte count for NLL alignment')
+    meta = a_path.parent / 'meta.json'
+    positions = json.loads(meta.read_text()).get('positions') if meta.is_file() else None
+    if positions is None:
+        if rows not in (token_count - 1, token_count):
+            raise ValueError('scored-only logits require meta.json positions for NLL alignment')
+        positions = list(range(1, rows + 1))
+    if (not isinstance(positions, list) or len(positions) != rows
+            or any(type(p) is not int for p in positions)
+            or positions[0] < 1 or positions[-1] > token_count
+            or (positions[-1] == token_count and positions[0] != 1)
+            or positions != list(range(positions[0], positions[0] + rows))):
+        raise ValueError('logits positions must be contiguous next-token indices matching every row')
+    other_meta = b_path.parent / 'meta.json'
+    if other_meta.is_file():
+        other_positions = json.loads(other_meta.read_text()).get('positions')
+        if other_positions is not None and other_positions != positions:
+            raise ValueError('logits arms have different scored positions')
+    other_tokens = b_path.parent / 'tokens.bin'
+    if other_tokens.is_file() and other_tokens.read_bytes() != tokens.read_bytes():
+        raise ValueError('logits arms have different token sequences')
+    return ['--tokens', str(tokens), '--offset', str(positions[0] - 1)]
+
+
 def compare_pairs(state, pairs, repeats):
     """Compare saved logits of arm pairs, per repeat, file by file."""
     results = []
@@ -1162,10 +1194,11 @@ def compare_pairs(state, pairs, repeats):
             for name in files:
                 dumped = True
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}.json'
-                extra = []
-                tokens = (da / name).parent / 'tokens.bin'
-                if Path(name).name == 'logits.bin' and tokens.is_file():
-                    extra = ['--tokens', str(tokens)]
+                try:
+                    extra = bin_token_args(da / name, db / name, state['vocab'])
+                except (ValueError, OSError) as error:
+                    results.append(dict(a=a, b=b, repeat=repeat, file=name, error=str(error)))
+                    continue
                 args = [str(da / name), str(db / name), str(state['vocab']), *extra, '--json', str(out)]
                 results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
             # Per-row dumps: each directory of row-NNNNNNNN.safetensors compares as

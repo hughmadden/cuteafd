@@ -177,10 +177,13 @@ impl<'a> CorePrograms<'a> {
         let kda=[KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m64"),64,true)?,
             KimiKdaCore::load(programs,&format!("kda_core_h{heads}_m4096"),4096,false)?];
         let mut mla=BTreeMap::new();
+        let k31 = cfg.dsa.is_some();
+        let prefix = if k31 { "kimik31_" } else { "" };
         for heads in [48,96] {for stride in [576,640] {for capacity in [64,4096] {
-            let names=[format!("mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
-                format!("mla_query_h{heads}_m{capacity}"),format!("mla_gate_output_h{heads}_m{capacity}")];
-            mla.insert((heads,stride,capacity),KimiMlaSplit::load(programs,
+            let names=[format!("{prefix}mla_rank_norm_h{heads}_kv{stride}{}_m{capacity}",cache_format.program_suffix()),
+                format!("{prefix}mla_query_h{heads}_m{capacity}"),format!("{prefix}mla_gate_output_h{heads}_m{capacity}")];
+            let load = if k31 { KimiMlaSplit::load_k31 } else { KimiMlaSplit::load };
+            mla.insert((heads,stride,capacity),load(programs,
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
         Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layouts,native_inventory:inventory.clone(),native_bf16,native_fp8,native_scratch,native_add:programs.library().f32_add()?,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,6144/ranks)?,

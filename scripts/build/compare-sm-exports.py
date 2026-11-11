@@ -206,6 +206,9 @@ def jobs(scope):
                        ["--geometry", "kimik3", "--only", ",".join(names)]))
     result.append(("ml4-draft-context-fc", "export_b12x_dsv4_aot.py",
                    ["--geometry", "ml4", "--only", "draft_context_fc"]))
+    result.append(("ml4-index", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "ml4", "--only", ",".join(
+                       f"index_post{suffix}_m{rows}" for rows in (64, 4096) for suffix in ("", "_nope"))]))
     result.append(("mla-draft-h64", "export_b12x_dsv4_aot.py",
                    ["--geometry", "kimik3", "--only", ",".join([
                        "mla_draft_producer_m64", "mla_draft_producer_fp8_m64", "mla_draft_output_m64",

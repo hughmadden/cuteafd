@@ -183,6 +183,12 @@ impl LayerLayout {
                     rank.insert("mla.uv", &[heads, cfg.v_head_dim, cfg.kv_lora_rank, 2])?;
                     rank.insert("mla.gate", &[heads, cfg.v_head_dim, cfg.hidden, 2])?;
                     rank.insert("mla.output", &[cfg.hidden, heads, cfg.v_head_dim, 2])?;
+                    if let Some(index) = cfg.dsa {
+                        rank.insert("mla.indexer.q", &[index.heads, index.head_dim, cfg.q_lora_rank, 2])?;
+                        rank.insert("mla.indexer.kw", &[sum(index.head_dim, index.heads)?, cfg.hidden, 2])?;
+                        rank.insert("mla.indexer.norm", &[index.head_dim, 2])?;
+                        rank.insert("mla.indexer.bias", &[index.head_dim, 2])?;
+                    }
                 }
                 KimiAttention::Mla => {}
             }

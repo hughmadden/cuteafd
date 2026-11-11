@@ -234,6 +234,12 @@ def requirements(repo, matrix, scope):
             programs = {'step5', 'step52'} if dual else {'step5'}
         elif family == 'kimi_k3':
             programs = {'kimik3', 'dense_trellis_k6', 'kimi_split'}
+            checkpoint = scopes_module(repo).checkpoint_config(values) or {}
+            text = checkpoint.get('text_config', checkpoint)
+            if (checkpoint.get('model_type') == 'kimi_k31'
+                    or 'KimiK31ForConditionalGeneration' in checkpoint.get('architectures', [])
+                    or 'dsa_config' in text):
+                programs.add('kimik31')
         elif family == 'mistral_large4':
             programs = {'ml4', 'dense_trellis_k6'} | ({'ml42'} if dual else set())
         elif family == 'minimax_m3':

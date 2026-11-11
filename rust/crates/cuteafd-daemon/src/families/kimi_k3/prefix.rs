@@ -97,7 +97,10 @@ impl<'a> KimiPrefix<'a> {
         ensure!(mla.iter().all(|bank| bank.parity() == parity), "Kimi prefix page ownership differs between ranks");
         let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, mla[0].format())?;
         let resident_page_bytes: usize = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes as usize).sum();
-        let page_bytes = if parity { resident_page_bytes / 2 } else { resident_page_bytes };
+        let page_bytes = if parity {
+            let index_bytes = resident.iter().sum::<usize>() * mla[0].index_page_bytes();
+            (resident_page_bytes - index_bytes) / 2 + index_bytes
+        } else { resident_page_bytes };
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda.iter().map(|bank| bank.mark_bytes()).sum::<usize>(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
@@ -210,10 +213,13 @@ impl<'a> KimiPrefix<'a> {
     fn page_buffers(&self, rank: usize, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!((page as usize) < self.0.layout.pages && (1..=MLA_PAGE_ROWS).contains(&rows),
             "Kimi prefix page copy outside admission");
-        if !self.0.mla[rank].owns_page(page) { return Ok(Vec::new()); }
-        self.0.cfg.attention.iter().enumerate().filter(|(layer, kind)|
-            **kind == KimiAttention::Mla && self.0.mla[rank].layer(*layer).is_ok())
-            .map(|(layer, _)| self.0.mla[rank].page(layer, page as usize, rows)).collect()
+        let mut segments = Vec::new();
+        for (layer, kind) in self.0.cfg.attention.iter().enumerate() {
+            if *kind == KimiAttention::Mla && self.0.mla[rank].layer(layer).is_ok() {
+                segments.extend(self.0.mla[rank].page_segments(layer, page as usize, rows)?);
+            }
+        }
+        Ok(segments)
     }
 
     fn move_mark(&self, mark: MarkSlot, slot: usize, capture: bool) -> Result<()> {
@@ -292,6 +298,12 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     }
 
     fn record_format(&self) -> &'static str {
+        if self.0.cfg.dsa.is_some() {
+            return match self.0.mla[0].format() {
+                cuteafd_core::MlaCacheFormat::Bf16 => "kimi_k31_bf16_mla_e4m3_pow2_index_v1",
+                cuteafd_core::MlaCacheFormat::Fp8 => "kimi_k31_fp8_mla_e4m3_pow2_index_v1",
+            };
+        }
         match self.0.mla[0].format() {
             cuteafd_core::MlaCacheFormat::Bf16 => "kimi_k3_bf16_mla_tp2_kda_f32_v1",
             cuteafd_core::MlaCacheFormat::Fp8 => "kimi_k3_ds_fp8_mla_tp2_kda_f32_v1",
@@ -672,10 +684,20 @@ mod tests {
     #[test]
     #[ignore = "requires CUTEAFD_NATIVE_LIFETIME_FIXTURE_DIR; CPU-only fake DSO"]
     fn exact_adapter_restores_both_kda_shards_and_full_partial_mla_pages() -> Result<()> {
-        for (heads, cache_format) in [false, true].into_iter()
-            .flat_map(|heads| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
-                .map(|format| (heads, format))) {
-            let fixture = Fixture::build()?;
+        exact_page_adapter(false)
+    }
+
+    #[test]
+    fn k31_prefix_restores_native_index_keys_scales_and_both_context_copies() -> Result<()> {
+        exact_page_adapter(true)
+    }
+
+    fn exact_page_adapter(indexer: bool) -> Result<()> {
+        for (attention, cache_format) in [AttentionPlacement::Layers, AttentionPlacement::Heads,
+            AttentionPlacement::Context].into_iter()
+            .flat_map(|attention| [cuteafd_core::MlaCacheFormat::Bf16, cuteafd_core::MlaCacheFormat::Fp8]
+                .map(|format| (attention, format))) {
+            let fixture = if indexer { Fixture::build_for_tests()? } else { Fixture::build()? };
             let library = fixture.load()?;
             fixture.immediate_copies(&library)?;
             let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
@@ -683,10 +705,25 @@ mod tests {
             cfg.attention = vec![KimiAttention::Kda, KimiAttention::Mla, KimiAttention::Mla];
             cfg.dense.truncate(3);
             let mut inputs = super::super::admission::tests::inputs(&cfg);
-            inputs.attention = heads.then_some(AttentionPlacement::Heads);
+            inputs.attention = Some(AttentionPlacement::Heads);
             inputs.cache_format = cache_format;
             let mut placement = super::super::admission::admit(inputs)?.placement;
             placement.pool_tokens = 256;
+            placement.attention_placement = attention;
+            for (layer, assignment) in placement.layers.iter_mut().enumerate() {
+                if cfg.attention[layer] == KimiAttention::Mla {
+                    assignment.mode = match attention {
+                        AttentionPlacement::Heads => cuteafd_loader::placement::LayerMode::HeadSplit,
+                        AttentionPlacement::Context => cuteafd_loader::placement::LayerMode::ContextSplit,
+                        AttentionPlacement::Layers => cuteafd_loader::placement::LayerMode::Whole {
+                            gpu: (layer - 1) as u8, ffn: cuteafd_loader::placement::FfnMode::Split },
+                    };
+                }
+            }
+            if indexer {
+                cfg.dsa = Some(cuteafd_loader::families::kimi_k3::config::KimiDsaConfig {
+                    heads: 32, head_dim: 128, topk: 2048 });
+            }
             let bank = |rank| -> Result<_> {
                 let device = Device { library: &library, id: rank as i32 };
                 let readers = (0..2).map(|_| Stream::new(device).map(Rc::new)).collect::<Result<Vec<_>>>()?;
@@ -753,13 +790,14 @@ mod tests {
                 }
             }
             for (from, to, rows) in [(0, 2, 64), (1, 3, 1)] {
-                family.copy_rows(TailCopy { from, to, rows, owner: None }).map_err(boxed)?;
+                family.copy_rows(TailCopy { from, to, rows, owner: family.page_device(from) }).map_err(boxed)?;
                 for rank in 0..2 {
-                    for (src, dst) in family.page_buffers(rank, from, 64)?.into_iter()
-                        .zip(family.page_buffers(rank, to, 64)?) {
+                    let partial = family.page_buffers(rank, to, rows)?;
+                    for ((src, dst), live) in family.page_buffers(rank, from, 64)?.into_iter()
+                        .zip(family.page_buffers(rank, to, 64)?).zip(partial) {
                         let source = read(src)?;
                         let destination = read(dst)?;
-                        let copied = rows * cache_format.record_bytes();
+                        let copied = live.bytes;
                         assert_eq!(source[..copied], destination[..copied]);
                         if rows == 1 {
                             let sentinel = (0..dst.bytes).map(|i| (i.wrapping_mul(31) + 199) as u8).collect::<Vec<_>>();
@@ -783,7 +821,19 @@ mod tests {
             assert_eq!(family.commit_point(&restored), 65);
             assert_eq!(family.page_segments(0).iter().map(|range| range.bytes).sum::<usize>(), family.layout().page_bytes);
             assert_eq!(family.mark_segments(MarkSlot(0)).iter().map(|range| range.bytes).sum::<usize>(), family.layout().mark_bytes);
-            assert_eq!(family.layout().page_bytes, 2 * if heads { 2 } else { 1 } * 64 * cache_format.record_bytes());
+            let copies = if attention == AttentionPlacement::Heads { 4 } else { 2 };
+            let index_copies = if attention == AttentionPlacement::Layers { 2 } else { 4 };
+            assert_eq!(family.layout().page_bytes, copies * 64 * cache_format.record_bytes()
+                + if indexer { index_copies * 8448 } else { 0 });
+            if indexer {
+                assert!(family.record_format().starts_with("kimi_k31_"));
+                for rank in 0..2 {
+                    let segments = family.page_buffers(rank, 0, 1)?;
+                    let index_layers = if attention == AttentionPlacement::Layers { 1 } else { 2 };
+                    assert_eq!(segments.iter().filter(|segment| segment.bytes == 128).count(), index_layers);
+                    assert_eq!(segments.iter().filter(|segment| segment.bytes == 4).count(), index_layers);
+                }
+            }
             fixture.configure_pack(&library, 1, 0)?;
             let before = fixture.events()?.len();
             assert!(family.capture(MarkSlot(0), &original, 65).is_err());

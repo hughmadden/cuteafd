@@ -301,6 +301,9 @@ pub struct KimiRecipe {
     /// allocation granularity. Empty for the profiled two-rank layer placement,
     /// whose whole-layer owners already name one layer each.
     pub records_by_layer: Vec<[u64; 2]>,
+    /// Full-history index bytes per 64 logical tokens for each resident MLA
+    /// layer. This is a separate backing, including under Context placement.
+    pub index_bytes_per_page: u64,
     /// Attention weight bytes per rank for each layer.
     pub layer_attention: Vec<ModeBytes>,
     pub first_moe: usize,
@@ -707,6 +710,17 @@ impl Recipe for KimiRecipe {
                         ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
                             crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
                         false, self.maximum_pages));
+                    if self.index_bytes_per_page > 0 {
+                        let bytes = self.index_bytes_per_page.checked_mul(self.page_rows() / PAGE_ROWS)
+                            .ok_or(Refusal::Overflow("Kimi index pages"))?;
+                        let owner = Allocation::buffer(format!("index.records.{layer}.{rank}"),
+                            Location::coordinator(rank as u8), bytes, Lifetime::RESIDENT,
+                            Category::Kv, "index records");
+                        contract.components.push(Component::allocation(owner,
+                            ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
+                                crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
+                            false, self.maximum_pages));
+                    }
                 }
             }
         }
@@ -766,8 +780,20 @@ impl Recipe for KimiRecipe {
                         ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
                             crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
                         false, self.maximum_pages);
-                    allocation.activation = activation;
+                    allocation.activation = activation.clone();
                     contract.components.push(allocation);
+                    if self.index_bytes_per_page > 0 {
+                        let bytes = self.index_bytes_per_page;
+                        let owner = Allocation::buffer(format!("index.records.{layer}.{option}"),
+                            Location::coordinator(gpu), bytes, Lifetime::RESIDENT,
+                            Category::Kv, "index records");
+                        let mut allocation = Component::allocation(owner,
+                            ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
+                                crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
+                            false, self.maximum_pages);
+                        allocation.activation = activation;
+                        contract.components.push(allocation);
+                    }
                 }
             }
         }
@@ -1103,6 +1129,7 @@ mod tests {
             maximum_pages: 4,
             records_per_page: vec![128],
             records_by_layer: vec![[64, 0], [64, 0]],
+            index_bytes_per_page: 0,
             layer_attention: vec![ModeBytes { whole: 100, split: [0; 2] }; 2],
             first_moe: 1,
             kinds: vec![AttentionClass::Kda],
@@ -1121,6 +1148,50 @@ mod tests {
         };
         toy_weight_owners(&mut recipe);
         recipe
+    }
+
+    #[test]
+    fn k31_index_backings_keep_independent_tails_and_context_replication() {
+        use crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES as G;
+        for placement in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
+            let mut recipe = recipe();
+            recipe.gpus = 2;
+            recipe.placement = placement;
+            recipe.context = 32768;
+            recipe.maximum_pages = recipe.context / if placement == AttentionPlacement::Context { 128 } else { 64 };
+            recipe.attention = vec![match placement {
+                AttentionPlacement::Heads => LayerMode::HeadSplit,
+                AttentionPlacement::Context => LayerMode::ContextSplit,
+                AttentionPlacement::Layers => LayerMode::Whole { gpu: 0, ffn: FfnMode::Split },
+            }; 2];
+            let record = 64 * 1152;
+            recipe.records_by_layer = vec![[record; 2]; 2];
+            recipe.records_per_page = vec![record * if placement == AttentionPlacement::Layers { 1 } else { 2 }; 2];
+            recipe.index_bytes_per_page = 8448;
+            recipe.layer_attention = vec![ModeBytes { whole: 100, split: [50; 2] }; 2];
+            recipe.experts = None;
+            recipe.arenas = vec![Arena { count: 0, peak: vec![0; 2], resident: vec![0; 2], weights: vec![0; 2] }];
+            toy_weight_owners(&mut recipe);
+            let contract = recipe.prepare(&Request { context: recipe.context.into(), ..single() }).unwrap();
+            let pages = recipe.maximum_pages;
+            let facts = contract.facts(&vec![0; contract.variables.len()], pages).unwrap();
+            let owners = facts.allocations.iter().filter(|owner|
+                matches!(owner.group.as_str(), "records" | "index records")).collect::<Vec<_>>();
+            let expected_layers = if placement == AttentionPlacement::Layers { 2 } else { 4 };
+            assert_eq!(owners.len(), expected_layers * 2);
+            for owner in &owners {
+                let per_page = if owner.group == "records" { record } else {
+                    8448 * if placement == AttentionPlacement::Context { 2 } else { 1 }
+                };
+                assert_eq!(owner.bytes, (per_page * pages).div_ceil(G) * G);
+            }
+            if placement != AttentionPlacement::Layers {
+                for rank in 0..2 {
+                    assert_eq!(owners.iter().filter(|owner| owner.location == Location::coordinator(rank)
+                        && owner.group == "index records").count(), 2);
+                }
+            }
+        }
     }
 
     #[test]

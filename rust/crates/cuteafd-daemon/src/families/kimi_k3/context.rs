@@ -7,16 +7,41 @@ use cuteafd_loader::families::kimi_k3::context::ContextLayout;
 use std::{collections::BTreeMap, rc::Rc};
 
 pub(crate) struct Programs<'a> {
-    partial: [[cuteafd_ffi::KimiMlaPartial<'a>; 2]; 2],
-    tiles: cuteafd_loader::families::kimi_k3::context::TilePolicy,
+    partial: Option<([[cuteafd_ffi::KimiMlaPartial<'a>; 2]; 2],
+        cuteafd_loader::families::kimi_k3::context::TilePolicy)>,
     pub combine: cuteafd_ffi::programs::BoundProgram<'a>,
-    pub gather: cuteafd_ffi::programs::BoundProgram<'a>,
+    pub gather: Option<cuteafd_ffi::programs::BoundProgram<'a>>,
     pub sms: usize,
 }
 
 impl<'a> Programs<'a> {
     pub(crate) fn load(programs: &'a cuteafd_ffi::programs::Programs<'a>,
         format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
+        Self::load_variant(programs, format, false)
+    }
+
+    pub(crate) fn load_for_config(programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        format: cuteafd_core::MlaCacheFormat,
+        cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config) -> Result<Self> {
+        Self::load_variant(programs, format, cfg.dsa.is_some())
+    }
+
+    fn load_variant(programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        format: cuteafd_core::MlaCacheFormat, dsa: bool) -> Result<Self> {
+        if dsa {
+            let combine = programs.spec("kimik31_lse_combine2")?;
+            ensure!(combine.scalar_kinds == b"i" && combine.geometry["heads"] == 48
+                && combine.geometry["has_sink"] == false, "Kimi DSA context combine ABI differs");
+            let name = format!("kimik31_paged_staging_gather{}", format.program_suffix());
+            let gather = programs.spec(&name)?;
+            ensure!(gather.scalar_kinds == b"iii" && gather.geometry["row_bytes"] == format.record_bytes()
+                && gather.geometry["page_rows"] == 64 && gather.geometry["page_bytes"] == 64 * format.record_bytes(),
+                "Kimi DSA context gather ABI differs");
+            return Ok(Self { partial: None,
+                combine: programs.bound("kimik31_lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"] )?,
+                gather: Some(programs.bound(&name, &["pool", "table", "staging"] )?),
+                sms: programs.library().sm_count()? });
+        }
         let tag = format.program_suffix();
         let combine = programs.spec("kimik3_lse_combine2")?;
         ensure!(combine.scalar_kinds == b"i" && combine.geometry["heads"] == 48
@@ -42,20 +67,22 @@ impl<'a> Programs<'a> {
         });
         let [first, second] = partial;
         Ok(Self {
-            partial: [first?, second?], tiles: tiles.context("Kimi context partial tile policy missing")?,
+            partial: Some(([first?, second?], tiles.context("Kimi context partial tile policy missing")?)),
             combine: programs.bound("kimik3_lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"] )?,
-            gather: programs.bound(&format!("kimik3_paged_staging_gather{tag}"), &["pool", "table", "staging"] )?,
+            gather: Some(programs.bound(&format!("kimik3_paged_staging_gather{tag}"), &["pool", "table", "staging"] )?),
             sms: programs.library().sm_count()?,
         })
     }
 
     pub(crate) fn partial(&self, rows: usize, rank: usize) -> Result<&cuteafd_ffi::KimiMlaPartial<'a>> {
-        self.partial[self.tiles.index(rows)?].get(rank).context("Kimi context partial head rank")
+        let (partial, tiles) = self.partial.as_ref().context("Kimi DSA context requires selected-token partials")?;
+        partial[tiles.index(rows)?].get(rank).context("Kimi context partial head rank")
     }
 
     pub(crate) fn layout(programs: &cuteafd_ffi::programs::Programs<'_>,
-        format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize) -> Result<ContextLayout> {
-        let mut names = cuteafd_loader::families::kimi_k3::context::program_names(format);
+        format: cuteafd_core::MlaCacheFormat, extent: usize, rows: usize, banks: usize,
+        cfg: &cuteafd_loader::families::kimi_k3::config::KimiK3Config) -> Result<ContextLayout> {
+        let mut names = cuteafd_loader::families::kimi_k3::context::program_names_for_config(format, cfg);
         names.extend(programs.names().filter(|name| name.starts_with("dense_trellis_k6_trellis_"))
             .map(str::to_owned));
         let entries = names.iter().map(|name| -> Result<_> {
@@ -63,7 +90,7 @@ impl<'a> Programs<'a> {
             Ok(serde_json::json!({"name": name, "geometry": spec.geometry,
                 "scratch_bytes_at_capacity": spec.scratch}))
         }).collect::<Result<Vec<_>>>()?;
-        ContextLayout::from_manifest(&serde_json::json!({"programs": entries}), format, extent, rows, banks)
+        ContextLayout::from_manifest_for_config(&serde_json::json!({"programs": entries}), format, extent, rows, banks, cfg)
     }
 }
 
@@ -110,6 +137,23 @@ impl<'a> Rank<'a> {
                     })?;
                 }
             }
+        }
+        if layout.dsa() {
+            // Rank one publishes this empty run; rank zero overwrites its run
+            // with global selection. Never merge two duplicate global runs.
+            for (name, bits) in [("DSA global scores", f32::NEG_INFINITY.to_bits()),
+                ("DSA global indices", u32::MAX)] {
+                let buffer = owner.buffer(name)?;
+                let bytes = bits.to_le_bytes().repeat(buffer.bytes / 4);
+                for stream in &owner.streams {
+                    stream.device.run(|| {
+                        // SAFETY: startup owns this fixed destination and ordered
+                        // staging retains the host bytes until the upload lands.
+                        unsafe { stream.device.library.copy_h2d_ordered(buffer, &bytes, stream.raw) }
+                    })?;
+                }
+            }
+            for stream in &owner.streams { stream.drain()?; }
         }
         Ok(owner)
     }

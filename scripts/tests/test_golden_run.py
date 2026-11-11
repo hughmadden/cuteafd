@@ -505,6 +505,73 @@ def test_compare_pairs_reads_safetensors_row_dumps(tmp_path):
     assert '| False |' in table and 'row-00000001.safetensors' in table
 
 
+@pytest.mark.parametrize('positions', [None, [1, 2], [4, 5]])
+def test_compare_pairs_aligns_bin_nll_with_scored_positions(tmp_path, positions):
+    root = tmp_path / 'golden'
+    logits = np.array([[8, 0, -2], [-2, 0, 8]], dtype='<f4')
+    tokens = np.array([2, 0, 2] if positions is None or positions[0] == 1
+                      else [2, 1, 1, 1, 0, 2], dtype='<u4')
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1' / 'window'
+        out.mkdir(parents=True)
+        logits.tofile(out / 'logits.bin')
+        tokens.tofile(out / 'tokens.bin')
+        if positions is not None:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    state = dict(root=str(root), vocab=3, slots={})
+    result, = golden.compare_pairs(state, [('a', 'b')], 1)
+    assert not result.get('error') and result['nll_rows'] == 2
+    expected = -float(log_probs(logits)[np.arange(2), [0, 2]].mean())
+    assert result['nll_a'] == pytest.approx(expected, abs=1e-7)
+    assert result['nll_b'] == pytest.approx(expected, abs=1e-7)
+    assert result['mean_kl'] == 0 and result['top1_agreement'] == 1
+
+
+@pytest.mark.parametrize('with_metadata', [False, True])
+def test_compare_pairs_preserves_full_prompt_bin_final_unscored_row(tmp_path, with_metadata):
+    root = tmp_path / 'golden'
+    logits = np.array([[8, 0, -2], [-2, 0, 8], [1, 2, 3]], dtype='<f4')
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        logits.tofile(out / 'logits.bin')
+        np.array([2, 0, 2], dtype='<u4').tofile(out / 'tokens.bin')
+        if with_metadata:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=[1, 2, 3])))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert not result.get('error') and result['rows'] == 3 and result['nll_rows'] == 2
+    assert result['nll_a'] == pytest.approx(-float(log_probs(logits[:2])[np.arange(2), [0, 2]].mean()), abs=1e-7)
+
+
+@pytest.mark.parametrize('positions', [None, [0, 1], [4], [4, 6], [4, 6.0], [5, 6]])
+def test_compare_pairs_refuses_ambiguous_bin_nll_alignment(tmp_path, positions):
+    root = tmp_path / 'golden'
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        np.zeros((2, 3), dtype='<f4').tofile(out / 'logits.bin')
+        np.zeros(6, dtype='<u4').tofile(out / 'tokens.bin')
+        if positions is not None:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert result.get('error')
+
+
+@pytest.mark.parametrize('mismatch', ['positions', 'tokens'])
+def test_compare_pairs_refuses_misaligned_bin_arms(tmp_path, mismatch):
+    root = tmp_path / 'golden'
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        np.zeros((2, 3), dtype='<f4').tofile(out / 'logits.bin')
+        np.array([0, 0, int(arm == 'b' and mismatch == 'tokens'), 0, 0, 0],
+                 dtype='<u4').tofile(out / 'tokens.bin')
+        positions = [3, 4] if arm == 'b' and mismatch == 'positions' else [4, 5]
+        (out / 'meta.json').write_text(json.dumps(dict(positions=positions)))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert 'different' in result['error']
+
+
 def test_resolve_model_uses_hub_paths(env):
     host, container, extra = golden.resolve_model('org/model')
     assert container == str(host) and extra == [str(host)]

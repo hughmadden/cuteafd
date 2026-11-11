@@ -77,7 +77,7 @@ impl CheckpointView {
         };
         if mode == CoreView::Fp8Compact {
             let model_type = config.get("model_type").and_then(Value::as_str).unwrap_or("");
-            if mc.is_some() {
+            if mc.is_some() || model_type == "kimi_k31" {
                 let family = match model_type {
                     "kimi_k3" | "kimi_k3_1" | "kimi_k31" | "kimi_linear" => Some("Kimi K3.1"),
                     "glm_next" | "glm5_flash" | "glm5_next" | "glm5_next_text" => Some("GLM Flash"),

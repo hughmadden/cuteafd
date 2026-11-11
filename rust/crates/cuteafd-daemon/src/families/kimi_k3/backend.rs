@@ -646,7 +646,7 @@ mod tests {
         let prefill = args.prefill()?;
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;
         let loaded = super::super::startup::load(&library, &programs, &checkpoint, &cfg, &cfg,
-            super::super::startup::Options { expert_usage: false, expert_usage_reader: Default::default(), cache_format: args.kv_cache, devices: [args.device, peer],
+            super::super::startup::Options { role: super::super::startup::Role::Serve, expert_usage: false, expert_usage_reader: Default::default(), cache_format: args.kv_cache, devices: [args.device, peer],
                 attention: cuteafd_loader::placement::attention::parse(&args.attention_placement).map_err(anyhow::Error::msg)?,
                 native_lib: &args.native_lib, manifest: &args.manifest, peers: args.peers.clone(), rtx_expert_layers: args.rtx_expert_layers,
                 rows: usize::try_from(prefill.span_rows)?,

@@ -231,7 +231,8 @@ def test_family_table_and_planner_fixtures_name_kimi() -> None:
     lines = {case["line"] for case in fixtures}
     assert "kimi_k3 kimi_k3 1 92" in lines
     launch = (ROOT / "rust/crates/cuteafd-loader/src/plan/launch.rs").read_text()
-    assert '"kimi_k3" =>' in launch
+    assert '"kimi_k3" | "kimi_k31" =>' in launch
+    assert "kimi_k3 kimi_k31 1 92" in lines
 
 
 # --- the example config --------------------------------------------------------

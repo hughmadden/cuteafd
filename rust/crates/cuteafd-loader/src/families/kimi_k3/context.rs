@@ -44,6 +44,13 @@ impl DecodeBuckets {
         Ok(buckets)
     }
 
+    fn for_dsa(mut self) -> Self {
+        // Index append/frontier metadata has no padded rows. Admission and
+        // runtime use the same exact-shape graph inventory for this variant.
+        self.plain = (1..=ROWS).collect();
+        self
+    }
+
     pub fn plain(&self) -> &[usize] { &self.plain }
 
     pub fn bucket(&self, rows: usize) -> Result<usize> {
@@ -108,7 +115,8 @@ pub struct ContextLayout {
     workspace: Vec<(&'static str, usize)>,
     metadata_banks: usize,
     decode: DecodeBuckets,
-    tiles: TilePolicy,
+    tiles: Option<TilePolicy>,
+    dsa: bool,
 }
 
 /// Required names are format-specific: a BF16 package cannot admit FP8 context.
@@ -121,9 +129,35 @@ pub fn program_names(format: MlaCacheFormat) -> Vec<String> {
     names
 }
 
+pub fn program_names_for_config(format: MlaCacheFormat, cfg: &super::config::KimiK3Config) -> Vec<String> {
+    variant_program_names(format, cfg.dsa.is_some())
+}
+
+fn variant_program_names(format: MlaCacheFormat, dsa: bool) -> Vec<String> {
+    if !dsa { return program_names(format); }
+    let tag = format.program_suffix();
+    let mut names = vec!["kimik31_lse_combine2".into(), "kimik31_dsa_candidate_merge".into(),
+        format!("kimik31_paged_staging_gather{tag}")];
+    for begin in [0, HEADS] {
+        names.push(format!("kimik31_sparse_mla_partial{tag}_h{begin}_m64"));
+    }
+    names
+}
+
 impl ContextLayout {
     pub fn from_manifest(manifest: &serde_json::Value, format: MlaCacheFormat,
         max_context: usize, unit_rows: usize, metadata_banks: usize) -> Result<Self> {
+        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, false)
+    }
+
+    pub fn from_manifest_for_config(manifest: &serde_json::Value, format: MlaCacheFormat,
+        max_context: usize, unit_rows: usize, metadata_banks: usize,
+        cfg: &super::config::KimiK3Config) -> Result<Self> {
+        Self::from_variant(manifest, format, max_context, unit_rows, metadata_banks, cfg.dsa.is_some())
+    }
+
+    fn from_variant(manifest: &serde_json::Value, format: MlaCacheFormat,
+        max_context: usize, unit_rows: usize, metadata_banks: usize, dsa: bool) -> Result<Self> {
         ensure!((1..=super::COMPILED_CONTEXT).contains(&max_context)
             && (1..=super::allocation::UNIT_ROWS_MAX).contains(&unit_rows)
             && (1..=super::allocation::LANE_ROWS_MAX).contains(&metadata_banks),
@@ -131,24 +165,48 @@ impl ContextLayout {
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
         let mut scratch = 0;
         let mut tiles = None;
-        for name in program_names(format) {
+        for name in variant_program_names(format, dsa) {
             let entries = programs.iter().filter(|p| p["name"].as_str() == Some(&name)).collect::<Vec<_>>();
             ensure!(entries.len() == 1, "Kimi context requires one {name} program");
+            if dsa && name.ends_with("lse_combine2") {
+                ensure!(entries[0]["geometry"]["heads"] == HEADS
+                    && entries[0]["geometry"]["has_sink"] == false, "Kimi DSA context combine geometry differs");
+            }
+            if dsa && name.ends_with("dsa_candidate_merge") {
+                ensure!(entries[0]["geometry"]["topk"] == 2048
+                    && entries[0]["geometry"]["unit_rows"] == ROWS, "Kimi DSA context merge geometry differs");
+            }
+            if dsa && name.contains("paged_staging_gather") {
+                let geometry = &entries[0]["geometry"];
+                ensure!(geometry["row_bytes"] == format.record_bytes() && geometry["page_rows"] == ROWS
+                    && geometry["page_bytes"] == ROWS * format.record_bytes(),
+                    "Kimi DSA context gather geometry differs");
+            }
             if name.contains("_partial") {
                 let bytes = entries[0]["scratch_bytes_at_capacity"]["scratch"].as_u64()
                     .with_context(|| format!("Kimi context missing {name} scratch extent"))?;
                 let bytes = usize::try_from(bytes).context("Kimi context scratch extent overflow")?;
                 let geometry = &entries[0]["geometry"];
-                let tile = if name.contains("_t8_") { 8 } else { 16 };
-                ensure!(geometry["heads_per_tile"] == tile, "Kimi context {name} tile geometry differs");
-                let policy = TilePolicy::from_geometry(geometry)?;
-                ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
-                    "Kimi context tile policies differ between programs");
-                tiles = Some(policy);
-                ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
-                    && geometry["device_splits"] == true && geometry["fixed_split_grid"] == 16
-                    && geometry["lse_base"] == 2,
-                    "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
+                if dsa {
+                    let begin = if name.contains("_h0_") { 0 } else { HEADS };
+                    ensure!(geometry["heads"] == 96 && geometry["head_begin"] == begin
+                        && geometry["head_count"] == HEADS && geometry["max_rows"] == ROWS
+                        && geometry["page_size"] == 1 && geometry["topk"] == 2048
+                        && geometry["num_splits"] == 16 && geometry["lse_base"] == 2
+                        && geometry["norm_eps"] == 1e-5 && geometry["kv_cache"] == format.label(),
+                        "Kimi DSA context {name} selected partial contract differs");
+                } else {
+                    let tile = if name.contains("_t8_") { 8 } else { 16 };
+                    ensure!(geometry["heads_per_tile"] == tile, "Kimi context {name} tile geometry differs");
+                    let policy = TilePolicy::from_geometry(geometry)?;
+                    ensure!(tiles.as_ref().is_none_or(|expected| *expected == policy),
+                        "Kimi context tile policies differ between programs");
+                    tiles = Some(policy);
+                    ensure!(geometry["num_splits"] == 16 && geometry["runtime_splits"] == true
+                        && geometry["device_splits"] == true && geometry["fixed_split_grid"] == 16
+                        && geometry["lse_base"] == 2,
+                        "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
+                }
                 let expected = (ROWS * HEADS * 16 * 512 * 2).next_multiple_of(1024)
                     + ROWS * HEADS * 16 * 4;
                 ensure!(bytes == expected, "Kimi context {name} scratch extent {bytes} differs from native {expected}");
@@ -159,6 +217,13 @@ impl ContextLayout {
         let partial = ROWS * HEADS * (512 * 2 + 4);
         let mut workspace = vec![("own-head partial", partial), ("peer-head partial", partial), ("partial scratch", scratch),
             ("decode input", ROWS * 7168 * 2), ("decode output", ROWS * 7168 * 2)];
+        if dsa {
+            for name in ["DSA global scores", "DSA global indices", "DSA merged scores", "DSA merged indices",
+                "DSA local slots"] {
+                workspace.push((name, ROWS * 2048 * 4));
+            }
+            workspace.push(("DSA local lengths", ROWS * 4));
+        }
         for (name, bytes) in METADATA.into_iter().zip([unit_rows * 8,
             ROWS * half_pages * 4, ROWS * 4, (ROWS + 1) * 4, 2 * half_pages * 4,
             3 * (unit_rows.div_ceil(ROWS) + 1) * 8, 4]) {
@@ -170,14 +235,18 @@ impl ContextLayout {
         let buffers = ContextBuffers { staging_unit_bytes: (ROWS * format.record_bytes()) as u64,
             staging_unit_rows: ROWS as u64, compiled_extent: max_context as u64,
             query_row_bytes: (HEADS * 576 * 2) as u64, partial_row_bytes: (HEADS * (512 * 2 + 4)) as u64,
+            candidate_row_bytes: if dsa { 2048 * 8 } else { 0 },
             decode_rows: ROWS as u64, lanes: 1, workspace_bytes, ..Default::default() };
         buffers.demands()?;
-        Ok(Self { buffers, workspace, metadata_banks, decode: DecodeBuckets::from_manifest(manifest)?,
-            tiles: tiles.context("Kimi context tile policy missing")? })
+        ensure!(dsa || tiles.is_some(), "Kimi context tile policy missing");
+        let decode = DecodeBuckets::from_manifest(manifest)?;
+        let decode = if dsa { decode.for_dsa() } else { decode };
+        Ok(Self { buffers, workspace, metadata_banks, decode, tiles, dsa })
     }
 
     pub fn decode(&self) -> &DecodeBuckets { &self.decode }
-    pub fn tiles(&self) -> &TilePolicy { &self.tiles }
+    pub fn tiles(&self) -> Option<&TilePolicy> { self.tiles.as_ref() }
+    pub fn dsa(&self) -> bool { self.dsa }
     pub fn buffers(&self) -> ContextBuffers { self.buffers }
     pub fn workspace(&self) -> Vec<(&'static str, usize)> { self.workspace.clone() }
 
@@ -288,18 +357,18 @@ mod tests {
         add_manifest_programs(&mut manifest);
         let baseline = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Bf16, 8192, 128, 3)?;
         for (rows, tile) in [(1, 8), (2, 8), (3, 8), (4, 16), (8, 16), (16, 16), (32, 16), (48, 16), (64, 16)] {
-            assert_eq!(baseline.tiles().tile(rows)?, tile);
-            assert_eq!(baseline.tiles().index(rows)?, usize::from(tile == 16));
+            assert_eq!(baseline.tiles().unwrap().tile(rows)?, tile);
+            assert_eq!(baseline.tiles().unwrap().index(rows)?, usize::from(tile == 16));
         }
-        assert!(baseline.tiles().tile(0).is_err());
-        assert!(baseline.tiles().tile(65).is_err());
+        assert!(baseline.tiles().unwrap().tile(0).is_err());
+        assert!(baseline.tiles().unwrap().tile(65).is_err());
         let routes = (1..=64).map(|rows| if rows % 3 == 0 {8} else {16}).collect::<Vec<_>>();
         for program in manifest["programs"].as_array_mut().unwrap().iter_mut()
             .filter(|program| program["name"].as_str().unwrap().contains("_partial")) {
             program["geometry"]["context_heads_per_tile"] = serde_json::json!(routes);
         }
         let changed = ContextLayout::from_manifest(&manifest, MlaCacheFormat::Bf16, 8192, 128, 3)?;
-        for rows in 1..=64 { assert_eq!(changed.tiles().tile(rows)?, routes[rows - 1]); }
+        for rows in 1..=64 { assert_eq!(changed.tiles().unwrap().tile(rows)?, routes[rows - 1]); }
         assert_eq!(baseline.decode(), changed.decode());
         assert_eq!(baseline.workspace(), changed.workspace());
         assert_eq!(baseline.buffers(), changed.buffers());
@@ -344,6 +413,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn k31_context_admits_selected_partials_and_exact_candidate_owners() -> Result<()> {
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            let scratch = ROWS * HEADS * 16 * (512 * 2 + 4);
+            let entries = variant_program_names(format, true).into_iter().map(|name| {
+                let begin = if name.contains("_h0_") { 0 } else { HEADS };
+                serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":scratch},
+                    "geometry":{"heads":96,"head_begin":begin,"head_count":HEADS,"max_rows":ROWS,
+                        "page_size":1,"topk":2048,"num_splits":16,"lse_base":2,"norm_eps":1e-5,
+                        "kv_cache":format.label(),"unit_rows":ROWS}})
+            }).collect::<Vec<_>>();
+            let mut manifest = serde_json::json!({"programs":entries});
+            manifest["programs"][0]["geometry"] = serde_json::json!({"heads":HEADS,"has_sink":false});
+            manifest["programs"][2]["geometry"] = serde_json::json!({"row_bytes":format.record_bytes(),
+                "page_rows":ROWS,"page_bytes":ROWS * format.record_bytes()});
+            let layout = ContextLayout::from_variant(&manifest, format, 8192, 2752, 3, true)?;
+            assert!(layout.dsa() && layout.tiles().is_none());
+            assert_eq!(layout.decode().plain(), (1..=ROWS).collect::<Vec<_>>());
+            assert_eq!(layout.decode().graph_rows(0, 1, ROWS), (1..=ROWS).collect::<Vec<_>>());
+            for rows in 1..=ROWS { assert_eq!(layout.decode().dispatch_rows(rows, false)?, rows); }
+            assert_eq!(layout.buffers().candidate_row_bytes, 2048 * 8);
+            let candidates = layout.workspace().iter().filter(|(name, _)| name.starts_with("DSA "))
+                .map(|(_, bytes)| *bytes).sum::<usize>();
+            assert_eq!(candidates, ROWS * (5 * 2048 * 4 + 4));
+            assert_eq!(layout.buffers().workspace_bytes,
+                layout.workspace().iter().map(|(_, bytes)| *bytes as u64).sum::<u64>());
+            assert!(ContextLayout::from_manifest(&manifest, format, 8192, 2752, 3).is_err());
+            for field in ["norm_eps", "lse_base", "topk", "head_begin", "page_size", "kv_cache"] {
+                let mut broken = manifest.clone();
+                broken["programs"][3]["geometry"][field] = serde_json::Value::Null;
+                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true).is_err(), "{field}");
+            }
+            for name in variant_program_names(format, true) {
+                let mut broken = manifest.clone();
+                broken["programs"].as_array_mut().unwrap().retain(|program| program["name"] != name);
+                assert!(ContextLayout::from_variant(&broken, format, 8192, 2752, 3, true).is_err(), "{name}");
+            }
+        }
+        Ok(())
     }
 
     #[test]

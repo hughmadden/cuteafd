@@ -89,7 +89,7 @@ pub(super) struct Residency {
 pub(super) fn replicated(rest: &str) -> bool {
     !rest.starts_with("self_attn.") && !rest.starts_with("block_sparse_moe.shared_experts.") && !rest.starts_with("mlp.")
         || ["self_attn.f_a_proj.", "self_attn.o_norm.", "self_attn.q_a_proj.", "self_attn.q_a_layernorm.",
-            "self_attn.kv_a_proj_with_mqa.", "self_attn.kv_a_layernorm."].iter().any(|p| rest.starts_with(p))
+            "self_attn.kv_a_proj_with_mqa.", "self_attn.kv_a_layernorm.", "self_attn.indexer."].iter().any(|p| rest.starts_with(p))
 }
 
 /// Strip the text prefix: `language_model.model.layers.3.x` -> `layers.3.x`.
@@ -138,6 +138,14 @@ impl Model {
                     add(format!("{a}.kv_a_proj_with_mqa.weight"), vec![cfg.kv_lora_rank + cfg.qk_rope_dim, h], DType::Bf16);
                     add(format!("{a}.kv_a_layernorm.weight"), vec![cfg.kv_lora_rank], DType::Bf16);
                     add(format!("{a}.kv_b_proj.weight"), vec![heads * (cfg.qk_nope_dim + cfg.v_head_dim), cfg.kv_lora_rank], DType::Bf16);
+                    if let Some(index) = cfg.dsa {
+                        add(format!("{a}.indexer.wq_b.weight"), vec![index.heads * index.head_dim, cfg.q_lora_rank], DType::Bf16);
+                        add(format!("{a}.indexer.wk.weight"), vec![index.head_dim, h], DType::Bf16);
+                        add(format!("{a}.indexer.weights_proj.weight"), vec![index.heads, h], DType::Bf16);
+                        for leaf in ["weight", "bias"] {
+                            add(format!("{a}.indexer.k_norm.{leaf}"), vec![index.head_dim], DType::Bf16);
+                        }
+                    }
                 }
             }
             if cfg.dense[layer] {
@@ -186,7 +194,7 @@ impl Model {
                         let ordinal = model.cfg.dense[..layer].iter().filter(|dense| !**dense).count();
                         model.frontends[ordinal % 2] += tensor.meta.byte_length;
                     }
-                    let residency = if role.component == Component::Attention && model.cfg.attention[layer] == KimiAttention::Mla {
+                    let residency = if matches!(role.component, Component::Attention | Component::Indexer) && model.cfg.attention[layer] == KimiAttention::Mla {
                         &mut model.mla[layer]
                     } else { &mut model.coordinator };
                     let bucket = if replicated(rest) { &mut residency.replicated } else { &mut residency.split };
@@ -227,6 +235,7 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
     let layers = (0..cfg.layers).map(|layer| LayerSpec {
         attention: match cfg.attention[layer] {
             KimiAttention::Kda => AttentionKind::Kda,
+            KimiAttention::Mla if cfg.dsa.is_some() => AttentionKind::MlaDsa { indexer: true },
             KimiAttention::Mla => AttentionKind::Mla { rope: false, output_gate: true },
         },
         ffn: if cfg.dense[layer] { FfnKind::Dense { intermediate: cfg.dense_intermediate } } else { FfnKind::Moe },
@@ -258,7 +267,9 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
                 cfg.residual_block, cfg.max_residual_blocks()),
             format!("Situ FFNs (beta {}, linear beta {}); MLA without RoPE plus sigmoid output gate; KDA full-rank output gate",
                 cfg.situ_beta, cfg.situ_linear_beta),
-            "no native MTP; external K3 DFlash/dSpark drafters exist".into(),
+            if cfg.dsa.is_some() {
+                "Gated DSA: native BF16 NoPE indexer; device execution and K3 drafter compatibility unqualified (#1777)".into()
+            } else { "no native MTP; external K3 DFlash/dSpark drafters exist".into() },
         ],
     }
 }
@@ -275,8 +286,8 @@ impl Family for KimiK3 {
     fn id(&self) -> &'static str { "kimi_k3" }
     fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn detect(&self, checkpoint: &Checkpoint) -> bool {
-        checkpoint.architectures().iter().any(|a| a == "KimiK3ForConditionalGeneration")
-            || checkpoint.model_type() == Some("kimi_k3")
+        checkpoint.architectures().iter().any(|a| matches!(a.as_str(), "KimiK3ForConditionalGeneration" | "KimiK31ForConditionalGeneration"))
+            || matches!(checkpoint.model_type(), Some("kimi_k3" | "kimi_k31"))
     }
     fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn FamilyModel>, ConfigError> {
         Ok(Box::new(Model::open(checkpoint).map_err(ConfigError::from_anyhow)?))
@@ -300,6 +311,7 @@ impl Family for KimiK3 {
             else if rest.starts_with("block_sparse_moe.shared_experts.") { Component::SharedExpert }
             else if rest.starts_with("block_sparse_moe.routed_expert_") { Component::LatentProjection }
             else if rest.starts_with("mlp.") { Component::DenseFfn }
+            else if rest.starts_with("self_attn.indexer.") { Component::Indexer }
             else if rest.starts_with("self_attn.") { Component::Attention }
             else if rest.starts_with("self_attention_res_") || rest.starts_with("mlp_res_") { Component::ResidualMix }
             else if rest.starts_with("input_layernorm.") || rest.starts_with("post_attention_layernorm.") { Component::Norm }
@@ -328,7 +340,7 @@ impl FamilyModel for Model {
     fn configure(&mut self) -> Result<(), ConfigError> {
         self.core.validate_runtime_groups(&self.cfg).map_err(ConfigError::from_anyhow)
     }
-    fn native_serving_admission(&self) -> bool { true }
+    fn native_serving_admission(&self) -> bool { self.cfg.dsa.is_none() }
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
@@ -349,6 +361,10 @@ impl FamilyModel for Model {
             geometry.placement = crate::serving_capacity::KvPlacement::PartitionedContext;
             for rank in &mut geometry.ranks {
                 rank.persistent_unit_bytes = (layers * 64 * options.mla_kv.record_bytes() / 2) as u64;
+                // Each context rank selects over the full token history.
+                if let Some(index) = self.cfg.dsa {
+                    rank.persistent_unit_bytes += (layers * 64 * (index.head_dim + 4)) as u64;
+                }
             }
         }
         Ok(Some(geometry))

@@ -279,3 +279,167 @@ def test_ml4_shared_score_reduction_preserves_math():
     expected = torch.einsum("qh,qhk->qk", w.float() * 3 ** -.5,
         torch.relu(torch.einsum("qhd,kd->qhk", q.float(), k.float()) * 4 ** -.5))
     assert torch.equal(indexer_score_reduction(q, k, w), expected)
+
+
+def test_rust_golden_vectors_match_pinned_python_reference():
+    import hashlib
+    import json
+    import math
+    torch = pytest.importorskip("torch")
+    from shape_invariant import fixed_index_topk
+    from families.mistral_large4.ops import indexer_score_reduction
+
+    fixture = json.loads((Path(__file__).parent / "fixtures/kimi-k31-dsa.json").read_text())
+    assert fixture["reference_sha256"] == hashlib.sha256(Path(k31.__file__).read_bytes()).hexdigest()
+    tensor = lambda key, *shape: torch.tensor(fixture[key], dtype=torch.float32).reshape(*shape)
+    c = config()
+    a = k31.extend_reference(tiny_reference(torch), c).KimiDSAAttention(c, 1).eval().float()
+    index = a.indexer
+    with torch.no_grad():
+        for parameter, key in ((index.wq_b.weight, "wq"), (index.wk.weight, "wk"),
+                (index.weights_proj.weight, "wh"), (index.k_norm.weight, "norm"),
+                (index.k_norm.bias, "bias")):
+            parameter.copy_(tensor(key, *parameter.shape))
+        iq, ik, iw = index(tensor("hidden", 5, 4), tensor("latent", 5, 4))
+        torch.testing.assert_close(iq, tensor("index_queries", 5, 2, 4), rtol=0, atol=0)
+        torch.testing.assert_close(ik, tensor("index_keys", 5, 4), rtol=0, atol=0)
+        scores = indexer_score_reduction(iq, ik, iw)
+        q, k, v, gate = (tensor("mla_query", 5, 4), tensor("mla_keys", 5, 4),
+            tensor("mla_values", 5, 2), tensor("gate", 5, 2))
+        outputs = []
+        for position in range(5):
+            chosen = fixed_index_topk(scores[position:position+1, :position+1], 2)
+            ids = sorted(chosen.indices[0, torch.isfinite(chosen.values[0])].tolist())
+            assert ids + [-1] * (2 - len(ids)) == fixture["selected"][position]
+            # Evaluate the selected attention directly, independent of the Rust oracle.
+            probabilities = ((q[position] @ k[ids].T) / math.sqrt(4)).softmax(-1)
+            outputs.append((probabilities @ v[ids]) * gate[position].sigmoid())
+        torch.testing.assert_close(torch.stack(outputs), tensor("gated_values", 5, 2),
+            rtol=3e-5, atol=3e-6)
+
+
+def test_skipped_quick_windows_preserve_full_and_prefix_defaults():
+    import copy
+    import re
+    from families.kimi_k3.golden import QUICK_WINDOWS, execution_windows
+    rust = (Path(__file__).resolve().parents[2] /
+        "rust/crates/cuteafd-bench/src/fidelity_dataset.rs").read_text()
+    sealed = re.search(r"pub const QUICK_WINDOWS:.*?= \[(.*?)\];", rust).group(1)
+    assert tuple(re.findall(r'"([^"]+)"', sealed)) == QUICK_WINDOWS
+    panel = {"windows": [dict(id=wid, tokens=[1] * (9000 if wid == "a20" else 520),
+        score_from=8488 if wid == "a20" else 8) for wid in (*QUICK_WINDOWS, "extra")]}
+    original = copy.deepcopy(panel)
+    selected = execution_windows(panel, skip_routed=True)
+    assert tuple(w["id"] for w in selected) == QUICK_WINDOWS
+    assert max(w["score_from"] for w in selected) > 8192
+    assert len(execution_windows(panel)) == 9
+    probe = {"windows": [dict(id="short", tokens=[1] * 640, score_from=64)]}
+    assert execution_windows(probe, skip_routed=True, prefix_probe=True) == probe["windows"]
+    selected[0]["tokens"][0] = 2
+    assert panel == original
+    for change, message in ((lambda p: p["windows"].pop(0), "sealed eight"),
+            (lambda p: p["windows"].append(copy.deepcopy(p["windows"][0])), "sealed eight"),
+            (lambda p: p["windows"][0].update(score_from=1), "512 scored"),
+            (lambda p: p["windows"][4].update(tokens=[1] * 520, score_from=8), "8K history")):
+        changed = copy.deepcopy(panel)
+        change(changed)
+        with pytest.raises(ValueError, match=message):
+            execution_windows(changed, skip_routed=True)
+
+
+def test_skipped_routed_diagnostic_keeps_router_and_shared_only():
+    torch = pytest.importorskip("torch")
+    calls = []
+
+    class Gate(torch.nn.Module):
+        def forward(self, hidden):
+            calls.append(hidden.clone())
+            return torch.zeros(1, dtype=torch.long), torch.ones(1)
+
+    block = torch.nn.Module()
+    block.gate = Gate()
+    block.shared_experts = torch.nn.Linear(4, 4, bias=False)
+    block.experts = torch.nn.ModuleList([torch.nn.Linear(4, 4)])
+    block.routed_expert_down_proj = torch.nn.Linear(4, 2)
+    block.routed_expert_up_proj = torch.nn.Linear(2, 4)
+    block.routed_expert_norm = torch.nn.LayerNorm(2)
+    layer = torch.nn.Module()
+    layer.block_sparse_moe = block
+    hidden = torch.randn(2, 4)
+    expected = block.shared_experts(hidden)
+    assert k31.skip_routed_experts(layer) is layer
+    assert k31.skip_routed_experts(layer) is layer
+    assert torch.equal(block(hidden), expected)
+    assert len(calls) == 1
+    assert all(name.startswith("block_sparse_moe.shared_experts.") for name, _ in layer.named_parameters())
+    assert not hasattr(block, "experts")
+    dense = torch.nn.Module()
+    assert k31.skip_routed_experts(dense) is dense
+
+
+def test_arithmetic_diagnostic_is_explicit_single_window_and_cannot_qualify():
+    from families.kimi_k3.golden import diagnostic_options, diagnostic_rows, execution_windows
+    panel = {"windows": [dict(id="a00", tokens=[1] * 1834, score_from=1322)]}
+    assert diagnostic_options(types.SimpleNamespace()) is None
+    args = dict(skip_routed_experts=True, diagnostic_window="a00", diagnostic_arithmetic="f32")
+    assert diagnostic_options(types.SimpleNamespace(**args))["arithmetic"] == "f32"
+    assert execution_windows(panel, skip_routed=True, diagnostic_window="a00") == panel["windows"]
+    for change in (dict(skip_routed_experts=False), dict(diagnostic_window=None),
+                   dict(diagnostic_arithmetic=None), dict(stop_after_layer=0), dict(diagnose_layer=0)):
+        with pytest.raises(ValueError, match="arithmetic diagnostic"):
+            diagnostic_options(types.SimpleNamespace(**(args | change)))
+    for kwargs in (dict(skip_routed=False), dict(skip_routed=True, prefix_probe=True)):
+        with pytest.raises(ValueError, match="arithmetic diagnostic"):
+            execution_windows(panel, diagnostic_window="a00", **kwargs)
+    with pytest.raises(ValueError, match="absent or duplicated"):
+        execution_windows(panel, skip_routed=True, diagnostic_window="missing")
+    multiple = {"windows": [*panel["windows"], dict(id="a04", tokens=[2] * 1822, score_from=1310)]}
+    assert execution_windows(multiple, skip_routed=True, diagnostic_window="a04,a00") == multiple["windows"]
+    listed = diagnostic_options(types.SimpleNamespace(**(args | {"diagnostic_window": "a00,a04"})))
+    assert listed["window"] == "a00,a04"
+    for invalid in ("a00,a00", "a00,missing", "a00,", "", "a04,a04"):
+        with pytest.raises(ValueError, match="absent or duplicated"):
+            execution_windows(multiple, skip_routed=True, diagnostic_window=invalid)
+    duplicated = {"windows": [*multiple["windows"], multiple["windows"][0]]}
+    with pytest.raises(ValueError, match="absent or duplicated"):
+        execution_windows(duplicated, skip_routed=True, diagnostic_window="a00,a04")
+    assert diagnostic_rows("1757:1821") == (1757, 1821)
+    import argparse
+    for value in ("0:65", "-1:1", "1:1", "1", "x:2"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            diagnostic_rows(value)
+
+
+def test_diagnostic_capture_retains_exact_prefix_and_ffn_without_mutation(tmp_path):
+    import json
+    import numpy as np
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.golden import DiagnosticCapture
+
+    class Layer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index, self.attn_res_block_size, self.is_linear_attn = index, 2, True
+            self.self_attn = torch.nn.Identity()
+
+        def forward(self, hidden):
+            attention = self.self_attn(hidden * 2)
+            prefix = attention if self.index % 2 == 0 else hidden + attention
+            return prefix + 1
+
+    hidden = torch.arange(24).reshape(1, 6, 4).float()
+    for index in (0, 1):
+        layer = Layer(index)
+        expected = layer(hidden)
+        root = tmp_path / str(index)
+        with DiagnosticCapture(root, layer, index, (1, 3)) as capture:
+            result = layer(hidden)
+            capture.save("post-ffn", result)
+        assert torch.equal(result, expected)
+        assert not layer._forward_pre_hooks and not layer.self_attn._forward_hooks
+        for kind, want in (("post-attention", expected - 1), ("post-ffn", expected)):
+            folder = root / ("layer-%02d-%s" % (index, kind))
+            actual = np.fromfile(folder / "residual.bin", dtype="<f4").reshape(2, 4)
+            np.testing.assert_array_equal(actual, want[0, 1:3].numpy())
+            meta = json.loads((folder / "meta.json").read_bytes())
+            assert meta["rows"] == [1, 3] and meta["diagnostic_only"]

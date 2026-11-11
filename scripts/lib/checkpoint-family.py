@@ -34,6 +34,7 @@ FAMILIES = {
     "step5_vl": "step5",
     "step5": "step5",
     "kimi_k3": "kimi_k3",
+    "kimi_k31": "kimi_k3",
     "muse_spark": "muse_spark",
     "mistral_large4": "mistral_large4",
 }

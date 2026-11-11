@@ -15,6 +15,13 @@ const MODES: &[LayerMode] = &[LayerMode::HeadSplit, LayerMode::ContextSplit,
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
+fn program_families(dsa: bool, projected: bool) -> &'static [&'static str] {
+    match (dsa, projected) {
+        (false, false) => &["kimik3"], (false, true) => &["kimik3", "kimi"],
+        (true, false) => &["kimik3", "kimik31"], (true, true) => &["kimik3", "kimik31", "kimi"],
+    }
+}
+
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
@@ -28,6 +35,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let rows = prefill.span_rows as usize;
     let unit = prefill.unit_rows as usize;
     let cfg = model.cfg();
+    if let Err(error) = cfg.validate_attention_runtime() {
+        report.refuse_placement(error.to_string(),
+            "Complete the Gated DSA kernel and prefix-cache qualification tracked in #1777; dense MLA is not an equivalent fallback.");
+        return MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(),
+            notes: vec!["Kimi K3.1 headers and core views are recognized; sparse execution is not qualified".into()] };
+    }
     let ranks = requested.spark_ranks();
     let gpus = opts.rtx_bytes.len();
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: 0, waste: Vec::new(), notes: vec![
@@ -95,15 +108,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let layout = (|| -> anyhow::Result<_> {
             let manifest = manifest.as_ref().context("Kimi context requires PROGRAMS.json")?;
             let banks = if rows <= 64 { 1 } else { rows.div_ceil(unit) };
-            crate::families::kimi_k3::context::ContextLayout::from_manifest(manifest, opts.mla_kv,
-                context as usize, unit, banks)
+            crate::families::kimi_k3::context::ContextLayout::from_manifest_for_config(manifest, opts.mla_kv,
+                context as usize, unit, banks, &cfg)
         })();
         match layout {
             Ok(layout) => Some(layout),
             Err(error) => {
                 report.refuse_placement(format!("Kimi context program admission refused: {error:#}"),
                     &format!("Install PROGRAMS.json with {}.",
-                        crate::families::kimi_k3::context::program_names(opts.mla_kv).join(", ")));
+                        crate::families::kimi_k3::context::program_names_for_config(opts.mla_kv, &cfg).join(", ")));
                 return memory;
             }
         }
@@ -163,7 +176,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                     gpus, |_, _| true, |layer| cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla,
                     Some(context.decode()))?;
             }
-            let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
+            let families = program_families(cfg.dsa.is_some(), !model.core.projections.is_empty());
             let native_manifest = input.programs_manifest(path)?;
             let native = model.core.native_programs(unit, gpus, Some(&native_manifest))?;
             let mut programs = ProgramSet::from_manifest(manifest, families);
@@ -447,7 +460,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             entry_gpu: 0, head_gpu: head_rank as u8,
             terminal: if gpus == 1 { TerminalHome::AttentionOwner } else { TerminalHome::Replicated } },
         peer_row_bytes, maximum_pages,
-        records_per_page, records_by_layer, layer_attention, first_moe,
+        records_per_page, records_by_layer,
+        index_bytes_per_page: cfg.dsa.map_or(0, |index| PAGE * (index.head_dim + 4) as u64),
+        layer_attention, first_moe,
         kinds,
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
@@ -607,6 +622,34 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Spark budget {} B/rank includes rank-specific header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
         spark_budget.budget, admitted.waves, admitted.unit_rows));
     memory
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::*;
+
+    #[test]
+    fn k31_module_census_keeps_shared_and_native_numerics_in_every_core_view() {
+        let manifest = serde_json::json!({"programs": [
+            {"name":"kimik3_rmsnorm_h7168", "scratch_bytes_at_capacity":{"scratch":16}},
+            {"name":"kimik31_index_producer_m64", "scratch_bytes_at_capacity":{"scratch":32}},
+            {"name":"kimik31_sparse_mla_h96_m64", "scratch_bytes_at_capacity":{"scratch":64}},
+            {"name":"kimi_mla_rank_norm_h96_kv576_m64", "scratch_bytes_at_capacity":{"scratch":128}},
+            {"name":"glmf_index_topk_decode_m64", "scratch_bytes_at_capacity":{"scratch":256}}
+        ]});
+        for dsa in [false, true] { for projected in [false, true] {
+            let programs = ProgramSet::from_manifest(&manifest, program_families(dsa, projected));
+            assert!(programs.names.iter().any(|name| name == "kimik3_rmsnorm_h7168"));
+            for name in ["kimik31_index_producer_m64", "kimik31_sparse_mla_h96_m64"] {
+                assert_eq!(programs.names.iter().any(|selected| selected == name), dsa);
+            }
+            assert_eq!(programs.names.iter().any(|name| name == "kimi_mla_rank_norm_h96_kv576_m64"), projected);
+            assert!(!programs.names.iter().any(|name| name.starts_with("glmf_")));
+            assert_eq!(programs.names.len(), 1 + usize::from(dsa) * 2 + usize::from(projected));
+            assert_eq!(programs.scratch.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+                16 + u64::from(dsa) * 96 + u64::from(projected) * 128);
+        } }
+    }
 }
 
 /// Kimi's typed owners, the same sum its pre-placement reserve charges.

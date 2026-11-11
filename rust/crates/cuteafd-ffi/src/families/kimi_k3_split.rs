@@ -26,11 +26,21 @@ pub struct KimiMlaSplit<'a> {
 impl<'a> KimiMlaSplit<'a> {
     pub fn load(programs: &'a Programs<'a>, names: [&str; 3], heads: usize, rows: usize,
         kv_stride: usize, cache_format: MlaCacheFormat) -> Result<Self> {
+        Self::load_variant(programs, names, heads, rows, kv_stride, cache_format, false)
+    }
+
+    pub fn load_k31(programs: &'a Programs<'a>, names: [&str; 3], heads: usize, rows: usize,
+        kv_stride: usize, cache_format: MlaCacheFormat) -> Result<Self> {
+        Self::load_variant(programs, names, heads, rows, kv_stride, cache_format, true)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, names: [&str; 3], heads: usize, rows: usize,
+        kv_stride: usize, cache_format: MlaCacheFormat, k31: bool) -> Result<Self> {
         if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) || !matches!(kv_stride, 576 | 640) {
             return Err(KimiSplitError::Invalid("MLA geometry"));
         }
         let specs = [programs.spec(names[0])?, programs.spec(names[1])?, programs.spec(names[2])?];
-        let scratch = validate_mla(specs, heads, rows, kv_stride, cache_format)?;
+        let scratch = validate_mla_variant(specs, heads, rows, kv_stride, cache_format, k31)?;
         let rank = programs.program(names[0], RANK)?;
         let query = programs.program(names[1], QUERY)?;
         let gate = programs.program(names[2], GATE)?;
@@ -146,14 +156,19 @@ fn schema(spec: &ProgramSpec, pointers: &[&str], scalars: &[u8], rows: usize) ->
     }
     Ok(())
 }
+#[cfg(test)]
 fn validate_mla(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: usize,
     cache_format: MlaCacheFormat) -> Result<usize> {
+    validate_mla_variant(specs, heads, rows, kv_stride, cache_format, false)
+}
+fn validate_mla_variant(specs: [&ProgramSpec;3], heads: usize, rows: usize, kv_stride: usize,
+    cache_format: MlaCacheFormat, k31: bool) -> Result<usize> {
     for (spec, pointers) in specs.iter().zip([RANK,QUERY,GATE]) {
         schema(spec,pointers,b"i",rows)?;
         if [("heads",heads),("hidden",7168),("q_lora_rank",1536),("kv_lora_rank",512),
             ("qk_nope_dim",128),("qk_rope_dim",64),("v_head_dim",128),("page_rows",64)]
             .iter().any(|&(key,value)|spec.geometry[key].as_u64()!=Some(value as u64))
-            || spec.geometry["norm_eps"].as_f64()!=Some(1e-6) {
+            || spec.geometry["norm_eps"].as_f64()!=Some(if k31 { 1e-5 } else { 1e-6 }) {
             return Err(KimiSplitError::Invalid("MLA manifest geometry"));
         }
     }
@@ -239,6 +254,21 @@ mod tests {
         a.pointers.swap(0,1);
         assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Fp8).is_err());
     }
+    #[test]
+    fn k31_projected_mla_requires_its_own_rank_norm_epsilon() {
+        let mut a = spec(RANK,64);
+        a.geometry["kv_stride"]=json!(640);
+        a.geometry["kv_cache"]=json!("bf16");
+        a.scratch.insert("scratch".into(),(64usize*2112*2).div_ceil(1024) as u64*1024);
+        let mut b=spec(QUERY,64); let mut c=spec(GATE,64);
+        assert!(validate_mla_variant([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16,true).is_err());
+        for spec in [&mut a,&mut b,&mut c] { spec.geometry["norm_eps"]=json!(1e-5); }
+        assert!(validate_mla_variant([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16,true).is_ok());
+        assert!(validate_mla([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16).is_err());
+        b.geometry["norm_eps"]=json!(1e-6);
+        assert!(validate_mla_variant([&a,&b,&c],48,64,640,MlaCacheFormat::Bf16,true).is_err());
+    }
+
     #[test]
     fn whole_kda_manifest_requires_full_width_scratch() {
         let g = KimiKdaGeometry::new(96).unwrap();

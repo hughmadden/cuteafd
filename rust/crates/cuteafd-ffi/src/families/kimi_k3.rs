@@ -161,6 +161,380 @@ impl<'a> KimiMla<'a> {
     }
 }
 
+/// K3.1's native BF16 MLA projection seams, without any dense-attention
+/// program. The shared lane inserts index production and selection between them.
+pub struct KimiMlaProjection<'a> {
+    producer: Program<'a>, output: Program<'a>,
+    heads: usize, rows: usize, scratch: [usize; 2], cache_format: MlaCacheFormat,
+}
+
+impl<'a> KimiMlaProjection<'a> {
+    pub fn load_k31(programs: &'a Programs<'a>, heads: usize, rows: usize,
+        cache_format: MlaCacheFormat) -> Result<Self> {
+        let suffix = if heads == 48 { "" } else { "_h96" };
+        let cache = cache_format.program_suffix();
+        let producer = programs.program(&format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), PRODUCER)?;
+        let output = programs.program(&format!("kimik31_mla_output{suffix}_m{rows}"), OUTPUT)?;
+        let scratch = validate_k31_projection_manifest([producer.spec(), output.spec()], heads, rows, cache_format)?;
+        Ok(Self { producer, output, heads, rows, scratch, cache_format })
+    }
+
+    pub fn scratch_bytes(&self) -> [usize; 2] { self.scratch }
+
+    pub fn produce(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_producer(weights, b, self.heads, self.rows, self.scratch[0], self.cache_format.record_bytes())?;
+        // SAFETY: validated native operands and disjoint writes; caller retains
+        // the stream and all backing arenas through completion and graph replay.
+        unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, weights.qkv_a.ptr, weights.q_a_norm.ptr,
+            weights.kv_a_norm.ptr, weights.q_b.ptr, weights.uk.ptr, b.cache.ptr, b.query.ptr,
+            b.q_resid.ptr, b.producer_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
+    pub fn output(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_output(weights, b, self.heads, self.rows, self.scratch[1])?;
+        // SAFETY: validated output phase; selected attention or peer combination
+        // precedes this launch on the retained stream, with stable buffer owners.
+        unsafe { self.output.launch(&[b.attention.ptr, b.x.ptr, weights.uv.ptr, weights.gate.ptr,
+            weights.output.ptr, b.output.ptr, b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_k31_projection_manifest(specs: [&ProgramSpec; 2], heads: usize, rows: usize,
+    format: MlaCacheFormat) -> Result<[usize; 2]> {
+    if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) {
+        return Err(KimiMlaError::Invalid("K3.1 projection head/row geometry"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let scratch = [align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
+        2 * align(rows * heads * 128 * 2)];
+    for (i, spec) in specs.iter().enumerate() {
+        let g = &spec.geometry;
+        let pointers = if i == 0 { PRODUCER } else { OUTPUT };
+        if spec.capacity_rows as usize != rows || spec.scalar_kinds != b"i"
+            || spec.pointers.iter().map(String::as_str).ne(pointers.iter().copied())
+            || g["norm_eps"].as_f64() != Some(1e-5)
+            || (i == 0 && g["kv_cache"].as_str() != Some(format.label()))
+            || [("heads", heads), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+                ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
+                .iter().any(|&(key, value)| g[key].as_u64() != Some(value as u64))
+            || spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch[i] as u64) {
+            return Err(KimiMlaError::Invalid("K3.1 projection manifest geometry/ABI/scratch"));
+        }
+    }
+    Ok(scratch)
+}
+
+const INDEX_PRODUCER: &[&str] = &["x", "q_resid", "positions", "index_slots", "cos_sin",
+    "w_iq", "w_ik", "k_norm_w", "k_norm_b", "index_cache", "q_fp8", "head_weights", "scratch"];
+
+/// Native BF16 index projections. Key/head rows share one packed arena view;
+/// neither projection participates in the selected dense-core conversion.
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexWeights {
+    pub query: Buffer, pub key_heads: Buffer, pub norm: Buffer, pub bias: Buffer,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexBatch {
+    pub rows: usize, pub cache_pages: usize,
+    pub x: Buffer, pub q_resid: Buffer, pub positions: Buffer, pub slots: Buffer,
+    /// NoPE ignores this retained placeholder, matching the shared producer ABI.
+    pub cos_sin: Buffer,
+    pub cache: Buffer, pub query_fp8: Buffer, pub head_weights: Buffer, pub scratch: Buffer,
+}
+
+pub struct KimiIndexProducer<'a> {
+    program: Program<'a>, rows: usize, scratch: usize,
+}
+impl<'a> KimiIndexProducer<'a> {
+    pub fn load(programs: &'a Programs<'a>, rows: usize) -> Result<Self> {
+        let name = format!("kimik31_index_producer_m{rows}");
+        let scratch = validate_index_manifest(programs.spec(&name)?, rows)?;
+        Ok(Self { program: programs.program(&name, INDEX_PRODUCER)?, rows, scratch })
+    }
+
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// The caller orders normalized q-LoRA and hidden inputs before this stage,
+    /// and retains native weights/cache/outputs through stream and graph use.
+    pub fn launch(&self, weights: KimiIndexWeights, b: KimiIndexBatch, stream: *mut c_void) -> Result<()> {
+        validate_index_batch(weights, b, self.rows, self.scratch)?;
+        // SAFETY: extents, devices and write aliases checked. The owning lane
+        // supplies valid physical slots and retains the stream and storage.
+        unsafe { self.program.launch(&[b.x.ptr, b.q_resid.ptr, b.positions.ptr, b.slots.ptr,
+            b.cos_sin.ptr, weights.query.ptr, weights.key_heads.ptr, weights.norm.ptr,
+            weights.bias.ptr, b.cache.ptr, b.query_fp8.ptr, b.head_weights.ptr, b.scratch.ptr],
+            &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_index_manifest(spec: &ProgramSpec, rows: usize) -> Result<usize> {
+    let g = &spec.geometry;
+    if !(1..=4096).contains(&rows) || spec.capacity_rows as usize != rows
+        || spec.scalar_kinds != b"i" || spec.pointers.iter().map(String::as_str).ne(INDEX_PRODUCER.iter().copied())
+        || [("hidden", 7168), ("q_lora_rank", 1536), ("index_heads", 32),
+            ("index_head_dim", 128), ("index_topk", 2048), ("page_rows", 64), ("max_rows", rows)]
+            .iter().any(|&(key, value)| g[key].as_u64() != Some(value as u64))
+        || g["index_norm_eps"].as_f64() != Some(1e-5) || g["rope"].as_bool() != Some(false)
+        || g["scale_format"].as_str() != Some("ue8m0") || g["scale_storage"].as_str() != Some("float32")
+        || g["query_amax_floor"].as_f64() != Some(1e-10) || g["key_amax_floor"].as_f64() != Some(1e-4) {
+        return Err(KimiMlaError::Invalid("K3.1 index manifest arithmetic/geometry/ABI"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let scratch = align(rows * 4096 * 2) + align(rows * 160 * 2);
+    if spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
+        return Err(KimiMlaError::Invalid("K3.1 index manifest scratch"));
+    }
+    Ok(scratch)
+}
+
+fn validate_index_batch(w: KimiIndexWeights, b: KimiIndexBatch, rows: usize, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("K3.1 index batch/cache geometry"));
+    }
+    let cache = b.cache_pages.checked_mul(8448).ok_or(KimiMlaError::Invalid("index cache overflow"))?;
+    validate_phase(&[(b.x, b.rows * 7168 * 2), (b.q_resid, b.rows * 1536 * 2),
+        (b.positions, b.rows * 8), (b.slots, b.rows * 8), (b.cos_sin, 64 * 4),
+        (w.query, 4096 * 1536 * 2), (w.key_heads, 160 * 7168 * 2),
+        (w.norm, 128 * 2), (w.bias, 128 * 2), (b.cache, cache),
+        (b.query_fp8, b.rows * 4096), (b.head_weights, b.rows * 32 * 4),
+        (b.scratch, scratch)], 9..13, b.x.device_id)
+}
+
+const INDEX_TOPK: &[&str] = &["q_fp8", "weights", "index_k_cache", "page_table", "cache_lengths", "output_indices", "scratch"];
+const SCORED_TOPK: &[&str] = &["q", "weights", "cache", "table", "lengths", "indices", "scores", "scratch"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KimiIndexMode { Decode, Prefill }
+impl KimiIndexMode {
+    fn name(self) -> &'static str { match self { Self::Decode => "decode", Self::Prefill => "prefill" } }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiIndexSelection {
+    pub rows: usize, pub cache_pages: usize, pub table_width: usize, pub table_stride: usize,
+    pub query_fp8: Buffer, pub head_weights: Buffer, pub cache: Buffer, pub table: Buffer,
+    /// Per-query causal frontier, including the query's current token.
+    pub lengths: Buffer,
+    pub indices: Buffer, pub scores: Buffer, pub scratch: Buffer,
+}
+
+/// Shared DSA selector. Context always scores the replicated full history and
+/// returns global logical candidates; parity filtering is a later stage.
+pub struct KimiIndexTopK<'a> {
+    program: Program<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool, runtime_sms: Option<i32>, scratch: usize,
+}
+impl<'a> KimiIndexTopK<'a> {
+    pub fn load(programs: &'a Programs<'a>, rows: usize, pages: usize, mode: KimiIndexMode,
+        context: bool) -> Result<Self> {
+        let stem = if context { "scored_index_topk" } else { "index_topk" };
+        let name = format!("kimik31_{stem}_{}_m{rows}", mode.name());
+        let (scratch, runtime) = validate_topk_manifest(programs.spec(&name)?, rows, pages, mode, context)?;
+        let runtime_sms = runtime.then(|| programs.library().sm_count()).transpose()?
+            .map(|n| i32::try_from(n).map_err(|_| KimiMlaError::Invalid("index selector SM count"))).transpose()?;
+        Ok(Self { program: programs.program(&name, if context { SCORED_TOPK } else { INDEX_TOPK })?,
+            rows, pages, mode, scored: context, runtime_sms, scratch })
+    }
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// Table entries and causal frontiers are device metadata owned by the lane.
+    /// Scratch is zero-initialized once by its admitted owner, before capture.
+    pub fn launch(&self, b: KimiIndexSelection, stream: *mut c_void) -> Result<()> {
+        validate_topk_batch(b, self.rows, self.pages, self.mode, self.scored, self.scratch)?;
+        if self.scored {
+            // SAFETY: writer aliases and extents checked; full-index (1,0)
+            // selection precedes parity filtering, with retained causal metadata.
+            unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
+                b.lengths.ptr, b.indices.ptr, b.scores.ptr, b.scratch.ptr],
+                &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
+                  Scalar::I32(b.table_stride as i32), Scalar::I32(1), Scalar::I32(0)], stream)?; }
+        } else {
+            let scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.table_width as i32),
+                Scalar::I32(b.table_stride as i32), Scalar::I32(self.runtime_sms.unwrap_or(0))];
+            // SAFETY: physical index/MLA tables agree for ordinary placement;
+            // outputs/scratch are disjoint and retained through the queued work.
+            unsafe { self.program.launch(&[b.query_fp8.ptr, b.head_weights.ptr, b.cache.ptr, b.table.ptr,
+                b.lengths.ptr, b.indices.ptr, b.scratch.ptr],
+                &scalars[..if self.runtime_sms.is_some() { 4 } else { 3 }], stream)?; }
+        }
+        Ok(())
+    }
+}
+
+fn validate_topk_manifest(spec: &ProgramSpec, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool) -> Result<(usize, bool)> {
+    let g = &spec.geometry;
+    let runtime = !scored && g["runtime_sm_count"].as_bool() == Some(true);
+    let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
+    let scalars = if scored { &b"iiiii"[..] } else if runtime { &b"iiii"[..] } else { &b"iii"[..] };
+    if !(1..=4096).contains(&rows) || !(1..=16384).contains(&pages)
+        || spec.capacity_rows as usize != rows || spec.scalar_kinds != scalars
+        || spec.pointers.iter().map(String::as_str).ne(pointers.iter().copied())
+        || g["topk"].as_u64() != Some(2048) || g["heads"].as_u64() != Some(32)
+        || g["max_rows"].as_u64() != Some(rows as u64)
+        || g["max_pages"].as_u64() != Some(pages as u64) || g["mode"].as_str() != Some(mode.name()) {
+        return Err(KimiMlaError::Invalid("K3.1 selector manifest geometry/ABI"));
+    }
+    let scratch = spec.scratch.get("scratch").and_then(|n| usize::try_from(*n).ok())
+        .filter(|n| *n > 0).ok_or(KimiMlaError::Invalid("K3.1 selector scratch"))?;
+    if spec.scratch.len() != 1 { return Err(KimiMlaError::Invalid("K3.1 selector scratch inventory")); }
+    Ok((scratch, runtime))
+}
+
+fn validate_topk_batch(b: KimiIndexSelection, rows: usize, pages: usize, mode: KimiIndexMode,
+    scored: bool, scratch: usize) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_pages == 0 || b.cache_pages > i32::MAX as usize / 64
+        || b.table_width == 0 || b.table_width > pages || b.table_stride < b.table_width
+        || b.table_stride > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("K3.1 selector batch/table geometry"));
+    }
+    let table = if mode == KimiIndexMode::Prefill { b.table_width } else {
+        (b.rows - 1).checked_mul(b.table_stride).and_then(|n| n.checked_add(b.table_width))
+            .ok_or(KimiMlaError::Invalid("K3.1 selector table overflow"))?
+    };
+    let operands = [(b.query_fp8, b.rows * 4096), (b.head_weights, b.rows * 32 * 4),
+        (b.cache, b.cache_pages * 8448), (b.table, table * 4), (b.lengths, b.rows * 4),
+        (b.indices, b.rows * 2048 * 4), (b.scratch, scratch), (b.scores, b.rows * 2048 * 4)];
+    validate_phase(&operands[..if scored { 8 } else { 7 }], 5..if scored { 8 } else { 7 }, b.query_fp8.device_id)
+}
+
+const CANDIDATE_MERGE: &[&str] = &["scores", "indices", "out_scores", "out_indices", "table", "local_slots", "local_lengths"];
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiCandidateBatch {
+    pub rows: usize, pub table_stride: usize, pub rank: usize,
+    /// Two score-ordered runs per row, each 2048 entries. K3.1 supplies global
+    /// selection as the first run and (-inf,-1) as the second, not local top-k.
+    pub scores: Buffer, pub indices: Buffer,
+    pub output_scores: Buffer, pub output_indices: Buffer,
+    /// Independent compact MLA table, not the replicated index-cache table.
+    pub table: Buffer, pub local_slots: Buffer, pub local_lengths: Buffer,
+}
+
+pub struct KimiCandidateMerge<'a> { program: Program<'a> }
+impl<'a> KimiCandidateMerge<'a> {
+    pub fn load(programs: &'a Programs<'a>) -> Result<Self> {
+        let name = "kimik31_dsa_candidate_merge";
+        let spec = programs.spec(name)?;
+        if spec.scalar_kinds != b"iii" || !spec.scratch.is_empty()
+            || spec.pointers.iter().map(String::as_str).ne(CANDIDATE_MERGE.iter().copied())
+            || spec.geometry["topk"].as_u64() != Some(2048)
+            || spec.geometry["unit_rows"].as_u64() != Some(64) {
+            return Err(KimiMlaError::Invalid("K3.1 candidate merge ABI"));
+        }
+        Ok(Self { program: programs.program(name, CANDIDATE_MERGE)? })
+    }
+    pub fn launch(&self, b: KimiCandidateBatch, stream: *mut c_void) -> Result<()> {
+        validate_candidate_batch(b)?;
+        // SAFETY: full global candidates are already selected, local mapping
+        // extents/aliases checked; the lane retains both runs and compact table.
+        unsafe { self.program.launch(&[b.scores.ptr, b.indices.ptr, b.output_scores.ptr,
+            b.output_indices.ptr, b.table.ptr, b.local_slots.ptr, b.local_lengths.ptr],
+            &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_stride as i32), Scalar::I32(b.rank as i32)], stream)?; }
+        Ok(())
+    }
+}
+fn validate_candidate_batch(b: KimiCandidateBatch) -> Result<()> {
+    if !(1..=4096).contains(&b.rows) || !(1..=8192).contains(&b.table_stride) || b.rank > 1 {
+        return Err(KimiMlaError::Invalid("K3.1 candidate merge geometry"));
+    }
+    let operands = [(b.scores,b.rows*4096*4), (b.indices,b.rows*4096*4),
+        (b.table,b.rows*b.table_stride*4), (b.output_scores,b.rows*2048*4),
+        (b.output_indices,b.rows*2048*4), (b.local_slots,b.rows*2048*4), (b.local_lengths,b.rows*4)];
+    validate_phase(&operands, 3..7, b.scores.device_id)
+}
+
+const SPARSE_ATTENTION: &[&str] = ATTENTION;
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiSparseBatch {
+    pub rows: usize, pub cache_tokens: usize,
+    pub query: Buffer, pub cache: Buffer, pub indices: Buffer, pub lengths: Buffer,
+    pub query_offsets: Buffer, pub output: Buffer, pub lse: Buffer, pub scratch: Buffer,
+}
+
+/// Selected physical-token gathers over native Kimi records. Ordinary attention
+/// emits natural-log LSE; Context partials emit base2 for the shared peer combine.
+pub struct KimiSparseMla<'a> {
+    program: Program<'a>, heads: usize, rows: usize, partial: bool,
+    scratch: usize, format: MlaCacheFormat,
+}
+impl<'a> KimiSparseMla<'a> {
+    pub fn load(programs: &'a Programs<'a>, heads: usize, rows: usize, format: MlaCacheFormat,
+        context_head_begin: Option<usize>) -> Result<Self> {
+        let suffix = format.program_suffix();
+        let name = if let Some(begin) = context_head_begin {
+            format!("kimik31_sparse_mla_partial{suffix}_h{begin}_m{rows}")
+        } else {
+            let h = if heads == 48 { "" } else { "_h96" };
+            format!("kimik31_sparse_mla{h}{suffix}_m{rows}")
+        };
+        let scratch = validate_sparse_manifest(programs.spec(&name)?, heads, rows, format, context_head_begin)?;
+        Ok(Self { program: programs.program(&name, SPARSE_ATTENTION)?, heads, rows,
+            partial: context_head_begin.is_some(), scratch, format })
+    }
+    pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// Indices are preselected, causal, valid local slots; each query is one
+    /// request. Empty local lengths are permitted only for a Context partial.
+    pub fn launch(&self, b: KimiSparseBatch, stream: *mut c_void) -> Result<()> {
+        validate_sparse_batch(b, self.heads, self.rows, self.partial, self.scratch, self.format)?;
+        let partial_scalars = [Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
+        let full_scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
+        let scalars = if self.partial { &partial_scalars[..] } else { &full_scalars[..] };
+        // SAFETY: exact token addressing, extents, device and writer aliases
+        // checked; caller owns causal table contents and queued graph lifetimes.
+        unsafe { self.program.launch(&[b.query.ptr, b.cache.ptr, b.indices.ptr, b.lengths.ptr,
+            b.query_offsets.ptr, b.output.ptr, b.lse.ptr, b.scratch.ptr], scalars, stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_sparse_batch(b: KimiSparseBatch, heads: usize, rows: usize, partial: bool,
+    scratch: usize, format: MlaCacheFormat) -> Result<()> {
+    if b.rows == 0 || b.rows > rows || b.cache_tokens == 0 || b.cache_tokens > i32::MAX as usize {
+        return Err(KimiMlaError::Invalid("selected MLA batch/cache geometry"));
+    }
+    let cache = b.cache_tokens.checked_mul(format.record_bytes())
+        .ok_or(KimiMlaError::Invalid("selected MLA cache overflow"))?;
+    let output_heads = if partial { 48 } else { heads };
+    validate_phase(&[(b.query, b.rows * heads * 576 * 2), (b.cache, cache),
+        (b.indices, b.rows * 2048 * 4), (b.lengths, b.rows * 4),
+        (b.query_offsets, (b.rows + 1) * 4), (b.output, b.rows * output_heads * 512 * 2),
+        (b.lse, b.rows * output_heads * 4), (b.scratch, scratch)], 5..8, b.query.device_id)
+}
+
+fn validate_sparse_manifest(spec: &ProgramSpec, heads: usize, rows: usize, format: MlaCacheFormat,
+    begin: Option<usize>) -> Result<usize> {
+    let g = &spec.geometry;
+    let partial = begin.is_some();
+    if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows)
+        || begin.is_some_and(|b| heads != 96 || !matches!(b, 0 | 48))
+        || spec.capacity_rows as usize != rows
+        || spec.pointers.iter().map(String::as_str).ne(SPARSE_ATTENTION.iter().copied())
+        || spec.scalar_kinds.as_slice() != if partial { &b"ili"[..] } else { &b"iili"[..] }
+        || [("heads", heads), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+            ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64),
+            ("page_size", 1), ("max_rows", rows), ("topk", 2048), ("num_splits", 16)]
+            .iter().any(|&(key, n)| g[key].as_u64() != Some(n as u64))
+        || g["norm_eps"].as_f64() != Some(1e-5) || g["kv_cache"].as_str() != Some(format.label())
+        || (if partial { g["lse_base"].as_u64() != Some(2) } else { g["lse_base"].as_str() != Some("e") })
+        || begin.is_some_and(|b| g["head_begin"].as_u64() != Some(b as u64) || g["head_count"].as_u64() != Some(48)) {
+        return Err(KimiMlaError::Invalid("selected MLA manifest geometry/LSE units/ABI"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let n = rows * if partial { 48 } else { heads } * 16;
+    let scratch = align(n * 512 * 2) + if partial { n * 4 } else { align(n * 4) };
+    if spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
+        return Err(KimiMlaError::Invalid("selected MLA manifest scratch"));
+    }
+    Ok(scratch)
+}
+
 fn validate_phase(operands: &[(Buffer, usize)], writers: std::ops::Range<usize>, device: i32) -> Result<()> {
     validate_buffers(operands, device)?;
     for &(buffer, bytes) in operands {
@@ -676,11 +1050,20 @@ impl<'a> KimiKda<'a> {
     }
 
     pub fn load_heads(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, rows, decode, heads, false)
+    }
+
+    pub fn load_k31(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, rows, decode, heads, true)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize, k31: bool) -> W8Result<Self> {
         let geometry = KimiKdaGeometry::new(heads)?;
         let pointers = ["x", "w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o",
             "conv_state", "state", "slots", "seq_first", "out", "replay", "scratch"];
         let prefill = [&pointers[..13], &pointers[14..]].concat();
-        let name = if heads == 48 { format!("kimik3_kda_m{rows}") } else { format!("kda_fused_h96_m{rows}") };
+        let name = if heads == 48 { format!("{}_kda_m{rows}", if k31 { "kimik31" } else { "kimik3" }) }
+            else { format!("kda_fused_h96_m{rows}") };
         let program = programs.program(&name, if decode { &pointers } else { &prefill })?;
         let scratch = validate_kda_manifest_heads(program.spec(), rows, decode, geometry)?;
         let output_name = if heads == 48 { "kimik3_ffn_down_i6144" } else { "kda_output_h96" };
@@ -730,8 +1113,18 @@ impl<'a> KimiKdaCommit<'a> {
     }
 
     pub fn load_heads(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, false)
+    }
+
+    pub fn load_k31(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, true)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, heads: usize, k31: bool) -> W8Result<Self> {
         let geometry = KimiKdaGeometry::new(heads)?;
-        let name = if heads == 48 { "kimik3_kda_commit" } else { "kda_commit_h96" };
+        let name = if heads == 48 {
+            if k31 { "kimik31_kda_commit" } else { "kimik3_kda_commit" }
+        } else { "kda_commit_h96" };
         let program = programs.program(name, &["state", "conv_state", "replay", "tables"])?;
         validate_kda_commit_manifest(program.spec(), geometry)?;
         Ok(Self { program, geometry })
@@ -1129,6 +1522,294 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn k31_native_mla_projection_requires_variant_epsilon_and_exact_seam_abi() {
+        for heads in [48, 96] { for rows in [64, 4096] {
+            for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let entries = specs(heads, rows, KimiMlaMode::Decode);
+                let mut seams = [entries[0].clone(), entries[2].clone()];
+                for (i, spec) in seams.iter_mut().enumerate() {
+                    spec.geometry["norm_eps"] = 1e-5.into();
+                    spec.pointers = (if i == 0 { PRODUCER } else { OUTPUT })
+                        .iter().map(|name| (*name).into()).collect();
+                }
+                seams[0].geometry["kv_cache"] = format.label().into();
+                let validate = |s: &[ProgramSpec; 2]| validate_k31_projection_manifest(s.each_ref(), heads, rows, format);
+                assert_eq!(validate(&seams).unwrap(), [entries[0].scratch["scratch"] as usize,
+                    entries[2].scratch["scratch"] as usize]);
+                for i in 0..2 {
+                    for (key, value) in [("norm_eps", serde_json::json!(1e-6)),
+                        ("heads", serde_json::json!(32)), ("page_rows", serde_json::json!(1))] {
+                        let mut wrong = seams.clone(); wrong[i].geometry[key] = value;
+                        assert!(validate(&wrong).is_err(), "{i}/{key}");
+                    }
+                    let mut wrong = seams.clone(); wrong[i].pointers.swap(0, 1);
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].scratch.insert("unadmitted".into(), 16);
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].capacity_rows += 1;
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].scalar_kinds = b"ii".to_vec();
+                    assert!(validate(&wrong).is_err());
+                }
+                seams[0].geometry["kv_cache"] = "wrong".into();
+                assert!(validate(&seams).is_err());
+            }
+        }}
+    }
+
+    #[test]
+    fn k31_index_selection_checks_causal_metadata_extents_and_writer_aliases() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let b = KimiIndexSelection { rows: 17, cache_pages: 128, table_width: 64, table_stride: 80,
+            query_fp8: buffer(1), head_weights: buffer(2), cache: buffer(3), table: buffer(4),
+            lengths: buffer(5), indices: buffer(6), scores: buffer(7), scratch: buffer(8) };
+        for mode in [KimiIndexMode::Decode, KimiIndexMode::Prefill] {
+            for scored in [false, true] {
+                let check = |b| validate_topk_batch(b, 64, 16384, mode, scored, 4096);
+                check(b).unwrap();
+                let table = if mode == KimiIndexMode::Decode { (b.rows - 1) * b.table_stride + b.table_width }
+                    else { b.table_width };
+                for bad in [KimiIndexSelection { rows: 0, ..b }, KimiIndexSelection { rows: 65, ..b },
+                    KimiIndexSelection { table_width: 16385, ..b }, KimiIndexSelection { table_stride: 63, ..b },
+                    KimiIndexSelection { cache_pages: usize::MAX, ..b },
+                    KimiIndexSelection { table: Buffer { bytes: table * 4 - 1, ..b.table }, ..b },
+                    KimiIndexSelection { cache: Buffer { bytes: b.cache_pages * 8448 - 1, ..b.cache }, ..b },
+                    KimiIndexSelection { lengths: Buffer { bytes: b.rows * 4 - 1, ..b.lengths }, ..b }] {
+                    assert!(check(bad).is_err());
+                }
+                for reader in [b.query_fp8, b.head_weights, b.cache, b.table, b.lengths] {
+                    assert!(check(KimiIndexSelection { indices: reader, ..b }).is_err());
+                    assert!(check(KimiIndexSelection { scratch: reader, ..b }).is_err());
+                }
+                if scored {
+                    assert!(check(KimiIndexSelection { scores: b.indices, ..b }).is_err());
+                    assert!(check(KimiIndexSelection { scores: b.cache, ..b }).is_err());
+                } else {
+                    check(KimiIndexSelection { scores: Buffer { ptr: std::ptr::null_mut(), bytes: 0,
+                        device_id: 0, flags: 0 }, ..b }).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k31_selector_manifest_pins_head_count_and_dynamic_sm_abi() {
+        for mode in [KimiIndexMode::Decode, KimiIndexMode::Prefill] {
+            for (scored, runtime) in [(false,false), (false,true), (true,false)] {
+                let pointers = if scored { SCORED_TOPK } else { INDEX_TOPK };
+                let spec = ProgramSpec { name: "topk".into(), capacity_rows: 64,
+                    pointers: pointers.iter().map(|s| (*s).into()).collect(),
+                    scalar_kinds: if scored { b"iiiii".to_vec() } else if runtime { b"iiii".to_vec() } else { b"iii".to_vec() },
+                    scratch: [("scratch".into(),4096)].into_iter().collect(),
+                    geometry: serde_json::json!({"topk":2048,"heads":32,"max_rows":64,
+                        "max_pages":16384,"mode":mode.name(),"runtime_sm_count":runtime}) };
+                assert_eq!(validate_topk_manifest(&spec,64,16384,mode,scored).unwrap(),(4096,runtime));
+                for (key,value) in [("topk",1024),("heads",64)] {
+                    let mut wrong=spec.clone(); wrong.geometry[key]=serde_json::json!(value);
+                    assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+                }
+                let mut wrong=spec.clone(); wrong.scalar_kinds.push(b'i');
+                assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+                let mut wrong=spec.clone(); wrong.scratch.clear();
+                assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn k31_candidate_merge_retains_full_global_runs_and_disjoint_local_outputs() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let b = KimiCandidateBatch { rows: 17, table_stride: 8192, rank: 0,
+            scores: buffer(1), indices: buffer(2), output_scores: buffer(3), output_indices: buffer(4),
+            table: buffer(5), local_slots: buffer(6), local_lengths: buffer(7) };
+        validate_candidate_batch(b).unwrap();
+        validate_candidate_batch(KimiCandidateBatch { rank: 1, ..b }).unwrap();
+        for bad in [KimiCandidateBatch { rank: 2, ..b }, KimiCandidateBatch { rows: 0, ..b },
+            KimiCandidateBatch { table_stride: 8193, ..b },
+            KimiCandidateBatch { scores: Buffer { bytes: b.rows*2048*4, ..b.scores }, ..b },
+            KimiCandidateBatch { indices: Buffer { bytes: b.rows*2048*4, ..b.indices }, ..b },
+            KimiCandidateBatch { local_lengths: Buffer { bytes: b.rows*4-1, ..b.local_lengths }, ..b }] {
+            assert!(validate_candidate_batch(bad).is_err());
+        }
+        for reader in [b.scores,b.indices,b.table] {
+            assert!(validate_candidate_batch(KimiCandidateBatch { local_slots: reader, ..b }).is_err());
+            assert!(validate_candidate_batch(KimiCandidateBatch { output_scores: reader, ..b }).is_err());
+        }
+        assert!(validate_candidate_batch(KimiCandidateBatch { output_indices: b.local_slots, ..b }).is_err());
+    }
+
+    #[test]
+    fn k31_selected_mla_manifest_separates_final_and_peer_lse_units() {
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            for (heads, begin) in [(48, None), (96, None), (96, Some(0)), (96, Some(48))] {
+                let rows = 64;
+                let n = rows * if begin.is_some() { 48 } else { heads } * 16;
+                let scratch = n * (512 * 2 + 4);
+                let mut geometry = specs(heads, rows, KimiMlaMode::Decode)[1].geometry.clone();
+                geometry["norm_eps"] = serde_json::json!(1e-5);
+                geometry["kv_cache"] = serde_json::json!(format.label());
+                geometry["max_rows"] = serde_json::json!(rows);
+                geometry["topk"] = serde_json::json!(2048);
+                geometry["page_size"] = serde_json::json!(1);
+                geometry["lse_base"] = if begin.is_some() { serde_json::json!(2) } else { serde_json::json!("e") };
+                if let Some(begin) = begin {
+                    geometry["head_begin"] = serde_json::json!(begin);
+                    geometry["head_count"] = serde_json::json!(48);
+                }
+                let spec = ProgramSpec { name: "selected".into(), geometry,
+                    pointers: SPARSE_ATTENTION.iter().map(|name| (*name).into()).collect(),
+                    scalar_kinds: if begin.is_some() { b"ili".to_vec() } else { b"iili".to_vec() },
+                    capacity_rows: rows as u32,
+                    scratch: [("scratch".into(), scratch as u64)].into_iter().collect() };
+                assert_eq!(validate_sparse_manifest(&spec, heads, rows, format, begin).unwrap(), scratch);
+                for (key, value) in [("norm_eps", serde_json::json!(1e-6)),
+                    ("page_size", serde_json::json!(64)), ("topk", serde_json::json!(1024)),
+                    ("lse_base", serde_json::json!(if begin.is_some() { "e" } else { "2" }))] {
+                    let mut wrong = spec.clone(); wrong.geometry[key] = value;
+                    assert!(validate_sparse_manifest(&wrong, heads, rows, format, begin).is_err(), "{key}");
+                }
+                let mut wrong = spec.clone(); wrong.scratch.insert("scratch".into(), 1);
+                assert!(validate_sparse_manifest(&wrong, heads, rows, format, begin).is_err());
+                if begin.is_some() {
+                    assert!(validate_sparse_manifest(&spec, 48, rows, format, begin).is_err());
+                    assert!(validate_sparse_manifest(&spec, heads, rows, format, Some(24)).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k31_selected_mla_accepts_sealed_export_manifest() {
+        // Unmodified entries from the f44d9776 SM120 export, not synthesized
+        // from the consumer's pointer-name constants.
+        let manifest: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/kimi_k31_sparse_mla_sm120.json")).unwrap();
+        assert_eq!(manifest["sparkinfer_revision"], "f44d97769fd540fafd7ed341ae6966554fa80ea7");
+        let entries = manifest["programs"].as_array().unwrap();
+        assert_eq!(entries.len(), 16);
+        for entry in entries {
+            let pointers = entry["pointers"].as_array().unwrap().iter()
+                .map(|p| p["name"].as_str().unwrap().to_owned()).collect();
+            let scalar_kinds = entry["scalars"].as_array().unwrap().iter().map(|scalar| {
+                match scalar["type"].as_str().unwrap() {
+                    "int32" => b'i', "int64" => b'l', other => panic!("unexpected scalar {other}"),
+                }
+            }).collect();
+            let spec = ProgramSpec {
+                name: entry["name"].as_str().unwrap().to_owned(), pointers, scalar_kinds,
+                scratch: entry["scratch_bytes_at_capacity"].as_object().unwrap().iter()
+                    .map(|(name, bytes)| (name.clone(), bytes.as_u64().unwrap())).collect(),
+                capacity_rows: entry["capacity_rows"].as_u64().unwrap().try_into().unwrap(),
+                geometry: entry["geometry"].clone(),
+            };
+            let heads = spec.geometry["heads"].as_u64().unwrap() as usize;
+            let rows = spec.capacity_rows as usize;
+            let begin = spec.geometry.get("head_begin").map(|value| value.as_u64().unwrap() as usize);
+            let format = match spec.geometry["kv_cache"].as_str().unwrap() {
+                "bf16" => MlaCacheFormat::Bf16, "fp8" => MlaCacheFormat::Fp8,
+                other => panic!("unexpected cache format {other}"),
+            };
+            validate_sparse_manifest(&spec, heads, rows, format, begin).unwrap();
+            for (index, alias) in [(2, "indices"), (3, "lengths"), (4, "query_offsets"), (5, "out")] {
+                let mut wrong = spec.clone();
+                wrong.pointers[index] = alias.into();
+                assert!(validate_sparse_manifest(&wrong, heads, rows, format, begin).is_err(),
+                    "{} accepted stale alias {alias}", spec.name);
+            }
+        }
+    }
+
+    #[test]
+    fn k31_selected_mla_batch_checks_gather_extents_and_phase_aliases() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let b = KimiSparseBatch { rows: 17, cache_tokens: 128, query: buffer(1), cache: buffer(2),
+            indices: buffer(3), lengths: buffer(4), query_offsets: buffer(5),
+            output: buffer(6), lse: buffer(7), scratch: buffer(8) };
+        for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+            for (heads, partial) in [(48, false), (96, false), (96, true)] {
+                let check = |b| validate_sparse_batch(b, heads, 64, partial, 4096, format);
+                check(b).unwrap();
+                for bad in [KimiSparseBatch { rows: 0, ..b }, KimiSparseBatch { rows: 65, ..b },
+                    KimiSparseBatch { cache_tokens: 0, ..b }, KimiSparseBatch { cache_tokens: usize::MAX, ..b },
+                    KimiSparseBatch { cache: Buffer { bytes: b.cache_tokens * format.record_bytes() - 1, ..b.cache }, ..b },
+                    KimiSparseBatch { indices: Buffer { bytes: b.rows * 2048 * 4 - 1, ..b.indices }, ..b },
+                    KimiSparseBatch { query_offsets: Buffer { bytes: (b.rows + 1) * 4 - 1, ..b.query_offsets }, ..b },
+                    KimiSparseBatch { query: Buffer { bytes: b.rows * heads * 576 * 2 - 1, ..b.query }, ..b }] {
+                    assert!(check(bad).is_err());
+                }
+                for reader in [b.query, b.cache, b.indices, b.lengths, b.query_offsets] {
+                    assert!(check(KimiSparseBatch { output: Buffer { ptr: reader.ptr, ..b.output }, ..b }).is_err());
+                    assert!(check(KimiSparseBatch { scratch: Buffer { ptr: reader.ptr, ..b.scratch }, ..b }).is_err());
+                }
+                assert!(check(KimiSparseBatch { lse: b.output, ..b }).is_err());
+                for bad in [Buffer { flags: 1, ..b.output }, Buffer { bytes: 1, ..b.output },
+                    Buffer { device_id: 1, ..b.output },
+                    Buffer { ptr: (usize::MAX - 15) as *mut c_void, ..b.output }] {
+                    assert!(check(KimiSparseBatch { output: bad, ..b }).is_err());
+                }
+                if partial {
+                    check(KimiSparseBatch { output: Buffer { bytes: b.rows * 48 * 512 * 2, ..b.output },
+                        lse: Buffer { bytes: b.rows * 48 * 4, ..b.lse }, ..b }).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k31_index_manifest_requires_exact_native_qdq_and_cache_layout() {
+        let rows = 64;
+        let scratch = rows * (4096 + 160) * 2;
+        let spec = ProgramSpec { name: "kimik31_index_producer_m64".into(),
+            pointers: INDEX_PRODUCER.iter().map(|name| (*name).into()).collect(),
+            scalar_kinds: b"i".to_vec(), capacity_rows: rows as u32,
+            scratch: [("scratch".into(), scratch as u64)].into_iter().collect(),
+            geometry: serde_json::json!({"hidden":7168,"q_lora_rank":1536,"index_heads":32,
+                "index_head_dim":128,"index_topk":2048,"page_rows":64,"max_rows":64,
+                "index_norm_eps":1e-5,"rope":false,"scale_format":"ue8m0","scale_storage":"float32",
+                "query_amax_floor":1e-10,"key_amax_floor":1e-4}) };
+        assert_eq!(validate_index_manifest(&spec, rows).unwrap(), scratch);
+        for (key, value) in [("index_norm_eps", serde_json::json!(1e-6)),
+            ("rope", serde_json::json!(true)), ("scale_format", serde_json::json!("fp32")),
+            ("scale_storage", serde_json::json!("uint8")), ("query_amax_floor", serde_json::json!(0)),
+            ("key_amax_floor", serde_json::json!(1e-10)), ("index_topk", serde_json::json!(1024))] {
+            let mut wrong = spec.clone();
+            wrong.geometry[key] = value;
+            assert!(validate_index_manifest(&wrong, rows).is_err(), "{key}");
+        }
+        let mut wrong = spec.clone(); wrong.scratch.insert("scratch".into(), 1);
+        assert!(validate_index_manifest(&wrong, rows).is_err());
+        let mut wrong = spec.clone(); wrong.pointers.swap(1, 2);
+        assert!(validate_index_manifest(&wrong, rows).is_err());
+        assert!(validate_index_manifest(&spec, rows + 1).is_err());
+    }
+
+    #[test]
+    fn k31_index_batch_rejects_writer_aliases_and_undercharged_cache() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let weights = KimiIndexWeights { query: buffer(1), key_heads: buffer(2), norm: buffer(3), bias: buffer(4) };
+        let b = KimiIndexBatch { rows: 17, cache_pages: 3, x: buffer(5), q_resid: buffer(6),
+            positions: buffer(7), slots: buffer(8), cos_sin: buffer(9), cache: buffer(10),
+            query_fp8: buffer(11), head_weights: buffer(12), scratch: buffer(13) };
+        let check = |b| validate_index_batch(weights, b, 64, 4096);
+        check(b).unwrap();
+        assert!(check(KimiIndexBatch { rows: 0, ..b }).is_err());
+        assert!(check(KimiIndexBatch { rows: 65, ..b }).is_err());
+        assert!(check(KimiIndexBatch { cache_pages: usize::MAX, ..b }).is_err());
+        assert!(check(KimiIndexBatch { cache: Buffer { bytes: 3 * 8448 - 1, ..b.cache }, ..b }).is_err());
+        for reader in [b.x, b.q_resid, b.positions, b.slots, b.cos_sin,
+            weights.query, weights.key_heads, weights.norm, weights.bias] {
+            assert!(check(KimiIndexBatch { cache: Buffer { ptr: reader.ptr, ..b.cache }, ..b }).is_err());
+            assert!(check(KimiIndexBatch { query_fp8: Buffer { ptr: reader.ptr, ..b.query_fp8 }, ..b }).is_err());
+        }
+        assert!(check(KimiIndexBatch { head_weights: b.query_fp8, ..b }).is_err());
+        assert!(check(KimiIndexBatch { scratch: b.cache, ..b }).is_err());
     }
 
     #[test]
