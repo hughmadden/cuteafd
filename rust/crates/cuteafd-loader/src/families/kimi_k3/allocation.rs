@@ -77,6 +77,49 @@ pub const ATTENTION_METADATA: [&str; 6] = ["KDA slots", "KDA first", "MLA slots"
 /// Consumed entirely on the lane stream inside route/latent_up. Neither peer
 /// exchange nor a pending Spark wave retains these intermediates.
 pub const HOOK_SCRATCH: [&str; 3] = ["router logits", "latent input", "latent normalized"];
+/// Index metadata survives every layer of its unit, including independently
+/// addressed full-history index pages when MLA uses compact Context pages.
+pub const DSA_METADATA: [&str; 6] = ["DSA positions", "DSA slots", "DSA page table",
+    "DSA lengths", "DSA query offsets", "DSA selected lengths"];
+/// Unit-local index temporaries are not lane row planes. Keep their backing
+/// distinct from projected-core scratch until all index and attention readers end.
+pub const DSA_SCRATCH: [&str; 5] = ["DSA query", "DSA head weights", "DSA indices",
+    "DSA producer scratch", "DSA selector scratch"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DsaScratch {
+    pub producer: usize,
+    pub selector: usize,
+}
+
+impl DsaScratch {
+    pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
+        let mut required = Self { producer: 0, selector: 0 };
+        for rows in [64, 4096] {
+            required.producer = required.producer.max(program_scratch(manifest,
+                &format!("kimik31_index_producer_m{rows}"), rows)?);
+            let mode = if rows == 64 { "decode" } else { "prefill" };
+            for stem in ["index_topk", "scored_index_topk"] {
+                required.selector = required.selector.max(program_scratch(manifest,
+                    &format!("kimik31_{stem}_{mode}_m{rows}"), rows)?);
+            }
+        }
+        ensure!(required.producer > 0 && required.selector > 0, "Kimi DSA scratch must be declared");
+        Ok(required)
+    }
+}
+
+fn program_scratch(manifest: &serde_json::Value, name: &str, rows: usize) -> Result<usize> {
+    let entries = manifest["programs"].as_array().context("Kimi program inventory missing")?;
+    let mut found = entries.iter().filter(|entry| entry["name"] == name);
+    let entry = found.next().with_context(|| format!("Kimi missing {name} scratch inventory"))?;
+    ensure!(found.next().is_none(), "Kimi duplicate {name} scratch inventory");
+    ensure!(entry["capacity_rows"].as_u64() == Some(rows as u64), "Kimi {name} scratch capacity differs");
+    let scratch = entry["scratch_bytes_at_capacity"].as_object().context("Kimi scratch inventory missing")?;
+    ensure!(scratch.len() == 1, "Kimi {name} scratch inventory has undeclared owners");
+    usize::try_from(scratch.get("scratch").and_then(serde_json::Value::as_u64).context("Kimi scratch byte extent missing")?)
+        .context("Kimi scratch byte extent overflow")
+}
 
 impl NativeLaneLayout {
     fn metadata_banks_for(rows: usize, unit: usize) -> usize {
@@ -88,7 +131,7 @@ impl NativeLaneLayout {
 
     /// Each bank has the decode-capable extent; unit tails can be <=64 rows.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
-        ensure!(ATTENTION_METADATA.contains(&name) && bank < self.metadata_banks(),
+        ensure!((ATTENTION_METADATA.contains(&name) || DSA_METADATA.contains(&name)) && bank < self.metadata_banks(),
             "Kimi attention metadata bank outside admission");
         let bytes = self.operands.get(name).context("Kimi metadata plane absent")?;
         ensure!(bytes % self.metadata_banks() == 0, "Kimi metadata bank stride");
@@ -175,6 +218,31 @@ impl NativeLaneLayout {
         Ok(layout)
     }
 
+    /// Add exact index owners without changing any existing BF16 or core phase
+    /// offsets. Context candidate exchange/partial owners are admitted separately.
+    pub fn with_dsa(mut self, cfg: &KimiK3Config, scratch: DsaScratch) -> Result<Self> {
+        ensure!(cfg.dsa.is_some_and(|index| (index.heads, index.head_dim, index.topk) == (32, 128, 2048)),
+            "Kimi DSA lane requires the native 32x128/top2048 indexer");
+        ensure!(scratch.producer > 0 && scratch.selector > 0, "Kimi DSA scratch missing");
+        let rows = self.unit;
+        let requests = rows.min(64);
+        for (name, bytes) in [("DSA query", rows * 4096), ("DSA head weights", rows * 32 * 4),
+            ("DSA indices", rows * 2048 * 4), ("DSA producer scratch", scratch.producer),
+            ("DSA selector scratch", scratch.selector)] {
+            ensure!(self.operands.insert(name, bytes).is_none(), "duplicate Kimi DSA scratch owner {name}");
+        }
+        for (name, bytes) in [("DSA positions", rows * 8), ("DSA slots", rows * 8),
+            ("DSA page table", requests * self.max_context.div_ceil(64) * 4),
+            ("DSA lengths", rows * 4), ("DSA query offsets", (rows + 1) * 4),
+            ("DSA selected lengths", rows * 4)] {
+            let stride = bytes.checked_add(15).context("Kimi DSA metadata alignment overflow")? / 16 * 16;
+            let bytes = stride.checked_mul(self.metadata_banks()).context("Kimi DSA metadata banks overflow")?;
+            ensure!(self.operands.insert(name, bytes).is_none(), "duplicate Kimi DSA metadata owner {name}");
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
     /// Preserve every BF16 offset. Place transient K6 operands into holes whose
     /// previous reader has completed on the same lane stream. Peer meet outputs
     /// remain separate allocations because the exchange stream reads them.
@@ -233,6 +301,26 @@ impl NativeLaneLayout {
 }
 
 impl NativeScratch {
+    pub fn from_manifest_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config,
+        ranks: usize) -> Result<Self> {
+        if cfg.dsa.is_none() { return Self::from_manifest_for_ranks(manifest, ranks); }
+        ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
+        let mut mla = Vec::new();
+        for rows in [64, 4096] { for suffix in ["", "_h96"] { for cache in ["", "_fp8"] {
+            let output = program_scratch(manifest, &format!("kimik31_mla_output{suffix}_m{rows}"), rows)?;
+            let producer = program_scratch(manifest, &format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), rows)?;
+            mla.push([producer, program_scratch(manifest,
+                &format!("kimik31_sparse_mla{suffix}{cache}_m{rows}"), rows)?, output]);
+            if suffix == "_h96" { for begin in [0, 48] {
+                mla.push([producer, program_scratch(manifest,
+                    &format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{rows}"), rows)?, output]);
+            }}
+        }}}
+        let prefix = if ranks == 1 { "kda_fused_h96" } else { "kimik31_kda" };
+        Self::combine([program_scratch(manifest, &format!("{prefix}_m64"), 64)?,
+            program_scratch(manifest, &format!("{prefix}_m4096"), 4096)?], mla)
+    }
+
     pub fn from_manifest(manifest: &serde_json::Value) -> Result<Self> {
         Self::from_manifest_for_ranks(manifest, 2)
     }
@@ -518,8 +606,9 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
-    let layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
-        NativeScratch::from_manifest_for_ranks(manifest, physical_ranks)?, physical_ranks)?;
+    let mut layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
+        NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
+    if cfg.dsa.is_some() { layout = layout.with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?; }
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
     // Enumerate and validate every capturable key; memory is the configured
@@ -555,6 +644,85 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    fn k31_manifest() -> serde_json::Value {
+        let mut programs = Vec::new();
+        let mut add = |name: String, rows, bytes| programs.push(serde_json::json!({
+            "name": name, "capacity_rows": rows, "scratch_bytes_at_capacity": {"scratch": bytes}}));
+        for rows in [64, 4096] {
+            for name in ["kimik31_kda", "kda_fused_h96"] { add(format!("{name}_m{rows}"), rows, rows); }
+            add(format!("kimik31_index_producer_m{rows}"), rows, rows * 8512);
+            let mode = if rows == 64 { "decode" } else { "prefill" };
+            for (stem, bytes) in [("index_topk", rows * 128), ("scored_index_topk", rows * 256)] {
+                add(format!("kimik31_{stem}_{mode}_m{rows}"), rows, bytes);
+            }
+            for suffix in ["", "_h96"] {
+                add(format!("kimik31_mla_output{suffix}_m{rows}"), rows, rows * 1024);
+                for cache in ["", "_fp8"] {
+                    add(format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), rows, rows * 2048);
+                    add(format!("kimik31_sparse_mla{suffix}{cache}_m{rows}"), rows, rows * 4096);
+                    if suffix == "_h96" { for begin in [0, 48] {
+                        add(format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{rows}"), rows, rows * 3072);
+                    }}
+                }
+            }
+        }
+        serde_json::json!({"programs": programs})
+    }
+
+    #[test]
+    fn k31_scratch_uses_selected_manifests_not_k3_dense_fallback() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let manifest = k31_manifest();
+        for ranks in [1, 2] {
+            let scratch = NativeScratch::from_manifest_for_config(&manifest, &cfg, ranks)?;
+            assert_eq!(scratch, NativeScratch { kda: 4096, mla: [4096 * 2048, 4096 * 4096, 4096 * 1024] });
+        }
+        assert_eq!(DsaScratch::from_manifest(&manifest)?, DsaScratch { producer: 4096 * 8512, selector: 4096 * 256 });
+        assert!(NativeScratch::from_manifest_for_ranks(&manifest, 2).is_err());
+        for index in 0..manifest["programs"].as_array().unwrap().len() {
+            let mut missing = manifest.clone(); missing["programs"].as_array_mut().unwrap().remove(index);
+            assert!(NativeScratch::from_manifest_for_config(&missing, &cfg, 1).is_err()
+                || NativeScratch::from_manifest_for_config(&missing, &cfg, 2).is_err()
+                || DsaScratch::from_manifest(&missing).is_err(), "missing program {index}");
+        }
+        for bad in [serde_json::json!({}), serde_json::json!({"extra":16}), serde_json::json!({"scratch":"4096"})] {
+            let mut wrong = manifest.clone(); wrong["programs"][2]["scratch_bytes_at_capacity"] = bad;
+            assert!(DsaScratch::from_manifest(&wrong).is_err());
+        }
+        let mut duplicate = manifest.clone();
+        duplicate["programs"].as_array_mut().unwrap().push(manifest["programs"][2].clone());
+        assert!(DsaScratch::from_manifest(&duplicate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn k31_index_lane_owners_preserve_phase_offsets_and_bank_causal_frontiers() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let manifest = k31_manifest();
+        let scratch = NativeScratch::from_manifest_for_config(&manifest, &cfg, 2)?;
+        let index = DsaScratch::from_manifest(&manifest)?;
+        for unit in [64, 2752, 4096] {
+            let base = NativeLaneLayout::new(&cfg, unit * 2, unit, 1_048_576, scratch)?;
+            let lane = base.clone().with_dsa(&cfg, index)?;
+            assert_eq!(lane.arena_offsets, base.arena_offsets);
+            assert_eq!(lane.arena_bytes, base.arena_bytes);
+            assert_eq!(lane.operands["DSA indices"], unit * 2048 * 4);
+            for name in DSA_METADATA {
+                let (first, stride) = lane.metadata_extent(name, 0)?;
+                assert_eq!(first, 0);
+                assert_eq!(stride % 16, 0);
+                assert_eq!(lane.metadata_extent(name, 1)?, (stride, stride));
+            }
+            assert_eq!(lane.metadata_extent("DSA lengths", 0)?.1, unit * 4);
+            let extra = DSA_METADATA.into_iter().chain(DSA_SCRATCH).map(|name| lane.operands[name]).sum::<usize>();
+            assert_eq!(lane.bytes()? - base.bytes()?, extra);
+            assert!(lane.with_dsa(&cfg, index).is_err());
+        }
+        Ok(())
     }
 
     #[test]

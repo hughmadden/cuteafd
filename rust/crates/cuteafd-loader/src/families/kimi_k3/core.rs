@@ -249,8 +249,11 @@ impl CoreCharges {
         let native_stage_bytes = native_stages.values().sum::<usize>();
         stages.extend(native_stages);
         let stage_bytes = if stages.is_empty() { 0 } else {
-            let base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
-                super::allocation::NativeScratch::from_manifest_for_ranks(manifest, ranks)?, ranks)?;
+            let mut base = super::allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, super::COMPILED_CONTEXT,
+                super::allocation::NativeScratch::from_manifest_for_config(manifest, cfg, ranks)?, ranks)?;
+            if cfg.dsa.is_some() {
+                base = base.with_dsa(cfg, super::allocation::DsaScratch::from_manifest(manifest)?)?;
+            }
             base.clone().with_core_stages(stages.clone())?.bytes()?.checked_sub(base.bytes()?)
                 .context("Kimi core stage charge underflow")?
         };
