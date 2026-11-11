@@ -1,7 +1,9 @@
 //! One caller-admitted serial projection workspace per lane or prefill owner.
 use crate::shared::memory::{device::{Allocation, Device}, receipts::Inventory};
 use anyhow::{ensure, Result};
-use cuteafd_ffi::{native_dense::DenseLinear, native_dense_glue::{Companion, Op}, programs::Programs};
+use cuteafd_ffi::{native_dense::Mxfp8A8, programs::Programs, CuteafdDeviceBuffer};
+use super::weights::TargetWeights;
+use std::ffi::c_void;
 use std::collections::BTreeMap;
 use cuteafd_core::memory_layout::Tag;
 use cuteafd_loader::families::minimax_m3::weight_layout::{CoordinatorWeights, DenseInput, DenseWorkspace};
@@ -10,8 +12,7 @@ use cuteafd_loader::families::minimax_m3::weight_layout::{CoordinatorWeights, De
 /// workspaces are allocated here. Each physical device binds its own handles.
 pub(crate) struct NativePrograms<'a> {
     pub device: Device<'a>,
-    pub linears: BTreeMap<String, DenseLinear<'a>>,
-    pub quantizers: BTreeMap<usize, Companion<'a>>,
+    pub linears: BTreeMap<String, Mxfp8A8<'a>>,
 }
 
 impl<'a> NativePrograms<'a> {
@@ -31,21 +32,16 @@ impl<'a> NativePrograms<'a> {
         }
         device.run(|| {
             let mut linears = BTreeMap::new();
-            let mut quantizers = BTreeMap::new();
             for projection in &weights.projections {
                 let name = projection.program_name();
                 if !linears.contains_key(&name) {
-                    let linear = DenseLinear::bind(programs, &name)?;
+                    let quantizer = format!("exlr8_dense_quant_k{}_bf16_a8", projection.input);
+                    let linear = Mxfp8A8::bind(programs, &name, &quantizer)?;
                     ensure!(linear.geometry() == projection.geometry(), "MiniMax bound dense geometry differs");
                     linears.insert(name, linear);
                 }
-                if !quantizers.contains_key(&projection.input) {
-                    let name = format!("exlr8_dense_quant_k{}_bf16_a8", projection.input);
-                    let op = Op::Mx8QuantBf16 { features: u32::try_from(projection.input)? };
-                    quantizers.insert(projection.input, Companion::bind(programs, &name, op)?);
-                }
             }
-            Ok(Self { device, linears, quantizers })
+            Ok(Self { device, linears })
         })
     }
 }
@@ -103,6 +99,59 @@ impl<'a> ExecutionOwner<'a> {
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         self.workspace.inventory(inventory, prefix)?;
         self.activation.inventory(inventory, &format!("{prefix}.activation"))
+    }
+
+    /// The producer writes packed BF16 rows here, at the selected projection's
+    /// width. It need not produce into another allocation and copy afterward.
+    pub fn producer_destination(&self) -> CuteafdDeviceBuffer { self.activation.buffer }
+
+    pub fn prepare<'o, 'p>(&'o mut self, programs: &'p NativePrograms<'a>,
+        projection: &cuteafd_loader::families::minimax_m3::weight_layout::Mxfp8Projection,
+        rows: u32, stream: *mut c_void) -> Result<Prepared<'o, 'p, 'a>> {
+        ensure!((1..=self.input_layout.rows).contains(&rows), "MiniMax rows exceed execution owner");
+        ensure!(projection.input as u64 <= self.input_layout.width, "MiniMax input exceeds execution owner");
+        let device = self.activation.device;
+        ensure!(device.id == programs.device.id && std::ptr::eq(device.library, programs.device.library),
+            "MiniMax dense programs differ from execution owner device/library");
+        let linear = programs.linears.get(&projection.program_name())
+            .ok_or_else(|| anyhow::anyhow!("MiniMax unbound dense projection"))?;
+        ensure!(linear.geometry() == projection.geometry(), "MiniMax prepared projection geometry differs");
+        device.run(|| Ok(linear.quantize(rows, self.workspace.inputs.buffer,
+            self.activation.buffer, self.workspace.records.buffer, stream)?))?;
+        Ok(Prepared { owner: self, programs, width: projection.input, rows, stream })
+    }
+}
+
+/// Borrowing the execution owner prevents another quantization from replacing
+/// records between sibling projections. All enqueues stay on its ordered stream.
+pub(crate) struct Prepared<'o, 'p, 'a> {
+    owner: &'o mut ExecutionOwner<'a>,
+    programs: &'p NativePrograms<'a>,
+    width: usize,
+    rows: u32,
+    stream: *mut c_void,
+}
+
+impl Prepared<'_, '_, '_> {
+    /// Temporary F32 output: retain/narrow any needed result before the next
+    /// projection. Native checkpoint weights are consumed directly from aliases.
+    pub fn project(&mut self, weights: &TargetWeights<'_>,
+        projection: &cuteafd_loader::families::minimax_m3::weight_layout::Mxfp8Projection)
+        -> Result<CuteafdDeviceBuffer> {
+        ensure!(projection.input == self.width, "MiniMax prepared input width differs");
+        let linear = self.programs.linears.get(&projection.program_name())
+            .ok_or_else(|| anyhow::anyhow!("MiniMax unbound dense projection"))?;
+        ensure!(linear.geometry() == projection.geometry(), "MiniMax projection geometry differs");
+        let payload = weights.operand(&format!("{}.weight", projection.stem))?;
+        let scales = weights.operand(&format!("{}.weight_scale_inv", projection.stem))?;
+        let device = self.programs.device;
+        for operand in [payload, scales] {
+            ensure!(std::ptr::eq(device.library, operand.device.library), "MiniMax weight library differs");
+        }
+        device.run(|| Ok(linear.project(self.rows, self.owner.workspace.inputs.buffer,
+            payload.buffer, scales.buffer, self.owner.workspace.records.buffer,
+            self.owner.workspace.output.buffer, self.stream)?))?;
+        Ok(self.owner.workspace.output.buffer)
     }
 }
 
@@ -233,9 +282,7 @@ mod tests {
         let bound = NativePrograms::bind(device, &programs, &weights, &manifest, 17)?;
         assert_eq!(bound.device.id, 1);
         assert_eq!(bound.linears.len(), 1);
-        assert_eq!(bound.quantizers.len(), 1);
         assert_eq!(bound.linears.values().next().unwrap().geometry(), weights.projections[0].geometry());
-        assert_eq!(bound.quantizers[&128].op, Op::Mx8QuantBf16 { features: 128 });
         assert_eq!(library.cuda_get_device()?, 0);
         assert_eq!(fixture.events()?.matches('D').count(), 0);
 
@@ -251,6 +298,38 @@ mod tests {
         assert!(NativePrograms::bind(device, &programs, &weights, &manifest, 17).is_err());
         assert_eq!(library.cuda_get_device()?, 0);
         assert_eq!(fixture.events()?.matches('D').count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_dense_refuses_incompatible_owners_before_dispatch() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let manifest = manifest();
+        fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
+        let path = fixture.directory().join("PROGRAMS.json");
+        std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        let programs = library.programs()?.with_manifest(&path)?;
+        let weights = weights()?;
+        let device = Device { library: &library, id: 1 };
+        let bound = NativePrograms::bind(device, &programs, &weights, &manifest, 17)?;
+        let mut owner = ExecutionOwner::new(device, &weights, 17)?;
+        assert_eq!(owner.producer_destination().ptr, owner.activation.buffer.ptr);
+        let projection = &weights.projections[0];
+        let stream = std::ptr::null_mut();
+        for rows in [0, 18, 4097] { assert!(owner.prepare(&bound, projection, rows, stream).is_err()); }
+        let mut wide = projection.clone();
+        wide.input = 256;
+        assert!(owner.prepare(&bound, &wide, 17, stream).is_err());
+        let other = NativePrograms::bind(Device { library: &library, id: 0 }, &programs, &weights, &manifest, 17)?;
+        assert!(owner.prepare(&other, projection, 17, stream).is_err());
+        // Real CPU fixture allocations are host fallback: never mask their flags
+        // in daemon code just to pass the CUDA-only checked launch contract.
+        let error = owner.prepare(&bound, projection, 17, stream).err().unwrap();
+        assert!(error.to_string().contains("buffer extent/alignment/device"), "{error:#}");
+        assert_eq!(library.cuda_get_device()?, 0);
+        assert_eq!(fixture.events()?.matches('D').count(), 4);
         Ok(())
     }
 
