@@ -44,6 +44,13 @@ impl DecodeBuckets {
         Ok(buckets)
     }
 
+    fn for_dsa(mut self) -> Self {
+        // Index append/frontier metadata has no padded rows. Admission and
+        // runtime use the same exact-shape graph inventory for this variant.
+        self.plain = (1..=ROWS).collect();
+        self
+    }
+
     pub fn plain(&self) -> &[usize] { &self.plain }
 
     pub fn bucket(&self, rows: usize) -> Result<usize> {
@@ -225,7 +232,9 @@ impl ContextLayout {
             decode_rows: ROWS as u64, lanes: 1, workspace_bytes, ..Default::default() };
         buffers.demands()?;
         ensure!(dsa || tiles.is_some(), "Kimi context tile policy missing");
-        Ok(Self { buffers, workspace, metadata_banks, decode: DecodeBuckets::from_manifest(manifest)?, tiles, dsa })
+        let decode = DecodeBuckets::from_manifest(manifest)?;
+        let decode = if dsa { decode.for_dsa() } else { decode };
+        Ok(Self { buffers, workspace, metadata_banks, decode, tiles, dsa })
     }
 
     pub fn decode(&self) -> &DecodeBuckets { &self.decode }
@@ -414,6 +423,9 @@ mod tests {
             manifest["programs"][0]["geometry"] = serde_json::json!({"heads":HEADS,"has_sink":false});
             let layout = ContextLayout::from_variant(&manifest, format, 8192, 2752, 3, true)?;
             assert!(layout.dsa() && layout.tiles().is_none());
+            assert_eq!(layout.decode().plain(), (1..=ROWS).collect::<Vec<_>>());
+            assert_eq!(layout.decode().graph_rows(0, 1, ROWS), (1..=ROWS).collect::<Vec<_>>());
+            for rows in 1..=ROWS { assert_eq!(layout.decode().dispatch_rows(rows, false)?, rows); }
             assert_eq!(layout.buffers().candidate_row_bytes, 2048 * 8);
             let candidates = layout.workspace().iter().filter(|(name, _)| name.starts_with("DSA "))
                 .map(|(_, bytes)| *bytes).sum::<usize>();
