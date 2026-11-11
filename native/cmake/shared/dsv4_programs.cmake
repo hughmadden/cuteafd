@@ -80,9 +80,9 @@ if(CUTEAFD_ENABLE_KIMIK3_AOT)
   # Kimi always packages the native K6 core programs; the runtime selects them
   # from the checkpoint's own headers.
   if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
-    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,kimik31,dense_trellis_k6,kimi_split")
   else()
-    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,kimik31,dense_trellis_k6,kimi_split")
   endif()
 endif()
 if(CUTEAFD_ENABLE_MUSE_AOT)

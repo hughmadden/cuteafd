@@ -2591,7 +2591,8 @@ mod tests {
         layout.base = layout.base.with_dsa(&cfg, DsaScratch { producer: 16, selector: 16 })?;
         let mut pool = cuteafd_engine::prefix::RefPagePool::parity(128, 64, 0);
         pool.alloc_for(0..128)?;
-        let pages = (0..128).map(|page| ((page * 37) % 64) * 2 + page % 2).collect::<Vec<u32>>();
+        let pages = (0..128).map(|page| (((page / 2) * 37) % 64) * 2 + page % 2).collect::<Vec<u32>>();
+        assert_eq!(pages.iter().copied().collect::<std::collections::BTreeSet<_>>().len(), pages.len());
         let windows = crate::shared::prefill_pipeline::prefill_units(5505, 2752, 3, 128)?;
         let mut banks = DSA_METADATA.map(|name| (name, vec![0xa5; layout.operands[name]]))
             .into_iter().collect::<BTreeMap<_, _>>();

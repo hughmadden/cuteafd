@@ -528,6 +528,46 @@ def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
     assert SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs'] == ['dense_trellis_k6', 'kimi_split', 'kimik3']
 
 
+@pytest.mark.parametrize('checkpoint,k31', [
+    ({'architectures': ['KimiK31ForConditionalGeneration']}, True),
+    ({'model_type': 'kimi_k31'}, True),
+    ({'text_config': {'dsa_config': {'dsa_layers': [4, 8]}}}, True),
+    ({'dsa_config': {'dsa_layers': [4, 8]}}, True),
+    ({'architectures': ['KimiK3ForConditionalGeneration']}, False),
+    ({}, False),
+])
+def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypatch, checkpoint, k31):
+    real = SCOPE.scopes_module(REPO)
+    monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
+    monkeypatch.setenv('HF_HOME', str(tmp_path / 'hf'))
+    # A misleading repository name must not select the K3.1 variant.
+    model = 'fixture/Kimi-K3.1-EXL3-K2'
+    config = tmp_path / 'hf/hub/models--fixture--Kimi-K3.1-EXL3-K2/snapshots/revision/config.json'
+    write_json(config, checkpoint)
+    (tmp_path / 'kimi.config').write_text(
+        f'FAMILY=kimi_k3\nMODEL_ID={model}\nMODEL_REVISION=revision\nSPARK_COUNT=0\nRTX_GPUS=2\n')
+    matrix = tmp_path / 'matrix.json'
+    write_json(matrix, dict(entries=[dict(name='kimi', family='kimi_k3', config='kimi.config')]))
+    wanted = {'kimik3', 'dense_trellis_k6', 'kimi_split'} | ({'kimik31'} if k31 else set())
+    assert set(SCOPE.requirements(tmp_path, matrix, 'kimi')[0]['programs']) == wanted
+
+    # CMake always ships both variants; placement inputs must inventory that union.
+    cmake = (REPO / 'native/cmake/shared/dsv4_programs.cmake').read_text()
+    block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)\n', 1)[1].split('\nif(CUTEAFD_ENABLE_MUSE_AOT)', 1)[0]
+    import re
+    geometries = re.findall(r'set\(CUTEAFD_PROGRAM_GEOMETRY "([^"]+)"\)', block)
+    shipped = {'kimik3', 'kimik31', 'dense_trellis_k6', 'kimi_split'}
+    assert len(geometries) == 2
+    for geometry in geometries:
+        assert set(geometry.removeprefix('${CUTEAFD_PROGRAM_GEOMETRY},').split(',')) == shipped
+    spec = importlib.util.spec_from_file_location('k31_placement_inputs', REPO / 'scripts/build/export-placement-inputs.py')
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    args = publisher.export_jobs()[0][2]
+    assert shipped <= set(args[args.index('--geometry') + 1].split(','))
+    assert wanted <= shipped
+
+
 def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
     real = SCOPE.scopes_module(REPO)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
