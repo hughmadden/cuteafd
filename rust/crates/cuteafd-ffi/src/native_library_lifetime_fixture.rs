@@ -145,7 +145,7 @@ impl Fixture {
     }
 
     /// Configure static package ABI before loading a CPU expert module.
-    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; 16], scratch: &[u64; 6]) -> Result<()> {
+    pub fn configure_fp8(&self, library: &NativeLibrary, words: &[u32; crate::fp8_moe::FP8_MOE_INFO_WORDS], scratch: &[u64; 6]) -> Result<()> {
         // SAFETY: the CPU-only export copies the two fixed-size arrays synchronously.
         unsafe {
             let configure: Symbol<unsafe extern "C" fn(*const u32, *const u64)> =

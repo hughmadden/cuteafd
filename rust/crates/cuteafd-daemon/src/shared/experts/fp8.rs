@@ -1040,8 +1040,8 @@ mod tests {
         let catalog = crate::shared::memory::push_fp8::tests::fixture(
             root.path(), ExpertFormat::Fp8Block128, false)?;
         let tensors = catalog.fp8().unwrap();
-        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, 128, 1024, 64, 2, 1024, 1, 7, 0,
-            1, 16, 0, 0, 0, 0, 0];
+        let words = [6 | 1 << 8 | 1 << 16 | 1 << 24, 128, 1024, 64, 2, 1024, 1, 7, 0,
+            1, 16, 0, 0, 0, 0, 0, 1.0f32.to_bits(), 0];
         fixture.configure_fp8(&library, &words, &[256, 0, 0, 0, 0, 0])?;
         let before = fixture.events()?.matches('D').count();
         let mut mounted = Fp8Weights::load(&library, tensors, fixture.directory(), &[], 1, 0, 1, 256)?;
