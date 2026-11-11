@@ -50,6 +50,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
     "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "kimik31": ("moonshotai/Kimi-K3.1-Pro", 1048576),
     "ml4": ("mistralai/Mistral-Large-4-1T-A52B", 1048576),
 }
 
@@ -959,6 +960,60 @@ def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     return out
 
 
+def kimi_k31_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """K3.1 uses shared KDA/MLA, native index math and global DSA selection.
+
+    Keep this inventory separate from K3's dense attention exports: K3's rank
+    normalization remains 1e-6, while K3.1 requires 1e-5 in every core view.
+    No K3 drafter is exported here until hidden-state compatibility is qualified.
+    """
+    from b12x.integration.cuteafd import context_split, glmf, kimi_dsa, kimi_mla
+
+    index = kimi_dsa.KimiDsaGeometry()
+    pages = (max_context + PAGE_ROWS - 1) // PAGE_ROWS
+    out = [("kda_commit", "kda_commit", {}, lambda: glmf.compile_glmf_kda_commit_aot(g)),
+           ("lse_combine2", "lse_combine2", {"heads": 48, "has_sink": False},
+            lambda: context_split.compile_lse_combine2_aot(heads=48, has_sink=False)),
+           ("dsa_candidate_merge", "dsa_candidate_merge", {"topk": 2048},
+            lambda: context_split.compile_dsa_candidate_merge_aot(topk=2048))]
+    for rows in sorted({decode_rows, prefill_rows}):
+        decode = rows == decode_rows
+        params = {"max_rows": rows, "output_kind": "norm", "decode": decode, "bf16_wide": not decode}
+        out.append((f"kda_m{rows}", "kda", params,
+                    lambda kw=params: glmf.compile_glmf_kda_aot(g, **kw)))
+        out.append((f"index_producer_m{rows}", "index_producer", {"max_rows": rows},
+                    lambda r=rows: kimi_dsa.compile_kimi_index_producer_aot(index, max_rows=r)))
+        mode = "decode" if decode else "prefill"
+        for stem, compile_topk in (("index_topk", kimi_dsa.compile_kimi_index_topk_aot),
+                                   ("scored_index_topk", kimi_dsa.compile_kimi_context_index_topk_aot)):
+            params = {"max_rows": rows, "max_pages": pages, "mode": mode}
+            out.append((f"{stem}_{mode}_m{rows}", stem, params,
+                        lambda fn=compile_topk, kw=params: fn(index, **kw)))
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                mla = kimi_mla.KimiMlaGeometry(heads=heads, kv_cache=cache, norm_eps=1e-5)
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                params = {"max_rows": rows, "heads": heads, "kv_cache": cache}
+                out.append((f"mla_producer{suffix}{cache_suffix}_m{rows}", "mla_producer", params,
+                            lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_producer_aot(g, max_rows=r)))
+                out.append((f"sparse_mla{suffix}{cache_suffix}_m{rows}", "sparse_mla", params,
+                            lambda r=rows, g=mla: kimi_dsa.compile_kimi_sparse_mla_aot(g, max_rows=r)))
+                if cache == "bf16":
+                    out.append((f"mla_output{suffix}_m{rows}", "mla_output", params,
+                                lambda r=rows, g=mla: kimi_mla.compile_kimi_mla_output_aot(g, max_rows=r)))
+                if heads == 96:
+                    for begin in (0, 48):
+                        out.append((f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}", "sparse_mla_partial",
+                                    {**params, "head_begin": begin, "head_count": 48},
+                                    lambda r=rows, g=mla, b=begin: kimi_dsa.compile_kimi_sparse_mla_partial_aot(
+                                        g, max_rows=r, head_begin=b)))
+    out.extend(kimi_w8_programs())
+    out.extend(kimi_latent_programs())
+    out.extend(kimi_route_programs())
+    return out
+
+
 def kimi_context_programs(decode_rows: int, max_context: int):
     """Kimi h96-query owned-page partials, h48 combine and format-native gathers."""
     from b12x.integration.cuteafd import context_split, kimi_mla
@@ -1346,13 +1401,13 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
-    if "kimik3" in geometries:
+    if any(name in geometries for name in ("kimik3", "kimik31")):
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
@@ -1514,10 +1569,10 @@ def main() -> None:
              "glm2": glm2, "mimo": MIMO_V2_FLASH, "mimop": MIMO_V26_PRO,
              "mimo2": mimo2, "mimop2": mimop2, "mimof": MIMO_V26_FLASH, "mimof2": mimof2, "glmf": GLM53_FLASH, "glmf2": glmf2, "qwen4": QWEN38_FLASH_NEXT,
              "qwen35": QWEN35_9B, "qwen38": QWEN38_27B,
-             "kimik3": kimi_kda}[name]
+             "kimik3": kimi_kda, "kimik31": kimi_kda}[name]
         family = {"flash": "dsv4f", "flash2": "dsv4f2", "pro": "dsv4p", "pro2": "dsv4p2", "glm": "glm", "glm2": "glm2", "mimo": "mimo", "mimop": "mimop",
                   "mimo2": "mimo2", "mimop2": "mimop2", "mimof": "mimof", "mimof2": "mimof2", "glmf": "glmf", "glmf2": "glmf2", "qwen4": "qwen4",
-                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3"}[name]
+                  "qwen35": "qwen35", "qwen38": "qwen38", "kimik3": "kimik3", "kimik31": "kimik31"}[name]
         manifest["families"][family] = {k: v for k, v in vars(g).items()}
         extent = geometry_context(name, args.max_context)
         manifest["family_capacities"][family] = {"max_context": extent}
@@ -1526,7 +1581,7 @@ def main() -> None:
                 "mimo2": mimo_head_split_programs, "mimop2": mimo_head_split_programs,
                 "mimof": mimo_programs, "mimof2": mimo_head_split_programs,
                 "glmf": glmf_programs, "glmf2": glmf_head_split_programs,
-                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs}.get(name, programs)
+                "qwen4": qwen4_programs, "kimik3": kimi_kda_programs, "kimik31": kimi_k31_programs}.get(name, programs)
         if name in ("qwen35", "qwen38"):
             # These exports target the named official checkpoints' native norm storage.
             norm_dtype = torch.float32 if name == "qwen35" else torch.bfloat16
@@ -1585,7 +1640,7 @@ def main() -> None:
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
-    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2", "step5", "step52")):
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "kimik31", "ml4", "muse", "muse2", "step5", "step52")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
                   {"max_rows": 4096 if (k, n) in flash_native_bf16_shapes()
                       or "native-core" in draft_bf16_shapes()[(k, n)] else 2048},
@@ -1595,7 +1650,7 @@ def main() -> None:
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n, "f32"))
                  for n, k in sorted(native_attention_bf16_f32_shapes())]
     if "native_attention" not in geometries and any(name in geometries for name in
-            ("glm", "glm2", "kimik3", "step5", "step52", "muse", "muse2", "ml4")):
+            ("glm", "glm2", "kimik3", "kimik31", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]
     if "minimax" in geometries:
         from export_b12x_exlr8_dense_aot import minimax_programs

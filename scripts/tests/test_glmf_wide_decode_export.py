@@ -42,7 +42,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
+    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_dsa", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -50,6 +50,8 @@ def exporter(monkeypatch):
         @property
         def record_bytes(self):
             return 656 if self.kv_cache == "fp8" else 1152
+    package.kimi_dsa.KimiDsaGeometry = lambda: types.SimpleNamespace(index_heads=32, index_head_dim=128,
+        index_topk=2048, index_norm_eps=1e-5, hidden=7168, q_lora_rank=1536, page_rows=64)
     package.kimi_mla.KimiMlaGeometry = lambda **kw: KimiGeometry(**kw)
     package.kimi_mla.kimi_context_heads_per_tile = lambda *, rows: 8 if rows < 4 else 16
     @dataclasses.dataclass(frozen=True)
@@ -641,6 +643,42 @@ def test_kimi_nope_mla_exports_both_head_layouts_and_all_modes(exporter, decode_
                 assert vars(args[0]) == {"heads": heads, "kv_cache": cache}
                 assert kwargs == {"max_rows": rows, "max_context": 1048576, "mode": mode}
                 assert params == {"mode": mode, "max_rows": rows, "heads": heads, "kv_cache": cache}
+
+
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 2048)])
+def test_kimi_k31_exports_native_dsa_without_changing_k3_or_enabling_a_drafter(exporter, decode_rows, prefill_rows):
+    programs = exporter.kimi_k31_programs(GEOMETRY, decode_rows, prefill_rows, 1048576)
+    catalog = {stem: (op, params, build) for stem, op, params, build in programs}
+    assert len(catalog) == len(programs)
+    assert not any("draft" in stem or "dense_mla" in stem for stem in catalog)
+    assert {"kda_commit", "lse_combine2", "dsa_candidate_merge"} <= catalog.keys()
+    for rows, mode in [(decode_rows, "decode"), (prefill_rows, "prefill")]:
+        module, function, args, kwargs = catalog[f"index_producer_m{rows}"][2]()
+        assert (module, function, kwargs) == ("kimi_dsa", "compile_kimi_index_producer_aot", {"max_rows": rows})
+        assert args[0].index_norm_eps == 1e-5
+        for stem, function in [("index_topk", "compile_kimi_index_topk_aot"),
+                               ("scored_index_topk", "compile_kimi_context_index_topk_aot")]:
+            module, actual, args, kwargs = catalog[f"{stem}_{mode}_m{rows}"][2]()
+            assert (module, actual) == ("kimi_dsa", function)
+            assert kwargs == {"max_rows": rows, "max_pages": 16384, "mode": mode}
+        for heads in (48, 96):
+            suffix = "" if heads == 48 else "_h96"
+            for cache in ("bf16", "fp8"):
+                cache_suffix = "" if cache == "bf16" else "_fp8"
+                for stem in (f"mla_producer{suffix}{cache_suffix}_m{rows}",
+                             f"sparse_mla{suffix}{cache_suffix}_m{rows}"):
+                    module, function, args, kwargs = catalog[stem][2]()
+                    assert args[0].norm_eps == 1e-5
+                    assert (args[0].heads, args[0].kv_cache, kwargs["max_rows"]) == (heads, cache, rows)
+                if heads == 96:
+                    for begin in (0, 48):
+                        module, function, args, kwargs = catalog[f"sparse_mla_partial{cache_suffix}_h{begin}_m{rows}"][2]()
+                        assert (module, function) == ("kimi_dsa", "compile_kimi_sparse_mla_partial_aot")
+                        assert args[0].norm_eps == 1e-5
+                        assert kwargs == {"max_rows": rows, "head_begin": begin}
+    for stem, op, params, build in exporter.kimi_kda_programs(GEOMETRY, decode_rows, prefill_rows, 1048576):
+        if op == "mla_producer":
+            assert "norm_eps" not in vars(build()[2][0])
 
 
 def test_kimi_context_exports_native_partial_ranges_and_shared_primitives(exporter, monkeypatch):
