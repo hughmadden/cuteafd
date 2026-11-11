@@ -77,6 +77,16 @@ impl CoordinatorWeights {
     pub fn dense_programs(&self) -> BTreeSet<String> {
         self.projections.iter().map(Mxfp8Projection::program_name).collect()
     }
+
+    /// Charge one arena backing and its one driver-allocation tail. Tensor
+    /// views are aliases, not additional resident-weight charges.
+    pub fn weight_components(&self, maximum_pages: u64)
+        -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
+        use crate::placement::planner::{weight_arena_components, Lifetime, Location, Refusal};
+        let rank = u8::try_from(self.rank).map_err(|_| Refusal::Overflow("MiniMax coordinator rank"))?;
+        weight_arena_components(&self.arena, Location::coordinator(rank), Lifetime::RESIDENT,
+            maximum_pages, cuteafd_core::memory_layout::MemoryKind::Weights)
+    }
 }
 
 struct Builder<'a> {

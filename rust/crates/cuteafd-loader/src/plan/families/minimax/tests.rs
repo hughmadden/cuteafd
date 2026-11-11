@@ -124,6 +124,20 @@ fn coordinator_native_arena_preserves_checkpoint_bytes_and_explicit_owners() {
         assert!(weight.arena.view(&format!("{TEXT}norm.weight")).is_some());
         assert_eq!(weight.arena.view(&format!("{TEXT}embed_tokens.weight")).is_some(), rank == 0);
         assert_eq!(weight.arena.view("language_model.lm_head.weight").is_some(), rank == 1);
+        let components = weight.weight_components(1024).unwrap();
+        use crate::placement::planner::ComponentKind;
+        assert_eq!(components.len(), 3);
+        let ComponentKind::Allocation { template, .. } = &components[0].kind else { panic!("root") };
+        assert_eq!(template.id, weight.arena.id());
+        assert_eq!(template.bytes, weight.arena.bytes() as u64);
+        assert!(template.view.is_none());
+        let ComponentKind::ResidentWeight(resident) = &components[1].kind else { panic!("resident") };
+        assert_eq!(resident.id, template.id);
+        assert_eq!(resident.weights.0, template.bytes);
+        let ComponentKind::AllocationGranularity(tail) = &components[2].kind else { panic!("tail") };
+        assert_eq!(tail.requests(), [template.bytes]);
+        assert_eq!(tail.backings[0].backing, template.id);
+        assert!(weight.weight_components(0).is_err());
     }
     assert!(weights[0].arena.view(&format!("{TEXT}layers.3.block_sparse_moe.gate.weight")).is_some());
     let single = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
