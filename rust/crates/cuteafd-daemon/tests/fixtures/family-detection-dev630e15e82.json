@@ -1,0 +1,147 @@
+{
+  "baseline": "630e15e8254f3844b6447a2805b6f10f5e2b2842",
+  "results": [
+    {
+      "model": "Qwen/Qwen3.5-9B",
+      "revision": "c202236235762e1c871ad0ccb60c8ee5ba337b9a",
+      "family": "qwen3_5"
+    },
+    {
+      "model": "Qwen/Qwen3.8-27B",
+      "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "family": "qwen3_5"
+    },
+    {
+      "model": "Qwen/Qwen3.8-27B-FP8",
+      "revision": "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a",
+      "family": "qwen3_5"
+    },
+    {
+      "model": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+      "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+      "family": "mimo_v2"
+    },
+    {
+      "model": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+      "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
+      "family": "mimo_v2"
+    },
+    {
+      "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+      "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+      "family": "deepseek_v4"
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+      "family": "deepseek_v41"
+    },
+    {
+      "model": "kindlingai/glm-5.3-exlr8-k2-k3-k4",
+      "revision": "a2b599e06c59f2ccb01aaa44e6f182ba21e39f80",
+      "family": "glm5"
+    },
+    {
+      "model": "kindlingai/glm-5.3-flash-exlr8-k2-k3-k4",
+      "revision": "867580abd28d142bb4c56218bb81a752b7dea988",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "nvidia/GLM-5.3-Flash-NVFP4",
+      "revision": "09b04e5e74bca08ca8549fc736d4cdd8624bfde3",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "nvidia/GLM-5.3-NVFP4",
+      "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+      "family": "glm5"
+    },
+    {
+      "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "revision": "2061e0b0c5d92bdf7c8fbd4241bbc2af239d7e2d",
+      "family": "qwen4"
+    },
+    {
+      "model": "stepfun-ai/Step-5-Preview",
+      "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
+      "family": "step5"
+    },
+    {
+      "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+      "revision": "7a63f24905223aff19212d65226be708950823ac",
+      "family": "deepseek_v4"
+    },
+    {
+      "model": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
+      "revision": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
+      "family": "deepseek_v41"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-Core-K6",
+      "revision": "5a4e83a09a11f3145332ed632d28a9894ea88225",
+      "family": "glm5"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+      "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
+      "family": "glm5"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8",
+      "revision": "d31ebc921f1f098b4a56d37aaccb3cdef4096184",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6",
+      "revision": "5d3fffe1df9c4a109bbbdafb60dc19df9fac019d",
+      "family": "glm5_flash"
+    },
+    {
+      "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2",
+      "revision": "acba35b61a672561652b16a96fca1be85c1bd875",
+      "family": "kimi_k3"
+    },
+    {
+      "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6",
+      "revision": "1a28050d2954426a43a3db705e53ca120e5f2b47",
+      "family": "kimi_k3"
+    },
+    {
+      "model": "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6",
+      "revision": "03c80aebaa483d55760703ae5bc0c9734c9d67d6",
+      "family": "mistral_large4"
+    },
+    {
+      "model": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6",
+      "revision": "89998fb177acd9a862ac8bd4fb79bfd50e940c97",
+      "family": "muse_spark"
+    },
+    {
+      "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+      "revision": "888306bd3996d6317758c07df50622829259ad17",
+      "family": "qwen4"
+    },
+    {
+      "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+      "revision": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89",
+      "family": "step5"
+    },
+    {
+      "model": "zai-org/GLM-5.3-Flash",
+      "revision": "eb9eb208eb0d988989d07a6a12d0fdeb5f52574a",
+      "family": "glm5_flash"
+    }
+  ],
+  "not_installed": [
+    {
+      "model": "stepfun-ai/Step-5-Preview-NVFP4",
+      "revision": "bc246cc2848e17b37f377eda8fd825c5b3018d1f",
+      "reason": "retired example checkpoint absent"
+    }
+  ]
+}

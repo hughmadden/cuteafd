@@ -286,9 +286,12 @@ mod tests {
             ("minimax_index_producer", 4096 * 2304),
         ]);
         let components = programs.workspace_components("minimax.producer.0", 0, Lifetime::TARGET, 16).unwrap();
-        let names = serde_json::to_string(&components).unwrap();
-        assert!(names.contains("minimax.producer.0.minimax_index_producer.tail"));
-        assert!(!names.contains("activation"));
+        use crate::placement::planner::ComponentKind;
+        assert!(components.iter().any(|c| matches!(&c.kind,
+            ComponentKind::AllocationGranularity(tail)
+                if tail.id == "minimax.producer.0.minimax_index_producer.tail")));
+        assert_eq!(components.iter().filter(|c| matches!(&c.kind,
+            ComponentKind::Allocation { .. })).count(), 3);
         assert!(ProducerPrograms::resolve(&manifest, 4097).is_err());
         assert!(ProducerPrograms::resolve(&manifest, 0).is_err());
         let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().pop();
@@ -350,10 +353,9 @@ mod tests {
             .workspace_components("minimax.prefill.0", 0, true, Lifetime::TARGET, 16)
             .unwrap();
         assert!(components.len() > prefill.len());
-        let serialized = serde_json::to_value(&components).unwrap();
-        assert!(serialized
-            .to_string()
-            .contains("minimax.prefill.0.index.scratch.tail"));
+        assert!(components.iter().any(|c| matches!(&c.kind,
+            crate::placement::planner::ComponentKind::AllocationGranularity(tail)
+                if tail.id == "minimax.prefill.0.index.scratch.tail")));
         assert!(programs
             .workspace_components("", 0, true, Lifetime::TARGET, 16)
             .is_err());
