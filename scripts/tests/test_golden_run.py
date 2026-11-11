@@ -194,6 +194,11 @@ BASE = ['--task', 'gr', '--family', 'glm', '--model', 'org/model']
 GOLDEN = ['--', '--snapshot', '{snapshot}', '--device', '0', '--split-device', '1', '--skip-routed-experts', '--nll']
 
 
+def test_minimax_golden_uses_shared_runner_subcommand():
+    assert golden.golden_args('minimax', ['--snapshot', '{snapshot}', '--nll']) == [
+        'minimax-golden', '--snapshot', '{snapshot}', '--nll']
+
+
 @pytest.mark.parametrize('family,sub', sorted(golden.SUBCOMMANDS.items()))
 def test_argv_per_family_passes_args_verbatim(family, sub):
     args = ['--snapshot', '{snapshot}', '--golden', '/g', '--resume-at', '100,256', '--save-logits', '{out}/l']

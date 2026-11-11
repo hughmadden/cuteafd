@@ -127,10 +127,19 @@ fn flags(value: &Value, key: &str, layers: usize) -> Result<Vec<bool>> {
     }).collect()
 }
 
-fn token_ids(value: &Value) -> Vec<u32> {
+fn token_id(value: &Value, key: &str, vocab: usize) -> Result<u32> {
+    let id = value.as_u64().with_context(|| format!("MiniMax M3 {key} must be a token id"))?;
+    ensure!(id < vocab as u64, "MiniMax M3 {key} {id} is outside vocabulary {vocab}");
+    Ok(u32::try_from(id)?)
+}
+
+fn token_ids(value: &Value, key: &str, vocab: usize) -> Result<Vec<u32>> {
     match value {
-        Value::Array(ids) => ids.iter().filter_map(|id| id.as_u64().map(|id| id as u32)).collect(),
-        other => other.as_u64().map(|id| vec![id as u32]).unwrap_or_default(),
+        Value::Array(ids) => {
+            ensure!(!ids.is_empty(), "MiniMax M3 {key} must not be empty");
+            ids.iter().map(|id| token_id(id, key, vocab)).collect()
+        }
+        other => Ok(vec![token_id(other, key, vocab)?]),
     }
 }
 
@@ -147,25 +156,25 @@ impl MiniMaxM3Config {
         ensure!(heads % kv_heads == 0, "MiniMax M3 heads {heads} are not a multiple of KV heads {kv_heads}");
         let rotary_dim = int(v, "rotary_dim")?;
         ensure!(rotary_dim <= head_dim && rotary_dim % 2 == 0, "MiniMax M3 rotary_dim {rotary_dim} must be even and at most head_dim {head_dim}");
-        if let Some(factor) = v["partial_rotary_factor"].as_f64() {
+        if v.get("partial_rotary_factor").is_some() {
+            let factor = float(v, "partial_rotary_factor")?;
             ensure!((factor * head_dim as f64 - rotary_dim as f64).abs() < 1e-9,
                 "partial_rotary_factor {factor} disagrees with rotary_dim {rotary_dim} of head_dim {head_dim}");
         }
         ensure!(v["use_gemma_norm"].as_bool() == Some(true), "MiniMax M3 norms must be Gemma (1 + w) RMSNorms");
         ensure!(v["use_qk_norm"].as_bool() == Some(true) && v["qk_norm_type"] == "per_head",
             "MiniMax M3 requires per-head QK norms, found use_qk_norm={} qk_norm_type={}", v["use_qk_norm"], v["qk_norm_type"]);
-        ensure!(v["attention_output_gate"].as_bool() != Some(true), "MiniMax M3 attention output gates are not part of this release");
+        ensure!(v.get("attention_output_gate").is_none_or(|value| value.as_bool() == Some(false)),
+            "MiniMax M3 attention output gates must be false or absent");
         ensure!(v["hidden_act"] == "swigluoai", "MiniMax M3 FFNs must be swigluoai, found {}", v["hidden_act"]);
         ensure!(v["scoring_func"] == "sigmoid" && v["use_routing_bias"].as_bool() == Some(true),
             "MiniMax M3 routing must be sigmoid with a selection bias");
         ensure!(v["n_shared_experts"].as_u64() == Some(1), "MiniMax M3 requires one shared expert, found {}", v["n_shared_experts"]);
         let moe = flags(v, "moe_layer_freq", layers)?;
         let sparse_cfg = &v["sparse_attention_config"];
-        let sparse = if sparse_cfg["use_sparse_attention"].as_bool() == Some(true) {
-            flags(sparse_cfg, "sparse_attention_freq", layers)?
-        } else {
-            vec![false; layers]
-        };
+        let enabled = sparse_cfg["use_sparse_attention"].as_bool().context("MiniMax M3 use_sparse_attention must be boolean")?;
+        let sparse_flags = flags(sparse_cfg, "sparse_attention_freq", layers)?;
+        let sparse = if enabled { sparse_flags } else { vec![false; layers] };
         let msa = MsaConfig {
             index_heads: int(sparse_cfg, "sparse_num_index_heads")?,
             index_dim: int(sparse_cfg, "sparse_index_dim")?,
@@ -177,7 +186,8 @@ impl MiniMaxM3Config {
         ensure!(msa.index_dim >= rotary_dim, "MSA index dim {} is narrower than rotary_dim {rotary_dim}", msa.index_dim);
         ensure!(msa.local_blocks <= msa.topk_blocks, "MSA local blocks {} exceed top-k {}", msa.local_blocks, msa.topk_blocks);
         ensure!(sparse_cfg["sparse_score_type"] == "max", "MSA block score must be max, found {}", sparse_cfg["sparse_score_type"]);
-        ensure!(sparse_cfg["sparse_init_block"].as_u64().unwrap_or(0) == 0, "MSA sink (init) blocks are not part of this release");
+        ensure!(sparse_cfg.get("sparse_init_block").is_none_or(|value| value.as_u64() == Some(0)),
+            "MSA sink (init) blocks must be zero or absent");
         let disabled = flags(sparse_cfg, "sparse_disable_index_value", layers)?;
         ensure!(disabled.iter().all(|x| *x), "MSA index values must be disabled on every layer");
         let q = &root["quantization_config"];
@@ -189,10 +199,13 @@ impl MiniMaxM3Config {
         for key in ["rope_theta", "rms_norm_eps", "routed_scaling_factor", "swiglu_alpha", "swiglu_limit"] {
             ensure!(float(v, key)? > 0.0, "MiniMax M3 {key} must be positive");
         }
-        ensure!(v["tie_word_embeddings"].as_bool() != Some(true), "MiniMax M3 requires an untied LM head");
-        let eos = token_ids(&v["eos_token_id"]);
+        ensure!(v.get("tie_word_embeddings").is_none_or(|value| value.as_bool() == Some(false)),
+            "MiniMax M3 tie_word_embeddings must be false or absent");
+        let vocab_size = int(v, "vocab_size")?;
+        let bos = token_id(v.get("bos_token_id").unwrap_or(&Value::from(200_034)), "bos_token_id", vocab_size)?;
+        let eos = token_ids(v.get("eos_token_id").unwrap_or(&Value::from(200_020)), "eos_token_id", vocab_size)?;
         Ok(Self {
-            vocab_size: int(v, "vocab_size")?,
+            vocab_size,
             hidden: int(v, "hidden_size")?,
             layers,
             heads,
@@ -214,8 +227,8 @@ impl MiniMaxM3Config {
             msa,
             max_position: int(v, "max_position_embeddings")?,
             tie_embeddings: v["tie_word_embeddings"].as_bool().unwrap_or(false),
-            bos: v["bos_token_id"].as_u64().unwrap_or(200_034) as u32,
-            eos: if eos.is_empty() { vec![200_020] } else { eos },
+            bos,
+            eos,
         })
     }
 
@@ -248,7 +261,8 @@ impl MiniMaxM3VisionConfig {
     }
 
     pub fn from_hf(root: &Value) -> Result<Option<Self>> {
-        let Some(v) = root.get("vision_config").filter(|v| v.is_object()) else { return Ok(None) };
+        let Some(v) = root.get("vision_config") else { return Ok(None) };
+        ensure!(v.is_object(), "MiniMax M3 vision_config must be an object");
         ensure!(v["hidden_act"] == "gelu" && root["projector_hidden_act"] == "gelu", "MiniMax M3 vision uses exact GELU");
         ensure!(v["position_embedding_type"] == "rope" && v["rope_mode"] == "3d", "MiniMax M3 vision requires 3D RoPE");
         ensure!(root["vision_feature_layer"].as_i64() == Some(-1) && root["vision_feature_select_strategy"] == "full",
@@ -347,5 +361,26 @@ pub(crate) mod tests {
         assert!(mutate(&|c| c["text_config"]["moe_layer_freq"].as_array_mut().unwrap().pop().map(|_| ()).unwrap()).is_err());
         let small = mutate(&|c| c["text_config"]["num_local_experts"] = 64.into()).unwrap();
         assert!(small.release_geometry().is_err());
+    }
+
+    #[test]
+    fn malformed_optional_semantics_and_tokens_fail_closed() {
+        for (key, value) in [("partial_rotary_factor", Value::from("half")),
+            ("attention_output_gate", Value::from("false")), ("tie_word_embeddings", Value::from(0)),
+            ("bos_token_id", Value::from(4_294_967_296u64)), ("eos_token_id", serde_json::json!([200020, "bad"])),
+            ("eos_token_id", serde_json::json!([])), ("eos_token_id", Value::from(200064))] {
+            let mut cfg = release_config();
+            cfg["text_config"][key] = value;
+            assert!(MiniMaxM3Config::from_hf(&cfg).is_err(), "accepted {key}");
+        }
+        for (key, value) in [("sparse_init_block", Value::from("0")),
+            ("use_sparse_attention", Value::Null), ("sparse_disable_index_value", serde_json::json!([]))] {
+            let mut cfg = release_config();
+            cfg["text_config"]["sparse_attention_config"][key] = value;
+            assert!(MiniMaxM3Config::from_hf(&cfg).is_err(), "accepted {key}");
+        }
+        let mut cfg = release_config();
+        cfg["vision_config"] = Value::from("bundled");
+        assert!(MiniMaxM3VisionConfig::from_hf(&cfg).is_err());
     }
 }

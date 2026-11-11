@@ -105,6 +105,17 @@ def make_snapshot(folder, vocab=64):
     return folder
 
 
+def test_shared_sparse_indexer_vectors_match_independent_msa_reference():
+    vectors = ROOT / "rust/crates/cuteafd-loader/src/families/minimax_m3/fixtures/msa-vectors.json"
+    for case in json.loads(vectors.read_text())["cases"]:
+        scores = torch.tensor(case["block_scores"], dtype=torch.float32).repeat_interleave(128, -1)
+        for head, token, value in case["overrides"]:
+            scores[head, token] = value
+        selected = model.msa_select(scores[:, None, :], torch.tensor([case["position"]]))
+        assert selected[:, 0].tolist() == case["selected"], case["name"]
+        assert selected.dtype == torch.int32 and selected.shape == (4, 1, 16)
+
+
 def test_mxfp8_dequantization_row_and_32_column_blocks():
     weights = torch.tensor([[1., -2., .5, 3.] * 16, [-1., 2., -.5, -3.] * 16]).to(torch.float8_e4m3fn)
     scales = torch.tensor([[127, 128], [126, 125]], dtype=torch.uint8)
