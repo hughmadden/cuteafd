@@ -337,6 +337,52 @@ fn validate_topk_batch(b: KimiIndexSelection, rows: usize, pages: usize, mode: K
     validate_phase(&operands[..if scored { 8 } else { 7 }], 5..if scored { 8 } else { 7 }, b.query_fp8.device_id)
 }
 
+const CANDIDATE_MERGE: &[&str] = &["scores", "indices", "out_scores", "out_indices", "table", "local_slots", "local_lengths"];
+
+#[derive(Clone, Copy, Debug)]
+pub struct KimiCandidateBatch {
+    pub rows: usize, pub table_stride: usize, pub rank: usize,
+    /// Two score-ordered runs per row, each 2048 entries. K3.1 supplies global
+    /// selection as the first run and (-inf,-1) as the second, not local top-k.
+    pub scores: Buffer, pub indices: Buffer,
+    pub output_scores: Buffer, pub output_indices: Buffer,
+    /// Independent compact MLA table, not the replicated index-cache table.
+    pub table: Buffer, pub local_slots: Buffer, pub local_lengths: Buffer,
+}
+
+pub struct KimiCandidateMerge<'a> { program: Program<'a> }
+impl<'a> KimiCandidateMerge<'a> {
+    pub fn load(programs: &'a Programs<'a>) -> Result<Self> {
+        let name = "kimik31_dsa_candidate_merge";
+        let spec = programs.spec(name)?;
+        if spec.scalar_kinds != b"iii" || !spec.scratch.is_empty()
+            || spec.pointers.iter().map(String::as_str).ne(CANDIDATE_MERGE.iter().copied())
+            || spec.geometry["topk"].as_u64() != Some(2048)
+            || spec.geometry["unit_rows"].as_u64() != Some(64) {
+            return Err(KimiMlaError::Invalid("K3.1 candidate merge ABI"));
+        }
+        Ok(Self { program: programs.program(name, CANDIDATE_MERGE)? })
+    }
+    pub fn launch(&self, b: KimiCandidateBatch, stream: *mut c_void) -> Result<()> {
+        validate_candidate_batch(b)?;
+        // SAFETY: full global candidates are already selected, local mapping
+        // extents/aliases checked; the lane retains both runs and compact table.
+        unsafe { self.program.launch(&[b.scores.ptr, b.indices.ptr, b.output_scores.ptr,
+            b.output_indices.ptr, b.table.ptr, b.local_slots.ptr, b.local_lengths.ptr],
+            &[Scalar::I32(b.rows as i32), Scalar::I32(b.table_stride as i32), Scalar::I32(b.rank as i32)], stream)?; }
+        Ok(())
+    }
+}
+fn validate_candidate_batch(b: KimiCandidateBatch) -> Result<()> {
+    if !(1..=4096).contains(&b.rows) || !(1..=8192).contains(&b.table_stride) || b.rank > 1 {
+        return Err(KimiMlaError::Invalid("K3.1 candidate merge geometry"));
+    }
+    let operands = [(b.scores,b.rows*4096*4), (b.indices,b.rows*4096*4),
+        (b.table,b.rows*b.table_stride*4), (b.output_scores,b.rows*2048*4),
+        (b.output_indices,b.rows*2048*4), (b.local_slots,b.rows*2048*4), (b.local_lengths,b.rows*4)];
+    validate_phase(&operands, 3..7, b.scores.device_id)
+}
+
 const SPARSE_ATTENTION: &[&str] = &["query", "kv_cache", "indices", "lengths", "query_offsets", "out", "lse", "scratch"];
 
 #[derive(Clone, Copy, Debug)]
@@ -1452,6 +1498,29 @@ mod tests {
                 assert!(validate_topk_manifest(&wrong,64,16384,mode,scored).is_err());
             }
         }
+    }
+
+    #[test]
+    fn k31_candidate_merge_retains_full_global_runs_and_disjoint_local_outputs() {
+        let buffer = |index| Buffer { ptr: (index * 0x10000000usize) as *mut c_void,
+            bytes: 0x10000000, device_id: 0, flags: 0 };
+        let b = KimiCandidateBatch { rows: 17, table_stride: 8192, rank: 0,
+            scores: buffer(1), indices: buffer(2), output_scores: buffer(3), output_indices: buffer(4),
+            table: buffer(5), local_slots: buffer(6), local_lengths: buffer(7) };
+        validate_candidate_batch(b).unwrap();
+        validate_candidate_batch(KimiCandidateBatch { rank: 1, ..b }).unwrap();
+        for bad in [KimiCandidateBatch { rank: 2, ..b }, KimiCandidateBatch { rows: 0, ..b },
+            KimiCandidateBatch { table_stride: 8193, ..b },
+            KimiCandidateBatch { scores: Buffer { bytes: b.rows*2048*4, ..b.scores }, ..b },
+            KimiCandidateBatch { indices: Buffer { bytes: b.rows*2048*4, ..b.indices }, ..b },
+            KimiCandidateBatch { local_lengths: Buffer { bytes: b.rows*4-1, ..b.local_lengths }, ..b }] {
+            assert!(validate_candidate_batch(bad).is_err());
+        }
+        for reader in [b.scores,b.indices,b.table] {
+            assert!(validate_candidate_batch(KimiCandidateBatch { local_slots: reader, ..b }).is_err());
+            assert!(validate_candidate_batch(KimiCandidateBatch { output_scores: reader, ..b }).is_err());
+        }
+        assert!(validate_candidate_batch(KimiCandidateBatch { output_indices: b.local_slots, ..b }).is_err());
     }
 
     #[test]

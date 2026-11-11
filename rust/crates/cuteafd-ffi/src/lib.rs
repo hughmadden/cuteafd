@@ -4,6 +4,7 @@ pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_m
 pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiMlaPartial, KimiMlaPartialBatch, KimiIndexProducer, KimiIndexWeights, KimiIndexBatch,
     KimiSparseMla, KimiSparseBatch, KimiIndexTopK, KimiIndexSelection, KimiIndexMode,
+    KimiCandidateMerge, KimiCandidateBatch,
     KimiFfn, KimiFfnBatch, KimiFfnMode, KimiLatent, KimiPrefixMode, KimiResidual, KimiResidualBatch, KimiResidualSite,
     KimiRmsNorm, KimiSitu, KimiW8Error, KimiKda, KimiKdaBatch, KimiKdaWeights, KimiKdaCommit, KimiKdaGeometry,
     KimiRouter, KimiRoutes, KimiExpertInput, MLA_PAGE_ROWS, MLA_RECORD_BYTES};
