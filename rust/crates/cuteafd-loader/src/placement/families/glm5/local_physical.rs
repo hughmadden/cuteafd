@@ -153,7 +153,7 @@ impl LocalPhysicalSource {
                     let tensors = catalog.fp8().context("NVFP4 local headers missing")?.for_coordinator();
                     let (directory, _) = crate::formats::fp8_experts::exact_layout_directory(&local.package, &tensors, 2, rank);
                     let layout = directory.file_name().and_then(|name| name.to_str()).context("NVFP4 layout name missing")?;
-                    let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, layout, input.max_rows as u64)
+                    let scratch = crate::placement::inventory::fp8moe_scratch_bytes(&manifest, layout, input.max_rows as u64)?
                         .context("NVFP4 scratch extent missing")?;
                     let (scratch, output, _) = crate::serving_capacity::fp8moe_tp2_workspace(
                         usize::try_from(scratch)?, cfg.hidden, input.max_rows)?;

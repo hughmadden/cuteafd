@@ -275,7 +275,7 @@ impl ProgramsManifest {
 }
 
 impl ProgramEntry {
-    fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
+    pub(crate) fn from_manifest(entry: &Value) -> anyhow::Result<Self> {
         use anyhow::Context;
         #[derive(Deserialize)]
         struct Pointer { name: String }
@@ -764,11 +764,74 @@ impl GraphSet {
 /// smallest compiled capacity holding `rows`, from its `manifest.json`
 /// (`layouts.<layout>.capacities[].scratch_bytes`), as the runtime's
 /// `Fp8MoeModule::scratch_bytes` returns it. No CUDA.
-pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option<u64> {
-    let capacities = manifest["layouts"][layout]["capacities"].as_array()?;
-    capacities.iter().filter_map(|c| Some((c["capacity"].as_u64()?, c["scratch_bytes"].as_u64()?)))
-        .filter(|&(capacity, _)| capacity >= rows).min_by_key(|&(capacity, _)| capacity)
-        .map(|(_, bytes)| bytes.max(256))
+pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64)
+    -> Result<Option<u64>, Fp8MoeManifestError> {
+    let invalid = |reason: &str| Fp8MoeManifestError::Contract { layout: layout.into(), reason: reason.into() };
+    let layouts = manifest["layouts"].as_object().ok_or_else(|| invalid("missing layouts object"))?;
+    let Some(info) = layouts.get(layout) else { return Ok(None) };
+    let abi = info["abi_version"].as_u64();
+    if abi != Some(u64::from(cuteafd_ffi::fp8_moe::FP8_MOE_ABI)) {
+        return Err(Fp8MoeManifestError::Abi { layout: layout.into(), found: info["abi_version"].to_string(),
+            expected: cuteafd_ffi::fp8_moe::FP8_MOE_ABI });
+    }
+    let number = |key: &str| -> Result<f32, Fp8MoeManifestError> {
+        let value = info[key].as_f64().ok_or_else(|| invalid(&format!("missing or invalid {key}")))? as f32;
+        if !value.is_finite() { return Err(invalid(&format!("non-finite {key}"))) }
+        Ok(value)
+    };
+    let limit = number("swiglu_limit")?;
+    let alpha = number("swiglu_alpha")?;
+    let beta = number("swiglu_beta")?;
+    if limit < 0.0 || info["projection"].as_str() != Some("bf16") {
+        return Err(invalid("invalid limit or unsupported projection"));
+    }
+    let activation = info["activation"].as_str();
+    let weights = info["weights"].as_str();
+    if !matches!(weights, Some("fp8" | "mxfp4" | "nvfp4" | "nvfp4a4" | "bf16")) {
+        return Err(invalid("unsupported weight storage"));
+    }
+    match activation {
+        Some("silu_bf16_product" | "silu_post_clamp_fp32_product") if alpha == 1.0 && beta == 0.0 => (),
+        Some("swigluoai") if matches!(weights, Some("nvfp4" | "nvfp4a4")) && alpha > 0.0 && limit > 0.0 => (),
+        _ => return Err(invalid("unsupported activation or inconsistent alpha/beta/limit")),
+    }
+    if weights == Some("mxfp4") && activation != Some("silu_bf16_product") {
+        return Err(invalid("MXFP4 requires silu_bf16_product"));
+    }
+    let capacities = info["capacities"].as_array().ok_or_else(|| invalid("missing capacities"))?;
+    let mut scratch = None;
+    let mut previous = 0;
+    if capacities.is_empty() || capacities.len() > 6 { return Err(invalid("expected 1..=6 capacities")) }
+    for entry in capacities {
+        let capacity = entry["capacity"].as_u64().ok_or_else(|| invalid("invalid capacity"))?;
+        let bytes = entry["scratch_bytes"].as_u64().ok_or_else(|| invalid("invalid scratch_bytes"))?;
+        if capacity <= previous || capacity > i32::MAX as u64 { return Err(invalid("capacities must be positive, increasing int32 values")) }
+        previous = capacity;
+        if capacity >= rows && scratch.is_none() { scratch = Some(bytes.max(256)); }
+    }
+    Ok(scratch)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum Fp8MoeManifestError {
+    #[error("FP8 expert layout {layout} has ABI {found}, expected ABI{expected}; regenerate placement inputs")]
+    Abi { layout: String, found: String, expected: u8 },
+    #[error("FP8 expert layout {layout}: {reason}; regenerate placement inputs")]
+    Contract { layout: String, reason: String },
+    #[error("cannot read FP8 expert manifest {path}: {source}")]
+    Read { path: std::path::PathBuf, #[source] source: std::io::Error },
+    #[error("invalid FP8 expert manifest {path}: {source}; regenerate placement inputs")]
+    Json { path: std::path::PathBuf, #[source] source: serde_json::Error },
+}
+
+/// Only absence is optional; unreadable, malformed or stale packages are errors.
+pub fn fp8moe_manifest(path: &std::path::Path) -> Result<Option<Value>, Fp8MoeManifestError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Fp8MoeManifestError::Read { path: path.into(), source }),
+    };
+    serde_json::from_slice(&bytes).map(Some).map_err(|source| Fp8MoeManifestError::Json { path: path.into(), source })
 }
 
 /// The `fp8moe` package a coordinator loads for `format` experts of geometry
@@ -776,10 +839,10 @@ pub fn fp8moe_scratch_bytes(manifest: &Value, layout: &str, rows: u64) -> Option
 /// `shared::experts::fp8::package_directory`), under `lib`'s `fp8/` tree, and
 /// its scratch for `rows` rows.
 pub fn fp8moe_package_scratch(lib: &std::path::Path, family: &str,
-    format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Option<(String, u64)> {
+    format: crate::formats::fp8_experts::ExpertFormat, rows: u64) -> Result<Option<(String, u64)>, Fp8MoeManifestError> {
     let name = format.package_name(family);
-    let manifest: Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json")).ok()?).ok()?;
-    Some((name, fp8moe_scratch_bytes(&manifest, "tp1", rows)?))
+    let Some(manifest) = fp8moe_manifest(&lib.join("fp8").join(&name).join("manifest.json"))? else { return Ok(None) };
+    Ok(fp8moe_scratch_bytes(&manifest, "tp1", rows)?.map(|bytes| (name, bytes)))
 }
 
 /// Mandatory native W4A4 dense package; missing exports never select W4A16.
@@ -787,9 +850,9 @@ pub fn dense_package_directory(lib: &std::path::Path, geometry: &str) -> std::pa
     lib.join("fp8").join(crate::formats::fp8_experts::ExpertFormat::Nvfp4.package_name(geometry)).join("tp1")
 }
 
-pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Option<u64> {
+pub fn dense_package_scratch(lib: &std::path::Path, geometry: &str, rows: u64) -> Result<Option<u64>, Fp8MoeManifestError> {
     let directory = dense_package_directory(lib, geometry);
-    let manifest: Value = serde_json::from_slice(&std::fs::read(directory.parent()?.join("manifest.json")).ok()?).ok()?;
+    let Some(manifest) = fp8moe_manifest(&directory.parent().expect("dense package parent").join("manifest.json"))? else { return Ok(None) };
     fp8moe_scratch_bytes(&manifest, "tp1", rows)
 }
 
@@ -951,13 +1014,13 @@ mod tests {
             let root = dir.path().join("fp8").join(&name);
             std::fs::create_dir_all(root.join("tp1")).unwrap();
             std::fs::write(root.join("manifest.json"), json!({"layouts":{"tp1":{
-                "capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
-            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16),
+                "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":16,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+            assert_eq!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 16).unwrap(),
                 Some((name, 1024)));
             assert_eq!(dense_package_directory(dir.path(), family), root.join("tp1"));
-            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).is_none());
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 17).unwrap().is_none());
             std::fs::remove_file(root.join("manifest.json")).unwrap();
-            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).is_none());
+            assert!(fp8moe_package_scratch(dir.path(), family, ExpertFormat::Nvfp4, 1).unwrap().is_none());
         }
     }
 
@@ -1127,12 +1190,64 @@ mod tests {
 
     #[test]
     fn package_scratch_takes_the_smallest_capacity_at_or_above_rows() {
-        let manifest = json!({"layouts": {"tp1": {"capacities": [
+        let manifest = json!({"layouts": {"tp1": {"abi_version":6,"weights":"fp8","projection":"bf16",
+            "activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [
             {"capacity": 1, "scratch_bytes": 99328}, {"capacity": 1024, "scratch_bytes": 91839488},
             {"capacity": 4096, "scratch_bytes": 661072896}]}}});
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096), Some(661072896));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 1000), Some(91839488));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 8192), None);
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap(), Some(661072896));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 1000).unwrap(), Some(91839488));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 8192).unwrap(), None);
+    }
+
+    #[test]
+    fn measured_mimo_flash_manifest_preserves_native_contract_and_scratch() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mimo-flash-min-native-manifest.json")).unwrap();
+        assert_eq!(manifest["layouts"]["tp1"]["weights"], "mxfp4");
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 2752).unwrap(), Some(671_354_880));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap(), Some(671_354_880));
+    }
+
+    #[test]
+    fn native_manifest_rejects_stale_abi_and_invalid_contracts_before_capacity_lookup() {
+        let valid = json!({"layouts":{"tp1":{"abi_version":6,"weights":"nvfp4","projection":"bf16",
+            "activation":"swigluoai","swiglu_limit":7.0,"swiglu_alpha":1.702,"swiglu_beta":1.0,
+            "capacities":[{"capacity":16,"scratch_bytes":128}]}}});
+        assert_eq!(fp8moe_scratch_bytes(&valid, "tp1", 1).unwrap(), Some(256));
+        for version in [Value::Null, json!(5), json!(7), json!("6")] {
+            let mut manifest = valid.clone();
+            manifest["layouts"]["tp1"]["abi_version"] = version;
+            let error = fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap_err();
+            assert!(matches!(error, Fp8MoeManifestError::Abi { .. }));
+            assert!(error.to_string().contains("regenerate placement inputs"));
+        }
+        let mut missing = valid.clone();
+        missing["layouts"]["tp1"].as_object_mut().unwrap().remove("abi_version");
+        assert!(matches!(fp8moe_scratch_bytes(&missing, "tp1", 1), Err(Fp8MoeManifestError::Abi { .. })));
+        for (key, value) in [("activation", json!("unknown")), ("projection", json!("fp32")),
+            ("weights", json!("fp8")), ("swiglu_limit", json!(0)), ("swiglu_alpha", json!(-1)),
+            ("swiglu_alpha", json!(1e100)), ("swiglu_beta", Value::Null), ("capacities", json!([])),
+            ("capacities", json!([{"capacity":16,"scratch_bytes":128},{"capacity":1,"scratch_bytes":256}])),
+            ("capacities", json!([{"capacity":16}]))] {
+            let mut manifest = valid.clone();
+            manifest["layouts"]["tp1"][key] = value;
+            assert!(matches!(fp8moe_scratch_bytes(&manifest, "tp1", 4096), Err(Fp8MoeManifestError::Contract { .. })), "{key}");
+        }
+    }
+
+    #[test]
+    fn optional_native_packages_never_hide_stale_or_malformed_metadata() {
+        use crate::formats::fp8_experts::ExpertFormat;
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("fp8").join(ExpertFormat::Nvfp4.package_name("test"));
+        std::fs::create_dir_all(&package).unwrap();
+        for content in ["not json", r#"{"layouts":{"tp1":{"capacities":[{"capacity":16,"scratch_bytes":128}]}}}"#] {
+            std::fs::write(package.join("manifest.json"), content).unwrap();
+            assert!(fp8moe_package_scratch(root.path(), "test", ExpertFormat::Nvfp4, 1).is_err());
+            assert!(dense_package_scratch(root.path(), "test", 1).is_err());
+        }
+        std::fs::remove_file(package.join("manifest.json")).unwrap();
+        assert!(dense_package_scratch(root.path(), "test", 1).unwrap().is_none());
     }
 
     #[test]

@@ -299,7 +299,7 @@ fn glm_fp8_package_physical_weights_equal_mount_and_push() -> Result<()> {
     let package = root.path().join("package/tp2");
     std::fs::create_dir_all(&package)?;
     std::fs::write(package.parent().unwrap().join("manifest.json"), serde_json::to_vec(&serde_json::json!({
-        "layouts":{"tp2":{"capacities":[{"capacity":64,"scratch_bytes":256}]}}
+        "layouts":{"tp2":{"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":64,"scratch_bytes":256}]}}
     }))?)?;
     let local = glm5::LocalInventory { package: package.clone(), format: glm5::GlmLocalFormat::Nvfp4 { w4a4:true },
         experts:vec![], backend_workspace:0, extra_workspace:[0;2], world:2, unit_limit:0 };

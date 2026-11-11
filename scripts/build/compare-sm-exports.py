@@ -526,6 +526,11 @@ def export_routed(extra, output, selected_objects=None):
             "tp": tp, **{key: getattr(g, key) for key in
                 ("hidden", "slice", "experts", "top_k", "intermediate", "weights")},
             "input": "wire" if wire else "bf16",
+            "abi_version": package.ABI_VERSION, "activation": g.activation,
+            "projection": g.projection, "swiglu_limit": g.swiglu_limit,
+            **dict(zip(("swiglu_alpha", "swiglu_beta"), package.activation_params(
+                g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                getattr(g, "swiglu_beta", None), g.swiglu_limit))),
         }
         forms = [(rows, "auto", indirect) for rows in capacities]
         forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]

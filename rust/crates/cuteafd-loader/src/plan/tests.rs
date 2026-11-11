@@ -2204,6 +2204,54 @@ fn nvfp4_operand_carries_its_global_and_input_scales() {
 }
 
 #[test]
+fn compressed_nvfp4_preserves_divisor_scales_and_rejects_modelopt_aliasing() {
+    use format::{ScaleDirection, ScaleEncoding, TensorScale};
+    let compressed = detect_group("e", &[("weight_packed", "U8", &[64, 64]),
+        ("weight_scale", "F8_E4M3", &[64, 8]), ("weight_global_scale", "F32", &[]),
+        ("input_global_scale", "F32", &[1])]).unwrap();
+    assert!(compressed.is_compressed_nvfp4());
+    assert!(!compressed.is_nvfp4());
+    assert_eq!(compressed.logical, [64, 128]);
+    assert_eq!(compressed.stored, [64, 64]);
+    assert_eq!(compressed.label(), "nvfp4-g16-divisor");
+    let divisor = Some(TensorScale { encoding: ScaleEncoding::F32, direction: ScaleDirection::Divide });
+    assert_eq!(compressed.global_scale, divisor);
+    assert_eq!(compressed.input_scale, divisor);
+    assert_eq!(compressed.scale.as_ref().unwrap().direction, ScaleDirection::Multiply);
+    let modelopt = detect_group("e", &[("weight", "U8", &[64, 64]),
+        ("weight_scale", "F8_E4M3", &[64, 8]), ("weight_scale_2", "F32", &[]),
+        ("input_scale", "F32", &[])]).unwrap();
+    assert!(modelopt.is_nvfp4());
+    assert!(!modelopt.is_compressed_nvfp4());
+    assert_ne!(modelopt, compressed);
+    assert_eq!(modelopt.global_scale.unwrap().direction, ScaleDirection::Multiply);
+    assert_eq!(modelopt.input_scale.unwrap().direction, ScaleDirection::Multiply);
+}
+
+#[test]
+fn compressed_nvfp4_reports_missing_and_malformed_members() {
+    let valid = [("weight_packed", "U8", &[64, 64][..]),
+        ("weight_scale", "F8_E4M3", &[64, 8][..]), ("weight_global_scale", "F32", &[][..]),
+        ("input_global_scale", "F32", &[][..])];
+    for omitted in 0..valid.len() {
+        let members = valid.iter().enumerate().filter(|(i, _)| *i != omitted).map(|(_, m)| *m).collect::<Vec<_>>();
+        let error = detect_group("e", &members).unwrap_err();
+        assert!(error.reason.contains(valid[omitted].0), "{error}");
+    }
+    for (slot, dtype, shape) in [(0, "I8", &[64, 64][..]), (0, "U8", &[64, 63][..]),
+        (0, "U8", &[64][..]), (0, "U8", &[0, 64][..]), (1, "U8", &[64, 8][..]),
+        (1, "F8_E4M3", &[64, 4][..]), (2, "BF16", &[][..]), (3, "F32", &[2][..])] {
+        let mut members = valid;
+        members[slot] = (valid[slot].0, dtype, shape);
+        let error = detect_group("e", &members).unwrap_err();
+        assert_eq!(error.tensor, format!("e.{}", valid[slot].0), "{error}");
+    }
+    let mut extra = valid.to_vec();
+    extra.push(("input_scale", "F32", &[]));
+    assert_eq!(detect_group("e", &extra).unwrap_err().tensor, "e.input_scale");
+}
+
+#[test]
 fn segmented_fused_qkv_resolves_checkpoint_shards() {
     let dir = snapshot_tp(mimo_pro_config(), &mimo_pro_tensors(), Some(8));
     let report = plan(dir.path(), &sparks(6)).unwrap();
@@ -2482,7 +2530,7 @@ fn glm5_flash_native_block_projection_rejects_wrong_scale_dtype_grid_or_missing_
 #[test]
 fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let dense = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(dense.path(), json!({"layouts": {"tp1": {"capacities": [{"capacity":4096,"scratch_bytes":1024}]}}}).to_string()).unwrap();
+    std::fs::write(dense.path(), json!({"layouts": {"tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": [{"capacity":4096,"scratch_bytes":1024}]}}}).to_string()).unwrap();
     let quant_options = |ranks| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20, glmf_dense_manifest: Some(dense.path().to_path_buf()), ..Default::default() }), ..sparks(ranks) };
     let mut tensors = glm5_flash_tensors(&glm5_flash_config(2));
     tensors.retain(|(name, ..)| !name.contains(".mlp.experts.") && !name.starts_with("model.language_model.layers.0.mlp."));
@@ -3724,7 +3772,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp2":{
-        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
@@ -5696,7 +5744,7 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
     std::fs::create_dir_all(&share).unwrap();
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":{
-        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
@@ -6614,7 +6662,7 @@ fn mimo_and_qwen_all_onboarded_preserve_media_only_spark_and_refuse_unavailable_
     std::fs::write(&mimo_manifest, serde_json::to_vec(&json!({"layouts": {"tp1": {
         "input": "bf16", "tp": 1, "hidden": 4096, "experts": 256, "top_k": 8,
         "intermediate": 2048, "slice": 2048, "weights": "mxfp4",
-        "capacities": [{"capacity": 4096, "scratch_bytes": 671_354_880}]
+        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities": [{"capacity": 4096, "scratch_bytes": 671_354_880}]
     }}})).unwrap()).unwrap();
     let mimo_base = PlanOptions {
         vision: MediaMode::Spark(Some(0)),

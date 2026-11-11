@@ -329,7 +329,7 @@ mod tests {
                     std::fs::write(&package, serde_json::to_vec(&json!({"layouts":{"tp1":{
                         "input":"bf16", "tp":1, "hidden":4096, "experts":256,
                         "top_k":8, "intermediate":2048, "slice":2048, "weights":"fp8",
-                        "capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
+                        "abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"capacities":[{"capacity":4096,"scratch_bytes":671_354_880}]
                     }}}))?)?;
                     options.mimo_expert_manifest = Some(package);
                 }

@@ -1198,7 +1198,8 @@ def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
+    geometry = SimpleNamespace(weights="fp8", hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -1227,6 +1228,7 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
         __file__=str(tmp_path / "baseline-package.py"),
         layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        ABI_VERSION=6, activation_params=lambda *args: (1.0, 0.0),
         input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
     ))
     (tmp_path / "baseline-package.py").write_text("# baseline without core variants\n")
@@ -1238,7 +1240,9 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     assert len(records) == 1
     assert json.loads((tmp_path / "routed.json").read_text())["layouts"]["tp1"] == {
         "tp": 1, "hidden": 4096, "slice": 2048, "experts": 256, "top_k": 8,
-        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16"}
+        "intermediate": 2048, "weights": "fp8", "input": "wire" if indirect else "bf16",
+        "abi_version": 6, "activation": "silu_bf16_product", "projection": "bf16",
+        "swiglu_limit": 0.0, "swiglu_alpha": 1.0, "swiglu_beta": 0.0}
     assert records[0]["scratch_bytes"] == (128 if indirect else 64)
 
 
@@ -1267,7 +1271,8 @@ def test_spark_routed_object_set_matches_production_including_core(tmp_path, mon
     monkeypatch.setenv("CUTEAFD_BUILD_KIND", build_kind)
     from contextlib import nullcontext
     package = compare_sm.load_file("core_set_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
-    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048)
+    geometry = SimpleNamespace(weights=weights, hidden=4096, slice=2048, experts=256, top_k=8, intermediate=2048,
+        activation="silu_bf16_product", projection="bf16", swiglu_limit=0.0)
     calls = []
     def compile_program(g, **kwargs):
         calls.append(kwargs)
@@ -1611,6 +1616,12 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
             'exl3/exl3-qwen4-k45', 'fp8/fp8-mimop', 'fp8/fp8-mimof'} <= names
     assert set(publisher.V41_MANIFESTS) <= names
     for name, exporter, extra in jobs:
+        if name.startswith(('fp8/', 'bf16/')):
+            assert extra[extra.index('--capacities') + 1] == publisher.fp8_capacities()
+        elif name.startswith('exl3/'):
+            expected = (compare_sm.EXL3_CAPACITIES_KIMIK3 if name == 'exl3/exl3-kimik3-k23'
+                        else compare_sm.EXL3_CAPACITIES)
+            assert extra[extra.index('--capacities') + 1] == expected
         if name.startswith('v41-'):
             assert extra[extra.index('--rows') + 1] == (
                 compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
@@ -1627,11 +1638,49 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
     assert len(names) == len(jobs)
 
 
+def test_native_placement_jobs_follow_fp8_recipe_not_exl3_policy(monkeypatch):
+    publisher = compare_sm.load_file('test_native_capacity_recipe', ROOT / 'scripts/build/export-placement-inputs.py')
+    capacities = publisher.fp8_capacities()
+    assert 1 <= len(capacities.split(',')) <= 6
+    assert capacities != compare_sm.EXL3_CAPACITIES
+    exl3_before = {name: extra[extra.index('--capacities') + 1]
+                   for name, _, extra in publisher.export_jobs() if name.startswith('exl3/')}
+    changed = '1,16,80,4096'
+    monkeypatch.setattr(publisher, 'fp8_capacities', lambda root: changed)
+    jobs = publisher.export_jobs()
+    native = [extra for name, _, extra in jobs if name.startswith(('fp8/', 'bf16/'))]
+    assert native
+    assert all(extra[extra.index('--capacities') + 1] == changed for extra in native)
+    assert {name: extra[extra.index('--capacities') + 1]
+            for name, _, extra in jobs if name.startswith('exl3/')} == exl3_before
+
+
+@pytest.mark.parametrize('recipe', [
+    '',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,16")\n' * 2,
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,2,3,4,5,6,7")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "0,16")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "16,1")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,1")',
+    'set(CUTEAFD_FP8_MOE_CAPACITIES "1,2147483648")',
+])
+def test_native_placement_rejects_invalid_capacity_recipe(tmp_path, recipe):
+    publisher = compare_sm.load_file('test_invalid_capacity_recipe', ROOT / 'scripts/build/export-placement-inputs.py')
+    path = tmp_path / publisher.FP8_CAPACITY_RECIPE
+    path.parent.mkdir(parents=True)
+    path.write_text(recipe)
+    with pytest.raises(ValueError):
+        publisher.fp8_capacities(tmp_path)
+    path.write_text('set(CUTEAFD_FP8_MOE_CAPACITIES "1,16,80,256,1024,4096") # native recipe\n')
+    assert publisher.fp8_capacities(tmp_path) == '1,16,80,256,1024,4096'
+
+
 def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
     publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
     for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
                      'scripts/build/kernel-records.py', 'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
-                     'examples/configs/retired.config', 'benchmarks/current-matrix.json'):
+                     'examples/configs/retired.config', 'benchmarks/current-matrix.json',
+                     'native/cmake/shared/fp8_moe.cmake'):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('original')
@@ -1645,6 +1694,10 @@ def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch)
     (tmp_path / 'examples/configs/retired.config').write_text('retired edit')
     matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'new'}]}))
     assert publisher.source_hashes() == before
+    recipe = tmp_path / publisher.FP8_CAPACITY_RECIPE
+    recipe.write_text('changed capacities')
+    assert publisher.source_hashes() != before
+    recipe.write_text('original')
     (tmp_path / 'examples/configs/live.config').write_text('MODEL_REVISION=changed')
     assert publisher.source_hashes() != before
     (tmp_path / 'examples/configs/live.config').write_text('original')

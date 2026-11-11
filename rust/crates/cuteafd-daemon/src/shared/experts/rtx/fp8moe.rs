@@ -300,7 +300,7 @@ mod tests {
             layers: 2, first_layer: 0, experts: 8, topk: 8, hidden: 4096, intermediate: 256,
             draft_stages: 0, draft_experts: 0 })?;
         let info = Fp8MoeInfo { hidden: 4096, intermediate: 256, slice: 128, experts: 8, topk: 8,
-            tp: 2, wire_input: false, swiglu_limit: 10.0,
+            tp: 2, wire_input: false, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
             capacities: vec![1, 16], weights: Fp8MoeWeights::Fp8 };
@@ -385,7 +385,7 @@ mod tests {
             for rank in 0..2 {
                 let mut info = Fp8MoeInfo { hidden, intermediate, slice: tensors.rank_width(2, rank, Slicing::Blocks(128))?,
                     experts: 1, topk, tp: 2, wire_input: false,
-                    swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
+                    swiglu_limit: tensors.shape().geometry()?.swiglu_limit().unwrap_or(0.0), swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![1, 16, 4096],
                     weights: match format { ExpertFormat::Fp8Block128 => Fp8MoeWeights::Fp8,
                         ExpertFormat::Mxfp4 => Fp8MoeWeights::Mxfp4,
                         ExpertFormat::Bf16 => Fp8MoeWeights::Bf16,
@@ -413,9 +413,9 @@ mod tests {
         let retained = [(1024, 163_779_584), (4096, 734_346_240)];
         let capacities: Vec<_> = retained.iter().map(|&(capacity, scratch)|
             serde_json::json!({"capacity": capacity, "scratch_bytes": scratch})).collect();
-        let manifest = serde_json::json!({"layouts": {"tp2": {"capacities": capacities}}});
+        let manifest = serde_json::json!({"layouts": {"tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities}}});
         for (rows, abi_scratch) in retained {
-            let scratch = fp8moe_scratch_bytes(&manifest, "tp2", rows as u64)
+            let scratch = fp8moe_scratch_bytes(&manifest, "tp2", rows as u64)?
                 .context("planner retained-form scratch inventory")?;
             let (_, output, runtime) = workspace(abi_scratch, 4096, rows)?;
             let planned = scratch + output as u64;
@@ -426,9 +426,9 @@ mod tests {
             }
         }
         // Admission uses the smallest sufficient bucket, not the request rows.
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1023), Some(163_779_584));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1025), Some(734_346_240));
-        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 4097), None);
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1023).unwrap(), Some(163_779_584));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 1025).unwrap(), Some(734_346_240));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp2", 4097).unwrap(), None);
         Ok(())
     }
 

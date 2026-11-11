@@ -236,11 +236,17 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let mut workspace = workspace.unwrap();
         let mut local_workspace = local_workspace.unwrap();
         if checkpoint.tensors.iter().any(|t| t.meta.name.ends_with("mlp.gate_proj.weight") && t.meta.dtype == cuteafd_core::DType::U8) {
-            let dense = options.glmf_dense_manifest.as_ref().and_then(|p| std::fs::read(p).ok())
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-                .and_then(|m| placement::inventory::fp8moe_scratch_bytes(&m, "tp1", max_rows))
-                .or_else(|| placement::inventory::dense_package_scratch(&placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows))
-                .ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
+            let selected = match options.glmf_dense_manifest.as_ref() {
+                Some(path) => placement::inventory::fp8moe_manifest(path)?
+                    .map(|manifest| placement::inventory::fp8moe_scratch_bytes(&manifest, "tp1", max_rows))
+                    .transpose()?.flatten(),
+                None => None,
+            };
+            let dense = match selected {
+                Some(bytes) => Some(bytes),
+                None => placement::inventory::dense_package_scratch(
+                    &placement::inventory::image_lib(options.workspace_manifest.as_deref()), "glmfdense", max_rows)?,
+            }.ok_or_else(|| anyhow::anyhow!("dense NVFP4 package scratch manifest missing"))?;
             for profile in [&mut workspace, &mut local_workspace] {
                 profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, 0,
                     Category::Workspace, "steps", dense + 8 * max_rows, Basis::Formula));

@@ -470,9 +470,9 @@ def write_package(path: Path, *, input_kind="wire", role="spark", revision=REVIS
         "sparkinfer_revision": revision,
         "compute": [12, 1],
         "layouts": {layout: {"input": input_kind, "capacities": [{"capacity": 80}],
-                             "weights": weights, "abi_version": 5, "activation": "silu_bf16_product",
+                             "weights": weights, "abi_version": 6, "activation": "silu_bf16_product",
                              "projection": "bf16", "hidden": 4096, "experts": 256, "top_k": 8,
-                             "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0}},
+                             "intermediate": 2048, "tp": 4, "slice": 512, "swiglu_limit": 0.0, "swiglu_alpha": 1.0, "swiglu_beta": 0.0}},
         "files": {str(library.relative_to(path)): {
             "bytes": library.stat().st_size, "sha256": hashlib.sha256(library.read_bytes()).hexdigest()}},
     }
@@ -715,9 +715,10 @@ def test_explicit_activation_info_words(kind, storage, activation, code):
             package_tool.info_words(g, [16], False)
         return
     words = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
-    assert len(words) == 16
-    assert words[0] == 5 | storage << 8 | code << 16 | 1 << 24
-    assert words[9:] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert len(words) == 18
+    assert words[0] == 6 | storage << 8 | code << 16 | 1 << 24
+    assert words[9:16] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert words[16:] == [0x3f800000, 0]
     assert words[0] not in (1, 2, 3, 4)  # old runtimes reject rather than guess
     for field, value in [("activation", "unknown"), ("projection", "fp32"), ("swiglu_limit", float("nan"))]:
         bad = SimpleNamespace(**vars(g))
@@ -736,7 +737,7 @@ def test_mxfp4_package_rejects_post_activation(tmp_path):
 
 
 @pytest.mark.parametrize("field,value", [("activation", None), ("activation", "unknown"),
-                                         ("projection", "fp32"), ("abi_version", 4)])
+                                         ("projection", "fp32"), ("abi_version", 5)])
 def test_package_requires_explicit_activation_contract(tmp_path, field, value):
     path = write_package(tmp_path / "package")
     manifest = json.loads((path / "manifest.json").read_text())
@@ -744,3 +745,21 @@ def test_package_requires_explicit_activation_contract(tmp_path, field, value):
     (path / "manifest.json").write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="activation/projection ABI"):
         package_tool.verify(path)
+
+
+def test_oai_info_words_keep_capacity_slots_and_explicit_params():
+    import struct
+    from types import SimpleNamespace
+    g = SimpleNamespace(kind="nvfp4a4", weights="nvfp4", activation="swigluoai", projection="bf16",
+                        swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0,
+                        hidden=6144, slice=3072, experts=128, top_k=4, intermediate=3072, tp=1)
+    words = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    assert words[0] == 6 | 4 << 8 | 3 << 16 | 1 << 24
+    assert words[9:16] == [6, 1, 16, 80, 256, 1024, 4096]
+    assert words[16:] == [struct.unpack("<I", struct.pack("<f", 1.702))[0], 0x3f800000]
+    for field, value in [("swiglu_alpha", None), ("swiglu_alpha", 0.0), ("swiglu_beta", None),
+                         ("swiglu_beta", float("inf")), ("swiglu_limit", 0.0), ("weights", "fp8")]:
+        bad = SimpleNamespace(**vars(g))
+        setattr(bad, field, value)
+        with pytest.raises(ValueError):
+            package_tool.info_words(bad, [16], False)

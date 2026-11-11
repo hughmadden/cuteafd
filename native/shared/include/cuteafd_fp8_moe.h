@@ -11,17 +11,20 @@
 extern "C" {
 #endif
 
-// words (16): [0] packed contract (all bytes required):
-//   bits 0..7: ABI version 5 (old unversioned contracts are rejected)
+// words (18): [0] packed contract (all bytes required):
+//   bits 0..7: ABI version 6 (old unversioned contracts are rejected)
 //   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
-//                          2=post-SiLU clamp + FP32 product/final BF16 rounding
+//                          2=post-SiLU clamp + FP32 product/final BF16 rounding,
+//                          3=SwiGLU-OAI FP32 gate*sigmoid(alpha*gate)*(up+beta)
 //   bits 24..31: projection 1=BF16 gate/up and down outputs
 // Both activations clamp up to [-limit, limit]; limit zero disables clamping.
 // [1] hidden, [2] slice, [3] experts, [4] top-k,
 // [5] intermediate, [6] tp, [7] input dtype (7 = FP8 E4M3 + UE8M0 K32 wire
 // rows: Spark packages; 1 = BF16 rows: coordinator packages), [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacity count n,
-// [10 .. 10+n) capacities.
+// [10 .. 10+n) capacities (n <= 6), [16] alpha FP32 bits, [17] beta FP32 bits.
+// SiLU requires alpha=1, beta=0. OAI requires NVFP4, alpha>0 and limit>0;
+// gate is capped above limit and up clamped to [-limit, limit] before activation.
 int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
 int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
 // Static arithmetic interval for the launch-selected capacity/form (including

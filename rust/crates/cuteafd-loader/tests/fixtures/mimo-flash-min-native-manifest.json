@@ -12,6 +12,12 @@
       "intermediate": 2048,
       "input": "bf16",
       "weights": "mxfp4",
+      "abi_version": 6,
+      "projection": "bf16",
+      "activation": "silu_bf16_product",
+      "swiglu_limit": 0.0,
+      "swiglu_alpha": 1.0,
+      "swiglu_beta": 0.0,
       "capacities": [
         {
           "capacity": 1,

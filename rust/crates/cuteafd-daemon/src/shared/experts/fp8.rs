@@ -69,15 +69,7 @@ pub(super) fn validate_checkpoint_contract(info: &Fp8MoeInfo, tensors: &Fp8Exper
             "expert layer {layer}: native BF16/NVFP4 weights require BF16 input");
         view.validate_layer(layer)?;
         let activation = tensors.activation(layer).unwrap_or(shape.geometry()?.activation());
-        let (mode, limit) = match activation {
-            cuteafd_core::FfnActivation::SiluBf16Product { limit } =>
-                (Fp8MoeActivation::SiluBf16Product, limit.unwrap_or(0.0)),
-            cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit } =>
-                (Fp8MoeActivation::SiluPostClampFp32Product, limit),
-            cuteafd_core::FfnActivation::Situ { .. } =>
-                anyhow::bail!("expert layer {layer}: native FP8 packages do not export the checkpoint's Situ activation"),
-        };
-        info.validate_activation(mode, limit, Fp8MoeProjection::Bf16)
+        info.validate_activation(activation, Fp8MoeProjection::Bf16)
             .with_context(|| format!("expert layer {layer}"))?;
     }
     Ok(())
@@ -149,6 +141,7 @@ pub(super) fn validate_bf16_package(main: &Fp8MoeInfo, bf16: &Fp8MoeInfo, capaci
     ensure!(!bf16.wire_input && bf16.weights == main.weights && bf16.hidden == main.hidden
         && bf16.experts == main.experts && bf16.topk == main.topk && bf16.intermediate == main.intermediate
         && bf16.tp == main.tp && bf16.slice == main.slice && bf16.swiglu_limit == main.swiglu_limit
+        && bf16.swiglu_alpha == main.swiglu_alpha && bf16.swiglu_beta == main.swiglu_beta
         && bf16.activation == main.activation && bf16.projection == main.projection,
         "{bf16:?} is not the BF16-input form of the primary FP8 package {main:?}");
     bf16.capacity_for(capacity)
@@ -1047,8 +1040,8 @@ mod tests {
         let catalog = crate::shared::memory::push_fp8::tests::fixture(
             root.path(), ExpertFormat::Fp8Block128, false)?;
         let tensors = catalog.fp8().unwrap();
-        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, 128, 1024, 64, 2, 1024, 1, 7, 0,
-            1, 16, 0, 0, 0, 0, 0];
+        let words = [6 | 1 << 8 | 1 << 16 | 1 << 24, 128, 1024, 64, 2, 1024, 1, 7, 0,
+            1, 16, 0, 0, 0, 0, 0, 1.0f32.to_bits(), 0];
         fixture.configure_fp8(&library, &words, &[256, 0, 0, 0, 0, 0])?;
         let before = fixture.events()?.matches('D').count();
         let mut mounted = Fp8Weights::load(&library, tensors, fixture.directory(), &[], 1, 0, 1, 256)?;
@@ -1149,7 +1142,7 @@ mod tests {
         write_snapshot(dir.path(),&source["config"],&fixture,None);
         let tensors = Fp8ExpertTensors::read(dir.path(),shape).unwrap();
         let info = Fp8MoeInfo {hidden:128,slice:256,experts:2,topk:1,intermediate:1536,tp:6,
-            wire_input:false,swiglu_limit:7.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
+            wire_input:false,swiglu_limit:7.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,activation:Fp8MoeActivation::SiluPostClampFp32Product,
             projection:Fp8MoeProjection::Bf16,capacities:vec![16],weights:Fp8MoeWeights::Bf16};
         super::validate_checkpoint_contract(&info,&tensors,&[0],6,0,Slicing::Padded).unwrap();
         for mutation in 0..4 {
@@ -1306,7 +1299,7 @@ mod tests {
     #[test]
     fn bf16_sibling_must_share_weight_layout_arithmetic_and_capacity() {
         let primary = Fp8MoeInfo { hidden: 6144, slice: 512, experts: 256, topk: 8, intermediate: 2048, tp: 4,
-            wire_input: true, swiglu_limit: 10.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
+            wire_input: true, swiglu_limit: 10.0, swiglu_alpha: 1.0, swiglu_beta: 0.0, activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product, projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16, capacities: vec![64, 4096], weights: Fp8MoeWeights::Fp8 };
         let mut bf16 = primary.clone();
         bf16.wire_input = false;
         // A sibling may compile different capacities; its own scratch uses its own top.

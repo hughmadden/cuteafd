@@ -82,12 +82,12 @@ fn fp8_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pat
         ensure!(lib.join("fp8").join(&name).join(format!("tp{tp}")).is_dir(), "missing {name}/tp{tp} package");
     }
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
-    let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
+    let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)?
         .with_context(|| format!("missing {name} tp{tp} scratch for {rows} rows"))?;
     let bf16 = lib.join("fp8").join(format!("{name}-bf16"));
     let sibling = if bf16.join(format!("tp{tp}")).is_dir() {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(bf16.join("manifest.json"))?)?;
-        inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)
+        inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)?
             .with_context(|| format!("missing BF16-input {name} scratch"))?
     } else { 0 };
     let mut requests = vec![scratch.max(sibling)];

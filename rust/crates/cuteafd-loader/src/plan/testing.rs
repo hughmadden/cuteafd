@@ -632,7 +632,7 @@ pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
     let package = root.join("lib/fp8/fp8-glmf");
     fs::create_dir_all(&share).unwrap();
     fs::create_dir_all(&package).unwrap();
-    let layout = json!({"capacities":[{"capacity":4096,"scratch_bytes":4096}]});
+    let layout = json!({"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities":[{"capacity":4096,"scratch_bytes":4096}]});
     fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":layout,"tp2":layout}}).to_string()).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_s16", "kda_s16t", "kda_w8",
         "kda_w8_s16", "kda_w8_s16t", "mla_producer", "o", "ffn_i2048",
@@ -1623,7 +1623,7 @@ fn install_step5_rtx_expert_packages(manifest: &std::path::Path) {
         let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
             serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
         std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
-            "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}})).unwrap()).unwrap();
+            "tp1": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(65536)}, "tp2": {"abi_version":6,"projection":"bf16","activation":"silu_bf16_product","swiglu_limit":0.0,"swiglu_alpha":1.0,"swiglu_beta":0.0,"weights":"fp8","capacities": capacities(32768)}}})).unwrap()).unwrap();
     }
     install_step5_exl3_rtx_package(manifest);
 }

@@ -255,7 +255,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         .map(|t| ((cfg.ple_dim / cfg.ple_rows().max(1)) as u64
             * if t.meta.dtype == cuteafd_core::DType::F8E4M3 { 1 } else { 2 }, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     for (package, bytes) in package_scratch(input, report, options.workspace_manifest.as_deref(),
-        shape.prefill_rows, mtp) {
+        shape.prefill_rows, mtp)? {
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
@@ -518,25 +518,25 @@ fn publish_host(report: &mut PlanReport, options: &LayoutOptions, host: &qwen4::
 /// Package scratch of Qwen's resident FP8/NVFP4 experts (`Fp8Experts::load`): one scratch per package
 /// the backbone and the mixed-format MTP layer load, at the prefill rows' capacity.
 fn package_scratch(input: &super::super::PlanInput, report: &PlanReport, workspace_manifest: Option<&std::path::Path>,
-    prefill_rows: u64, mtp: bool) -> Vec<(String, u64)> {
-    let Ok(catalog) = input.expert_catalog() else { return Vec::new() };
-    let Some(tensors) = catalog.fp8() else { return Vec::new() };
+    prefill_rows: u64, mtp: bool) -> Result<Vec<(String, u64)>> {
+    let Ok(catalog) = input.expert_catalog() else { return Ok(Vec::new()) };
+    let Some(tensors) = catalog.fp8() else { return Ok(Vec::new()) };
     let lib = crate::placement::inventory::image_lib(workspace_manifest);
     let layers = catalog.routed_experts().layers;
     let all_onboarded = layers > 0 && report.onboard_layers == Some(layers);
     let local = report.placement == ExpertPlacement::Local || all_onboarded;
     let mut out = Vec::new();
     if local {
-        out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", tensors.format(), prefill_rows));
+        out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", tensors.format(), prefill_rows)?);
     }
     if mtp {
         if let Ok(format) = tensors.layer_format(layers) {
             if !local || format != tensors.format() {
-                out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", format, prefill_rows));
+                out.extend(crate::placement::inventory::fp8moe_package_scratch(&lib, "qwen4", format, prefill_rows)?);
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn exl3_arenas(input: &super::super::PlanInput, mtp: bool) -> Option<(u64, u64)> {

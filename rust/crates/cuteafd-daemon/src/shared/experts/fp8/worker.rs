@@ -561,9 +561,9 @@ mod tests {
         for format in [1u32, 2, 4, 5] {
             for capacity in [1usize, 17] {
                 let wire = matches!(format, 1 | 2);
-                let mut words = [5 | format << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+                let mut words = [6 | format << 8 | 1 << 16 | 1 << 24, geometry.hidden,
                     128, 2, geometry.topk, 256, 2, if wire { 7 } else { 1 }, 0,
-                    2, 16, 4096, 0, 0, 0, 0];
+                    2, 16, 4096, 0, 0, 0, 0, 1.0f32.to_bits(), 0];
                 fixture.configure_fp8(&library, &words, &[1024, 4096, 0, 0, 0, 0])?;
                 // SAFETY: this test compiled the CPU-only native ABI above.
                 let module = unsafe { Fp8MoeModule::load(fixture.directory())? };
@@ -639,9 +639,9 @@ mod tests {
         std::fs::hard_link(fixture.directory().join("liblifetime_fixture.so"),
             fixture.directory().join("libcuteafd_fp8moe.so"))?;
         let geometry = cuteafd_core::expert_geometry();
-        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+        let words = [6 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
             128, geometry.experts, geometry.topk, 256, 2, 7, 0,
-            2, 16, 4096, 0, 0, 0, 0];
+            2, 16, 4096, 0, 0, 0, 0, 1.0f32.to_bits(), 0];
         let scratch_bytes = (1 << 20) + 2 * 769 * geometry.topk as u64 * geometry.hidden as u64 * 2;
         fixture.configure_fp8(&library, &words, &[scratch_bytes, scratch_bytes, 0, 0, 0, 0])?;
         let replies = (0..4).map(|index| serde_json::json!({
@@ -800,9 +800,9 @@ mod tests {
         std::fs::hard_link(fixture.directory().join("liblifetime_fixture.so"),
             fixture.directory().join("libcuteafd_fp8moe.so"))?;
         let geometry = cuteafd_core::expert_geometry();
-        let words = [5 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
+        let words = [6 | 1 << 8 | 1 << 16 | 1 << 24, geometry.hidden,
             128, geometry.experts, geometry.topk, 256, 2, 7, 0,
-            2, 16, 4096, 0, 0, 0, 0];
+            2, 16, 4096, 0, 0, 0, 0, 1.0f32.to_bits(), 0];
         let bf16_module = if bf16_sibling {
             let mut bf16_words = words;
             bf16_words[7] = 1;

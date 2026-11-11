@@ -2,7 +2,7 @@
 """Run a family golden subcommand, a native test or a command from sealed WIP slots
 on raptor's RTX GPUs, optionally against real expert workers on Sparks.
 
-  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5|kimi|muse \\
+  scripts/bench/golden-run.py --task NAME --family dsv4|glm|glmf|mimo|qwen4|qwen35|step5|kimi|muse|minimax \\
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
@@ -97,7 +97,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
-               'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden'}
+               'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden',
+               'minimax': 'minimax-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')

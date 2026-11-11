@@ -1298,7 +1298,7 @@ def main() -> None:
                              "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
                              "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
                              "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), "
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), minimax (vendor MXFP8 A8), "
                              "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections), "
@@ -1346,9 +1346,9 @@ def main() -> None:
     except ValueError as error:
         raise SystemExit(str(error)) from error
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "native_attention") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "exlr8", "exlr8_dense", "minimax", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "native_attention") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or native_attention")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or native_attention")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
@@ -1463,6 +1463,8 @@ def main() -> None:
             }
             work += [(name, *item) for item in dense_programs(families=dense_families, input_dtype="bf16")]
             continue
+        if name == "minimax":
+            continue  # appended after existing programs to preserve their indices
         if name == "exlr8_dense":
             from export_b12x_exlr8_dense_aot import programs as dense_programs
             if not native_families:
@@ -1595,6 +1597,10 @@ def main() -> None:
     if "native_attention" not in geometries and any(name in geometries for name in
             ("glm", "glm2", "kimik3", "step5", "step52", "muse", "muse2", "ml4")):
         work += [("native_attention", *item) for item in native_attention_programs()]
+    if "minimax" in geometries:
+        from export_b12x_exlr8_dense_aot import minimax_programs
+        manifest["families"]["minimax"] = {"abi_version": 1}
+        work += [("minimax", *item) for item in minimax_programs()]
     # Per-program reuse (python/tools/lib/_export_cache.py): only under the export
     # cache's recorder. Programs compile independently of which others the
     # geometry list requests; their recipes read every argument except these.
@@ -1604,7 +1610,8 @@ def main() -> None:
     for family, suffix, op, params, thunk in work:
         if selected is not None and suffix not in selected:
             continue
-        stem = suffix if family == "kimi_split" else f"{family}_{suffix}"
+        stem = (suffix if family == "kimi_split" else
+                f"exlr8_dense_{suffix}" if family == "minimax" else f"{family}_{suffix}")
         object_selection = globals().get("_selected_object_labels")
         if object_selection is not None and not any(label == stem or label.startswith(stem + "_sm")
                                                    for label in object_selection):

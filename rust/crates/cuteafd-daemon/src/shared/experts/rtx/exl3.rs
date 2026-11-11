@@ -184,6 +184,7 @@ fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
             cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
             cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
             cuteafd_core::FfnActivation::Situ { .. } => "situ",
+            cuteafd_core::FfnActivation::SwigluOai { .. } => "swigluoai",
         };
         // The exporter omits the activation key only for its ordinary SiLU default.
         let exported_activation = match meta.get("activation") {

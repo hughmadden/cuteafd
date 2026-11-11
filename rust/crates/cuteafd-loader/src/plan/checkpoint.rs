@@ -72,6 +72,10 @@ impl CheckpointFormat {
 #[serde(rename_all = "snake_case")]
 pub enum ModuleNumerics { CheckpointPrecision, W4A4, W8A8, W8CheckpointActivations }
 
+fn projection_stem(module: &str) -> &str {
+    module.strip_suffix(".weight_packed").or_else(|| module.strip_suffix(".weight")).unwrap_or(module)
+}
+
 fn module_match(pattern: &str, module: &str) -> bool {
     if !pattern.contains('*') {
         return module == pattern || module.strip_prefix(pattern).is_some_and(|s| s.starts_with('.'));
@@ -129,6 +133,8 @@ pub fn read_json(path: &Path) -> Result<Value> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionStorage {
     Native { dtype: cuteafd_core::DType, shape: Vec<usize> },
+    /// Compressed-tensors packed E2M1; shape is logical, not the packed U8 extent.
+    CompressedNvfp4 { shape: Vec<usize> },
     Exl3,
 }
 
@@ -174,9 +180,18 @@ impl Checkpoint {
                     && self.contains_tensor(&tensor.meta.name)).cloned());
         }
         let weight = tensors.iter().find(|tensor| tensor.meta.name == format!("{stem}.weight"));
+        let packed = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.weight_packed"));
         let trellis = tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.trellis"));
-        ensure!(!(weight.is_some() && trellis), "{stem}: checkpoint contains both native and EXL3 storage");
-        let storage = if trellis { ProjectionStorage::Exl3 } else {
+        ensure!(usize::from(weight.is_some()) + usize::from(packed) + usize::from(trellis) <= 1,
+            "{stem}: checkpoint contains conflicting native, packed or EXL3 storage");
+        let storage = if packed {
+            let members = tensors.iter().map(|tensor|
+                (tensor.meta.name[prefix.len()..].to_owned(), tensor)).collect();
+            let operand = super::format::detect(&members)
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.tensor, error.reason))?;
+            ensure!(operand.is_compressed_nvfp4(), "{stem}: invalid compressed NVFP4 storage");
+            ProjectionStorage::CompressedNvfp4 { shape: operand.logical }
+        } else if trellis { ProjectionStorage::Exl3 } else {
             let weight = weight.with_context(|| format!("{stem}: selected projection headers missing"))?;
             ProjectionStorage::Native { dtype: weight.meta.dtype.clone(), shape: weight.meta.shape.clone() }
         };
@@ -400,9 +415,17 @@ impl Checkpoint {
     /// Select each module's declared arithmetic. Ignore rules take precedence;
     /// class-wide Linear rules apply only to linear weights, not arbitrary tensors.
     pub fn module_numerics(&self, module: &str) -> Result<ModuleNumerics> {
-        let stem = module.strip_suffix(".weight").unwrap_or(module);
-        let weight = format!("{stem}.weight");
-        let dtype = self.header(&weight).map(|header| header.dtype.clone());
+        let stem = projection_stem(module);
+        ensure!(!(self.contains_tensor(&format!("{stem}.weight")) && self.contains_tensor(&format!("{stem}.weight_packed"))),
+            "{stem}: checkpoint contains both native and packed storage");
+        let dtype = ["weight", "weight_packed"].iter()
+            .find_map(|suffix| self.header(&format!("{stem}.{suffix}"))).map(|header| header.dtype.clone());
+        if ["weight_packed", "weight_global_scale", "input_global_scale"].iter()
+            .any(|suffix| self.contains_tensor(&format!("{stem}.{suffix}")))
+            && self.declared_numerics(stem)? == ModuleNumerics::W4A4 {
+            self.validate_native_members(stem,
+                &["weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"], true)?;
+        }
         match dtype {
             Some(dtype) => self.module_numerics_with_header(stem, dtype),
             None => self.declared_numerics(stem),
@@ -412,8 +435,22 @@ impl Checkpoint {
     /// Complete unquantized BF16 headers override an overbroad ModelOpt declaration;
     /// partial quantization is never treated as an unquantized checkpoint module.
     pub fn module_numerics_with_header(&self, module: &str, dtype: cuteafd_core::DType) -> Result<ModuleNumerics> {
-        let module = module.strip_suffix(".weight").unwrap_or(module);
+        let module = projection_stem(module);
         let declared = self.declared_numerics(module)?;
+        let compressed = self.contains_tensor(&format!("{module}.weight_packed"));
+        let mxfp8 = self.quantization().is_some_and(|q| q.get("quant_method").and_then(Value::as_str) == Some("mxfp8"));
+        if compressed && declared == ModuleNumerics::W4A4 {
+            ensure!(!self.contains_tensor(&format!("{module}.weight")), "{module}: checkpoint contains both native and packed storage");
+            ensure!(dtype == cuteafd_core::DType::U8, "{module}.weight_packed: compressed NVFP4 requires U8 storage");
+            self.validate_native_members(module,
+                &["weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"], true)?;
+            return Ok(declared);
+        }
+        if mxfp8 && declared == ModuleNumerics::W8A8 {
+            ensure!(dtype == cuteafd_core::DType::F8E4M3, "{module}.weight: declared MXFP8 requires E4M3 storage");
+            self.validate_native_members(module, &["weight", "weight_scale_inv"], false)?;
+            return Ok(declared);
+        }
         if declared != ModuleNumerics::W4A4 { return Ok(declared); }
         let scales = ["weight_scale", "weight_scale_2", "input_scale"]
             .map(|suffix| self.contains_tensor(&format!("{module}.{suffix}")));
@@ -434,8 +471,30 @@ impl Checkpoint {
         Ok(declared)
     }
 
+    fn validate_native_members(&self, module: &str, suffixes: &[&str], compressed: bool) -> Result<()> {
+        let mut members = BTreeMap::new();
+        for suffix in suffixes {
+            let name = format!("{module}.{suffix}");
+            ensure!(self.contains_tensor(&name), "{name}: declared native arithmetic is missing tensor");
+            if let Some(meta) = self.header(&name) {
+                members.insert((*suffix).to_owned(), CheckpointTensor { shard: String::new(), meta: meta.clone() });
+            }
+        }
+        // Inventory-only views may not have read the payload shard yet.
+        if members.len() != suffixes.len() { return Ok(()); }
+        let refs = members.iter().map(|(suffix, tensor)| (suffix.clone(), tensor)).collect();
+        let operand = super::format::detect(&refs)
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.tensor, error.reason))?;
+        ensure!(if compressed { operand.is_compressed_nvfp4() } else {
+            operand.is_fp8_row_groups(32, &[super::format::ScaleEncoding::Ue8m0])
+                && operand.logical.len() == 2 && operand.logical.iter().all(|dim| *dim > 0)
+                && operand.logical[1] % 32 == 0
+        }, "{module}: native storage does not match declared arithmetic");
+        Ok(())
+    }
+
     fn declared_numerics(&self, module: &str) -> Result<ModuleNumerics> {
-        let module = module.strip_suffix(".weight").unwrap_or(module);
+        let module = projection_stem(module);
         // Stacked MoE projections are parameters of the MoE, not child Linear
         // modules. In particular, a router-module wildcard must not accidentally
         // match the lexical gate_proj parameter stem. Keep the original stem for
@@ -450,6 +509,28 @@ impl Checkpoint {
     fn declared_numerics_for_owner(&self, module: &str, owner: &str) -> Result<ModuleNumerics> {
         let Some(root) = self.quantization() else { return Ok(ModuleNumerics::CheckpointPrecision) };
         let q = root.get("quantization").unwrap_or(root);
+        if root.get("quant_method").and_then(Value::as_str) == Some("mxfp8") {
+            if q.get("ignored_layers").and_then(Value::as_array).is_some_and(|rules|
+                rules.iter().filter_map(Value::as_str).any(|rule| module_match(rule, owner))) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            if module.contains(".experts.") && q.get("moe_quant_algo").is_some() {
+                ensure!(q.get("moe_quant_algo").and_then(Value::as_str) == Some("NVFP4")
+                    && q.get("moe_quant_format").and_then(Value::as_str) == Some("nvfp4-pack-quantized")
+                    && q.get("group_size").and_then(Value::as_u64) == Some(16),
+                    "{module}: unsupported packed expert arithmetic");
+                return Ok(ModuleNumerics::W4A4);
+            }
+            // Norms, embeddings and other non-linear parameters are not MXFP8.
+            if !(module.ends_with("_proj") || module.ends_with(".w1") || module.ends_with(".w2")
+                || module.ends_with(".w3") || self.contains_tensor(&format!("{module}.weight_scale_inv"))) {
+                return Ok(ModuleNumerics::CheckpointPrecision);
+            }
+            ensure!(q.get("activation_scheme").and_then(Value::as_str) == Some("dynamic")
+                && q.get("weight_block_size") == Some(&serde_json::json!([1, 32])),
+                "{module}: native MXFP8 requires dynamic activations and [1,32] weight blocks");
+            return Ok(ModuleNumerics::W8A8);
+        }
         if root.get("quant_method").and_then(Value::as_str) != Some("modelopt")
             && root.pointer("/producer/name").and_then(Value::as_str) != Some("modelopt") {
             return Ok(ModuleNumerics::CheckpointPrecision);
@@ -505,7 +586,8 @@ impl Checkpoint {
     }
 
     pub fn declared_module_numerics(&self) -> Result<BTreeMap<String, ModuleNumerics>> {
-        self.tensor_names().filter_map(|name| name.strip_suffix(".weight"))
+        self.tensor_names().filter(|name| name.ends_with(".weight") || name.ends_with(".weight_packed"))
+            .map(projection_stem)
             .map(|module| Ok((module.to_owned(), self.module_numerics(module)?))).collect()
     }
 
@@ -514,8 +596,16 @@ impl Checkpoint {
     pub fn spark_input_is_bf16(&self) -> bool {
         let layers = opt_usize_field(self.text_config(), "num_hidden_layers");
         self.tensor_names().any(|name| {
-            let Some(stem) = name.strip_suffix(".input_scale") else { return false };
-            if !stem.contains(".experts.") || !self.contains_tensor(&format!("{stem}.weight_scale_2")) {
+            let stem = if let Some(stem) = name.strip_suffix(".input_global_scale") {
+                if !["weight_packed", "weight_scale", "weight_global_scale"].iter()
+                    .all(|suffix| self.contains_tensor(&format!("{stem}.{suffix}"))) { return false; }
+                if self.module_numerics(stem).ok() != Some(ModuleNumerics::W4A4) { return false; }
+                stem
+            } else if let Some(stem) = name.strip_suffix(".input_scale") {
+                if !self.contains_tensor(&format!("{stem}.weight_scale_2")) { return false; }
+                stem
+            } else { return false; };
+            if !stem.contains(".experts.") {
                 return false;
             }
             // Legacy fixtures/undeclared checkpoints retain header detection.
@@ -528,7 +618,7 @@ impl Checkpoint {
                 return false;
             }
             let parts: Vec<_> = stem.split('.').collect();
-            if parts.iter().any(|part| matches!(*part, "mtp" | "nextn")) { return false; }
+            if parts.iter().any(|part| matches!(*part, "mtp" | "nextn" | "dspark")) { return false; }
             let layer = parts.iter().position(|part| *part == "layers")
                 .and_then(|at| parts.get(at + 1)).and_then(|value| value.parse::<usize>().ok());
             layer.is_some_and(|layer| layers.is_none_or(|count| layer < count))
@@ -835,6 +925,106 @@ mod sliced_tests {
                 }}
             })).unwrap()).unwrap();
             assert_eq!(Checkpoint::inventory(dir.path()).unwrap().spark_input_is_bf16(), bf16);
+        }
+    }
+
+    fn mixed_mxfp8_config() -> Value {
+        json!({"num_hidden_layers":1, "quantization_config":{
+            "quant_method":"mxfp8", "activation_scheme":"dynamic", "weight_block_size":[1,32],
+            "group_size":16, "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized",
+            "ignored_layers":["lm_head", "vision_tower", "*.block_sparse_moe.gate"]}})
+    }
+
+    fn compressed_expert(stem: &str) -> Vec<crate::plan::testing::Tensor> {
+        vec![t(format!("{stem}.weight_packed"), "U8", &[16,32]),
+            t(format!("{stem}.weight_scale"), "F8_E4M3", &[16,4]),
+            t(format!("{stem}.weight_global_scale"), "F32", &[]),
+            t(format!("{stem}.input_global_scale"), "F32", &[])]
+    }
+
+    #[test]
+    fn mxfp8_mixed_native_numerics_are_role_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+        let routed = "language_model.model.layers.0.block_sparse_moe.experts.0.w1";
+        let dense = "language_model.model.layers.0.self_attn.index_q_proj";
+        let mut tensors = compressed_expert(routed);
+        tensors.extend([t(format!("{dense}.weight"), "F8_E4M3", &[16,64]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,2]),
+            t("language_model.model.layers.0.block_sparse_moe.gate.weight", "F32", &[16,64]),
+            t("language_model.model.layers.0.self_attn.q_norm.weight", "BF16", &[64]),
+            t("lm_head.weight", "BF16", &[16,64]),
+            t("vision_tower.q_proj.weight", "BF16", &[16,64])]);
+        write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+        for checkpoint in [Checkpoint::open(dir.path()).unwrap(), Checkpoint::inventory(dir.path()).unwrap(),
+            Checkpoint::open_for_role(dir.path(), "coordinator", |name| name == "lm_head.weight").unwrap()] {
+            for suffix in ["", ".weight_packed"] {
+                assert_eq!(checkpoint.module_numerics(&format!("{routed}{suffix}")).unwrap(), ModuleNumerics::W4A4);
+            }
+            assert_eq!(checkpoint.module_numerics(dense).unwrap(), ModuleNumerics::W8A8);
+            for module in ["lm_head", "vision_tower.q_proj", "language_model.model.layers.0.block_sparse_moe.gate",
+                "language_model.model.layers.0.self_attn.q_norm"] {
+                assert_eq!(checkpoint.module_numerics(module).unwrap(), ModuleNumerics::CheckpointPrecision, "{module}");
+            }
+            let map = checkpoint.declared_module_numerics().unwrap();
+            assert_eq!(map[routed], ModuleNumerics::W4A4);
+            assert_eq!(map[dense], ModuleNumerics::W8A8);
+            assert!(checkpoint.spark_input_is_bf16());
+        }
+        let projection = Checkpoint::open(dir.path()).unwrap().projection(routed).unwrap();
+        assert_eq!(projection.storage, ProjectionStorage::CompressedNvfp4 { shape:vec![16,64] });
+        assert_eq!(projection.source_bytes, 16*32 + 16*4 + 2*4);
+        assert_eq!(projection.tensors.len(), 4);
+    }
+
+    #[test]
+    fn mxfp8_native_contracts_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let routed = "model.layers.0.mlp.experts.0.w1";
+        let dense = "model.layers.0.self_attn.q_proj";
+        for (key, value) in [("activation_scheme", json!("static")), ("weight_block_size", json!([1,16])),
+            ("group_size", json!(32)), ("moe_quant_algo", json!("FP8")), ("moe_quant_format", json!("modelopt"))] {
+            let mut config = mixed_mxfp8_config();
+            config["quantization_config"][key] = value;
+            std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
+            write_safetensors(&dir.path().join("model.safetensors"), &compressed_expert(routed));
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            let module = if matches!(key, "activation_scheme" | "weight_block_size") { dense } else { routed };
+            assert!(checkpoint.module_numerics(module).is_err(), "{key}");
+        }
+        std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+        let native = [t(format!("{dense}.weight"), "F8_E4M3", &[16,64]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,2])];
+        for removed in 0..4 {
+            let mut tensors = compressed_expert(routed);
+            tensors.remove(removed);
+            tensors.extend(native.clone());
+            write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+            let checkpoint = Checkpoint::open(dir.path()).unwrap();
+            assert!(checkpoint.projection(routed).is_err(), "missing member {removed}");
+            assert!(checkpoint.module_numerics(routed).is_err(), "missing member {removed}");
+        }
+        for bad in [t(format!("{dense}.weight_scale_inv"), "F32", &[16,2]),
+            t(format!("{dense}.weight_scale_inv"), "U8", &[16,4])] {
+            write_safetensors(&dir.path().join("model.safetensors"), &[native[0].clone(), bad]);
+            assert!(Checkpoint::open(dir.path()).unwrap().module_numerics(dense).is_err());
+        }
+        let mut tensors = compressed_expert(routed);
+        tensors.push(t(format!("{routed}.weight"), "BF16", &[16,64]));
+        write_safetensors(&dir.path().join("model.safetensors"), &tensors);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        assert!(checkpoint.projection(routed).is_err());
+        assert!(checkpoint.module_numerics(routed).is_err());
+    }
+
+    #[test]
+    fn compressed_nvfp4_wire_ignores_draft_and_out_of_range_experts() {
+        for stem in ["model.layers.1.mlp.experts.0.w1", "model.mtp.layers.0.mlp.experts.0.w1",
+            "nextn.layers.0.mlp.experts.0.w1", "dspark.layers.0.mlp.experts.0.w1"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.json"), mixed_mxfp8_config().to_string()).unwrap();
+            write_safetensors(&dir.path().join("model.safetensors"), &compressed_expert(stem));
+            assert!(!Checkpoint::inventory(dir.path()).unwrap().spark_input_is_bf16(), "{stem}");
         }
     }
 
