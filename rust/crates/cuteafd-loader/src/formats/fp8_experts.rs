@@ -1839,6 +1839,7 @@ mod tests {
             ("glm:nvfp4", ExpertFormat::Nvfp4), ("glm:nvfp4a4", ExpertFormat::Nvfp4),
             ("glmf:nvfp4", ExpertFormat::Nvfp4), ("glmf:nvfp4a4", ExpertFormat::Nvfp4),
             ("qwen4:nvfp4", ExpertFormat::Nvfp4), ("qwen4:nvfp4a4", ExpertFormat::Nvfp4),
+            ("minimax:nvfp4", ExpertFormat::Nvfp4), ("minimax:nvfp4a4", ExpertFormat::Nvfp4),
         ] {
             for intermediate in [640, 1536, 2048, 2304, 3072] {
                 let mut tensors = catalog(format, intermediate);

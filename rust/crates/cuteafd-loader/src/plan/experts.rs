@@ -206,7 +206,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         && bits.bytes().all(|bit| (b'2'..=b'6').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
         && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4");
-    let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
+    let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4" | "minimax"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
@@ -285,6 +285,25 @@ mod tests {
         let layers = model.spec().layers.iter().enumerate()
             .filter_map(|(layer, spec)| (spec.ffn == super::super::spec::FfnKind::Moe).then_some(layer)).collect::<Vec<_>>();
         super::checkpoint_spark_recipe(checkpoint, world, &layers)
+    }
+
+    #[test]
+    fn minimax_nvfp4_retains_native_k16_ownership_and_h128_padding() {
+        use crate::formats::fp8_experts::Slicing;
+        for world in 1..=8 {
+            let recipe = spark_recipe("minimax:nvfp4a4", 3072, world).unwrap();
+            assert_eq!(recipe, spark_recipe("minimax:nvfp4", 3072, world).unwrap());
+            assert_eq!(recipe.widths.iter().sum::<usize>(), 3072);
+            assert!(recipe.widths.iter().all(|width| width % 16 == 0));
+            assert!(recipe.stored_widths.iter().all(|width| width % 128 == 0));
+            assert_eq!(recipe.slicing, if 3072 % (128 * world) == 0 { Slicing::Blocks(16) } else { Slicing::Padded });
+        }
+        let tp5 = spark_recipe("minimax:nvfp4a4", 3072, 5).unwrap();
+        assert_eq!(tp5.widths, vec![624, 624, 608, 608, 608]);
+        assert_eq!(tp5.stored_widths, vec![640; 5]);
+        assert_eq!(spark_recipe("minimax:nvfp4a4", 3072, 6).unwrap().widths, vec![512; 6]);
+        assert!(spark_recipe("minimax:fp8", 3072, 4).is_err());
+        assert!(spark_recipe("minimax:nvfp4a4", 3072, 9).is_err());
     }
 
     #[test]

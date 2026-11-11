@@ -195,6 +195,9 @@ def family_scopes(cards, config_reader):
                 counts.add(f"muse={count}")
         if family == 'minimax_m3':
             env['CUTEAFD_WIP_MINIMAX_AOT'] = 'ON'
+            scopes.add('minimax:nvfp4a4')
+            if count:
+                counts.add(f'minimax={count}')
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.
