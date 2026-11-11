@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,20 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
+FP8_CAPACITY_RECIPE = Path("native/cmake/shared/fp8_moe.cmake")
+
+
+def fp8_capacities(root=ROOT):
+    """Use the native package recipe, not EXL3's independent row policy."""
+    declarations = re.findall(r'^\s*set\(CUTEAFD_FP8_MOE_CAPACITIES\s+"([0-9,]+)"\)',
+                              (root / FP8_CAPACITY_RECIPE).read_text(), re.M)
+    if len(declarations) != 1:
+        raise ValueError("expected one literal CUTEAFD_FP8_MOE_CAPACITIES recipe")
+    capacities = [int(value) for value in declarations[0].split(",")]
+    if (not 1 <= len(capacities) <= 6 or capacities != sorted(set(capacities))
+            or any(value <= 0 or value > 0x7fffffff for value in capacities)):
+        raise ValueError("native FP8 recipe requires 1..6 increasing positive int32 capacities")
+    return declarations[0]
 
 
 def load(name, path):
@@ -52,7 +67,7 @@ def source_hashes():
     # Keep identical to plan::testing::placement_input_source_hashes. Card report
     # rewrites do not affect compilation; only the selected example inventory does.
     paths = [ROOT / "scripts/build/export-placement-inputs.py", ROOT / "scripts/build/kernel-records.py",
-             ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py",
+             ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py", ROOT / FP8_CAPACITY_RECIPE,
              *(ROOT / config for config in live_configs(ROOT))]
     return {**compare.v4_placement_sources(),
             **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},
@@ -61,6 +76,7 @@ def source_hashes():
 
 def export_jobs():
     scope = load("placement_scope", ROOT / "scripts/build/release-scope.py")
+    native_capacities = fp8_capacities(ROOT)
     experts = set()
     for config in live_configs():
         _, _, scopes = scope.entry_scopes(ROOT, {"config": config, "set": {}})
@@ -88,7 +104,7 @@ def export_jobs():
             geometry = family + ("_bf16" if kind == "bf16" else "")
             suffix = "-bf16-weights" if kind == "bf16" else ""
             jobs.append((f"fp8/fp8-{family}{suffix}", "package_fp8_moe_aot.py", [
-                "--geometry", geometry, "--capacities", compare.EXL3_CAPACITIES,
+                "--geometry", geometry, "--capacities", native_capacities,
                 "--layouts", "tp1,tp2", "--role", "coordinator"]))
     jobs.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", compare.V41_PROJECTION_CAPACITIES]),
