@@ -126,6 +126,22 @@ impl CoordinatorWeights {
         Ok(resolved)
     }
 
+    /// Raw checkpoint operands need only a bounded reused source buffer: no
+    /// dequantization, row repacking, scale conversion or device staging.
+    pub fn mount_load(&self, checkpoint: &Checkpoint) -> Result<crate::shared::dense_read::MountLoad> {
+        use crate::shared::dense_read::{MountLoad, ReadBatch, STEP_BYTES};
+        let mut load = MountLoad::default();
+        for (name, view) in self.arena.views() {
+            let header = checkpoint.header(name).with_context(|| format!("MiniMax mount lacks {name}"))?;
+            ensure!(header.byte_length == view.bytes() as u64, "MiniMax mount {name}: admitted bytes differ");
+            let rows = if header.shape.len() >= 2 { header.shape[0] } else { 1 };
+            ensure!(rows > 0 && view.bytes() % rows == 0, "MiniMax mount {name}: invalid row extent");
+            let row_bytes = view.bytes() / rows;
+            load.merge(MountLoad::read(ReadBatch::new(rows, row_bytes, row_bytes, STEP_BYTES)?));
+        }
+        Ok(load)
+    }
+
     /// Charge one arena backing and its one driver-allocation tail. Tensor
     /// views are aliases, not additional resident-weight charges.
     pub fn weight_components(&self, maximum_pages: u64)

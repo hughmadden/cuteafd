@@ -138,6 +138,15 @@ fn coordinator_native_arena_preserves_checkpoint_bytes_and_explicit_owners() {
         assert_eq!(tail.requests(), [template.bytes]);
         assert_eq!(tail.backings[0].backing, template.id);
         assert!(weight.weight_components(0).is_err());
+        let load = weight.mount_load(&checkpoint).unwrap();
+        assert_eq!(load.full_row_cache, 0);
+        assert_eq!(load.pinned_tables, 0);
+        assert!(load.pinned_source > 0 && load.pinned_source <= crate::shared::dense_read::STEP_BYTES as u64);
+        let owners = load.allocations("minimax.mount");
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].location, crate::placement::planner::Location::PINNED);
+        assert_eq!(owners[0].lifetime, crate::placement::planner::Lifetime {
+            first: crate::placement::planner::Phase::Load, last: crate::placement::planner::Phase::Load });
     }
     assert!(weights[0].arena.view(&format!("{TEXT}layers.3.block_sparse_moe.gate.weight")).is_some());
     let single = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap();
@@ -254,6 +263,9 @@ fn installed_minimax_headers_match_native_contract() {
         ModuleNumerics::CheckpointPrecision);
     let weights = crate::families::minimax_m3::weight_layout::CoordinatorWeights::plan(
         &checkpoint, &model.cfg, 1, &vec![0; model.cfg.layers]).unwrap();
+    let load = weights[0].mount_load(&checkpoint).unwrap();
+    assert_eq!(load, crate::shared::dense_read::MountLoad {
+        pinned_source: crate::shared::dense_read::STEP_BYTES as u64, full_row_cache: 0, pinned_tables: 0 });
     assert_eq!(weights[0].projections.len(), 60 * 9);
     assert_eq!(weights[0].records_bytes(2752).unwrap(), (2752 / 16) * (12288 / 32) * 528);
     assert!(weights[0].arena.views().keys().all(|name| !name.contains(".experts.") && !name.starts_with("vision_tower.")));
