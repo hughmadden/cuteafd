@@ -13,8 +13,13 @@ use std::{ffi::c_void, rc::Rc};
 pub(crate) const PREFIX_REUSE: ReuseRule = ReuseRule::EXACT;
 
 pub(crate) struct Mla<'a> {
-    native: KimiMla<'a>,
+    native: MlaNative<'a>,
     layers: Vec<KimiAttention>,
+}
+
+enum MlaNative<'a> {
+    Dense(KimiMla<'a>),
+    Sparse { projection: cuteafd_ffi::KimiMlaProjection<'a>, attention: cuteafd_ffi::KimiSparseMla<'a> },
 }
 
 impl<'a> Mla<'a> {
@@ -24,30 +29,67 @@ impl<'a> Mla<'a> {
             && cfg.kv_lora_rank == 512 && cfg.qk_nope_dim == 128 && cfg.qk_rope_dim == 64
             && cfg.v_head_dim == 128, "unsupported Kimi native MLA geometry");
         ensure!(cfg.mla_record_values() * 2 == MLA_RECORD_BYTES, "Kimi MLA cache accounting mismatch");
-        Ok(Self { native: KimiMla::load(programs, heads, capacity, mode, cache_format)?, layers: cfg.attention.clone() })
+        let native = if cfg.dsa.is_some() {
+            MlaNative::Sparse { projection: cuteafd_ffi::KimiMlaProjection::load_k31(programs, heads, capacity, cache_format)?,
+                attention: cuteafd_ffi::KimiSparseMla::load(programs, heads, capacity, cache_format, None)? }
+        } else { MlaNative::Dense(KimiMla::load(programs, heads, capacity, mode, cache_format)?) };
+        Ok(Self { native, layers: cfg.attention.clone() })
     }
 
-    pub(crate) fn scratch_bytes(&self) -> [usize; 3] { self.native.scratch_bytes() }
-    pub(crate) fn max_context(&self) -> usize { self.native.max_context() }
-    pub(crate) fn splits(&self) -> usize { self.native.splits() }
+    pub(crate) fn scratch_bytes(&self) -> [usize; 3] {
+        match &self.native {
+            MlaNative::Dense(native) => native.scratch_bytes(),
+            MlaNative::Sparse { projection, attention } => {
+                let [producer, output] = projection.scratch_bytes();
+                [producer, attention.scratch_bytes(), output]
+            }
+        }
+    }
+    pub(crate) fn max_context(&self) -> usize {
+        match &self.native { MlaNative::Dense(native) => native.max_context(),
+            MlaNative::Sparse { .. } => cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT }
+    }
+    pub(crate) fn splits(&self) -> usize {
+        match &self.native { MlaNative::Dense(native) => native.splits(), MlaNative::Sparse { .. } => 16 }
+    }
 
     pub(crate) fn produce(&self, layer: usize, weights: KimiMlaWeights,
         batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
         ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
-        self.native.produce(weights, batch, stream)?;
+        match &self.native {
+            MlaNative::Dense(native) => native.produce(weights, batch, stream)?,
+            MlaNative::Sparse { projection, .. } => projection.produce(weights, batch, stream)?,
+        }
         Ok(())
     }
 
     pub(crate) fn output(&self, layer: usize, weights: KimiMlaWeights,
         batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
         ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
-        self.native.output(weights, batch, stream)?;
+        match &self.native {
+            MlaNative::Dense(native) => native.output(weights, batch, stream)?,
+            MlaNative::Sparse { projection, .. } => projection.output(weights, batch, stream)?,
+        }
         Ok(())
     }
 
     pub(crate) fn attention(&self,layer:usize,batch:KimiMlaBatch,stream:*mut c_void)->Result<()> {
         ensure!(self.layers.get(layer)==Some(&KimiAttention::Mla),"layer {layer} is not Kimi MLA");
-        self.native.attention(batch,stream)?;Ok(())
+        match &self.native {
+            MlaNative::Dense(native) => native.attention(batch, stream)?,
+            MlaNative::Sparse { .. } => anyhow::bail!("Kimi K3.1 requires causal index selection before MLA"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn selected(&self, layer: usize, batch: cuteafd_ffi::KimiSparseBatch,
+        stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
+        match &self.native {
+            MlaNative::Sparse { attention, .. } => attention.launch(batch, stream)?,
+            MlaNative::Dense(_) => anyhow::bail!("Kimi K3 dense MLA cannot consume DSA token slots"),
+        }
+        Ok(())
     }
 
     /// Output is head-local at 48 heads and complete at 96 heads. This call
@@ -55,7 +97,10 @@ impl<'a> Mla<'a> {
     pub(crate) fn forward(&self, layer: usize, weights: KimiMlaWeights,
                           batch: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
         ensure!(self.layers.get(layer) == Some(&KimiAttention::Mla), "layer {layer} is not Kimi MLA");
-        self.native.launch(weights, batch, stream)?;
+        match &self.native {
+            MlaNative::Dense(native) => native.launch(weights, batch, stream)?,
+            MlaNative::Sparse { .. } => anyhow::bail!("Kimi K3.1 requires the shared index/selected-MLA chain"),
+        }
         Ok(())
     }
 }

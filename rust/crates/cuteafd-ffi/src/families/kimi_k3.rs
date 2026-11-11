@@ -1050,11 +1050,20 @@ impl<'a> KimiKda<'a> {
     }
 
     pub fn load_heads(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, rows, decode, heads, false)
+    }
+
+    pub fn load_k31(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, rows, decode, heads, true)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, rows: usize, decode: bool, heads: usize, k31: bool) -> W8Result<Self> {
         let geometry = KimiKdaGeometry::new(heads)?;
         let pointers = ["x", "w_in", "w_fg", "conv_w", "a_log", "dt_bias", "o_norm", "w_o",
             "conv_state", "state", "slots", "seq_first", "out", "replay", "scratch"];
         let prefill = [&pointers[..13], &pointers[14..]].concat();
-        let name = if heads == 48 { format!("kimik3_kda_m{rows}") } else { format!("kda_fused_h96_m{rows}") };
+        let name = if heads == 48 { format!("{}_kda_m{rows}", if k31 { "kimik31" } else { "kimik3" }) }
+            else { format!("kda_fused_h96_m{rows}") };
         let program = programs.program(&name, if decode { &pointers } else { &prefill })?;
         let scratch = validate_kda_manifest_heads(program.spec(), rows, decode, geometry)?;
         let output_name = if heads == 48 { "kimik3_ffn_down_i6144" } else { "kda_output_h96" };
@@ -1104,8 +1113,18 @@ impl<'a> KimiKdaCommit<'a> {
     }
 
     pub fn load_heads(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, false)
+    }
+
+    pub fn load_k31(programs: &'a Programs<'a>, heads: usize) -> W8Result<Self> {
+        Self::load_variant(programs, heads, true)
+    }
+
+    fn load_variant(programs: &'a Programs<'a>, heads: usize, k31: bool) -> W8Result<Self> {
         let geometry = KimiKdaGeometry::new(heads)?;
-        let name = if heads == 48 { "kimik3_kda_commit" } else { "kda_commit_h96" };
+        let name = if heads == 48 {
+            if k31 { "kimik31_kda_commit" } else { "kimik3_kda_commit" }
+        } else { "kda_commit_h96" };
         let program = programs.program(name, &["state", "conv_state", "replay", "tables"])?;
         validate_kda_commit_manifest(program.spec(), geometry)?;
         Ok(Self { program, geometry })

@@ -146,6 +146,34 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
             }
         }
     }
+    for name in ["kimik31_kda_commit", "kimik31_lse_combine2", "kimik31_dsa_candidate_merge"] {
+        add(name.into(), SequenceLocal)?;
+    }
+    for capacity in [64, 4096] {
+        for stem in ["kda", "index_producer"] { add(format!("kimik31_{stem}_m{capacity}"), SequenceLocal)?; }
+        let mode = if capacity == 64 { "decode" } else { "prefill" };
+        for stem in ["index_topk", "scored_index_topk"] {
+            add(format!("kimik31_{stem}_{mode}_m{capacity}"), SequenceLocal)?;
+        }
+        for heads in [48, 96] {
+            let suffix = if heads == 48 { "" } else { "_h96" };
+            add(format!("kimik31_mla_output{suffix}_m{capacity}"), SequenceLocal)?;
+            for stem in ["mla_query", "mla_gate_output"] {
+                add(format!("kimik31_{stem}_h{heads}_m{capacity}"), SequenceLocal)?;
+            }
+            for cache in ["", "_fp8"] {
+                for stem in ["mla_producer", "sparse_mla"] {
+                    add(format!("kimik31_{stem}{suffix}{cache}_m{capacity}"), SequenceLocal)?;
+                }
+                for stride in [576, 640] {
+                    add(format!("kimik31_mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"), SequenceLocal)?;
+                }
+            }
+        }
+        for cache in ["", "_fp8"] { for begin in [0, 48] {
+            add(format!("kimik31_sparse_mla_partial{cache}_h{begin}_m{capacity}"), SequenceLocal)?;
+        }}
+    }
     add("kimik3_lse_combine2".into(), SequenceLocal)?;
     for cache in ["", "_fp8"] {
         add(format!("kimik3_paged_staging_gather{cache}"), SequenceLocal)?;
@@ -199,7 +227,7 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
 }
 
 fn packing_program(name: &str, core: bool) -> bool {
-    name.starts_with("kimik3_") || name.starts_with("kda_fused_")
+    name.starts_with("kimik3_") || name.starts_with("kimik31_") || name.starts_with("kda_fused_")
         || matches!(name, "kda_commit_h96" | "kda_output_h96") || core && (name.starts_with("kda_core_")
         || name.starts_with("mla_rank_norm_") || name.starts_with("mla_query_")
         || name.starts_with("mla_gate_output_") || name.starts_with("dense_trellis_k6_"))
@@ -232,6 +260,7 @@ pub(crate) struct NativePrograms<'a> {
     pub kda: [KimiKda<'a>; 2],
     pub commit: KimiKdaCommit<'a>,
     pub mla: [MlaPrograms<'a>; 2],
+    dsa: Option<DsaPrograms<'a>>,
     pub latent: KimiLatent<'a>,
     pub router: KimiRouter<'a>,
     pub wire: KimiExpertInput<'a>,
@@ -254,6 +283,39 @@ pub(crate) struct MlaPrograms<'a> {
     pub decode: super::mla::Mla<'a>,
     pub verify: super::mla::Mla<'a>,
     pub extend: super::mla::Mla<'a>,
+}
+
+struct DsaPrograms<'a> {
+    producer: [cuteafd_ffi::KimiIndexProducer<'a>; 2],
+    selector: [cuteafd_ffi::KimiIndexTopK<'a>; 2],
+    scored: [cuteafd_ffi::KimiIndexTopK<'a>; 2],
+    partial: [[cuteafd_ffi::KimiSparseMla<'a>; 2]; 2],
+    merge: cuteafd_ffi::KimiCandidateMerge<'a>,
+    scratch: cuteafd_loader::families::kimi_k3::allocation::DsaScratch,
+}
+
+impl<'a> DsaPrograms<'a> {
+    fn load(programs: &'a Programs<'a>, format: cuteafd_core::MlaCacheFormat) -> Result<Self> {
+        use cuteafd_ffi::{KimiIndexMode, KimiIndexProducer, KimiIndexTopK, KimiSparseMla};
+        let pages = cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT.div_ceil(64);
+        let producer = [KimiIndexProducer::load(programs, 64)?, KimiIndexProducer::load(programs, 4096)?];
+        let selector = [KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, false)?,
+            KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, false)?];
+        let scored = [KimiIndexTopK::load(programs, 64, pages, KimiIndexMode::Decode, true)?,
+            KimiIndexTopK::load(programs, 4096, pages, KimiIndexMode::Prefill, true)?];
+        let partial = [
+            [KimiSparseMla::load(programs, 96, 64, format, Some(0))?,
+             KimiSparseMla::load(programs, 96, 64, format, Some(48))?],
+            [KimiSparseMla::load(programs, 96, 4096, format, Some(0))?,
+             KimiSparseMla::load(programs, 96, 4096, format, Some(48))?],
+        ];
+        let scratch = cuteafd_loader::families::kimi_k3::allocation::DsaScratch {
+            producer: producer.iter().map(|p| p.scratch_bytes()).max().unwrap(),
+            selector: selector.iter().chain(scored.iter()).map(|p| p.scratch_bytes()).max().unwrap(),
+        };
+        Ok(Self { producer, selector, scored, partial,
+            merge: cuteafd_ffi::KimiCandidateMerge::load(programs)?, scratch })
+    }
 }
 
 /// Reusable native temporary storage for one serialized layer lane. These are
@@ -298,8 +360,9 @@ impl<'a> NativePrograms<'a> {
         let packing_cap = coordinator_packing_cap(programs, !inventory.projections.is_empty(), rows, &native.programs)?;
         device.run(|| {
             let heads = cfg.kda_heads / ranks;
-            let kda = [KimiKda::load_heads(programs, 64, true, heads)?,
-                KimiKda::load_heads(programs, 4096, false, heads)?];
+            let load_kda = if cfg.dsa.is_some() { KimiKda::load_k31 } else { KimiKda::load_heads };
+            let kda = [load_kda(programs, 64, true, heads)?, load_kda(programs, 4096, false, heads)?];
+            let dsa = cfg.dsa.map(|_| DsaPrograms::load(programs, cache_format)).transpose()?;
             // Admission can select owned MLA or explicit head split. Resolve
             // both before its measured baseline, never lazily after admission.
             let load_mla = |heads| -> Result<MlaPrograms<'a>> {
@@ -311,12 +374,15 @@ impl<'a> NativePrograms<'a> {
             };
             let mla = [load_mla(48)?, load_mla(96)?];
             let scratch = NativeScratch::combine(kda.each_ref().map(|p| p.scratch_bytes()),
-                mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()]))?;
+                mla.iter().flat_map(|p| [p.decode.scratch_bytes(), p.verify.scratch_bytes(), p.extend.scratch_bytes()])
+                    .chain(dsa.iter().flat_map(|dsa| dsa.partial.iter().flatten()
+                        .map(|partial| [0, partial.scratch_bytes(), 0]))))?;
             let core = super::core_runtime::CorePrograms::load_for_ranks(programs, cfg, inventory, rows, cache_format, ranks)?;
             ensure!(core.as_ref().map_or(0, |core| core.native_scratch) as u64 == native.fp8_scratch_bytes,
                 "Kimi runtime native scratch differs from exact shared manifest charge");
             Ok(Self { device, w8: W8::load_for_ranks(cfg, programs, ffn_mode, ranks)?, norm: KimiRmsNorm::load(programs, cfg.hidden)?,
-                kda, commit: KimiKdaCommit::load_heads(programs, heads)?, mla, latent: KimiLatent::load(programs)?,
+                kda, commit: if cfg.dsa.is_some() { KimiKdaCommit::load_k31(programs, heads)? }
+                    else { KimiKdaCommit::load_heads(programs, heads)? }, mla, dsa, latent: KimiLatent::load(programs)?,
                 router: KimiRouter::load(programs)?, wire: KimiExpertInput::load(programs)?,
                 add: device.library.bf16_add()?, core, packing_cap, ranks, scratch,
                 graph_core: cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(inventory),
@@ -343,6 +409,7 @@ impl<'a> NativePrograms<'a> {
             .into_iter().all(|capacity| max_context <= capacity)), "Kimi lane context exceeds native programs");
         let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
             cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
+        if let Some(dsa) = &self.dsa { layout.base = layout.base.with_dsa(cfg, dsa.scratch)?; }
         if let Some(core)=&self.core {
             layout.core=core.layouts[rank].clone();
             // Split producers consume the same named scratch planes as fused
@@ -499,6 +566,14 @@ impl Lane<'_> {
                     unsafe { self.stream.device.library.copy_h2d_ordered(buffer, &vec![0; buffer.bytes], self.stream.raw) }
                 })?;
             }
+        }
+        if self.layout.operands.contains_key("DSA selector scratch") {
+            let scratch = self.buffer("DSA selector scratch")?;
+            self.stream.device.run(|| {
+                // SAFETY: the admitted selector owner is fresh and retained by
+                // this lane; initialize its persistent counters before capture.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(scratch, scratch.bytes, self.stream.raw) }
+            })?;
         }
         self.stream.drain()
     }
@@ -1011,7 +1086,13 @@ impl<'a> LocalLane<'a> {
                     producer_scratch: self.lane.buffer("MLA producer scratch")?,
                     attention_scratch: self.lane.buffer("MLA attention scratch")?,
                     output_scratch: self.lane.buffer("MLA output scratch")? };
-                device.run(|| program.forward(layer, weights, batch, self.lane.stream.raw))?;
+                device.run(|| {
+                    if self.programs.dsa.is_some() {
+                        program.produce(layer, weights, batch, self.lane.stream.raw)?;
+                        self.dsa_attention(layer, batch)?;
+                        program.output(layer, weights, batch, self.lane.stream.raw)
+                    } else { program.forward(layer, weights, batch, self.lane.stream.raw) }
+                })?;
             }
             None => bail!("Kimi attention layer outside inventory"),
         }
@@ -1262,6 +1343,44 @@ impl<'a> LocalLane<'a> {
         })
     }
 
+    /// Ordinary placement shares physical page IDs between index and MLA.
+    /// Context must instead merge global candidates into its independent local table.
+    fn dsa_attention(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
+        ensure!(!self.mla.parity(), "Kimi Context DSA requires global candidates before parity mapping");
+        let programs = self.programs.dsa.as_ref().context("Kimi DSA programs not resolved")?;
+        let unit = usize::from(batch.rows > 64);
+        let cache = self.mla.index(layer)?;
+        let query = self.lane.buffer("DSA query")?;
+        let head_weights = self.lane.buffer("DSA head weights")?;
+        let indices = self.lane.buffer("DSA indices")?;
+        let weights = self.layer(layer)?.indexer()?;
+        let stream = self.stream();
+        stream.device.run(|| {
+            programs.producer[unit].launch(weights, cuteafd_ffi::KimiIndexBatch {
+                rows: batch.rows, cache_pages: self.mla.pages(), x: batch.x, q_resid: batch.q_resid,
+                positions: self.lane.buffer("DSA positions")?, slots: self.lane.buffer("DSA slots")?,
+                // NoPE retains the producer's rotary pointer ABI without reading it.
+                cos_sin: self.lane.buffer("DSA positions")?, cache, query_fp8: query, head_weights,
+                scratch: self.lane.buffer("DSA producer scratch")?,
+            }, stream.raw)?;
+            programs.selector[unit].launch(cuteafd_ffi::KimiIndexSelection {
+                rows: batch.rows, cache_pages: self.mla.pages(),
+                table_width: self.lane.layout.max_context.div_ceil(64),
+                table_stride: self.lane.layout.max_context.div_ceil(64),
+                query_fp8: query, head_weights, cache, table: self.lane.buffer("DSA page table")?,
+                lengths: self.lane.buffer("DSA lengths")?, indices,
+                scores: indices, scratch: self.lane.buffer("DSA selector scratch")?,
+            }, stream.raw)?;
+            self.mla_program(layer, batch.rows, false)?.selected(layer, cuteafd_ffi::KimiSparseBatch {
+                rows: batch.rows, cache_tokens: self.mla.pages() * 64,
+                query: batch.query, cache: batch.cache, indices,
+                lengths: self.lane.buffer("DSA selected lengths")?,
+                query_offsets: self.lane.buffer("DSA query offsets")?, output: batch.attention,
+                lse: batch.lse, scratch: batch.attention_scratch,
+            }, stream.raw)
+        })
+    }
+
     fn mla_output(&self, layer: usize, batch: cuteafd_ffi::KimiMlaBatch) -> Result<()> {
         let weights = self.layer(layer)?;
         let stream = self.stream();
@@ -1403,7 +1522,8 @@ impl<'a> LocalLane<'a> {
                         super::core_runtime::mla_query_projected(split,projected("mla.q_b")?,rows,batch.q_resid,
                             q_b,weights.buffer("mla.uk")?,batch.query,stream.raw)?;
                     }
-                    attention.attention(layer,batch,stream.raw)?;
+                    if self.programs.dsa.is_some() { self.dsa_attention(layer, batch)?; }
+                    else { attention.attention(layer,batch,stream.raw)?; }
                     super::core_runtime::mla_gate_projected(split,projected("mla.gate")?,rows,input,batch.attention,
                         weights.buffer("mla.uv")?,self.lane.buffer("K6 gate")?,normalized,stream.raw)?;
                     "mla.output"
@@ -2147,7 +2267,12 @@ mod packing_inventory_tests {
             "kimik3_dense_mla_extend_h96_fp8_m4096", "mla_rank_norm_h48_kv640_fp8_m64",
             "mla_query_h96_m4096", "kimik3_mla_draft_attention_full_m64",
             "kimik3_lse_combine2", "kimik3_mla_partial_fp8_h48_t8_m64",
-            "kimik3_mla_partial_fp8_h48_t16_m64", "kimik3_paged_staging_gather"] {
+            "kimik3_mla_partial_fp8_h48_t16_m64", "kimik3_paged_staging_gather",
+            "kimik31_kda_commit", "kimik31_kda_m64", "kimik31_index_producer_m4096",
+            "kimik31_index_topk_decode_m64", "kimik31_scored_index_topk_prefill_m4096",
+            "kimik31_mla_producer_h96_fp8_m4096", "kimik31_sparse_mla_h96_m64",
+            "kimik31_sparse_mla_partial_fp8_h48_m4096", "kimik31_dsa_candidate_merge",
+            "kimik31_mla_query_h96_m64", "kimik31_mla_rank_norm_h48_kv576_fp8_m4096"] {
             assert_eq!(roles[name], SequenceLocal, "{name}");
         }
         for name in ["kimik3_new_projection", "dense_trellis_k6_new_projection", "mla_query_new"] {
