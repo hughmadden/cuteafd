@@ -201,10 +201,6 @@ def onboard(value: str, config: dict | None = None) -> str:
 
 
 def main() -> int:
-    if len(sys.argv) == 3 and sys.argv[1] == "--attention-variant":
-        with Path(__file__).with_name("attention-variants.json").open(encoding="utf-8") as handle:
-            variants = json.load(handle)
-        return 0 if variants.get(sys.argv[2]) is True else 1
     if len(sys.argv) in (3, 4) and sys.argv[1] == "--onboard":
         config = None
         if len(sys.argv) == 4:

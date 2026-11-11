@@ -88,7 +88,7 @@ pub fn spec_from(cfg: &MimoV2Config, checkpoint: &Checkpoint) -> ModelSpec {
                 memory.max_load_staging, memory.max_load_staging as f64 / GIB));
         }
     } else {
-        notes.push("default resident formats follow checkpoint tensors; explicit single-copy head/O/drafter conversions remain configurable".into());
+        notes.push("default target weights preserve checkpoint precision; head/O FP8 conversions are opt-in; drafter defaults are unchanged (exempt)".into());
     }
     notes.push("component bytes, owner totals and weight-only placement budgets below describe checkpoint source storage; they are not complete resident-memory admission. Runtime admission counts selected representations, loading phases, optional DFlash, caches and workspaces separately".into());
     ModelSpec {

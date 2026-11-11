@@ -182,7 +182,7 @@ pub fn manifest_context_for_cards(cfg: &GlmDsaConfig, manifest: &serde_json::Val
         cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
         let family = cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: cfg.program_family(), split_family: cfg.split_program_family() };
-        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+        cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, plan,
             |name| family.contains(name))?;
         let Some(card) = manifest_context(cfg, &selected, sm_count, &plan) else { return Ok(None) };
         context = Some(match context {
@@ -237,6 +237,7 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     }
     let optional = [format!("glm_index_producer_bf16_{cap}"), format!("{prefix}_producer_bf16_{cap}"),
         format!("{prefix}_o_bf16_{cap}"), format!("{prefix}_ffn_i{moe}_bf16_{cap}"),
+        format!("{prefix}_ffn_i{dense}_bf16_{cap}"),
         format!("{prefix}_ffn_i{dense}_pt_{cap}")];
     for name in optional { programs = programs.max(lookup(&name).unwrap_or(0)); }
     let name = format!("glm_index_topk_{mode}_{cap}");

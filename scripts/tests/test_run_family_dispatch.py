@@ -63,6 +63,24 @@ def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.parametrize("value,resolved", [(None, "native"), ("native", "native"), ("fp8", "fp8")])
+def test_glm_target_conversion_policy_reaches_plan_and_serve(tmp_path, value, resolved):
+    keys = "SPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    if value is not None:
+        keys += f"CUTEAFD_GLM_BF16={value}\n"
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", keys)
+    assert result.returncode == 0, result.stderr
+    for command in ["cuteafd plan", "cuteafd serve-glm"]:
+        launch = next(line for line in result.stderr.splitlines() if command in line)
+        assert f"CUTEAFD_GLM_BF16={resolved}" in launch
+
+
+def test_glm_target_conversion_policy_refuses_unknown_value(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3}, "test/glm", "CUTEAFD_GLM_BF16=auto\n")
+    assert result.returncode == 2
+    assert "CUTEAFD_GLM_BF16 must be native or fp8" in result.stderr
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 @pytest.mark.parametrize("attention", ["auto", "heads", "context", "layers"])
 @pytest.mark.parametrize("wip", [False, True])
@@ -88,65 +106,47 @@ def test_glm_native_attention_reaches_plan_and_coordinator(tmp_path, gpus, atten
     assert f"CUTEAFD_ATTENTION_PLACEMENT={attention}" in coordinators[0]
 
 
-@pytest.mark.parametrize("mode,flag", [("hqa", None), ("compact", "--compact-attention"),
-                                        ("fp8-compact", "--fp8-compact-attention")])
-def test_attention_bundle_reaches_plan_coordinator_and_workers(tmp_path, mode, flag):
+@pytest.mark.parametrize("mode", ["original", "k6-compact", "k8-compact", "fp8-compact"])
+def test_core_view_reaches_plan_coordinator_and_workers(tmp_path, mode):
     config = {"model_type": "glm5_next", "num_hidden_layers": 2,
               "mlp_layer_types": ["sparse"] * 2,
               "layer_types": ["linear_attention", "deepseek_sparse_attention"]}
-    keys = (f"ATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=2\n"
+    keys = (f"CORE_VIEW={mode}\nSPARK_COUNT=1\nRTX_GPUS=2\n"
             "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
     source = tmp_path / "selected-checkpoint"
     source.mkdir()
-    (source / "config.compact-attention.json").write_text(json.dumps(config))
-    (source / "config.json").write_text(json.dumps(config) if mode != "compact" else "invalid default must not open")
-    result = _family_launch_result(tmp_path, config, "test/hqa-flash", keys, checkpoint_source=source)
+    for name in ["config.json", "config.k6.json", "config.k8.json"]:
+        (source / name).write_text(json.dumps(config))
+    result = _family_launch_result(tmp_path, config, "test/mc-flash", keys, checkpoint_source=source)
     assert result.returncode == 0, result.stderr
-    lines = result.stderr.splitlines()
     for command in ["cuteafd plan", "cuteafd serve-glmf --snapshot", "cuteafd expertd-native"]:
-        selected = [line for line in lines if command in line]
+        selected = [line for line in result.stderr.splitlines() if command in line]
         assert selected, result.stderr
         for line in selected:
-            if flag:
-                assert flag in line
-            else:
-                assert "--compact-attention" not in line and "--fp8-compact-attention" not in line
+            assert f"--core-view {mode}" in line
 
 
-def test_attention_variant_table_matches_launcher_and_distinguishes_ml4(tmp_path):
-    reader = ROOT / "scripts/lib/checkpoint-family.py"
-    variants = json.loads(reader.with_name("attention-variants.json").read_text())
-    assert variants and all(type(enabled) is bool for enabled in variants.values())
-    for family, enabled in [*variants.items(), ("unknown", False)]:
-        result = subprocess.run(["python3", str(reader), "--attention-variant", family],
-                                capture_output=True, text=True, timeout=10)
-        assert (result.returncode == 0) == enabled, family
-    # The launcher checks selected checkpoint metadata, never the shared glm5 engine name.
-    config = {"model_type": "mistral_large4",
-              "architectures": ["MistralLarge4ForConditionalGeneration"],
-              "text_config": {"model_type": "mistral_large4_text",
-                              "num_hidden_layers": 72, "first_k_dense_replace": 1}}
-    for enabled in [False, True]:
-        case = tmp_path / str(enabled)
-        result = _family_launch_result(case, config, "test/ml4-variant",
-            "ATTENTION_MODE=fp8-compact\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-            attention_variants={"glm5": not enabled, "mistral_large4": enabled})
-        if enabled:
-            assert result.returncode == 0, result.stderr
-            launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glm --snapshot" in line)
-            assert "--fp8-compact-attention" in launch
-        else:
-            assert result.returncode != 0
-            assert "checkpoint variant mistral_large4" in result.stderr
-
-
-@pytest.mark.parametrize("mode", ["compact", "fp8-compact", "unknown"])
-def test_attention_bundle_refuses_unsupported_modes_and_families(tmp_path, mode):
-    config = {"model_type": "unknown", "num_hidden_layers": 4}
-    result = _family_launch_result(tmp_path, config, "test/no-hqa",
-                                  f"EXLR8_MANIFEST=up1\nATTENTION_MODE={mode}\nSPARK_COUNT=1\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+def test_core_view_refuses_unknown_value(tmp_path):
+    result = _family_launch_result(tmp_path, {"model_type": "glm5_next"}, "test/mc",
+                                  "CORE_VIEW=unknown\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
     assert result.returncode != 0
-    assert "ATTENTION_MODE" in result.stderr
+    assert "CORE_VIEW" in result.stderr
+
+
+@pytest.mark.parametrize("family", ["deepseek_v41", "deepseek_v4", "mimo_v2"])
+def test_original_core_view_is_not_forwarded_to_unsupported_workers(tmp_path, family):
+    config = ({"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
+               "moe_layer_freq": [0, 1]} if family == "mimo_v2" else {"model_type": family})
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/model"
+    # V4.1 does not accept this family key; its original view is implicit.
+    selector = "" if family == "deepseek_v41" else "CORE_VIEW=original\n"
+    result = _family_launch_result(tmp_path, config, model,
+        selector + "SPARK_COUNT=4\nSPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    worker_marker = "--profile-args" if family == "deepseek_v41" else "cuteafd expertd-native"
+    workers = [line for line in result.stderr.splitlines() if worker_marker in line]
+    assert len(workers) == 4, result.stderr
+    assert all("--core-view" not in line for line in workers), result.stderr
 
 
 @pytest.mark.parametrize("activations", [None, "a16", "a8"])
@@ -907,7 +907,6 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           deployment_overrides: dict | None = None,
                           probe_fails: bool = False, root_launcher: bool = False,
                           checkpoint_source: Path | None = None,
-                          attention_variants: dict[str, bool] | None = None,
                           execute_workers: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. nvidia-smi reports
@@ -922,10 +921,6 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     copy_input(ROOT / "scripts" / "launch" / "preflight-fp8-bf16.py", repo / "scripts" / "launch")
     copy_input(ROOT / "scripts" / "lib" / "checkpoint-family.py", repo / "scripts" / "lib")
     copy_input(ROOT / "scripts" / "lib" / "release-common.sh", repo / "scripts" / "lib")
-    if attention_variants is not None:
-        table = repo / "scripts/lib/attention-variants.json"
-        table.unlink()  # Sandbox inputs may share an immutable template inode.
-        table.write_text(json.dumps(attention_variants))
     from launcher_sandbox import stub_cuda_capacity
     stub_cuda_capacity(repo / "scripts/lib/release-common.sh",
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
@@ -950,9 +945,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
-    if "ATTENTION_MODE=compact" in keys:
+    if "CORE_VIEW=k6-compact" in keys:
         selected = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
-        (selected / "config.compact-attention.json").write_text(json.dumps(family_config))
+        (selected / "config.k6.json").write_text(json.dumps(family_config))
     if checkpoint_source is not None:
         staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
         # Header fixtures have huge sparse tensor payloads; never materialize them.
@@ -975,6 +970,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    # Launcher tests model an idle host, independent of real API listeners.
+    (bin_dir / "ss").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (bin_dir / "ss").chmod(0o755)
     audio_backend = ("pcm-bf16-aot-v1" if family_config.get("model_type") == "muse_spark" else
                      "mimo_audio_fp32_v1/cuda13000/cufft12000/cublas13.0.0/cute_aot_sm121/export" + "cd" * 32)
     for tool in ("docker", "ssh", "nest") if with_nest else ("docker", "ssh"):
@@ -1086,8 +1084,9 @@ def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 config = json.loads(os.environ["STUB_CHECKPOINT"])
 config_path = os.environ["STUB_CONFIG_PATH"]
-if "--compact-attention" in args:
-    config_path = os.path.join(os.path.dirname(config_path), "config.compact-attention.json")
+if value("--core-view") in ("k6-compact", "k8-compact"):
+    bits = value("--core-view")[1]
+    config_path = os.path.join(os.path.dirname(config_path), f"config.k{bits}.json")
 described = subprocess.check_output([sys.executable, os.environ["STUB_FAMILY_READER"], config_path], text=True).split()
 family, _, first, last = described
 ranks = int(os.environ["STUB_PREFERRED_RANKS"] if os.environ["STUB_FORCE_PREFERRED"] else value("--spark-ranks", os.environ["STUB_PREFERRED_RANKS"]))
@@ -2516,17 +2515,19 @@ def test_glmf_precision_defaults_follow_serving_split(tmp_path, layout, physical
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert ("--split-device" in launch) == split
     # The shared Rust resolver selects the checkpoint/topology head; shell passes auto.
-    # The split adds token-row KDA output ownership.
-    assert "--kda-fp8 row128" in launch
+    # Native KDA and BF16 heads stay unchanged on every topology.
+    assert "--kda-fp8 off" in launch
     assert "--fp8-head auto" in launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all("--fp8-head auto" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
     assert launch.count("--kda-fp8") == launch.count("--fp8-head") == 1
     assert launch.count("--snapshot ") == 1
-    assert ("--kda-output-shard --kda-prefill-expanded" in launch) == split
+    assert "--kda-output-shard" not in launch
+    assert "--kda-prefill-expanded" not in launch
 
 
-@pytest.mark.parametrize("keys,shard", [("", True), ("GLM5_FLASH_KDA_SPLIT=partials\n", False),
+@pytest.mark.parametrize("keys,shard", [("", False), ("GLM5_FLASH_KDA_FP8=row128\n", True),
+                                        ("GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_KDA_SPLIT=partials\n", False),
                                         ("GLM5_FLASH_KDA_FP8=off\n", False)])
 def test_glmf_split_token_rows_follow_fp8_kda(tmp_path, keys, shard):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -2555,9 +2556,9 @@ def test_glmf_explicit_precision_wins_on_either_layout(tmp_path, layout, prefix,
 
 @pytest.mark.parametrize("layout,keys,kda,head", [
     ("RTX_GPUS=1\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
-    ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
+    ("RTX_GPUS=1\n", "GLM5_FLASH_FP8_HEAD=off\n", "off", "false"),
     ("RTX_GPUS=2\n", "GLM5_FLASH_KDA_FP8=off\n", "off", "auto"),
-    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "row128", "false"),
+    ("RTX_GPUS=2\n", "GLM5_FLASH_FP8_HEAD=off\n", "off", "false"),
 ])
 def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, head):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
@@ -2571,7 +2572,7 @@ def test_glmf_precision_overrides_are_independent(tmp_path, layout, keys, kda, h
 @pytest.mark.parametrize("layout,accepted", [("RTX_GPUS=1\n", True), ("RTX_GPUS=2\n", False)])
 def test_glmf_kda_prefill_validation_uses_resolved_precision(tmp_path, layout, accepted):
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
-                                  "GLM5_FLASH_FP8_PREFILL=all\n" + layout)
+                                  "GLM5_FLASH_KDA_FP8=row128\nGLM5_FLASH_FP8_PREFILL=all\n" + layout)
     assert result.returncode == (0 if accepted else 2), result.stderr
     if accepted:
         assert "--fp8-prefill all" in result.stderr
@@ -2627,14 +2628,14 @@ def test_glmf_invalid_fp8_options_fail_before_workers_launch(tmp_path, key, valu
                                                   ("COORDINATOR_GPUS=0,1\nCOORDINATOR_SPLIT=off\n", (0, 1))])
 def test_glmf_packed_head_reaches_serve_and_plan_on_one_gpu(tmp_path, layout, physical_gpus):
     """GLM5_FLASH_FP8_HEAD=packed (mirroring V41_FP8_HEAD=packed) keeps the exact 12-bit head:
-    serve-glmf and its plan both get --fp8-head packed, once, beside the default row128 KDA."""
+    serve-glmf and its plan both get --fp8-head packed, once, beside the default native KDA."""
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "test/glmf",
                                   layout + "GLM5_FLASH_FP8_HEAD=packed\n", physical_gpus=physical_gpus)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-glmf" in line)
     assert "--split-device" not in launch
     assert "--fp8-head packed" in launch and launch.count("--fp8-head") == 1, launch
-    assert "--kda-fp8 row128" in launch
+    assert "--kda-fp8 off" in launch
     plans = [line for line in result.stderr.splitlines() if "cuteafd plan" in line]
     assert plans and all("--fp8-head packed" in plan and plan.count("--fp8-head") == 1 for plan in plans), plans
 

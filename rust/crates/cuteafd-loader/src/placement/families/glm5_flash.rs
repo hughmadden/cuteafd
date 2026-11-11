@@ -86,7 +86,7 @@ pub fn manifest_context_for_cards(manifest: &serde_json::Value, heads: usize, sm
     for &sm_count in sms {
         let mut selected = manifest.clone();
         cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sm_count.try_into()?)?;
-        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, plan,
+        cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, plan,
             |name| (name.starts_with("glmf_") && !name.ends_with("_m128")) || name.starts_with("glmf2_"))?;
         let Some(card) = manifest_context_for_plan(&selected, heads, sm_count, &plan)? else { return Ok(None) };
         context = Some(match context {

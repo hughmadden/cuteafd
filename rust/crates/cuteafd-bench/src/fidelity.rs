@@ -322,8 +322,7 @@ const PRECISION_SETTINGS: &[&str] = &["CUTEAFD_V41_FP8_HEAD", "fp8-head", "kda-f
     "CUTEAFD_SPARK_PREFILL_REPLY_FORMAT", "CUTEAFD_SPARK_DECODE_REPLY_FORMAT",
     "spark-prefill-reply-format", "spark-decode-reply-format",
     "spark-prefill-reply-format-explicit", "spark-decode-reply-format-explicit",
-    "compact-attention", "fp8-compact-attention", "attention-mode", "attention-bundle-fingerprint",
-    "attention-fp8-recipe", "CUTEAFD_COMPACT_ATTENTION", "CUTEAFD_FP8_COMPACT_ATTENTION"];
+    "core-view", "core-view-fingerprint", "core-fp8-recipe", "CUTEAFD_CORE_VIEW"];
 
 /// Quant selection: settings a cross-checkpoint pair may also change, beside the precision
 /// switches. Exact names only; each one picks which weights serve, nothing else.
@@ -943,12 +942,12 @@ mod tests {
     }
 
     #[test]
-    fn attention_modes_are_precision_only_not_layout_or_code_changes() {
+    fn core_views_are_precision_only_not_layout_or_code_changes() {
         let mut b = run(3, 8);
         b.settings = serde_json::json!({"snapshot": "/snapshots/revision", "model": "checkpoint", "settings": [
-            {"name": "attention-mode", "value": "hqa"},
-            {"name": "attention-bundle-fingerprint", "value": "bf16-identity"},
-            {"name": "attention-fp8-recipe", "value": "none"}]});
+            {"name": "core-view", "value": "original"},
+            {"name": "core-view-fingerprint", "value": "bf16-identity"},
+            {"name": "core-fp8-recipe", "value": "none"}]});
         let mut a = b.clone();
         a.settings["settings"][0]["value"] = serde_json::json!("fp8-compact");
         a.settings["settings"][1]["value"] = serde_json::json!("fp8-identity");

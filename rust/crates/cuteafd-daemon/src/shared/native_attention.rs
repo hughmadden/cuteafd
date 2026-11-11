@@ -19,23 +19,23 @@ pub(crate) enum AttentionRecord {
 
 pub(crate) fn attention_records(snapshot: &std::path::Path,
     selected: &cuteafd_loader::plan::checkpoint::SelectedProjection,
-    mode: cuteafd_loader::plan::checkpoint::AttentionMode,
+    mode: cuteafd_loader::plan::checkpoint::CoreView,
     layout: &cuteafd_loader::formats::native_attention::NativeLayout,
     rule: crate::shared::fp8_linear::Fp8Scales, values: CuteafdDeviceBuffer,
     scales: Option<CuteafdDeviceBuffer>) -> Result<Vec<AttentionRecord>> {
     use cuteafd_loader::{formats::trellis_core::CoreSplit,
-        plan::checkpoint::{AttentionMode, ProjectionStorage}};
+        plan::checkpoint::{CoreView, ProjectionStorage}};
     use crate::shared::experts::rtx::dense::{Operand, Step, windows};
     let ProjectionStorage::Native { dtype, shape } = &selected.storage else {
         anyhow::bail!("{}: native recipe received trellis", layout.stem);
     };
     ensure!(shape.len() == 2 && matches!(dtype, DType::Bf16 | DType::F8E4M3), "native attention source geometry");
-    if *dtype == DType::F8E4M3 && mode == AttentionMode::Fp8Compact {
+    if *dtype == DType::F8E4M3 && mode == CoreView::Fp8Compact {
         return Err(cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion {
             tensor: format!("{}.weight", layout.stem), found: "E4M3".into(),
         }.into());
     }
-    let fp8 = *dtype == DType::F8E4M3 || mode == AttentionMode::Fp8Compact;
+    let fp8 = *dtype == DType::F8E4M3 || mode == CoreView::Fp8Compact;
     ensure!(fp8 == layout.fp8 && layout.ranks > 0 && layout.rank < layout.ranks,
         "native attention recipe differs from selected mode");
     let [n, k] = layout.shape;
@@ -71,7 +71,7 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
             AttentionRecord::Operand(Operand { device, buffer: grid, lands: vec![(source(&scale.meta.name,
                 rows.start/128..rows.end/128, cols.start/128..cols.end/128, 4)?, 0)], bytes: n/128*(k/128)*4 })]);
     }
-    let rule = if mode == AttentionMode::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
+    let rule = if mode == CoreView::Fp8Compact { crate::shared::fp8_linear::Fp8Scales::Amax } else { rule };
     let whole = source(&weight, rows, cols, 2)?;
     windows(&[whole], 128)?.into_iter().map(|(rects, rows)| {
         let target = Target {
@@ -89,7 +89,7 @@ pub(crate) fn attention_records(snapshot: &std::path::Path,
 mod tests {
     use super::*;
     use cuteafd_loader::{formats::{native_attention::NativeLayout, trellis_core::CoreSplit},
-        plan::checkpoint::{AttentionMode, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
+        plan::checkpoint::{CoreView, CheckpointTensor, ProjectionStorage, SelectedProjection}, SafetensorsTensorMetadata};
 
     #[test]
     fn fp8_compact_records_refuse_already_fp8_before_allocations_or_sources() {
@@ -98,7 +98,7 @@ mod tests {
         let layout = NativeLayout { stem: "layers.0.attention.wq".into(), shape: [256, 256],
             fp8: true, rank: 0, ranks: 1, split: CoreSplit::Whole };
         let error = attention_records(std::path::Path::new("/unreadable"), &selected,
-            AttentionMode::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+            CoreView::Fp8Compact, &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
             CuteafdDeviceBuffer::default(), None).err().expect("already-FP8 must refuse");
         let refusal = error.downcast_ref::<cuteafd_loader::formats::native_attention::UnsupportedFp8Conversion>()
             .expect("conversion refusal must retain its typed error");
@@ -120,14 +120,14 @@ mod tests {
             let layout = NativeLayout { stem: stem.into(), shape: [256, 256], fp8: true, rank: 1, ranks: 2, split: CoreSplit::Output };
             let values = CuteafdDeviceBuffer { device_id: 0, bytes: 65536, ..Default::default() };
             let scales = CuteafdDeviceBuffer { device_id: 0, bytes: 256, ..Default::default() };
-            let records = attention_records(std::path::Path::new("/selected"), &selected, AttentionMode::Hqa,
+            let records = attention_records(std::path::Path::new("/selected"), &selected, CoreView::Original,
                 &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales))?;
             let AttentionRecord::Operand(scale) = &records[1] else { panic!("native scale must land verbatim"); };
             assert_eq!(scale.lands[0].0.name, format!("{stem}.{suffix}"));
             assert_eq!(scale.lands[0].0.rows, 2..4);
             assert_eq!(scale.lands[0].0.cols, 0..8);
             selected.tensors.pop();
-            let error = attention_records(std::path::Path::new("/selected"), &selected, AttentionMode::Hqa,
+            let error = attention_records(std::path::Path::new("/selected"), &selected, CoreView::Original,
                 &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, Some(scales)).err().unwrap();
             assert!(error.is::<cuteafd_loader::formats::native_attention::InvalidFp8Scale>());
         }

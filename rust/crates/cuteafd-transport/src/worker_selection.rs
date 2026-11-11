@@ -37,7 +37,7 @@ impl WorkerIdentity {
     pub fn from_snapshot_manifest(snapshot: &Path, geometry: cuteafd_core::ExpertGeometry,
         selected: crate::expert::SparkWorld, manifest: Option<&str>) -> Result<Self> {
         Self::from_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, geometry, selected, manifest)
+            cuteafd_loader::plan::checkpoint::CoreView::Original)?, geometry, selected, manifest)
     }
 
     pub fn from_view(view: &cuteafd_loader::plan::checkpoint::CheckpointView,

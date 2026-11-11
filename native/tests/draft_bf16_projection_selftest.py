@@ -47,7 +47,9 @@ def shapes():
                  (1536, 18432), (1536, 9216), (12288, 7168), (6144, 7168),
                  (12288, 4096), (6144, 4096), (8192, 8192), (4096, 8192),
                  (8192, 4096)):
-        result.setdefault((k, n), []).append("hqa-native")
+        result.setdefault((k, n), []).append("checkpoint-native")
+    for n in (512, 576):
+        result.setdefault((6144, n), []).append("ml4-native-kv-a")
     return result
 
 
@@ -60,14 +62,14 @@ def main():
     parser.add_argument("--out-dtype", choices=("bf16", "f32"), default="bf16")
     parser.add_argument("--shape", action="append", help="restrict to K,N; repeatable")
     parser.add_argument("--rows", action="append", type=int, default=[],
-                        help="additional live row count (1..2048); repeatable")
+                        help="additional live row count (1..4096); repeatable")
     parser.add_argument("--support-library", help="load native dependencies for isolated translation-unit iteration")
     parser.add_argument("--screen", action="store_true", help="compare fixed-Lt, padding and existing row-local TMA")
     parser.add_argument("--skinny-screen", action="store_true",
                         help="compare canonical TMA with row-retiled M16 tensor-core arms")
     args = parser.parse_args()
-    if any(rows < 1 or rows > 2048 for rows in args.rows):
-        parser.error("--rows must be between 1 and 2048")
+    if any(rows < 1 or rows > 4096 for rows in args.rows):
+        parser.error("--rows must be between 1 and 4096")
     row_counts = tuple(sorted({1, 4, 8, 16, 17, 32, 64, 128, 140, 2048, *args.rows}))
     assert not (args.screen and args.skinny_screen), "select one screen"
     assert args.out_dtype == "bf16" or not (args.screen or args.skinny_screen), "screens require BF16 output"

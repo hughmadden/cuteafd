@@ -147,9 +147,7 @@ pub(crate) struct EngineArgs {
     /// host at load) INSTEAD of BF16: the one head the target (prefill, verify,
     /// golden rows) and the MTP drafts share, every logits row through
     /// `qwen4_head_fp8` in 16-row spans. Default false: both share the BF16 head.
-    /// Default true: measured on one RTX (C1 code 196 -> 222 tok/s, KL 0.034 ->
-    /// 0.036, top-1 unchanged 88.5%). --fp8-decode stays off: KL +0.012.
-    #[arg(long, alias = "fp8-head", default_value_t = true, action = clap::ArgAction::Set)]
+    #[arg(long, alias = "fp8-head", default_value_t = false, action = clap::ArgAction::Set)]
     pub mtp_fp8_head: bool,
     #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
@@ -462,10 +460,10 @@ mod weight_representation_tests {
     }
 
     #[test]
-    fn measured_defaults_fp8_head_bf16_projections_and_options() {
+    fn default_bf16_head_and_projections_require_explicit_fp8() {
         for extra in [&[][..], &["--mtp", "1"][..]] {
             let parsed = args(extra).unwrap();
-            assert!(!parsed.fp8_decode && parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
+            assert!(!parsed.fp8_decode && !parsed.mtp_fp8_head && !parsed.fp8_prefill_w8a8);
         }
         assert!(!args(&["--mtp-fp8-head", "false"]).unwrap().mtp_fp8_head);
         let parsed = args(&["--fp8-decode", "true", "--mtp-fp8-head", "true", "--fp8-prefill-w8a8", "true"]).unwrap();
@@ -629,7 +627,7 @@ impl Opened {
             };
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan_view(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
-                source, cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?, cuteafd_core::ExpertGeometry::QWEN4,
+                source, cuteafd_loader::plan::checkpoint::CoreView::Original)?, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(),
                 admission::spark_model(cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(
                     self.experts.as_ref().context("Qwen Spark admission requires routed expert headers")?)?,

@@ -792,7 +792,7 @@ mod core_owner_tests {
     }
 
     fn inventory(layer: usize, leaves: &[(&str, [usize; 2])]) -> CoreInventory {
-        CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: leaves.iter().map(|(leaf, shape)| {
+        CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: leaves.iter().map(|(leaf, shape)| {
             let stem = format!("language_model.model.layers.{layer}.{leaf}");
             let projection = CoreProjection { stem: stem.clone(), bits: 6, codebook: Exl3Codebook::Mul1,
                 shape: *shape, stored_outputs: shape[0], split: cuteafd_loader::families::kimi_k3::core::split(&stem).unwrap(),
@@ -992,7 +992,7 @@ mod core_owner_tests {
     fn native_head_is_terminal_only_and_packs_no_bf16_shadow() -> Result<()> {
         let mut cfg=fixture_config();cfg.vocab_size=128;
         let stem="language_model.lm_head".to_owned();
-        let core=CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{
+        let core=CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections:BTreeMap::from([(stem.clone(),CoreProjection{
             stem,bits:6,codebook:Exl3Codebook::Mul1,shape:[cfg.vocab_size,cfg.hidden],
             stored_outputs:cfg.vocab_size,split:CoreSplit::Whole,source_bytes:0})])};
         let baseline=GlobalLayout::pair(&cfg)?;
@@ -1020,7 +1020,7 @@ mod core_owner_tests {
         let mut cfg = fixture_config();
         cfg.vocab_size = 128;
         let stem = "language_model.lm_head".to_owned();
-        let core = CoreInventory { largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
+        let core = CoreInventory { selected_core_view: None, largest_selected_dense_bytes: None, native: BTreeMap::new(), projections: BTreeMap::from([(stem.clone(), CoreProjection {
             stem, bits: 6, codebook: Exl3Codebook::Mul1, shape: [cfg.vocab_size, cfg.hidden],
             stored_outputs: cfg.vocab_size, split: CoreSplit::Whole, source_bytes: 0,
         })]) };

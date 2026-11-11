@@ -15,9 +15,16 @@ place. The starting configs also serve the checkpoint's bundled vision and
 PCM audio towers by default; qualification and caveats are recorded below
 and on #923.
 
-## Attention and core views
+## Core views
 
-The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC` provides the original BF16 core
+and complete `k8-compact` / `k6-compact` cores. Select with `CORE_VIEW` (default
+`original`) or `--core-view`; see the [MC contract](../mc-checkpoints.md).
+The original path retains native attention, MoE frontend/backend and vocabulary
+head weights. Compact widths have distinct dispatch and exact memory charges.
+`fp8-compact` retains the existing attention conversion scope, using row-major
+E4M3 weights with F32 block-128 scales and BF16 activations (W8A16).
+Towers and routed experts are shared, not converted with the core.
 
 ## Architecture
 

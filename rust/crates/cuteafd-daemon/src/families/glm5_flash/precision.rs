@@ -120,6 +120,8 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 for scalar in ["weight_scale_2", "input_scale"] {
                     self::scalar(primary, format!("{name}.{scalar}"))?;
                 }
+            } else if core.native.get(&name).is_some_and(|p| !p.fp8) {
+                require(primary, format!("{name}.weight"), DType::Bf16, vec![rows, cols], 2, "native dense/shared BF16 MLP")?;
             } else {
                 block(primary, format!("{name}.weight"), rows, cols, "dense/shared FP8 block MLP")?;
             }
@@ -211,21 +213,22 @@ mod tests {
     }
 
     #[test]
-    fn direct_cli_bf16_is_admitted_for_block_quantization_at_load() {
+    fn direct_cli_bf16_preserves_native_projection_precision() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
         check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]
-    fn other_source_formats_and_partial_bf16_blocks_are_named() {
+    fn unsupported_source_formats_are_named_and_native_bf16_needs_no_blocks() {
         let (mut checkpoint, cfg) = fixture();
         widen_sources(&mut checkpoint);
         let name = "model.language_model.layers.0.mlp.gate_proj.weight";
         checkpoint.tensors.iter_mut().find(|t| t.meta.name == name).unwrap().meta.dtype = DType::F16;
         let error = check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap_err();
-        assert!(matches!(error, ProjectionInputError::Source { ref name, actual: DType::F16, .. }
-            if name == "model.language_model.layers.0.mlp.gate_proj.weight"), "{error}");
+        assert!(matches!(error, ProjectionInputError::Native(_)), "{error}");
+        assert!(error.to_string().contains(name.strip_suffix(".weight").unwrap())
+            && error.to_string().contains("F16"), "{error}");
         let (mut checkpoint, mut cfg) = fixture();
         widen_sources(&mut checkpoint);
         cfg.moe_intermediate = 2000;
@@ -236,8 +239,7 @@ mod tests {
                 t.meta.byte_length = s.iter().map(|&n| n as u64).product::<u64>() * 2;
             }
         }
-        assert!(matches!(check_projection_inputs(&checkpoint, &cfg, cfg.layers),
-            Err(ProjectionInputError::Blocks { .. })));
+        check_projection_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
     }
 
     #[test]

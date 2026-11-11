@@ -271,8 +271,8 @@ impl<'a> GlmEngine<'a> {
         let local = retained[usize::from(key == "down")].buffer;
         let native = layer.attention_native.contains_key(key);
         let peer = self.core_received(rank, slot(index, key == "down", lane), rows, if native { 4 } else { 2 })?;
-        // Widen retained BF16 cores for rank-ordered F32 addition, then run
-        // the one complete H128/svh egress.
+        // Native projections retain F32 partials; trellis projections widen
+        // retained BF16 cores before the complete H128/svh egress.
         let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
         if native {
             // SAFETY: both rank-ordered F32 partials have completed their exchange;
@@ -332,8 +332,8 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    /// Input-side projections narrow F32 cores to retained BF16 before any
-    /// following projection reuses the accumulator. Their caller owns the meet.
+    /// Input-side native projections retain F32 partials, while trellis cores
+    /// retain BF16. Their caller owns the meet before either storage is reused.
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
         if let Some(weights) = layer.attention_native.get(key) {
@@ -350,11 +350,11 @@ impl<'a> GlmEngine<'a> {
         let stream = self.stream_of(rank);
         self.on(rank, || {
             if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
-                let core = projection.core(rows, input, weights, &scratch.projection, stream)?;
+                let core = projection.core(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, stream)?;
                 let retained = retained.context("GLM K6 split core has no retained row storage")?;
                 crate::shared::dense_trellis::retain_partial(&programs.narrow, core, retained,
                     rows * weights.shape[0], stream)
-            } else { projection.local(rows, input, weights, &scratch.projection, output, stream) }
+            } else { projection.local(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, output, stream) }
         })
     }
 
@@ -506,7 +506,7 @@ impl<'a> GlmEngine<'a> {
         let (gate, up, hidden) = (scratch.stage("gate")?, scratch.stage("up")?, scratch.stage("hidden")?);
         self.core_linear(rank, w, layer, "gate", w.x.buffer, gate, rows, None)?;
         self.core_linear(rank, w, layer, "up", w.x.buffer, up, rows, None)?;
-        let intermediate = layer.core["gate"].shape[0];
+        let intermediate = Self::core_shape(layer, "gate")?[0];
         let name = match self.cfg.variant.ml4() {
             // Mistral Large 4's format-neutral SwiGLU (whole and two-GPU widths).
             Some(_) => format!("ml4_swiglu_i{intermediate}"),

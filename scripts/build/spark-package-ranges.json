@@ -8,7 +8,6 @@
     "scripts/build/spark-package-ranges.json",
     "scripts/lib/wip_aot_scopes.py",
     "scripts/lib/checkpoint-family.py",
-    "scripts/lib/attention-variants.json",
     "scripts/launch/preflight-spark-packages.py"
   ],
   "spark_budget_bytes": 107374182400,

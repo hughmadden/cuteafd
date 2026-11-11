@@ -11,7 +11,7 @@ pub use config::{GlmDsaConfig, GlmIndexer, GlmVariant};
 /// Shared representation choice for header admission and runtime program/loading paths.
 pub fn native_bf16() -> bool {
     static NATIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native"))
+    *NATIVE.get_or_init(|| std::env::var("CUTEAFD_GLM_BF16").map_or(true, |v| v != "fp8"))
 }
 
 /// Replicated heads cannot restore the host prefix tier; marks remain device-resident.

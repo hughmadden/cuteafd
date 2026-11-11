@@ -81,7 +81,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
         .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
     ensure!(peers.len() == world && !layers.is_empty(), "decode gate world disagrees with launched peers");
     let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(&snapshot,
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
     let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
     ensure!(catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8,
         "decode gate requires an EXLR8 checkpoint");

@@ -576,7 +576,7 @@ mod tests {
             "sealed Step-5 expert geometry"
         );
         let exports = crate::families::step5::serve::package_exports(&serde_json::json!({"layouts": {"tp": tp4.clone()}}))?;
-        SparkAdmission::plan_hqa_for_test(
+        SparkAdmission::plan_original_for_test(
             snapshot,
             ExpertGeometry::STEP5,
             Some(&catalog),

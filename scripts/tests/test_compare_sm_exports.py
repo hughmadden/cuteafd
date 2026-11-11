@@ -63,9 +63,12 @@ def test_two_target_counts():
 
 def test_draft_bf16_group_matches_exported_shapes():
     exporter = compare_sm.load_file("test_draft_bf16_exporter", ROOT / "python/tools/aot/export_b12x_dsv4_aot.py")
-    assert exporter.hqa_bf16_shapes() == {(1536,16384),(1536,8192),
-                                          (16384,4096),(8192,4096),(4096,4096)}
-    assert exporter.hqa_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
+    assert exporter.flash_native_bf16_shapes() == {(1536,16384),(1536,8192),
+                                          (16384,4096),(8192,4096),(4096,4096),
+                                          (4096,1536),(4096,512),(4096,12288),(4096,6144),
+                                          (12288,4096),(6144,4096),(4096,2048),(4096,1024),
+                                          (2048,4096),(1024,4096)}
+    assert exporter.flash_native_bf16_shapes() <= exporter.draft_bf16_shapes().keys()
     expected = ",".join(f"k{k}_n{n}" for k, n in sorted(exporter.draft_bf16_shapes()))
     for scope in ("all", "suspects"):
         job, = (job for job in compare_sm.jobs(scope) if job[0] == "draft-bf16")
@@ -80,9 +83,12 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
         "kimik3": {(18432,1536),(9216,1536),(7168,12288),(7168,6144)},
         "step5": {(4096,12288),(4096,6144)},
         "muse": {(8192,8192),(8192,4096)},
-        "ml4": {(8192,6144),(4096,6144),(6144,8192),(6144,4096)},
+        "ml4": {(8192,6144),(4096,6144),(6144,8192),(6144,4096),
+                (24576,6144),(12288,6144),(6144,6144),(3072,6144),
+                (6144,24576),(6144,12288),(6144,3072)},
     }
-    assert exporter.native_attention_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(6144,4096)}
+    assert exporter.native_attention_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(6144,4096),
+                                                        (6144,12288),(6144,3072)}
     assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192)}
     programs = exporter.native_attention_programs()
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
@@ -94,6 +100,8 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
         ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
     stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
              for n,k in family_shapes}
+    stems |= {"k6144_n512", "k6144_n576"}
+    assert all("native-core" in exporter.draft_bf16_shapes()[(6144,n)] for n in (512,576))
     stems |= {f"k{k}_n{n}_f32" for n,k in exporter.native_attention_bf16_f32_shapes()}
     args = jobs["native-attention-bf16"][1]
     assert args[:2] == ["--geometry", "muse"] and set(args[3].split(",")) == stems
@@ -109,6 +117,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "projection_oracle_inventory", "exec"), namespace)
     native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
                    for n,k in family_shapes}
+    native_bf16.update((6144, n) for n in (512, 576))
     assert native_bf16 <= namespace["shapes"]().keys()
     assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}
 

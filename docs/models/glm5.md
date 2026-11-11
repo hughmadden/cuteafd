@@ -26,9 +26,14 @@ Native EXL3 K4 + K6-core starting configs:
 [min](../../examples/configs/glm53-exl3-k6core-min.config) ·
 [max](../../examples/configs/glm53-exl3-k6core-max.config).
 
-## Attention and core views
+## Core selection
 
-The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
+Plain GLM checkpoints use `CORE_VIEW=original` and their checkpoint-native
+core. A compact selector requires an explicit [MC manifest](../mc-checkpoints.md);
+there is no alternate-attention publication or filename fallback. Where native
+BF16 attention operands are supported, `fp8-compact` retains the existing
+load-time attention conversion scope. It does not convert an FP8-origin core.
+Selected metadata and fingerprints are immutable across planning and serving.
 
 ## Engineering summary
 

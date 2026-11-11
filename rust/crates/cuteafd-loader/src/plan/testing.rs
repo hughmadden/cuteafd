@@ -529,6 +529,34 @@ pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::
                 "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
         }
     }
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers {
+            for layouts in core.layer_native(cfg, layer, ranks, owner)? {
+                for layout in layouts.into_values() {
+                    use cuteafd_ffi::draft_projection::ProjectionOutput;
+                    let [n, k] = layout.shape;
+                    let output = crate::families::glm5::core::native_output(&layout);
+                    for stage in if layout.fp8 { &[64, 4096][..] } else { &[4096][..] } {
+                        let entry = if layout.fp8 {
+                            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+                            json!({"name":format!("native_attention_n{n}_k{k}_m{stage}{suffix}"),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":256},
+                                "geometry":{"input_features":k,"output_features":n,"output_dtype":output.torch_dtype(),
+                                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+                        } else {
+                            json!({"name":output.program_name(k,n),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                                "scratch_bytes_at_capacity":{},"geometry":{"width":k,"outputs":n,
+                                    "output_dtype":output.torch_dtype(),"reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}})
+                        };
+                        programs.insert(entry["name"].as_str().unwrap().to_owned(), entry);
+                    }
+                }
+            }
+        }
+    } }
     for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
         for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
             let name = format!("{prefix}_stage_swiglu_i{inter}");
@@ -606,14 +634,17 @@ pub fn write_glm5_flash_workspaces(root: &Path) -> std::path::PathBuf {
     fs::create_dir_all(&package).unwrap();
     let layout = json!({"capacities":[{"capacity":4096,"scratch_bytes":4096}]});
     fs::write(package.join("manifest.json"), json!({"layouts":{"tp1":layout,"tp2":layout}}).to_string()).unwrap();
-    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_s16", "kda_s16t", "kda_w8",
+        "kda_w8_s16", "kda_w8_s16t", "mla_producer", "o", "ffn_i2048",
         "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
             ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
         .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
             "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096",
             "glmf2_kda_w8_norm_m64", "glmf2_kda_output_rows_m64",
             "glmf2_kda_w8_norm_m4096", "glmf2_kda_output_rows_m4096",
-            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096"].map(str::to_string))
+            "glmf2_kda_w8_norm_expanded_m4096", "glmf2_kda_output_rows_expanded_m4096",
+            "glmf2_kda_w8_m64", "glmf2_kda_w8_m4096",
+            "glmf2_kda_w8_expanded_m4096"].map(str::to_string))
         .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
     let path = share.join("PROGRAMS.json");
     fs::write(&path, json!({"capacities":{"max_context":131072},"programs":programs}).to_string()).unwrap();
@@ -1725,4 +1756,70 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
             "add_pre_mm_projector_layer_norm": true, "adapter_bias": false}}).to_string()).unwrap();
     fs::write(dir.join("processor_config.json"),
         include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
+}
+
+/// Three complete indexed core views with private core shards and one shared backing.
+pub fn write_mc_snapshot(dir: &Path, config: &Value, tensors: &[Tensor],
+    shapes: &std::collections::BTreeMap<String, Vec<usize>>) {
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    fs::create_dir_all(dir).unwrap();
+    let core_stems = shapes.keys().map(|n| n.strip_suffix(".weight").unwrap()).collect::<Vec<_>>();
+    let shared = tensors.iter().filter(|(name, ..)| !core_stems.iter().any(|stem|
+        name.strip_prefix(stem).is_some_and(|tail| tail.starts_with('.')))).cloned().collect::<Vec<_>>();
+    let shard = "shared-and-core.safetensors";
+    let mut h = Sha256::new();
+    let shared_map: BTreeMap<_, _> = shared.iter().map(|(name, ..)| (name.clone(), shard)).collect();
+    for (name, shard) in &shared_map { h.update(format!("{name}\0{shard}\n")); }
+    let shared_digest = format!("{:x}", h.finalize());
+    let all: BTreeMap<String, Tensor> = shared.iter().cloned().map(|t| (t.0.clone(), t)).collect();
+    let mut variants = Vec::new();
+    for (view, bits, suffix) in [("original", 16, ""), ("k6-compact", 6, ".k6"), ("k8-compact", 8, ".k8")] {
+        let index_name = format!("model{suffix}.safetensors.index.json");
+        let config_name = format!("config{suffix}.json");
+        let quant_name = format!("quantize_config{suffix}.json");
+        let mut active = shared.clone();
+        let mut core = Vec::new();
+        for (name, shape) in shapes {
+            let stem = name.strip_suffix(".weight").unwrap();
+            let generated = if bits == 16 { vec![t(name, "BF16", shape)] }
+                else { exl3(&format!("{stem}{suffix}"), shape[0].next_multiple_of(128), shape[1], bits) };
+            for mut tensor in generated {
+                // Views select the canonical module names but use private shards
+                // for alternate payloads that share tensor names.
+                tensor.0 = tensor.0.replace(&format!("{stem}{suffix}."), &format!("{stem}."));
+                core.push(tensor.0.clone());
+                active.push(tensor);
+            }
+        }
+        let core_shard = format!("core{suffix}.safetensors");
+        let core_set = core.iter().collect::<std::collections::BTreeSet<_>>();
+        write_safetensors(&dir.join(&core_shard), &active.iter().filter(|t| core_set.contains(&t.0)).cloned().collect::<Vec<_>>());
+        let weights: BTreeMap<_, _> = active.iter().map(|(name, ..)| (name.clone(),
+            if core_set.contains(name) { core_shard.as_str() } else { shard })).collect();
+        let projections = active.iter().filter_map(|(name, _, shape)| name.strip_suffix(".trellis")
+            .map(|stem| (stem.to_owned(), shape[2]/16, shape[0]*16, shape[1]*16))).collect::<Vec<_>>();
+        let mut cfg = config.clone();
+        let mut compact = exl3_compact(4);
+        compact["per_module_metadata"] = json!(format!("{quant_name}:tensor_storage"));
+        cfg["quantization_config"] = compact.clone();
+        cfg["transformers_weights"] = json!(index_name);
+        let quant = exl3_manifest(&compact, &projections);
+        let mut hashes = BTreeMap::new();
+        for (name, value) in [(&config_name, cfg), (&quant_name, quant), (&index_name, json!({"weight_map":weights}))] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            hashes.insert(name.clone(), format!("{:x}", Sha256::digest(&bytes)));
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        core.sort();
+        let mut h = Sha256::new();
+        h.update(format!("cuteafd-mc-view-v1\0{view}\0{shared_digest}\0"));
+        for (name, digest) in &hashes { h.update(format!("{name}\0{digest}\n")); }
+        variants.push(json!({"name":view, "index":index_name, "config":config_name, "quantize":quant_name,
+            "core_bits":bits, "core_tensors":core, "metadata_sha256":hashes, "fingerprint":format!("{:x}", h.finalize())}));
+    }
+    write_safetensors(&dir.join(shard), &all.into_values().collect::<Vec<_>>());
+    fs::write(dir.join("cuteafd-mc.json"), json!({"schema":"cuteafd-mc-v1",
+        "source":{"repo":"test/source", "revision":"0123456789012345678901234567890123456789"},
+        "original_core_dtype":"BF16", "shared_inventory_sha256":shared_digest, "variants":variants}).to_string()).unwrap();
 }

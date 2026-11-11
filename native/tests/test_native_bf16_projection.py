@@ -1,4 +1,4 @@
-"""Selected Flash BF16 projections and first-use capture (sealed-slot GPU test)."""
+"""Checkpoint-native Flash BF16 projections and first-use capture (sealed-slot GPU test)."""
 import ctypes as C
 from concurrent.futures import ThreadPoolExecutor
 import os

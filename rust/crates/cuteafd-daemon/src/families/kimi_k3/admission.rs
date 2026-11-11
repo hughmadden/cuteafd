@@ -2585,7 +2585,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn mla_cache_residency_and_pages_follow_accepted_attention_modes() -> Result<()> {
+    fn mla_cache_residency_and_pages_follow_accepted_core_views() -> Result<()> {
         let cfg = cfg();
         let owned = admit(inputs(&cfg))?;
         let mut i = inputs(&cfg);

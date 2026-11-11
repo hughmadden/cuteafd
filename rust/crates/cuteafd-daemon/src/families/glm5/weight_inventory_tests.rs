@@ -399,7 +399,7 @@ fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
 }
 
 #[test]
-fn official_ml4_fp8_is_refused_by_inventory_and_expert_catalog() -> Result<()> {
+fn official_ml4_native_inventory_keeps_expert_package_refusal() -> Result<()> {
     let root = installed(
         "mistralai--Mistral-Large-4-1T-A52B",
         "f12dabdc0c1e99e7f7924461a6f308859b05af4d",
@@ -414,15 +414,65 @@ fn official_ml4_fp8_is_refused_by_inventory_and_expert_catalog() -> Result<()> {
         false,
         false,
         EmbeddingHome::Device(0),
-    )
-    .unwrap_err();
+    )?;
     let loader = cuteafd_loader::read_expert_catalog(&root).unwrap_err();
-    type Refusal = cuteafd_loader::families::glm5::core::UnsupportedAttentionFormat;
-    let refusal = inventory
-        .downcast_ref::<Refusal>()
-        .context("typed inventory refusal")?;
-    assert!(!refusal.tensors.is_empty() && refusal.found.contains("F8E4M3"));
+    assert!(!inventory.owners.is_empty());
+    let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+    assert!(core.projections.is_empty());
+    assert!(core.native.values().any(|layout| layout.fp8));
+    assert!(core.native.values().any(|layout| !layout.fp8));
     assert!(loader.to_string().contains("no Spark expert package"));
+    Ok(())
+}
+
+#[test]
+fn original_ml4_native_inventory_equals_routes_and_single_arena_charges() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut tensors = fixture::mistral_large4_tensors(None, false);
+    let experts = tensors.iter().filter_map(|(name, _, shape)| {
+        let stem = name.strip_suffix(".weight")?;
+        stem.contains(".experts.").then(|| (stem.to_owned(), shape.clone()))
+    }).collect::<Vec<_>>();
+    tensors.retain(|(name, ..)| !name.contains(".experts."));
+    for (stem, shape) in experts {
+        tensors.extend(fixture::exl3(&stem, shape[0], shape[1], 4));
+    }
+    let (mut quant, mut manifest) = fixture::mistral_large4_exl3_config(&tensors);
+    for metadata in [&mut quant, &mut manifest] {
+        for key in ["core_bits", "head_bits", "lm_head"] {
+            metadata.as_object_mut().unwrap().remove(key);
+        }
+    }
+    let mut config = fixture::mistral_large4_config();
+    config.as_object_mut().unwrap().remove("transformers_weights");
+    config["quantization_config"] = quant;
+    fixture::write_snapshot(root.path(), &config, &tensors, None);
+    fixture::write_quantize_config(root.path(), &manifest);
+    // The native contract validates bundled drafter headers against Mistral's params.
+    std::fs::write(root.path().join("params.json"), serde_json::to_vec(&serde_json::json!({
+        "softmax_tanh_gating": 30.0,
+        "mtp": {"n_layers": 3, "depth": 3, "ragged_attention": "2048,2048,2048",
+            "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+            "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}}
+    }))?)?;
+    let cfg = GlmDsaConfig::from_hf(&config)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let attention = (0..cfg.layers).map(|layer| (layer % 2) as u8).collect::<Vec<_>>();
+    for ranks in [1, 2] {
+        for whole in [false, true] {
+            if whole && ranks == 1 { continue; }
+            let owners = whole.then_some(attention.as_slice());
+            for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                let inventory = WeightInventory::from_checkpoint(&checkpoint, ranks, cfg.layers,
+                    owners, true, false, home)?;
+                let actual = replay(&catalog, &cfg, &checkpoint, ranks, owners, true, home)?;
+                assert_eq!(signatures(inventory.owners.iter().map(|owner| owner.allocation.clone())),
+                    signatures(actual), "original ML4 tp{ranks} whole={whole} embed={home:?}");
+                arena_inventory(&format!("original ML4 tp{ranks} whole={whole} embed={home:?}"), &inventory)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -842,7 +892,7 @@ fn ml4_non_native_index_query_is_refused_before_upload() -> Result<()> {
     // Inventory validates core shapes from config, so construct its complete core
     // descriptors with the same config rather than admitting an incomplete group.
     for (name, shape) in cuteafd_loader::families::glm5::core::expected(&cfg) {
-        if name.contains(".attention.") && !name.contains("indexer") {
+        if !name.contains("indexer") && name != "output.weight" {
             let stem = name.strip_suffix(".weight").unwrap();
             renamed.retain(|t| !t.0.starts_with(&format!("{stem}.")));
             renamed.extend(fixture::exl3(

@@ -1235,26 +1235,20 @@ echo "  context/output: $MAX_CONTEXT_TOKENS/$MAX_OUTPUT_TOKENS; dSpark: $SPECULA
 }
 
 # The family: run.sh passes --family; a direct call reads the checkpoint's own config.json.
-attention_mode="$(get ATTENTION_MODE hqa)"
-case "$attention_mode" in
-  hqa|compact|fp8-compact) ;;
-  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+core_view="$(get CORE_VIEW original)"
+case "$core_view" in
+  original|fp8-compact) selected_config=config.json ;;
+  k8-compact) selected_config=config.k8.json ;;
+  k6-compact) selected_config=config.k6.json ;;
+  *) release_die "CORE_VIEW must be original, k8-compact, k6-compact or fp8-compact" ;;
 esac
-selected_config=config.json
-[[ "$attention_mode" != compact ]] || selected_config=config.compact-attention.json
-detected_family="$(release_config_family "$config" "$attention_mode")"
+detected_family="$(release_config_family "$config" "$core_view")"
 [[ -n "$family" ]] || family="$detected_family"
-attention_mode="$(get ATTENTION_MODE hqa)"
-attention_mode_args=()
-case "$attention_mode" in
-  hqa) ;;
-  compact|fp8-compact)
-    python3 "$repo_root/scripts/lib/checkpoint-family.py" --attention-variant "$detected_family" ||
-      release_die "unsupported ATTENTION_MODE=$attention_mode for checkpoint variant $detected_family"
-    if [[ "$attention_mode" == compact ]]; then attention_mode_args=(--compact-attention)
-    else attention_mode_args=(--fp8-compact-attention); fi
-    ;;
-  *) release_die "ATTENTION_MODE must be hqa, compact or fp8-compact" ;;
+core_view_args=(--core-view "$core_view")
+serve_core_view_args=()
+case "$family" in
+  glm5|glm5_flash|kimi_k3|step5|muse_spark) serve_core_view_args=("${core_view_args[@]}") ;;
+  *) [[ "$core_view" == original ]] || release_die "CORE_VIEW=$core_view is unsupported for $family" ;;
 esac
 
 [[ "$family" == deepseek_v41 || "$family" == deepseek_v4 || "$(get TP2_DSPARK_EXPERTS off)" != on ]] ||
@@ -1471,7 +1465,7 @@ snapshot_of() {
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
-spark_worker_args+=" ${attention_mode_args[*]}"
+spark_worker_args+=" ${serve_core_view_args[*]}"
 exlr8_manifest="$(get EXLR8_MANIFEST)"
 exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
 if [[ -n "$exlr8_prefill_activations" ]]; then
@@ -1623,7 +1617,7 @@ decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
 fi
-family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}")
+family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}" "${serve_core_view_args[@]}")
 case "$(get EXPERT_USAGE on)" in
   on|off) ;;
   *) release_die "EXPERT_USAGE must be on or off" ;;
@@ -2060,10 +2054,9 @@ if [[ "$family" == deepseek_v4 ]]; then
   release_resolve_tp2_dspark_experts "$family" "$((1 + head_split))"
   [[ "$TP2_DSPARK_EXPERTS" != on ]] || dspark_args+=(--tp2-dspark-experts)
 fi
-# GLM 5.3 Flash: MLA and shared-expert projections use the primary checkpoint's
-# FP8 blocks or BF16 quantized to 128x128 blocks at load. Dense MLPs use the
-# same route, or native packed NVFP4. Resolve precision after the split: both
-# layouts default to row128 KDA and an FP8 head; the two-GPU head split adds
+# GLM 5.3 Flash: BF16 target MLA/FFNs and KDA stay BF16 by default; native
+# FP8/NVFP4 checkpoint weights retain their format. Explicit row128/channel
+# KDA conversion on the two-GPU head split adds
 # token-row KDA output ownership (--kda-output-shard --kda-prefill-expanded),
 # which avoids rounding half-K BF16 partials (2026-10-05: C1 +7.6%, paired
 # top-1 453 -> 460/512, KL +0.0008). GLM5_FLASH_KDA_SPLIT=partials keeps the
@@ -2080,7 +2073,7 @@ if [[ $family == glm5_flash ]]; then
   [[ -z "$local_layers" ]] || family_args+=(--rtx-expert-layers "$local_layers")
   kda_fp8="$(key GLM5_FLASH_KDA_FP8 GLMF_KDA_FP8 auto)"
   case "$kda_fp8" in
-    ""|auto) kda_fp8=row128 ;;
+    ""|auto) kda_fp8=off ;;
     off|row128|channel) ;;
     *) echo "GLM5_FLASH_KDA_FP8 must be auto, off, row128 or channel" >&2; exit 2 ;;
   esac
@@ -2118,8 +2111,8 @@ if [[ $family == glm5_flash ]]; then
       echo "PREFILL_ROWS must be a multiple of 64 up to 4096" >&2; exit 2
     fi
   fi
-  # GLM5_FLASH_FP8_HEAD: auto is resolved by the shared checkpoint/topology resolver: packed on one GPU,
-  # FP8 on two GPUs, native heads unchanged. on selects E4M3; off keeps BF16; packed keeps exact 12-bit BF16
+  # GLM5_FLASH_FP8_HEAD: auto preserves the checkpoint BF16 head on every topology.
+  # Native heads stay unchanged. on selects E4M3; off keeps BF16; packed keeps exact 12-bit BF16
   # (mirroring V41_FP8_HEAD=packed): target logits exact, drafts through its coarse plane, about
   # three quarters of the BF16 bytes. The daemon checks packed split support after normalizing
   # native K6/EXLR8 heads, which ignore this conversion setting.
@@ -2305,7 +2298,12 @@ case "$family" in
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
     ;;
   glm5)
-    # Prefill units, waves and span come from the deployment plan (units-span).
+    # Plan and serve resolve the same explicit target conversion policy.
+    glm_bf16="$(get CUTEAFD_GLM_BF16 "${CUTEAFD_GLM_BF16:-native}")"
+    case "$glm_bf16" in
+      native|fp8) lane_env_args+=(-e "CUTEAFD_GLM_BF16=$glm_bf16") ;;
+      *) release_die "CUTEAFD_GLM_BF16 must be native or fp8" ;;
+    esac
     ;;
   glm5_flash|qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
@@ -2550,7 +2548,7 @@ audio_encoder_hash=""
   done
   plan_json="$(docker run --rm --network none ${plan_profile_env[@]+"${plan_profile_env[@]}"} "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${chat_template_mounts[@]}" "${wip_mount_args[@]}" "${plan_config_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
-    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${attention_mode_args[@]}" "${plan_memory_args[@]}" \
+    "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${core_view_args[@]}" "${plan_memory_args[@]}" \
     --rtx "$plan_rtx" --gpu-memory-cap "$plan_cap" --coordinator-weight-budget-gib "$(release_gib "$plan_cap")" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()

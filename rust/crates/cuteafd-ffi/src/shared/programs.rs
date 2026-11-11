@@ -327,7 +327,7 @@ impl<'a> Programs<'a> {
     pub fn with_attention_plan(mut self, plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
         keep: impl Fn(&str) -> bool) -> Result<Self> {
         let select = |spec: &mut ProgramSpec| -> Result<()> {
-            cuteafd_core::coordinator_programs::select_attention_scratch(&spec.geometry, &mut spec.scratch, plan)?;
+            cuteafd_core::coordinator_programs::select_core_view_scratch(&spec.geometry, &mut spec.scratch, plan)?;
             Ok(())
         };
         for (_, spec) in self.programs.values_mut() {

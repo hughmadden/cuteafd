@@ -647,8 +647,9 @@ impl WeightInventory {
                 let dense = layer < cfg.first_moe_layer;
                 let names = [weight(Op::Gate)?, weight(Op::Up)?, weight(Op::Down)?];
                 let group = if dense { "dense" } else { "shared_expert" };
-                if (dense || !native_shared) && core.get_weight(&names[0]).is_none() {
-                    let shared_bf16 = !dense && native_bf16 && headers.all_bf16(&names)?;
+                if (dense || !native_shared) && core.get_weight(&names[0]).is_none()
+                    && !core.native.contains_key(names[0].strip_suffix(".weight").unwrap()) {
+                    let shared_bf16 = native_bf16 && headers.all_bf16(&names)?;
                     headers.projection(
                         &mut out,
                         rank,
@@ -704,12 +705,13 @@ impl WeightInventory {
                 for (name, layout) in &native_layouts[rank] {
                     let source = core.native.get(&layout.stem).context("native attention source layout")?;
                     out.attention_mount.merge(native_attention_mount(layout, source.shape,
-                        checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact)?);
+                        checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact)?);
                     let [n, k] = layout.shape.map(|n| n as u64);
-                    out.add(rank, &format!("layer.{layer}.native.{name}.values"), "attention",
+                    let group = if matches!(*name, "gate" | "up" | "down") { group } else { "attention" };
+                    out.add(rank, &format!("layer.{layer}.native.{name}.values"), group,
                         if layout.fp8 { "fp8" } else { "bf16" }, product(&[n, k, if layout.fp8 { 1 } else { 2 }])?.max(256))?;
                     if layout.fp8 {
-                        out.add(rank, &format!("layer.{layer}.native.{name}.scales"), "attention", "fp8-scale",
+                        out.add(rank, &format!("layer.{layer}.native.{name}.scales"), group, "fp8-scale",
                             product(&[n.div_ceil(128), k.div_ceil(128), 4])?.max(256))?;
                     }
                 }

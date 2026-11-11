@@ -186,7 +186,7 @@ struct CsaWeights<'a> {
     residual: Program<'a>,
     epsilon: f32,
     native: Option<super::native::NativeAttention<'a>>,
-    hqa_output: Option<super::native::OutputProjection<'a>>,
+    native_output: Option<super::native::OutputProjection<'a>>,
 }
 
 pub(super) struct CsaLayer<'a> {
@@ -346,7 +346,7 @@ impl<'a> CsaLayer<'a> {
             (DType::F32, vec![192]),
             (DType::F32, vec![192]),
             (DType::Bf16, vec![64, H]),
-            (if contract.attention_mode == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, Q]),
+            (if contract.core_view == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact { DType::F8E4M3 } else { DType::Bf16 }, vec![H, Q]),
             (DType::Bf16, vec![H, H]),
             (DType::Bf16, vec![256, H]),
             (DType::Bf16, vec![256, H]),
@@ -515,7 +515,7 @@ impl<'a> CsaLayer<'a> {
             residual_spec.geometry["width"] == H,
             "CSA residual geometry"
         );
-        let hqa_output = if native_layer && !native_o {
+        let native_output = if native_layer && !native_o {
             Some(device.run(|| super::native::OutputProjection::load(
                 programs, &layout, layer_id, rows.min(4096), Q, H, cuteafd_ffi::draft_projection::ProjectionOutput::Bf16))?)
         } else { None };
@@ -549,7 +549,7 @@ impl<'a> CsaLayer<'a> {
             .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w, weight_arena)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let mut owner = Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
-            programs: resolved, residual, epsilon: contract.norms.input, native, hqa_output }), ffn, arena)?;
+            programs: resolved, residual, epsilon: contract.norms.input, native, native_output }), ffn, arena)?;
         owner.native_scratch = match (&owner.immutable.native, native_scratch) {
             (None, _) => None,
             (Some(_), Some(shared)) => Some(shared),
@@ -1123,7 +1123,7 @@ impl<'a> CsaLayer<'a> {
             let view = |plane: usize, width: usize| CuteafdDeviceBuffer {
                 ptr: self.ptr(plane, start * width * 2), bytes: rows * width * 2, ..self.planes[plane].buffer };
             output.launch(rows, view(GATED, Q), view(DELTA, H), scratch, stream.raw)?;
-        } else if let Some(output) = &self.immutable.hqa_output {
+        } else if let Some(output) = &self.immutable.native_output {
             let delta = CuteafdDeviceBuffer { ptr: self.ptr(DELTA, start * H * 2),
                 bytes: rows * H * 2, ..self.planes[DELTA].buffer };
             stream.device.run(|| {

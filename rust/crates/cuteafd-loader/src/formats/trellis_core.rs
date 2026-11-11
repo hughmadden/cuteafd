@@ -240,6 +240,14 @@ pub fn read_projections(
         let suffixes = members.keys().map(String::as_str).collect::<Vec<_>>();
         let module = exl3_module(&stem, &suffixes, |suffix| members.get(suffix).map(|t| &t.meta))?;
         contract.validate_width(&stem, module.bits)?;
+        if checkpoint.view.as_ref().is_some_and(|view| view.is_mc()) {
+            let expected_bits = match checkpoint.core_view() {
+                crate::plan::checkpoint::CoreView::K6Compact => 6,
+                crate::plan::checkpoint::CoreView::K8Compact => 8,
+                _ => anyhow::bail!("{stem}: MC original core must be native, not trellis"),
+            };
+            ensure!(module.bits == expected_bits, "{stem}: selected core view requires K{expected_bits}, found K{}", module.bits);
+        }
         let padded = contract.padded_outputs && module.output_features == shape[0].next_multiple_of(128);
         ensure!(module.input_features == shape[1] && (module.output_features == shape[0] || padded),
             "{stem}: core header shape [{},{}], expected {shape:?} (only explicit N128 padding is allowed)",

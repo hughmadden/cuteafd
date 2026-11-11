@@ -94,12 +94,10 @@ impl Census<'_> {
                 }
             }
             if let Some(core) = &w.core {
-                actual.projection(
-                    &format!("{kind}.core.projection"),
-                    &core.projection,
-                    lifetime,
-                    Category::Workspace,
-                )?;
+                if let Some(projection) = &core.projection {
+                    actual.projection(&format!("{kind}.core.projection"), projection,
+                        lifetime, Category::Workspace)?;
+                }
                 if let Some(native) = &core.native {
                     actual.record(&format!("{kind}.core.native.scratch"), native.buffer, lifetime,
                         Category::Workspace, "GLM target hooks")?;

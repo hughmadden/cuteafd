@@ -520,11 +520,9 @@ def assert_retired_release(entry: dict, report: dict) -> None:
     assert entry["release_note"].strip()
 
 
-def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
+def test_v5_smoke_card_inventory() -> None:
     smoke = json.loads((ROOT / "scripts/bench/release-smoke-v5.json").read_text())
-    variants = json.loads((ROOT / "scripts/lib/attention-variants.json").read_text())
     names, ports, cards = set(), set(), set()
-    comparisons = {}
     for entry in smoke["entries"]:
         name = entry["name"]
         assert name not in names
@@ -552,15 +550,7 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
             assert host == values[f"SPARK_{rank}_HOST"] == f"REPLACE-ME-spark-{rank}"
         assert "nvfp4" not in name and "nospec" not in name and "reference" not in name
         assert entry.get("baseline", True), "All cards retain baseline quick quality"
-        if name.endswith(("-hqa", "-fp8-compact")):
-            assert entry["family"] in variants
-            assert values["MODEL_ID"].endswith("-HQA"), "Comparison modes require the dual-view HQA checkpoint"
-            assert len(entry["gpus"]) == 2
-            assert values["ATTENTION_MODE"] in ("hqa", "fp8-compact")
-            comparisons.setdefault(entry["family"], set()).add(values["ATTENTION_MODE"])
-            continue
-        assert "ATTENTION_MODE" not in values, "Regular cards use the checkpoint's default attention"
-        assert not values["MODEL_ID"].endswith("-HQA")
+        assert "CORE_VIEW" not in values, "Release cards use the checkpoint's default core"
         column = "5090" if name.endswith("-5090") else f"{len(entry['gpus'])}rtx"
         identity = (entry["family"], values["MODEL_ID"], column)
         assert identity not in cards
@@ -577,9 +567,6 @@ def test_v5_smoke_card_inventory_and_attention_comparison() -> None:
     assert len(cards) == 39
     assert len({(family, model) for family, model, _ in cards}) == 20
     assert sum(column == "5090" for _, _, column in cards) == 7
-    assert set(comparisons) == set(variants)
-    for family, modes in comparisons.items():
-        assert modes == ({"hqa"} if family == "mistral_large4" else {"hqa", "fp8-compact"})
     assert not names.intersection(entry["name"] for entry in smoke["retired"])
 
 

@@ -10,7 +10,7 @@ pub struct GlmfRepresentation {
     pub output_shard: bool,
 }
 impl Default for GlmfRepresentation {
-    fn default() -> Self { Self { kda_fp8: true, head: GlmfHeadFormat::Auto, output_shard: true } }
+    fn default() -> Self { Self { kda_fp8: false, head: GlmfHeadFormat::Auto, output_shard: false } }
 }
 
 /// The one resident form of the vocabulary head `lm_head.weight` [vocab, hidden] that target
@@ -44,11 +44,11 @@ impl std::str::FromStr for GlmfHeadFormat {
 }
 
 impl GlmfHeadFormat {
-    /// Native heads ignore conversion; BF16 auto uses packed on TP1 and FP8 on TP2.
-    pub fn resolve(self, native_head: bool, ranks: usize) -> Self {
+    /// Auto preserves the checkpoint head; conversions require an explicit choice.
+    pub fn resolve(self, native_head: bool, _ranks: usize) -> Self {
         if native_head { Self::Bf16 }
         else if self == Self::Auto {
-            if ranks == 1 { Self::Packed } else { Self::Fp8 }
+            Self::Bf16
         } else { self }
     }
 
@@ -247,7 +247,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             }
             let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
             let gate = format!("{mlp}.gate_proj.weight");
-            if core.get_weight(&gate).is_some() {
+            if core.staged(gate.strip_suffix(".weight").unwrap()) {
                 bytes += native[rank].iter().filter(|(name, _)| name.starts_with("mlp."))
                     .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
             } else if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
@@ -309,8 +309,8 @@ mod tests {
         let single = resident_weights(&checkpoint, &cfg, 0, 1, Default::default()).unwrap();
         let split = resident_weights(&checkpoint, &cfg, 0, 2, Default::default()).unwrap();
         assert_eq!(single[0].embedding, 524_288);
-        assert_eq!(single[0].weights, 403_968); // norm BF16 + packed head.
-        assert_eq!(split[0].weights, 278_528); // auto head split retains FP8.
+        assert_eq!(single[0].weights, 532_480); // BF16 norm and source head.
+        assert_eq!(split[0].weights, 532_480); // Same source precision on TP2.
         assert_eq!((split[1].embedding, split[1].weights), (0, 0));
         assert!(resident_weights(&checkpoint, &cfg, 2, 1, Default::default()).unwrap_err().contains("resident operand missing"));
         // Each head form charges its own allocation and nothing else; the exact 12-bit one is
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!("auto".parse::<GlmfHeadFormat>(), Ok(GlmfHeadFormat::Auto));
         assert_eq!(GlmfHeadFormat::default(), GlmfHeadFormat::Auto);
         assert_eq!(GlmfRepresentation::default().head, GlmfHeadFormat::Auto);
-        for (native, ranks, resolved) in [(false, 1, Packed), (false, 2, Fp8), (true, 1, Bf16), (true, 2, Bf16)] {
+        for (native, ranks, resolved) in [(false, 1, Bf16), (false, 2, Bf16), (true, 1, Bf16), (true, 2, Bf16)] {
             assert_eq!(GlmfHeadFormat::Auto.resolve(native, ranks), resolved);
         }
         let (vocab, hidden) = (154_880, 4096);
@@ -464,15 +464,16 @@ mod tests {
             let Some(path) = resolved.snapshot_path else { continue };
             let checkpoint = Checkpoint::open(&path).unwrap();
             let cfg = GlmNextConfig::from_hf(&checkpoint.config).unwrap();
+            // Original retains all BF16 KDA projections and the BF16 shared head.
             let single = resident_weights(&checkpoint, &cfg, cfg.layers, 1, Default::default()).unwrap();
             assert_eq!((single[0].embedding, single[0].weights),
-                (1_268_776_960, 8_956_184_320 - 654_213_120 + 956_074_752), "{model}");
+                (1_268_776_960, 14_034_716_416), "{model}");
             let packed = GlmfRepresentation { head: GlmfHeadFormat::Packed, ..Default::default() };
             let packed = resident_weights(&checkpoint, &cfg, cfg.layers, 1, packed).unwrap();
-            assert_eq!(packed[0].weights, 8_956_184_320 - 654_213_120 + 956_074_752, "{model}");
+            assert_eq!(packed[0].weights, 14_034_716_416 - 1_268_776_960 + 956_074_752, "{model}");
             let split = resident_weights(&checkpoint, &cfg, cfg.layers, 2, Default::default()).unwrap();
             assert_eq!((split[0].weights, split[1].weights),
-                (5_660_947_200, 4_907_587_072 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
+                (7_936_512_768, 6_568_588_800 + router_replica_bytes(&checkpoint, &cfg, cfg.layers).unwrap()), "{model}");
             assert_eq!(split[1].embedding, 0);
         }
     }

@@ -30,9 +30,15 @@ its roughly 1.81M-token pool and onboards none. These are planner results,
 not hardware qualification. Start from the published-revision-pinned
 `examples/configs/step5-exl3-k6core-{min,max}.config`.
 
-## Attention and core views
+## Core selection
 
-The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
+Plain Step-5 checkpoints use `CORE_VIEW=original`. A compact selector requires
+an explicit [MC manifest](../mc-checkpoints.md), with complete K8/K6 core views
+rather than alternate attention-only files. `fp8-compact` retains the existing
+native BF16 O-projection conversion scope, including private MTP outputs:
+row-major E4M3 weights, F32 block-128 scales and BF16 activations (W8A16).
+TP2 SWA outputs retain F32 partials and narrow once after rank-ordered reduction.
+Whole-core FP8 expansion is separate from this conversion path.
 
 ## Native MTP
 

@@ -15,9 +15,9 @@ struct TowerBundleMismatch(String);
 
 /// Snapshot tower loaders are valid only while both bundles select identical towers.
 fn validate_shared_towers(view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Result<()> {
-    use cuteafd_loader::plan::{Checkpoint, checkpoint::{AttentionMode, CheckpointView}};
+    use cuteafd_loader::plan::{Checkpoint, checkpoint::{CoreView, CheckpointView}};
     let selected = Checkpoint::inventory_view(view)?;
-    let default = Checkpoint::inventory_view(&CheckpointView::select(view.snapshot(), AttentionMode::Hqa)?)?;
+    let default = Checkpoint::inventory_view(&CheckpointView::select(view.snapshot(), CoreView::Original)?)?;
     let towers = |checkpoint: &Checkpoint| checkpoint.weight_map.iter().filter(|(name, _)|
         cuteafd_loader::media::muse_vision::is_tensor(name) || name.starts_with("model.audio_tower."))
         .map(|(name, shard)| (name.clone(), shard.clone())).collect::<std::collections::BTreeMap<_, _>>();
@@ -452,63 +452,16 @@ impl Ready {
 mod tests {
     use super::*;
 
-    fn bundle_fixture(root: &Path, compact_config: &serde_json::Value, compact_map: &serde_json::Value) -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT};
-        std::fs::write(root.join(COMPACT_CONFIG), compact_config.to_string())?;
-        std::fs::write(root.join(COMPACT_INDEX), serde_json::json!({"weight_map": compact_map}).to_string())?;
-        std::fs::write(root.join(COMPACT_QUANT), "{}")?;
-        Ok(())
-    }
-
     #[test]
-    fn selected_towers_require_identical_default_names_shards_and_configuration() -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
+    fn media_binding_uses_immutable_selected_config() -> Result<()> {
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let dir = tempfile::tempdir()?;
-        let config = serde_json::json!({"model_type":"muse_spark", "vision_config":{"depth":50},
-            "audio_config":{"depth":4}, "text_config":{"hidden_size":8192,"rms_norm_eps":1e-6}});
-        let map = serde_json::json!({"model.vision_tower.test.weight":"vision.safetensors",
-            "model.vision_adapter.test.weight":"vision.safetensors",
-            "model.vision_projection.weight":"vision.safetensors",
-            "model.audio_tower.test.weight":"audio.safetensors"});
-        std::fs::write(dir.path().join("config.json"), config.to_string())?;
-        std::fs::write(dir.path().join("model.safetensors.index.json"),
-            serde_json::json!({"weight_map":map}).to_string())?;
-        bundle_fixture(dir.path(), &config, &map)?;
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact, AttentionMode::Compact] {
-            validate_shared_towers(&CheckpointView::select(dir.path(), mode)?)?;
-        }
-        for name in map.as_object().unwrap().keys() {
-            for remove in [false, true] {
-                let mut changed = map.clone();
-                if remove { changed.as_object_mut().unwrap().remove(name); }
-                else { changed[name] = "alternate.safetensors".into(); }
-                bundle_fixture(dir.path(), &config, &changed)?;
-                let error = validate_shared_towers(&CheckpointView::select(dir.path(), AttentionMode::Compact)?)
-                    .unwrap_err();
-                assert!(error.is::<TowerBundleMismatch>(), "{error:#}");
-            }
-        }
-        let mut changed = config.clone();
-        changed["text_config"]["rms_norm_eps"] = 1e-5.into();
-        bundle_fixture(dir.path(), &changed, &map)?;
-        let error = validate_shared_towers(&CheckpointView::select(dir.path(), AttentionMode::Compact)?)
-            .unwrap_err();
-        assert!(error.is::<TowerBundleMismatch>(), "{error:#}");
-        Ok(())
-    }
-
-    #[test]
-    fn media_binding_uses_selected_config_not_default_config() -> Result<()> {
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
-        let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("config.json"),
-            serde_json::json!({"vision_config":{},"image_token_id":7}).to_string())?;
+        std::fs::write(dir.path().join("config.json"), "{}")?;
         std::fs::write(dir.path().join("tokenizer_config.json"), "{}")?;
-        bundle_fixture(dir.path(), &serde_json::json!({}), &serde_json::json!({}))?;
-        let view = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
+        let view = CheckpointView::select(dir.path(), CoreView::Original)?;
+        std::fs::write(dir.path().join("config.json"), "invalid unselected bytes")?;
         let binding = Binding::from_view(&view, 100)?;
-        assert!(binding.markers.is_empty());
-        assert!(binding.video.is_none());
+        assert!(binding.markers.is_empty() && binding.video.is_none());
         Ok(())
     }
 
@@ -526,7 +479,7 @@ mod tests {
         let full = Checkpoint::open(dir.path())?;
         let expected = MediaOptions::from_checkpoint(&full, MediaMode::Auto, MediaMode::Auto, 2)?;
         let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(dir.path(),
-            cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+            cuteafd_loader::plan::checkpoint::CoreView::Original)?;
         let actual = inventory(&view, MediaMode::Auto, MediaMode::Auto, 2)?;
         assert_eq!(actual.vision_bytes, expected.vision_bytes);
         assert_eq!(actual.audio_bytes, expected.audio_bytes);

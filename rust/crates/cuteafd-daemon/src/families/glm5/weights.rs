@@ -960,9 +960,9 @@ impl<'a> GlmLoader<'a> {
                         else { anyhow::bail!("native attention load selected compressed source"); };
                     let receipt = cuteafd_loader::placement::families::glm5::weights::native_attention_mount(
                         &layout, [shape[0], shape[1]],
-                        checkpoint.attention_mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact)?;
+                        checkpoint.core_view() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact)?;
                     let records = attention_records(self.catalog.snapshot(), &selected,
-                        checkpoint.attention_mode(), &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
+                        checkpoint.core_view(), &layout, crate::shared::fp8_linear::Fp8Scales::Amax,
                         values.buffer, scales.as_ref().map(|s| s.buffer))?;
                     let mount = crate::shared::experts::rtx::dense::DenseLoad::mount(self.library);
                     mount.admit_mount(receipt)?;

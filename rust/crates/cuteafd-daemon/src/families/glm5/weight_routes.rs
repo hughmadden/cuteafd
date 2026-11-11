@@ -440,10 +440,10 @@ pub(super) fn layer_routes(
     }
     let dense = layer < cfg.first_moe_layer;
     let gate = cfg.stem(layer, Op::Gate).context("FFN gate")?;
-    if (dense || !native_shared) && core.get_weight(&gate).is_none() {
+    if (dense || !native_shared) && core.get_weight(&gate).is_none() && !core.native.contains_key(&gate) {
         let names = vec![r.weight(Op::Gate)?, r.weight(Op::Up)?];
         let down = vec![r.weight(Op::Down)?];
-        let bf16 = !dense && r.native_bf16(&[names.clone(), down.clone()].concat(), native_bf16)?;
+        let bf16 = r.native_bf16(&[names.clone(), down.clone()].concat(), native_bf16)?;
         r.push(
             false,
             "w_gate_up",

@@ -625,7 +625,7 @@ impl FamilyModel for Model {
 pub fn spark_world_admitted(snapshot: &std::path::Path, programs: &std::path::Path, ranks: usize)
     -> anyhow::Result<()> {
     let view = crate::plan::checkpoint::CheckpointView::select(snapshot,
-        crate::plan::checkpoint::AttentionMode::Hqa)?;
+        crate::plan::checkpoint::CoreView::Original)?;
     spark_world_admitted_view(&view, programs, ranks)
 }
 

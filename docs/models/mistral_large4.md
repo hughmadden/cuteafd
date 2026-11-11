@@ -15,9 +15,14 @@ lossless speculation have passed on hardware. On two GPUs, `auto` selects
 `context` after correctness and interleaved throughput qualification;
 explicit `layers` remains available.
 
-## Attention and core views
+## Original mixed-precision core
 
-The `-HQA` checkpoints are withdrawn from Hugging Face. Because Mistral Large 4's original dense core is already FP8, its replacement is `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4`: K4 experts with the original core restored, no quantized core. Until those publish, serve the Core-K6 checkpoint above.
+`wrldsuksgo2mars/Mistral-Large-4-EXL3-K4` is a plain checkpoint, not MC.
+Its complete original mixed-precision core is restored, including native E4M3
+`wq`/`wo` and F32 block-128 `qscale_weight`; routed experts remain EXL3 K4.
+Only `CORE_VIEW=original` is accepted. Compact trellis views and load-time FP8
+conversion refuse: an FP8-origin core is not requantized.
+TP2 output reductions retain F32 partials, add ranks in order and narrow once.
 
 ## How it runs
 

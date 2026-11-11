@@ -45,9 +45,11 @@ Decode and agentic-session workloads are unchanged.
   and Muse Spark (vision and PCM audio, both DFlash2 drafters). Step-5 EXL3
   gets a native K6 core, GLM 5.3 Flash EXLR8 runs natively, and Kimi K3 adds a
   single-RTX card (1× RTX + 6 Sparks).
-- **High-quality attention (HQA) checkpoints:** shipped with v5.0.0 and since
-  withdrawn from Hugging Face. Multi-core (MC) checkpoints with a selectable
-  original, K8 or K6 dense core are replacing them.
+- **Multi-core checkpoints:** MC repositories contain the original BF16 core
+  and complete K8/K6 trellis core views over shared EXL3 experts. `CORE_VIEW`
+  selects `original` (default), `k8-compact`, `k6-compact` or runtime-derived
+  `fp8-compact`; memory admission follows the selected view. See
+  [the MC contract](docs/mc-checkpoints.md) for availability and conversion scope.
 - **Decode CUDA graphs in every family,** in one bounded cache per GPU that
   pre-captures the most-replayed shapes at startup. A capture that runs out of
   memory falls back to eager instead of failing.

@@ -17,9 +17,17 @@ Set `TP2_DFLASH=off` to keep the draft on GPU1; direct CLI users can pass
 Starting config (replace the REPLACE-ME Spark hosts and the 192.0.2.x RoCE
 addresses): [max](../../examples/configs/kimi-k3-exl3-k6-max.config).
 
-## Attention and core views
+## Core views
 
-The `-HQA` checkpoints are withdrawn from Hugging Face. They're being replaced by multi-core (MC) checkpoints that bundle the original dense core with selectable K8 and K6 cores. Until those publish, serve the Core-K6 checkpoint above.
+`wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC` uses the [MC contract](../mc-checkpoints.md).
+`CORE_VIEW=original` retains the complete source-native BF16 core, not a mixture
+of native attention outputs and trellis inputs. `k8-compact` and `k6-compact`
+select complete trellis cores. Direct CLI uses `--core-view VALUE`.
+The selected metadata, memory ownership, worker identity and graph prewarm key
+remain fixed for the model lifetime. Untraced views use unpinned bootstrap
+shapes, never another view's measured graph inventory.
+
+`fp8-compact` refuses for this MC original; whole-core FP8 is pending.
 
 ## Release card
 

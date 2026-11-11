@@ -6,12 +6,12 @@ use cuteafd_loader::{media::{ImageFamily, ProcessorConfig, SpanExpander}, plan::
 use std::sync::Arc;
 use cuteafd_loader::plan::checkpoint::CheckpointView;
 #[cfg(test)]
-use cuteafd_loader::plan::checkpoint::AttentionMode;
+use cuteafd_loader::plan::checkpoint::CoreView;
 
 pub(super) fn vision_config(mode: MediaMode, snapshot: &std::path::Path) -> Result<Option<serde_json::Value>> {
     if mode == MediaMode::Off { return Ok(None); }
     let view = cuteafd_loader::plan::checkpoint::CheckpointView::select(snapshot,
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa)?;
+        cuteafd_loader::plan::checkpoint::CoreView::Original)?;
     vision_config_view(mode, &view)
 }
 
@@ -529,17 +529,16 @@ mod tests {
     }
     #[test]
     fn snapshot_identity_binds_selected_metadata_and_live_media_files() {
-        const COMPACT_CONFIG: &str = "config.compact-attention.json";
-        const COMPACT_INDEX: &str = "model.compact-attention.safetensors.index.json";
-        const COMPACT_QUANT: &str = "quantize_config.compact-attention.json";
+        const COMPACT_CONFIG: &str = "config.k6.json";
+        const COMPACT_INDEX: &str = "model.k6.safetensors.index.json";
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join(COMPACT_CONFIG), "{}").unwrap();
-        std::fs::write(root.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#).unwrap();
-        std::fs::write(root.path().join(COMPACT_QUANT), "{}").unwrap();
+        cuteafd_loader::plan::testing::write_mc_snapshot(root.path(),
+            &cuteafd_loader::plan::testing::glm5_flash_config(2), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128, 128])]));
         for file in ["tokenizer.json", "processor_config.json"] {
             std::fs::write(root.path().join(file), file).unwrap();
         }
-        let view = CheckpointView::select(root.path(), AttentionMode::Compact).unwrap();
+        let view = CheckpointView::select(root.path(), CoreView::K6Compact).unwrap();
         let before = snapshot_identity(&view).unwrap();
         assert_eq!(before["config_sha256"], view.metadata_sha256(COMPACT_CONFIG).unwrap());
         std::fs::remove_file(root.path().join(COMPACT_CONFIG)).unwrap();
@@ -554,7 +553,7 @@ mod tests {
     fn ordinary_and_generation_requests_never_consult_feature_files() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("config.json"), "{}").unwrap();
-        let view = CheckpointView::select(root.path(), AttentionMode::Hqa).unwrap();
+        let view = CheckpointView::select(root.path(), CoreView::Original).unwrap();
         std::fs::remove_file(root.path().join("config.json")).unwrap();
         let (mut prompt, mut media, _) = feature_request(); prompt.job.probe = None;
         let mut cache = cuteafd_engine::media::EmbeddingCache::new(16);

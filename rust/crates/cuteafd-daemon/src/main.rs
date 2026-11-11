@@ -67,7 +67,7 @@ fn serve_media(command: &mut Commands) -> Option<ServeMedia<'_>> {
 }
 
 /// Every qualified serve/golden entry stores the bundle before media or engine setup.
-fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut cli::AttentionArgs)> {
+fn command_attention(command: &mut Commands) -> Option<(&std::path::Path, &mut cli::CoreViewArgs)> {
     match command {
         Commands::ServeGlmf(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
         Commands::GlmfGolden(args) => Some((&args.engine.snapshot, &mut args.engine.attention)),
@@ -206,71 +206,12 @@ mod media_defaults_tests {
     }
 
     #[test]
-    fn attention_qualification_is_per_checkpoint_variant() -> anyhow::Result<()> {
-        use cuteafd_loader::plan::checkpoint::{AttentionMode, CheckpointView};
-        let root = tempfile::tempdir()?;
-        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
-        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
-        let fixtures = [
-            ("glm5_flash", serde_json::json!({"model_type":"glm5_next",
-                "architectures":["Glm5NextForConditionalGeneration"]})),
-            ("glm5", serde_json::json!({"model_type":"glm_moe_dsa",
-                "architectures":["GlmMoeDsaForCausalLM"]})),
-            ("mistral_large4", serde_json::json!({"model_type":"mistral_large4",
-                "architectures":["MistralLarge4ForConditionalGeneration"],
-                "text_config":{"model_type":"mistral_large4_text"}})),
-            ("kimi_k3", serde_json::json!({"model_type":"kimi_k3",
-                "architectures":["KimiK3ForConditionalGeneration"],
-                "text_config":{"model_type":"kimi_linear"}})),
-            ("step5", serde_json::json!({"model_type":"step5_vl",
-                "architectures":["Step5ForConditionalGeneration"],"text_config":{"model_type":"step5"}})),
-            ("muse_spark", serde_json::json!({"model_type":"muse_spark",
-                "architectures":["MuseSparkForConditionalGeneration"],
-                "text_config":{"model_type":"muse_spark_text"}})),
-            ("unknown", serde_json::json!({"model_type":"unknown", "text_config":{"model_type":"glm5_next"}})),
-        ];
-        let variants: std::collections::BTreeMap<String, bool> = serde_json::from_str(
-            include_str!("../../../../scripts/lib/attention-variants.json"))?;
-        for (expected, mut config) in fixtures {
-            config["transformers_weights"] = serde_json::json!("model.compact-attention.safetensors.index.json");
-            std::fs::write(root.path().join("config.compact-attention.json"), config.to_string())?;
-            let view = CheckpointView::select(root.path(), AttentionMode::Compact)?;
-            let checkpoint = cuteafd_loader::plan::Checkpoint::inventory_view(&view)?;
-            let family = cuteafd_loader::plan::family::detect(&checkpoint).map(|family| family.id()).unwrap_or("unknown");
-            assert_eq!(family, expected);
-            let attention = super::cli::AttentionArgs { compact_attention: true, ..Default::default() };
-            let result = attention.validate_view(&view);
-            assert_eq!(result.is_ok(), variants.get(expected).copied().unwrap_or(false), "{expected}");
-            if let Err(error) = result {
-                assert!(error.to_string().contains(&format!("family={expected}")), "{error}");
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn compact_consumers_require_and_reuse_selected_view() -> anyhow::Result<()> {
+    fn core_views_have_explicit_cli_and_no_old_flags() -> anyhow::Result<()> {
         use clap::Parser;
-        let root = tempfile::tempdir()?;
-        std::fs::write(root.path().join("config.compact-attention.json"),
-            r#"{"model_type":"glm5_next","architectures":["Glm5NextForConditionalGeneration"],"transformers_weights":"model.compact-attention.safetensors.index.json","vision_config":{},"max_position_embeddings":65536}"#)?;
-        std::fs::write(root.path().join("model.compact-attention.safetensors.index.json"), r#"{"weight_map":{}}"#)?;
-        std::fs::write(root.path().join("quantize_config.compact-attention.json"), "{}")?;
-        let mut command = super::cli::Cli::try_parse_from(["cuteafd", "serve-glmf", "--snapshot",
-            root.path().to_str().unwrap(), "--native-lib", "/native.so", "--compact-attention"])?.command;
-        assert!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto).is_err());
-        let super::Commands::ServeGlmf(args) = &mut command else { unreachable!() };
-        let view = args.engine.attention.select(root.path())?;
-        let fingerprint = view.fingerprint().to_owned();
-        args.engine.attention.selected_view = Some(view.clone());
-        std::fs::remove_file(root.path().join("config.compact-attention.json"))?;
-        assert_eq!(super::resolve_serve_media(&mut command, MediaMode::Auto, MediaMode::Auto)?,
-            (MediaMode::Auto, MediaMode::Off));
-        let manifest = root.path().join("programs.json");
-        std::fs::write(&manifest, r#"{"capacities":{"max_context":131072}}"#)?;
-        assert_eq!(super::shared::context::checkpoint_context_config(&view.config()?, &manifest,
-            "glm5_flash", 0)?, 65536);
-        assert_eq!(view.fingerprint(), fingerprint);
+        for view in ["original", "k6-compact", "k8-compact", "fp8-compact"] {
+            super::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--core-view", view])?;
+        }
+        assert!(super::cli::Cli::try_parse_from(["cuteafd", "plan", "/not-read", "--core-view", "compact"]).is_err());
         Ok(())
     }
 

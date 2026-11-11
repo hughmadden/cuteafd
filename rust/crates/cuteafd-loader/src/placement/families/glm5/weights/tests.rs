@@ -142,77 +142,23 @@ fn core_checkpoint(vocab: usize, core_head: bool) -> (serde_json::Value, Vec<Ten
     (config, tensors)
 }
 
+
 #[test]
-fn selected_modes_own_distinct_native_residency_and_compact_needs_no_native_shard() -> Result<()> {
-    use crate::plan::checkpoint::{AttentionMode, CheckpointView};
-    let (config, compact) = core_checkpoint(256, true);
-    let cfg = GlmDsaConfig::from_hf(&config)?;
-    let native_stems = (0..cfg.layers).flat_map(|layer| [Op::QB, Op::O]
-        .map(|op| cfg.stem(layer, op).unwrap())).collect::<std::collections::BTreeSet<_>>();
-    let dir = tempfile::tempdir()?;
-    write_snapshot(dir.path(), &config, &compact, None);
-    let mut compact_config = config.clone();
-    compact_config["transformers_weights"] = serde_json::json!("model.compact-attention.safetensors.index.json");
-    std::fs::write(dir.path().join("config.compact-attention.json"), serde_json::to_vec(&compact_config)?)?;
-    std::fs::copy(dir.path().join("model.safetensors.index.json"),
-        dir.path().join("model.compact-attention.safetensors.index.json"))?;
-    std::fs::write(dir.path().join("quantize_config.compact-attention.json"), "{}")?;
-    let mut selected = compact.iter().filter(|(name, _, _)|
-        !native_stems.iter().any(|stem| name.starts_with(&format!("{stem}."))))
-        .map(|(name, _, _)| (name.clone(), serde_json::json!("model-00001-of-00001.safetensors")))
-        .collect::<serde_json::Map<_, _>>();
-    let native = native_stems.iter().map(|stem| {
-        let shape = crate::families::glm5::core::expected(&cfg).remove(&format!("{stem}.weight")).unwrap();
-        t(format!("{stem}.weight"), "BF16", &shape)
-    }).collect::<Vec<_>>();
-    testing::write_safetensors(&dir.path().join("native.safetensors"), &native);
-    selected.extend(native.iter().map(|(name, _, _)| (name.clone(), serde_json::json!("native.safetensors"))));
-    std::fs::write(dir.path().join("model.safetensors.index.json"),
-        serde_json::to_vec(&serde_json::json!({"weight_map": selected}))?)?;
-    let mut identities = std::collections::BTreeSet::new();
-    for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact, AttentionMode::Compact] {
-        let view = CheckpointView::select(dir.path(), mode).with_context(|| format!("select {mode:?}"))?;
-        assert!(identities.insert(view.fingerprint().to_owned()));
-        let checkpoint = Checkpoint::open_view(&view).with_context(|| format!("open {mode:?}"))?;
-        let inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
-            false, false, EmbeddingHome::Device(0)).with_context(|| format!("inventory {mode:?}"))?;
+fn bf16_target_keeps_attention_indexer_dense_and_shared_owners_native() -> Result<()> {
+    let (config, tensors) = testing::glm5_compact_weights();
+    let tensors = tensors.into_iter().filter(|tensor| !tensor.0.ends_with("_scale_inv"))
+        .map(|(name, dtype, shape)| (name, if dtype == "F8_E4M3" { "BF16" } else { dtype }, shape))
+        .collect::<Vec<_>>();
+    for ranks in [1, 2] {
+        let inventory = ordinary(&config, &tensors, ranks, None, true, EmbeddingHome::Device(0));
+        assert!(inventory.owners.iter().all(|owner| !owner.format.contains("fp8")));
+        for group in ["attention", "indexer", "dense", "shared_expert"] {
+            assert!(inventory.owners.iter().any(|owner| owner.group == group && owner.format == "bf16"), "{group}");
+        }
         check_arenas(&inventory)?;
-        if mode != AttentionMode::Compact {
-            assert_eq!(crate::plan::layout::glm5::resident_owned(&checkpoint, 2, cfg.layers, None)?,
-                inventory.resident_groups()?, "{mode:?} display must use Recipe weight owners");
-        }
-        let native_owners = inventory.owners.iter().filter(|owner| owner.allocation.id.contains(".native."))
-            .collect::<Vec<_>>();
-        if mode == AttentionMode::Compact {
-            assert!(native_owners.is_empty());
-            assert_eq!(inventory.attention_mount, Default::default());
-        } else {
-            let fp8 = mode == AttentionMode::Fp8Compact;
-            assert_eq!(native_owners.len(), cfg.layers * 2 * 2 * if fp8 { 2 } else { 1 });
-            for rank in 0..2 {
-                for layer in 0..cfg.layers {
-                    for key in ["q_b", "o"] {
-                        assert_eq!(bytes(&inventory, &format!("gpu.{rank}.layer.{layer}.native.{key}.values")),
-                            128 * 256 * if fp8 { 1 } else { 2 });
-                        if fp8 { assert_eq!(bytes(&inventory,
-                            &format!("gpu.{rank}.layer.{layer}.native.{key}.scales")), 256); }
-                    }
-                }
-            }
-            assert!(inventory.attention_mount.pinned_source > 0);
-            assert_eq!(inventory.attention_mount.pinned_tables > 0, fp8);
-            for owner in inventory.attention_mount.allocations("glm.load.native_attention") {
-                assert_eq!(owner.lifetime, Lifetime { first: Phase::Load, last: Phase::Load });
-            }
-        }
+        let explicit = ordinary(&config, &tensors, ranks, None, false, EmbeddingHome::Device(0));
+        assert!(explicit.owners.iter().any(|owner| owner.group == "dense" && owner.format.contains("fp8")));
     }
-    std::fs::remove_file(dir.path().join("native.safetensors"))?;
-    std::fs::remove_file(dir.path().join("config.json"))?;
-    let compact = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
-    let checkpoint = Checkpoint::open_view(&compact)?;
-    let inventory = WeightInventory::from_checkpoint(&checkpoint, 2, cfg.layers, None,
-        false, false, EmbeddingHome::Device(0))?;
-    assert!(!inventory.owners.iter().any(|owner| owner.allocation.id.contains(".native.")));
     Ok(())
 }
 

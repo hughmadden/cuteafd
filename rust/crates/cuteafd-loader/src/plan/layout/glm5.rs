@@ -78,7 +78,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let core = (|| -> anyhow::Result<_> {
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
-        if core.projections.is_empty() { return Ok(None); }
+        if core.projections.is_empty() && core.native.is_empty() { return Ok(None); }
         let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
         let (_, draft_rows) = drafter_admission(options, checkpoint)?;
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
@@ -493,7 +493,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         let mut selected = m.clone();
         let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: cfg.program_family(),
             split_family: if devices.len() == 2 { cfg.split_program_family() } else { None } };
-        cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
+        cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, attention_plan,
             |name| family.contains(name))?;
         Ok(selected)
     }).transpose()?;
@@ -643,7 +643,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
-    cuteafd_core::coordinator_programs::select_attention_plans(&mut manifest, plan,
+    cuteafd_core::coordinator_programs::select_core_view_plans(&mut manifest, plan,
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
     let owners = (attention == crate::placement::AttentionPlacement::Layers)

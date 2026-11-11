@@ -373,6 +373,7 @@ pub fn draft_head_demand(core: &CoreInventory, rows: usize, metadata: &serde_jso
 
 #[derive(Debug, Default, Clone)]
 pub struct CoreInventory {
+    pub selected_core_view: Option<crate::plan::checkpoint::CoreView>,
     pub projections: BTreeMap<String, CoreProjection>,
     pub native: BTreeMap<String, crate::formats::native_attention::NativeProjection>,
     pub largest_selected_dense_bytes: Option<u64>,
@@ -408,13 +409,17 @@ impl CoreInventory {
                 "{stem}: Kimi native attention requires BF16 {shape:?}, found {dtype:?} {actual:?}");
             native.insert(stem.into(), crate::formats::native_attention::NativeProjection {
                 shape: [shape[0], shape[1]], split: split(stem).unwrap(),
-                fp8: checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
+                fp8: checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact });
         }
-        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.tensors.iter()
-            .filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
-                && !tensor.meta.name.contains(".experts."))
-            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0));
-        let inventory = Self { projections, native, largest_selected_dense_bytes };
+        ensure!(checkpoint.core_view() != crate::plan::checkpoint::CoreView::Fp8Compact
+            || !native.is_empty(),
+            "CORE_VIEW=fp8-compact has no supported conversion scope for this all-native core; use original until the native projection path supports conversion");
+        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.weight_map.keys()
+            .filter(|name| !name.contains(".experts."))
+            .filter_map(|name| checkpoint.header(name))
+            .map(|tensor| tensor.byte_length).max().unwrap_or(0));
+        let selected_core_view = checkpoint.view.as_ref().filter(|v| v.is_mc() || v.mode() == crate::plan::checkpoint::CoreView::Fp8Compact).map(|v| v.mode());
+        let inventory = Self { selected_core_view, projections, native, largest_selected_dense_bytes };
         inventory.validate_runtime_groups(cfg)?;
         Ok(inventory)
     }
@@ -586,224 +591,6 @@ mod tests {
             } else {
                 error.contains("only whole-group fallback") && error.contains(&stem) && error.contains("BF16:")
             }, "{error}");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn hqa_attention_inventory_and_mode_charges_follow_selected_projections() -> Result<()> {
-        use crate::plan::{checkpoint::{AttentionMode, CheckpointView}, testing};
-        use crate::placement::{LayerMode, FfnMode};
-        let dir = tempfile::tempdir()?;
-        testing::write_kimi_core_snapshot(dir.path(), false);
-        let compact_checkpoint = Checkpoint::open(dir.path())?;
-        let compact_cfg = KimiK3Config::from_hf(&compact_checkpoint.config)?;
-        let compact_core = crate::plan::families::kimi::core_inventory(&compact_checkpoint)?;
-        let compact_layouts = (0..compact_cfg.layers).map(|layer|
-            super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &compact_core))
-            .collect::<Result<Vec<_>>>()?;
-        let mut policies = BTreeMap::new();
-        for projection in compact_core.projections.values() {
-            for world in [1, 2] {
-                let (mut n, mut k) = (projection.stored_outputs, projection.shape[1]);
-                let side = if world == 1 || projection.split != CoreSplit::Input { 1 } else { 2 };
-                if world == 2 && projection.split != CoreSplit::Whole {
-                    if side == 1 { n /= 2; } else { k /= 2; }
-                }
-                let book = projection.codebook.marker();
-                policies.insert((k, n, side, book), serde_json::json!({"input_features":k,
-                    "output_features":n,"sharded_side":side,"codebook":book}));
-            }
-        }
-        let mut names = std::collections::BTreeSet::new();
-        for capacity in [64, 4096] {
-            for prefix in ["kimik3_kda", "kda_fused_h96", "kda_core_h48", "kda_core_h96"] {
-                names.insert(format!("{prefix}_m{capacity}"));
-            }
-            for heads in [48, 96] {
-                let suffix = if heads == 48 { "" } else { "_h96" };
-                for prefix in ["kimik3_mla_producer", "kimik3_mla_output"] {
-                    names.insert(format!("{prefix}{suffix}_m{capacity}"));
-                }
-                for mode in ["decode", "verify", "extend"] {
-                    names.insert(format!("kimik3_dense_mla_{mode}{suffix}_m{capacity}"));
-                }
-                for stride in [576, 640] { for cache in ["", "_fp8"] {
-                    names.insert(format!("mla_rank_norm_h{heads}_kv{stride}{cache}_m{capacity}"));
-                } }
-            }
-        }
-        let compact_manifest = serde_json::json!({"families":{"dense_trellis_k6":{"abi_version":1,
-            "row_policies":policies.into_values().collect::<Vec<_>>()}},
-            "programs":names.into_iter().map(|name| serde_json::json!({"name":name,
-                "scratch_bytes_at_capacity":{"scratch":256}})).collect::<Vec<_>>()});
-        let compact_index = std::fs::read(dir.path().join("model.safetensors.index.json"))?;
-        std::fs::write(dir.path().join("quantize_config.json"), "{}")?;
-        for (source, target) in [("config.json", "config.compact-attention.json"),
-            ("model.safetensors.index.json", "model.compact-attention.safetensors.index.json"),
-            ("quantize_config.json", "quantize_config.compact-attention.json")] {
-            std::fs::copy(dir.path().join(source), dir.path().join(target))?;
-        }
-        let mut index: serde_json::Value = serde_json::from_slice(&compact_index)?;
-        let mut restored = Vec::new();
-        for (name, dtype, shape) in testing::kimi_k3_tensors(false) {
-            if !name.contains(".self_attn.") || !(name.ends_with(".o_proj.weight") || name.ends_with(".q_b_proj.weight")) {
-                continue;
-            }
-            let stem = name.strip_suffix(".weight").unwrap();
-            for suffix in ["trellis", "suh", "svh", "mcg"] {
-                index["weight_map"].as_object_mut().unwrap().remove(&format!("{stem}.{suffix}"));
-            }
-            index["weight_map"][&name] = serde_json::json!("hqa.safetensors");
-            restored.push((name, dtype, shape));
-        }
-        testing::write_safetensors(&dir.path().join("hqa.safetensors"), &restored);
-        std::fs::write(dir.path().join("model.safetensors.index.json"), serde_json::to_vec(&index)?)?;
-        let declaration = serde_json::json!({"schema":"cuteafd-attention-views-v1", "mode":"hqa",
-            "views":{"hqa":{"config":"config.json", "index":"model.safetensors.index.json", "quantize":"quantize_config.json"},
-                "compact-attention":{"config":"config.compact-attention.json",
-                    "index":"model.compact-attention.safetensors.index.json", "quantize":"quantize_config.compact-attention.json"}},
-            "native_modules":"quantize_config.json:native_attention"});
-        let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("config.json"))?)?;
-        config["quantization_config"]["attention_view"] = declaration.clone();
-        let declarations = restored.iter().map(|(name, dtype, shape)| (name.strip_suffix(".weight").unwrap().to_owned(),
-            serde_json::json!({"format":"bf16", "shard":"hqa.safetensors", "compact_attention_bits":6,
-                "tensors":{name:{"dtype":dtype,"shape":shape}}}))).collect::<serde_json::Map<_, _>>();
-        let quant = serde_json::json!({"attention_view":declaration, "native_attention":declarations});
-        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config)?)?;
-        std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&quant)?)?;
-        let expected = testing::kimi_k3_tensors(false).into_iter().map(|(n, _, s)| (n, s)).collect();
-        let mut charges = Vec::new();
-        for mode in [AttentionMode::Hqa, AttentionMode::Fp8Compact] {
-            let view = CheckpointView::select(dir.path(), mode)?;
-            let checkpoint = Checkpoint::open_view(&view)?;
-            let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
-            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint, &expected)?;
-            // Worker role selection opens the mixed core before ordinary headers
-            // load; declared native headers must coexist with K6 discovery.
-            let inventory = Checkpoint::inventory_view(&view)?;
-            let eager = CoreInventory::from_checkpoint(&cfg, &inventory, &expected)?;
-            assert!(!eager.projections.is_empty());
-            use crate::serving_capacity::kimi_prewarm::KimiCoreFormat;
-            assert_eq!(KimiCoreFormat::from_inventory(&core), KimiCoreFormat::K6,
-                "attention view retains the checkpoint's parent graph inventory key");
-            assert_eq!(KimiCoreFormat::from_inventory(&eager), KimiCoreFormat::K6);
-            assert_eq!(eager.projections.keys().collect::<Vec<_>>(), core.projections.keys().collect::<Vec<_>>());
-            assert_eq!(eager.native, core.native);
-            for role in [crate::plan::files::ReadRole::Coordinator { local_experts: false, speculator: false },
-                crate::plan::files::ReadRole::Spark { rank: 0, world: 6 }] {
-                let selected = crate::plan::files::required_tensors(&inventory, role)?;
-                let opened = crate::plan::files::open_role_view(&view, role)?;
-                assert_eq!(crate::plan::files::required_tensors(&opened, role)?, selected,
-                    "role-filtered checkpoint must remain classifiable for Spark admission");
-                assert!(!selected.is_empty());
-                if matches!(role, crate::plan::files::ReadRole::Spark { .. }) {
-                    assert_eq!(crate::plan::experts::checkpoint_spark_recipe(&opened, 6, &[1])?,
-                        crate::plan::experts::checkpoint_spark_recipe(&checkpoint, 6, &[1])?);
-                }
-                for (name, _, _) in &restored {
-                    assert!(inventory.has_header(name));
-                    assert_eq!(selected.contains(name), matches!(role,
-                        crate::plan::files::ReadRole::Coordinator { .. }));
-                    if selected.contains(name) {
-                        let stem = name.strip_suffix(".weight").unwrap();
-                        assert_eq!(inventory.projection(stem)?.storage, opened.projection(stem)?.storage);
-                    }
-                }
-            }
-            assert_eq!(core.native.len(), restored.len());
-            assert!(core.native.values().all(|p| p.fp8 == (mode == AttentionMode::Fp8Compact)));
-            let largest = checkpoint.tensors.iter().filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
-                && !tensor.meta.name.contains(".experts.")).map(|tensor| tensor.meta.byte_length).max().unwrap();
-            assert_eq!(core.largest_selected_dense_bytes, Some(largest));
-            for ranks in [1, 2] {
-                let envelope = crate::placement::families::kimi::selected_push_host_envelope(&cfg, &core, ranks)?;
-                assert_eq!(envelope.dense_bytes, vec![crate::push_load::admitted_push_envelope(largest, 128, 1 << 20)?; ranks]);
-                let mount = core.native_mount_load(ranks)?;
-                assert!(mount.pinned_source > 0);
-                assert_eq!(mount.pinned_tables > 0, mode == AttentionMode::Fp8Compact);
-                assert!(mount.allocations("kimi.test.native").iter().all(|owner|
-                    owner.lifetime == crate::placement::planner::Lifetime {
-                        first: crate::placement::planner::Phase::Load, last: crate::placement::planner::Phase::Load }));
-                assert_eq!(core.attention_receive_bytes(64, ranks)?, 64 * 7168 * if ranks == 2 { 4 } else { 2 });
-                assert_eq!(core.native_attention_stages(8192, ranks)?.values().sum::<usize>(),
-                    if ranks == 2 { 8192 * 7168 * 4 } else { 0 });
-            }
-            let mut bytes = 0;
-            for layer in 0..cfg.layers {
-                let pair = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer, LayerMode::HeadSplit, &core)?;
-                for layout in pair {
-                    for (name, native) in &layout.native {
-                        assert!(!layout.operands.contains_key(name) && !layout.core.contains_key(name));
-                        assert_eq!(native.ranks, 2);
-                        assert_eq!(native.shape, if *name == "mla.q_b" { [9216, 1536] } else { [7168, 6144] });
-                        bytes += native.bytes()?;
-                    }
-                }
-                if cfg.attention[layer] == super::super::config::KimiAttention::Mla {
-                    let whole = super::super::weight_layout::LayerLayout::pair_with_core(&cfg, layer,
-                        LayerMode::Whole { gpu: 1, ffn: FfnMode::Split }, &core)?;
-                    assert!(whole[0].native.is_empty());
-                    assert!(whole[1].native.values().all(|p| p.rank == 0 && p.ranks == 1));
-                }
-            }
-            charges.push(bytes);
-        }
-        assert!(charges[1] < charges[0]);
-        for mutation in 0..4 {
-            let mut bad_config = config.clone();
-            let mut bad_quant = quant.clone();
-            let mut bad_index = index.clone();
-            let stem = restored[0].0.strip_suffix(".weight").unwrap();
-            match mutation {
-                0 => bad_config["quantization_config"]["attention_view"]["mode"] = serde_json::json!("compact-attention"),
-                1 => { bad_quant.as_object_mut().unwrap().remove("native_attention"); }
-                2 => { bad_index["weight_map"].as_object_mut().unwrap().remove(&restored[0].0); }
-                _ => bad_index["weight_map"][format!("{stem}.trellis")] = serde_json::json!("parent.safetensors"),
-            }
-            for (name, value) in [("config.json", &bad_config), ("quantize_config.json", &bad_quant),
-                ("model.safetensors.index.json", &bad_index)] {
-                std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
-            }
-            assert!(CheckpointView::select(dir.path(), AttentionMode::Hqa).is_err(), "mixed bundle {mutation}");
-        }
-        for (name, value) in [("config.json", &config), ("quantize_config.json", &quant),
-            ("model.safetensors.index.json", &index)] {
-            std::fs::write(dir.path().join(name), serde_json::to_vec(value)?)?;
-        }
-        for name in ["config.compact-attention.json", "quantize_config.compact-attention.json",
-            "model.compact-attention.safetensors.index.json"] {
-            let bytes = std::fs::read(dir.path().join(name))?;
-            std::fs::remove_file(dir.path().join(name))?;
-            assert!(CheckpointView::select(dir.path(), AttentionMode::Compact).is_err(), "missing {name}");
-            std::fs::write(dir.path().join(name), bytes)?;
-        }
-        let compact_view = CheckpointView::select(dir.path(), AttentionMode::Compact)?;
-        std::fs::remove_file(dir.path().join("hqa.safetensors"))?;
-        let checkpoint = Checkpoint::open_view(&compact_view)?;
-        let core = CoreInventory::from_checkpoint(&compact_cfg, &checkpoint, &expected)?;
-        assert!(core.native.is_empty());
-        assert!(core.largest_selected_dense_bytes.is_none());
-        for ranks in [1, 2] {
-            assert_eq!(core.native_mount_load(ranks)?, crate::shared::dense_read::MountLoad::default());
-            assert!(crate::placement::families::kimi::native_load_owners(&core, ranks, 16384)?.is_empty());
-            assert_eq!(crate::placement::families::kimi::selected_push_host_envelope(&compact_cfg, &core, ranks)?,
-                crate::placement::families::kimi::push_host_envelope(&compact_cfg, ranks)?);
-            for (rows, unit) in [(64, 64), (8256, 2752)] {
-                let before = CoreCharges::from_package_for_ranks(&compact_cfg, &compact_core,
-                    rows, unit, &compact_manifest, ranks)?;
-                let after = CoreCharges::from_package_for_ranks(&compact_cfg, &core,
-                    rows, unit, &compact_manifest, ranks)?;
-                assert_eq!(before, after, "compact mode changed parent core charges");
-                assert_eq!(before.demands()?, after.demands()?, "compact mode changed named owners");
-                assert_eq!(after.native_stage_bytes, 0);
-            }
-        }
-        assert!(core.native_attention_stages(8192, 2)?.is_empty());
-        assert_eq!(core.attention_receive_bytes(64, 2)?, exchange_recv_bytes(64)?);
-        for (layer, before) in compact_layouts.iter().enumerate() {
-            let after = super::super::weight_layout::LayerLayout::pair_with_core(&compact_cfg, layer, LayerMode::HeadSplit, &core)?;
-            assert_eq!(before, &after, "compact mode changed the parent layer {layer} allocation");
         }
         Ok(())
     }

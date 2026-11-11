@@ -968,7 +968,7 @@ release_known_key() {
     MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|EXPERT_USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    CUTEAFD_GLM_BF16|MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     GPU_GRAPH_RESERVE|GPU_GRAPH_RESERVE_EXTRA|GPU_GRAPH_RESERVE_EXTRA_CAP|SPARK_GRAPH_RESERVE|GRAPH_TRACE) return 0 ;; # Bounded graph cache.
     GPU_MEMORY_CAP|SPARK_MEMORY_CAP|GPU_RESERVE|SPARK_RESERVE|FAMILY_RESERVE|MEMORY_PADDING|GRAPH_DISABLE_LOW_MEM|GRAPH_NODE_PADDING|KV_TARGET_TOKENS|KV_MIN_TOKENS|KV_MAX_TOKENS) return 0 ;; # One device memory policy (docs/options.md).
@@ -986,7 +986,7 @@ release_known_key() {
     GLM5_FLASH_DECODE_ROWS) return 0 ;;
     GLM5_FLASH_PREFILL_BATCH|PREFILL_PACKING) return 0 ;;
     GLM5_FLASH_ROUTE_RING_CHECK) return 0 ;;
-    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|ATTENTION_MODE|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
+    PROBE_DUMP_ROOT|MEDIA_FEATURES_DIR|AUDIO_FEATURES_DIR|CORE_VIEW|ATTENTION_PLACEMENT|ATTENTION_PLAN_ROWS) return 0 ;;
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_NSYS_GRAPH_TRACE|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
@@ -1054,7 +1054,7 @@ release_spark_host_rows() {
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" attention="hqa" line key value hub dir
+  local config="$1" model="" revision="" attention="original" line key value hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -1063,7 +1063,7 @@ release_config_family() {
     case "$key" in
       MODEL_ID) model="$value" ;;
       MODEL_REVISION) revision="$value" ;;
-      ATTENTION_MODE) attention="$value" ;;
+      CORE_VIEW) attention="$value" ;;
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
@@ -1072,7 +1072,10 @@ release_config_family() {
   [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
   [[ -z "${2:-}" ]] || attention="$2"
   local selected_config=config.json
-  [[ "$attention" != compact ]] || selected_config=config.compact-attention.json
+  case "$attention" in
+    k6-compact) selected_config=config.k6.json ;;
+    k8-compact) selected_config=config.k8.json ;;
+  esac
   local described=""
   if [[ -n "$revision" && -f "$dir/snapshots/$revision/$selected_config" ]]; then
     described="$(python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" \

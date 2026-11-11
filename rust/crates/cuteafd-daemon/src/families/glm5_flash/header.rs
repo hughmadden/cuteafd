@@ -225,13 +225,11 @@ mod tests {
     fn mixed_kda_accepts_stored_native_fp8_and_checks_scale_bytes() {
         let (mut checkpoint, cfg) = fixture();
         let root = tempfile::tempdir().unwrap();
-        for (name, value) in [("config.compact-attention.json", "{}"),
-            ("model.compact-attention.safetensors.index.json", r#"{"weight_map":{}}"#),
-            ("quantize_config.compact-attention.json", "{}")] {
-            std::fs::write(root.path().join(name), value).unwrap();
-        }
+        cuteafd_loader::plan::testing::write_mc_snapshot(root.path(),
+            &cuteafd_loader::plan::testing::glm5_flash_config(2), &[],
+            &std::collections::BTreeMap::from([("lm_head.weight".into(), vec![128, 128])]));
         checkpoint.view = Some(cuteafd_loader::plan::checkpoint::CheckpointView::select(root.path(),
-            cuteafd_loader::plan::checkpoint::AttentionMode::Compact).unwrap());
+            cuteafd_loader::plan::checkpoint::CoreView::K6Compact).unwrap());
         for leaf in ["q_proj", "k_proj", "v_proj"] {
             let stem = format!("model.language_model.layers.0.self_attn.{leaf}");
             let at = checkpoint.tensors.iter().position(|t| t.meta.name == format!("{stem}.weight")).unwrap();

@@ -85,30 +85,35 @@ def exl3_reply_programs(max_rows):
             for width, topk in shapes for format in (1, 2)]
 
 
-def hqa_bf16_shapes():
-    # GLM Flash q_b and MLA/KDA o, whole and ordinary TP2 slices (K, N).
+def flash_native_bf16_shapes():
+    # GLM Flash native attention and dense/shared FFNs, whole/TP2 slices (K, N).
     return {(1536, 16384), (1536, 8192), (16384, 4096),
-            (8192, 4096), (4096, 4096)}
+            (8192, 4096), (4096, 4096), (4096, 1536), (4096, 512),
+            (4096, 12288), (4096, 6144), (12288, 4096), (6144, 4096),
+            (4096, 2048), (4096, 1024), (2048, 4096), (1024, 4096)}
 
 
 def native_attention_shapes():
-    """Native HQA projection [N,K] shapes from the published tensor headers."""
+    """Native core projection [N,K] shapes from the published tensor headers."""
     return {
         "glm": {(16384, 2048), (8192, 2048), (6144, 16384), (6144, 8192)},
         "kimik3": {(18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144)},
         "step5": {(4096, 12288), (4096, 6144)},
         "muse": {(8192, 8192), (8192, 4096)},
-        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096)},
+        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096),
+                (24576, 6144), (12288, 6144), (6144, 6144), (3072, 6144),
+                (6144, 24576), (6144, 12288), (6144, 3072)},
     }
 
 
 def native_attention_f32_shapes():
-    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096)}
+    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096),
+            (6144, 12288), (6144, 3072)}
 
 
 def native_attention_bf16_f32_shapes():
-    # ML4's checkpoint attention weights are already FP8; no BF16 fallback export.
-    return native_attention_f32_shapes() - {(6144, 4096)}
+    # ML4 q/o and FFNs ship FP8; these split-output shapes need no BF16 fallback.
+    return native_attention_f32_shapes() - {(6144, 4096), (6144, 12288), (6144, 3072)}
 
 
 def compile_native_attention_projection(n, k, max_rows, output="bf16"):
@@ -194,10 +199,12 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
-    for shape in hqa_bf16_shapes():
-        result.setdefault(shape, []).append("hqa-glmf")
+    for n in (512, 576):
+        result.setdefault((6144, n), []).append("native-core")
+    for shape in flash_native_bf16_shapes():
+        result.setdefault(shape, []).append("native-glmf")
     for n, k in set().union(*(shapes for family, shapes in native_attention_shapes().items() if family != "ml4")):
-        result.setdefault((k, n), []).append("hqa-native")
+        result.setdefault((k, n), []).append("native-core")
     return result
 
 
@@ -470,9 +477,11 @@ def glm_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda r=rows: attn.compile_glm_index_producer_aot(g, max_rows=r)),
             (f"o_bf16_m{rows}", "o", {"max_rows": rows, "weights": "bf16"},
              lambda r=rows: attn.compile_glm_o_aot(g, max_rows=r)),
-            (f"ffn_i{g.moe_inter}_bf16_m{rows}", "ffn", {"max_rows": rows, "inter": g.moe_inter, "weights": "bf16"},
-             lambda r=rows: ffn.compile_glm_ffn_aot(g, inter=g.moe_inter, max_rows=r)),
         ]
+        for inter in dict.fromkeys((g.moe_inter, g.dense_inter)):
+            out.append((f"ffn_i{inter}_bf16_m{rows}", "ffn",
+                        {"max_rows": rows, "inter": inter, "weights": "bf16"},
+                        lambda r=rows, i=inter: ffn.compile_glm_ffn_aot(g, inter=i, max_rows=r)))
     # ModelOpt declares static W8A8 for these dense MLPs at every row count.
     for rows in (decode_rows, prefill_rows):
         out.append((f"ffn_i{g.dense_inter}_pt_m{rows}", "ffn",
@@ -1576,8 +1585,8 @@ def main() -> None:
     # Append shared drafter exports after all existing objects: table indices stay stable.
     if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "ml4", "muse", "muse2", "step5", "step52")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
-                  {"max_rows": 4096 if (k, n) in hqa_bf16_shapes()
-                      or "hqa-native" in draft_bf16_shapes()[(k, n)] else 2048},
+                  {"max_rows": 4096 if (k, n) in flash_native_bf16_shapes()
+                      or "native-core" in draft_bf16_shapes()[(k, n)] else 2048},
                   lambda k=k, n=n: compile_draft_bf16_projection(k, n))
                  for k, n in sorted(draft_bf16_shapes())]
         work += [("draft_bf16", f"k{k}_n{n}_f32", "bf16_projection", {"max_rows": 4096},

@@ -323,7 +323,7 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
     tiers: &[usize],
 ) -> Result<V41Exl3Manifest> {
     read_deepseek_v4_exl3_manifest_view(
-        &crate::plan::checkpoint::CheckpointView::select(snapshot, crate::plan::checkpoint::AttentionMode::Hqa)?,
+        &crate::plan::checkpoint::CheckpointView::select(snapshot, crate::plan::checkpoint::CoreView::Original)?,
         backbone, headers, tiers)
 }
 
@@ -380,8 +380,6 @@ fn check_storage_maps_view(view: &crate::plan::checkpoint::CheckpointView, confi
         let mut manifest = crate::formats::exl3_storage::parse_storage_metadata(
             path, first.as_ref().unwrap(), Some(derived))?;
         normalize_legacy_names(&mut manifest);
-        view.check_attention_manifest(&manifest)?;
-        view.check_attention_headers(headers.iter().copied())?;
         let flavor = if manifest.get("checkpoint_format").is_some() {
             check_gptqmodel_manifest(compact, &manifest, derived, backbone_layers).with_context(|| format!("checking {file}"))?;
             crate::formats::exl3_contract::check_retained_native_tensors(&manifest, derived, headers)

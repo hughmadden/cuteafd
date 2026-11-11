@@ -15,7 +15,7 @@ use cuteafd_core::memory_layout::ArenaTag;
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
@@ -162,17 +162,17 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
     cfg.release_geometry()?;
     cuteafd_bench::context::set_family(cfg.family_id());
     let mode = match view.mode() {
-        cuteafd_loader::plan::checkpoint::AttentionMode::Hqa => "hqa",
-        cuteafd_loader::plan::checkpoint::AttentionMode::Compact => "compact",
-        cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact => "fp8-compact",
+        cuteafd_loader::plan::checkpoint::CoreView::Original => "original",
+        cuteafd_loader::plan::checkpoint::CoreView::K6Compact => "k6-compact", cuteafd_loader::plan::checkpoint::CoreView::K8Compact => "k8-compact",
+        cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact => "fp8-compact",
     };
-    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::AttentionMode::Fp8Compact {
+    let recipe = if view.mode() == cuteafd_loader::plan::checkpoint::CoreView::Fp8Compact {
         cuteafd_loader::plan::checkpoint::view::FP8_RECIPE
     } else { "none" };
     cuteafd_bench::context::set_resolved("attention-mode", mode);
     cuteafd_bench::context::set_resolved("attention-bundle-fingerprint", view.fingerprint());
     cuteafd_bench::context::set_resolved("attention-fp8-recipe", recipe);
-    tracing::info!(attention_mode = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
+    tracing::info!(core_view = mode, bundle = view.fingerprint(), fp8_recipe = recipe,
         "selected immutable Muse attention bundle");
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
     let device_ids = args.devices();

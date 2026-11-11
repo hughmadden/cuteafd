@@ -25,6 +25,17 @@ Attention (KDA), a minority run MLA + DSA.
 **Starting configs** (current primary-only recipes, natural minimum and maximum; replace the
 placeholder Spark hosts and addresses): Official FP8 [min](../../examples/configs/glm53-flash-fp8-min.config) · [max](../../examples/configs/glm53-flash-fp8-max.config); EXL3 K3.25 [min](../../examples/configs/glm53-flash-exl3-min.config) · [max](../../examples/configs/glm53-flash-exl3-max.config); EXL3 K4 + Core K6 [min](../../examples/configs/glm53-flash-exl3-k6-min.config) · [max](../../examples/configs/glm53-flash-exl3-k6-max.config); NVFP4 [min](../../examples/configs/glm53-flash-nvfp4-min.config) · [max](../../examples/configs/glm53-flash-nvfp4-max.config); tr3 4bpw [min](../../examples/configs/glm53-flash-tr3-min.config) · [max](../../examples/configs/glm53-flash-tr3-max.config).
 
+## Core views
+
+`wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC` follows the
+[MC contract](../mc-checkpoints.md): `CORE_VIEW=original` retains every
+source-native BF16 core projection; `k8-compact` and `k6-compact` select
+complete trellis cores. Plain checkpoints have no implicit compact views.
+FP8 conversion retains the family's existing runtime scope; no tower,
+router, embedding or routed expert is converted by core selection.
+
+`fp8-compact` refuses for this MC original; whole-core FP8 is pending.
+
 ## Engineering summary
 
 - Attention: hybrid — Kimi Delta Attention (token-sequential linear

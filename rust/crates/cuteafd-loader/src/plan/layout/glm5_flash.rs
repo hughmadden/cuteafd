@@ -117,7 +117,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         let selected_manifest = manifest.map(|manifest| -> anyhow::Result<_> {
             let mut selected = manifest.clone();
             cuteafd_core::coordinator_programs::select_card_plans(&mut selected, sms)?;
-            cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
+            cuteafd_core::coordinator_programs::select_core_view_plans(&mut selected, attention_plan,
                 |name| (name.starts_with("glmf_") && (decode_rows > 64 || !name.ends_with("_m128")))
                     || (ranks == 2 && name.starts_with("glmf2_")))?;
             Ok(selected)
@@ -149,7 +149,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         let core = if exlr8.is_some() { crate::families::glm5_flash::core::CoreInventory::default() }
             else { crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)? };
-        let native = exlr8.is_some() || !core.projections.is_empty();
+        let native = exlr8.is_some() || !core.projections.is_empty() || !core.native.is_empty();
         let native_mask = if exlr8.is_some() { crate::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
             else { core.scratch_mask(&cfg, cfg.layers) };
         let native_kda = native_mask.kda;
@@ -172,13 +172,13 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         representation.head = representation.head.resolve(exlr8.is_some() || core.get_weight("lm_head").is_some(), ranks);
         let state = options.glmf_kda_state;
-        anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
+        anyhow::ensure!(!native_mask.kda || state == crate::serving_capacity::GlmfKdaState::F32,
             "native Flash requires F32 KDA state programs");
         anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
-            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
-            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else { representation.head.name() }));
+            if exlr8.is_some() { "native EXLR8" } else if native_mask.kda { "selected trellis core" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
+            if exlr8.is_some() { "native EXLR8" } else if core.get_weight("lm_head").is_some() { "selected trellis core" } else { representation.head.name() }));
         let mut resident = if exlr8.is_some() { native_resident(attention.first_owner as usize)? }
             else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
                 attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)? };
@@ -299,11 +299,11 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             for profile in [&mut workspace, &mut local_workspace] {
                 for (rank, (&bytes, requests)) in bytes.iter().zip(&requests).enumerate() {
                     profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
-                        Category::Workspace, "native K6 core", bytes, Basis::Exact)
+                        Category::Workspace, "selected native core", bytes, Basis::Exact)
                         .with_requests(requests.clone()));
                 }
             }
-            notes.push("native K6 body and head; exact compressed owners and projection scratch".into());
+            notes.push("selected native core; exact staged projection owners and scratch".into());
         }
         let native_charge = exlr8.map(|(facts, _)| crate::plan::exlr8::native::FlashCharges::from_manifest(
             facts, &cfg, &whole_mla(attention.first_owner as usize), rows as usize, lanes as usize,
@@ -345,7 +345,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         let speculation = draft > 0 || !draft_tp2.is_empty();
         let inputs = glmf::GlmfInputs {
-        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code,
+        resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && exlr8.is_none() && core.projections.is_empty(), gpus: baselines, pending_code,
             headroom_bytes: crate::placement::reserve::gpu("glm5_flash"), spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation, state_slots: options.resolved_state_slots("glm5_flash"),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
@@ -363,7 +363,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
             .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
         let mut process = glmf::admission::ProcessOwners::new(host, (8 << 30).max(host.0 / 10));
         process.remote_experts = remote_experts;
-        if ranks == 2 && attention.mode == placement::AttentionPlacement::Layers && !native {
+        if ranks == 2 && attention.mode == placement::AttentionPlacement::Layers && exlr8.is_none() && core.projections.is_empty() {
             let mut alternate = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks,
                 representation, attention.mode, (attention.first_owner ^ 1) as usize).map_err(anyhow::Error::msg)?;
             if host_embedding { for rank in &mut alternate { rank.embedding = 0; } }
@@ -568,7 +568,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, select_attention_plans, select_card_plans};
+    use cuteafd_core::coordinator_programs::{AttentionReductionPlan, select_core_view_plans, select_card_plans};
     use crate::serving_capacity::{GlmfCoreScratch, GlmfScratchOptions, GlmfStepShape,
         glmf_core_step_scratch, glmf_manifest_scratch, glmf_step_workspaces, glmf_table_pages};
 
@@ -611,7 +611,7 @@ mod tests {
                 let plan = AttentionReductionPlan::new(64, drafts, None).unwrap();
                 let mut selected = raw.clone();
                 select_card_plans(&mut selected, sms).unwrap();
-                select_attention_plans(&mut selected, plan, |name| name.starts_with("glmf")).unwrap();
+                select_core_view_plans(&mut selected, plan, |name| name.starts_with("glmf")).unwrap();
                 let context = glmf::manifest_context_for_plan(&selected, cfg.heads, sms as usize, &plan).unwrap().unwrap();
                 assert_eq!(context.partial_scratch, expected_context);
                 let planned = glmf_step_workspace(&selected, &checkpoint, &ExpertPlacement::Local, 1,
@@ -622,7 +622,7 @@ mod tests {
                 let lookup = |name: &str| {
                     let entry = raw["programs"].as_array()?.iter().find(|p| p["name"] == name)?;
                     let mut scratch = serde_json::from_value(entry["scratch_bytes_at_capacity"].clone()).unwrap();
-                    cuteafd_core::coordinator_programs::select_attention_scratch(&entry["geometry"], &mut scratch, plan).unwrap();
+                    cuteafd_core::coordinator_programs::select_core_view_scratch(&entry["geometry"], &mut scratch, plan).unwrap();
                     scratch.get("scratch").copied()
                 };
                 let options = GlmfScratchOptions { split: true, index_compact: true, ..Default::default() };

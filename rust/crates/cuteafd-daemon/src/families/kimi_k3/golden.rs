@@ -23,7 +23,7 @@ const SOURCE: [(&str, &str); 3] = [
 #[derive(Debug, clap::Args)]
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
-    pub(crate) attention: crate::cli::AttentionArgs,
+    pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long, default_value = "fp8")] kv_cache: cuteafd_core::MlaCacheFormat,
     /// Prefill unit rows for scoring chunks; unset uses the shared serving policy.
     #[arg(long)] prefill_rows: Option<usize>,
@@ -226,12 +226,12 @@ impl GoldenArgs {
     }
 
     fn selected_provenance(&self, view: &cuteafd_loader::plan::checkpoint::CheckpointView) -> Value {
-        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, AttentionMode};
+        use cuteafd_loader::plan::checkpoint::{view::FP8_RECIPE, CoreView};
         let mut provenance = self.provenance();
-        provenance["attention_mode"] = serde_json::json!(view.mode());
-        provenance["attention_bundle_fingerprint"] = serde_json::json!(view.fingerprint());
-        provenance["attention_fp8_recipe"] = serde_json::json!(
-            if view.mode() == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" });
+        provenance["core_view"] = serde_json::json!(view.mode());
+        provenance["core_view_fingerprint"] = serde_json::json!(view.fingerprint());
+        provenance["core_fp8_recipe"] = serde_json::json!(
+            if view.mode() == CoreView::Fp8Compact { FP8_RECIPE } else { "none" });
         provenance
     }
 
@@ -878,28 +878,26 @@ mod tests {
     #[test]
     fn golden_provenance_binds_selected_mode_bundle_and_fp8_recipe() -> Result<()> {
         use clap::Parser;
-        use cuteafd_loader::plan::checkpoint::{view::{COMPACT_CONFIG, COMPACT_INDEX, COMPACT_QUANT, FP8_RECIPE},
-            AttentionMode, CheckpointView};
+        use cuteafd_loader::plan::checkpoint::{CoreView, CheckpointView};
         let dir = tempfile::tempdir()?;
-        std::fs::write(dir.path().join("config.json"), "{}")?;
-        std::fs::write(dir.path().join(COMPACT_CONFIG), "{}")?;
-        std::fs::write(dir.path().join(COMPACT_INDEX), r#"{"weight_map":{}}"#)?;
-        std::fs::write(dir.path().join(COMPACT_QUANT), "{}")?;
+        let config = cuteafd_loader::plan::testing::kimi_k3_config();
+        cuteafd_loader::plan::testing::write_mc_snapshot(dir.path(), &config, &[],
+            &std::collections::BTreeMap::from([("language_model.lm_head.weight".into(), vec![128, 128])]));
         let crate::cli::Commands::KimiGolden(args) = crate::cli::Cli::try_parse_from([
             "cuteafd", "kimi-golden", "--snapshot", "/checkpoint", "--nll",
             "--golden", "/reference", "--save-logits", "/output"])?.command
             else { panic!("Kimi command"); };
         let mut fingerprints = std::collections::BTreeSet::new();
-        for mode in [AttentionMode::Hqa, AttentionMode::Compact, AttentionMode::Fp8Compact] {
+        for mode in [CoreView::Original, CoreView::K6Compact, CoreView::K8Compact] {
             let view = CheckpointView::select(dir.path(), mode)?;
             let provenance = args.selected_provenance(&view);
-            assert_eq!(provenance["attention_mode"], serde_json::to_value(mode)?);
-            assert_eq!(provenance["attention_bundle_fingerprint"], view.fingerprint());
-            assert_eq!(provenance["attention_fp8_recipe"],
-                if mode == AttentionMode::Fp8Compact { FP8_RECIPE } else { "none" });
+            assert_eq!(provenance["core_view"], serde_json::to_value(mode)?);
+            assert_eq!(provenance["core_view_fingerprint"], view.fingerprint());
+            assert_eq!(provenance["core_fp8_recipe"], "none");
             fingerprints.insert(view.fingerprint().to_owned());
         }
         assert_eq!(fingerprints.len(), 3);
+        assert!(CheckpointView::select(dir.path(), CoreView::Fp8Compact).unwrap_err().to_string().contains("whole-core FP8 pending"));
         Ok(())
     }
 

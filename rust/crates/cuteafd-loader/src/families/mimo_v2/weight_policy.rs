@@ -1,9 +1,5 @@
-//! Measured single-copy defaults for MiMo checkpoints (2026-10-03, one RTX at
-//! the natural minimum, checkpoint -> FP8): V2 Flash C4 code 108.5 -> 125.1 tok/s,
-//! KL 0.103 -> 0.092; V2.6 Pro C4 71.5 -> 87.3, KL 0.026 -> 0.028. The target head
-//! and attention O projections and a BF16 DFlash drafter convert to E4M3 at
-//! load into their only resident copy; native FP8 QKV/FFN are unchanged.
-//! `--weight-policy checkpoint` and explicit per-weight options take precedence.
+//! Target weights preserve checkpoint precision; head/O FP8 conversion is opt-in.
+//! Drafter policy is independent because target verification determines output.
 use crate::plan::checkpoint::Checkpoint;
 use super::MimoV2Config;
 use super::projection::{MimoProjectionLayout, MimoProjectionLayoutError, MimoProjectionRepresentation};
@@ -42,23 +38,14 @@ pub fn qualified_projection_memory(cfg: &MimoV2Config) -> Result<QualifiedProjec
     })
 }
 
-/// FP8 when every target head/O matrix has a 128-wide K grid (the single-copy
-/// FP8 consumers' layout); otherwise the checkpoint formats.
-pub fn default_policy(checkpoint: &Checkpoint, cfg: &MimoV2Config) -> MimoDefaultPolicy {
-    // The V2.6 Flash checkpoint has not qualified lossy target conversions.
-    if matches!(cfg.program_family().ok(), Some("mimof" | "mimof2")) {
-        return MimoDefaultPolicy::Checkpoint;
-    }
-    let names = std::iter::once("lm_head.weight".to_string())
-        .chain((0..cfg.layers).map(|layer| format!("model.layers.{layer}.self_attn.o_proj.weight")));
-    for name in names {
-        let Ok(index) = checkpoint.tensors.binary_search_by(|tensor| tensor.meta.name.cmp(&name)) else {
-            return MimoDefaultPolicy::Checkpoint;
-        };
-        let shape = &checkpoint.tensors[index].meta.shape;
-        if shape.len() != 2 || shape[1] % 128 != 0 { return MimoDefaultPolicy::Checkpoint; }
-    }
-    MimoDefaultPolicy::Fp8
+/// Automatic target loading never changes checkpoint precision.
+pub fn default_policy(_checkpoint: &Checkpoint, _cfg: &MimoV2Config) -> MimoDefaultPolicy {
+    MimoDefaultPolicy::Checkpoint
+}
+
+/// Preserve the independently qualified FP8 drafter default.
+pub fn default_draft_fp8(cfg: &MimoV2Config) -> bool {
+    !matches!(cfg.program_family().ok(), Some("mimof" | "mimof2"))
 }
 
 #[cfg(test)]
@@ -87,12 +74,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn mimo_checkpoints_default_to_fp8_head_and_output() {
+    fn mimo_checkpoints_default_to_source_head_and_output() {
         for snapshot in ["/arbitrarily-renamed-local-copy", "/hf/models--XiaomiMiMo--MiMo-V2.6-Pro-RL/snapshots/rev"] {
             let (checkpoint, cfg, _, _) = fixture(snapshot);
-            assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Fp8);
+            assert_eq!(default_policy(&checkpoint, &cfg), MimoDefaultPolicy::Checkpoint);
             let spec = crate::plan::families::mimo::spec_from(&cfg, &checkpoint);
-            assert!(spec.notes.iter().any(|note| note.contains("default: single-copy FP8")));
+            assert!(spec.notes.iter().any(|note| note.contains("checkpoint precision")));
+            assert!(default_draft_fp8(&cfg));
         }
     }
 

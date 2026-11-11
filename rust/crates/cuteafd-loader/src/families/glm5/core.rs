@@ -39,13 +39,13 @@ pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &C
     for op in [Op::QA, Op::KvA, Op::QB, Op::O] {
         let Some(stem) = cfg.stem(layer, op) else { continue; };
         if inventory.projections.contains_key(&stem)
-            || matches!(op, Op::QB | Op::O) && inventory.native.get(&stem).is_some_and(|native| native.fp8) {
+            || inventory.native.contains_key(&stem) {
             continue;
         }
         return Err(UnsupportedAttentionFormat {
             tensors: vec![format!("{stem}.weight")],
-            found: "projection not validated as EXL3 K6 or declared native F8E4M3".into(),
-            expected: "EXL3 K6, or declared native E4M3 wq/wo with F32 block-128 scales",
+            found: "projection not validated as trellis or native BF16/E4M3".into(),
+            expected: "trellis or native BF16/E4M3 with F32 block-128 FP8 scales",
         });
     }
     Ok(())
@@ -54,10 +54,9 @@ pub fn validate_attention_format(cfg: &GlmDsaConfig, layer: usize, inventory: &C
 /// Validate the whole declared publication, including unused MTP projections.
 /// Serving owners below deliberately stop at the backbone's `cfg.layers`.
 pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<()> {
-    use crate::plan::checkpoint::{AttentionMode, ProjectionStorage};
+    use crate::plan::checkpoint::{CoreView, ProjectionStorage};
     use cuteafd_core::DType;
-    if !cfg.variant.is_glm() || checkpoint.attention_mode() == AttentionMode::Compact
-        || checkpoint.config.pointer("/quantization_config/attention_view").is_none() { return Ok(()); }
+    if !cfg.variant.is_glm() { return Ok(()); }
     let layers = cfg.layers.checked_add(cfg.mtp_layers).context("GLM publication layer overflow")?;
     for layer in 0..layers {
         for (leaf, expected) in [
@@ -65,16 +64,29 @@ pub fn validate_native_attention(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) ->
             ("o_proj", vec![cfg.hidden, cfg.heads * cfg.v_head_dim]),
         ] {
             let stem = format!("model.layers.{layer}.self_attn.{leaf}");
+            if checkpoint.contains_tensor(&format!("{stem}.trellis")) { continue; }
             let projection = checkpoint.projection(&stem)?;
             let ProjectionStorage::Native { dtype, shape } = &projection.storage else {
                 return Err(UnsupportedAttentionFormat { tensors: vec![stem], found: format!("{:?}", projection.storage),
-                    expected: "declared native BF16/E4M3 HQA attention" }.into());
+                    expected: "native BF16/E4M3 attention" }.into());
             };
             ensure!(shape == &expected && matches!(dtype, DType::Bf16 | DType::F8E4M3),
                 "{stem}: expected native BF16/E4M3 {expected:?}, found {dtype:?} {shape:?}");
             if *dtype == DType::F8E4M3 {
-                crate::formats::native_attention::fp8_scale(&projection, &stem)?;
-                if checkpoint.attention_mode() == AttentionMode::Fp8Compact {
+                if projection.tensors.iter().any(|tensor| tensor.meta.name == format!("{stem}.weight_scale"))
+                    && !projection.tensors.iter().any(|tensor| tensor.meta.name.ends_with(".weight_scale_inv")
+                        || tensor.meta.name.ends_with(".qscale_weight")) {
+                    // Ordinary GLM landing expands ModelOpt's scalar without changing E4M3 bytes.
+                    // Mixed trellis/native stages validate their stricter block-grid contract below.
+                    let scale = projection.tensors.iter().find(|tensor|
+                        tensor.meta.name == format!("{stem}.weight_scale")).unwrap();
+                    ensure!(scale.meta.dtype == DType::F32 && scale.meta.byte_length == 4
+                        && scale.meta.shape.iter().all(|&extent| extent == 1),
+                        "{stem}.weight_scale: expected one FP32 value");
+                } else {
+                    crate::formats::native_attention::fp8_scale(&projection, &stem)?;
+                }
+                if checkpoint.core_view() == CoreView::Fp8Compact {
                     return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
                         tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
                 }
@@ -183,45 +195,33 @@ impl CoreInventory {
             |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: &[6], split,
                 padded_outputs: kv_a.contains(stem) }))?;
         let mut inventory = Self { projections, native: BTreeMap::new() };
-        if checkpoint.view.is_some() {
-            let native_stems = (0..cfg.layers).flat_map(|layer| {
-                let operands = core_operands(cfg, layer).into_iter()
-                    .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O))
-                    .filter_map(|(_, op, _)| cfg.stem(layer, op)).collect::<Vec<_>>();
-                let staged = operands.iter().any(|stem| inventory.projections.contains_key(stem))
-                    || cfg.variant.ml4().is_some()
-                        && checkpoint.config.pointer("/quantization_config/attention_view").is_some();
-                operands.into_iter().filter(|stem| staged && !inventory.projections.contains_key(stem)).collect::<Vec<_>>()
-            }).collect::<std::collections::BTreeSet<_>>();
-            for layer in 0..cfg.layers {
-                let operands = core_operands(cfg, layer).into_iter()
-                    .filter(|(_, op, _)| matches!(op, Op::QA | Op::KvA | Op::QB | Op::O)).collect::<Vec<_>>();
-                if !operands.iter().any(|(_, op, _)| cfg.stem(layer, *op)
-                    .is_some_and(|stem| native_stems.contains(&stem))) { continue; }
-                for (_, op, split) in operands {
-                    let Some(stem) = cfg.stem(layer, op) else { continue; };
-                    if inventory.projections.contains_key(&stem) { continue; }
-                    let selected = checkpoint.projection(&stem)?;
-                    let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage else { continue; };
-                    let expected = expected(cfg).remove(&format!("{stem}.weight")).context("GLM native shape")?;
-                    ensure!(shape == &expected && matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
-                        "{stem}: native attention requires BF16/E4M3 shape {expected:?}, found {dtype:?} {shape:?}");
-                    if cfg.variant.ml4().is_some() {
-                        ensure!(checkpoint.config.pointer("/quantization_config/attention_view").is_some()
-                            && matches!(op, Op::QB | Op::O) && *dtype == cuteafd_core::DType::F8E4M3,
-                            "{stem}: Mistral Large 4 native attention requires declared E4M3 wq/wo");
+        let shapes = expected(cfg);
+        for layer in 0..cfg.layers {
+            let operands = core_operands(cfg, layer).into_iter().filter(|(_, op, _)|
+                matches!(op, Op::QA | Op::KvA | Op::QB | Op::O)
+                    || cfg.variant.ml4().is_some() && matches!(op, Op::Gate | Op::Up | Op::Down))
+                .filter_map(|(_, op, split)| cfg.stem(layer, op).map(|stem| (stem, split)))
+                .collect::<Vec<_>>();
+            let staged = cfg.variant.ml4().is_some()
+                || operands.iter().any(|(stem, _)| inventory.projections.contains_key(stem));
+            if !staged { continue; }
+            for (stem, split) in operands {
+                if inventory.projections.contains_key(&stem) { continue; }
+                let selected = checkpoint.projection(&stem)?;
+                let crate::plan::checkpoint::ProjectionStorage::Native { dtype, shape } = &selected.storage else { continue; };
+                let expected = shapes.get(&format!("{stem}.weight")).context("GLM native shape")?;
+                ensure!(shape == expected && matches!(dtype, cuteafd_core::DType::Bf16 | cuteafd_core::DType::F8E4M3),
+                    "{stem}: native core requires BF16/E4M3 shape {expected:?}, found {dtype:?} {shape:?}");
+                if *dtype == cuteafd_core::DType::F8E4M3 {
+                    crate::formats::native_attention::fp8_scale(&selected, &stem)?;
+                    if checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact {
+                        return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
+                            tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
                     }
-                    if *dtype == cuteafd_core::DType::F8E4M3 {
-                        crate::formats::native_attention::fp8_scale(&selected, &stem)?;
-                        if checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact {
-                            return Err(crate::formats::native_attention::UnsupportedFp8Conversion {
-                                tensor: format!("{stem}.weight"), found: "E4M3".into() }.into());
-                        }
-                    }
-                    inventory.native.insert(stem, NativeProjection { shape: [shape[0], shape[1]], split,
-                        fp8: *dtype == cuteafd_core::DType::F8E4M3
-                            || checkpoint.attention_mode() == crate::plan::checkpoint::AttentionMode::Fp8Compact });
                 }
+                inventory.native.insert(stem, NativeProjection { shape: [shape[0], shape[1]], split,
+                    fp8: *dtype == cuteafd_core::DType::F8E4M3
+                        || checkpoint.core_view() == crate::plan::checkpoint::CoreView::Fp8Compact });
             }
         }
         inventory.validate_groups(cfg)?;
@@ -264,7 +264,8 @@ impl CoreInventory {
         for (key, op, _) in core_operands(cfg, layer) {
             let Some(stem) = cfg.stem(layer, op) else { continue; };
             let Some(projection) = self.native.get(&stem) else { continue; };
-            let world = if owner.is_some() || projection.split == CoreSplit::Whole { 1 } else { ranks };
+            let attention = matches!(op, Op::QA | Op::KvA | Op::QB | Op::O | Op::IndexQ);
+            let world = if attention && owner.is_some() || projection.split == CoreSplit::Whole { 1 } else { ranks };
             let [mut n, mut k] = projection.shape;
             match projection.split {
                 CoreSplit::Input => { ensure!(k % world == 0, "{stem}: input split"); k /= world; }
@@ -273,7 +274,7 @@ impl CoreInventory {
             }
             ensure!(!projection.fp8 || n % 128 == 0 && k % 128 == 0, "{stem}: partial FP8 scale block");
             for (rank, layouts) in layouts.iter_mut().enumerate() {
-                if owner.is_some_and(|gpu| usize::from(gpu) != rank) { continue; }
+                if attention && owner.is_some_and(|gpu| usize::from(gpu) != rank) { continue; }
                 layouts.insert(key, NativeLayout { stem: stem.clone(), shape: [n, k], fp8: projection.fp8,
                     rank: if world == 1 { 0 } else { rank }, ranks: world, split: projection.split });
             }
@@ -305,6 +306,7 @@ pub struct CoreRankLayout {
     pub native: Vec<NativeLayout>,
     pub native_scratch: [usize; 2],
     pub attention_partial_bytes: usize,
+    pub down_partial_bytes: usize,
     pub stages: Option<[CoreStageLayout; 2]>,
     pub decode: Option<ProjectionScratchLayout>,
     pub prefill: Option<ProjectionScratchLayout>,
@@ -327,7 +329,7 @@ impl CoreRankLayout {
         if let Some(stages) = &self.stages { for stage in stages { add(stage.bytes()?)?; } }
         for bytes in self.native_scratch { add(bytes)?; }
         // Native attention keeps F32 partials; K6 down keeps its BF16 wire ABI.
-        add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(self.attention_partial_bytes + 2 + 4))
+        add(self.retained_rows.checked_mul(hidden).and_then(|n| n.checked_mul(self.attention_partial_bytes + self.down_partial_bytes + 4))
             .context("GLM K6 retained plane extent overflow")?)?;
         Ok(bytes as u64)
     }
@@ -398,7 +400,7 @@ impl CoreCharges {
                 native_scratch[rank][index] = usize::try_from(selected.fp8_scratch_bytes)?;
             }
         }
-        if bodies.iter().any(|body| !body.is_empty()) && cfg.variant.ml4().is_some() {
+        if (bodies.iter().any(|body| !body.is_empty()) || native.iter().any(|weights| !weights.is_empty())) && cfg.variant.ml4().is_some() {
             // Mistral Large 4's attention stages (export_b12x_dsv4_aot --geometry ml4).
             let entries = manifest["programs"].as_array().context("Mistral Large 4 stage program inventory")?;
             for cap in ["m64", "m4096"] {
@@ -472,6 +474,8 @@ impl CoreCharges {
         }
         let attention_partial_bytes = if native.iter().flatten().any(|w|
             w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
+        let down_partial_bytes = if native.iter().flatten().any(|w|
+            w.stem.ends_with(".w2") && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input)
             || attention_partial_bytes == 4;
         let scratch = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
@@ -486,7 +490,8 @@ impl CoreCharges {
             ProjectionScratchLayout::new(head.shape[1], head.shape[0], rows)).transpose();
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
-            let stages = if body.is_empty() { None } else {
+            let active = !body.is_empty() || !native[rank].is_empty();
+            let stages = if !active { None } else {
                 Some([CoreStageLayout::new(cfg, 64, ranks, owners.is_some())?,
                     CoreStageLayout::new(cfg, unit, ranks, owners.is_some())?])
             };
@@ -494,12 +499,12 @@ impl CoreCharges {
             let draft_head = if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None };
             layouts.push(CoreRankLayout {
                 decode: scratch(&body, 64)?, prefill: scratch(&body, unit)?, stages,
-                retained_rows: if body.is_empty() { 0 } else { 64usize.checked_add(span).context("GLM K6 row span")? },
+                retained_rows: if !active { 0 } else { 64usize.checked_add(span).context("GLM K6 row span")? },
                 receive_suffix: if ranks == 2 && split { 4usize.checked_mul(slots)
                     .and_then(|n| n.checked_mul(unit.max(64))).and_then(|n| n.checked_mul(cfg.hidden))
                     .and_then(|n| n.checked_mul(attention_partial_bytes)).context("GLM K6 receive suffix overflow")? } else { 0 },
                 native: native[rank].clone(), native_scratch: native_scratch[rank], attention_partial_bytes,
-                body, target_head, draft_head,
+                body, target_head, draft_head, down_partial_bytes,
             });
         }
         let result = Self { ranks: layouts, programs: programs.into_iter().collect(),
@@ -630,7 +635,6 @@ mod tests {
         let mut cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
         cfg.mtp_layers = 1;
         let mut checkpoint = checkpoint(&cfg);
-        checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
         for layer in 0..cfg.layers + cfg.mtp_layers {
             for (leaf, shape) in [
                 ("q_b_proj", vec![cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank]),
@@ -653,7 +657,7 @@ mod tests {
         view_config["quantization_config"].as_object_mut().unwrap().remove("attention_view");
         std::fs::write(&config, serde_json::to_vec(&view_config)?)?;
         checkpoint.view = Some(crate::plan::checkpoint::CheckpointView::select(dir.path(),
-            crate::plan::checkpoint::AttentionMode::Hqa)?);
+            crate::plan::checkpoint::CoreView::Original)?);
         // Publication validation consumes retained headers, never the snapshot again.
         std::fs::remove_file(config)?;
         validate_native_attention(&cfg, &checkpoint)?;
@@ -673,14 +677,14 @@ mod tests {
 
     #[test]
     fn mixed_selected_attention_preserves_native_geometry_and_rejects_missing_members() -> Result<()> {
-        use crate::plan::checkpoint::{AttentionMode, CheckpointView, CheckpointTensor};
+        use crate::plan::checkpoint::{CoreView, CheckpointView, CheckpointTensor};
         use cuteafd_core::DType;
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config())?;
         for dtype in [DType::Bf16, DType::F8E4M3] {
             let mut checkpoint = checkpoint(&cfg);
             let dir = tempfile::tempdir()?;
             std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
-            checkpoint.view = Some(CheckpointView::select(dir.path(), AttentionMode::Hqa)?);
+            checkpoint.view = Some(CheckpointView::select(dir.path(), CoreView::Original)?);
             for op in [Op::QB, Op::O] {
                 let stem = cfg.stem(0, op).unwrap();
                 checkpoint.tensors.retain(|tensor| !tensor.meta.name.starts_with(&format!("{stem}.")));
@@ -722,8 +726,8 @@ mod tests {
     }
 
     #[test]
-    fn ml4_selected_native_query_and_output_require_declared_e4m3_and_exact_scales() -> Result<()> {
-        use crate::plan::checkpoint::{AttentionMode, CheckpointView, CheckpointTensor};
+    fn ml4_selected_native_query_and_output_validate_exact_scales() -> Result<()> {
+        use crate::plan::checkpoint::{CoreView, CheckpointView, CheckpointTensor};
         use cuteafd_core::DType;
         let config = crate::plan::testing::mistral_large4_config();
         let cfg = GlmDsaConfig::from_hf(&config)?;
@@ -731,8 +735,7 @@ mod tests {
         checkpoint.config = config;
         let dir = tempfile::tempdir()?;
         std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&checkpoint.config)?)?;
-        checkpoint.view = Some(CheckpointView::select(dir.path(), AttentionMode::Hqa)?);
-        checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
+        checkpoint.view = Some(CheckpointView::select(dir.path(), CoreView::Original)?);
         for layer in 0..cfg.layers {
             for op in [Op::QB, Op::O] {
                 let stem = cfg.stem(layer, op).unwrap();
@@ -767,23 +770,75 @@ mod tests {
         let original = checkpoint.tensors.clone();
         let weight = cfg.weight(0, Op::QB).unwrap();
         let scale = format!("{}.qscale_weight", cfg.stem(0, Op::QB).unwrap());
-        for failure in ["missing", "shape", "scale_dtype", "weight_dtype", "undeclared", "conversion"] {
+        for failure in ["missing", "shape", "scale_dtype", "weight_dtype"] {
             checkpoint.tensors = original.clone();
-            checkpoint.config["quantization_config"]["attention_view"] = serde_json::json!({});
-            checkpoint.view = Some(CheckpointView::select(dir.path(), if failure == "conversion" {
-                AttentionMode::Fp8Compact
-            } else { AttentionMode::Hqa })?);
+            checkpoint.view = Some(CheckpointView::select(dir.path(), CoreView::Original)?);
             match failure {
                 "missing" => checkpoint.tensors.retain(|tensor| tensor.meta.name != scale),
                 "shape" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.shape[0] += 1,
                 "scale_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == scale).unwrap().meta.dtype = DType::Bf16,
-                "weight_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == weight).unwrap().meta.dtype = DType::Bf16,
-                "undeclared" => { checkpoint.config["quantization_config"].as_object_mut().unwrap().remove("attention_view"); },
-                "conversion" => (),
+                "weight_dtype" => checkpoint.tensors.iter_mut().find(|t| t.meta.name == weight).unwrap().meta.dtype = DType::F16,
                 _ => unreachable!(),
             }
             reindex(&mut checkpoint);
             assert!(CoreInventory::from_checkpoint(&cfg, &checkpoint).is_err(), "{failure}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ml4_original_mixed_core_has_native_owners_and_f32_ffn_partials() -> Result<()> {
+        use crate::plan::{testing, checkpoint::CoreView};
+        use cuteafd_core::DType;
+        let root = tempfile::tempdir()?;
+        let mut tensors = testing::mistral_large4_tensors(Some(&[1]), false);
+        let experts = tensors.iter().filter_map(|(name, _, shape)| {
+            let stem = name.strip_suffix(".weight")?;
+            stem.contains(".experts.").then(|| (stem.to_owned(), shape.clone()))
+        }).collect::<Vec<_>>();
+        tensors.retain(|(name, ..)| !name.contains(".experts."));
+        for (stem, shape) in experts { tensors.extend(testing::exl3(&stem, shape[0], shape[1], 4)); }
+        let (mut quant, mut manifest) = testing::mistral_large4_exl3_config(&tensors);
+        for metadata in [&mut quant, &mut manifest] {
+            for key in ["core_bits", "head_bits", "lm_head"] { metadata.as_object_mut().unwrap().remove(key); }
+        }
+        let mut config = testing::mistral_large4_config();
+        config.as_object_mut().unwrap().remove("transformers_weights");
+        config["quantization_config"] = quant;
+        testing::write_snapshot(root.path(), &config, &tensors, None);
+        testing::write_quantize_config(root.path(), &manifest);
+        let cfg = GlmDsaConfig::from_hf(&config)?;
+        for checkpoint in [Checkpoint::open(root.path())?, Checkpoint::inventory(root.path())?] {
+            assert_eq!(checkpoint.core_view(), CoreView::Original);
+            let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+            assert!(core.projections.is_empty());
+            assert_eq!(core.native.len(), cfg.layers * 5 + 63);
+            assert_eq!(checkpoint.header("output.weight").unwrap().dtype, DType::Bf16);
+            assert_eq!(checkpoint.header("layers.0.attention.wkv_b.weight").unwrap().dtype, DType::Bf16);
+            for layer in 0..cfg.layers {
+                validate_attention_format(&cfg, layer, &core)?;
+                if let Some(stem) = cfg.stem(layer, Op::KvA) { assert!(!core.native[&stem].fp8); }
+                for op in [Op::QB, Op::O, Op::Gate, Op::Up, Op::Down] {
+                    assert!(core.native[&cfg.stem(layer, op).unwrap()].fp8);
+                }
+                let owned = core.layer_native(&cfg, layer, 2, Some(0))?;
+                assert!(owned[1].keys().all(|key| matches!(*key, "gate" | "up" | "down")));
+                assert_eq!(owned[1]["down"].ranks, 2);
+            }
+            let manifest = package(&cfg, &core)?;
+            for ranks in [1, 2] {
+                let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None, 4096, 3, None, &manifest)?;
+                for rank in &charges.ranks {
+                    assert!(rank.body.is_empty() && rank.decode.is_none() && rank.prefill.is_none());
+                    assert!(rank.stages.is_some() && rank.native_scratch == [256; 2]);
+                    assert_eq!(rank.down_partial_bytes, if ranks == 2 { 4 } else { 2 });
+                    assert!(rank.target_head.is_none() && rank.draft_head.is_none());
+                }
+                if ranks == 2 {
+                    assert!(charges.programs.iter().any(|name| name == "native_attention_n6144_k12288_m4096_f32"));
+                    assert!(charges.programs.iter().any(|name| name == "native_attention_n6144_k3072_m4096_f32"));
+                }
+            }
         }
         Ok(())
     }

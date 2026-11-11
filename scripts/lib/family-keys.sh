@@ -34,9 +34,7 @@ _spark_slot_keys() {
 _family_allowed_keys() {
   local checkpoint_family="${2:-$1}" registry_dir
   registry_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-  if python3 "$registry_dir/checkpoint-family.py" --attention-variant "$checkpoint_family"; then
-    printf '%s\n' ATTENTION_MODE
-  fi
+  printf '%s\n' CORE_VIEW
   cat <<'EOF'
 VISION
 AUDIO
@@ -243,6 +241,7 @@ EOF
       ;;
     glm5)
       cat <<'EOF'
+CUTEAFD_GLM_BF16
 GPU_GRAPH_RESERVE
 GPU_GRAPH_RESERVE_EXTRA
 GPU_GRAPH_RESERVE_EXTRA_CAP

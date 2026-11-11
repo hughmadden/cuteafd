@@ -94,6 +94,7 @@ pub struct TargetBuffers {
     pub payload_row_bytes: u64,
     pub core_rows: bool,
     pub attention_partial_bytes: u64,
+    pub down_partial_bytes: u64,
 }
 
 fn mul(a: u64, b: u64) -> Result<u64, Refusal> {
@@ -254,7 +255,7 @@ impl Builder {
         if facts.core_rows {
             fields.extend([
                 ("core.attention", mul(cfg.hidden as u64, facts.attention_partial_bytes)?),
-                ("core.down", mul(cfg.hidden as u64, 2)?),
+                ("core.down", mul(cfg.hidden as u64, facts.down_partial_bytes)?),
                 ("core.reduction", mul(cfg.hidden as u64, 4)?),
             ]);
         }
