@@ -1688,7 +1688,7 @@ mod tests {
         // Unmodified entries from the f44d9776 SM120 export, not synthesized
         // from the consumer's pointer-name constants.
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/kimi_k31_sparse_mla_sm120.json")).unwrap();
+            "../../tests/fixtures/kimi_k31_sparse_mla_sm120.json")).unwrap();
         assert_eq!(manifest["sparkinfer_revision"], "f44d97769fd540fafd7ed341ae6966554fa80ea7");
         let entries = manifest["programs"].as_array().unwrap();
         assert_eq!(entries.len(), 16);
