@@ -78,21 +78,21 @@ fn minimax_native_inventory_is_planned_not_executable() {
 }
 
 #[test]
-fn minimax_contract_names_missing_and_drifted_tensors() {
+fn generic_native_validation_rejects_missing_and_drifted_minimax_tensors_early() {
     let (dir, cfg, mut tensors) = fixture();
     let name = format!("{TEXT}layers.0.self_attn.index_k_proj.weight_scale_inv");
     tensors.iter_mut().find(|t| t.0 == name).unwrap().2[1] += 1;
     testing::write_snapshot(dir.path(), &cfg, &tensors, None);
-    let diagnostic = match plan::plan(dir.path(), &PlanOptions::default()) {
-        Ok(report) => report.config_error.expect("drifted tensor must fail the family contract"),
-        Err(error) => error.to_string(),
+    let diagnostic = match plan::plan(dir.path(), &PlanOptions::default()).unwrap_err() {
+        plan::PlanError::Checkpoint(error) => error.to_string(),
+        error => panic!("expected generic checkpoint validation, got {error:?}"),
     };
     assert!(diagnostic.contains(&name), "{diagnostic}");
     tensors.retain(|t| t.0 != name);
     testing::write_snapshot(dir.path(), &cfg, &tensors, None);
-    let diagnostic = match plan::plan(dir.path(), &PlanOptions::default()) {
-        Ok(report) => report.config_error.expect("missing tensor must fail the family contract"),
-        Err(error) => error.to_string(),
+    let diagnostic = match plan::plan(dir.path(), &PlanOptions::default()).unwrap_err() {
+        plan::PlanError::Checkpoint(error) => error.to_string(),
+        error => panic!("expected generic checkpoint validation, got {error:?}"),
     };
     assert!(diagnostic.contains(&name), "{diagnostic}");
 }
