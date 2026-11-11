@@ -934,7 +934,7 @@ static uint32_t exl3_words[16] = {2,5120,1152,6,1,6,2,1,1,1,1,3,4,0,0,4};
 void fixture_configure_exl3(const uint32_t *words) { memcpy(exl3_words, words, sizeof(exl3_words)); }
 int cuteafd_exl3_info(uint32_t *out, uint32_t count) {
     const uint32_t *words = exl3_words;
-    if (count != 18) return 1;
+    if (count != 16) return 1;
     memcpy(out, words, sizeof(exl3_words));
     return 0;
 }

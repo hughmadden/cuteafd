@@ -1200,6 +1200,15 @@ mod tests {
     }
 
     #[test]
+    fn measured_mimo_flash_manifest_preserves_native_contract_and_scratch() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mimo-flash-min-native-manifest.json")).unwrap();
+        assert_eq!(manifest["layouts"]["tp1"]["weights"], "mxfp4");
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 2752).unwrap(), Some(671_354_880));
+        assert_eq!(fp8moe_scratch_bytes(&manifest, "tp1", 4096).unwrap(), Some(671_354_880));
+    }
+
+    #[test]
     fn native_manifest_rejects_stale_abi_and_invalid_contracts_before_capacity_lookup() {
         let valid = json!({"layouts":{"tp1":{"abi_version":6,"weights":"nvfp4","projection":"bf16",
             "activation":"swigluoai","swiglu_limit":7.0,"swiglu_alpha":1.702,"swiglu_beta":1.0,
