@@ -28,8 +28,15 @@ from families.kimi_k3.model import (LayerWeights, configure_f32, geometry, load_
 QUICK_WINDOWS = ("legacy", "a00", "a04", "a08", "a20", "c00", "d00", "e00")
 
 
-def execution_windows(panel, *, skip_routed=False, prefix_probe=False):
+def execution_windows(panel, *, skip_routed=False, prefix_probe=False, diagnostic_window=None):
     windows = copy.deepcopy(panel["windows"])
+    if diagnostic_window is not None:
+        if not skip_routed or prefix_probe:
+            raise ValueError("arithmetic diagnostic requires skipped experts and no prefix probe")
+        selected = [window for window in windows if window["id"] == diagnostic_window]
+        if len(selected) != 1:
+            raise ValueError("diagnostic window absent or duplicated")
+        return selected
     if not skip_routed or prefix_probe:
         return windows
     selected = [window for window in windows if window["id"] in QUICK_WINDOWS]
@@ -40,6 +47,83 @@ def execution_windows(panel, *, skip_routed=False, prefix_probe=False):
     if not any(w["score_from"] >= 8192 for w in selected):
         raise ValueError("skipped-routed quick diagnostic requires sparse DSA beyond 8K history")
     return selected
+
+
+def diagnostic_rows(value):
+    try:
+        first, end = map(int, value.split(":"))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("capture rows require FIRST:END") from error
+    if first < 0 or not first < end <= first + 64:
+        raise argparse.ArgumentTypeError("capture requires 1..64 nonnegative input rows")
+    return first, end
+
+
+def diagnostic_options(a):
+    window = getattr(a, "diagnostic_window", None)
+    arithmetic = getattr(a, "diagnostic_arithmetic", None)
+    rows = getattr(a, "diagnostic_capture_rows", None)
+    if window is None and arithmetic is None and rows is None:
+        return None
+    if (window is None or arithmetic not in ("f32", "bf16")
+            or not getattr(a, "skip_routed_experts", False)
+            or any(getattr(a, key, None) is not None and getattr(a, key) is not False
+                   for key in ("stop_after_layer", "diagnose_layer", "diagnose_official_noise",
+                               "diagnose_blas", "diagnose_linear_variants", "probe_state"))
+            or getattr(a, "_prefix_probe", False)):
+        raise ValueError("arithmetic diagnostic requires skipped experts, window, arithmetic and no other diagnostic")
+    return {"window": window, "arithmetic": arithmetic, "capture_rows": rows}
+
+
+class DiagnosticCapture:
+    """Retain small residual slices without changing decoder operands."""
+    def __init__(self, root, layer, index, rows):
+        self.root, self.layer, self.index, self.rows = root, layer, index, rows
+        self.handles = []
+        self.prefix = None
+
+    def save(self, kind, value, *, selected=False):
+        import torch
+        first, end = self.rows
+        value = value.reshape(-1, value.shape[-1])
+        value = (value if selected else value[first:end]).detach().float().cpu()
+        if value.shape[0] != end - first or not torch.isfinite(value).all():
+            raise ValueError("nonfinite or truncated diagnostic capture")
+        folder = self.root / ("layer-%02d-%s" % (self.index, kind))
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / "residual.bin"
+        temporary = path.with_suffix(".pending")
+        with temporary.open("wb") as stream:
+            value.numpy().astype("<f4").tofile(stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        atomic_json(folder / "meta.json", {"diagnostic_only": True, "layer": self.index,
+            "attention_kind": "KDA" if self.layer.is_linear_attn else "DSA-MLA",
+            "ffn_kind": "shared" if hasattr(self.layer, "block_sparse_moe") else "dense",
+            "rows": list(self.rows), "dtype": "F32", "shape": list(value.shape),
+            "path": path.name, "sha256": digest(path)})
+
+    def __enter__(self):
+        def before(module, args, kwargs):
+            hidden = args[0] if args else kwargs["hidden_states"]
+            first, end = self.rows
+            self.prefix = hidden[:, first:end].detach().clone()
+
+        def attended(module, args, output):
+            first, end = self.rows
+            selected = output[:, first:end]
+            if self.index % self.layer.attn_res_block_size:
+                selected = self.prefix + selected
+            self.save("post-attention", selected, selected=True)
+
+        self.handles = [self.layer.register_forward_pre_hook(before, with_kwargs=True),
+                        self.layer.self_attn.register_forward_hook(attended)]
+        return self
+
+    def __exit__(self, *_):
+        for handle in self.handles:
+            handle.remove()
 
 
 def digest(path):
@@ -253,6 +337,7 @@ def official_check(out, arrays, per_layer, *, comparison=None):
 
 def execute(a):
     stop = getattr(a, "stop_after_layer", None)
+    diagnostic = diagnostic_options(a)
     state_root = (a._kimi_probe_state if getattr(a, "_prefix_probe", False) else
                   a.out.parent / (a.out.name + "-layer-state"))
     latest = state_root / "latest.json"
@@ -277,6 +362,10 @@ def execute(a):
         arithmetic = None
     else:
         arithmetic = configure_f32()
+    if diagnostic and diagnostic["arithmetic"] == "bf16":
+        torch.set_default_dtype(torch.bfloat16)
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+        arithmetic = {**arithmetic, "dtype": "bfloat16", "bf16_reduced_precision_reduction": False}
     torch.manual_seed(0)
     manifest = load_set(a.windows)
     if manifest["family"] not in ("kimi_k3", "kimi_k31") or any(w.get("media") for w in manifest["windows"]):
@@ -289,7 +378,8 @@ def execute(a):
         raise ValueError("Kimi panel family differs from checkpoint")
     if stop is not None and not 0 <= stop < config.num_hidden_layers:
         raise ValueError("diagnostic stop layer is outside checkpoint")
-    weights = LayerWeights(a.snapshot, quantization, dtype=torch.float32,
+    weights = LayerWeights(a.snapshot, quantization,
+                           dtype=None if diagnostic and diagnostic["arithmetic"] == "bf16" else torch.float32,
                            kda_num_heads=config.linear_attn_config["num_heads"])
     # Check every layer shape and only the small A_log tails before GPU admission.
     for index in range(config.num_hidden_layers):
@@ -324,7 +414,7 @@ def execute(a):
         pins["indexer_ops_sha256"] = digest(Path(__file__).parents[1] / "mistral_large4/ops.py")
         pins["shape_invariant_sha256"] = digest(ROOT / "python/reference/shape_invariant.py")
     checking = getattr(a, "_prefix_probe", False)
-    if not checking and stop is None:
+    if not checking and stop is None and diagnostic is None:
         a._kimi_probe_state = a.out.parent / (a.out.name + "-prefix-state")
         # Keep interrupted evidence, but leave exactly one raw probe in the seal.
         for previous in a.out.glob("prefix-gate-*"):
@@ -332,9 +422,12 @@ def execute(a):
             archive.mkdir(exist_ok=True)
             previous.rename(archive / previous.name)
     # A diagnostic prefix is never passed to qualification or output scoring.
-    proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None else None
+    proof = qualify(a, manifest, execute, route_forcing=is_k31) if stop is None and diagnostic is None else None
     forced_routes = checking and getattr(a, "_route_forced_qualification", False)
-    windows = execution_windows(manifest, skip_routed=skip_routed, prefix_probe=checking)
+    windows = execution_windows(manifest, skip_routed=skip_routed, prefix_probe=checking,
+                                diagnostic_window=diagnostic["window"] if diagnostic else None)
+    if diagnostic and diagnostic["capture_rows"] and diagnostic["capture_rows"][1] > len(windows[0]["tokens"]) - 1:
+        raise ValueError("diagnostic capture rows exceed prediction inputs")
     if checking:
         for name in ("official_short", "adapted_short"):
             source = copy.deepcopy(windows[0])
@@ -346,7 +439,9 @@ def execute(a):
                "compressed_tensors": compressed_tensors.__version__,
                "compute_capability": list(torch.cuda.get_device_capability()),
                "image_sha256": os.environ.get("CUTEAFD_REFERENCE_IMAGE_SHA256", ""),
-               "state_dtype": "float32", "arithmetic": arithmetic,
+               "state_dtype": "bfloat16" if diagnostic and diagnostic["arithmetic"] == "bf16" else "float32",
+               "arithmetic": arithmetic,
+               **({"arithmetic_diagnostic": diagnostic} if diagnostic else {}),
                "skip_routed_experts": skip_routed,
                "expert_storage": ("diagnostic: router+shared-experts; routed contribution zero; no routed weights loaded"
                                   if skip_routed else "GPU packed cache; one F32 matrix resident per native Linear call"),
@@ -401,10 +496,15 @@ def execute(a):
                                                 use_cache=False, output_attentions=False)
                 else:
                     forced = routing and wid == "adapted_short"
-                    with geometry(reference):
-                        with routing.observe(gate, choices=choices, weights=route_weights) if forced else nullcontext():
-                            result, history = layer(hidden, attention_mask=None, block_residual=blocks,
-                                                    use_cache=False, output_attentions=False)
+                    capture = (DiagnosticCapture(a.out / "capture", layer, index, diagnostic["capture_rows"])
+                               if diagnostic and diagnostic["capture_rows"] else None)
+                    with capture if capture else nullcontext():
+                        with geometry(reference):
+                            with routing.observe(gate, choices=choices, weights=route_weights) if forced else nullcontext():
+                                result, history = layer(hidden, attention_mask=None, block_residual=blocks,
+                                                        use_cache=False, output_attentions=False)
+                        if capture:
+                            capture.save("post-ffn", result)
                 append = index % config.attn_res_block_size == 0
                 if history.shape[1] != original_blocks + int(append):
                     raise ValueError("official block-residual count differs")
@@ -436,6 +536,9 @@ def execute(a):
             print(f"diagnostic only: retained layer {state.latest['layer']}; no scores or publication", flush=True)
             return
         state.require_scoring()
+        if diagnostic:
+            # Both arms use exactly the same F32 final residual mix, norm and head.
+            weights.dtype = torch.float32
         with torch.device("meta"):
             norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             output_norm = reference.KimiRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -450,6 +553,8 @@ def execute(a):
         for window in windows:
             wid = window["id"]
             hidden, blocks = state.load(wid, config.hidden_size)
+            if diagnostic:
+                hidden, blocks = hidden.float(), blocks.float()
             hidden = reference._apply_attn_res(hidden[0], blocks, output_proj, output_norm)[None]
             hidden = norm(hidden)
             start = window["score_from"]
@@ -467,6 +572,25 @@ def execute(a):
                 total_nll += F.cross_entropy(torch.from_numpy(logits).double(), targets, reduction="sum").item()
                 total_rows += len(logits)
             del hidden, blocks, selected, logits
+        if diagnostic:
+            from fidelity_windows import collect_runtime_platform
+            platform = collect_runtime_platform()
+            atomic_json(a.out / "platform.json", platform)
+            atomic_json(a.out / "manifest.json", {
+                "schema": "cuteafd.kimi.arithmetic-diagnostic/1", "diagnostic_only": True,
+                "qualification_reference": False, "diagnostic": diagnostic,
+                "treatment": "router+shared-experts; routed contribution zero",
+                "checkpoint_config": json.loads((a.snapshot / "config.json").read_bytes()),
+                "checkpoint_config_sha256": digest(a.snapshot / "config.json"),
+                "binding": binding, "platform": platform, "platform_sha256": digest(a.out / "platform.json"),
+                "vocab": config.vocab_size, "windows": entries,
+                "nll": total_nll / total_rows, "scored_tokens": total_rows,
+                "logits_sha256": {entry["id"]: digest(a.out / entry["path"] / "logits.bin") for entry in entries},
+                "captures": {str(path.relative_to(a.out)): digest(path)
+                             for path in sorted((a.out / "capture").glob("*/meta.json"))}})
+            print(f"arithmetic diagnostic {diagnostic['arithmetic']}: NLL {total_nll / total_rows:.12f}; "
+                  f"{total_rows} rows; NOT a qualification reference", flush=True)
+            return
         comparison = None
         if checking:
             description = None
@@ -564,6 +688,11 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--skip-routed-experts", action="store_true",
                         help="quick sealed-eight diagnostic: router and shared expert, zero routed contribution; not full-model fidelity")
+    parser.add_argument("--diagnostic-window", help="skipped-only single-window arithmetic diagnosis; never qualification")
+    parser.add_argument("--diagnostic-arithmetic", choices=("f32", "bf16"),
+                        help="diagnostic decoder arithmetic; identical fixed-M128 geometry and F32 head")
+    parser.add_argument("--diagnostic-capture-rows", type=diagnostic_rows,
+                        help="retain 1..64 input rows after attention and FFN at every layer")
     parser.add_argument("--check-only", action="store_true", help="CPU checkpoint source/header/shape validation; no golden or device allocation")
     parser.add_argument("--layers", type=int, default=None)
     parser.add_argument("--stop-after-layer", type=int, default=None,
@@ -579,6 +708,7 @@ def main():
     parser.add_argument("--probe-state", type=Path,
                         help="saved probe state containing exact block000 short-stream embeddings")
     args = parser.parse_args()
+    diagnostic_options(args)
     if args.layers is not None:
         raise ValueError("partial layers cannot qualify a Kimi reference")
     if args.stop_after_layer is not None and (args.stop_after_layer < 0

@@ -375,3 +375,61 @@ def test_skipped_routed_diagnostic_keeps_router_and_shared_only():
     assert not hasattr(block, "experts")
     dense = torch.nn.Module()
     assert k31.skip_routed_experts(dense) is dense
+
+
+def test_arithmetic_diagnostic_is_explicit_single_window_and_cannot_qualify():
+    from families.kimi_k3.golden import diagnostic_options, diagnostic_rows, execution_windows
+    panel = {"windows": [dict(id="a00", tokens=[1] * 1834, score_from=1322)]}
+    assert diagnostic_options(types.SimpleNamespace()) is None
+    args = dict(skip_routed_experts=True, diagnostic_window="a00", diagnostic_arithmetic="f32")
+    assert diagnostic_options(types.SimpleNamespace(**args))["arithmetic"] == "f32"
+    assert execution_windows(panel, skip_routed=True, diagnostic_window="a00") == panel["windows"]
+    for change in (dict(skip_routed_experts=False), dict(diagnostic_window=None),
+                   dict(diagnostic_arithmetic=None), dict(stop_after_layer=0), dict(diagnose_layer=0)):
+        with pytest.raises(ValueError, match="arithmetic diagnostic"):
+            diagnostic_options(types.SimpleNamespace(**(args | change)))
+    for kwargs in (dict(skip_routed=False), dict(skip_routed=True, prefix_probe=True)):
+        with pytest.raises(ValueError, match="arithmetic diagnostic"):
+            execution_windows(panel, diagnostic_window="a00", **kwargs)
+    with pytest.raises(ValueError, match="absent or duplicated"):
+        execution_windows(panel, skip_routed=True, diagnostic_window="missing")
+    assert diagnostic_rows("1757:1821") == (1757, 1821)
+    import argparse
+    for value in ("0:65", "-1:1", "1:1", "1", "x:2"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            diagnostic_rows(value)
+
+
+def test_diagnostic_capture_retains_exact_prefix_and_ffn_without_mutation(tmp_path):
+    import json
+    import numpy as np
+    torch = pytest.importorskip("torch")
+    from families.kimi_k3.golden import DiagnosticCapture
+
+    class Layer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index, self.attn_res_block_size, self.is_linear_attn = index, 2, True
+            self.self_attn = torch.nn.Identity()
+
+        def forward(self, hidden):
+            attention = self.self_attn(hidden * 2)
+            prefix = attention if self.index % 2 == 0 else hidden + attention
+            return prefix + 1
+
+    hidden = torch.arange(24).reshape(1, 6, 4).float()
+    for index in (0, 1):
+        layer = Layer(index)
+        expected = layer(hidden)
+        root = tmp_path / str(index)
+        with DiagnosticCapture(root, layer, index, (1, 3)) as capture:
+            result = layer(hidden)
+            capture.save("post-ffn", result)
+        assert torch.equal(result, expected)
+        assert not layer._forward_pre_hooks and not layer.self_attn._forward_hooks
+        for kind, want in (("post-attention", expected - 1), ("post-ffn", expected)):
+            folder = root / ("layer-%02d-%s" % (index, kind))
+            actual = np.fromfile(folder / "residual.bin", dtype="<f4").reshape(2, 4)
+            np.testing.assert_array_equal(actual, want[0, 1:3].numpy())
+            meta = json.loads((folder / "meta.json").read_bytes())
+            assert meta["rows"] == [1, 3] and meta["diagnostic_only"]
