@@ -780,7 +780,7 @@ impl Recipe for KimiRecipe {
                         ByteCurve::linear_rounded(bytes, bytes, self.maximum_pages,
                             crate::placement::planner::SM120_ALLOCATION_GRANULARITY_BYTES),
                         false, self.maximum_pages);
-                    allocation.activation = activation;
+                    allocation.activation = activation.clone();
                     contract.components.push(allocation);
                     if self.index_bytes_per_page > 0 {
                         let bytes = self.index_bytes_per_page;
