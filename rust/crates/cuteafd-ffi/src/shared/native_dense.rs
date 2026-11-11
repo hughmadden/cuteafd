@@ -851,8 +851,7 @@ mod tests {
                     {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]}
         ]});
         fixture.register_programs(&library, manifest["programs"].as_array().unwrap())?;
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().join("PROGRAMS.json");
+        let path = fixture.directory().join("PROGRAMS.json");
         std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
         let programs = library.programs()?.with_manifest(&path)?;
         let names = manifest["programs"].as_array().unwrap();
