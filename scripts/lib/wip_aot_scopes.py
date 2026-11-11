@@ -24,7 +24,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4', minimax_m3='MINIMAX')
 FORMAT_ALIASES = dict(exl3='exl3', tr3='exl3', nvfp4='nvfp4', nvfp4a4='nvfp4',
                       fp8='fp8', mxfp4='fp8', bf16='fp8', native='fp8')
 # Families whose bundled vision tower runs the shared BF16 attention exports
@@ -193,6 +193,8 @@ def family_scopes(cards, config_reader):
                 env['CUTEAFD_WIP_AUDIO_AOT'] = 'ON'
             if count:
                 counts.add(f"muse={count}")
+        if family == 'minimax_m3':
+            env['CUTEAFD_WIP_MINIMAX_AOT'] = 'ON'
         if family == 'mistral_large4':
             # The GLM engine's ml4 variant: its own coordinator programs and K6
             # core (ML4_AOT), EXL3 K4/K5 experts at the card's Spark TP.

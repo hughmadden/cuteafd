@@ -86,7 +86,7 @@ def export_jobs():
     experts.add("qwen4:exl3-k45")
     geometries = [*compare.GEOMETRIES, "kimik3", "muse", "muse2", "ml4",
                   "dense_trellis_k6", "kimi_split", "expert_partial", "expert_reply",
-                  "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense"]
+                  "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense", "minimax"]
     jobs = [("programs", "export_b12x_dsv4_aot.py", [
         "--geometry", ",".join(geometries), "--max-context", "1048576",
         "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on",

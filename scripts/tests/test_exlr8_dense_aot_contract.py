@@ -299,3 +299,78 @@ def test_native_shared_owner_is_family_neutral_and_glm_keeps_its_buffers():
     assert "execution.seal_graph_storage()?" in shared
     assert "w.x.buffer,\n                w.shared.buffer" in engine
     assert "cuteafd_ffi::exlr8::KernelFamily::Glm,\n                devices.len(), rank" in family
+
+
+def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, tmp_path):
+    import json
+    import subprocess
+    import pytest
+    from test_wip_scope_exports import aot, cmake_flags
+
+    native = catalog(monkeypatch, ("minimax",))
+    tree = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
+    branch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                  and ast.unparse(node.test) == "'minimax' in geometries")
+    fake = types.ModuleType("export_b12x_exlr8_dense_aot")
+    fake.minimax_programs = lambda: native
+    monkeypatch.setitem(sys.modules, fake.__name__, fake)
+    namespace = {"geometries": ["minimax"], "manifest": {"families": {}}, "work": []}
+    exec(compile(ast.Module(body=[branch], type_ignores=[]), "dispatch", "exec"), namespace)
+    assert namespace["manifest"]["families"] == {"minimax": {"abi_version": 1}}
+    stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
+                and "kimi_split" in ast.unparse(node.value))
+    names = []
+    for family, suffix, *_ in namespace["work"]:
+        namespace.update(family=family, suffix=suffix)
+        exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
+        names.append(namespace["stem"])
+    assert names == ["exlr8_dense_" + name for name, *_ in native]
+    # MiniMax cannot accidentally enter either pre-existing family scope.
+    scope_node = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "dense_family_scopes")
+    exec(compile(ast.Module(body=[scope_node], type_ignores=[]), "scope", "exec"), namespace)
+    with pytest.raises(ValueError):
+        namespace["dense_family_scopes"]("minimax", None)
+
+    _, scopes = aot.config_scopes(dict(FAMILY="minimax_m3", MODEL_ID="fixture/minimax", SPARK_COUNT="2"))
+    assert scopes["CUTEAFD_WIP_MINIMAX_AOT"] == "ON"
+    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == ""
+    assert scopes.get("CUTEAFD_WIP_EXLR8_AOT", "OFF") == "OFF"
+    assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_MINIMAX_AOT"] == "ON"
+    assert cmake_flags("expert", scopes)["CUTEAFD_ENABLE_MINIMAX_AOT"] == "OFF"
+
+    def load(name, relative):
+        spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    release = load("minimax_release_scope", "scripts/build/release-scope.py")
+    monkeypatch.setattr(release, "scopes_module", lambda _: aot)
+    (tmp_path / "minimax.config").write_text("FAMILY=minimax_m3\nMODEL_ID=fixture/minimax\nSPARK_COUNT=2\n")
+    matrix = tmp_path / "matrix.json"
+    matrix.write_text(json.dumps({"entries": [{"name": "minimax", "family": "minimax_m3", "config": "minimax.config"}]}))
+    derived, _ = release.derive(tmp_path, matrix, "minimax", {})
+    assert derived["CUTEAFD_RELEASE_MINIMAX_AOT"] == "ON"
+    assert derived["CUTEAFD_RELEASE_EXLR8_AOT"] == "OFF"
+    assert release.requirements(tmp_path, matrix, "minimax")[0]["programs"] == ["minimax"]
+    placement = load("minimax_placement_inputs", "scripts/build/export-placement-inputs.py")
+    args = next(args for name, _, args in placement.export_jobs() if name == "programs")
+    assert "minimax" in args[args.index("--geometry") + 1].split(",")
+    assert "minimax" not in args[args.index("--dense-trellis-families") + 1].split(",")
+    assert "minimax" not in args[args.index("--exlr8-family") + 1].split(",")
+
+    (tmp_path / "CMakeLists.txt").write_text("\n".join([
+        "cmake_minimum_required(VERSION 3.18)", "project(minimax_scope NONE)",
+        "set(CUTEAFD_CUDA_ARCHITECTURES 120)", "set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)",
+        "set(CUTEAFD_ENABLE_MINIMAX_AOT ON)",
+        "add_custom_target(cuteafd_verify_sparkinfer_source)",
+        f'include("{ROOT / "native/cmake/shared/dsv4_programs.cmake"}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/scope.json" "${CUTEAFD_PROGRAM_GEOMETRY}|${CUTEAFD_DENSE_TRELLIS_FAMILIES}|${CUTEAFD_EXLR8_FAMILIES}")',
+    ]))
+    build = tmp_path / "build"
+    result = subprocess.run(["cmake", "-S", str(tmp_path), "-B", str(build)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (build / "scope.json").read_text() == "minimax,expert_reply||"
