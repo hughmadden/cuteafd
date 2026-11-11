@@ -7,6 +7,8 @@ use libloading::Library;
 use std::{ffi::c_void, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc};
 
 pub const FP8_MOE_POINTERS: usize = 11;
+pub const FP8_MOE_ABI: u8 = 6;
+pub const FP8_MOE_INFO_WORDS: usize = 18;
 pub const FP8_MOE_LIBRARY: &str = "libcuteafd_fp8moe.so";
 
 /// The expert weight format a package reads (ABI word 0).
@@ -18,7 +20,7 @@ pub enum Fp8MoeWeights {
     Mxfp4,
     /// Storage 4: ModelOpt NVFP4: packed E2M1, E4M3 scales per 16, each
     /// scale region followed by the experts' FP32 `weight_scale_2` and
-    /// `input_scale`. ABI v5 accepts calibrated W4A4 only, at every row count.
+    /// `input_scale`. ABI v6 accepts calibrated W4A4 only, at every row count.
     Nvfp4,
     /// Native BF16 row-major matrices; scale pointers are unused.
     Bf16,
@@ -32,6 +34,8 @@ pub enum Fp8MoeActivation {
     SiluBf16Product = 1,
     /// Clamp FP32 SiLU, multiply in FP32, then round once to BF16.
     SiluPostClampFp32Product = 2,
+    /// Clamp gate/up before gate * sigmoid(alpha * gate) * (up + beta).
+    SwigluOai = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +56,8 @@ pub struct Fp8MoeInfo {
     /// Input rows are FP8 K32 wire rows (Spark) rather than BF16 (coordinator).
     pub wire_input: bool,
     pub swiglu_limit: f32,
+    pub swiglu_alpha: f32,
+    pub swiglu_beta: f32,
     pub activation: Fp8MoeActivation,
     pub projection: Fp8MoeProjection,
     pub capacities: Vec<usize>,
@@ -60,11 +66,14 @@ pub struct Fp8MoeInfo {
 }
 
 impl Fp8MoeInfo {
-    fn from_words(words: [u32; 16]) -> Result<Self> {
+    fn from_words(words: [u32; FP8_MOE_INFO_WORDS]) -> Result<Self> {
         let count = words[9] as usize;
         let [version, format, activation, projection] = words[0].to_le_bytes();
-        ensure!(version == 5 && matches!(format, 1 | 2 | 4 | 5)
-            && matches!(activation, 1 | 2) && !(format == 2 && activation == 2) && projection == 1
+        ensure!(version == FP8_MOE_ABI,
+            "unsupported FP8 expert package ABI {version}; expected ABI{FP8_MOE_ABI} (re-export package)");
+        ensure!(matches!(format, 1 | 2 | 4 | 5)
+            && matches!(activation, 1 | 2 | 3) && !(format == 2 && activation != 1)
+            && (activation != 3 || format == 4) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
@@ -76,9 +85,12 @@ impl Fp8MoeInfo {
             tp: words[6] as usize,
             wire_input: words[7] == 7,
             swiglu_limit: f32::from_bits(words[8]),
+            swiglu_alpha: f32::from_bits(words[16]),
+            swiglu_beta: f32::from_bits(words[17]),
             activation: match activation {
                 1 => Fp8MoeActivation::SiluBf16Product,
-                _ => Fp8MoeActivation::SiluPostClampFp32Product,
+                2 => Fp8MoeActivation::SiluPostClampFp32Product,
+                _ => Fp8MoeActivation::SwigluOai,
             },
             projection: Fp8MoeProjection::Bf16,
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
@@ -107,16 +119,31 @@ impl Fp8MoeInfo {
             && info.capacities.windows(2).all(|w| w[0] < w[1])
             && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
             "inconsistent FP8 expert package info {info:?}");
+        ensure!(info.swiglu_alpha.is_finite() && info.swiglu_beta.is_finite()
+            && if info.activation == Fp8MoeActivation::SwigluOai {
+                info.swiglu_alpha > 0.0 && info.swiglu_limit > 0.0
+            } else { info.swiglu_alpha == 1.0 && info.swiglu_beta == 0.0 },
+            "inconsistent FP8 expert activation parameters {info:?}");
         Ok(info)
     }
 
     /// Check checkpoint semantics on static metadata before allocating device storage.
-    pub fn validate_activation(&self, activation: Fp8MoeActivation, limit: f32,
+    pub fn validate_activation(&self, requested: cuteafd_core::FfnActivation,
         projection: Fp8MoeProjection) -> Result<()> {
-        ensure!(limit.is_finite() && limit >= 0.0 && self.activation == activation
-            && self.swiglu_limit == limit && self.projection == projection,
-            "expert package activation/projection contract disagrees with checkpoint: package {:?}/{:?} limit {}, requested {:?}/{:?} limit {}",
-            self.activation, self.projection, self.swiglu_limit, activation, projection, limit);
+        use cuteafd_core::FfnActivation;
+        requested.validate().map_err(anyhow::Error::msg)?;
+        let (activation, limit, alpha, beta) = match requested {
+            FfnActivation::SiluBf16Product { limit } =>
+                (Fp8MoeActivation::SiluBf16Product, limit.unwrap_or(0.0), 1.0, 0.0),
+            FfnActivation::SiluPostClampFp32Product { limit } =>
+                (Fp8MoeActivation::SiluPostClampFp32Product, limit, 1.0, 0.0),
+            FfnActivation::SwigluOai { alpha, beta, limit } =>
+                (Fp8MoeActivation::SwigluOai, limit, alpha, beta),
+            FfnActivation::Situ { .. } => anyhow::bail!("native FP8 packages do not export Situ activation"),
+        };
+        ensure!(self.activation == activation && self.swiglu_limit == limit
+            && self.swiglu_alpha == alpha && self.swiglu_beta == beta && self.projection == projection,
+            "expert package activation/projection contract disagrees with checkpoint: package {self:?}, requested {requested:?}/{projection:?}");
         Ok(())
     }
 
@@ -294,9 +321,9 @@ impl Fp8MoeMetadata {
             (*library.get::<unsafe extern "C" fn(*mut u32, u32) -> i32>(b"cuteafd_fp8moe_info")?,
                 *library.get::<Scratch>(b"cuteafd_fp8moe_scratch_bytes")?)
         };
-        let mut words = [0u32; 16];
-        // SAFETY: the query fills at most sixteen live words.
-        ensure!(unsafe { query(words.as_mut_ptr(), 16) } == 0,
+        let mut words = [0u32; FP8_MOE_INFO_WORDS];
+        // SAFETY: the query fills at most FP8_MOE_INFO_WORDS live words.
+        ensure!(unsafe { query(words.as_mut_ptr(), FP8_MOE_INFO_WORDS as u32) } == 0,
             "FP8 expert package info query failed");
         let mut metadata = Self::from_words_and_scratch(words, |capacity| {
             let mut bytes = 0u64;
@@ -337,7 +364,7 @@ impl Fp8MoeMetadata {
         Ok(metadata)
     }
 
-    fn from_words_and_scratch(words: [u32; 16], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
+    fn from_words_and_scratch(words: [u32; FP8_MOE_INFO_WORDS], mut query: impl FnMut(usize) -> Result<u64>) -> Result<Self> {
         // Validate exactly the runtime's package contract before querying any
         // workspace extent; this helper does not create CUDA state.
         let info = Fp8MoeInfo::from_words(words)?;
@@ -598,9 +625,9 @@ mod metadata_tests {
         }
     }
 
-    fn words() -> [u32; 16] {
-        // ABI 5, MXFP4, pre-SiLU clamp, BF16 projection and input.
-        [0x01010205, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0]
+    fn words() -> [u32; FP8_MOE_INFO_WORDS] {
+        // ABI 6, MXFP4, pre-SiLU clamp, BF16 projection and input.
+        [0x01010206, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0, 1.0f32.to_bits(), 0]
     }
 
     #[test]
@@ -608,20 +635,20 @@ mod metadata_tests {
         for format in [1, 2, 4, 5] {
             for activation in [1, 2] {
                 let mut w = words();
-                w[0] = 5 | format << 8 | activation << 16 | 1 << 24;
+                w[0] = 6 | format << 8 | activation << 16 | 1 << 24;
                 w[8] = 7.0f32.to_bits();
                 if format == 2 && activation == 2 {
                     assert!(Fp8MoeInfo::from_words(w).is_err());
                     continue;
                 }
                 let info = Fp8MoeInfo::from_words(w).unwrap();
-                let requested = if activation == 1 { Fp8MoeActivation::SiluBf16Product }
-                    else { Fp8MoeActivation::SiluPostClampFp32Product };
-                info.validate_activation(requested, 7.0, Fp8MoeProjection::Bf16).unwrap();
-                assert!(info.validate_activation(requested, 2.0, Fp8MoeProjection::Bf16).is_err());
+                let requested = if activation == 1 { cuteafd_core::FfnActivation::SiluBf16Product { limit: Some(7.0) } }
+                    else { cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit: 7.0 } };
+                info.validate_activation(requested, Fp8MoeProjection::Bf16).unwrap();
+                assert!(info.validate_activation(cuteafd_core::FfnActivation::SiluBf16Product { limit: Some(2.0) }, Fp8MoeProjection::Bf16).is_err());
                 if activation == 1 {
-                    assert!(info.validate_activation(Fp8MoeActivation::SiluPostClampFp32Product,
-                        7.0, Fp8MoeProjection::Bf16).is_err());
+                    assert!(info.validate_activation(cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit: 7.0 },
+                        Fp8MoeProjection::Bf16).is_err());
                 }
             }
         }
@@ -635,6 +662,35 @@ mod metadata_tests {
             w[8] = limit.to_bits();
             assert!(Fp8MoeInfo::from_words(w).is_err());
         }
+    }
+
+    #[test]
+    fn oai_parameters_are_explicit_and_checked_before_workspace() {
+        let mut w = words();
+        w[0] = 6 | 4 << 8 | 3 << 16 | 1 << 24;
+        w[8] = 7.0f32.to_bits();
+        w[16] = 1.702f32.to_bits();
+        w[17] = 1.0f32.to_bits();
+        let requested = cuteafd_core::FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 };
+        let info = Fp8MoeInfo::from_words(w).unwrap();
+        info.validate_activation(requested, Fp8MoeProjection::Bf16).unwrap();
+        for (field, value) in [(8, 0.0), (16, 0.0), (16, f32::NAN), (17, f32::INFINITY)] {
+            let mut bad = w;
+            bad[field] = value.to_bits();
+            assert!(Fp8MoeMetadata::from_words_and_scratch(bad, |_| panic!("invalid params queried scratch")).is_err());
+        }
+        for (field, value) in [(8, 6.0f32), (16, 1.5), (17, 0.0)] {
+            let mut other = w;
+            other[field] = value.to_bits();
+            assert!(Fp8MoeInfo::from_words(other).unwrap().validate_activation(requested, Fp8MoeProjection::Bf16).is_err());
+        }
+        let mut old = w;
+        old[0] = (old[0] & !255) | 5;
+        assert!(Fp8MoeMetadata::from_words_and_scratch(old, |_| panic!("old ABI queried scratch")).unwrap_err()
+            .to_string().contains("expected ABI6"));
+        let mut legacy = words();
+        legacy[17] = 1.0f32.to_bits();
+        assert!(Fp8MoeInfo::from_words(legacy).is_err());
     }
 
     #[test]
@@ -663,7 +719,7 @@ mod metadata_tests {
         for format in [1, 4, 5] {
             for (tp, width) in [(6, 320), (6, 352), (3, 672), (3, 704)] {
                 let mut w = words();
-                w[0] = 5 | format << 8 | 1 << 16 | 1 << 24;
+                w[0] = 6 | format << 8 | 1 << 16 | 1 << 24;
                 w[2] = width;
                 w[6] = tp;
                 assert!(Fp8MoeInfo::from_words(w).is_err());

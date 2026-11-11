@@ -275,6 +275,9 @@ impl Family for MiniMaxM3 {
 }
 
 impl FamilyModel for Model {
+    fn activation(&self, _layer: usize, _shared: bool) -> Option<cuteafd_core::FfnActivation> {
+        Some(self.cfg.activation())
+    }
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         let contract = self.contract(stem)

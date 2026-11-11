@@ -9,6 +9,9 @@ pub enum FfnActivation {
     /// Step-5: clamp SiLU(gate) from above and up symmetrically in FP32,
     /// multiply in FP32, then round once to BF16.
     SiluPostClampFp32Product { limit: f32 },
+    /// Gate capped above limit, up clamped symmetrically, then FP32
+    /// gate * sigmoid(alpha * gate) * (up + beta), rounded once to BF16.
+    SwigluOai { alpha: f32, beta: f32, limit: f32 },
     /// Kimi K3 (`hidden_act=situ`): in FP32,
     /// `beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta)`,
     /// rounded once to BF16. `linear_beta` absent leaves `up` unbounded.
@@ -23,6 +26,8 @@ impl FfnActivation {
                 Err("FFN activation limit must be finite and positive"),
             Self::SiluPostClampFp32Product { limit } if bad(limit) =>
                 Err("FFN activation limit must be finite and positive"),
+            Self::SwigluOai { alpha, beta, limit } if bad(alpha) || !beta.is_finite() || bad(limit) =>
+                Err("SwiGLU-OAI requires finite beta and positive finite alpha/limit"),
             Self::Situ { beta, linear_beta } if bad(beta) || linear_beta.is_some_and(bad) =>
                 Err("Situ beta values must be finite and positive"),
             _ => Ok(self),
@@ -40,6 +45,10 @@ impl FfnActivation {
             }
             Self::SiluPostClampFp32Product { limit } => {
                 bf16((gate / (1.0 + (-gate).exp())).min(limit) * up.clamp(-limit, limit))
+            }
+            Self::SwigluOai { alpha, beta, limit } => {
+                let gate = gate.min(limit);
+                bf16(gate / (1.0 + (-alpha * gate).exp()) * (up.clamp(-limit, limit) + beta))
             }
             Self::Situ { beta, linear_beta } => {
                 let gate = beta * (gate / beta).tanh() / (1.0 + (-gate).exp());
@@ -106,6 +115,26 @@ mod tests {
             assert!(FfnActivation::Situ { beta: 4.0, linear_beta: Some(limit) }.validate().is_err());
         }
         assert!(FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) }.validate().is_ok());
+    }
+
+    #[test]
+    fn oai_matches_clamped_reference_and_validates_parameters() {
+        let oai = FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: 7.0 };
+        for gate in [-80.0f32, -8.0, -1.0, 0.0, 1.0, 7.0, 80.0] {
+            for up in [-80.0f32, -7.0, -1.0, 0.0, 7.0, 80.0] {
+                let g = gate.min(7.0);
+                let expected = bf16(g / (1.0 + (-1.702 * g).exp()) * (up.clamp(-7.0, 7.0) + 1.0));
+                assert_eq!(oai.evaluate(gate, up).to_bits(), expected.to_bits());
+            }
+        }
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(FfnActivation::SwigluOai { alpha: bad, beta: 1.0, limit: 7.0 }.validate().is_err());
+            assert!(FfnActivation::SwigluOai { alpha: 1.702, beta: 1.0, limit: bad }.validate().is_err());
+        }
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert!(FfnActivation::SwigluOai { alpha: 1.702, beta: bad, limit: 7.0 }.validate().is_err());
+        }
+        assert!(FfnActivation::SwigluOai { alpha: 1.702, beta: -1.0, limit: 7.0 }.validate().is_ok());
     }
 
     #[test]

@@ -24,13 +24,14 @@ capacity, and a verified ``manifest.json``:
 Library ABI (``native/shared/include/cuteafd_fp8_moe.h``)::
 
     int32_t cuteafd_fp8moe_info(uint32_t* words, uint32_t count);
-        words: [0] bytes [version=5, storage, activation, projection]. Storage:
+        words: [0] bytes [version=6, storage, activation, projection]. Storage:
         1 FP8 block128, 2 MXFP4, 4 NVFP4 W4A4, 5 BF16 (no scales).
         Activation: 1 pre-SiLU clamp/BF16 intermediate, 2 post-SiLU clamp/FP32
         product. Projection: 1 BF16 gate/up and down. All bytes are mandatory.
         [1] hidden, [2] slice, [3] experts, [4] top-k,
         [5] intermediate, [6] tp, [7] input dtype (7 = FP8 K32 wire rows, 1 = BF16 rows),
-        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..] capacities
+        [8] SwiGLU limit (FP32 bits, 0 = none), [9] capacities n, [10..16) capacities
+        [16] alpha (FP32 bits), [17] beta (FP32 bits); neutral 1/0 for SiLU.
     int32_t cuteafd_fp8moe_scratch_bytes(uint32_t capacity, uint64_t* bytes);
     int32_t cuteafd_fp8moe_create(void** context);           // loads every program on the current device
     int32_t cuteafd_fp8moe_launch(void* context, uint32_t capacity, void* const* pointers,
@@ -72,9 +73,9 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
-ABI_VERSION = 5
+ABI_VERSION = 6
 STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
-ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
+ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
 # Spark ranks take the FP8 K32 wire rows of the expert protocol; coordinator
@@ -92,7 +93,7 @@ def input_kind(role: str, weights: str, requested: str | None = None) -> str:
 
 LIBRARY = "libcuteafd_fp8moe.so"
 POINTERS = 11
-INFO_WORDS = 16
+INFO_WORDS = 18
 # Large-row program forms, in cuteafd_fp8moe_set_options order.
 FORMS = ("auto", "w8a16", "w8a8")
 SEGMENT_MAX_ROWS = 4 * 4096
@@ -496,6 +497,21 @@ def layout_geometry(base, layout: str):
     return tp, g
 
 
+def activation_params(activation, weights, alpha, beta, limit) -> tuple[float, float]:
+    import math
+
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("SwiGLU limit must be finite and nonnegative")
+    if activation == "swigluoai":
+        if (weights != "nvfp4" or alpha is None or beta is None
+                or not math.isfinite(alpha) or alpha <= 0 or not math.isfinite(beta) or limit <= 0):
+            raise ValueError("SwiGLU-OAI requires native NVFP4, positive finite alpha/limit and finite beta")
+        return float(alpha), float(beta)
+    if alpha not in (None, 1.0) or beta not in (None, 0.0):
+        raise ValueError("SiLU requires neutral alpha=1 and beta=0")
+    return 1.0, 0.0
+
+
 def info_words(g, capacities: list[int], wire: bool) -> list[int]:
     limit = struct.unpack("<I", struct.pack("<f", float(g.swiglu_limit)))[0]
     import math
@@ -510,12 +526,15 @@ def info_words(g, capacities: list[int], wire: bool) -> list[int]:
         raise ValueError("NVFP4/BF16 packages require BF16 input")
     if not capacities or any(c <= 0 or c > 0x7fffffff for c in capacities) or capacities != sorted(set(capacities)):
         raise ValueError("capacities must be positive, strictly increasing int32 values")
+    alpha, beta = activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                                    getattr(g, "swiglu_beta", None), g.swiglu_limit)
     contract = ABI_VERSION | STORAGE[g.kind] << 8 | ACTIVATION[g.activation] << 16 | PROJECTION[g.projection] << 24
     words = [contract, g.hidden, g.slice, g.experts, g.top_k, g.intermediate, g.tp, 7 if wire else 1, limit,
              len(capacities), *capacities]
-    if len(words) > INFO_WORDS:
-        raise ValueError(f"at most {INFO_WORDS - 10} capacities per package")
-    return words + [0] * (INFO_WORDS - len(words))
+    if len(words) > 16:
+        raise ValueError("at most 6 capacities per package")
+    params = [struct.unpack("<I", struct.pack("<f", value))[0] for value in (alpha, beta)]
+    return words + [0] * (16 - len(words)) + params
 
 
 def build(args: argparse.Namespace) -> None:
@@ -581,7 +600,9 @@ def build(args: argparse.Namespace) -> None:
             # TP is inspection metadata; kernels, routes and scratch use slice.
             # Preserve a distinct bridge (and its TP info word) per destination.
             compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
-                           g.activation, g.projection, g.swiglu_limit, ABI_VERSION,
+                           g.activation, g.projection, g.swiglu_limit,
+                           *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
+                                              getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
                            _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
                            os.environ.get("CUTEAFD_BUILD_KIND", "development"))
             identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
@@ -650,6 +671,8 @@ def build(args: argparse.Namespace) -> None:
                 "tp": tp, "hidden": g.hidden, "slice": g.slice, "experts": g.experts, "top_k": g.top_k,
                 "intermediate": g.intermediate, "swiglu_limit": g.swiglu_limit, "input": "wire" if wire else "bf16",
                 "weights": g.weights, "activation": g.activation, "projection": g.projection, "abi_version": ABI_VERSION,
+                **dict(zip(("swiglu_alpha", "swiglu_beta"), activation_params(g.activation, g.weights,
+                    getattr(g, "swiglu_alpha", None), getattr(g, "swiglu_beta", None), g.swiglu_limit))),
                 "arithmetic_routes": [{"capacity": p["capacity"], "form": p["form"],
                                         "segments": p["arithmetic_routes"]} for p in programs if not p.get("core_only", False)],
                 "weight_read_grouping": [{"capacity": p["capacity"], "form": p["form"],
@@ -692,6 +715,10 @@ def verify(package: Path, *, revision: str | None = None, role: str | None = Non
         info = layouts[name]
         if info.get("abi_version") != ABI_VERSION or info.get("activation") not in ACTIVATION or info.get("projection") not in PROJECTION:
             raise ValueError(f"{package}/{name}: missing or unknown expert activation/projection ABI")
+        if not all(key in info for key in ("swiglu_alpha", "swiglu_beta", "swiglu_limit")):
+            raise ValueError(f"{package}/{name}: missing explicit activation parameters")
+        activation_params(info["activation"], info.get("weights"), info["swiglu_alpha"],
+                          info["swiglu_beta"], info["swiglu_limit"])
         if info.get("weights") == "mxfp4" and info["activation"] != "silu_bf16_product":
             raise ValueError(f"{package}/{name}: MXFP4 supports only the pre-SiLU activation contract")
         if info.get("weights") in ("nvfp4", "bf16") and info.get("input") != "bf16":

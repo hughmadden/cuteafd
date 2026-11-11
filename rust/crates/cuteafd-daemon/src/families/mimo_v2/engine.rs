@@ -3990,7 +3990,7 @@ mod tests {
     fn narrow_prefill_expert_storage_covers_every_decode_descriptor_and_native_program() {
         use cuteafd_ffi::fp8_moe::{Fp8MoeInfo, Fp8MoeWeights};
         let info = Fp8MoeInfo { hidden: 4096, slice: 2048, experts: 256, topk: 8,
-            intermediate: 2048, tp: 1, wire_input: false, swiglu_limit: 0.0,
+            intermediate: 2048, tp: 1, wire_input: false, swiglu_limit: 0.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
             capacities: vec![16, 64, 4096], weights: Fp8MoeWeights::Fp8 };

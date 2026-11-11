@@ -246,6 +246,12 @@ impl MiniMaxM3Config {
         Ok(())
     }
 
+    pub fn activation(&self) -> cuteafd_core::FfnActivation {
+        cuteafd_core::FfnActivation::SwigluOai {
+            alpha: self.swiglu_alpha as f32, beta: 1.0, limit: self.swiglu_limit as f32,
+        }
+    }
+
     pub fn moe_layers(&self) -> usize { self.moe.iter().filter(|m| **m).count() }
 
     /// KV heads' query group width.

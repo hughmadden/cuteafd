@@ -142,6 +142,8 @@ pub struct Fp8ExpertTensors {
     /// Next) rather than as decoder layers past the backbone: layer
     /// `shape.layers + s` names them.
     mtp_layers: bool,
+    /// Compressed-tensors names and divisor globals, attested by config and headers.
+    compressed_nvfp4: bool,
     format: ExpertFormat,
     tensors: Arc<HashMap<String, Located>>,
     activations: Vec<cuteafd_core::FfnActivation>,
@@ -263,11 +265,35 @@ impl Fp8ExpertTensors {
     }
 
     pub fn name(&self, layer: usize, expert: usize, projection: Fp8Projection) -> String {
+        if self.compressed_nvfp4 {
+            let stem = match projection { Fp8Projection::Gate => "w1", Fp8Projection::Up => "w3", Fp8Projection::Down => "w2" };
+            return format!("{}layers.{layer}.block_sparse_moe.experts.{expert}.{stem}.weight_packed", self.prefix);
+        }
         if self.mtp_layers && layer >= self.shape.layers {
             let stage = layer - self.shape.layers;
             return format!("mtp.layers.{stage}.mlp.experts.{expert}.{}.weight", projection.stem());
         }
         format!("{}layers.{layer}.mlp.experts.{expert}.{}.weight", self.prefix, projection.stem())
+    }
+
+    fn scale_name(&self, weight: &str) -> String {
+        if self.compressed_nvfp4 {
+            format!("{}.weight_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
+        } else {
+            format!("{weight}{}", if self.tensors.get(weight).map_or(self.format.packed_fp4(), |t| matches!(t.dtype, DType::U8 | DType::I8)) { "_scale" } else { "_scale_inv" })
+        }
+    }
+
+    fn alpha_name(&self, weight: &str) -> String {
+        if self.compressed_nvfp4 {
+            format!("{}.weight_global_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
+        } else { format!("{weight}_scale_2") }
+    }
+
+    fn activation_scale_name(&self, weight: &str) -> String {
+        if self.compressed_nvfp4 {
+            format!("{}.input_global_scale", weight.strip_suffix(".weight_packed").expect("packed weight name"))
+        } else { input_scale_name(weight) }
     }
 
     /// Reads the index and every shard header holding routed experts; checks
@@ -298,7 +324,20 @@ impl Fp8ExpertTensors {
         let index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?;
         let weight_map: BTreeMap<String, String> = serde_json::from_value(
             index.get("weight_map").cloned().context("index has no weight_map")?)?;
-        let prefix = if weight_map.keys().any(|name| name.starts_with("model.language_model.layers.")) {
+        let checkpoint = crate::plan::checkpoint::Checkpoint::inventory(snapshot)?;
+        let quant = checkpoint.quantization();
+        let recipe = quant.map(|root| root.get("quantization").unwrap_or(root));
+        let compressed_nvfp4 = recipe.is_some_and(|q|
+            q.get("moe_quant_format").and_then(serde_json::Value::as_str) == Some("nvfp4-pack-quantized"));
+        if compressed_nvfp4 {
+            let q = recipe.expect("quantization recipe");
+            ensure!(q.get("moe_quant_algo").and_then(serde_json::Value::as_str) == Some("NVFP4")
+                && q.get("group_size").and_then(serde_json::Value::as_u64) == Some(16),
+                "compressed expert format requires NVFP4 with group_size=16");
+        }
+        let prefix = if weight_map.keys().any(|name| name.starts_with("language_model.model.layers.")) {
+            "language_model.model."
+        } else if weight_map.keys().any(|name| name.starts_with("model.language_model.layers.")) {
             "model.language_model."
         } else {
             "model."
@@ -309,7 +348,7 @@ impl Fp8ExpertTensors {
                 .and_then(|n| n.split('.').next()).and_then(|n| n.parse::<usize>().ok())
                 .or_else(|| name.strip_prefix("mtp.layers.").and_then(|n| n.split('.').next())
                     .and_then(|n| n.parse::<usize>().ok()).and_then(|s| shape.layers.checked_add(s)));
-            (name.contains(".mlp.experts.") || stacked_projection(name, prefix).is_some())
+            (name.contains(".mlp.experts.") || (compressed_nvfp4 && name.contains(".block_sparse_moe.experts.")) || stacked_projection(name, prefix).is_some())
                 && layer.is_some_and(|layer| layers.is_none_or(|selected| selected.contains(&layer)))
         };
         let shards: std::collections::BTreeSet<&String> =
@@ -348,14 +387,17 @@ impl Fp8ExpertTensors {
                 }
             }
         }
-        let checkpoint = crate::plan::checkpoint::Checkpoint::inventory(snapshot)?;
         let activations = match crate::plan::family::detect(&checkpoint) {
             Some(family) if family.id() == "step5" => {
                 crate::plan::families::step5::Config::parse(&checkpoint)?.activation
             }
+            Some(family) if family.id() == "minimax_m3" => {
+                let cfg = crate::families::minimax_m3::config::MiniMaxM3Config::from_hf(&checkpoint.config)?;
+                vec![cfg.activation(); cfg.layers]
+            }
             _ => Vec::new(),
         };
-        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
+        let mut catalog = Self { reader: Default::default(), snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers, compressed_nvfp4,
             format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
             slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
@@ -365,15 +407,15 @@ impl Fp8ExpertTensors {
         }
         if matches!(catalog.located(&first)?.dtype, DType::U8 | DType::I8) {
             // E4M3 scales with a second-level FP32 scale: ModelOpt NVFP4; UE8M0 ones: MXFP4.
-            let nvfp4 = catalog.tensors.get(&format!("{first}_scale")).is_some_and(|s| s.dtype == DType::F8E4M3)
-                && catalog.tensors.contains_key(&format!("{first}_scale_2"));
+            let nvfp4 = catalog.tensors.get(&catalog.scale_name(&first)).is_some_and(|s| s.dtype == DType::F8E4M3)
+                && catalog.tensors.contains_key(&catalog.alpha_name(&first));
             catalog.format = if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 };
         }
-        for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight")) {
+        for name in catalog.tensors.keys().filter(|name| name.ends_with(".weight") || name.ends_with(".weight_packed")) {
             use crate::plan::checkpoint::ModuleNumerics;
             let source = source_names.get(name).map(String::as_str).unwrap_or(name);
             let numerics = checkpoint.module_numerics_with_header(source, catalog.tensors[name].dtype.clone())?;
-            let nvfp4 = catalog.tensors.contains_key(&format!("{name}_scale_2"));
+            let nvfp4 = catalog.tensors.contains_key(&catalog.alpha_name(name));
             match numerics {
                 ModuleNumerics::W4A4 => ensure!(nvfp4, "{name}: declared W4A4 needs native NVFP4 weights"),
                 ModuleNumerics::W8A8 => {
@@ -394,6 +436,11 @@ impl Fp8ExpertTensors {
         // One expert of the first routed layer fixes the format contract.
         for projection in Fp8Projection::ALL {
             catalog.check(first_layer, 0, projection)?;
+            if compressed_nvfp4 {
+                let name = catalog.activation_scale_name(&catalog.name(first_layer, 0, projection));
+                let scale = catalog.located(&name)?;
+                ensure!(scale.dtype == DType::F32 && scale.bytes == 4, "{name}: expected one FP32 input scale");
+            }
         }
         Ok(catalog)
     }
@@ -456,9 +503,9 @@ impl Fp8ExpertTensors {
         match &self.located(&first)?.dtype {
             DType::F8E4M3 => Ok(ExpertFormat::Fp8Block128),
             DType::U8 | DType::I8 => {
-                let nvfp4 = self.tensors.get(&format!("{first}_scale"))
+                let nvfp4 = self.tensors.get(&self.scale_name(&first))
                     .is_some_and(|s| s.dtype == DType::F8E4M3)
-                    && self.tensors.contains_key(&format!("{first}_scale_2"));
+                    && self.tensors.contains_key(&self.alpha_name(&first));
                 Ok(if nvfp4 { ExpertFormat::Nvfp4 } else { ExpertFormat::Mxfp4 })
             }
             DType::Bf16 => Ok(ExpertFormat::Bf16),
@@ -517,7 +564,7 @@ impl Fp8ExpertTensors {
             for projection in Fp8Projection::ALL {
                 self.check(layer, expert, projection)?;
                 if self.format == ExpertFormat::Nvfp4 {
-                    let name = input_scale_name(&self.name(layer, expert, projection));
+                    let name = self.activation_scale_name(&self.name(layer, expert, projection));
                     let scale = self.located(&name)?;
                     ensure!(scale.dtype == DType::F32 && scale.bytes == 4,
                         "{name}: expected one FP32 input scale, found {:?} {:?}", scale.dtype, scale.shape);
@@ -553,11 +600,11 @@ impl Fp8ExpertTensors {
         if self.format == ExpertFormat::Nvfp4 {
             ensure!(weight.dtype == DType::U8 && weight.shape == [rows, cols / 2] && cols % 16 == 0,
                 "{name}: expected packed E2M1 U8 [{rows}, {}], found {:?} {:?}", cols / 2, weight.dtype, weight.shape);
-            let scale = self.located(&format!("{name}_scale"))?;
+            let scale = self.located(&self.scale_name(&name))?;
             ensure!(scale.dtype == DType::F8E4M3 && scale.shape == [rows, cols / 16],
                 "{name}_scale: expected E4M3 [{rows}, {}] (16 values per scale, linear), found {:?} {:?}", cols / 16,
                 scale.dtype, scale.shape);
-            let alpha = self.located(&format!("{name}_scale_2"))?;
+            let alpha = self.located(&self.alpha_name(&name))?;
             ensure!(alpha.dtype == DType::F32 && alpha.bytes == 4,
                 "{name}_scale_2: expected one FP32 value, found {:?} {:?}", alpha.dtype, alpha.shape);
             return Ok(());
@@ -565,7 +612,7 @@ impl Fp8ExpertTensors {
         if self.format == ExpertFormat::Mxfp4 {
             ensure!(matches!(weight.dtype, DType::U8 | DType::I8) && weight.shape == [rows, cols / 2] && cols % 32 == 0,
                 "{name}: expected packed E2M1 U8 [{rows}, {}], found {:?} {:?}", cols / 2, weight.dtype, weight.shape);
-            let scale = self.located(&format!("{name}_scale"))?;
+            let scale = self.located(&self.scale_name(&name))?;
             ensure!(matches!(scale.dtype, DType::U8 | DType::F8E8M0) && scale.shape == [rows, cols / 32],
                 "{name}_scale: expected UE8M0 [{rows}, {}], found {:?} {:?}", cols / 32, scale.dtype, scale.shape);
             return Ok(());
@@ -650,7 +697,7 @@ impl Fp8ExpertTensors {
                 reader_staging = reader_staging.max(usize::try_from(weight.bytes)?);
             }
             if self.format.packed_fp4() {
-                let scale = self.located(&format!("{name}_scale"))?;
+                let scale = self.located(&self.scale_name(&name))?;
                 if projection == Fp8Projection::Down {
                     reader_staging = reader_staging.max(usize::try_from(scale.bytes)?);
                 }
@@ -750,13 +797,13 @@ impl Fp8ExpertTensors {
 
     /// An NVFP4 projection's `weight_scale_2` (alpha); 1 for the other formats.
     pub fn read_alpha(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
-        self.read_scalar(&format!("{}_scale_2", self.name(layer, expert, projection)))
+        self.read_scalar(&self.alpha_name(&self.name(layer, expert, projection)))
     }
 
     /// An NVFP4 projection's static activation scale (`input_scale`, the W4A4
     /// recipe's); 1 for the other formats.
     pub fn read_input_scale(&self, layer: usize, expert: usize, projection: Fp8Projection) -> Result<f32> {
-        self.read_scalar(&input_scale_name(&self.name(layer, expert, projection)))
+        self.read_scalar(&self.activation_scale_name(&self.name(layer, expert, projection)))
     }
 
     /// The W4A4 FC1 kernel quantizes a step's activations once, with the gate
@@ -784,7 +831,10 @@ impl Fp8ExpertTensors {
         }
         let value = f32::from_le_bytes(self.read_scalar_bytes(name)?);
         ensure!(value.is_finite() && value > 0.0, "{name}: {value} is not a positive finite scale");
-        Ok(value)
+        let multiplier = if self.compressed_nvfp4 { value.recip() } else { value };
+        ensure!(multiplier.is_finite() && multiplier > 0.0,
+            "{name}: reciprocal scale {multiplier} is not positive and finite");
+        Ok(multiplier)
     }
 
     /// The raw bytes of one FP32 scalar tensor, so a comparison is bit-exact.
@@ -823,8 +873,7 @@ impl Fp8ExpertTensors {
             self.reader.open(&self.snapshot.join(&w.shard))?.read_exact_at(weight, w.offset)?;
             return Ok(weight.len());
         }
-        let suffix = if self.format.packed_fp4() { "_scale" } else { "_scale_inv" };
-        let s = self.located(&format!("{name}{suffix}"))?;
+        let s = self.located(&self.scale_name(&name))?;
         let read = |located: &Located, out: &mut [u8]| -> Result<()> {
             self.reader.open(&self.snapshot.join(&located.shard))?.read_exact_at(out, located.offset)
                 .with_context(|| format!("reading shared projection {name}"))
@@ -890,7 +939,7 @@ impl Fp8ExpertTensors {
         let slice = self.rank_width(tp, rank, slicing)?;
         let (first, len) = self.rank_range_with(tp, rank, slicing)?;
         let w = self.located(name)?;
-        let s = self.located(&format!("{name}_scale"))?;
+        let s = self.located(&self.scale_name(&name))?;
         let open = |shard: &str| self.reader.open(&self.snapshot.join(shard));
         let (w_file, s_file) = (open(&w.shard)?, open(&s.shard)?);
         weight.fill(0);
@@ -1019,7 +1068,7 @@ mod tests {
     fn catalog(format: ExpertFormat, intermediate: usize) -> Fp8ExpertTensors {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
-        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
+        Fp8ExpertTensors { reader: Default::default(), snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, compressed_nvfp4: false, format,
             tensors: Arc::new(HashMap::new()), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 
@@ -1410,6 +1459,68 @@ mod tests {
                 file.write_all_at(&scales(expert, projection).to_le_bytes(), at).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn compressed_nvfp4_uses_checkpoint_names_and_divisor_globals() {
+        use crate::plan::testing::{t, write_snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let mut headers = Vec::new();
+        for stem in ["w1", "w3", "w2"] {
+            let name = format!("language_model.model.layers.0.block_sparse_moe.experts.0.{stem}");
+            headers.extend([t(format!("{name}.weight_packed"), "U8", &[128, 64]),
+                t(format!("{name}.weight_scale"), "F8_E4M3", &[128, 8]),
+                t(format!("{name}.weight_global_scale"), "F32", &[]),
+                t(format!("{name}.input_global_scale"), "F32", &[])]);
+        }
+        let config = serde_json::json!({"quantization_config":{
+            "quant_method":"mxfp8", "activation_scheme":"dynamic", "weight_block_size":[1,32],
+            "moe_quant_algo":"NVFP4", "moe_quant_format":"nvfp4-pack-quantized", "group_size":16}});
+        write_snapshot(dir.path(), &config, &headers, None);
+        let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 1, topk: 1,
+            hidden: 128, intermediate: 128, draft_stages: 0, draft_experts: 0 };
+        let tensors = Fp8ExpertTensors::read(dir.path(), shape).unwrap();
+        assert_eq!(tensors.format(), ExpertFormat::Nvfp4);
+        tensors.validate_layer(0).unwrap();
+        for projection in Fp8Projection::ALL {
+            let name = tensors.name(0, 0, projection);
+            assert!(name.ends_with(".weight_packed"));
+            let write_scalar = |name: &str, value: f32| {
+                let loc = tensors.located(name).unwrap();
+                std::fs::File::options().write(true).open(dir.path().join(&loc.shard)).unwrap()
+                    .write_all_at(&value.to_le_bytes(), loc.offset).unwrap();
+            };
+            write_scalar(&tensors.alpha_name(&name), 4.0);
+            write_scalar(&tensors.activation_scale_name(&name), 8.0);
+            assert_eq!(tensors.read_alpha(0, 0, projection).unwrap(), 0.25);
+            assert_eq!(tensors.read_input_scale(0, 0, projection).unwrap(), 0.125);
+            let sizes = tensors.projection_bytes(projection);
+            let (mut weights, mut scales) = (vec![0; sizes.0], vec![0; sizes.1]);
+            tensors.read_projection_once(0, 0, projection, &mut weights, &mut scales).unwrap();
+            assert_eq!(&scales[sizes.1 - 8..], [0.25f32.to_le_bytes(), 0.125f32.to_le_bytes()].concat());
+            for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, f32::from_bits(1)] {
+                write_scalar(&tensors.alpha_name(&name), bad);
+                assert!(tensors.read_alpha(0, 0, projection).is_err());
+            }
+        }
+        let mut missing = config.clone();
+        missing["quantization_config"]["moe_quant_format"] = serde_json::Value::Null;
+        std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&missing).unwrap()).unwrap();
+        assert!(Fp8ExpertTensors::read(dir.path(), shape).is_err());
+    }
+
+    #[test]
+    fn modelopt_nvfp4_names_and_multiplier_bits_stay_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let tensors = nvfp4_snapshot(dir.path(), 2);
+        assert!(!tensors.compressed_nvfp4);
+        write_input_scales(&tensors, |_, _| 0.3);
+        let name = tensors.name(0, 0, Fp8Projection::Gate);
+        assert_eq!(name, "model.layers.0.mlp.experts.0.gate_proj.weight");
+        assert_eq!(tensors.scale_name(&name), format!("{name}_scale"));
+        assert_eq!(tensors.alpha_name(&name), format!("{name}_scale_2"));
+        assert_eq!(tensors.activation_scale_name(&name), "model.layers.0.mlp.experts.0.gate_proj.input_scale");
+        assert_eq!(tensors.read_input_scale(0, 0, Fp8Projection::Gate).unwrap().to_bits(), 0.3f32.to_bits());
     }
 
     #[test]
