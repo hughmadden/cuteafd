@@ -146,7 +146,11 @@ fn glm_flash_native_core_plan(bits: usize) {
     }
     let dir = snapshot(config, &tensors);
     let report = plan(dir.path(), &PlanOptions::default()).unwrap();
-    assert!(report.executable(), "{}", render(&report));
+    // Header admission is independent of installed workspace exports. The CLI
+    // fixture check covers full placement with the matching PROGRAMS.json.
+    for component in &report.components {
+        assert_eq!(component.rejected, 0, "{}", render(&report));
+    }
     let checkpoint = Checkpoint::open(dir.path()).unwrap();
     let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
     assert_eq!(core.projections.len(), shapes.len());
