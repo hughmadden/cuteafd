@@ -1619,7 +1619,9 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
         if name.startswith(('fp8/', 'bf16/')):
             assert extra[extra.index('--capacities') + 1] == publisher.fp8_capacities()
         elif name.startswith('exl3/'):
-            assert extra[extra.index('--capacities') + 1] == compare_sm.EXL3_CAPACITIES
+            expected = (compare_sm.EXL3_CAPACITIES_KIMIK3 if name == 'exl3/exl3-kimik3-k23'
+                        else compare_sm.EXL3_CAPACITIES)
+            assert extra[extra.index('--capacities') + 1] == expected
         if name.startswith('v41-'):
             assert extra[extra.index('--rows') + 1] == (
                 compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
@@ -1641,14 +1643,16 @@ def test_native_placement_jobs_follow_fp8_recipe_not_exl3_policy(monkeypatch):
     capacities = publisher.fp8_capacities()
     assert 1 <= len(capacities.split(',')) <= 6
     assert capacities != compare_sm.EXL3_CAPACITIES
+    exl3_before = {name: extra[extra.index('--capacities') + 1]
+                   for name, _, extra in publisher.export_jobs() if name.startswith('exl3/')}
     changed = '1,16,80,4096'
     monkeypatch.setattr(publisher, 'fp8_capacities', lambda root: changed)
     jobs = publisher.export_jobs()
     native = [extra for name, _, extra in jobs if name.startswith(('fp8/', 'bf16/'))]
     assert native
     assert all(extra[extra.index('--capacities') + 1] == changed for extra in native)
-    assert all(extra[extra.index('--capacities') + 1] == compare_sm.EXL3_CAPACITIES
-               for name, _, extra in jobs if name.startswith('exl3/'))
+    assert {name: extra[extra.index('--capacities') + 1]
+            for name, _, extra in jobs if name.startswith('exl3/')} == exl3_before
 
 
 @pytest.mark.parametrize('recipe', [
