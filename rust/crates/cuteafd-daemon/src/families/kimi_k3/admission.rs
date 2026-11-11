@@ -652,10 +652,12 @@ impl<'a> Admission<'a> {
         ensure!(rank < self.devices.len() && device == self.devices[rank], "Kimi MLA allocation differs from admitted device");
         ensure!(!self.mla_allocated[rank], "Kimi MLA bank already allocated");
         let layout = &self.mla_layouts[rank];
-        let charges = self.placement.items[rank].iter().filter(|item| item.group == "records").collect::<Vec<_>>();
+        let charges = self.placement.items[rank].iter().filter(|item|
+            matches!(item.group.as_str(), "records" | "index records")).collect::<Vec<_>>();
         ensure!(if layout.bytes() == 0 { charges.is_empty() } else {
-            charges.len() == 1 && charges[0].category == Category::Kv
-                && charges[0].basis == Basis::Exact && charges[0].bytes == layout.reserved_bytes()
+            charges.len() == if self.cfg.dsa.is_some() { 2 } else { 1 }
+                && charges.iter().all(|charge| charge.category == Category::Kv && charge.basis == Basis::Exact)
+                && charges.iter().map(|charge| charge.bytes).sum::<u64>() == layout.reserved_bytes()
         }, "Kimi MLA allocation differs from accepted record charge");
         Ok(layout)
     }
@@ -776,10 +778,10 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     } else {
         for (index, (layer, mode)) in request.layers.iter().zip(&attention).enumerate() {
             for rank in 0..RANKS {
-                let unit = match mode {
-                    LayerMode::Whole { gpu, .. } => if usize::from(*gpu) == rank { layer.kv_unit.unit_bytes_whole } else { 0 },
-                    LayerMode::HeadSplit | LayerMode::ContextSplit => layer.kv_unit.unit_bytes_split[rank],
-                };
+                let unit = if layer.kind != AttentionClass::Mla
+                    || matches!(mode, LayerMode::Whole { gpu, .. } if usize::from(*gpu) != rank) {
+                    0
+                } else { (MLA_PAGE_ROWS * cache_format.record_bytes()) as u64 };
                 records_by_layer[index][rank] = unit;
                 records[rank] += unit;
             }
@@ -818,6 +820,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         lanes, spark_links: spark_ranks > 0, hop_spec: request.hops.clone(),
         peer_row_bytes: request.context_buffers.query_row_bytes + request.context_buffers.partial_row_bytes,
         maximum_pages, records_per_page: records, records_by_layer,
+        index_bytes_per_page: cfg.dsa.map_or(0, |index| (MLA_PAGE_ROWS * (index.head_dim + 4)) as u64),
         layer_attention: request.layers.iter().map(|layer| layer.weights).collect(),
         first_moe: routed.first().copied().unwrap_or(cfg.layers),
         kinds: request.layers.iter().map(|layer| layer.kind).fold(Vec::new(), |mut kinds, kind| {
@@ -858,8 +861,11 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
         resident
     });
     let geometry = cuteafd_loader::families::kimi_k3::kda::cache_geometry_for_ranks(cfg, &resident, cache_format)?;
-    let page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>()
-        / if placement_mode == AttentionPlacement::Context { 2 } else { 1 };
+    let mut page_bytes = geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes).sum::<u64>();
+    if placement_mode == AttentionPlacement::Context {
+        let index_bytes = resident.iter().sum::<usize>() as u64 * recipe.index_bytes_per_page;
+        page_bytes = (page_bytes - index_bytes) / 2 + index_bytes;
+    }
     let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum::<u64>()
         + draft.as_ref().map(|layout| layout.window_mark_bytes()).transpose()?.unwrap_or(0) as u64;
     let host_prefix = prefix_args.map(|args| args.resolve_host_config(cuteafd_engine::prefix::FamilyLayout {
@@ -1094,11 +1100,13 @@ fn request<const RANKS: usize>(mut i: Inputs<'_, RANKS>) -> Result<PlacementRequ
             } else { 0 };
             (whole, attention)
         };
-        let unit = if mla { (MLA_PAGE_ROWS * i.cache_format.record_bytes()) as u64 } else { 0 };
+        let record = if mla { (MLA_PAGE_ROWS * i.cache_format.record_bytes()) as u64 } else { 0 };
+        let index = if mla { cfg.dsa.map_or(0, |index| (MLA_PAGE_ROWS * (index.head_dim + 4)) as u64) } else { 0 };
+        let unit = record + index;
         layers.push(LayerDemand { kind: if mla { AttentionClass::Mla } else { AttentionClass::Kda },
             weights: ModeBytes { whole, split: split_attention },
             kv_unit: KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
-                unit_bytes_context: (mla && i.context.is_some()).then_some([unit / 2; 2]) },
+                unit_bytes_context: (mla && i.context.is_some()).then_some([record / 2 + index; 2]) },
             fixed_bytes: ModeBytes::default(), extra: vec![], context_indexer: false, colocate: None,
             // admit() installs the checkpoint's TP2 rank-slice costs before solve.
             experts: (!cfg.dense[layer]).then_some(ExpertCost { whole: Bytes2::default(),
