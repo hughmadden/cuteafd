@@ -11,6 +11,45 @@ use cuteafd_ffi::{
     programs::ProgramSpec,
 };
 
+/// Producer scratch is separate from dense activations and MSA scoring scratch.
+/// Every concurrently queued execution owner gets its own instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProducerPrograms {
+    pub layouts: [cuteafd_ffi::minimax_m3::producers::ProducerLayout; 5],
+}
+impl ProducerPrograms {
+    pub fn resolve(manifest: &serde_json::Value, rows: u32) -> Result<(Self, Vec<ProgramSpec>), Refusal> {
+        use cuteafd_ffi::minimax_m3::producers::{Kind, validate_producer_entry};
+        let entries = manifest["programs"].as_array()
+            .ok_or_else(|| Refusal::InvalidFact("MiniMax PROGRAMS.json has no program list".into()))?;
+        let mut specs = Vec::new();
+        let mut layouts = Vec::new();
+        for kind in Kind::ALL {
+            let missing = |detail| Refusal::MissingExport { export: kind.name().into(),
+                geometry: "MiniMax native norm/partial-NeoX/index/OAI producers".into(), context: 0, detail };
+            let mut found = entries.iter().filter(|entry| entry["name"] == kind.name());
+            let entry = found.next().ok_or_else(|| missing("absent from PROGRAMS.json".into()))?;
+            if found.next().is_some() { return Err(missing("duplicate program".into())); }
+            let parsed = ProgramEntry::from_manifest(entry).map_err(|e| missing(e.to_string()))?;
+            let layout = validate_producer_entry(&parsed.spec, entry).map_err(|e| missing(e.to_string()))?;
+            if rows == 0 || rows > layout.rows {
+                return Err(missing(format!("compiled rows={}, requested rows={rows}", layout.rows)));
+            }
+            layouts.push(layout);
+            specs.push(parsed.spec);
+        }
+        Ok((Self { layouts: layouts.try_into().expect("five producers") }, specs))
+    }
+    pub fn workspace(&self) -> Vec<(&'static str, u64)> {
+        self.layouts.iter().filter(|layout| layout.scratch() != 0)
+            .map(|layout| (layout.kind.name(), layout.scratch())).collect()
+    }
+    pub fn workspace_components(&self, prefix: &str, rank: u8, lifetime: Lifetime,
+        maximum_pages: u64) -> Result<Vec<Component>, Refusal> {
+        components(self.workspace(), prefix, rank, lifetime, maximum_pages, Category::Workspace)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MsaPrograms {
     pub layouts: [Layout; 4],
@@ -234,6 +273,30 @@ mod tests {
             &serde_json::from_str(include_str!("fixtures/config.json")).unwrap(),
         )
         .unwrap()
+    }
+    #[test]
+    fn producer_inventory_charges_each_scratch_owner_once() {
+        let manifest: Value = serde_json::from_str(include_str!(
+            "../../../../cuteafd-ffi/tests/fixtures/minimax_producer_programs.json")).unwrap();
+        let (programs, specs) = ProducerPrograms::resolve(&manifest, 2048).unwrap();
+        assert_eq!(specs.len(), 5);
+        assert_eq!(programs.workspace(), vec![
+            ("minimax_norm_rope_h64", 4096 * 64 * 256),
+            ("minimax_norm_rope_h4", 4096 * 4 * 256),
+            ("minimax_index_producer", 4096 * 2304),
+        ]);
+        let components = programs.workspace_components("minimax.producer.0", 0, Lifetime::TARGET, 16).unwrap();
+        let names = serde_json::to_string(&components).unwrap();
+        assert!(names.contains("minimax.producer.0.minimax_index_producer.tail"));
+        assert!(!names.contains("activation"));
+        assert!(ProducerPrograms::resolve(&manifest, 4097).is_err());
+        assert!(ProducerPrograms::resolve(&manifest, 0).is_err());
+        let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().pop();
+        assert!(ProducerPrograms::resolve(&bad, 1).is_err());
+        let mut bad = manifest.clone(); bad["programs"].as_array_mut().unwrap().push(manifest["programs"][0].clone());
+        assert!(ProducerPrograms::resolve(&bad, 1).is_err());
+        let mut bad = manifest.clone(); bad["programs"][2]["pointers"][5]["dtype"] = json!("int32");
+        assert!(ProducerPrograms::resolve(&bad, 1).is_err());
     }
     #[test]
     fn executable_inventory_requires_every_mode_and_exact_selection_strides() {

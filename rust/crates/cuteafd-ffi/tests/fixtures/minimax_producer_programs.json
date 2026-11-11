@@ -1,0 +1,321 @@
+{
+  "programs": [
+    {
+      "name": "minimax_norm_rope_h64",
+      "family": "minimax",
+      "op": "minimax_norm_rope",
+      "params": {
+        "heads": 64,
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "heads": 64,
+        "head_dim": 128,
+        "rotary_dim": 64,
+        "eps": 1e-06
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "in"
+        },
+        {
+          "name": "weight",
+          "dtype": "bfloat16",
+          "shape": "[128] Gemma offset",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[positions,64] (cos32 then sin32)",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "bfloat16",
+          "shape": "[rows,64,128]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 67108864
+      }
+    },
+    {
+      "name": "minimax_norm_rope_h4",
+      "family": "minimax",
+      "op": "minimax_norm_rope",
+      "params": {
+        "heads": 4,
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "heads": 4,
+        "head_dim": 128,
+        "rotary_dim": 64,
+        "eps": 1e-06
+      },
+      "pointers": [
+        {
+          "name": "x",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "weight",
+          "dtype": "bfloat16",
+          "shape": "[128] Gemma offset",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[positions,64] (cos32 then sin32)",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "out"
+        },
+        {
+          "name": "scratch",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 4194304
+      }
+    },
+    {
+      "name": "minimax_index_producer",
+      "family": "minimax",
+      "op": "minimax_index_producer",
+      "params": {
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "heads": 4,
+        "head_dim": 128,
+        "rotary_dim": 64,
+        "eps": 1e-06,
+        "page_rows": 64
+      },
+      "pointers": [
+        {
+          "name": "iq",
+          "dtype": "bfloat16",
+          "shape": "[rows,4,128]",
+          "role": "in"
+        },
+        {
+          "name": "ik",
+          "dtype": "bfloat16",
+          "shape": "[rows,128]",
+          "role": "in"
+        },
+        {
+          "name": "iq_norm",
+          "dtype": "bfloat16",
+          "shape": "[128] Gemma offset",
+          "role": "in"
+        },
+        {
+          "name": "ik_norm",
+          "dtype": "bfloat16",
+          "shape": "[128] Gemma offset",
+          "role": "in"
+        },
+        {
+          "name": "positions",
+          "dtype": "int64",
+          "shape": "[rows]",
+          "role": "in"
+        },
+        {
+          "name": "slots",
+          "dtype": "int64",
+          "shape": "[rows] negative skips paged write",
+          "role": "in"
+        },
+        {
+          "name": "cos_sin",
+          "dtype": "float32",
+          "shape": "[positions,64] (cos32 then sin32)",
+          "role": "in"
+        },
+        {
+          "name": "q_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,4,128]",
+          "role": "out"
+        },
+        {
+          "name": "q_scale",
+          "dtype": "float32",
+          "shape": "[rows,4]",
+          "role": "out"
+        },
+        {
+          "name": "k_fp8",
+          "dtype": "float8_e4m3fn",
+          "shape": "[rows,128]",
+          "role": "out"
+        },
+        {
+          "name": "k_scale",
+          "dtype": "float32",
+          "shape": "[rows]",
+          "role": "out"
+        },
+        {
+          "name": "cache",
+          "dtype": "uint8",
+          "shape": "[pool_pages,8448] keys then FP32 scales",
+          "role": "inout"
+        },
+        {
+          "name": "scratch",
+          "dtype": "bfloat16",
+          "shape": "[rows,9,128]",
+          "role": "scratch"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {
+        "scratch": 9437184
+      }
+    },
+    {
+      "name": "minimax_oai_split_i3072",
+      "family": "minimax",
+      "op": "minimax_oai_split",
+      "params": {
+        "width": 3072,
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "width": 3072,
+        "alpha": 1.702,
+        "beta": 1.0,
+        "limit": 7.0
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,3072]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,3072]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,3072]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    },
+    {
+      "name": "minimax_oai_split_i12288",
+      "family": "minimax",
+      "op": "minimax_oai_split",
+      "params": {
+        "width": 12288,
+        "max_rows": 4096
+      },
+      "capacity_rows": 4096,
+      "geometry": {
+        "width": 12288,
+        "alpha": 1.702,
+        "beta": 1.0,
+        "limit": 7.0
+      },
+      "pointers": [
+        {
+          "name": "gate",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "in"
+        },
+        {
+          "name": "up",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "in"
+        },
+        {
+          "name": "out",
+          "dtype": "bfloat16",
+          "shape": "[rows,12288]",
+          "role": "out"
+        }
+      ],
+      "scalars": [
+        {
+          "name": "rows",
+          "type": "int32"
+        }
+      ],
+      "scratch_bytes_at_capacity": {}
+    }
+  ]
+}
