@@ -11,6 +11,9 @@ pub enum AttentionKind {
     MlaDsa { indexer: bool },
     /// Grouped-query attention over the full context.
     Gqa { heads: usize, kv_heads: usize, head_dim: usize },
+    /// Per-KV-head block selection over an independently projected sparse index.
+    BlockSparseGqa { heads: usize, kv_heads: usize, head_dim: usize,
+        block: usize, topk_blocks: usize, index_dim: usize },
     /// Grouped-query sliding-window attention.
     SlidingGqa { heads: usize, kv_heads: usize, head_dim: usize, window: usize, sinks: bool },
     /// Full causal MLA without an indexer (Kimi K3: no RoPE, sigmoid output gate).

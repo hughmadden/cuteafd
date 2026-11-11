@@ -20,6 +20,9 @@ use std::collections::BTreeMap;
 
 use super::checkpoint::CheckpointTensor;
 
+mod compressed_nvfp4;
+use compressed_nvfp4::compressed_nvfp4;
+
 /// How the stored elements encode the weight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -63,11 +66,12 @@ pub enum ScaleEncoding {
 
 /// How a scale applies. Every checkpoint layout this build knows multiplies
 /// (`w = q * s`), including HF's `weight_scale_inv` (named for the
-/// quantizer's division); a divisor layout would get its own variant.
+/// quantizer's division). Compressed-tensors global scales divide instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScaleDirection {
     Multiply,
+    Divide,
 }
 
 /// How the scale grid tiles the weight's rows.
@@ -102,6 +106,7 @@ pub struct BlockScale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct TensorScale {
     pub encoding: ScaleEncoding,
+    pub direction: ScaleDirection,
 }
 
 /// One logical weight as the checkpoint stores it.
@@ -169,7 +174,10 @@ impl QuantOperand {
             Encoding::E5m2 => "fp8e5m2",
             Encoding::E2m1 => {
                 return match (&self.scale, self.global_scale) {
-                    (Some(scale), Some(_)) if scale.encoding == ScaleEncoding::E4m3 => format!("nvfp4-g{}", scale.cols),
+                    (Some(scale), Some(global)) if scale.encoding == ScaleEncoding::E4m3 => {
+                        let direction = if global.direction == ScaleDirection::Divide { "-divisor" } else { "" };
+                        format!("nvfp4-g{}{direction}", scale.cols)
+                    }
                     (Some(scale), None) if scale.encoding == ScaleEncoding::Ue8m0 => format!("mxfp4-g{}", scale.cols),
                     (Some(scale), _) => format!("fp4-{}-g{}", scale_label(scale.encoding), scale.cols),
                     (None, _) => "fp4-unscaled".into(),
@@ -230,10 +238,19 @@ impl QuantOperand {
     /// ModelOpt NVFP4: packed E2M1, E4M3 per-16 linear scales, FP32 global scale.
     pub fn is_nvfp4(&self) -> bool {
         self.encoding == Encoding::E2m1
-            && self.global_scale.is_some_and(|g| g.encoding == ScaleEncoding::F32)
+            && self.global_scale.is_some_and(|g| g.encoding == ScaleEncoding::F32 && g.direction == ScaleDirection::Multiply)
             && self.scale.as_ref().is_some_and(|s| {
                 s.encoding == ScaleEncoding::E4m3 && s.cols == 16 && matches!(s.rows, RowTiling::Uniform { rows: 1 })
             })
+    }
+
+    /// Compressed-tensors NVFP4 uses reciprocal global scales, unlike ModelOpt.
+    pub fn is_compressed_nvfp4(&self) -> bool {
+        self.encoding == Encoding::E2m1 && self.container == "u8"
+            && self.global_scale.is_some_and(|g| g.encoding == ScaleEncoding::F32 && g.direction == ScaleDirection::Divide)
+            && self.input_scale.is_some_and(|g| g.encoding == ScaleEncoding::F32 && g.direction == ScaleDirection::Divide)
+            && self.scale.as_ref().is_some_and(|s| s.encoding == ScaleEncoding::E4m3 && s.cols == 16
+                && s.direction == ScaleDirection::Multiply && matches!(s.rows, RowTiling::Uniform { rows: 1 }))
     }
 
     /// MCG trellis bits for the existing routed-expert kernel contracts.
@@ -284,6 +301,9 @@ fn scale_label(encoding: ScaleEncoding) -> &'static str {
 
 /// Suffixes that belong to the logical weight named by the stem before them.
 const SUFFIXES: &[&str] = &[
+    "weight_packed",
+    "weight_global_scale",
+    "input_global_scale",
     "weight_scale_inv",
     // Mistral consolidated checkpoints: FP32 block scales, w = q * s.
     "qscale_weight",
@@ -386,6 +406,9 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     if crate::formats::exl3_storage::EXL3_SUFFIXES.iter().any(|suffix| members.contains_key(*suffix)) {
         return detect_exl3(members);
     }
+    if ["weight_packed", "weight_global_scale", "input_global_scale"].iter().any(|s| members.contains_key(*s)) {
+        return compressed_nvfp4(members);
+    }
     let weight = match get("weight") {
         Some(weight) => weight,
         // A group without `weight`: one tensor named by its own stem, or a lone
@@ -450,7 +473,7 @@ pub fn detect(members: &BTreeMap<String, &CheckpointTensor>) -> Result<QuantOper
     if let Some(input) = get("input_scale") {
         let encoding = scale_encoding(&input.dtype)
             .ok_or_else(|| malformed(&input.name, format!("input_scale dtype {}", dtype_label(&input.dtype))))?;
-        operand.input_scale = Some(TensorScale { encoding });
+        operand.input_scale = Some(TensorScale { encoding, direction: ScaleDirection::Multiply });
     }
     operand.companions = companions;
     if operand.scale.is_none() && !matches!(operand.encoding, Encoding::E4m3 | Encoding::E5m2 | Encoding::E2m1) {
@@ -554,7 +577,7 @@ fn fp4(members: &BTreeMap<String, &CheckpointTensor>, weight: &crate::Safetensor
             malformed(&global.name, format!("weight_scale_2 must be one value, found {} {:?}",
                 dtype_label(&global.dtype), global.shape))
         })?;
-        operand.global_scale = Some(TensorScale { encoding });
+        operand.global_scale = Some(TensorScale { encoding, direction: ScaleDirection::Multiply });
     }
     Ok(operand)
 }

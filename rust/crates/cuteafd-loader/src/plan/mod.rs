@@ -1899,6 +1899,8 @@ pub fn render(report: &PlanReport) -> String {
                     }
                     AttentionKind::MlaDsa { indexer } => format!("mla-dsa{}", if *indexer { "+idx" } else { "(shared idx)" }),
                     AttentionKind::Gqa { heads, kv_heads, head_dim } => format!("gqa {heads}/{kv_heads}x{head_dim}"),
+                    AttentionKind::BlockSparseGqa { heads, kv_heads, head_dim, block, topk_blocks, .. } =>
+                        format!("block-sparse-gqa {heads}/{kv_heads}x{head_dim} top{topk_blocks}x{block}"),
                     AttentionKind::SlidingGqa { window, sinks, .. } => {
                         format!("swa-gqa w{window}{}", if *sinks { "+sink" } else { "" })
                     }
