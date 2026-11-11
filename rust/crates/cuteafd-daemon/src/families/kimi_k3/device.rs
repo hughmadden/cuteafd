@@ -2583,6 +2583,58 @@ mod tests {
     }
 
     #[test]
+    fn k31_gathered_index_tables_keep_causal_decode_tails_in_independent_banks() -> Result<()> {
+        use cuteafd_loader::families::kimi_k3::{allocation::DsaScratch, config::KimiDsaConfig};
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.dsa = Some(KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let mut layout = LaneLayout::new(&cfg, 5505, 2752, 8192, NativeScratch { kda: 16, mla: [16; 3] })?;
+        layout.base = layout.base.with_dsa(&cfg, DsaScratch { producer: 16, selector: 16 })?;
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(128, 64, 0);
+        pool.alloc_for(0..128)?;
+        let pages = (0..128).map(|page| ((page * 37) % 64) * 2 + page % 2).collect::<Vec<u32>>();
+        let windows = crate::shared::prefill_pipeline::prefill_units(5505, 2752, 3, 128)?;
+        let mut banks = DSA_METADATA.map(|name| (name, vec![0xa5; layout.operands[name]]))
+            .into_iter().collect::<BTreeMap<_, _>>();
+        let mut expected = Vec::new();
+        for (bank, window) in windows.iter().enumerate() {
+            let start = 63 + window.start;
+            let rows = window.len();
+            let sequences = [SequenceRows { slot: 0, start, rows, pages: &pages }];
+            let mut metadata = AttentionRows::build(&sequences, 2752, 1, 8192, &pool, true)?;
+            let dsa = DsaRows::build(&sequences, rows, 128)?;
+            assert_eq!(dsa.table.len(), if rows <= 64 { rows * 128 * 4 } else { 128 * 4 });
+            let lengths = i32_metadata(&dsa.lengths);
+            let table = i32_metadata(&dsa.table);
+            for row in 0..rows {
+                assert_eq!(lengths[row], (start + row + 1) as i32);
+                let offset = if rows <= 64 { row * 128 } else { 0 };
+                assert_eq!(&table[offset..offset + (start + rows).div_ceil(64)],
+                    &pages[..(start + rows).div_ceil(64)].iter().map(|page| *page as i32).collect::<Vec<_>>());
+            }
+            let logical = metadata.mla_slots.chunks_exact(8)
+                .map(|value| i64::from_le_bytes(value.try_into().unwrap())).collect::<Vec<_>>();
+            assert_eq!(logical, (start as i64..(start + rows) as i64).collect::<Vec<_>>());
+            assert_ne!(dsa.table, metadata.page_table);
+            metadata.dsa = Some(dsa);
+            metadata.check_layout(&layout)?;
+            for (name, bytes) in metadata.dsa.as_ref().unwrap().uploads() {
+                let (offset, capacity) = layout.metadata_extent(name, bank)?;
+                assert!(bytes.len() <= capacity);
+                banks.get_mut(name).unwrap()[offset..offset + bytes.len()].copy_from_slice(bytes);
+            }
+            expected.push(metadata);
+        }
+        assert_eq!(expected.last().unwrap().rows, 1);
+        for (bank, metadata) in expected.iter().enumerate() {
+            for (name, bytes) in metadata.dsa.as_ref().unwrap().uploads() {
+                let (offset, _) = layout.metadata_extent(name, bank)?;
+                assert_eq!(&banks[name][offset..offset + bytes.len()], bytes);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn packed_attention_metadata_matches_singletons_and_rejects_member_aliases() -> Result<()> {
         let mut pool = cuteafd_engine::prefix::RefPagePool::with_reserved(32, 64, 1);
         let pages = [pool.alloc(3)?, pool.alloc(3)?, pool.alloc(1)?];
@@ -2824,6 +2876,57 @@ mod tests {
             let actual = unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), bytes.len()) };
             assert_eq!(actual, bytes);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn k31_index_uploads_retain_sources_and_graph_pointers_across_unit_banks() -> Result<()> {
+        use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+        use cuteafd_loader::families::kimi_k3::{allocation::DsaScratch, config::KimiDsaConfig};
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 1 };
+        let mut cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
+        cfg.dsa = Some(KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let mut layout = LaneLayout::new(&cfg, 130, 65, 512, NativeScratch { kda: 16, mla: [16; 3] })?;
+        layout.base = layout.base.with_dsa(&cfg, DsaScratch { producer: 16, selector: 16 })?;
+        layout.operands.retain(|name, _| ATTENTION_METADATA.contains(name) || DSA_METADATA.contains(name));
+        layout.arena_offsets.clear();
+        layout.arena_bytes = 0;
+        let operands = device.run(|| layout.operands.iter().map(|(&name, &bytes)|
+            Ok((name, Allocation::new(device, bytes, crate::shared::memory::TEST)?))).collect::<Result<BTreeMap<_, _>>>())?;
+        let mut lane = Lane { stream: Rc::new(Stream { device, raw: std::ptr::null_mut() }), operands,
+            arena: None, layout, window: None, metadata_bank: 0, core: None };
+        lane.prime_attention()?;
+        let mut pool = cuteafd_engine::prefix::RefPagePool::parity(8, 64, 0);
+        pool.alloc_for(0..8)?;
+        let pages = [6, 5, 2, 7, 4, 1, 0, 3];
+        let mut expected = Vec::new();
+        let mut pointers = Vec::new();
+        for (bank, start, rows) in [(0, 63, 65), (1, 128, 1)] {
+            let sequences = [SequenceRows { slot: 0, start, rows, pages: &pages }];
+            let mut metadata = AttentionRows::build(&sequences, 65, 1, 512, &pool, true)?;
+            metadata.dsa = Some(DsaRows::build(&sequences, rows, 8)?);
+            lane.metadata_bank = bank;
+            pointers.push(DSA_METADATA.map(|name| lane.buffer(name).unwrap().ptr));
+            lane.upload_attention(&metadata)?;
+            expected.push(metadata);
+        }
+        fixture.finish_ordered_uploads(&library)?;
+        let staged = fixture.events()?;
+        for (bank, metadata) in expected.iter().enumerate() {
+            lane.metadata_bank = bank;
+            assert_eq!(DSA_METADATA.map(|name| lane.buffer(name).unwrap().ptr), pointers[bank]);
+            for (name, bytes) in metadata.uploads().into_iter().chain(metadata.dsa.as_ref().unwrap().uploads()) {
+                let buffer = lane.buffer(name)?;
+                // SAFETY: the fake DSO allocates host memory; its ordered-copy
+                // fence completed every source before these reads.
+                let actual = unsafe { std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), bytes.len()) };
+                assert_eq!(actual, bytes);
+            }
+        }
+        assert_ne!(pointers[0], pointers[1]);
+        assert_eq!(fixture.events()?, staged, "reading retained graph views launches no work");
         Ok(())
     }
 

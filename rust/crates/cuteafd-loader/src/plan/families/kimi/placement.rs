@@ -15,6 +15,13 @@ const MODES: &[LayerMode] = &[LayerMode::HeadSplit, LayerMode::ContextSplit,
 /// Prefill lanes the Spark transport serves (one QP endpoint each).
 const LANES: u64 = 1;
 
+fn program_families(dsa: bool, projected: bool) -> &'static [&'static str] {
+    match (dsa, projected) {
+        (false, false) => &["kimik3"], (false, true) => &["kimik3", "kimi"],
+        (true, false) => &["kimik3", "kimik31"], (true, true) => &["kimik3", "kimik31", "kimi"],
+    }
+}
+
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport, opts: &mut crate::plan::layout::LayoutOptions,
     requested: ExpertPlacement) -> MemoryLayout {
     let limits = crate::plan::Family::prefill_limits(&super::KIMI_K3);
@@ -169,10 +176,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                     gpus, |_, _| true, |layer| cfg.attention[layer] == crate::families::kimi_k3::config::KimiAttention::Mla,
                     Some(context.decode()))?;
             }
-            let families: &[&str] = match (cfg.dsa.is_some(), model.core.projections.is_empty()) {
-                (false, true) => &["kimik3"], (false, false) => &["kimik3", "kimi"],
-                (true, true) => &["kimik3", "kimik31"], (true, false) => &["kimik3", "kimik31", "kimi"],
-            };
+            let families = program_families(cfg.dsa.is_some(), !model.core.projections.is_empty());
             let native_manifest = input.programs_manifest(path)?;
             let native = model.core.native_programs(unit, gpus, Some(&native_manifest))?;
             let mut programs = ProgramSet::from_manifest(manifest, families);
@@ -618,6 +622,34 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory.notes.push(format!("Spark budget {} B/rank includes rank-specific header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
         spark_budget.budget, admitted.waves, admitted.unit_rows));
     memory
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::*;
+
+    #[test]
+    fn k31_module_census_keeps_shared_and_native_numerics_in_every_core_view() {
+        let manifest = serde_json::json!({"programs": [
+            {"name":"kimik3_rmsnorm_h7168", "scratch_bytes_at_capacity":{"scratch":16}},
+            {"name":"kimik31_index_producer_m64", "scratch_bytes_at_capacity":{"scratch":32}},
+            {"name":"kimik31_sparse_mla_h96_m64", "scratch_bytes_at_capacity":{"scratch":64}},
+            {"name":"kimi_mla_rank_norm_h96_kv576_m64", "scratch_bytes_at_capacity":{"scratch":128}},
+            {"name":"glmf_index_topk_decode_m64", "scratch_bytes_at_capacity":{"scratch":256}}
+        ]});
+        for dsa in [false, true] { for projected in [false, true] {
+            let programs = ProgramSet::from_manifest(&manifest, program_families(dsa, projected));
+            assert!(programs.names.iter().any(|name| name == "kimik3_rmsnorm_h7168"));
+            for name in ["kimik31_index_producer_m64", "kimik31_sparse_mla_h96_m64"] {
+                assert_eq!(programs.names.iter().any(|selected| selected == name), dsa);
+            }
+            assert_eq!(programs.names.iter().any(|name| name == "kimi_mla_rank_norm_h96_kv576_m64"), projected);
+            assert!(!programs.names.iter().any(|name| name.starts_with("glmf_")));
+            assert_eq!(programs.names.len(), 1 + usize::from(dsa) * 2 + usize::from(projected));
+            assert_eq!(programs.scratch.iter().map(|(_, bytes)| bytes).sum::<u64>(),
+                16 + u64::from(dsa) * 96 + u64::from(projected) * 128);
+        } }
+    }
 }
 
 /// Kimi's typed owners, the same sum its pre-placement reserve charges.
