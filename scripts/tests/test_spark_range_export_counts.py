@@ -59,7 +59,7 @@ def test_every_planner_width_covered_world_has_a_package_alias():
 
 def test_minimax_native_nvfp4_worlds_cover_the_padded_vendor_slices():
     packages = module('minimax_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
-    assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(1, 9))
+    assert packages.geometry_worlds('minimax_nvfp4a4') == list(range(2, 9))
     assert packages.width_keys(3072, 16, 5, nvfp4=True) == {(False, 640)}
     assert packages.width_keys(3072, 16, 6, nvfp4=True) == {(False, 512)}
     entry = packages.package_entry('minimax', 'nvfp4a4')

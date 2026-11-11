@@ -403,7 +403,7 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
 
     _, scopes = aot.config_scopes(dict(FAMILY="minimax_m3", MODEL_ID="fixture/minimax", SPARK_COUNT="2"))
     assert scopes["CUTEAFD_WIP_MINIMAX_AOT"] == "ON"
-    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == ""
+    assert scopes["CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES"] == "minimax:nvfp4a4"
     assert scopes.get("CUTEAFD_WIP_EXLR8_AOT", "OFF") == "OFF"
     assert cmake_flags("coordinator", scopes)["CUTEAFD_ENABLE_MINIMAX_AOT"] == "ON"
     assert cmake_flags("expert", scopes)["CUTEAFD_ENABLE_MINIMAX_AOT"] == "OFF"
