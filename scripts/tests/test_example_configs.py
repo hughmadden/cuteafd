@@ -22,9 +22,11 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-core-k6-{size}.config" for size in ("min", "max")}
+NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
+                    ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
-                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION
+                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
            "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
            "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
@@ -738,6 +740,31 @@ def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp
         assert result.stderr.count("cuteafd expertd-native") == int(values["SPARK_COUNT"])
         launches.append(_speculation(launch))
     assert launches[0] == launches[1]
+
+
+@pytest.mark.parametrize("name", sorted(NEW_PUBLICATIONS))
+def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
+    path = EXAMPLES / name
+    values = keys(path)
+    ml4 = name.startswith("mistral-")
+    old_name = (name.replace("exl3-k4-", "exl3-k4-core-k6-") if ml4
+                else name.replace("exl3-k4-mc-", "exl3-k6-"))
+    expected = keys(EXAMPLES / old_name)
+    expected.update(MODEL_ID=("wrldsuksgo2mars/Mistral-Large-4-EXL3-K4" if ml4
+                              else "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC"),
+                    MODEL_REVISION=("9c354cee78cd6feddb057549b8edde6e3b319822" if ml4
+                                    else "91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d"),
+                    CORE_VIEW="original")
+    assert values == expected
+    assert not any(needle in path.read_text().lower() for needle in PRIVATE)
+    assert f"./run.sh --config examples/configs/{name} --dry-run" in path.read_text()
+    doc = ROOT / "docs/models" / ("mistral_large4.md" if ml4 else "glm5_flash.md")
+    assert f"../../examples/configs/{name}" in doc.read_text()
+    assert f"({name})" in (EXAMPLES / "README.md").read_text()
+    if not ml4:
+        assert all(view in path.read_text() for view in ("k8-compact", "k6-compact"))
+    matrix = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
+    assert name not in json.dumps(matrix), "Unbenchmarked publications are not release cards"
 
 
 def test_ml4_smoke_entries_use_published_examples_and_minimum_sparks() -> None:

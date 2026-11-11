@@ -787,6 +787,36 @@ fn installed_mimo_min_onboarding_is_eligible() {
         "published native package must not silently disable MiMo onboarding: {deployment}");
 }
 
+fn installed_launcher_memory_args(root: &std::path::Path, configured_cap: &str) -> Vec<String> {
+    // Use the launcher's resolver and GiB conversion, not the direct CLI's 80 GiB default.
+    let output = Command::new("timeout").args(["10", "bash", "-c", r#"
+repo_root="$1"
+source "$repo_root/scripts/lib/release-common.sh"
+profile="$(release_coordinator_profile "$2" "$3")" || exit
+read -r cap concurrency <<<"$profile"
+printf '%s %s' "$cap" "$(release_gib "$cap")"
+"#, "installed-launcher-budget"]).arg(root)
+        .arg(cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES.to_string())
+        .arg(configured_cap).output().unwrap();
+    assert!(output.status.success(), "launcher memory profile: {}", String::from_utf8_lossy(&output.stderr));
+    let values = String::from_utf8(output.stdout).unwrap().split_whitespace()
+        .map(str::to_owned).collect::<Vec<_>>();
+    assert_eq!(values.len(), 2, "launcher memory profile must return cap bytes and GiB");
+    vec!["--gpu-memory-cap".into(), values[0].clone(),
+        "--coordinator-weight-budget-gib".into(), values[1].clone()]
+}
+
+#[test]
+fn installed_example_memory_args_share_launcher_profile_and_weight_budget() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let physical = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
+    for (configured, expected) in [("", physical), ("32GiB", 32u64 << 30), ("128GiB", physical)] {
+        let args = installed_launcher_memory_args(&root, configured);
+        assert_eq!(args[1].parse::<u64>().unwrap(), expected);
+        assert_eq!(args[3].parse::<f64>().unwrap(), expected as f64 / (1u64 << 30) as f64);
+    }
+}
+
 fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
     programs_override: Option<std::path::PathBuf>, home: &std::path::Path,
     root: &std::path::Path) {
@@ -900,7 +930,8 @@ if args[1].name == "qwen38-exl3-min.config":
             ("EXLR8_MANIFEST", "--exlr8-manifest")] {
             if let Some(value) = config.get(key) { command.args([flag, value]); }
         }
-        command.arg("--workspace-manifest").arg(&programs);
+        command.arg("--workspace-manifest").arg(&programs)
+            .args(installed_launcher_memory_args(root, config.get("GPU_MEMORY_CAP").copied().unwrap_or("")));
         let start = std::time::Instant::now();
         let output = command.output().unwrap();
         let elapsed = start.elapsed();
