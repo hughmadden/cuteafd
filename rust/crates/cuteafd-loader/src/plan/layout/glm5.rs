@@ -78,7 +78,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let core = (|| -> anyhow::Result<_> {
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
-        if core.projections.is_empty() { return Ok(None); }
+        if core.projections.is_empty() && core.native.is_empty() { return Ok(None); }
         let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
         let (_, draft_rows) = drafter_admission(options, checkpoint)?;
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,

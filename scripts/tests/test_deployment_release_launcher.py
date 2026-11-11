@@ -240,6 +240,20 @@ def test_deployment_preserves_release_container_commands(
             expected = str(config.get("SPARK_MEMORY_CAP", 108 << 30))
             assert after["command"][after["command"].index("--device-budget-bytes") + 1] == expected
             before["command"][before["command"].index("--device-budget-bytes") + 1] = expected
+        # The new default is an explicit checkpoint-native view, not an implicit
+        # target-weight conversion. Historical captures predate this selector.
+        if old["host"] != "coordinator" or entry["family"] in {"glm5", "glm5_flash"}:
+            anchor = "--device-budget-bytes" if old["host"] != "coordinator" else "--embedding-placement"
+            position = before["command"].index(anchor) + 2
+            before["command"][position:position] = ["--core-view", "original"]
+        if old["host"] == "coordinator" and entry["family"] == "glm5":
+            before["env"]["CUTEAFD_GLM_BF16"] = "native"
+        if old["host"] == "coordinator" and entry["family"] == "glm5_flash":
+            position = before["command"].index("--kda-fp8") + 1
+            before["command"][position] = "off"
+            for flag in ("--kda-output-shard", "--kda-prefill-expanded"):
+                if flag in before["command"]:
+                    before["command"].remove(flag)
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])

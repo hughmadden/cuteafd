@@ -603,7 +603,29 @@ mod tests {
                     "reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]},
             }));
         }
+        let mut old_capacity = manifest.clone();
+        for program in old_capacity["programs"].as_array_mut().unwrap() {
+            if program["name"].as_str().is_some_and(|name| name.starts_with("draft_bf16_")) {
+                program["capacity_rows"] = json!(2048);
+            }
+        }
         for ranks in [1, 2] {
+            for unit in [64, 512, 2048] {
+                let before = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None,
+                    unit, 3, 64, None, false, &old_capacity)?;
+                let after = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None,
+                    unit, 3, 64, None, false, &manifest)?;
+                assert_eq!(before, after, "export capacity is not a workspace multiplier");
+            }
+            assert!(CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None,
+                4096, 3, 64, None, false, &old_capacity).is_err());
+            let inactive = CoreInventory::default();
+            let before = CoreCharges::from_package(&cfg, &inactive, cfg.layers, ranks, None,
+                4096, 3, 64, None, false, &old_capacity)?;
+            let after = CoreCharges::from_package(&cfg, &inactive, cfg.layers, ranks, None,
+                4096, 3, 64, None, false, &manifest)?;
+            assert_eq!(before, after);
+            assert_eq!(after.bytes(cfg.hidden)?, vec![0; ranks]);
             let charges = CoreCharges::from_package(&cfg, &core, cfg.layers, ranks, None,
                 4096, 3, 64, None, false, &manifest)?;
             for rank in &charges.ranks {

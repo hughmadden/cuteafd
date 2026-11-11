@@ -1131,7 +1131,7 @@ impl Opened {
             "layer-owned prefill lacks capacity for {prefill_lanes} waves");
         let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
             let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
-            if core.projections.is_empty() { return Ok(None); }
+            if core.projections.is_empty() && core.native.is_empty() { return Ok(None); }
             // Draft rows the K6 target head scores per step: DFlash2's sequences x block, or
             // mtp_dspark's whole admitted block (the planner's drafter_admission rows).
             let draft_rows = match (args.draft.as_deref(), &ml4_draft) {

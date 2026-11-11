@@ -27,7 +27,7 @@ fn layouts() -> HookBuffers {
         maximum_pages: 16,
         native: Some([native(64), native(128)]),
         core: Some(CoreRankLayout {
-            body: vec![], native: vec![], native_scratch: [0; 2], attention_partial_bytes: 2,
+            body: vec![], native: vec![], native_scratch: [0; 2], attention_partial_bytes: 2, down_partial_bytes: 2,
             stages: Some([
                 CoreStageLayout::new(&cfg, 64, 2, false).unwrap(),
                 CoreStageLayout::new(&cfg, 128, 2, false).unwrap(),

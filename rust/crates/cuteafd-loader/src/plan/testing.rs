@@ -529,6 +529,34 @@ pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::
                 "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
         }
     }
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers {
+            for layouts in core.layer_native(cfg, layer, ranks, owner)? {
+                for layout in layouts.into_values() {
+                    use cuteafd_ffi::draft_projection::ProjectionOutput;
+                    let [n, k] = layout.shape;
+                    let output = crate::families::glm5::core::native_output(&layout);
+                    for stage in if layout.fp8 { &[64, 4096][..] } else { &[4096][..] } {
+                        let entry = if layout.fp8 {
+                            let suffix = if output == ProjectionOutput::F32 { "_f32" } else { "" };
+                            json!({"name":format!("native_attention_n{n}_k{k}_m{stage}{suffix}"),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"weight"},{"name":"scales"},{"name":"out"},{"name":"scratch"}],
+                                "scalars":[{"type":"int32"}],"scratch_bytes_at_capacity":{"scratch":256},
+                                "geometry":{"input_features":k,"output_features":n,"output_dtype":output.torch_dtype(),
+                                    "max_rows":stage,"decode_rows":64,"scale_block":128,"storage":"row_major_e4m3",
+                                    "reduction":"canonical_fp8_gemv64_w8a16"}})
+                        } else {
+                            json!({"name":output.program_name(k,n),"capacity_rows":stage,
+                                "pointers":[{"name":"x"},{"name":"w"},{"name":"out"}],"scalars":[{"type":"int32"}],
+                                "scratch_bytes_at_capacity":{},"geometry":{"width":k,"outputs":n,
+                                    "output_dtype":output.torch_dtype(),"reduction":"ordered_k16","tiles_by_rows":[[16,1,4,16,64,6]]}})
+                        };
+                        programs.insert(entry["name"].as_str().unwrap().to_owned(), entry);
+                    }
+                }
+            }
+        }
+    } }
     for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
         for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
             let name = format!("{prefix}_stage_swiglu_i{inter}");

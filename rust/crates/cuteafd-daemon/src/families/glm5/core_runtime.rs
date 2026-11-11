@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, ffi::c_void};
 /// scratch is serialized; the caller retains split output cores in row slots.
 pub(crate) struct CorePrograms<'a> {
     projections: BTreeMap<(usize, usize, usize, &'static str), Projection<'a>>,
-    layouts: [ProjectionLayout; 2],
+    layouts: [Option<ProjectionLayout>; 2],
     stages: [cuteafd_loader::families::glm5::core::CoreStageLayout; 2],
     native_bf16: [cuteafd_ffi::draft_projection::DraftProjections<'a>; 2],
     native_fp8: [[cuteafd_ffi::native_attention::Fp8Projections<'a>; 2]; 2],
@@ -41,16 +41,15 @@ impl<'a> CorePrograms<'a> {
             }
             projections.insert(key, projection);
         }
-        if projections.is_empty() {
+        if projections.is_empty() && layers.iter().all(|layer| layer.attention_native.is_empty()) {
             ensure!(admitted.is_none_or(|a| a.body.is_empty()), "GLM K6 admitted body has no loaded owners");
             return Ok(None);
         }
         let admitted = admitted.context("GLM K6 body has no admitted native layout")?;
-        let layouts = [layouts[0].take().context("GLM K6 decode layout")?,
-            layouts[1].take().context("GLM K6 prefill layout")?];
+        let layouts = [layouts[0].take(), layouts[1].take()];
         for (actual, expected) in layouts.iter().zip([admitted.decode.as_ref(), admitted.prefill.as_ref()]) {
-            let expected = expected.context("GLM K6 admitted projection layout")?;
-            ensure!(actual.rows == expected.rows && actual.extents == expected.extents,
+            ensure!(actual.as_ref().map(|layout| (layout.rows, &layout.extents))
+                == expected.map(|layout| (layout.rows, &layout.extents)),
                 "GLM K6 loaded body scratch differs from admission");
         }
         use cuteafd_ffi::draft_projection::{DraftProjections, ProjectionOutput};
@@ -144,8 +143,10 @@ impl<'a> CorePrograms<'a> {
     pub(crate) fn allocate(&self, device: Device<'a>, rows: usize, decode: bool) -> Result<CoreScratch<'a>> {
         let index = usize::from(!decode);
         let layout = &self.layouts[index];
-        ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
-        let projection = layout.allocate(device, crate::shared::memory::Tag::workspace("glm/native-projection"))?;
+        let projection = layout.as_ref().map(|layout| {
+            ensure!(rows == layout.rows, "GLM K6 scratch differs from admitted row capacity");
+            layout.allocate(device, crate::shared::memory::Tag::workspace("glm/native-projection"))
+        }).transpose()?;
         let stages = self.stages[index].extents.iter().map(|(&name, &bytes)|
             Ok((name, Allocation::new(device, bytes, Tag::workspace("glm/core-scratch"))?))).collect::<Result<_>>()?;
         let native = (self.native_scratch[index] > 0)
@@ -155,7 +156,7 @@ impl<'a> CorePrograms<'a> {
 }
 
 pub(crate) struct CoreScratch<'a> {
-    pub projection: ProjectionScratch<'a>,
+    pub projection: Option<ProjectionScratch<'a>>,
     stages: BTreeMap<&'static str, Allocation<'a>>,
     pub native: Option<Allocation<'a>>,
     prefill: bool,
@@ -365,7 +366,8 @@ mod tests {
         // A common two-byte pitch would silently truncate the F32 sum view.
         assert!(view.contains("let width = arenas[plane].buffer.bytes / self.rows;"));
         assert!(view.contains("Ok([view(0)?, view(1)?, view(2)?])"));
-        assert!(source.contains(".ranks[rank].attention_partial_bytes)?, allocate(2)?, allocate(4)?])"));
+        assert!(source.contains(".ranks[rank].attention_partial_bytes)?"));
+        assert!(source.contains(".ranks[rank].down_partial_bytes)?, allocate(4)?])"));
         let native = include_str!("engine/native_dense.rs");
         let receive = native.split("fn core_received(").nth(1).unwrap()
             .split("pub(super) fn publish_projection").next().unwrap();

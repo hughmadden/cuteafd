@@ -414,10 +414,10 @@ impl CoreInventory {
         ensure!(checkpoint.core_view() != crate::plan::checkpoint::CoreView::Fp8Compact
             || !native.is_empty(),
             "CORE_VIEW=fp8-compact has no supported conversion scope for this all-native core; use original until the native projection path supports conversion");
-        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.tensors.iter()
-            .filter(|tensor| checkpoint.contains_tensor(&tensor.meta.name)
-                && !tensor.meta.name.contains(".experts."))
-            .map(|tensor| tensor.meta.byte_length).max().unwrap_or(0));
+        let largest_selected_dense_bytes = (!native.is_empty()).then(|| checkpoint.weight_map.keys()
+            .filter(|name| !name.contains(".experts."))
+            .filter_map(|name| checkpoint.header(name))
+            .map(|tensor| tensor.byte_length).max().unwrap_or(0));
         let selected_core_view = checkpoint.view.as_ref().filter(|v| v.is_mc() || v.mode() == crate::plan::checkpoint::CoreView::Fp8Compact).map(|v| v.mode());
         let inventory = Self { selected_core_view, projections, native, largest_selected_dense_bytes };
         inventory.validate_runtime_groups(cfg)?;

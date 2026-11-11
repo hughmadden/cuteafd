@@ -1093,6 +1093,8 @@ impl<'a> ProductionInput<'a> {
                     core_rows: recipe.hooks[device as usize].value.core.is_some(),
                     attention_partial_bytes: recipe.hooks[device as usize].value.core.as_ref()
                         .map_or(2, |core| core.attention_partial_bytes as u64),
+                    down_partial_bytes: recipe.hooks[device as usize].value.core.as_ref()
+                        .map_or(2, |core| core.down_partial_bytes as u64),
                 } });
             }
             let layers = (0..self.layers).map(|layer| GlmGraphLayer {

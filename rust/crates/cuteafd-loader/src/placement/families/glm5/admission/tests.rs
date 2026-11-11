@@ -673,7 +673,7 @@ fn recipe(cfg: &GlmDsaConfig) -> GlmRecipe<'_> {
                         )),
                         full_prefill_logits: false,
                         payload_row_bytes: if local { cfg.hidden as u64 * 4 } else { 0 },
-                        core_rows: false, attention_partial_bytes: 2,
+                        core_rows: false, attention_partial_bytes: 2, down_partial_bytes: 2,
                     },
                 });
             }

@@ -821,7 +821,7 @@ impl<'a> GlmEngine<'a> {
             if let Some(admitted) = admitted {
                 let span = cuteafd_loader::placement::families::glm5::prefill_span(
                     self.prefill_rows as u64, self.prefill_lanes as u64) as usize;
-                ensure!(admitted.retained_rows == if admitted.body.is_empty() { 0 } else { DECODE_ROWS + span },
+                ensure!(admitted.retained_rows == if admitted.body.is_empty() && admitted.native.is_empty() { 0 } else { DECODE_ROWS + span },
                     "GLM K6 retained row reserve differs from admission");
             }
             let programs = self.on(rank, || super::core_runtime::CorePrograms::new(self.programs, &self.cfg,
@@ -1211,7 +1211,8 @@ impl<'a> GlmEngine<'a> {
             core_rows: if self.core_programs.get(rank).is_some_and(Option::is_some) {
                 // Native TP2 attention retains F32; K6 down keeps its BF16 ABI.
                 let allocate = |element_bytes| self.alloc(rows * self.cfg.hidden * element_bytes).map(Buf::owned);
-                Some([allocate(self.core_admission.as_ref().context("GLM missing core admission")?.ranks[rank].attention_partial_bytes)?, allocate(2)?, allocate(4)?])
+                Some([allocate(self.core_admission.as_ref().context("GLM missing core admission")?.ranks[rank].attention_partial_bytes)?,
+                    allocate(self.core_admission.as_ref().unwrap().ranks[rank].down_partial_bytes)?, allocate(4)?])
             } else { None } })
     }
 
@@ -3259,7 +3260,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str,
         out: *mut c_void, rows: Scalar) -> Result<()> {
-        if layer.core.contains_key("gate") {
+        if layer.core.contains_key("gate") || layer.attention_native.contains_key("gate") {
             let rows = scalar_rows(rows)?;
             let out = cuteafd_ffi::CuteafdDeviceBuffer { ptr: out, bytes: rows * self.cfg.hidden * 2,
                 device_id: self.exchange_device(rank)?, flags: 0 };

@@ -86,7 +86,7 @@ def exl3_reply_programs(max_rows):
 
 
 def flash_native_bf16_shapes():
-    # GLM Flash q_b and MLA/KDA o, whole and ordinary TP2 slices (K, N).
+    # GLM Flash native attention and dense/shared FFNs, whole/TP2 slices (K, N).
     return {(1536, 16384), (1536, 8192), (16384, 4096),
             (8192, 4096), (4096, 4096), (4096, 1536), (4096, 512),
             (4096, 12288), (4096, 6144), (12288, 4096), (6144, 4096),
@@ -100,17 +100,20 @@ def native_attention_shapes():
         "kimik3": {(18432, 1536), (9216, 1536), (7168, 12288), (7168, 6144)},
         "step5": {(4096, 12288), (4096, 6144)},
         "muse": {(8192, 8192), (8192, 4096)},
-        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096)},
+        "ml4": {(8192, 6144), (4096, 6144), (6144, 8192), (6144, 4096),
+                (24576, 6144), (12288, 6144), (6144, 6144), (3072, 6144),
+                (6144, 24576), (6144, 12288), (6144, 3072)},
     }
 
 
 def native_attention_f32_shapes():
-    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096)}
+    return {(7168, 6144), (4096, 6144), (8192, 4096), (6144, 8192), (6144, 4096),
+            (6144, 12288), (6144, 3072)}
 
 
 def native_attention_bf16_f32_shapes():
-    # ML4's checkpoint attention weights are already FP8; no BF16 fallback export.
-    return native_attention_f32_shapes() - {(6144, 4096)}
+    # ML4 q/o and FFNs ship FP8; these split-output shapes need no BF16 fallback.
+    return native_attention_f32_shapes() - {(6144, 4096), (6144, 12288), (6144, 3072)}
 
 
 def compile_native_attention_projection(n, k, max_rows, output="bf16"):
@@ -196,6 +199,8 @@ def draft_bf16_shapes():
     for h in (2048, 4096, 5120, 6144):
         result.setdefault((2 * h, h), []).append("mimo/qwen-mtp")
     result.setdefault((30720, 6144), []).append("ml4-context-fc")
+    for n in (512, 576):
+        result.setdefault((6144, n), []).append("native-core")
     for shape in flash_native_bf16_shapes():
         result.setdefault(shape, []).append("native-glmf")
     for n, k in set().union(*(shapes for family, shapes in native_attention_shapes().items() if family != "ml4")):
