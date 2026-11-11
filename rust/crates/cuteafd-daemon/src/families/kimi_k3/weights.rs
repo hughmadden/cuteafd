@@ -4,7 +4,7 @@
 use crate::shared::{memory::device::{Allocation, Device}, placement::layers::AttentionShare};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, memory_layout::{Basis, Category}};
-use cuteafd_ffi::{CuteafdDeviceBuffer, KimiKdaWeights, KimiMlaWeights};
+use cuteafd_ffi::{CuteafdDeviceBuffer, KimiIndexWeights, KimiKdaWeights, KimiMlaWeights};
 use cuteafd_loader::{families::kimi_k3::{config::{KimiAttention, KimiK3Config}, kda, mla,
     w8::{self, ResidualWeightSite}}, formats::mla::MlaOperand, kda::{KdaOperand, KdaTensor}, placement::{Demand, LayerMode}, LoadedTensor};
 use std::collections::BTreeMap;
@@ -478,6 +478,13 @@ impl<'a> LayerWeights<'a> {
         Ok(KimiKdaWeights { input: self.buffer("kda.input")?, forget: self.buffer("kda.forget")?,
             convolution: self.buffer("kda.conv")?, a_log: self.buffer("kda.a_log")?,
             dt_bias: self.buffer("kda.dt_bias")?, norm: self.buffer("kda.norm")?, output: self.buffer("kda.output")? })
+    }
+
+    pub(crate) fn indexer(&self) -> Result<KimiIndexWeights> {
+        ensure!(self.attention.present(), "Kimi indexer weights absent on this nonowner");
+        Ok(KimiIndexWeights { query: self.buffer("mla.indexer.q")?,
+            key_heads: self.buffer("mla.indexer.kw")?, norm: self.buffer("mla.indexer.norm")?,
+            bias: self.buffer("mla.indexer.bias")? })
     }
 
     pub(crate) fn mla(&self) -> Result<KimiMlaWeights> {

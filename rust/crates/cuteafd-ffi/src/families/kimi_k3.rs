@@ -161,6 +161,71 @@ impl<'a> KimiMla<'a> {
     }
 }
 
+/// K3.1's native BF16 MLA projection seams, without any dense-attention
+/// program. The shared lane inserts index production and selection between them.
+pub struct KimiMlaProjection<'a> {
+    producer: Program<'a>, output: Program<'a>,
+    heads: usize, rows: usize, scratch: [usize; 2], cache_format: MlaCacheFormat,
+}
+
+impl<'a> KimiMlaProjection<'a> {
+    pub fn load_k31(programs: &'a Programs<'a>, heads: usize, rows: usize,
+        cache_format: MlaCacheFormat) -> Result<Self> {
+        let suffix = if heads == 48 { "" } else { "_h96" };
+        let cache = cache_format.program_suffix();
+        let producer = programs.program(&format!("kimik31_mla_producer{suffix}{cache}_m{rows}"), PRODUCER)?;
+        let output = programs.program(&format!("kimik31_mla_output{suffix}_m{rows}"), OUTPUT)?;
+        let scratch = validate_k31_projection_manifest([producer.spec(), output.spec()], heads, rows, cache_format)?;
+        Ok(Self { producer, output, heads, rows, scratch, cache_format })
+    }
+
+    pub fn scratch_bytes(&self) -> [usize; 2] { self.scratch }
+
+    pub fn produce(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_producer(weights, b, self.heads, self.rows, self.scratch[0], self.cache_format.record_bytes())?;
+        // SAFETY: validated native operands and disjoint writes; caller retains
+        // the stream and all backing arenas through completion and graph replay.
+        unsafe { self.producer.launch(&[b.x.ptr, b.slots.ptr, weights.qkv_a.ptr, weights.q_a_norm.ptr,
+            weights.kv_a_norm.ptr, weights.q_b.ptr, weights.uk.ptr, b.cache.ptr, b.query.ptr,
+            b.q_resid.ptr, b.producer_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+
+    pub fn output(&self, weights: KimiMlaWeights, b: KimiMlaBatch, stream: *mut c_void) -> Result<()> {
+        validate_output(weights, b, self.heads, self.rows, self.scratch[1])?;
+        // SAFETY: validated output phase; selected attention or peer combination
+        // precedes this launch on the retained stream, with stable buffer owners.
+        unsafe { self.output.launch(&[b.attention.ptr, b.x.ptr, weights.uv.ptr, weights.gate.ptr,
+            weights.output.ptr, b.output.ptr, b.output_scratch.ptr], &[Scalar::I32(b.rows as i32)], stream)?; }
+        Ok(())
+    }
+}
+
+fn validate_k31_projection_manifest(specs: [&ProgramSpec; 2], heads: usize, rows: usize,
+    format: MlaCacheFormat) -> Result<[usize; 2]> {
+    if !matches!(heads, 48 | 96) || !(1..=4096).contains(&rows) {
+        return Err(KimiMlaError::Invalid("K3.1 projection head/row geometry"));
+    }
+    let align = |n: usize| n.div_ceil(1024) * 1024;
+    let scratch = [align(rows * 2112 * 2) + align(rows * heads * 192 * 2),
+        2 * align(rows * heads * 128 * 2)];
+    for (i, spec) in specs.iter().enumerate() {
+        let g = &spec.geometry;
+        let pointers = if i == 0 { PRODUCER } else { OUTPUT };
+        if spec.capacity_rows as usize != rows || spec.scalar_kinds != b"i"
+            || spec.pointers.iter().map(String::as_str).ne(pointers.iter().copied())
+            || g["norm_eps"].as_f64() != Some(1e-5)
+            || (i == 0 && g["kv_cache"].as_str() != Some(format.label()))
+            || [("heads", heads), ("hidden", 7168), ("q_lora_rank", 1536), ("kv_lora_rank", 512),
+                ("qk_nope_dim", 128), ("qk_rope_dim", 64), ("v_head_dim", 128), ("page_rows", 64)]
+                .iter().any(|&(key, value)| g[key].as_u64() != Some(value as u64))
+            || spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch[i] as u64) {
+            return Err(KimiMlaError::Invalid("K3.1 projection manifest geometry/ABI/scratch"));
+        }
+    }
+    Ok(scratch)
+}
+
 const INDEX_PRODUCER: &[&str] = &["x", "q_resid", "positions", "index_slots", "cos_sin",
     "w_iq", "w_ik", "k_norm_w", "k_norm_b", "index_cache", "q_fp8", "head_weights", "scratch"];
 
@@ -1438,6 +1503,42 @@ mod tests {
                 "page_rows": 64, "norm_eps": 1e-6, "kv_cache": "bf16", "max_context": context,
                 "num_splits": splits, "chunks_per_split": context.div_ceil(64).div_ceil(splits), "mode": mode.name()}),
         })
+    }
+
+    #[test]
+    fn k31_native_mla_projection_requires_variant_epsilon_and_exact_seam_abi() {
+        for heads in [48, 96] { for rows in [64, 4096] {
+            for format in [MlaCacheFormat::Bf16, MlaCacheFormat::Fp8] {
+                let entries = specs(heads, rows, KimiMlaMode::Decode);
+                let mut seams = [entries[0].clone(), entries[2].clone()];
+                for (i, spec) in seams.iter_mut().enumerate() {
+                    spec.geometry["norm_eps"] = 1e-5.into();
+                    spec.pointers = (if i == 0 { PRODUCER } else { OUTPUT })
+                        .iter().map(|name| (*name).into()).collect();
+                }
+                seams[0].geometry["kv_cache"] = format.label().into();
+                let validate = |s: &[ProgramSpec; 2]| validate_k31_projection_manifest(s.each_ref(), heads, rows, format);
+                assert_eq!(validate(&seams).unwrap(), [entries[0].scratch["scratch"] as usize,
+                    entries[2].scratch["scratch"] as usize]);
+                for i in 0..2 {
+                    for (key, value) in [("norm_eps", serde_json::json!(1e-6)),
+                        ("heads", serde_json::json!(32)), ("page_rows", serde_json::json!(1))] {
+                        let mut wrong = seams.clone(); wrong[i].geometry[key] = value;
+                        assert!(validate(&wrong).is_err(), "{i}/{key}");
+                    }
+                    let mut wrong = seams.clone(); wrong[i].pointers.swap(0, 1);
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].scratch.insert("unadmitted".into(), 16);
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].capacity_rows += 1;
+                    assert!(validate(&wrong).is_err());
+                    let mut wrong = seams.clone(); wrong[i].scalar_kinds = b"ii".to_vec();
+                    assert!(validate(&wrong).is_err());
+                }
+                seams[0].geometry["kv_cache"] = "wrong".into();
+                assert!(validate(&seams).is_err());
+            }
+        }}
     }
 
     #[test]

@@ -1,7 +1,7 @@
 mod families;
 mod shared;
 pub use shared::{audio, pcm_audio, dense_trellis, draft_projection, exlr8, fp8_moe, glm_stage, mla_draft, native_attention, native_dense, native_dense_glue, peer_exchange, programs, projected_index, projected_kda, vision};
-pub use families::kimi_k3::{KimiMla, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
+pub use families::kimi_k3::{KimiMla, KimiMlaProjection, KimiMlaBatch, KimiMlaError, KimiMlaMode, KimiMlaWeights,
     KimiMlaPartial, KimiMlaPartialBatch, KimiIndexProducer, KimiIndexWeights, KimiIndexBatch,
     KimiSparseMla, KimiSparseBatch, KimiIndexTopK, KimiIndexSelection, KimiIndexMode,
     KimiCandidateMerge, KimiCandidateBatch,
