@@ -301,6 +301,43 @@ def test_native_shared_owner_is_family_neutral_and_glm_keeps_its_buffers():
     assert "cuteafd_ffi::exlr8::KernelFamily::Glm,\n                devices.len(), rank" in family
 
 
+def test_minimax_msa_fixture_matches_pinned_fork_without_cuda():
+    import json
+
+    base = ROOT / "third_party/sparkinfer/b12x/integration/cuteafd"
+    expected = []
+    for module, compiler, extent_name, modes, operation in (
+        ("minimax_indexer", "compile_minimax_index_aot", "max_pages",
+         ((64, 16384, "decode"), (4096, 16384, "prefill")), "minimax_index"),
+        ("minimax_attention", "compile_minimax_attention_aot", "max_batch",
+         ((64, 64, "decode"), (4096, 64, "extend")), "minimax_attention"),
+    ):
+        tree = ast.parse((base / (module + ".py")).read_text())
+        nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("_layout", compiler)]
+        namespace = {
+            "torch": types.SimpleNamespace(**{name: name for name in
+                     ("float8_e4m3fn", "float32", "uint8", "int32", "bfloat16")}),
+            "Operand": lambda name, dtype, shape, role="in", **kwargs:
+                dict(name=name, dtype=dtype, shape=shape, role=role),
+            "Scalar": lambda name, kind="int32", *args: dict(name=name, type=kind),
+            "compile_program": lambda launch, **kwargs: kwargs,
+        }
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), module, "exec"), namespace)
+        def launch(rows, extent, mode, *args):
+            return types.SimpleNamespace(nbytes=namespace["_layout"](rows, extent, mode)[2])
+        namespace.update(_Decode=launch, _Prefill=launch, _Attention=launch)
+        for rows, extent, mode in modes:
+            params = dict(max_rows=rows, mode=mode, **{extent_name: extent})
+            program = namespace[compiler](**params)
+            expected.append(dict(name=program["name"], family="minimax", op=operation,
+                params=params, capacity_rows=rows, geometry=program["geometry"],
+                pointers=list(program["operands"]), scalars=list(program["scalars"]),
+                scratch_bytes_at_capacity={key: fn(rows) for key, fn in program["scratch"].items()}))
+    fixture = ROOT / "rust/crates/cuteafd-ffi/tests/fixtures/minimax_msa_programs.json"
+    assert json.loads(fixture.read_text()) == {"programs": expected}
+
+
 def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, tmp_path):
     import json
     import subprocess
@@ -314,18 +351,49 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     fake = types.ModuleType("export_b12x_exlr8_dense_aot")
     fake.minimax_programs = lambda: native
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
-    namespace = {"geometries": ["minimax"], "manifest": {"families": {}}, "work": []}
-    exec(compile(ast.Module(body=[branch], type_ignores=[]), "dispatch", "exec"), namespace)
+    for module_name, compiler in (("minimax_indexer", "compile_minimax_index_aot"),
+                                  ("minimax_attention", "compile_minimax_attention_aot")):
+        module = types.ModuleType("b12x.integration.cuteafd." + module_name)
+        setattr(module, compiler, lambda **kwargs: kwargs)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
+                 "work": [], "CHECKPOINT_CONTEXTS": {},
+                 "args": types.SimpleNamespace(decode_rows=64, prefill_rows=4096, max_context=1048576)}
+    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+               and node.name in ("geometry_context", "minimax_sparse_programs")]
+    exec(compile(ast.Module(body=helpers + [branch], type_ignores=[]), "dispatch", "exec"), namespace)
     assert namespace["manifest"]["families"] == {"minimax": {"abi_version": 1}}
+    assert namespace["manifest"]["family_capacities"] == {"minimax": {"max_context": 1048576}}
+    sparse = namespace["work"][len(native):]
+    assert [(suffix, op, params, thunk()) for _, suffix, op, params, thunk in sparse] == [
+        ("index_decode", "minimax_index", dict(max_rows=64, max_pages=16384, mode="decode"),
+         dict(max_rows=64, max_pages=16384, mode="decode")),
+        ("index_prefill", "minimax_index", dict(max_rows=4096, max_pages=16384, mode="prefill"),
+         dict(max_rows=4096, max_pages=16384, mode="prefill")),
+        ("attention_decode", "minimax_attention", dict(max_rows=64, max_batch=64, mode="decode"),
+         dict(max_rows=64, max_batch=64, mode="decode")),
+        ("attention_extend", "minimax_attention", dict(max_rows=4096, max_batch=64, mode="extend"),
+         dict(max_rows=4096, max_batch=64, mode="extend")),
+    ]
+    # Non-default capacities must flow all the way into the pinned compilers.
+    custom = namespace["minimax_sparse_programs"](16, 2048, 2049)
+    assert custom[0][3]() == dict(max_rows=16, max_pages=33, mode="decode")
+    assert custom[1][3]() == dict(max_rows=2048, max_pages=33, mode="prefill")
+    assert custom[3][3]() == dict(max_rows=2048, max_batch=16, mode="extend")
     stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
                 and "kimi_split" in ast.unparse(node.value))
     names = []
-    for family, suffix, *_ in namespace["work"]:
-        namespace.update(family=family, suffix=suffix)
+    for family, suffix, op, *_ in namespace["work"]:
+        namespace.update(family=family, suffix=suffix, op=op)
         exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
         names.append(namespace["stem"])
-    assert names == ["exlr8_dense_" + name for name, *_ in native]
+    assert names[:len(native)] == ["exlr8_dense_" + name for name, *_ in native]
+    assert names[len(native):] == ["minimax_index_decode", "minimax_index_prefill",
+                                  "minimax_attention_decode", "minimax_attention_extend"]
+    namespace.update(family="glmf", suffix="sentinel", op="attention")
+    exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
+    assert namespace["stem"] == "glmf_sentinel"
     # MiniMax cannot accidentally enter either pre-existing family scope.
     scope_node = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
                       and node.name == "dense_family_scopes")
