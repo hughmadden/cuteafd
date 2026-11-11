@@ -157,6 +157,47 @@ def parse_attention() -> dict[str, dict[str, str]]:
 
 ATTENTION = parse_attention()
 
+LEVERS_SECTION = "Optional performance levers"
+LEVER_COLUMNS = ["Lever", "Families", "Enable", "Effect", "Cost"]
+
+
+def parse_levers() -> list[dict[str, object]]:
+    """The optional, default-off performance-lever rows."""
+    for section, header, rows in tables(DOC.read_text().splitlines()):
+        if section != LEVERS_SECTION:
+            continue
+        assert header == LEVER_COLUMNS, f"{LEVERS_SECTION} header is {header}"
+        levers: list[dict[str, object]] = []
+        for row in rows:
+            assert len(row) == len(LEVER_COLUMNS), f"short lever row: {row}"
+            keys = re.findall(r"`([A-Z_0-9]+)`", row[0])
+            assert keys, f"lever row names no key: {row}"
+            families = [family.strip() for family in row[1].split(",") if family.strip()]
+            assert families, f"lever row {keys} names no family"
+            assert all(cell for cell in row[2:]), f"lever row {keys} has an empty cell"
+            levers.append({"keys": keys, "families": families})
+        assert levers, f"{LEVERS_SECTION} lists no levers"
+        return levers
+    raise AssertionError(f"docs/options.md has no {LEVERS_SECTION} section")
+
+
+def parse_defaults() -> dict[str, str]:
+    """Every key's documented default from the Key | Default area tables."""
+    defaults: dict[str, str] = {}
+    for _, header, rows in tables(DOC.read_text().splitlines()):
+        if header[:2] != ["Key", "Default"]:
+            continue
+        for row in rows:
+            for key in re.findall(r"`([A-Z_0-9]+)`", row[0]):
+                value = label(row[1])
+                assert defaults.setdefault(key, value) == value, \
+                    f"{key} has two documented defaults"
+    return defaults
+
+
+LEVERS = parse_levers()
+DEFAULTS = parse_defaults()
+
 
 def test_graph_reserve_keys_are_separate_and_bounded_cache_families_only():
     # Families on the bounded graph cache (#1627) take the reserve keys.
@@ -326,3 +367,29 @@ def test_example_media_values_pass_the_release_config_validator(path: Path, tmp_
     config.write_text("\n".join(media) + "\n")
     result = run_bash(f'release_load_config "{config}" stop')
     assert result.returncode == 0, f"{path.name}: {result.stderr}"
+
+
+def test_optional_levers_are_default_off_and_documented():
+    """Every lever is a real launch key, off by default and accepted where listed."""
+    seen = set()
+    for lever in LEVERS:
+        for key in lever["keys"]:
+            assert key not in seen, f"duplicate lever row for {key}"
+            seen.add(key)
+            assert key in MATRIX, f"lever {key} is absent from the family support table"
+            assert key in DEFAULTS, f"lever {key} has no documented default"
+            default = DEFAULTS[key]
+            assert default.startswith(("off", "unset")), \
+                f"lever {key} default is {default!r}, not off/unset"
+            for family in lever["families"]:
+                assert family in COLUMNS, f"lever {key} names unknown family column {family}"
+                assert MATRIX[key][family], f"lever {key} is not accepted by {family}"
+    assert seen
+
+
+def test_optional_levers_section_is_near_the_top_and_linked():
+    text = DOC.read_text()
+    assert text.index(f"## {LEVERS_SECTION}") < text.index("## How options are set")
+    assert "[Optional performance levers](#optional-performance-levers)" in text
+    agents = (ROOT / "AGENTS.md").read_text()
+    assert "docs/options.md#optional-performance-levers" in agents

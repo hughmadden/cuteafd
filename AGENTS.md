@@ -364,6 +364,11 @@ Porting a family or changing shared serve, prefill, exchange or admission code: 
   Re-run a family's rows after changes that target that family's code (or a
   shared hot path that plausibly moves it); skip irrelevant changes,
   staleness is fine.
+- A PR that adds an optional, default-off performance lever (a launch key or
+  an MC core view) adds its row to `docs/options.md`'s
+  [Optional performance levers](docs/options.md#optional-performance-levers)
+  table in the same PR, with its measured effect or `unmeasured` and its
+  precision or quality cost.
 - `benchmarks/current-matrix.json` is the table's input: one row per
   family × checkpoint, each cell `current` or `held`/`pending`/`na` with
   the reason it renders. A memory-capped 5090 simulation stays `pending`
