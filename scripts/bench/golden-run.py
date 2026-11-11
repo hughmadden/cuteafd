@@ -1159,12 +1159,13 @@ def bin_token_args(a_path, b_path, vocab):
     meta = a_path.parent / 'meta.json'
     positions = json.loads(meta.read_text()).get('positions') if meta.is_file() else None
     if positions is None:
-        if rows != token_count - 1:
+        if rows not in (token_count - 1, token_count):
             raise ValueError('scored-only logits require meta.json positions for NLL alignment')
         positions = list(range(1, rows + 1))
     if (not isinstance(positions, list) or len(positions) != rows
             or any(type(p) is not int for p in positions)
-            or positions[0] < 1 or positions[-1] >= token_count
+            or positions[0] < 1 or positions[-1] > token_count
+            or (positions[-1] == token_count and positions[0] != 1)
             or positions != list(range(positions[0], positions[0] + rows))):
         raise ValueError('logits positions must be contiguous next-token indices matching every row')
     other_meta = b_path.parent / 'meta.json'

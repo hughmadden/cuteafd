@@ -527,6 +527,22 @@ def test_compare_pairs_aligns_bin_nll_with_scored_positions(tmp_path, positions)
     assert result['mean_kl'] == 0 and result['top1_agreement'] == 1
 
 
+@pytest.mark.parametrize('with_metadata', [False, True])
+def test_compare_pairs_preserves_full_prompt_bin_final_unscored_row(tmp_path, with_metadata):
+    root = tmp_path / 'golden'
+    logits = np.array([[8, 0, -2], [-2, 0, 8], [1, 2, 3]], dtype='<f4')
+    for arm in ('a', 'b'):
+        out = root / arm / 'r1'
+        out.mkdir(parents=True)
+        logits.tofile(out / 'logits.bin')
+        np.array([2, 0, 2], dtype='<u4').tofile(out / 'tokens.bin')
+        if with_metadata:
+            (out / 'meta.json').write_text(json.dumps(dict(positions=[1, 2, 3])))
+    result, = golden.compare_pairs(dict(root=str(root), vocab=3, slots={}), [('a', 'b')], 1)
+    assert not result.get('error') and result['rows'] == 3 and result['nll_rows'] == 2
+    assert result['nll_a'] == pytest.approx(-float(log_probs(logits[:2])[np.arange(2), [0, 2]].mean()), abs=1e-7)
+
+
 @pytest.mark.parametrize('positions', [None, [0, 1], [4], [4, 6], [4, 6.0], [5, 6]])
 def test_compare_pairs_refuses_ambiguous_bin_nll_alignment(tmp_path, positions):
     root = tmp_path / 'golden'
