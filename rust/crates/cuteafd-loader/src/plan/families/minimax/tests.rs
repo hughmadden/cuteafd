@@ -98,6 +98,43 @@ fn generic_native_validation_rejects_missing_and_drifted_minimax_tensors_early()
 }
 
 #[test]
+fn coordinator_native_dense_workspace_prices_each_serial_owner_once() {
+    use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
+    use crate::placement::planner::{ComponentKind, Lifetime};
+    let (dir, _, _) = fixture();
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+    let weights = CoordinatorWeights::plan(&checkpoint, &cfg, 1, &[0; 4]).unwrap().remove(0);
+    for rows in [1, 16, 17, 2752, 4096] {
+        let layout = weights.dense_workspace(rows).unwrap();
+        assert_eq!(layout.records, u64::from(rows).div_ceil(16) * (12288 / 32) * 528);
+        assert_eq!(layout.output, u64::from(rows) * 12288 * 4);
+        let components = layout.components("minimax.dense", 0, Lifetime::TARGET, 1024).unwrap();
+        let owners = layout.allocations("minimax.dense", 0, Lifetime::TARGET);
+        assert_eq!(owners.iter().map(|a| a.bytes).sum::<u64>(), 8 + layout.records + layout.output);
+        let allocations = components.iter().filter_map(|c| match &c.kind {
+            ComponentKind::Allocation { template, .. } => Some(template), _ => None }).collect::<Vec<_>>();
+        assert_eq!(allocations, owners.iter().collect::<Vec<_>>());
+        assert!(!components.iter().any(|c| matches!(c.kind, ComponentKind::ResidentWeight(_))));
+        for component in &components {
+            if let ComponentKind::AllocationGranularity(tail) = &component.kind {
+                assert_eq!(tail.backings.len(), 1);
+                let backing = owners.iter().find(|a| a.id == tail.backings[0].backing).unwrap();
+                assert_eq!(tail.requests(), [backing.bytes]);
+            }
+        }
+        assert!(layout.components("", 0, Lifetime::TARGET, 1024).is_err());
+        assert!(layout.components("dense", 2, Lifetime::TARGET, 1024).is_err());
+        assert!(layout.components("dense", 0, Lifetime::TARGET, 0).is_err());
+    }
+    assert!(weights.dense_workspace(0).is_err());
+    assert!(weights.dense_workspace(4097).is_err());
+    let mut empty = weights;
+    empty.projections.clear();
+    assert!(empty.dense_workspace(1).is_err());
+}
+
+#[test]
 fn coordinator_native_arena_preserves_checkpoint_bytes_and_explicit_owners() {
     use crate::families::minimax_m3::weight_layout::CoordinatorWeights;
     let (dir, _, _) = fixture();

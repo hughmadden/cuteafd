@@ -38,7 +38,53 @@ pub struct CoordinatorWeights {
     pub projections: Vec<Mxfp8Projection>,
 }
 
+/// Reused storage for serial native projections in one execution owner. Input
+/// activations and any results retained across projections belong to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DenseWorkspace {
+    pub rows: u32,
+    pub records: u64,
+    pub output: u64,
+}
+
+impl DenseWorkspace {
+    pub fn allocations(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime)
+        -> Vec<crate::placement::planner::Allocation> {
+        use crate::placement::planner::{Allocation, Location};
+        [("inputs", 8), ("records", self.records), ("output", self.output)].into_iter()
+            .map(|(name, bytes)| Allocation::buffer(format!("{prefix}.{name}"), Location::coordinator(rank),
+                bytes, lifetime, cuteafd_core::memory_layout::Category::Workspace, "native serial dense projection")).collect()
+    }
+
+    pub fn components(self, prefix: &str, rank: u8, lifetime: crate::placement::planner::Lifetime,
+        maximum_pages: u64) -> std::result::Result<Vec<crate::placement::planner::Component>, crate::placement::planner::Refusal> {
+        use crate::placement::planner::{ByteCurve, Component, Refusal, fixed_request_tails};
+        if prefix.is_empty() || rank > 1 || maximum_pages == 0 || self.rows == 0 || self.rows > 4096
+            || self.records == 0 || self.output == 0 {
+            return Err(Refusal::InvalidFact("invalid MiniMax dense workspace owner".into()));
+        }
+        let mut components = self.allocations(prefix, rank, lifetime).into_iter().map(|allocation| {
+            let bytes = ByteCurve::fixed(allocation.bytes, maximum_pages);
+            Component::allocation(allocation, bytes, false, maximum_pages)
+        }).collect();
+        fixed_request_tails(&mut components, maximum_pages, &[])?;
+        Ok(components)
+    }
+}
+
 impl CoordinatorWeights {
+    /// Each decode lane or concurrently live prefill unit needs its own owner.
+    /// The F32 output is temporary; callers retain live gate/up/Q/K/V separately.
+    pub fn dense_workspace(&self, rows: u32) -> Result<DenseWorkspace> {
+        let records = self.records_bytes(rows)?;
+        let output = self.projections.iter().map(|projection| {
+            u64::from(rows).checked_mul(projection.output as u64).and_then(|bytes| bytes.checked_mul(4))
+                .context("MiniMax dense output extent overflow")
+        }).try_fold(0, |peak, bytes| Ok::<_, anyhow::Error>(peak.max(bytes?)))?;
+        ensure!(records > 0 && output > 0, "MiniMax dense owner has no projections");
+        Ok(DenseWorkspace { rows, records, output })
+    }
+
     /// Whole layers are assigned explicitly. The entry GPU owns embedding,
     /// the final GPU owns the head, and every GPU owns its final norm.
     pub fn plan(checkpoint: &Checkpoint, cfg: &MiniMaxM3Config, ranks: usize,
